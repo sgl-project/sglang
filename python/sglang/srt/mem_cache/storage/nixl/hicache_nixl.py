@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
 
 from .nixl_registry import NixlRegistry
 from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager
@@ -283,12 +284,11 @@ class HiCacheNixl(HiCacheStorage):
         kind: str,
     ) -> torch.Tensor:
         """Allocate a ``(STORAGE_BATCH_SIZE, page_numel)`` bounce buffer and
-        pre-register it as a DRAM region with NIXL."""
-        buf = torch.empty(
-            (STORAGE_BATCH_SIZE, page_numel),
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
+        pre-register it as a DRAM region with NIXL. Uses alloc_mmap so the
+        buffer is page-aligned -- required when O_DIRECT is on for any
+        file-based backend (POSIX/GDS/GDS_MT/3FS). pin_memory is currently
+        unused (alloc_mmap does not support it)."""
+        buf = alloc_mmap((STORAGE_BATCH_SIZE, page_numel), dtype)
         self._pre_register_host(buf.data_ptr(), buf.numel() * buf.element_size(), kind)
         return buf
 

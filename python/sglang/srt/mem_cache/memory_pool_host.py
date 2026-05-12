@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -78,18 +79,19 @@ def synchronized(func):
     return wrapper
 
 
-class HostTensorAllocator(abc.ABC):
+class HostTensorAllocator:
     def __init__(self):
         """Initialize the HostTensorAllocator."""
         self.dtype = None
         self.dims = None
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
-        """Allocate a tensor of given dims and dtype on the memory."""
+        assert (
+            device == "cpu"
+        ), f"HostTensorAllocator only supports CPU allocations; got device={device!r}"
         self.dtype = dtype
         self.dims = dims
-        tensor = torch.empty(dims, dtype=dtype, device=device)
-        return tensor
+        return alloc_mmap(dims, dtype)
 
 
 class HiSparseHostPoolMixin:
@@ -187,11 +189,16 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
-        ret = torch.cuda.cudart().cudaHostRegister(
-            buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-        )
-        if ret != 0:
-            raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+        cudart = torch.cuda.cudart()
+        n_bytes = buffer.numel() * buffer.element_size()
+        rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
+        if int(rc) != 0:
+            raise RuntimeError(
+                f"cudaHostRegister failed (rc={int(rc)}, "
+                f"{cudart.cudaGetErrorString(rc)}) for ptr={buffer.data_ptr():#x} "
+                f"size={n_bytes}; host buffer is not pinned and device transfers "
+                f"may silently return stale data."
+            )
     return buffer
 
 

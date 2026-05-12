@@ -337,6 +337,7 @@ class Envs:
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    SGLANG_HUGEPAGE_SIZE = EnvStr("")
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)

@@ -190,7 +190,6 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_DISABLE_OUTLINES_DISK_CACHE` | Disable Outlines disk cache | `false` |
 | `SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE` | Use SGLang's custom Triton kernel cache implementation for lower overheads (automatically enabled on CUDA) | `false` |
 | `SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE` | Decode-side incremental KV cache offload stride. Rounded down to a multiple of `--page-size` (min is `--page-size`). If unset/invalid/<=0, it falls back to `--page-size`. | Not set (uses `--page-size`) |
-| `SGLANG_HICACHE_NIXL_USE_DIRECT_IO` | Enable `O_DIRECT` for any file-based NIXL backend (POSIX, GDS, GDS_MT, 3FS) when opening cache files (bypasses the OS page cache, reducing memory pressure and improving throughput on NVMe). Can also be disabled via `{"use_direct_io": false}` in `--hicache-storage-backend-extra-config`. Falls back to buffered I/O with a warning when `O_DIRECT` is unavailable on the current OS. | `true` |
 
 
 ## Function Calling / Tool Use
