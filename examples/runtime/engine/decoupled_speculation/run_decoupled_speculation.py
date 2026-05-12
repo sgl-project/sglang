@@ -14,10 +14,8 @@ import argparse
 import csv
 import json
 import logging
-import os
 import socket
 from dataclasses import asdict, dataclass
-from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -61,10 +59,7 @@ _RUNTIME_IMPORTS_READY = False
 def _ensure_runtime_imports() -> None:
     """Import Ray and decoupled-spec helpers after argparse handles --help."""
     global _RUNTIME_IMPORTS_READY
-    global common_launch_draft_actors
     global create_remote_decoupled_spec_topology
-    global create_result_endpoint_from_pg
-    global DraftActor
     global PlacementGroupSchedulingStrategy
     global PortActor
     global TargetActor
@@ -73,7 +68,7 @@ def _ensure_runtime_imports() -> None:
     global _get_real_verify_acceptance_stats
     global _messages_to_fallback_text
     global _normalize_prompt
-    global format_tcp_address
+    global get_decoupled_spec_actor_env_vars
     global infer_prompt_column
     global placement_group
     global ray
@@ -101,12 +96,9 @@ def _ensure_runtime_imports() -> None:
     placement_group = ray_placement_group
     remove_placement_group = ray_remove_placement_group
     PlacementGroupSchedulingStrategy = RayPlacementGroupSchedulingStrategy
-    common_launch_draft_actors = common.launch_draft_actors
     create_remote_decoupled_spec_topology = (
         common.create_remote_decoupled_spec_topology
     )
-    create_result_endpoint_from_pg = common.create_result_endpoint_from_pg
-    DraftActor = common.DraftActor
     PortActor = common.PortActor
     TargetActor = common.TargetActor
     _build_chat_template_renderer = common._build_chat_template_renderer
@@ -114,7 +106,7 @@ def _ensure_runtime_imports() -> None:
     _get_real_verify_acceptance_stats = common._get_real_verify_acceptance_stats
     _messages_to_fallback_text = common._messages_to_fallback_text
     _normalize_prompt = common._normalize_prompt
-    format_tcp_address = common.format_tcp_address
+    get_decoupled_spec_actor_env_vars = common.get_decoupled_spec_actor_env_vars
     infer_prompt_column = common.infer_prompt_column
     resolve_dapo_math_17k_prompt_column = (
         common.resolve_dapo_math_17k_prompt_column
@@ -214,7 +206,11 @@ def parse_args() -> argparse.Namespace:
         dest="batch_size",
         type=int,
         default=1,
-        help="Number of valid prompts to run in one generate call.",
+        help=(
+            "Number of valid prompts to run in one generate call. When using "
+            "multiple verifier replicas, this must be divisible by the number "
+            "of verifier replicas."
+        ),
     )
     parser.add_argument(
         "--disable-chat-template",
@@ -313,16 +309,37 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "GPU count available on each Ray node. For single-node runs, defaults "
-            "to target_tp_size + draft_tp_size * num_draft_replicas."
+            "GPU count available on each Ray node. Used with --nnodes to bound "
+            "the total verifier and drafter GPU budgets."
+        ),
+    )
+    parser.add_argument(
+        "--verify-ngpus",
+        dest="verify_ngpus",
+        type=int,
+        default=None,
+        help=(
+            "Total GPUs reserved for verifier replicas. If omitted, all GPUs "
+            "not reserved by --draft-ngpus are used for verifier replicas."
+        ),
+    )
+    parser.add_argument(
+        "--draft-ngpus",
+        dest="draft_ngpus",
+        type=int,
+        default=None,
+        help=(
+            "Total GPUs reserved for all drafter replicas. The number of "
+            "drafters is derived as draft_ngpus / draft_tp_size."
         ),
     )
     parser.add_argument(
         "--dist-init-addr",
         default=None,
         help=(
-            "SGLang distributed init address. For multi-node, pass host:port "
-            "or host together with --dist-init-port."
+            "Optional SGLang distributed init address override. If omitted for "
+            "multi-node runs, the script uses each verifier placement group's "
+            "rank-0 host."
         ),
     )
     parser.add_argument(
@@ -330,12 +347,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Base port for this run. Spec dist init uses base, decode uses "
-            "base+1, the decoupled result endpoint uses base+2, and the draft "
-            "control endpoint uses base+3."
+            "Base port for this run. With V verifier replicas, spec dist-init "
+            "uses base..base+V-1, decode uses base+V..base+2V-1, verifier "
+            "result endpoints use base+2V..base+3V-1, and drafter control "
+            "endpoints start at base+3V."
         ),
     )
-    parser.add_argument("--num-draft-replicas", type=int, default=1)
+    parser.add_argument(
+        "--num-draft-replicas",
+        dest="num_draft_replicas",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--output-dir",
         default=None,
@@ -429,7 +453,6 @@ def _build_codeforces_raw_prompt(
     row_index: int,
     chat_template_renderer,
     code_language: str,
-    enable_thinking: bool,
 ) -> str:
     missing_values = [
         column
@@ -657,7 +680,6 @@ def load_prompt_samples(args: argparse.Namespace) -> tuple[str, list[PromptSampl
                         row_index=row_index,
                         chat_template_renderer=chat_template_renderer,
                         code_language=args.code_language,
-                        enable_thinking=args.enable_thinking,
                     )
                 elif args.dataset_format == "dapo_math_17k":
                     prompt = _build_dapo_math_17k_prompt(
@@ -790,20 +812,6 @@ def derive_dist_init_addr_from_pg(
     return f"{host}:{port}"
 
 
-def derive_result_endpoint_from_pg(
-    args: argparse.Namespace,
-    pg,
-    avoid_port: int | None = None,
-    preferred_port: int | None = None,
-) -> str:
-    del args
-    return create_result_endpoint_from_pg(
-        pg,
-        avoid_port=avoid_port,
-        preferred_port=preferred_port,
-    )
-
-
 def init_ray(address: str, namespace: str, nnodes: int) -> None:
     init_kwargs = dict(
         address=address,
@@ -842,55 +850,87 @@ def derive_target_layout(args: argparse.Namespace) -> tuple[int, int]:
 def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
     if args.nnodes <= 0:
         raise ValueError("nnodes must be positive")
-    if args.n_gpu_per_node is None:
-        if args.nnodes != 1:
-            raise ValueError("n-gpu-per-node is required when nnodes > 1")
-        args.n_gpu_per_node = args.target_tp_size + (
-            args.draft_tp_size * args.num_draft_replicas
-        )
-    if args.n_gpu_per_node <= 0:
-        raise ValueError("n-gpu-per-node must be positive")
     if args.target_tp_size <= 0:
         raise ValueError("target-tp-size must be positive")
     if args.target_ep_size is not None and args.target_ep_size <= 0:
         raise ValueError("target-ep-size must be positive when set")
     if args.draft_tp_size <= 0:
         raise ValueError("draft-tp-size must be positive")
-    if args.num_draft_replicas <= 0:
-        raise ValueError("num-draft-replicas must be positive")
-    if args.num_draft_replicas != 1:
+    if args.verify_ngpus is not None and args.verify_ngpus <= 0:
+        raise ValueError("verify-ngpus must be positive when set")
+    if args.draft_ngpus is not None and args.draft_ngpus <= 0:
+        raise ValueError("draft-ngpus must be positive when set")
+    if args.num_draft_replicas is not None and args.num_draft_replicas <= 0:
+        raise ValueError("num-draft-replicas must be positive when set")
+    if args.draft_ngpus is None:
+        args.draft_ngpus = args.draft_tp_size * (args.num_draft_replicas or 1)
+    if args.draft_ngpus % args.draft_tp_size != 0:
         raise ValueError(
-            "This ZMQ mesh demo currently supports exactly one draft replica."
+            f"draft-ngpus ({args.draft_ngpus}) must be divisible by "
+            f"draft-tp-size ({args.draft_tp_size})"
         )
+    derived_num_draft_replicas = args.draft_ngpus // args.draft_tp_size
+    if (
+        args.num_draft_replicas is not None
+        and args.num_draft_replicas != derived_num_draft_replicas
+    ):
+        raise ValueError(
+            "num-draft-replicas must match draft-ngpus / draft-tp-size "
+            f"({derived_num_draft_replicas}) when --draft-ngpus is set"
+        )
+    args.num_draft_replicas = derived_num_draft_replicas
+    if (
+        args.verify_ngpus is not None
+        and args.verify_ngpus % args.target_tp_size != 0
+    ):
+        raise ValueError(
+            f"verify-ngpus ({args.verify_ngpus}) must be divisible by "
+            f"target-tp-size ({args.target_tp_size})"
+        )
+
+    if args.n_gpu_per_node is None:
+        if args.nnodes != 1:
+            raise ValueError("n-gpu-per-node is required when nnodes > 1")
+        args.n_gpu_per_node = (
+            (args.verify_ngpus or args.target_tp_size) + args.draft_ngpus
+        )
+    if args.n_gpu_per_node <= 0:
+        raise ValueError("n-gpu-per-node must be positive")
+
+    total_cluster_gpus = args.n_gpu_per_node * args.nnodes
+    if args.verify_ngpus is None:
+        args.verify_ngpus = total_cluster_gpus - args.draft_ngpus
+    if args.draft_ngpus + args.verify_ngpus > total_cluster_gpus:
+        raise ValueError(
+            f"verify-ngpus + draft-ngpus ({args.verify_ngpus} + "
+            f"{args.draft_ngpus}) exceeds nnodes*n-gpu-per-node "
+            f"({total_cluster_gpus})"
+        )
+    if args.verify_ngpus <= 0:
+        raise ValueError(
+            f"draft-ngpus ({args.draft_ngpus}) must leave GPUs for at least "
+            "one verifier replica"
+        )
+    if args.verify_ngpus % args.target_tp_size != 0:
+        raise ValueError(
+            f"verify-ngpus ({args.verify_ngpus}) must be divisible by "
+            f"target-tp-size ({args.target_tp_size})"
+        )
+    args.num_verifier_replicas = args.verify_ngpus // args.target_tp_size
 
     target_nnodes, target_gpus_per_node = derive_target_layout(args)
 
-    residual_gpus_per_node = args.n_gpu_per_node - target_gpus_per_node
-    max_free_gpus_per_node = (
-        args.n_gpu_per_node if target_nnodes < args.nnodes else residual_gpus_per_node
-    )
-    if args.draft_tp_size > max_free_gpus_per_node:
+    if args.draft_tp_size > args.n_gpu_per_node:
         raise ValueError(
             f"each draft actor needs {args.draft_tp_size} GPUs on one node, "
-            f"but at most {max_free_gpus_per_node} GPUs are free on any one node"
-        )
-
-    total_residual_gpus = (
-        args.n_gpu_per_node * args.nnodes - args.target_tp_size
-    )
-    required_draft_gpus = args.draft_tp_size * args.num_draft_replicas
-    if required_draft_gpus > total_residual_gpus:
-        raise ValueError(
-            f"draft replicas require {required_draft_gpus} GPUs, but only "
-            f"{total_residual_gpus} GPUs remain after reserving target GPUs"
+            f"but n-gpu-per-node is only {args.n_gpu_per_node}"
         )
 
     ray_gpus = int(ray.cluster_resources().get("GPU", 0))
-    required_spec_gpus = args.target_tp_size + required_draft_gpus
-    if ray_gpus and required_spec_gpus > ray_gpus:
+    if ray_gpus and total_cluster_gpus > ray_gpus:
         raise ValueError(
-            f"Ray cluster reports {ray_gpus} GPUs, but spec mode requires "
-            f"{required_spec_gpus}"
+            f"Ray cluster reports {ray_gpus} GPUs, but this run requires "
+            f"{total_cluster_gpus}"
         )
 
     alive_target_nodes = [
@@ -908,37 +948,6 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
     return target_nnodes, target_gpus_per_node
 
 
-def _get_decoupled_spec_actor_env_vars(
-    args: argparse.Namespace | None = None,
-) -> dict[str, str]:
-    env_vars: dict[str, str] = {}
-    if args is not None:
-        env_vars["SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL"] = (
-            "1" if args.decoupled_spec_allow_partial else "0"
-        )
-    for env_name in (
-        "SGLANG_DECOUPLED_SPEC_DEBUG",
-        "SGLANG_DECOUPLED_SPEC_TRACE_DIR",
-        "SGLANG_DECOUPLED_SPEC_SUMMARY_INTERVAL",
-    ):
-        env_value = os.environ.get(env_name)
-        if env_value:
-            env_vars[env_name] = env_value
-    return env_vars
-
-
-def launch_draft_actors(
-    args: argparse.Namespace,
-    verifier_result_endpoints: list[str],
-    control_port: int | None = None,
-) -> tuple[list[Any], list[str]]:
-    return common_launch_draft_actors(
-        args,
-        verifier_result_endpoints,
-        control_port=control_port,
-    )
-
-
 def create_target_placement_group(target_nnodes: int, target_gpus_per_node: int):
     bundles = [
         {"CPU": 1, "GPU": target_gpus_per_node}
@@ -948,6 +957,17 @@ def create_target_placement_group(target_nnodes: int, target_gpus_per_node: int)
     pg = placement_group(bundles, strategy=strategy)
     ray.get(pg.ready())
     return pg
+
+
+def create_target_placement_groups(
+    num_replicas: int,
+    target_nnodes: int,
+    target_gpus_per_node: int,
+):
+    return [
+        create_target_placement_group(target_nnodes, target_gpus_per_node)
+        for _ in range(num_replicas)
+    ]
 
 
 def launch_target_actors(
@@ -962,7 +982,7 @@ def launch_target_actors(
     connect_endpoints: list[str] | None = None,
     rank: int | None = None,
 ) -> list[Any]:
-    actor_env_vars = _get_decoupled_spec_actor_env_vars(args)
+    actor_env_vars = get_decoupled_spec_actor_env_vars(args)
     actors = []
     for node_rank in range(target_nnodes):
         scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -986,7 +1006,6 @@ def launch_target_actors(
             nnodes=target_nnodes,
             node_rank=node_rank,
             dist_init_addr=dist_init_addr,
-            batch_size=args.batch_size,
             speculative_num_steps=args.num_speculative_steps,
             bind_endpoint=bind_endpoint,
             connect_endpoints=connect_endpoints,
@@ -1156,6 +1175,21 @@ def collect_mode_metrics(
     )
 
 
+def _split_indices(num_items: int, num_shards: int) -> list[list[int]]:
+    if num_shards <= 0:
+        raise ValueError("num_shards must be positive")
+    if num_items % num_shards != 0:
+        raise ValueError(
+            f"batch size ({num_items}) must be divisible by verifier replicas "
+            f"({num_shards})"
+        )
+    shard_size = num_items // num_shards
+    return [
+        list(range(shard_index * shard_size, (shard_index + 1) * shard_size))
+        for shard_index in range(num_shards)
+    ]
+
+
 def run_mode(
     *,
     args: argparse.Namespace,
@@ -1163,48 +1197,103 @@ def run_mode(
     prompt_input_ids: list[list[int]],
     sampling_params: dict[str, Any],
     prompt_samples: list[PromptSample],
-    dist_init_addr: str | None,
+    dist_init_addrs: list[str | None],
     target_nnodes: int,
     target_gpus_per_node: int,
-    pg=None,
-    endpoint_config: Any | None = None,
+    pgs: list[Any] | None = None,
+    endpoint_configs: list[Any] | None = None,
     include_output_text: bool = True,
 ) -> ModeMetrics:
-    target_actors: list[Any] = []
-    owns_pg = pg is None
+    target_actor_groups: list[list[Any]] = []
+    owns_pgs = pgs is None
+    num_replicas = (
+        len(endpoint_configs) if endpoint_configs is not None else len(dist_init_addrs)
+    )
+    if num_replicas <= 0:
+        raise ValueError("run_mode requires at least one target replica")
+    if len(dist_init_addrs) != num_replicas:
+        raise ValueError(
+            f"dist_init_addrs has {len(dist_init_addrs)} entries, expected {num_replicas}"
+        )
+    if pgs is not None and len(pgs) != num_replicas:
+        raise ValueError(f"pgs has {len(pgs)} entries, expected {num_replicas}")
+
+    replica_indices = _split_indices(len(prompt_samples), num_replicas)
+    outputs_by_index: list[dict[str, Any] | None] = [None] * len(prompt_samples)
     try:
-        if pg is None:
-            pg = create_target_placement_group(target_nnodes, target_gpus_per_node)
-        target_actors = launch_target_actors(
-            args=args,
-            mode=mode,
-            dist_init_addr=dist_init_addr,
-            target_nnodes=target_nnodes,
-            target_gpus_per_node=target_gpus_per_node,
-            pg=pg,
-            bind_endpoint=(
-                endpoint_config.bind_endpoint if endpoint_config is not None else None
-            ),
-            connect_endpoints=(
-                endpoint_config.connect_endpoints
-                if endpoint_config is not None
-                else None
-            ),
-            rank=endpoint_config.rank if endpoint_config is not None else None,
-        )
-        result = ray.get(
-            target_actors[0].generate_batch.remote(
-                prompt_input_ids, sampling_params
+        if pgs is None:
+            pgs = create_target_placement_groups(
+                num_replicas,
+                target_nnodes,
+                target_gpus_per_node,
             )
-        )
+
+        for replica_index in range(num_replicas):
+            endpoint_config = (
+                endpoint_configs[replica_index]
+                if endpoint_configs is not None
+                else None
+            )
+            actors = launch_target_actors(
+                args=args,
+                mode=mode,
+                dist_init_addr=dist_init_addrs[replica_index],
+                target_nnodes=target_nnodes,
+                target_gpus_per_node=target_gpus_per_node,
+                pg=pgs[replica_index],
+                bind_endpoint=(
+                    endpoint_config.bind_endpoint
+                    if endpoint_config is not None
+                    else None
+                ),
+                connect_endpoints=(
+                    endpoint_config.connect_endpoints
+                    if endpoint_config is not None
+                    else None
+                ),
+                rank=endpoint_config.rank if endpoint_config is not None else None,
+            )
+            target_actor_groups.append(actors)
+
+        result_refs = []
+        for replica_index, indices in enumerate(replica_indices):
+            shard_input_ids = [prompt_input_ids[index] for index in indices]
+            result_refs.append(
+                (
+                    indices,
+                    target_actor_groups[replica_index][0].generate_batch.remote(
+                        shard_input_ids,
+                        sampling_params,
+                    ),
+                )
+            )
+
+        for indices, result_ref in result_refs:
+            result = ray.get(result_ref)
+            shard_outputs = result["outputs"]
+            if len(shard_outputs) != len(indices):
+                raise RuntimeError(
+                    f"{mode} returned {len(shard_outputs)} outputs for "
+                    f"{len(indices)} prompts on one replica"
+                )
+            for index, output in zip(indices, shard_outputs, strict=True):
+                outputs_by_index[index] = output
     finally:
-        shutdown_actors(target_actors)
-        if owns_pg and pg is not None:
-            remove_placement_group(pg)
+        for actors in target_actor_groups:
+            shutdown_actors(actors)
+        if owns_pgs and pgs is not None:
+            for pg in pgs:
+                remove_placement_group(pg)
+
+    if any(output is None for output in outputs_by_index):
+        missing = [
+            index for index, output in enumerate(outputs_by_index) if output is None
+        ]
+        raise RuntimeError(f"{mode} did not return outputs for indices {missing}")
 
     return collect_mode_metrics(
         mode=mode,
-        outputs=result["outputs"],
+        outputs=[output for output in outputs_by_index if output is not None],
         prompt_samples=prompt_samples,
         include_output_text=include_output_text,
     )
@@ -1245,7 +1334,10 @@ def build_result(
             "target_ep_size": args.target_ep_size,
             "target_moe_a2a_backend": args.target_moe_a2a_backend,
             "target_mamba_scheduler_strategy": args.target_mamba_scheduler_strategy,
+            "num_verifier_replicas": args.num_verifier_replicas,
+            "verify_ngpus": args.verify_ngpus,
             "draft_tp_size": args.draft_tp_size,
+            "draft_ngpus": args.draft_ngpus,
             "num_speculative_steps": args.num_speculative_steps,
             "temperature": args.temperature,
             "deterministic": args.deterministic,
@@ -1421,6 +1513,10 @@ def print_summary(result: dict[str, Any]) -> None:
     print(f"dataset_format: {result['config']['dataset_format']}")
     print(f"prompt_column: {result['config']['prompt_column']}")
     print(f"batch_size: {result['config']['batch_size']}")
+    print(f"verify_ngpus: {result['config']['verify_ngpus']}")
+    print(f"draft_ngpus: {result['config']['draft_ngpus']}")
+    print(f"num_verifier_replicas: {result['config']['num_verifier_replicas']}")
+    print(f"num_draft_replicas: {result['config']['num_draft_replicas']}")
     print(f"max_new_tokens: {result['config']['max_new_tokens']}")
     print(f"total_prompt_tokens: {result['dataset']['total_prompt_tokens']}")
     print(
@@ -1483,7 +1579,10 @@ def print_summary(result: dict[str, Any]) -> None:
                     raise RuntimeError(
                         "Mismatched per-request ordering between decoupled_spec and decode"
                     )
-                _print_response_block("decode_response", decode_item.get("output_text", ""))
+                _print_response_block(
+                    "decode_response",
+                    decode_item.get("output_text", ""),
+                )
 
 
 def main() -> None:
@@ -1499,26 +1598,64 @@ def main() -> None:
     }
 
     draft_actors: list[Any] = []
-    spec_pg = None
+    spec_pgs = []
     try:
         init_ray(args.ray_address, args.ray_namespace, args.nnodes)
         target_nnodes, target_gpus_per_node = validate_resources(args)
 
-        spec_pg = create_target_placement_group(target_nnodes, target_gpus_per_node)
-        spec_dist_init_addr = derive_dist_init_addr_from_pg(args, spec_pg)
-        _, spec_dist_init_port = _parse_host_port(spec_dist_init_addr)
-        preferred_result_port = (
-            args.dist_init_port + 2 if args.dist_init_port is not None else None
+        spec_pgs = create_target_placement_groups(
+            args.num_verifier_replicas,
+            target_nnodes,
+            target_gpus_per_node,
         )
-        preferred_control_port = (
-            args.dist_init_port + 3 if args.dist_init_port is not None else None
+        spec_dist_init_addrs = [
+            derive_dist_init_addr_from_pg(args, pg, port_offset=replica_index)
+            for replica_index, pg in enumerate(spec_pgs)
+        ]
+        spec_dist_init_ports = {
+            port
+            for addr in spec_dist_init_addrs
+            if addr is not None
+            for _, port in [_parse_host_port(addr)]
+            if port is not None
+        }
+        num_verifiers = args.num_verifier_replicas
+        reserved_dist_init_ports = set(spec_dist_init_ports)
+        if not args.skip_decode:
+            if args.dist_init_port is not None:
+                reserved_dist_init_ports.update(
+                    args.dist_init_port + num_verifiers + replica_index
+                    for replica_index in range(num_verifiers)
+                )
+            elif args.dist_init_addr is not None:
+                _, base_port = _parse_host_port(args.dist_init_addr)
+                if base_port is not None:
+                    reserved_dist_init_ports.update(
+                        base_port + num_verifiers + replica_index
+                        for replica_index in range(num_verifiers)
+                    )
+        preferred_result_ports = (
+            [
+                args.dist_init_port + 2 * num_verifiers + i
+                for i in range(num_verifiers)
+            ]
+            if args.dist_init_port is not None
+            else None
+        )
+        preferred_control_ports = (
+            [
+                args.dist_init_port + 3 * num_verifiers + i
+                for i in range(args.num_draft_replicas)
+            ]
+            if args.dist_init_port is not None
+            else None
         )
         topology = create_remote_decoupled_spec_topology(
             args,
-            spec_pg,
-            avoid_port=spec_dist_init_port,
-            preferred_result_port=preferred_result_port,
-            preferred_control_port=preferred_control_port,
+            spec_pgs,
+            avoid_ports=reserved_dist_init_ports,
+            preferred_result_ports=preferred_result_ports,
+            preferred_control_ports=preferred_control_ports,
         )
         draft_actors = topology.draft_actors or []
         spec_metrics = run_mode(
@@ -1527,11 +1664,11 @@ def main() -> None:
             prompt_input_ids=prompt_input_ids,
             sampling_params=sampling_params,
             prompt_samples=prompt_samples,
-            dist_init_addr=spec_dist_init_addr,
+            dist_init_addrs=spec_dist_init_addrs,
             target_nnodes=target_nnodes,
             target_gpus_per_node=target_gpus_per_node,
-            pg=spec_pg,
-            endpoint_config=topology.verifier_configs[0],
+            pgs=spec_pgs,
+            endpoint_configs=topology.verifier_configs,
             include_output_text=True,
         )
         shutdown_actors(draft_actors)
@@ -1539,19 +1676,24 @@ def main() -> None:
 
         decode_metrics = None
         if not args.skip_decode:
-            decode_dist_init_addr = derive_dist_init_addr_from_pg(
-                args, spec_pg, port_offset=1
-            )
+            decode_dist_init_addrs = [
+                derive_dist_init_addr_from_pg(
+                    args,
+                    pg,
+                    port_offset=args.num_verifier_replicas + replica_index,
+                )
+                for replica_index, pg in enumerate(spec_pgs)
+            ]
             decode_metrics = run_mode(
                 args=args,
                 mode="decode",
                 prompt_input_ids=prompt_input_ids,
                 sampling_params=sampling_params,
                 prompt_samples=prompt_samples,
-                dist_init_addr=decode_dist_init_addr,
+                dist_init_addrs=decode_dist_init_addrs,
                 target_nnodes=target_nnodes,
                 target_gpus_per_node=target_gpus_per_node,
-                pg=spec_pg,
+                pgs=spec_pgs,
                 include_output_text=True,
             )
 
@@ -1572,8 +1714,8 @@ def main() -> None:
                 print(f"  {output_path}")
     finally:
         shutdown_actors(draft_actors)
-        if spec_pg is not None:
-            remove_placement_group(spec_pg)
+        for pg in spec_pgs:
+            remove_placement_group(pg)
         if ray.is_initialized():
             ray.shutdown()
 
