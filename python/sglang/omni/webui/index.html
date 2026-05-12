@@ -35,56 +35,62 @@
 
     .shell {
       display: grid;
-      grid-template-columns: minmax(340px, 420px) minmax(0, 1fr);
-      gap: clamp(18px, 3vw, 42px);
+      grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
+      gap: clamp(18px, 2.5vw, 34px);
       width: min(1440px, calc(100vw - 40px));
       margin: 0 auto;
       padding: 34px 0;
     }
 
-    header {
+    .side-panel {
+      align-self: start;
+      display: grid;
+      gap: 18px;
+      position: sticky;
+      top: 28px;
+    }
+
+    .side-header {
       border-top: 2px solid var(--ink);
       padding-top: 16px;
-      margin-bottom: 24px;
     }
 
     h1 {
       margin: 0;
-      max-width: 11ch;
-      font-size: 64px;
-      line-height: 0.9;
+      font-size: 44px;
+      line-height: 1;
       font-weight: 500;
       letter-spacing: 0;
     }
 
     .subtitle {
-      margin: 14px 0 0;
+      margin: 10px 0 0;
       color: var(--muted);
-      max-width: 34ch;
       font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 13px;
-      line-height: 1.55;
+      line-height: 1.45;
     }
 
-    .status {
+    .connection {
+      display: grid;
+      gap: 10px;
+      border-block: 1px solid var(--line);
+      padding: 13px 0;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .status,
+    .model-strip {
       display: grid;
       grid-template-columns: 1fr auto;
       align-items: center;
       gap: 10px;
-      margin: 22px 0;
-      padding: 13px 0;
-      border-block: 1px solid var(--line);
-      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 13px;
     }
 
     .model-strip {
-      display: grid;
-      gap: 4px;
-      margin: -6px 0 22px;
-      padding-bottom: 16px;
-      border-bottom: 1px solid var(--line);
-      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: baseline;
     }
 
     .model-strip span {
@@ -100,6 +106,7 @@
       font-size: 13px;
       font-weight: 750;
       word-break: break-word;
+      text-align: right;
     }
 
     .dot {
@@ -118,13 +125,17 @@
     .control {
       display: grid;
       gap: 8px;
-      margin-bottom: 16px;
     }
 
-    .section-label {
-      margin: 22px 0 10px;
-      padding-top: 14px;
+    .control-group {
+      display: grid;
+      gap: 12px;
       border-top: 1px solid var(--line);
+      padding-top: 16px;
+    }
+
+    .control-group h3 {
+      margin: 0;
       color: var(--muted);
       font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 12px;
@@ -188,11 +199,17 @@
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      margin-top: 18px;
     }
 
+    .preset-actions,
     .side-actions {
-      margin-top: 6px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .side-actions .warn {
+      grid-column: 1 / -1;
     }
 
     button {
@@ -464,6 +481,7 @@
 
     @media (max-width: 900px) {
       .shell { grid-template-columns: 1fr; }
+      .side-panel { position: static; }
       h1 { font-size: 44px; }
       .timeline { min-height: 520px; }
       .turn { grid-template-columns: 1fr; }
@@ -475,85 +493,93 @@
 </head>
 <body>
   <main class="shell">
-    <section>
-      <header>
+    <aside class="side-panel">
+      <header class="side-header">
         <h1>Omni Lab</h1>
         <p class="subtitle">Interleaved text-image conversations through SGLang /v1/omni/generate.</p>
       </header>
 
-      <div class="status">
-        <span id="statusText">Checking backend</span>
-        <span id="statusDot" class="dot"></span>
-      </div>
-
-      <div class="model-strip">
-        <span>Model</span>
-        <strong id="modelView">loading</strong>
-      </div>
-
-      <div class="section-label">Request</div>
-
-      <div class="control">
-        <label for="task">Task</label>
-        <select id="task">
-          <option value="interleave" selected>interleave</option>
-          <option value="t2i">t2i</option>
-          <option value="edit">edit</option>
-          <option value="vlm">vlm</option>
-        </select>
-      </div>
-
-      <div class="section-label">Multi-turn preset</div>
-
-      <div class="actions" style="margin-top: 0;">
-        <button class="secondary" id="turn1">Preset: first image</button>
-        <button class="secondary" id="turn2">Preset: edit previous</button>
-      </div>
-
-      <div class="row">
-        <div class="control">
-          <label for="width">Width</label>
-          <input id="width" type="number" value="1024" min="128" max="1536" step="32">
+      <div class="connection">
+        <div class="status">
+          <span id="statusText">Checking backend</span>
+          <span id="statusDot" class="dot"></span>
         </div>
-        <div class="control">
-          <label for="height">Height</label>
-          <input id="height" type="number" value="1024" min="128" max="1536" step="32">
+        <div class="model-strip">
+          <span>Model</span>
+          <strong id="modelView">loading</strong>
         </div>
       </div>
 
-      <div class="row">
+      <div class="control-group">
+        <h3>Request</h3>
         <div class="control">
-          <label for="steps">Steps</label>
-          <input id="steps" type="number" value="50" min="1" max="80">
-        </div>
-        <div class="control">
-          <label for="seed">Seed</label>
-          <input id="seed" type="number" value="223">
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="control">
-          <label for="cfgText">Text CFG</label>
-          <input id="cfgText" type="number" value="4.0" min="0" max="12" step="0.1">
-        </div>
-        <div class="control">
-          <label for="cfgImage">Image CFG</label>
-          <input id="cfgImage" type="number" value="1.0" min="0" max="12" step="0.1">
+          <label for="task">Task</label>
+          <select id="task">
+            <option value="interleave" selected>interleave</option>
+            <option value="t2i">t2i</option>
+            <option value="edit">edit</option>
+            <option value="vlm">vlm</option>
+          </select>
         </div>
       </div>
 
-      <div class="checkline">
-        <input id="keepSession" type="checkbox" checked>
-        <span>Keep omni session across turns</span>
+      <div class="control-group">
+        <h3>Multi-turn preset</h3>
+        <div class="preset-actions">
+          <button class="secondary" id="turn1">First image</button>
+          <button class="secondary" id="turn2">Edit previous</button>
+        </div>
       </div>
 
-      <div class="actions side-actions">
-        <button class="secondary" id="newChat">New chat</button>
-        <button class="secondary" id="reset">Clear timeline</button>
-        <button class="warn" id="closeSession">Close session</button>
+      <div class="control-group">
+        <h3>Generation</h3>
+        <div class="row">
+          <div class="control">
+            <label for="width">Width</label>
+            <input id="width" type="number" value="1024" min="128" max="1536" step="32">
+          </div>
+          <div class="control">
+            <label for="height">Height</label>
+            <input id="height" type="number" value="1024" min="128" max="1536" step="32">
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="control">
+            <label for="steps">Steps</label>
+            <input id="steps" type="number" value="50" min="1" max="80">
+          </div>
+          <div class="control">
+            <label for="seed">Seed</label>
+            <input id="seed" type="number" value="223">
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="control">
+            <label for="cfgText">Text CFG</label>
+            <input id="cfgText" type="number" value="4.0" min="0" max="12" step="0.1">
+          </div>
+          <div class="control">
+            <label for="cfgImage">Image CFG</label>
+            <input id="cfgImage" type="number" value="1.0" min="0" max="12" step="0.1">
+          </div>
+        </div>
       </div>
-    </section>
+
+      <div class="control-group">
+        <h3>Session</h3>
+        <div class="checkline">
+          <input id="keepSession" type="checkbox" checked>
+          <span>Keep omni session across turns</span>
+        </div>
+        <div class="side-actions">
+          <button class="secondary" id="newChat">New chat</button>
+          <button class="secondary" id="reset">Clear timeline</button>
+          <button class="warn" id="closeSession">Close session</button>
+        </div>
+      </div>
+    </aside>
 
     <section class="timeline">
       <div class="timeline-head">
