@@ -627,6 +627,73 @@ class TestKimiK2EndToEnd(unittest.TestCase):
         self.assertEqual(len(name_calls), 1)
         self.assertEqual(name_calls[0].name, "get_weather")
 
+    def test_e2e_normal_think_close_then_content_overlap_tool_call(self):
+        """Standard case with </think> — should also work correctly."""
+        reasoning_det = KimiK2ReasoningDetector(stream_reasoning=True)
+        tc_det = KimiK2FuncDetector()
+
+        chunks = [
+            "<think>",
+            "Thinking about it...",
+            "</think>This is a ",
+            "content:<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>functions.get_weather:0",
+            '<|tool_call_argument_begin|>{"city": "London"}',
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+
+        all_reasoning = ""
+        all_content = ""
+        all_tc_calls = []
+
+        for chunk in chunks:
+            r = reasoning_det.parse_streaming_increment(chunk)
+            all_reasoning += r.reasoning_text
+            if r.normal_text:
+                tc_result = tc_det.parse_streaming_increment(r.normal_text, self.tools)
+                all_content += tc_result.normal_text
+                all_tc_calls.extend(tc_result.calls)
+
+        self.assertEqual("Thinking about it...", all_reasoning)
+        self.assertEqual("This is a content:", all_content)
+        name_calls = [c for c in all_tc_calls if c.name]
+        self.assertEqual(len(name_calls), 1)
+        self.assertEqual(name_calls[0].name, "get_weather")
+
+    def test_e2e_normal_think_close_then_content_overlap_tool_call_multi_token(self):
+        """Speculative decoding: a single chunk may contain normal text followed
+        by tool-call markers and even the tool_call_begin/id. The normal-text
+        prefix must still be emitted (not stripped) by the tool-call parser.
+        """
+        reasoning_det = KimiK2ReasoningDetector(stream_reasoning=True)
+        tc_det = KimiK2FuncDetector()
+
+        chunks = [
+            "<think>",
+            "Thinking about it...",
+            "</think>This is a ",
+            'content.<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city": "London"}<|tool_call_end|><|tool_calls_section_end|>',
+        ]
+
+        all_reasoning = ""
+        all_content = ""
+        all_tc_calls = []
+
+        for chunk in chunks:
+            r = reasoning_det.parse_streaming_increment(chunk)
+            all_reasoning += r.reasoning_text
+            if r.normal_text:
+                tc_result = tc_det.parse_streaming_increment(r.normal_text, self.tools)
+                all_content += tc_result.normal_text
+                all_tc_calls.extend(tc_result.calls)
+
+        self.assertEqual("Thinking about it...", all_reasoning)
+        self.assertEqual("This is a content.", all_content)
+        name_calls = [c for c in all_tc_calls if c.name]
+        self.assertEqual(len(name_calls), 1)
+        self.assertEqual(name_calls[0].name, "get_weather")
+
     def test_e2e_multiple_tool_calls_without_think_close(self):
         """Multiple tool calls inside <think> without </think>."""
         reasoning_det = KimiK2ReasoningDetector(stream_reasoning=True)
