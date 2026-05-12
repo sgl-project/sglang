@@ -1032,8 +1032,11 @@ class EAGLEWorker(TpModelWorker):
         # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
         if spec_info.topk > 1 and res.accepted_indices.shape[0] > 0:
             # accepted_indices=[0,2,3,4,5,7,9,10,11], num_accept_tokens=[4, 3, 2], cumulative_num_accept_tokens=[4, 7, 9]
+            # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_num_accept_tokens[:-1]]) = [0, 5, 10]
             # last_token_indices_per_req=accepted_indices[cumulative_num_accept_tokens - 1] = [4, 9, 11] (last token ID of each req)
             # accept_steps = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
+            # equivalent: accept_steps = last_token_indices_per_req - first_token_indices_per_req;
+            # `accepted_indices_offset` equals `first_token_indices_per_req` because the first accepted slot of each req is its "current token" at logical position i * draft_token_num.
             accept_steps = (
                 res.accepted_indices[cumulative_num_accept_tokens - 1]
                 - accepted_indices_offset
