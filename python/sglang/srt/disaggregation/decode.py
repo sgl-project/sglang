@@ -252,7 +252,7 @@ class DecodeRequest:
         return self.req.seqlen
 
     @property
-    def priority(self):
+    def priority(self) -> Optional[int]:
         return self.req.priority
 
 
