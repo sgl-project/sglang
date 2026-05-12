@@ -125,16 +125,11 @@ class BreakableCudaGraphRunner:
         if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
             self.layer_model = language_model.model
         else:
-            # Disable BCG instead of capturing the outer model.forward, which
-            # would bake bs=1 from logits_processor into the graph and silently
-            # corrupt multi-req prefill. ``can_run`` returns False below; the
-            # caller falls back to eager extend.
+            # If we can't find the inner layer_model, disable BCG.
             self.layer_model = None
             logger.warning(
                 "[BCG] Could not resolve inner layer_model on %s. BCG is "
-                "disabled for this model; prefill will fall back to eager. "
-                "To enable BCG, expose an explicit `.model.layers` attribute "
-                "on the model class.",
+                "disabled for this model; prefill will fall back to eager.",
                 type(language_model).__name__,
             )
             return
