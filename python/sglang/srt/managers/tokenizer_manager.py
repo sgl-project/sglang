@@ -85,9 +85,6 @@ from sglang.srt.managers.tokenizer_manager_components.score_request_handler impo
     ScoreRequestHandler,
     ScoreRequestHandlerConfig,
 )
-from sglang.srt.managers.tokenizer_manager_score_mixin import (
-    TokenizerManagerScoreMixin,
-)
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -138,7 +135,7 @@ class InputFormat(Enum):
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
-class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+class TokenizerManager(TokenizerControlMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
     def __init__(
