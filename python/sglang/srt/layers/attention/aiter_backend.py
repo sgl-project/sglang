@@ -2837,7 +2837,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer, forward_batch.out_cache_loc, k, v, k_descale, v_descale
                 )
 
         if self.use_mla:
@@ -2934,6 +2934,13 @@ class AiterAttnBackend(AttentionBackend):
                 # ``fp8_dtype``; aiter has no ``fp8_e5m2`` string.)
                 aiter_kv_str = self._get_aiter_paged_ragged_kv_cache_dtype()
 
+                paged_k_scale = (
+                    k_descale if self.kv_cache_dtype == fp8_dtype else self.k_scale
+                )
+                paged_v_scale = (
+                    v_descale if self.kv_cache_dtype == fp8_dtype else self.v_scale
+                )
+
                 paged_attention_ragged(
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                     self.workspace_buffer,
@@ -2950,8 +2957,8 @@ class AiterAttnBackend(AttentionBackend):
                     aiter_kv_str,
                     "NHD",
                     self.logits_soft_cap,
-                    self.k_scale,
-                    self.v_scale,
+                    paged_k_scale,
+                    paged_v_scale,
                     None,
                     _AITER_PARTITION_SIZE_ROCM,
                 )
