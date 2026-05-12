@@ -28,8 +28,8 @@ from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
-    attn_tp_all_reduce,
     attn_tp_all_gather,
+    attn_tp_all_reduce,
     dp_gather_replicate,
     dp_scatter,
     get_attention_cp_rank,
