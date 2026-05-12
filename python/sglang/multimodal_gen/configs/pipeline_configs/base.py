@@ -401,6 +401,9 @@ class PipelineConfig:
         """
         return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
 
+    def supports_continuous_batching(self):
+        return False
+
     def estimate_request_cost(self, batch) -> float:
         """Return the relative cost used for batching admission caps.
 
