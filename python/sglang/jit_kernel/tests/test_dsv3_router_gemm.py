@@ -7,6 +7,10 @@ from sglang.jit_kernel.dsv3_router_gemm import (
     can_use_dsv3_router_gemm,
     dsv3_router_gemm,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=37, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=148, suite="nightly-kernel-1-gpu", nightly=True)
 
 HIDDEN_DIM = 7168
 ATOL = 1e-2
