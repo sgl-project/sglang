@@ -419,7 +419,8 @@ class AnthropicServing:
             ),
             media_type="text/event-stream",
             background=self.openai_serving_chat.tokenizer_manager.create_abort_task(
-                adapted_request
+                self.openai_serving_chat.tokenizer_manager.response_emitter,
+                adapted_request,
             ),
         )
 
