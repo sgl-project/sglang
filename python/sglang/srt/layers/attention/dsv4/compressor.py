@@ -354,7 +354,7 @@ class Compressor(nn.Module):
         self.overlap = self.ratio == 4
         self.rotate = rotate
         coff = 1 + self.overlap
-        self.coff = coff = 1 + self.overlap
+        self.coff = coff
 
         self.ape = nn.Parameter(
             torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32)
