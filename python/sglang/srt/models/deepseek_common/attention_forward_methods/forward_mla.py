@@ -19,7 +19,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
     _is_cublas_ge_129,
     _is_cuda,
-    _is_gfx95_supported,
     _is_hip,
     _is_musa,
     _use_aiter,
@@ -100,6 +99,9 @@ if _use_aiter:
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
+
+    from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
@@ -111,7 +113,6 @@ if _use_aiter_gfx95:
         fused_flatten_mxfp4_quant,
         fused_rms_mxfp4_quant,
     )
-    from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
 
 
 class DeepseekMLAForwardMixin:
@@ -356,7 +357,7 @@ class DeepseekMLAForwardMixin:
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
             and (not skip_rope_for_nsa_tilelang_fused)
-            and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
+            and (not _use_aiter or not _is_hip or self.use_nsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
@@ -390,6 +391,8 @@ class DeepseekMLAForwardMixin:
         topk_indices,
         llama_4_scaling,
     ):
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
@@ -457,7 +460,7 @@ class DeepseekMLAForwardMixin:
                     ),
                 )
         else:
-            if _use_aiter_gfx95:
+            if _use_aiter:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
@@ -539,7 +542,11 @@ class DeepseekMLAForwardMixin:
                     attn_bmm_output,
                 )
             else:
-                if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
+                if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
+                    get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
+                ):
+                    # fp8 Triton kernel: always on gfx950,
+                    # cudagraph-only on gfx942 (hides launch overhead)
                     attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=attn_output,
                         WQ=self.w_vc.transpose(-1, -2),
