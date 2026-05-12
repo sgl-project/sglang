@@ -469,7 +469,7 @@ def _deep_gemm_fp8_fp4_mega_moe_pcg_op(
     l2_scale: torch.Tensor,
     cumulative_local_expert_recv_stats: Optional[torch.Tensor],
     sym_buffer: torch.Tensor,
-    sym_buffer_ptrs: torch.Tensor,
+    sym_buffer_ptrs: List[int],
     rank: int,
     num_max_tokens_per_rank: int,
     num_experts: int,
