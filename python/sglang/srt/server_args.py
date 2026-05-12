@@ -3624,7 +3624,7 @@ class ServerArgs:
                 )
             else:
                 logger.warning(
-                    "DFLASH spec v2 is enabled by default and overlap schedule is turned on (experimental)."
+                    "Spec v2 is enabled by default for DFLASH speculative decoding."
                 )
 
             if self.enable_mixed_chunk:
