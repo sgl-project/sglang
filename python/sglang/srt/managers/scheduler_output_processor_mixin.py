@@ -406,7 +406,7 @@ class SchedulerOutputProcessorMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
-    def _resolve_spec_overlap_token_ids(
+    def _resolve_spec_overlap_tokens(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
         """Resolve the padding next token ids for speculative decoding with overlap."""
@@ -487,7 +487,7 @@ class SchedulerOutputProcessorMixin:
 
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
-                next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+                next_token_ids = self._resolve_spec_overlap_tokens(result, batch)
             elif isinstance(next_token_ids, list):
                 pass  # MLX path: already a list[int], skip torch round-trip
             else:

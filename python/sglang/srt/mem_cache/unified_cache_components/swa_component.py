@@ -362,6 +362,7 @@ class SWAComponent(TreeComponent):
         while cur != root and swa_lock_size < sliding_window_size:
             comp = cur.component_data[ct]
             if comp.value is None:
+                result.skip_lock_node_ids.setdefault(ct, set()).add(cur.id)
                 cur = cur.parent
                 continue
             if comp.lock_ref == 0:
@@ -385,14 +386,16 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         root = self.cache.root_node
         swa_uuid_for_lock = params.swa_uuid_for_lock if params else None
+        skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         dec_swa = True
 
-        # lock_ref == 0 means acquire_component_lock skipped this node
-        # (tombstone at acquire time) or load_back revived a tombstone between
-        # acquire and release. Either way, there is nothing for us to undo here.
+        # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
         cur = node
         while cur != root and dec_swa:
             comp = cur.component_data[ct]
+            if cur.id in skip_lock_node_ids:
+                cur = cur.parent
+                continue
             if comp.lock_ref == 0:
                 cur = cur.parent
                 continue
