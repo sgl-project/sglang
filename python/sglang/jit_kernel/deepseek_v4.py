@@ -963,7 +963,7 @@ def fused_store_cache(
     indices: torch.Tensor,
     *,
     page_size: int,
-    type: str,
+    type: Literal["flashmla", "indexer"],
 ) -> None:
     module = _jit_fused_store_module(
         name=type,
@@ -1115,7 +1115,7 @@ def fused_store_cache_pcg_op(
     indices: torch.Tensor,
     *,
     page_size: int,
-    type: Literal["flashmla", "indexer"],
+    type: str,
 ) -> None:
     fused_store_cache(input, cache, indices, page_size=page_size, type=type)
 
