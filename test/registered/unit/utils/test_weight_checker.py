@@ -188,14 +188,14 @@ class TestPostprocessTensors(CustomTestCase):
         b = torch.randn(4)
         raw = {"a.weight": a, "b.bias": b}
         _assert_triples_close(
-            _postprocess_tensors(raw),
+            _postprocess_tensors(raw, set()),
             [("a.weight", True, a), ("b.bias", True, b)],
         )
 
     def test_weight_alone_without_scale_inv_does_not_trigger_dequant(self):
         w = torch.randn(4)
         raw = {"x.weight": w}
-        _assert_triples_close(_postprocess_tensors(raw), [("x.weight", True, w)])
+        _assert_triples_close(_postprocess_tensors(raw, set()), [("x.weight", True, w)])
 
     # --- non-persistent buffer skip ---
 
@@ -207,7 +207,7 @@ class TestPostprocessTensors(CustomTestCase):
             "model.layers.0.weight": plain,
         }
         _assert_triples_close(
-            _postprocess_tensors(raw),
+            _postprocess_tensors(raw, set()),
             [
                 ("model.rotary_emb.cos_sin_cache", False, cache),
                 ("model.layers.0.weight", True, plain),
@@ -217,14 +217,14 @@ class TestPostprocessTensors(CustomTestCase):
     def test_skips_inv_freq_substring(self):
         t = torch.randn(4)
         _assert_triples_close(
-            _postprocess_tensors({"model.rotary_emb.inv_freq": t}),
+            _postprocess_tensors({"model.rotary_emb.inv_freq": t}, set()),
             [("model.rotary_emb.inv_freq", False, t)],
         )
 
     def test_skips_weight_fp32_substring(self):
         t = torch.randn(4)
         _assert_triples_close(
-            _postprocess_tensors({"model.layers.0.mlp.gate._weight_fp32": t}),
+            _postprocess_tensors({"model.layers.0.mlp.gate._weight_fp32": t}, set()),
             [("model.layers.0.mlp.gate._weight_fp32", False, t)],
         )
 
@@ -232,7 +232,7 @@ class TestPostprocessTensors(CustomTestCase):
         # Pattern can appear anywhere in the name, not just at the end.
         t = torch.randn(4)
         _assert_triples_close(
-            _postprocess_tensors({"weird.cos_sin_cache.foo.bar": t}),
+            _postprocess_tensors({"weird.cos_sin_cache.foo.bar": t}, set()),
             [("weird.cos_sin_cache.foo.bar", False, t)],
         )
 
@@ -248,7 +248,7 @@ class TestPostprocessTensors(CustomTestCase):
             qweight, sf_fp32, block_size=[128, 128], dtype=torch.bfloat16
         )
         _assert_triples_close(
-            _postprocess_tensors(raw),
+            _postprocess_tensors(raw, set()),
             [
                 ("x.weight", True, expected_dequant),
                 ("x.weight", False, qweight),
@@ -264,7 +264,7 @@ class TestPostprocessTensors(CustomTestCase):
             qweight, sf_fp32, block_size=[128, 128], dtype=torch.bfloat16
         )
         _assert_triples_close(
-            _postprocess_tensors(raw),
+            _postprocess_tensors(raw, set()),
             [
                 ("x.weight", True, expected_dequant),
                 ("x.weight", False, qweight),
@@ -285,7 +285,7 @@ class TestPostprocessTensors(CustomTestCase):
         )
         # All dequant entries come first, then a raw pass over every key.
         _assert_triples_close(
-            _postprocess_tensors(raw),
+            _postprocess_tensors(raw, set()),
             [
                 ("x.weight", True, expected_dequant),
                 ("x.weight", False, qweight),
@@ -299,7 +299,7 @@ class TestPostprocessTensors(CustomTestCase):
         # through as a normal entry with should_compare=True.
         s = torch.zeros(1, 1, dtype=torch.int32)
         _assert_triples_close(
-            _postprocess_tensors({"x.weight_scale_inv": s}),
+            _postprocess_tensors({"x.weight_scale_inv": s}, set()),
             [("x.weight_scale_inv", True, s)],
         )
 

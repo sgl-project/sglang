@@ -251,6 +251,24 @@ MODELS = {
         ],
     },
     # 13. Skill-only extra preset
+    "ltx23-two-stage-cfg-parallel": {
+        "path": "Lightricks/LTX-2.3",
+        "prompt": "A beautiful sunset over the ocean",
+        "negative_prompt": "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static.",
+        "seed": 1234,
+        "extra_args": [
+            "--pipeline-class-name=LTX2TwoStagePipeline",
+            "--width=1536",
+            "--height=1024",
+            "--num-frames=121",
+            "--fps=24",
+            "--num-inference-steps=30",
+            "--guidance-scale=3.0",
+            "--num-gpus=2",
+            "--cfg-parallel-size=2",
+        ],
+    },
+    # 14. Skill-only extra preset
     "hunyuanvideo": {
         "path": "hunyuanvideo-community/HunyuanVideo",
         "prompt": "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
@@ -263,7 +281,7 @@ MODELS = {
             "--num-inference-steps=30",
         ],
     },
-    # 14. Skill-only extra preset
+    # 15. Skill-only extra preset
     # Requires: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
     "mova-720p": {
         "path": "OpenMOSS-Team/MOVA-720p",
@@ -279,7 +297,7 @@ MODELS = {
             "--num-inference-steps=2",
         ],
     },
-    # 15. Skill-only extra preset
+    # 16. Skill-only extra preset
     "helios": {
         "path": "BestWishYsh/Helios-Base",
         "prompt": "A curious raccoon",
