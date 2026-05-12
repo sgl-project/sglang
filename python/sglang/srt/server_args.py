@@ -3609,18 +3609,12 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            spec_v1_reason = None
-            if (
-                not envs.SGLANG_ENABLE_SPEC_V2.get()
-                and not self.disable_overlap_schedule
-            ):
+            if not envs.SGLANG_ENABLE_SPEC_V2.get():
                 self.disable_overlap_schedule = True
-                spec_v1_reason = "SGLANG_ENABLE_SPEC_V2=False"
 
             if self.disable_overlap_schedule:
                 logger.warning(
-                    "Spec v1 is used for DFLASH speculative decoding because %s.",
-                    spec_v1_reason or "overlap schedule is disabled",
+                    "Spec v1 is used for DFLASH speculative decoding because overlap schedule is disabled."
                 )
             else:
                 logger.warning(
