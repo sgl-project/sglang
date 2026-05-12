@@ -17,11 +17,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Sentinel for _post_transcribe(language=...). ``_USE_CASE_LANG`` means
-# fall back to ``audio_case.language``; an explicit ``None`` *omits* the
-# field (e.g. to exercise Whisper's fused auto-detect path).
-_USE_CASE_LANG: Any = object()
-
 
 @dataclass
 class AudioTestCase:
@@ -32,7 +27,6 @@ class AudioTestCase:
     min_keyword_matches: int = 1
     local_cache_path: Optional[str] = None
     language: Optional[str] = None
-    mime_type: str = "audio/wav"
     filename: str = "audio.wav"
 
 
@@ -90,15 +84,13 @@ class ASRTestBase(CustomTestCase):
 
     # ---- helpers ----
 
-    def _get_audio_file(self, audio_case: AudioTestCase):
-        """Download audio and return a file tuple for the openai SDK."""
-        audio_bytes = download_audio_bytes(audio_case.url, audio_case.local_cache_path)
-        return (audio_case.filename, audio_bytes, audio_case.mime_type)
-
     def _transcribe(self, audio_case: AudioTestCase) -> str:
         """Non-streaming transcription via openai SDK. Returns text."""
-        audio_file = self._get_audio_file(audio_case)
-        kwargs = {"model": self.served_model_name, "file": audio_file}
+        audio_bytes = download_audio_bytes(audio_case.url, audio_case.local_cache_path)
+        kwargs = {
+            "model": self.served_model_name,
+            "file": (audio_case.filename, audio_bytes),
+        }
         if audio_case.language:
             kwargs["language"] = audio_case.language
         result = self.client.audio.transcriptions.create(**kwargs)
@@ -112,7 +104,7 @@ class ASRTestBase(CustomTestCase):
         audio_case: AudioTestCase,
         *,
         stream: bool = False,
-        language: Any = _USE_CASE_LANG,
+        language: Optional[str] = None,
         response_format: Optional[str] = None,
         timestamp_granularities: Optional[List[str]] = None,
         timeout: float = 180,
@@ -124,15 +116,11 @@ class ASRTestBase(CustomTestCase):
         JSON body (``verbose_json``, segments, etc.) or to omit ``language``
         entirely — both of which the openai SDK path can't easily express.
 
-        ``language`` semantics:
-
-        * ``_USE_CASE_LANG`` (default) — use ``audio_case.language``.
-        * ``None`` — omit the field (e.g. for fused auto-detect tests).
-        * explicit string — override.
+        ``language=None`` omits the field; pass a string to set it. The
+        ``_transcribe_json`` / ``_transcribe_stream`` wrappers default to
+        ``audio_case.language`` when the caller doesn't specify one.
         """
         audio_bytes = download_audio_bytes(audio_case.url, audio_case.local_cache_path)
-        if language is _USE_CASE_LANG:
-            language = audio_case.language
         data = {"model": self.served_model_name}
         if stream:
             data["stream"] = "true"
@@ -144,7 +132,7 @@ class ASRTestBase(CustomTestCase):
             data["timestamp_granularities[]"] = timestamp_granularities
         response = requests.post(
             self.base_url + "/v1/audio/transcriptions",
-            files={"file": (audio_case.filename, audio_bytes, audio_case.mime_type)},
+            files={"file": (audio_case.filename, audio_bytes)},
             data=data,
             timeout=timeout,
             stream=stream,
@@ -155,8 +143,11 @@ class ASRTestBase(CustomTestCase):
     def _transcribe_json(self, audio_case: AudioTestCase, **kwargs: Any) -> dict:
         """Non-streaming raw POST returning the parsed JSON body.
 
+        Defaults ``language`` to ``audio_case.language`` when the caller
+        doesn't pass one; pass ``language=None`` explicitly to omit.
         ``**kwargs`` forwards to :py:meth:`_post_transcribe`.
         """
+        kwargs.setdefault("language", audio_case.language)
         return self._post_transcribe(audio_case, stream=False, **kwargs).json()
 
     def _transcribe_stream(self, audio_case: AudioTestCase, **kwargs: Any):
@@ -164,9 +155,11 @@ class ASRTestBase(CustomTestCase):
 
         Uses raw requests because sglang's streaming format
         (``choices[0].delta.content``) differs from the OpenAI SDK's
-        TranscriptionTextDeltaEvent shape. ``**kwargs`` forwards to
-        :py:meth:`_post_transcribe`.
+        TranscriptionTextDeltaEvent shape. Defaults ``language`` to
+        ``audio_case.language`` when the caller doesn't pass one;
+        ``**kwargs`` forwards to :py:meth:`_post_transcribe`.
         """
+        kwargs.setdefault("language", audio_case.language)
         response = self._post_transcribe(audio_case, stream=True, **kwargs)
         return parse_sse_stream(response)
 
@@ -237,6 +230,21 @@ class ASRTestBase(CustomTestCase):
             )
             self.assertIn(
                 "delta", event["choices"][0], f"Event {i} choice missing 'delta'"
+            )
+
+    def test_multiple_sequential_requests(self):
+        """Sequential non-streaming requests on the same audio yield identical text."""
+        case = self.audio_cases[0]
+        results = []
+        for _ in range(3):
+            text = self._transcribe(case)
+            self.assertGreater(len(text), 0)
+            results.append(text)
+        for i in range(1, len(results)):
+            self.assertEqual(
+                results[0],
+                results[i],
+                f"Transcription {i + 1} differs from first transcription",
             )
 
     def test_streaming_vs_nonstreaming(self):
