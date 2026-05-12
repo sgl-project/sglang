@@ -1,8 +1,9 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
@@ -16,6 +17,12 @@ pub enum ResponseChunk {
     Error(String),
 }
 
+impl ResponseChunk {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Finished(_) | Self::Error(_))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResponseData {
     pub text: Option<String>,
@@ -27,6 +34,46 @@ pub struct ResponseData {
 
 pub const DEFAULT_RESPONSE_CHANNEL_CAPACITY: usize = 64;
 
+type BridgeStateRef = Arc<Mutex<BridgeState>>;
+
+#[derive(Default)]
+struct BridgeState {
+    channels: HashMap<String, Sender<ResponseChunk>>,
+    pending_sends: HashSet<String>,
+    ready_callbacks: HashMap<String, PyObject>,
+    ready_signals: HashSet<String>,
+    terminal_errors: HashMap<String, TerminalError>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TerminalError {
+    ChannelFull { rid: String },
+    ClientDisconnected { rid: String },
+    Aborted { rid: String },
+}
+
+impl TerminalError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::ChannelFull { rid } => {
+                format!("gRPC response channel full for {rid}: client not consuming")
+            }
+            Self::ClientDisconnected { rid } => {
+                format!("gRPC client disconnected for request {rid}")
+            }
+            Self::Aborted { rid } => format!("Request aborted: {rid}"),
+        }
+    }
+}
+
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkSendStatus {
+    Ready,
+    Pending,
+    Closed,
+}
+
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
         tracing::warn!(mutex = name, "Recovering from poisoned gRPC bridge mutex");
@@ -37,11 +84,11 @@ fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard
 /// Holds a reference to the Python RuntimeHandle and manages per-request channels.
 pub struct PyBridge {
     runtime_handle: PyObject,
-    channels: Arc<Mutex<HashMap<String, Sender<ResponseChunk>>>>,
-    terminal_errors: Arc<Mutex<HashMap<String, String>>>,
+    state: BridgeStateRef,
     rust_tokenizer: Option<RustTokenizer>,
     context_len: i32,
     response_channel_capacity: usize,
+    tokio_handle: Handle,
 }
 
 impl PyBridge {
@@ -50,14 +97,15 @@ impl PyBridge {
         rust_tokenizer: Option<RustTokenizer>,
         context_len: i32,
         response_channel_capacity: usize,
+        tokio_handle: Handle,
     ) -> Self {
         Self {
             runtime_handle,
-            channels: Arc::new(Mutex::new(HashMap::new())),
-            terminal_errors: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(BridgeState::default())),
             rust_tokenizer,
             context_len,
             response_channel_capacity: response_channel_capacity.max(1),
+            tokio_handle,
         }
     }
 
@@ -77,55 +125,38 @@ impl PyBridge {
 
     fn create_channel(&self, rid: &str) -> PyResult<Receiver<ResponseChunk>> {
         let (sender, receiver) = mpsc::channel(self.response_channel_capacity);
-        {
-            let mut channels = lock_or_recover(self.channels.as_ref(), "channels");
-            if channels.contains_key(rid) {
-                return Err(PyRuntimeError::new_err(format!(
-                    "Duplicate active gRPC request id: {}",
-                    rid
-                )));
-            }
-            channels.insert(rid.to_string(), sender);
+        let mut state = lock_or_recover(self.state.as_ref(), "state");
+        if state.channels.contains_key(rid) {
+            return Err(PyRuntimeError::new_err(format!(
+                "Duplicate active gRPC request id: {}",
+                rid
+            )));
         }
-        {
-            let mut terminal_errors =
-                lock_or_recover(self.terminal_errors.as_ref(), "terminal_errors");
-            terminal_errors.remove(rid);
-        }
+        state.channels.insert(rid.to_string(), sender);
+        state.terminal_errors.remove(rid);
+        state.ready_callbacks.remove(rid);
+        state.ready_signals.remove(rid);
+        state.pending_sends.remove(rid);
         Ok(receiver)
     }
 
-    fn make_chunk_callback(
-        &self,
-        py: Python<'_>,
-        rid: String,
-        channels: Arc<Mutex<HashMap<String, Sender<ResponseChunk>>>>,
-        terminal_errors: Arc<Mutex<HashMap<String, String>>>,
-        runtime_handle: PyObject,
-    ) -> PyResult<PyObject> {
+    fn make_chunk_callback(&self, py: Python<'_>, rid: String) -> PyResult<PyObject> {
         let callback = ChunkCallback {
             rid,
-            channels,
-            terminal_errors,
-            runtime_handle,
+            state: self.state.clone(),
+            runtime_handle: self.runtime_handle.clone_ref(py),
+            tokio_handle: self.tokio_handle.clone(),
         };
         let py_callback = Py::new(py, callback)?;
         Ok(py_callback.into_any())
     }
 
-    fn make_json_callback(
-        &self,
-        py: Python<'_>,
-        rid: String,
-        channels: Arc<Mutex<HashMap<String, Sender<ResponseChunk>>>>,
-        terminal_errors: Arc<Mutex<HashMap<String, String>>>,
-        runtime_handle: PyObject,
-    ) -> PyResult<PyObject> {
+    fn make_json_callback(&self, py: Python<'_>, rid: String) -> PyResult<PyObject> {
         let callback = JsonChunkCallback {
             rid,
-            channels,
-            terminal_errors,
-            runtime_handle,
+            state: self.state.clone(),
+            runtime_handle: self.runtime_handle.clone_ref(py),
+            tokio_handle: self.tokio_handle.clone(),
         };
         let py_callback = Py::new(py, callback)?;
         Ok(py_callback.into_any())
@@ -146,19 +177,11 @@ impl PyBridge {
         req_dict: HashMap<String, serde_json::Value>,
     ) -> PyResult<Receiver<ResponseChunk>> {
         let receiver = self.create_channel(rid)?;
-        let channels_ref = self.channels.clone();
-        let terminal_errors_ref = self.terminal_errors.clone();
         let rid_owned = rid.to_string();
 
         let result = Python::with_gil(|py| -> PyResult<()> {
             let py_req_dict = json_map_to_pydict(py, &req_dict)?;
-            let callback = self.make_chunk_callback(
-                py,
-                rid_owned,
-                channels_ref,
-                terminal_errors_ref,
-                self.runtime_handle.clone_ref(py),
-            )?;
+            let callback = self.make_chunk_callback(py, rid_owned)?;
 
             let kwargs = PyDict::new(py);
             kwargs.set_item("req_type", req_type)?;
@@ -185,27 +208,27 @@ impl PyBridge {
 
     pub fn abort(&self, rid: &str, abort_all: bool) -> PyResult<()> {
         if abort_all {
-            let rids = {
-                let channels = lock_or_recover(self.channels.as_ref(), "channels");
-                channels.keys().cloned().collect::<Vec<_>>()
-            };
-            {
-                let mut channels = lock_or_recover(self.channels.as_ref(), "channels");
-                channels.clear();
-            }
-            let mut terminal_errors =
-                lock_or_recover(self.terminal_errors.as_ref(), "terminal_errors");
+            let mut state = lock_or_recover(self.state.as_ref(), "state");
+            let rids = state
+                .channels
+                .drain()
+                .map(|(rid, _)| rid)
+                .collect::<Vec<_>>();
+            state.pending_sends.clear();
+            state.ready_callbacks.clear();
+            state.ready_signals.clear();
             for channel_rid in rids {
-                terminal_errors.insert(channel_rid, "Request aborted".to_string());
+                state.terminal_errors.insert(
+                    channel_rid.clone(),
+                    TerminalError::Aborted { rid: channel_rid },
+                );
             }
         } else {
-            {
-                let mut channels = lock_or_recover(self.channels.as_ref(), "channels");
-                channels.remove(rid);
-            }
-            let mut terminal_errors =
-                lock_or_recover(self.terminal_errors.as_ref(), "terminal_errors");
-            terminal_errors.insert(rid.to_string(), "Request aborted".to_string());
+            let mut state = lock_or_recover(self.state.as_ref(), "state");
+            remove_channel_refs_locked(&mut state, rid);
+            state
+                .terminal_errors
+                .insert(rid.to_string(), TerminalError::Aborted { rid: rid.into() });
         }
         Python::with_gil(|py| {
             self.runtime_handle
@@ -266,27 +289,17 @@ impl PyBridge {
         })
     }
 
-    pub fn submit_get_load(
-        &self,
-        rid: &str,
-        dp_rank: Option<i32>,
-    ) -> PyResult<Receiver<ResponseChunk>> {
+    fn submit_json<F>(&self, rid: &str, call: F) -> PyResult<Receiver<ResponseChunk>>
+    where
+        F: for<'py> FnOnce(Python<'py>, &PyObject, PyObject) -> PyResult<()>,
+    {
+        // Closure args are: current Python token, RuntimeHandle, and the JSON chunk callback.
         let receiver = self.create_channel(rid)?;
-        let channels_ref = self.channels.clone();
-        let terminal_errors_ref = self.terminal_errors.clone();
         let rid_owned = rid.to_string();
 
         let result = Python::with_gil(|py| -> PyResult<()> {
-            let callback = self.make_json_callback(
-                py,
-                rid_owned,
-                channels_ref,
-                terminal_errors_ref,
-                self.runtime_handle.clone_ref(py),
-            )?;
-            self.runtime_handle
-                .call_method1(py, "get_load", (callback, dp_rank))?;
-            Ok(())
+            let callback = self.make_json_callback(py, rid_owned)?;
+            call(py, &self.runtime_handle, callback)
         });
 
         match result {
@@ -298,32 +311,22 @@ impl PyBridge {
         }
     }
 
-    pub fn submit_flush_cache(&self, rid: &str) -> PyResult<Receiver<ResponseChunk>> {
-        let receiver = self.create_channel(rid)?;
-        let channels_ref = self.channels.clone();
-        let terminal_errors_ref = self.terminal_errors.clone();
-        let rid_owned = rid.to_string();
-
-        let result = Python::with_gil(|py| -> PyResult<()> {
-            let callback = self.make_json_callback(
-                py,
-                rid_owned,
-                channels_ref,
-                terminal_errors_ref,
-                self.runtime_handle.clone_ref(py),
-            )?;
-            self.runtime_handle
-                .call_method1(py, "flush_cache", (callback,))?;
+    pub fn submit_get_load(
+        &self,
+        rid: &str,
+        dp_rank: Option<i32>,
+    ) -> PyResult<Receiver<ResponseChunk>> {
+        self.submit_json(rid, move |py, runtime_handle, callback| {
+            runtime_handle.call_method1(py, "get_load", (callback, dp_rank))?;
             Ok(())
-        });
+        })
+    }
 
-        match result {
-            Ok(()) => Ok(receiver),
-            Err(err) => {
-                self.remove_channel(rid);
-                Err(err)
-            }
-        }
+    pub fn submit_flush_cache(&self, rid: &str) -> PyResult<Receiver<ResponseChunk>> {
+        self.submit_json(rid, |py, runtime_handle, callback| {
+            runtime_handle.call_method1(py, "flush_cache", (callback,))?;
+            Ok(())
+        })
     }
 
     pub fn submit_pause_generation(
@@ -331,59 +334,17 @@ impl PyBridge {
         rid: &str,
         mode: &str,
     ) -> PyResult<Receiver<ResponseChunk>> {
-        let receiver = self.create_channel(rid)?;
-        let channels_ref = self.channels.clone();
-        let terminal_errors_ref = self.terminal_errors.clone();
-        let rid_owned = rid.to_string();
-
-        let result = Python::with_gil(|py| -> PyResult<()> {
-            let callback = self.make_json_callback(
-                py,
-                rid_owned,
-                channels_ref,
-                terminal_errors_ref,
-                self.runtime_handle.clone_ref(py),
-            )?;
-            self.runtime_handle
-                .call_method1(py, "pause_generation", (mode, callback))?;
+        self.submit_json(rid, move |py, runtime_handle, callback| {
+            runtime_handle.call_method1(py, "pause_generation", (mode, callback))?;
             Ok(())
-        });
-
-        match result {
-            Ok(()) => Ok(receiver),
-            Err(err) => {
-                self.remove_channel(rid);
-                Err(err)
-            }
-        }
+        })
     }
 
     pub fn submit_continue_generation(&self, rid: &str) -> PyResult<Receiver<ResponseChunk>> {
-        let receiver = self.create_channel(rid)?;
-        let channels_ref = self.channels.clone();
-        let terminal_errors_ref = self.terminal_errors.clone();
-        let rid_owned = rid.to_string();
-
-        let result = Python::with_gil(|py| -> PyResult<()> {
-            let callback = self.make_json_callback(
-                py,
-                rid_owned,
-                channels_ref,
-                terminal_errors_ref,
-                self.runtime_handle.clone_ref(py),
-            )?;
-            self.runtime_handle
-                .call_method1(py, "continue_generation", (callback,))?;
+        self.submit_json(rid, |py, runtime_handle, callback| {
+            runtime_handle.call_method1(py, "continue_generation", (callback,))?;
             Ok(())
-        });
-
-        match result {
-            Ok(()) => Ok(receiver),
-            Err(err) => {
-                self.remove_channel(rid);
-                Err(err)
-            }
-        }
+        })
     }
 
     pub fn submit_start_profile(
@@ -391,59 +352,17 @@ impl PyBridge {
         rid: &str,
         output_dir: Option<&str>,
     ) -> PyResult<Receiver<ResponseChunk>> {
-        let receiver = self.create_channel(rid)?;
-        let channels_ref = self.channels.clone();
-        let terminal_errors_ref = self.terminal_errors.clone();
-        let rid_owned = rid.to_string();
-
-        let result = Python::with_gil(|py| -> PyResult<()> {
-            let callback = self.make_json_callback(
-                py,
-                rid_owned,
-                channels_ref,
-                terminal_errors_ref,
-                self.runtime_handle.clone_ref(py),
-            )?;
-            self.runtime_handle
-                .call_method1(py, "start_profile", (output_dir, callback))?;
+        self.submit_json(rid, move |py, runtime_handle, callback| {
+            runtime_handle.call_method1(py, "start_profile", (output_dir, callback))?;
             Ok(())
-        });
-
-        match result {
-            Ok(()) => Ok(receiver),
-            Err(err) => {
-                self.remove_channel(rid);
-                Err(err)
-            }
-        }
+        })
     }
 
     pub fn submit_stop_profile(&self, rid: &str) -> PyResult<Receiver<ResponseChunk>> {
-        let receiver = self.create_channel(rid)?;
-        let channels_ref = self.channels.clone();
-        let terminal_errors_ref = self.terminal_errors.clone();
-        let rid_owned = rid.to_string();
-
-        let result = Python::with_gil(|py| -> PyResult<()> {
-            let callback = self.make_json_callback(
-                py,
-                rid_owned,
-                channels_ref,
-                terminal_errors_ref,
-                self.runtime_handle.clone_ref(py),
-            )?;
-            self.runtime_handle
-                .call_method1(py, "stop_profile", (callback,))?;
+        self.submit_json(rid, |py, runtime_handle, callback| {
+            runtime_handle.call_method1(py, "stop_profile", (callback,))?;
             Ok(())
-        });
-
-        match result {
-            Ok(()) => Ok(receiver),
-            Err(err) => {
-                self.remove_channel(rid);
-                Err(err)
-            }
-        }
+        })
     }
 
     pub fn submit_update_weights(
@@ -452,34 +371,14 @@ impl PyBridge {
         model_path: &str,
         load_format: Option<&str>,
     ) -> PyResult<Receiver<ResponseChunk>> {
-        let receiver = self.create_channel(rid)?;
-        let channels_ref = self.channels.clone();
-        let terminal_errors_ref = self.terminal_errors.clone();
-        let rid_owned = rid.to_string();
-
-        let result = Python::with_gil(|py| -> PyResult<()> {
-            let callback = self.make_json_callback(
-                py,
-                rid_owned,
-                channels_ref,
-                terminal_errors_ref,
-                self.runtime_handle.clone_ref(py),
-            )?;
-            self.runtime_handle.call_method1(
+        self.submit_json(rid, move |py, runtime_handle, callback| {
+            runtime_handle.call_method1(
                 py,
                 "update_weights_from_disk",
                 (model_path, load_format, callback),
             )?;
             Ok(())
-        });
-
-        match result {
-            Ok(()) => Ok(receiver),
-            Err(err) => {
-                self.remove_channel(rid);
-                Err(err)
-            }
-        }
+        })
     }
 
     // ------------------------------------------------------------------
@@ -493,12 +392,7 @@ impl PyBridge {
         json_body: &[u8],
         trace_headers: &HashMap<String, String>,
     ) -> PyResult<Receiver<ResponseChunk>> {
-        let receiver = self.create_channel(rid)?;
-        let channels_ref = self.channels.clone();
-        let terminal_errors_ref = self.terminal_errors.clone();
-        let rid_owned = rid.to_string();
-
-        let result = Python::with_gil(|py| -> PyResult<()> {
+        self.submit_json(rid, move |py, runtime_handle, callback| {
             let kwargs = PyDict::new(py);
             let py_bytes = PyBytes::new(py, json_body);
             kwargs.set_item("json_body", py_bytes)?;
@@ -510,103 +404,154 @@ impl PyBridge {
                 kwargs.set_item("trace_headers", py_trace_headers)?;
             }
 
-            let callback = self.make_json_callback(
-                py,
-                rid_owned,
-                channels_ref,
-                terminal_errors_ref,
-                self.runtime_handle.clone_ref(py),
-            )?;
             kwargs.set_item("chunk_callback", callback)?;
 
-            self.runtime_handle
-                .call_method(py, method_name, (), Some(&kwargs))?;
+            runtime_handle.call_method(py, method_name, (), Some(&kwargs))?;
             Ok(())
-        });
-
-        match result {
-            Ok(()) => Ok(receiver),
-            Err(err) => {
-                self.remove_channel(rid);
-                Err(err)
-            }
-        }
+        })
     }
 
     pub fn remove_channel(&self, rid: &str) {
-        {
-            let mut channels = lock_or_recover(self.channels.as_ref(), "channels");
-            channels.remove(rid);
-        }
-        {
-            let mut terminal_errors =
-                lock_or_recover(self.terminal_errors.as_ref(), "terminal_errors");
-            terminal_errors.remove(rid);
-        }
+        let mut state = lock_or_recover(self.state.as_ref(), "state");
+        remove_channel_refs_locked(&mut state, rid);
+        state.terminal_errors.remove(rid);
     }
 
-    pub fn take_terminal_error(&self, rid: &str) -> Option<String> {
-        let mut terminal_errors = lock_or_recover(self.terminal_errors.as_ref(), "terminal_errors");
-        terminal_errors.remove(rid)
+    pub fn take_terminal_error(&self, rid: &str) -> Option<TerminalError> {
+        let mut state = lock_or_recover(self.state.as_ref(), "state");
+        state.terminal_errors.remove(rid)
     }
 }
 
 fn close_channel_with_error(
     py: Python<'_>,
     rid: &str,
-    channels: &Arc<Mutex<HashMap<String, Sender<ResponseChunk>>>>,
-    terminal_errors: &Arc<Mutex<HashMap<String, String>>>,
+    state: &BridgeStateRef,
     runtime_handle: &PyObject,
-    error: &str,
+    error: TerminalError,
 ) {
-    {
-        let mut channels = lock_or_recover(channels.as_ref(), "channels");
-        channels.remove(rid);
-    }
-    {
-        let mut terminal_errors = lock_or_recover(terminal_errors.as_ref(), "terminal_errors");
-        terminal_errors.insert(rid.to_string(), error.to_string());
-    }
+    let mut state = lock_or_recover(state.as_ref(), "state");
+    remove_channel_refs_locked(&mut state, rid);
+    state.terminal_errors.insert(rid.to_string(), error);
+    drop(state);
     let _ = runtime_handle.call_method1(py, "abort", (rid, false));
+}
+
+fn remove_channel_refs_locked(state: &mut BridgeState, rid: &str) {
+    state.channels.remove(rid);
+    state.pending_sends.remove(rid);
+    state.ready_callbacks.remove(rid);
+    state.ready_signals.remove(rid);
+}
+
+fn remove_channel_refs(rid: &str, state: &BridgeStateRef) {
+    let mut state = lock_or_recover(state.as_ref(), "state");
+    remove_channel_refs_locked(&mut state, rid);
+}
+
+fn register_pending_send(rid: &str, state: &BridgeStateRef) -> bool {
+    let mut state = lock_or_recover(state.as_ref(), "state");
+    state.pending_sends.insert(rid.to_string())
+}
+
+fn mark_send_ready(py: Python<'_>, rid: &str, state: &BridgeStateRef) -> Option<PyObject> {
+    let mut state = lock_or_recover(state.as_ref(), "state");
+    state.pending_sends.remove(rid);
+    if let Some(callback) = state.ready_callbacks.get(rid) {
+        Some(callback.clone_ref(py))
+    } else {
+        state.ready_signals.insert(rid.to_string());
+        None
+    }
+}
+
+fn notify_ready(py: Python<'_>, rid: &str, callback: PyObject) {
+    if let Err(err) = callback.call0(py) {
+        tracing::warn!(rid, "gRPC on_ready callback failed: {}", err);
+    }
 }
 
 fn try_send_chunk(
     py: Python<'_>,
     rid: &str,
-    channels: &Arc<Mutex<HashMap<String, Sender<ResponseChunk>>>>,
-    terminal_errors: &Arc<Mutex<HashMap<String, String>>>,
+    state: &BridgeStateRef,
     runtime_handle: &PyObject,
+    tokio_handle: &Handle,
     sender: &Sender<ResponseChunk>,
     msg: ResponseChunk,
-) -> PyResult<()> {
+) -> PyResult<ChunkSendStatus> {
+    let terminal = msg.is_terminal();
     match sender.try_send(msg) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(msg)) => {
-            match py.allow_threads(|| sender.blocking_send(msg).map_err(|_| ())) {
-                Ok(()) => Ok(()),
-                Err(_) => {
-                    close_channel_with_error(
-                        py,
-                        rid,
-                        channels,
-                        terminal_errors,
-                        runtime_handle,
-                        "gRPC client disconnected",
-                    );
-                    Ok(())
-                }
+        Ok(()) => {
+            if terminal {
+                remove_channel_refs(rid, state);
             }
+            Ok(ChunkSendStatus::Ready)
+        }
+        Err(TrySendError::Full(msg)) => {
+            if !register_pending_send(rid, state) {
+                tracing::warn!(
+                    rid,
+                    "gRPC bridge received another chunk before the parked chunk drained; closing stream"
+                );
+                close_channel_with_error(
+                    py,
+                    rid,
+                    state,
+                    runtime_handle,
+                    TerminalError::ChannelFull { rid: rid.into() },
+                );
+                return Ok(ChunkSendStatus::Closed);
+            }
+
+            let rid_owned = rid.to_string();
+            let state = state.clone();
+            let runtime_handle = runtime_handle.clone_ref(py);
+            let sender = sender.clone();
+
+            tokio_handle.spawn(async move {
+                match sender.send(msg).await {
+                    Ok(()) => {
+                        if terminal {
+                            // Terminal chunks end the producer contract; no further on_ready
+                            // signal is fired after a parked Finished/Error drains.
+                            remove_channel_refs(&rid_owned, &state);
+                            return;
+                        }
+
+                        Python::with_gil(|py| {
+                            if let Some(callback) = mark_send_ready(py, &rid_owned, &state) {
+                                notify_ready(py, &rid_owned, callback);
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        Python::with_gil(|py| {
+                            close_channel_with_error(
+                                py,
+                                &rid_owned,
+                                &state,
+                                &runtime_handle,
+                                TerminalError::ClientDisconnected {
+                                    rid: rid_owned.clone(),
+                                },
+                            );
+                        });
+                    }
+                }
+            });
+
+            Ok(ChunkSendStatus::Pending)
         }
         Err(TrySendError::Closed(_)) => {
             close_channel_with_error(
                 py,
                 rid,
-                channels,
-                terminal_errors,
+                state,
                 runtime_handle,
-                "gRPC client disconnected",
+                TerminalError::ClientDisconnected { rid: rid.into() },
             );
-            Ok(())
+            Ok(ChunkSendStatus::Closed)
         }
     }
 }
@@ -618,41 +563,61 @@ fn try_send_chunk(
 #[pyclass]
 struct ChunkCallback {
     rid: String,
-    channels: Arc<Mutex<HashMap<String, Sender<ResponseChunk>>>>,
-    terminal_errors: Arc<Mutex<HashMap<String, String>>>,
+    state: BridgeStateRef,
     runtime_handle: PyObject,
+    tokio_handle: Handle,
 }
 
 #[pymethods]
 impl ChunkCallback {
+    /// Register before producing chunks. If a parked chunk drained before registration,
+    /// Rust fires `on_ready` immediately so late registration cannot miss the edge.
+    fn set_on_ready(&self, py: Python<'_>, on_ready: PyObject) -> PyResult<()> {
+        let should_notify = {
+            let mut state = lock_or_recover(self.state.as_ref(), "state");
+            state
+                .ready_callbacks
+                .insert(self.rid.clone(), on_ready.clone_ref(py));
+            state.ready_signals.remove(&self.rid)
+        };
+        if should_notify {
+            on_ready.call0(py)?;
+        }
+        Ok(())
+    }
+
+    fn clear_on_ready(&self) {
+        // End notifications for this rid. Do not call set_on_ready again for the same rid.
+        let mut state = lock_or_recover(self.state.as_ref(), "state");
+        state.ready_callbacks.remove(&self.rid);
+        state.ready_signals.remove(&self.rid);
+    }
+
     #[pyo3(signature = (chunk, finished=false, error=None))]
     fn __call__(
         &self,
         chunk: &Bound<'_, PyDict>,
         finished: bool,
         error: Option<String>,
-    ) -> PyResult<()> {
+    ) -> PyResult<ChunkSendStatus> {
         let py = chunk.py();
-        let channels = lock_or_recover(self.channels.as_ref(), "channels");
-        let sender = match channels.get(&self.rid) {
+        let state = lock_or_recover(self.state.as_ref(), "state");
+        let sender = match state.channels.get(&self.rid) {
             Some(s) => s.clone(),
-            None => return Ok(()),
+            None => return Ok(ChunkSendStatus::Closed),
         };
-        drop(channels);
+        drop(state);
 
         if let Some(err_msg) = error {
-            try_send_chunk(
+            return try_send_chunk(
                 py,
                 &self.rid,
-                &self.channels,
-                &self.terminal_errors,
+                &self.state,
                 &self.runtime_handle,
+                &self.tokio_handle,
                 &sender,
                 ResponseChunk::Error(err_msg),
-            )?;
-            let mut channels = lock_or_recover(self.channels.as_ref(), "channels");
-            channels.remove(&self.rid);
-            return Ok(());
+            );
         }
 
         let text: Option<String> = chunk
@@ -686,19 +651,12 @@ impl ChunkCallback {
         try_send_chunk(
             py,
             &self.rid,
-            &self.channels,
-            &self.terminal_errors,
+            &self.state,
             &self.runtime_handle,
+            &self.tokio_handle,
             &sender,
             msg,
-        )?;
-
-        if finished {
-            let mut channels = lock_or_recover(self.channels.as_ref(), "channels");
-            channels.remove(&self.rid);
-        }
-
-        Ok(())
+        )
     }
 }
 
@@ -709,13 +667,36 @@ impl ChunkCallback {
 #[pyclass]
 struct JsonChunkCallback {
     rid: String,
-    channels: Arc<Mutex<HashMap<String, Sender<ResponseChunk>>>>,
-    terminal_errors: Arc<Mutex<HashMap<String, String>>>,
+    state: BridgeStateRef,
     runtime_handle: PyObject,
+    tokio_handle: Handle,
 }
 
 #[pymethods]
 impl JsonChunkCallback {
+    /// Register before producing chunks. If a parked chunk drained before registration,
+    /// Rust fires `on_ready` immediately so late registration cannot miss the edge.
+    fn set_on_ready(&self, py: Python<'_>, on_ready: PyObject) -> PyResult<()> {
+        let should_notify = {
+            let mut state = lock_or_recover(self.state.as_ref(), "state");
+            state
+                .ready_callbacks
+                .insert(self.rid.clone(), on_ready.clone_ref(py));
+            state.ready_signals.remove(&self.rid)
+        };
+        if should_notify {
+            on_ready.call0(py)?;
+        }
+        Ok(())
+    }
+
+    fn clear_on_ready(&self) {
+        // End notifications for this rid. Do not call set_on_ready again for the same rid.
+        let mut state = lock_or_recover(self.state.as_ref(), "state");
+        state.ready_callbacks.remove(&self.rid);
+        state.ready_signals.remove(&self.rid);
+    }
+
     #[pyo3(signature = (chunk_bytes, finished=false, error=None, status_code=None))]
     fn __call__(
         &self,
@@ -723,28 +704,25 @@ impl JsonChunkCallback {
         finished: bool,
         error: Option<String>,
         status_code: Option<i32>,
-    ) -> PyResult<()> {
+    ) -> PyResult<ChunkSendStatus> {
         let py = chunk_bytes.py();
-        let channels = lock_or_recover(self.channels.as_ref(), "channels");
-        let sender = match channels.get(&self.rid) {
+        let state = lock_or_recover(self.state.as_ref(), "state");
+        let sender = match state.channels.get(&self.rid) {
             Some(s) => s.clone(),
-            None => return Ok(()),
+            None => return Ok(ChunkSendStatus::Closed),
         };
-        drop(channels);
+        drop(state);
 
         if let Some(err_msg) = error {
-            try_send_chunk(
+            return try_send_chunk(
                 py,
                 &self.rid,
-                &self.channels,
-                &self.terminal_errors,
+                &self.state,
                 &self.runtime_handle,
+                &self.tokio_handle,
                 &sender,
                 ResponseChunk::Error(err_msg),
-            )?;
-            let mut channels = lock_or_recover(self.channels.as_ref(), "channels");
-            channels.remove(&self.rid);
-            return Ok(());
+            );
         }
 
         let bytes_data: Vec<u8> = if let Ok(b) = chunk_bytes.extract::<Vec<u8>>() {
@@ -777,19 +755,12 @@ impl JsonChunkCallback {
         try_send_chunk(
             py,
             &self.rid,
-            &self.channels,
-            &self.terminal_errors,
+            &self.state,
             &self.runtime_handle,
+            &self.tokio_handle,
             &sender,
             msg,
-        )?;
-
-        if finished {
-            let mut channels = lock_or_recover(self.channels.as_ref(), "channels");
-            channels.remove(&self.rid);
-        }
-
-        Ok(())
+        )
     }
 }
 
@@ -799,6 +770,8 @@ fn extract_meta_info(chunk: &Bound<'_, PyDict>) -> HashMap<String, String> {
         && let Ok(meta_dict) = meta_obj.downcast::<PyDict>()
     {
         for (k, v) in meta_dict.iter() {
+            // The proto schema is map<string, string>; encode each Python value as JSON
+            // so clients can recover numbers, booleans, arrays, and objects losslessly.
             if let Ok(key) = k.extract::<String>()
                 && let Ok(val) = py_value_to_json_string(&v)
             {

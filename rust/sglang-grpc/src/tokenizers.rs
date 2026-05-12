@@ -40,18 +40,12 @@ impl TokenizerBackend for HuggingFaceTokenizerBackend {
     }
 }
 
-enum TokenizerCandidate {
-    HuggingFaceJson(PathBuf),
-    TiktokenJson(PathBuf),
-}
-
 /// Rust-native tokenizer wrapper with pluggable backends.
 ///
 /// This mirrors Python's `get_tokenizer` shape: inspect the tokenizer path,
 /// choose a backend, and fall back to Python for unsupported tokenizer families.
 pub struct RustTokenizer {
     backend: Box<dyn TokenizerBackend>,
-    context_len: i32,
 }
 
 impl RustTokenizer {
@@ -63,14 +57,13 @@ impl RustTokenizer {
         context_len: i32,
     ) -> Option<Self> {
         let path = Path::new(tokenizer_path);
-        let candidates = tokenizer_candidates(path);
-        if candidates.is_empty() {
+        let Some(tokenizer_json) = resolve_tokenizer_json(path) else {
             tracing::info!(
                 "No native tokenizer candidates found at {:?}; Rust tokenizer disabled",
                 path
             );
             return None;
-        }
+        };
 
         if matches!(tokenizer_mode, Some("slow")) {
             tracing::info!(
@@ -80,47 +73,26 @@ impl RustTokenizer {
             return None;
         }
 
-        for candidate in candidates {
-            match candidate {
-                TokenizerCandidate::HuggingFaceJson(tokenizer_json) => {
-                    match HuggingFaceTokenizerBackend::from_file(&tokenizer_json) {
-                        Ok(backend) => {
-                            let tokenizer = Self {
-                                backend: Box::new(backend),
-                                context_len,
-                            };
-                            tracing::info!(
-                                "Rust tokenizer loaded via {} from {:?} (context_len={})",
-                                tokenizer.backend_name(),
-                                tokenizer_json,
-                                context_len
-                            );
-                            return Some(tokenizer);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to load Rust tokenizer from {:?}: {}. Falling back to Python.",
-                                tokenizer_json,
-                                e
-                            );
-                        }
-                    }
-                }
-                TokenizerCandidate::TiktokenJson(tokenizer_json) => {
-                    tracing::info!(
-                        "Tokenizer at {:?} uses SGLang tiktoken JSON format; native Rust backend is not implemented, falling back to Python",
-                        tokenizer_json
-                    );
-                }
+        match load_backend(&tokenizer_json) {
+            Ok(backend) => {
+                let tokenizer = Self { backend };
+                tracing::info!(
+                    "Rust tokenizer loaded via {} from {:?} (context_len={})",
+                    tokenizer.backend_name(),
+                    tokenizer_json,
+                    context_len
+                );
+                Some(tokenizer)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load Rust tokenizer from {:?}: {}. Falling back to Python.",
+                    tokenizer_json,
+                    e
+                );
+                None
             }
         }
-
-        None
-    }
-
-    /// Backwards-compatible entry point for callers that only have a model path.
-    pub fn from_model_path(model_path: &str, context_len: i32) -> Option<Self> {
-        Self::from_tokenizer_path(model_path, None, context_len)
     }
 
     pub fn backend_name(&self) -> &'static str {
@@ -136,42 +108,20 @@ impl RustTokenizer {
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String, String> {
         self.backend.decode(ids, skip_special_tokens)
     }
-
-    /// Return the model's context length.
-    pub fn context_len(&self) -> i32 {
-        self.context_len
-    }
 }
 
-fn tokenizer_candidates(path: &Path) -> Vec<TokenizerCandidate> {
-    if path.is_file() {
-        return tokenizer_candidate_from_json(path).into_iter().collect();
-    }
-
-    let tokenizer_json = path.join("tokenizer.json");
-    tokenizer_candidate_from_json(&tokenizer_json)
-        .into_iter()
-        .collect()
+fn load_backend(tokenizer_json: &Path) -> Result<Box<dyn TokenizerBackend>, String> {
+    // Add new native backend probes here. Unsupported formats should return an
+    // error so callers can fall back to Python without changing the public API.
+    HuggingFaceTokenizerBackend::from_file(tokenizer_json)
+        .map(|backend| Box::new(backend) as Box<dyn TokenizerBackend>)
 }
 
-fn tokenizer_candidate_from_json(path: &Path) -> Option<TokenizerCandidate> {
-    if !path.exists() {
-        return None;
-    }
-
-    if is_tiktoken_json(path) {
-        Some(TokenizerCandidate::TiktokenJson(path.to_path_buf()))
+fn resolve_tokenizer_json(path: &Path) -> Option<PathBuf> {
+    let candidate = if path.is_file() {
+        path.to_path_buf()
     } else {
-        Some(TokenizerCandidate::HuggingFaceJson(path.to_path_buf()))
-    }
-}
-
-fn is_tiktoken_json(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        .and_then(|value| {
-            Some(value.get("regular_tokens")?.is_array() && value.get("special_tokens")?.is_array())
-        })
-        .unwrap_or(false)
+        path.join("tokenizer.json")
+    };
+    candidate.exists().then_some(candidate)
 }

@@ -46,12 +46,8 @@ pub(crate) fn json_map_to_pydict<'py>(
 }
 
 pub(crate) fn py_value_to_json_string(value: &Bound<'_, PyAny>) -> PyResult<String> {
-    if let Ok(s) = value.extract::<String>() {
-        return Ok(s);
-    }
-
-    // gRPC meta_info is a map<string, string>. Prefer JSON for structured Python
-    // values, but keep a string fallback so non-serializable metadata still crosses.
+    // gRPC meta_info is a map<string, string>. JSON-encode every value,
+    // including strings, so clients can decode the map uniformly.
     match value
         .py()
         .import("json")

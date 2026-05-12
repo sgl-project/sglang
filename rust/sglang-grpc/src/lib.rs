@@ -9,11 +9,12 @@ pub mod proto {
 
 use pyo3::prelude::*;
 use std::net::{SocketAddr, TcpListener};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::time::Duration;
+use tracing_subscriber::EnvFilter;
 
-use bridge::{DEFAULT_RESPONSE_CHANNEL_CAPACITY, PyBridge};
+use bridge::{ChunkSendStatus, DEFAULT_RESPONSE_CHANNEL_CAPACITY, PyBridge};
 use tokenizers::RustTokenizer;
 
 /// Handle returned to Python that controls the running gRPC server.
@@ -46,58 +47,114 @@ struct TokenizerInfo {
 }
 
 /// Extract tokenizer path/mode and context_len from the Python RuntimeHandle (one-time GIL).
-fn extract_tokenizer_info(runtime_handle: &PyObject) -> TokenizerInfo {
+///
+/// Missing `tokenizer_manager` indicates a misconfigured runtime handle and should surface at
+/// startup. Sub-fields are best-effort because unsupported native tokenizer backends can still
+/// fall back to Python tokenization.
+fn extract_tokenizer_info(runtime_handle: &PyObject) -> PyResult<TokenizerInfo> {
     Python::with_gil(|py| {
-        let tm = match runtime_handle.getattr(py, "tokenizer_manager") {
-            Ok(tm) => tm,
-            Err(err) => {
-                tracing::warn!(
-                    "Runtime handle is missing tokenizer_manager; Rust tokenizer disabled: {}",
+        let tm = runtime_handle
+            .getattr(py, "tokenizer_manager")
+            .map_err(|err| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "runtime_handle.tokenizer_manager is required: {}",
                     err
-                );
-                return TokenizerInfo {
-                    tokenizer_path: None,
-                    tokenizer_mode: None,
-                    context_len: 0,
-                };
+                ))
+            })?;
+
+        let server_args = match tm.getattr(py, "server_args") {
+            Ok(args) => Some(args),
+            Err(err) => {
+                tracing::debug!("Could not extract tokenizer_manager.server_args: {}", err);
+                None
             }
         };
 
-        let server_args = tm.getattr(py, "server_args").ok();
-
-        let tokenizer_path: Option<String> = server_args
-            .as_ref()
-            .and_then(|args| args.getattr(py, "tokenizer_path").ok())
-            .and_then(|v| v.extract(py).ok())
-            .or_else(|| {
-                tm.getattr(py, "model_path")
-                    .ok()
-                    .and_then(|v| v.extract(py).ok())
-            });
+        let tokenizer_path: Option<String> = if let Some(args) = server_args.as_ref() {
+            match args.getattr(py, "tokenizer_path") {
+                Ok(value) => value.extract(py).map(Some).unwrap_or_else(|err| {
+                    tracing::debug!("Could not extract server_args.tokenizer_path: {}", err);
+                    None
+                }),
+                Err(err) => {
+                    tracing::debug!("server_args.tokenizer_path is unavailable: {}", err);
+                    None
+                }
+            }
+            .or_else(|| match args.getattr(py, "model_path") {
+                Ok(value) => value.extract(py).map(Some).unwrap_or_else(|err| {
+                    tracing::debug!("Could not extract server_args.model_path: {}", err);
+                    None
+                }),
+                Err(err) => {
+                    tracing::debug!("server_args.model_path is unavailable: {}", err);
+                    None
+                }
+            })
+        } else {
+            None
+        }
+        .or_else(|| match tm.getattr(py, "model_path") {
+            Ok(value) => value.extract(py).map(Some).unwrap_or_else(|err| {
+                tracing::debug!("Could not extract tokenizer_manager.model_path: {}", err);
+                None
+            }),
+            Err(err) => {
+                tracing::debug!("tokenizer_manager.model_path is unavailable: {}", err);
+                None
+            }
+        });
         if tokenizer_path.is_none() {
             tracing::warn!("Could not extract tokenizer path; Rust tokenizer disabled");
         }
 
-        let tokenizer_mode: Option<String> = server_args
-            .as_ref()
-            .and_then(|args| args.getattr(py, "tokenizer_mode").ok())
-            .and_then(|v| v.extract(py).ok());
+        let tokenizer_mode: Option<String> =
+            server_args
+                .as_ref()
+                .and_then(|args| match args.getattr(py, "tokenizer_mode") {
+                    Ok(value) => value.extract(py).map(Some).unwrap_or_else(|err| {
+                        tracing::debug!("Could not extract server_args.tokenizer_mode: {}", err);
+                        None
+                    }),
+                    Err(err) => {
+                        tracing::debug!("server_args.tokenizer_mode is unavailable: {}", err);
+                        None
+                    }
+                });
 
         let context_len: i32 = tm
             .getattr(py, "model_config")
+            .map_err(|err| {
+                tracing::debug!("tokenizer_manager.model_config is unavailable: {}", err);
+                err
+            })
             .ok()
-            .and_then(|mc| mc.getattr(py, "context_len").ok())
-            .and_then(|v| v.extract(py).ok())
+            .and_then(|mc| {
+                mc.getattr(py, "context_len")
+                    .map_err(|err| {
+                        tracing::debug!("model_config.context_len is unavailable: {}", err);
+                        err
+                    })
+                    .ok()
+            })
+            .and_then(|v| {
+                v.extract(py)
+                    .map_err(|err| {
+                        tracing::debug!("Could not extract model_config.context_len: {}", err);
+                        err
+                    })
+                    .ok()
+            })
             .unwrap_or_else(|| {
                 tracing::warn!("Could not extract model_config.context_len; defaulting to 0");
                 0
             });
 
-        TokenizerInfo {
+        Ok(TokenizerInfo {
             tokenizer_path,
             tokenizer_mode,
             context_len,
-        }
+        })
     })
 }
 
@@ -110,7 +167,6 @@ fn extract_tokenizer_info(runtime_handle: &PyObject) -> TokenizerInfo {
 ///
 /// Returns:
 ///     GrpcServerHandle that can be used to shut down the server.
-/// Start the native gRPC server in a background thread.
 #[pyfunction]
 #[pyo3(signature = (host, port, runtime_handle, worker_threads=4, response_channel_capacity=64, response_timeout_secs=300))]
 fn start_server(
@@ -121,6 +177,13 @@ fn start_server(
     response_channel_capacity: usize,
     response_timeout_secs: u64,
 ) -> PyResult<GrpcServerHandle> {
+    // Best-effort: embedding processes may initialize tracing themselves.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .try_init();
+
     let addr: SocketAddr = format!("{}:{}", host, port).parse().map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid address: {}", e))
     })?;
@@ -157,10 +220,8 @@ fn start_server(
         ))
     })?;
 
-    // Extract tokenizer info from Python (one-time GIL acquisition)
-    let tokenizer_info = extract_tokenizer_info(&runtime_handle);
+    let tokenizer_info = extract_tokenizer_info(&runtime_handle)?;
 
-    // Attempt to load the Rust tokenizer
     let rust_tokenizer = tokenizer_info.tokenizer_path.as_deref().and_then(|p| {
         RustTokenizer::from_tokenizer_path(
             p,
@@ -169,40 +230,36 @@ fn start_server(
         )
     });
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .thread_name("sglang-grpc-tokio")
+        .build()
+        .map_err(|err| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to build Tokio runtime for gRPC server: {}",
+                err
+            ))
+        })?;
+    let tokio_handle = rt.handle().clone();
+
     let bridge = Arc::new(PyBridge::new(
         runtime_handle,
         rust_tokenizer,
         tokenizer_info.context_len,
         response_channel_capacity,
+        tokio_handle,
     ));
     let shutdown = Arc::new(Notify::new());
     let shutdown_clone = shutdown.clone();
-    let (startup_tx, startup_rx) = mpsc::channel();
+    let bridge_clone = bridge.clone();
 
     let join_handle = std::thread::Builder::new()
         .name("sglang-grpc".to_string())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(worker_threads)
-                .enable_all()
-                .thread_name("sglang-grpc-tokio")
-                .build()
-            {
-                Ok(rt) => {
-                    let _ = startup_tx.send(Ok(()));
-                    rt
-                }
-                Err(err) => {
-                    let message = format!("Failed to build Tokio runtime for gRPC server: {}", err);
-                    tracing::error!("{}", message);
-                    let _ = startup_tx.send(Err(message));
-                    return;
-                }
-            };
-
             if let Err(e) = rt.block_on(server::run_grpc_server(
                 listener,
-                bridge,
+                bridge_clone,
                 shutdown_clone,
                 response_timeout,
             )) {
@@ -215,20 +272,6 @@ fn start_server(
                 e
             ))
         })?;
-    match startup_rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => {
-            let _ = join_handle.join();
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(message));
-        }
-        Err(err) => {
-            let _ = join_handle.join();
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "gRPC server thread exited before startup: {}",
-                err
-            )));
-        }
-    }
 
     Ok(GrpcServerHandle {
         shutdown,
@@ -240,5 +283,6 @@ fn start_server(
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
     m.add_class::<GrpcServerHandle>()?;
+    m.add_class::<ChunkSendStatus>()?;
     Ok(())
 }
