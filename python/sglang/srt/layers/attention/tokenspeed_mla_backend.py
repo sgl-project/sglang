@@ -19,6 +19,10 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLAMultiStepDraftBackend,
     _quantize_fp8_qkv,
 )
+from sglang.srt.utils import is_tokenspeed_mla_available
+
+if is_tokenspeed_mla_available():
+    import tokenspeed_mla
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -38,10 +42,12 @@ _g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
 def _get_tokenspeed_workspace(
     device: torch.device, num_heads: int, kv_lora_rank: int
 ) -> torch.Tensor:
-    from tokenspeed_mla import get_num_sm
-
     needed = (
-        get_num_sm(device) * num_heads * _TOKENSPEED_MAX_Q_LEN * (kv_lora_rank + 1) * 4
+        tokenspeed_mla.get_num_sm(device)
+        * num_heads
+        * _TOKENSPEED_MAX_Q_LEN
+        * (kv_lora_rank + 1)
+        * 4
     )
     existing = _g_tokenspeed_workspace.get(device)
     if existing is None or existing.numel() < needed:
@@ -85,15 +91,11 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         # without warm-up the first request trips the 300 s scheduler watchdog.
         # The public ``warmup_compile_prefill`` skips ``return_lse=False``, so
         # we drive the private compile helper for the (causal, no-LSE) variant.
-        try:
-            from tokenspeed_mla.mla_prefill import (
-                _compile_prefill_kernel,
-                _compiled_kernels,
-                _enable_ex2_emulation,
-            )
-
+        if is_tokenspeed_mla_available():
+            _compile_prefill_kernel = tokenspeed_mla.mla_prefill._compile_prefill_kernel
+            _compiled_kernels = tokenspeed_mla.mla_prefill._compiled_kernels
             head_dim_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
-            enable_ex2_emulation = _enable_ex2_emulation()
+            enable_ex2_emulation = tokenspeed_mla.mla_prefill._enable_ex2_emulation()
             use_pdl = is_arch_support_pdl()
             for is_causal in (True, False):
                 for return_lse in (True, False):
@@ -121,8 +123,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                         use_pdl=use_pdl,
                         enable_ex2_emulation=enable_ex2_emulation,
                     )
-        except ImportError:
-            pass
 
     def _ensure_workspace(self, device: torch.device) -> torch.Tensor:
         if (
@@ -143,19 +143,19 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         max_seq_len: int,
         layer: "RadixAttention",
     ) -> torch.Tensor:
-        from tokenspeed_mla import tokenspeed_mla_decode
-
         # tokenspeed splits trtllm-gen's ``bmm1_scale`` into ``softmax_scale``
         # (applied at QK^T) and ``output_scale`` (applied at attn @ V). K and V
         # share the kv_lora_rank prefix, so both use the same k_scale.
-        k_scale = getattr(layer, "k_scale_float", None) or 1.0
+        k_scale = getattr(layer, "k_scale_float", None)
+        if k_scale is None:
+            k_scale = 1.0
         softmax_scale = float(layer.scaling) * float(k_scale)
         output_scale = float(k_scale)
 
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
-        return tokenspeed_mla_decode(
+        return tokenspeed_mla.tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
             workspace_buffer=self._ensure_workspace(query.device),
@@ -186,8 +186,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         out_buffer: torch.Tensor,
         o_sf_scale: float = 1.0,
     ):
-        from tokenspeed_mla import tokenspeed_mla_prefill
-
         # Quantize to FP8 for the Blackwell FP8 GEMM speedup (mirrors trtllm-gen).
         # The kernel has no per-tensor scale knob for either K or V, so we
         # require both ``k_scale_float`` and ``v_scale_float`` to be 1.0 — the
@@ -202,7 +200,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 f"k_scale={k_scale}, v_scale={v_scale}."
             )
 
-        return tokenspeed_mla_prefill(
+        return tokenspeed_mla.tokenspeed_mla_prefill(
             query=q,
             key=k,
             value=v,
