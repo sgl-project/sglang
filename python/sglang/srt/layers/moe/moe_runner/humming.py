@@ -364,6 +364,10 @@ class HummingRunnerCore(MoeRunnerCore):
         return buffers
 
     def apply_activation(self, inputs: torch.Tensor, outputs: torch.Tensor):
+        if self.swiglu_limit is not None:
+            half = inputs.shape[-1] // 2
+            inputs[:, :half].clamp_(max=self.swiglu_limit)
+            inputs[:, half:].clamp_(min=-self.swiglu_limit, max=self.swiglu_limit)
         if self.activation == "silu":
             from sgl_kernel import silu_and_mul
 
