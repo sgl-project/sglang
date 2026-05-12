@@ -533,11 +533,21 @@ class SchedulerOutputProcessorMixin:
             ):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                if req.finished():
+                    self._finalize_radix_mamba_backup(req, True)
+                self._release_stale_radix_mamba_track_slot(req, batch, i)
+                if req.is_retracted:
+                    self._free_radix_mamba_backup_slot(req)
+                elif req.req_pool_idx is not None and not req.finished_output:
+                    self._handle_finished_req(req, i, logits_output)
                 continue
 
             if is_spec_v1:
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
+                self._finalize_radix_mamba_backup(
+                    req, not self._has_mamba_track_slot(batch, i)
+                )
                 self._handle_finished_req(req, i, logits_output)
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     req.hidden_states.append(
@@ -562,6 +572,9 @@ class SchedulerOutputProcessorMixin:
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
             req.check_finished(new_accepted_len)
+            self._finalize_radix_mamba_backup(
+                req, not self._has_mamba_track_slot(batch, i)
+            )
 
             self._handle_finished_req(req, i, logits_output)
 
@@ -667,6 +680,40 @@ class SchedulerOutputProcessorMixin:
         if req.require_reasoning and think_end_id is not None:
             req.update_reasoning_tokens(next_token_id, think_end_id)
 
+    def _free_radix_mamba_backup_slot(self: Scheduler, req: Req) -> None:
+        if req.radix_mamba_backup_slot is None:
+            return
+        self.req_to_token_pool.mamba_pool.free(req.radix_mamba_backup_slot)
+        req.radix_mamba_backup_slot = req.radix_mamba_backup_seqlen = None
+
+    def _release_stale_radix_mamba_track_slot(
+        self: Scheduler, req: Req, batch: ScheduleBatch, i: int
+    ) -> None:
+        if not self._has_mamba_track_slot(batch, i):
+            return
+        track_slot = batch.mamba_track_indices[i : i + 1]
+        if req.pending_radix_mamba_slot is not None and torch.equal(
+            req.pending_radix_mamba_slot, track_slot
+        ):
+            if req.finished() and req.mamba_last_track_seqlen is None:
+                req.pending_radix_mamba_slot = None
+                self.req_to_token_pool.mamba_pool.free(track_slot)
+            return
+        self.req_to_token_pool.mamba_pool.free(track_slot)
+
+    def _finalize_radix_mamba_backup(
+        self: Scheduler, req: Req, use_backup_for_cache: bool
+    ) -> None:
+        if req.radix_mamba_backup_slot is None:
+            return
+        if not req.finished() or not use_backup_for_cache:
+            self._free_radix_mamba_backup_slot(req)
+            return
+
+        req.pending_radix_mamba_slot = req.radix_mamba_backup_slot
+        req.mamba_last_track_seqlen = req.radix_mamba_backup_seqlen
+        req.radix_mamba_backup_slot = req.radix_mamba_backup_seqlen = None
+
     def _mamba_prefix_cache_update(
         self: Scheduler,
         req: Req,
@@ -675,35 +722,37 @@ class SchedulerOutputProcessorMixin:
         i: int,
     ) -> None:
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-        if req.mamba_ping_pong_track_buffer is not None:
+        if get_global_server_args().enable_mamba_extra_buffer():
+            if req.pending_radix_mamba_slot is None:
+                return
+            if batch.mamba_track_mask is not None and not self._has_mamba_track_slot(
+                batch, i
+            ):
+                return
             mamba_track_interval = get_global_server_args().mamba_track_interval
             if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
-                # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
-                req.mamba_next_track_idx = (
-                    batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
-                    )
-                )
                 req.mamba_last_track_seqlen = seq_len
             elif (
                 not batch.spec_algorithm.is_none()
                 and result.num_correct_drafts_per_req_cpu is not None
             ):
-                # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
                 actual_seq_len = req.seqlen - 1
                 if (
                     actual_seq_len // mamba_track_interval
                     != (actual_seq_len - result.num_correct_drafts_per_req_cpu[i] - 1)
                     // mamba_track_interval
                 ):
-                    req.mamba_next_track_idx = (
-                        batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                            req.mamba_next_track_idx
-                        )
-                    )
                     req.mamba_last_track_seqlen = (
                         actual_seq_len // mamba_track_interval * mamba_track_interval
                     )
+
+    @staticmethod
+    def _has_mamba_track_slot(batch: ScheduleBatch, i: int) -> bool:
+        return (
+            batch.mamba_track_mask is not None
+            and batch.mamba_track_indices is not None
+            and bool(batch.mamba_track_mask[i].item())
+        )
 
     def _process_input_token_logprobs(
         self: Scheduler, req: Req, input_token_logprobs: List

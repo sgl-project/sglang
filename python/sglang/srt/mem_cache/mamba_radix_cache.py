@@ -555,45 +555,55 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
             if self.enable_mamba_extra_buffer:
-                mamba_ping_pong_track_buffer_to_keep = (
-                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
+                if req.pending_radix_mamba_slot is not None:
+                    mamba_value = req.pending_radix_mamba_slot.clone()
+                    req.pending_radix_mamba_slot = None
+                    result = self.insert(
+                        InsertParams(
+                            key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                            value=page_aligned_kv_indices,
+                            mamba_value=mamba_value,
+                            prev_prefix_len=req.cache_protected_len,
+                        )
                     )
-                )
-                mamba_value = (
-                    req.mamba_ping_pong_track_buffer[
-                        mamba_ping_pong_track_buffer_to_keep
-                    ]
-                    .unsqueeze(-1)
-                    .clone()
-                )
+                    mamba_exist = result.mamba_exist
+                else:
+                    # No pending slot: decode phase never triggered tracking
+                    # (output shorter than mamba_track_interval). The mamba
+                    # state was already inserted into the radix tree by the
+                    # last cache_unfinished_req during chunked prefill, or
+                    # no tracking was ever done (short prompt, no chunking).
+                    # In either case, free KV beyond the cached prefix and
+                    # skip mamba insert.
+                    self.token_to_kv_pool_allocator.free(
+                        kv_indices[req.cache_protected_len :]
+                    )
+                    mamba_exist = True
             else:
                 mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
-                mamba_ping_pong_track_buffer_to_keep = None
-
-            result = self.insert(
-                InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
-                    value=page_aligned_kv_indices,
-                    mamba_value=mamba_value,
-                    prev_prefix_len=req.cache_protected_len,
+                result = self.insert(
+                    InsertParams(
+                        key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                        value=page_aligned_kv_indices,
+                        mamba_value=mamba_value,
+                        prev_prefix_len=req.cache_protected_len,
+                    )
                 )
-            )
-            mamba_exist = result.mamba_exist
+                mamba_exist = result.mamba_exist
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
             mamba_exist = True
 
-        if mamba_exist:
-            mamba_ping_pong_track_buffer_to_keep = None
+        if mamba_exist and self.enable_mamba_extra_buffer:
+            # Radix tree already had mamba state at this prefix; free the pre-allocated slot
+            if req.pending_radix_mamba_slot is not None:
+                self.req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
+                req.pending_radix_mamba_slot = None
 
         free_mamba_cache = True if self.enable_mamba_extra_buffer else mamba_exist
 
         if free_mamba_cache:
-            self.req_to_token_pool.free_mamba_cache(
-                req,
-                mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
-            )
+            self.req_to_token_pool.free_mamba_cache(req)
 
         self.dec_lock_ref(req.last_node)
 
@@ -639,44 +649,40 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         if self.enable_mamba_extra_buffer:
-            # copy from the ping pong track buffer
-            mamba_ping_pong_track_buffer_to_keep = (
-                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
-            )
-            mamba_value = (
-                req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep]
-                .unsqueeze(-1)
-                .clone()
-            )
+            if req.pending_radix_mamba_slot is None:
+                return _skip_cache_unfinished_req(req)
+            # Data is already in the pending radix slot (written by track kernel).
+            # Transfer ownership directly to the radix tree — no fork needed.
+            mamba_value = req.pending_radix_mamba_slot.clone()
+            req.pending_radix_mamba_slot = None
         else:
             mamba_value = self.req_to_token_pool.get_mamba_indices(
                 req.req_pool_idx
             ).unsqueeze(-1)
-        # radix tree mamba value is forked from req space
-        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
-
-        # if alloc mamba cache failed, do evict and alloc again
-        if mamba_value_forked is None:
-            self.evict(EvictParams(num_tokens=0, mamba_num=1))
+            # no_buffer mode: fork from working slot (old behavior)
             mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
                 mamba_value
             )
-            assert mamba_value_forked is not None, "Can not alloc mamba cache"
+            if mamba_value_forked is None:
+                self.evict(EvictParams(num_tokens=0, mamba_num=1))
+                mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
+                    mamba_value
+                )
+                assert mamba_value_forked is not None, "Can not alloc mamba cache"
+            mamba_value = mamba_value_forked
+
         result = self.insert(
             InsertParams(
                 key=RadixKey(page_aligned_token_ids, req.extra_key),
                 value=page_aligned_kv_indices,
-                mamba_value=mamba_value_forked,
+                mamba_value=mamba_value,
                 prev_prefix_len=req.cache_protected_len,
                 chunked=chunked,
             )
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
-        # there is a mamba cache in radix cache, release it
         if mamba_exist:
-            self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
+            self.req_to_token_pool.mamba_pool.free(mamba_value)
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
@@ -688,7 +694,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         if not mamba_exist:
-            assert torch.equal(new_last_node.mamba_value, mamba_value_forked)
+            assert torch.equal(new_last_node.mamba_value, mamba_value)
 
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
@@ -713,6 +719,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.mamba_last_track_seqlen = None
         req.last_node = new_last_node
+
+        # Pre-allocate the next pending_radix_mamba_slot so that the next
+        # extend/decode prepare doesn't need to alloc on the hot path.
+        if self.enable_mamba_extra_buffer and req.pending_radix_mamba_slot is None:
+            pending = self.req_to_token_pool.mamba_pool.alloc(1)
+            if pending is None:
+                self.evict(EvictParams(num_tokens=0, mamba_num=1))
+                pending = self.req_to_token_pool.mamba_pool.alloc(1)
+            if pending is not None:
+                req.pending_radix_mamba_slot = pending
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)

@@ -20,8 +20,8 @@ _is_hip = is_hip()
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
-# Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
-MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+# Needs 1 + 1 slots for mamba request with prefix cache. 1 for pending radix slot, 1 for running mamba state.
+MAMBA_STATE_PER_REQ_PREFIX_CACHE = 2
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
@@ -575,6 +575,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba_pool_idx = None
+        if req.pending_radix_mamba_slot is not None:
+            tree_cache.req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
+            req.pending_radix_mamba_slot = None
+        if req.radix_mamba_backup_slot is not None:
+            tree_cache.req_to_token_pool.mamba_pool.free(req.radix_mamba_backup_slot)
+            req.radix_mamba_backup_slot = req.radix_mamba_backup_seqlen = None
         return
 
     tree_cache.cache_finished_req(

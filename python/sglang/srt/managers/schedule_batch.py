@@ -692,13 +692,16 @@ class Req(ReqDllmMixin):
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
-        self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
-        self.mamba_next_track_idx: Optional[int] = None  # 0 or 1
+        self.pending_radix_mamba_slot: Optional[torch.Tensor] = (
+            None  # shape (1), pre-allocated radix target slot
+        )
+        self.radix_mamba_backup_slot: Optional[torch.Tensor] = None  # shape (1)
+        self.radix_mamba_backup_seqlen: Optional[int] = None
         self.mamba_last_track_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
         # the branching point seqlen to track mamba state. If set, given by prefix match,
-        # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
+        # it will be the tracked seqlen for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
 
         # Check finish
@@ -1259,8 +1262,8 @@ class Req(ReqDllmMixin):
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
         self.mamba_pool_idx = None
-        self.mamba_ping_pong_track_buffer = None
-        self.mamba_next_track_idx = None
+        self.pending_radix_mamba_slot = None
+        self.radix_mamba_backup_slot = self.radix_mamba_backup_seqlen = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
@@ -2005,10 +2008,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
         mask = req.extend_input_len >= mamba_cache_chunk_size
+
+        if mask:
+            if req.pending_radix_mamba_slot is not None:
+                track_index = req.pending_radix_mamba_slot[0].item()
+            else:
+                mask = False
+        if not mask:
+            track_index = 0
+
         mamba_track_mask_cpu.append(mask)
-        mamba_track_indices_cpu.append(
-            req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
-        )
+        mamba_track_indices_cpu.append(track_index)
+
         mamba_track_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
@@ -2041,11 +2052,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            req.mamba_next_track_idx = (
-                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
-            )
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
@@ -2358,34 +2364,79 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         if get_global_server_args().enable_mamba_extra_buffer():
+            mamba_track_interval = get_global_server_args().mamba_track_interval
+
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
+                self.mamba_track_mask = torch.empty(
+                    (0,), dtype=torch.bool, device=self.device
+                )
             else:
-                # already on device
-                all_buffers = torch.stack(
-                    [req.mamba_ping_pong_track_buffer for req in self.reqs]
-                )
-                idx = (
-                    torch.tensor(
-                        [req.mamba_next_track_idx for req in self.reqs],
-                        dtype=torch.int64,
-                        pin_memory=True,
+                interval_mask_cpu = (
+                    self.seq_lens_cpu % mamba_track_interval == 0
+                ).tolist()
+                can_track_cpu = [
+                    (
+                        (not in_interval)
+                        or self._maybe_backup_pending_radix_mamba_slot(req)
                     )
-                    .unsqueeze(1)
-                    .to(device=all_buffers.device, non_blocking=True)
+                    for req, in_interval in zip(self.reqs, interval_mask_cpu)
+                ]
+                interval_mask = torch.tensor(
+                    interval_mask_cpu,
+                    dtype=torch.bool,
+                    pin_memory=is_pin_memory_available(self.device),
+                ).to(device=self.device, non_blocking=True)
+                _zero = torch.zeros(1, dtype=torch.int64, device=self.device)
+                slot_indices = (
+                    torch.stack(
+                        [
+                            (
+                                req.pending_radix_mamba_slot
+                                if req.pending_radix_mamba_slot is not None
+                                else _zero
+                            )
+                            for req in self.reqs
+                        ]
+                    )
+                    .squeeze(1)
+                    .to(torch.int64)
                 )
-                self.mamba_track_indices = (
-                    torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+                has_slot = torch.tensor(
+                    [req.pending_radix_mamba_slot is not None for req in self.reqs],
+                    dtype=torch.bool,
+                    pin_memory=is_pin_memory_available(self.device),
+                ).to(device=self.device, non_blocking=True)
+                can_track = torch.tensor(
+                    can_track_cpu,
+                    dtype=torch.bool,
+                    pin_memory=is_pin_memory_available(self.device),
+                ).to(device=self.device, non_blocking=True)
+                self.mamba_track_mask = interval_mask & has_slot & can_track
+                self.mamba_track_indices = torch.where(
+                    self.mamba_track_mask, slot_indices, torch.zeros_like(slot_indices)
                 )
 
-            # async H2D
-            self.mamba_track_mask = (
-                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
-                .pin_memory()
-                .to(device=self.device, non_blocking=True)
-            )
+    def _maybe_backup_pending_radix_mamba_slot(self, req: Req) -> bool:
+        if (
+            not self.enable_overlap
+            or req.pending_radix_mamba_slot is None
+            or req.mamba_last_track_seqlen is None
+            or req.radix_mamba_backup_slot is not None
+        ):
+            return True
+
+        backup = self.req_to_token_pool.mamba_pool.fork_from(
+            req.pending_radix_mamba_slot
+        )
+        if backup is None:
+            return False
+
+        req.radix_mamba_backup_slot = backup
+        req.radix_mamba_backup_seqlen = req.mamba_last_track_seqlen
+        return True
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:

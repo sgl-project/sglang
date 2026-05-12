@@ -57,8 +57,7 @@ class SessionSlot:
 
     # Mamba states
     mamba_pool_idx: Any = None
-    mamba_ping_pong_track_buffer: Any = None
-    mamba_next_track_idx: Any = None
+    pending_radix_mamba_slot: Any = None
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
@@ -80,13 +79,13 @@ class SessionSlot:
             self.swa_uuid_for_lock = req.swa_uuid_for_lock
 
         self.mamba_pool_idx = req.mamba_pool_idx
-        self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
-        self.mamba_next_track_idx = req.mamba_next_track_idx
+        self.pending_radix_mamba_slot = req.pending_radix_mamba_slot
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
 
         req.req_pool_idx = None
         req.mamba_pool_idx = None
+        req.pending_radix_mamba_slot = None
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
@@ -97,8 +96,7 @@ class SessionSlot:
         req.swa_uuid_for_lock = self.swa_uuid_for_lock
 
         req.mamba_pool_idx = self.mamba_pool_idx
-        req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
-        req.mamba_next_track_idx = self.mamba_next_track_idx
+        req.pending_radix_mamba_slot = self.pending_radix_mamba_slot
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
 
@@ -458,7 +456,7 @@ class StreamingSession(BasePrefixCache):
 
     def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total mamba_pool entries held by session slots (mamba_pool_idx +
-        mamba_ping_pong_track_buffer). Excludes slots whose owning req is
+        pending_radix_mamba_slot). Excludes slots whose owning req is
         currently in the batch -- those slots are counted via the normal
         alloc/free paths (same convention as the sibling ``session_held_*``
         accessors).
@@ -472,8 +470,8 @@ class StreamingSession(BasePrefixCache):
                 continue
             if slot.mamba_pool_idx is not None:
                 total += slot.mamba_pool_idx.numel()
-            if slot.mamba_ping_pong_track_buffer is not None:
-                total += slot.mamba_ping_pong_track_buffer.numel()
+            if slot.pending_radix_mamba_slot is not None:
+                total += slot.pending_radix_mamba_slot.numel()
         return total
 
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
@@ -484,9 +482,9 @@ class StreamingSession(BasePrefixCache):
         if slot.mamba_pool_idx is not None:
             mamba_pool.free(slot.mamba_pool_idx.unsqueeze(0))
             slot.mamba_pool_idx = None
-        if slot.mamba_ping_pong_track_buffer is not None:
-            mamba_pool.free(slot.mamba_ping_pong_track_buffer)
-            slot.mamba_ping_pong_track_buffer = None
+        if slot.pending_radix_mamba_slot is not None:
+            mamba_pool.free(slot.pending_radix_mamba_slot)
+            slot.pending_radix_mamba_slot = None
 
     # -- Internal helpers (streaming body bits) --
 

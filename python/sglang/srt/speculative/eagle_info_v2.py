@@ -267,23 +267,34 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
-            # Set mamba_track_indices for mamba prefix-cache state tracking
+            # Set mamba_track_indices for mamba prefix-cache state tracking.
+            # Reuse existing pending_radix_mamba_slot — the verify kernel will
+            # overwrite it, so no free+alloc needed on this hot path.
             if get_global_server_args().enable_mamba_extra_buffer():
-                mapping = (
-                    req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+                mamba_track_interval = get_global_server_args().mamba_track_interval
+                may_cross_boundary = (
+                    (
+                        batch.seq_lens_cpu // mamba_track_interval
+                        != (batch.seq_lens_cpu + self.draft_token_num)
+                        // mamba_track_interval
+                    ).tolist()
+                    if not get_global_server_args().disable_overlap_schedule
+                    else [False] * bs
                 )
-                req_pool_idx_tensor = batch.req_pool_indices.to(
-                    device=mapping.device, dtype=torch.int64
+                track_indices = []
+                track_mask = []
+                _zero = torch.zeros(1, dtype=torch.int64, device=device)[0]
+                for req, may_cross in zip(batch.reqs, may_cross_boundary):
+                    if req.pending_radix_mamba_slot is not None and not may_cross:
+                        track_indices.append(req.pending_radix_mamba_slot[0])
+                        track_mask.append(True)
+                    else:
+                        track_indices.append(_zero)
+                        track_mask.append(False)
+                batch.mamba_track_indices = torch.stack(track_indices).to(torch.int64)
+                batch.mamba_track_mask = torch.tensor(
+                    track_mask, dtype=torch.bool, device=device
                 )
-                track_col_idx = torch.tensor(
-                    [req.mamba_next_track_idx for req in batch.reqs],
-                    dtype=torch.int64,
-                    pin_memory=True,
-                ).to(mapping.device, non_blocking=True)
-                batch.mamba_track_indices = mapping[
-                    req_pool_idx_tensor, track_col_idx
-                ].to(dtype=torch.int64)
-                batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
             # Populate seq_lens_cpu/seq_lens_sum on the verify input so that
