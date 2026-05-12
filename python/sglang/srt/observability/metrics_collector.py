@@ -96,8 +96,7 @@ class SchedulerStats:
     mamba_evictable_tokens: int = 0
     mamba_used_tokens: int = 0
 
-    # UMBP/feat: pending_prealloc + gpu_kv_cache_occupancy + per-tier hit tokens
-    pending_prealloc_token_usage: float = 0.0
+    # UMBP/feat: gpu_kv_cache_occupancy + per-tier hit tokens (pending_prealloc_token_usage already declared below)
     gpu_kv_cache_occupancy: float = 0.0
     l1_hit_tokens: int = 0
     l2_hit_tokens: int = 0
@@ -264,12 +263,6 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
         )
 
-        self.max_total_num_tokens = Gauge(
-            name="sglang:max_total_num_tokens",
-            documentation="Maximum total number of tokens in the KV cache pool.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
 
         # =================================================================
         # Memory pool usage ratios
