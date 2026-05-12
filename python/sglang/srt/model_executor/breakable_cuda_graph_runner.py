@@ -125,19 +125,19 @@ class BreakableCudaGraphRunner:
         if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
             self.layer_model = language_model.model
         else:
-            # Fall back to capturing the outer model. Bs-shaped kernels in the
-            # outer forward (logits_processor gather, sampler) will bake
-            # batch_size=1 into captured launch params — multi-req prefill on
-            # this path silently produces wrong-shaped logits. Warn so the
-            # failure mode is visible instead of silent.
-            self.layer_model = language_model
+            # Disable BCG instead of capturing the outer model.forward, which
+            # would bake bs=1 from logits_processor into the graph and silently
+            # corrupt multi-req prefill. ``can_run`` returns False below; the
+            # caller falls back to eager extend.
+            self.layer_model = None
             logger.warning(
-                "[BCG] Could not resolve inner layer_model on %s; capturing "
-                "the outer model.forward. Multi-batch prefill may bake "
-                "batch_size=1 into the captured graph. Consider exposing an "
-                "explicit `.model.layers` attribute on the model class.",
+                "[BCG] Could not resolve inner layer_model on %s. BCG is "
+                "disabled for this model; prefill will fall back to eager. "
+                "To enable BCG, expose an explicit `.model.layers` attribute "
+                "on the model class.",
                 type(language_model).__name__,
             )
+            return
 
         # Memory pool
         if get_global_graph_memory_pool() is None:
@@ -340,6 +340,8 @@ class BreakableCudaGraphRunner:
                 self.output_buffers[num_tokens] = output
 
     def can_run(self, forward_batch: "ForwardBatch"):
+        if self.layer_model is None:
+            return False
         if forward_batch.forward_mode.is_target_verify():
             return False
         if forward_batch.input_embeds is not None:
