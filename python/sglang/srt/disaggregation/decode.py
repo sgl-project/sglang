@@ -175,7 +175,6 @@ class DecodeReqToTokenPool:
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
-
     def __init__(
         self,
         size: int,
@@ -1341,7 +1340,6 @@ class DecodeTransferQueue:
 
 
 class SchedulerDisaggregationDecodeMixin:
-
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
