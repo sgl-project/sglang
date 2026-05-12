@@ -35,6 +35,7 @@ import copy
 import dataclasses
 import logging
 import re
+from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
@@ -121,6 +122,21 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+
+def _flatten_parts_to_int64_tensor(
+    parts: List[array], device, pin: bool
+) -> torch.Tensor:
+    """Flatten a list of array.array('q') buffers into one int64 tensor.
+
+    Uses NumPy here to speed up the conversion by using memcpy
+    instead of a per-element PyLong-to-int64 walk.
+    """
+    combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
+    cpu_t = torch.from_numpy(combined)
+    if pin:
+        cpu_t = cpu_t.pin_memory()
+    return cpu_t.to(device, non_blocking=True)
 
 
 @lru_cache(maxsize=1)
@@ -609,14 +625,14 @@ class Req(ReqDllmMixin):
         self,
         rid: str,
         origin_input_text: str,
-        origin_input_ids: List[int],
+        origin_input_ids: Union[List[int], array],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         stream: bool = False,
-        origin_input_ids_unpadded: Optional[Tuple[int]] = None,
+        origin_input_ids_unpadded: Optional[array] = None,
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
@@ -657,9 +673,10 @@ class Req(ReqDllmMixin):
         )
         self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids
-        self.output_ids = []
+        self.output_ids = array("q")
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
-        self.fill_ids = []
+        self.fill_ids = array("q")
+
         self.session = session
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
@@ -929,6 +946,17 @@ class Req(ReqDllmMixin):
         self.hisparse_staging = False
 
     @property
+    def origin_input_ids(self) -> array:
+        return self._origin_input_ids
+
+    # Auto-coerce list[int] -> array.array('q')
+    @origin_input_ids.setter
+    def origin_input_ids(self, value: Union[List[int], array]) -> None:
+        self._origin_input_ids: array = (
+            value if isinstance(value, array) else array("q", value)
+        )
+
+    @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
         return len(self.origin_input_ids) + len(self.output_ids)
@@ -942,7 +970,7 @@ class Req(ReqDllmMixin):
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     @property
-    def output_ids_through_stop(self) -> List[int]:
+    def output_ids_through_stop(self) -> array:
         """Get the output ids through the stop condition. Stop position is included."""
         if self.finished_len is not None:
             return self.output_ids[: self.finished_len]
@@ -1105,7 +1133,7 @@ class Req(ReqDllmMixin):
             self.surr_offset = max(
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-            self.surr_and_decode_ids = (
+            self.surr_and_decode_ids = list(
                 self.origin_input_ids_unpadded[self.surr_offset :] + output_ids
             )
             self.cur_decode_ids_len = len(output_ids)
@@ -1297,7 +1325,7 @@ class Req(ReqDllmMixin):
         # Therefore, we discard the generated output_ids and restart prefill and generation
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
-            self.output_ids = []
+            self.output_ids = array("q")
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1362,7 +1390,7 @@ class Req(ReqDllmMixin):
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None
         self.grammar = None
-        self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.origin_input_ids = array("q", [0])  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
         self.to_finish = FINISH_ABORT(
@@ -1598,7 +1626,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_dllm(self):
         return self.dllm_config is not None
 
-    def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
+    def prepare_encoder_info_extend(
+        self, input_ids: List[array], seq_lens: List[int]
+    ):
         _pin = is_pin_memory_available(self.device)
         self.encoder_lens_cpu = []
         self.encoder_cached = []
@@ -1647,9 +1677,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             pt += req.extend_input_len
 
         # Reassign
-        self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int64, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        self.input_ids = _flatten_parts_to_int64_tensor(
+            input_ids, self.device, _pin
+        )
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
@@ -1752,9 +1782,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
 
         _pin = is_pin_memory_available(self.device)
-        input_ids_tensor = torch.tensor(
-            list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        input_ids_tensor = _flatten_parts_to_int64_tensor(
+            input_ids, self.device, _pin
+        )
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
