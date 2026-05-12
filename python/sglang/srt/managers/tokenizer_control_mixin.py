@@ -85,6 +85,9 @@ from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.managers.tokenizer_manager_components.session_controller import (
+        SessionController,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -847,8 +850,9 @@ class TokenizerControlMixin:
 
         return results
 
+    @staticmethod
     async def open_session(
-        self: TokenizerManager,
+        self: "SessionController",
         obj: OpenSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
@@ -874,8 +878,9 @@ class TokenizerControlMixin:
         finally:
             self.session_futures.pop(obj.session_id, None)
 
+    @staticmethod
     async def close_session(
-        self: TokenizerManager,
+        self: "SessionController",
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
