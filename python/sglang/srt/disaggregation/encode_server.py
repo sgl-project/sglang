@@ -888,7 +888,7 @@ class MMEncoder:
         All ranks participate in VIT forward; tp_size > 1 adds broadcasts for sync."""
         try:
             mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
-            grid_thw = _get_mm_grid_dim(mm_inputs, modality)
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
             mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
             num_items = len(grid_thw)
 
@@ -1481,7 +1481,7 @@ class MMEncoder:
         rank 0 returns metadata immediately."""
         try:
             mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
-            grid_thw = _get_mm_grid_dim(mm_inputs, modality)
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
 
             # Compute metadata without running forward (all ranks)
             total_tokens = sum(self.get_num_tokens(g, modality) for g in grid_thw)

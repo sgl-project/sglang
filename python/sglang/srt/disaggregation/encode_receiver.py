@@ -1,7 +1,6 @@
 import asyncio
 import itertools
 import logging
-import pickle
 import random
 import threading
 import time
@@ -29,6 +28,7 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
+from sglang.srt.utils.common import safe_pickle_loads
 from sglang.srt.utils.hf_transformers_utils import get_processor
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -491,24 +491,21 @@ class WaitingImageRequest:
                     logger.info("No tasks to send.")
                     return
                 logger.info(f"Concurrently sending {len(tasks)} requests...")
-                try:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                except asyncio.TimeoutError:
-                    timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
-                    logger.error(
-                        f"Encoder /scheduler_receive_url timeout ({timeout_val}s) for req_id={req_id}"
-                    )
-                    return
-                except Exception as e:
-                    logger.error(
-                        f"Encoder /scheduler_receive_url failed for req_id={req_id}: {e}",
-                        exc_info=True,
-                    )
-                    return
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
                 for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        logger.error(f"Request {i} failed: {result}")
+                    if isinstance(result, asyncio.TimeoutError):
+                        timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+                        logger.error(
+                            f"Request {i} to encoder /scheduler_receive_url timed out "
+                            f"({timeout_val}s) for req_id={req_id}"
+                        )
+                    elif isinstance(result, Exception):
+                        logger.error(
+                            f"Request {i} to encoder /scheduler_receive_url failed for "
+                            f"req_id={req_id}: {result}",
+                            exc_info=result,
+                        )
                     else:
                         logger.debug(f"Request {i} succeeded.")
 
@@ -530,7 +527,7 @@ class WaitingImageRequest:
             except zmq.Again:
                 # No data available yet, wait a bit and retry
                 return
-            recv_obj: EmbeddingData = pickle.loads(parts[0])
+            recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
             if getattr(recv_obj, "error_msg", None) is not None:
                 logger.warning(
                     f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
@@ -721,26 +718,28 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 )
                 for r in encode_requests
             ]
-            try:
-                responses = await asyncio.gather(*tasks)
-            except asyncio.TimeoutError:
-                timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
-                logger.error(
-                    f"Encoder /encode timeout ({timeout_val}s) for rid={self.rid}"
-                )
-                self.status = WaitingImageRequestStatus.FAIL
-                self.error_msg = f"Encoder /encode timeout ({timeout_val}s)"
-                self.recv_socket.close()
-                return
-            except Exception as e:
-                logger.error(
-                    f"Encoder /encode failed for rid={self.rid}: {e}",
-                    exc_info=True,
-                )
-                self.status = WaitingImageRequestStatus.FAIL
-                self.error_msg = str(e)
-                self.recv_socket.close()
-                return
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for i, resp in enumerate(responses):
+                if isinstance(resp, asyncio.TimeoutError):
+                    timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+                    logger.error(
+                        f"Encoder /encode timeout ({timeout_val}s) for rid={self.rid} "
+                        f"(request {i})"
+                    )
+                    self.status = WaitingImageRequestStatus.FAIL
+                    self.error_msg = f"Encoder /encode timeout ({timeout_val}s)"
+                    self.recv_socket.close()
+                    return
+                elif isinstance(resp, Exception):
+                    logger.error(
+                        f"Encoder /encode failed for rid={self.rid} (request {i}): {resp}",
+                        exc_info=resp,
+                    )
+                    self.status = WaitingImageRequestStatus.FAIL
+                    self.error_msg = str(resp)
+                    self.recv_socket.close()
+                    return
             for resp in responses:
                 if resp.status != 200:
                     try:
@@ -767,24 +766,30 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             # Phase 2: Pre-allocate and register GPU landing buffer with Mooncake engine
             # (encode server will write embeddings directly to this address via GPU-direct transfer)
             total_bytes = sum(s for s in embedding_sizes if s is not None)
-            gpu_buffer = torch.empty(
-                total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
-            )
-            self.embeddings_engine.register(gpu_buffer.data_ptr(), gpu_buffer.nbytes)
-            self.embeddings_buffer = gpu_buffer
-            buffer_address = gpu_buffer.data_ptr()
+            if total_bytes > 0:
+                gpu_buffer = torch.empty(
+                    total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
+                )
+                self.embeddings_engine.register(
+                    gpu_buffer.data_ptr(), gpu_buffer.nbytes
+                )
+                self.embeddings_buffer = gpu_buffer
+                buffer_address = gpu_buffer.data_ptr()
 
-            logger.info(
-                f"Pre-allocated Mooncake GPU landing buffer: "
-                f"rid={self.rid}, size={total_bytes}, addr={buffer_address}"
-            )
+                logger.info(
+                    f"Pre-allocated Mooncake GPU landing buffer: "
+                    f"rid={self.rid}, size={total_bytes}, addr={buffer_address}"
+                )
+            else:
+                self.embeddings_buffer = None
+                buffer_address = 0
 
             # Phase 2 cont: POST /send with RDMA info
             offset = 0
             send_tasks = []
             for idx in range(total_num_parts):
                 rj = response_sorted[idx]
-                encoder_idx = rj.pop("encoder_idx")
+                encoder_idx = rj.pop("encoder_idx", None)
                 rj.update(
                     {
                         "session_id": self.embeddings_engine.session_id,
@@ -800,7 +805,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 offset += embedding_sizes[idx]
 
             # Phase 3: Wait for RDMA transfers to complete
-            send_responses = await asyncio.gather(*send_tasks)
+            send_responses = await asyncio.gather(*send_tasks, return_exceptions=True)
             for resp in send_responses:
                 if resp.status != 200:
                     try:
@@ -826,7 +831,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             except zmq.Again:
                 return
 
-            recv_obj: EmbeddingData = pickle.loads(parts[0])
+            recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
             if getattr(recv_obj, "error_msg", None) is not None:
                 logger.warning(f"Received error for {self.rid}: {recv_obj.error_msg}")
                 self.error_msg = recv_obj.error_msg
@@ -1093,7 +1098,7 @@ class MMReceiverBase(ABC):
                 parts = await recv_socket.recv_multipart(copy=False)
                 if not parts:
                     continue
-                recv_obj: EmbeddingData = pickle.loads(parts[0])
+                recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
                 if getattr(recv_obj, "error_msg", None) is not None:
                     logger.warning(
                         f"Encoder error for req_id={req_id}: {recv_obj.error_msg} "
@@ -1545,21 +1550,23 @@ class MMReceiverHTTP(MMReceiverBase):
                 for encode_request in encode_requests
             ]
 
-            try:
-                responses = await asyncio.gather(*tasks)
-            except asyncio.TimeoutError:
-                timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
-                logger.error(
-                    f"Encoder HTTP request timeout ({timeout_val}s) for req_id={req_id}, "
-                    f"encoders={[self.encode_urls[req['encoder_idx']] for req in encode_requests]}"
-                )
-                return
-            except Exception as e:
-                logger.error(
-                    f"Encoder HTTP request failed for req_id={req_id}: {e}",
-                    exc_info=True,
-                )
-                return
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for i, response in enumerate(responses):
+                if isinstance(response, asyncio.TimeoutError):
+                    timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+                    logger.error(
+                        f"Encoder HTTP request timeout ({timeout_val}s) for req_id={req_id} "
+                        f"(request {i}), "
+                        f"encoder={self.encode_urls[encode_requests[i]['encoder_idx']]}"
+                    )
+                    return
+                elif isinstance(response, Exception):
+                    logger.error(
+                        f"Encoder HTTP request failed for req_id={req_id} (request {i}): {response}",
+                        exc_info=response,
+                    )
+                    return
             for response in responses:
                 if response.status != 200:
                     try:

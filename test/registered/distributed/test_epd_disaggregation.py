@@ -1381,17 +1381,22 @@ class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
     is_in_ci(),
     "TestEPDDisaggregationMooncake test requires RDMA hardware, skipping in CI",
 )
-class TestEPDDisaggregationMooncake(PDDisaggregationServerBase):
+class TestEPDDisaggregationMooncake(MMMUMixin, PDDisaggregationServerBase):
     """Test EPD disaggregation with mooncake GPU→GPU transfer.
 
     Validates the async VIT forward + GPU buffer pre-allocation +
     GPU-to-GPU mooncake transfer pipeline using MMMU eval (multi-image).
     """
 
+    # Qwen2.5-VL-3B-Instruct scores ~0.40 on the 50-sample MMMU subset.
+    accuracy = 0.40
+    mmmu_args = ["--limit", "50"]
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
+        cls.base_url = cls.lb_url  # MMMUMixin reads this for OPENAI_API_BASE
         cls.encode_port = f"{int(cls.lb_port) + 306}"
         cls.encode_url = f"http://{cls.base_host}:{cls.encode_port}"
 
@@ -1415,11 +1420,6 @@ class TestEPDDisaggregationMooncake(PDDisaggregationServerBase):
         cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
-
-        # Set OpenAI API key and base URL environment variables. Needed for lmms-eval to work.
-        cls.api_key = "sk-123456"
-        os.environ["OPENAI_API_KEY"] = cls.api_key
-        os.environ["OPENAI_API_BASE"] = f"{cls.lb_url}/v1"
 
     @classmethod
     def start_encode(cls):
@@ -1509,75 +1509,6 @@ class TestEPDDisaggregationMooncake(PDDisaggregationServerBase):
                     kill_process_tree(process.pid)
                 except Exception as e:
                     print(f"Error killing process: {e}")
-
-    def run_mmmu_eval(self, model_version: str, output_path: str, limit: str = "50"):
-        """
-        Evaluate a VLM on the MMMU validation set with lmms-eval.
-        Reference: test_vlm_models.py
-
-        Args:
-            model_version: Model version/checkpoint to evaluate
-            output_path: Path to save evaluation results
-            limit: Number of samples to evaluate (default: "50" for CI time constraints)
-        """
-        model = "openai_compatible"
-        tp = 1
-        tasks = "mmmu_val"
-        batch_size = 32
-        log_suffix = "openai_compatible"
-        os.makedirs(output_path, exist_ok=True)
-
-        model_args = f'model_version="{model_version}",tp={tp}'
-
-        cmd = [
-            "python3",
-            "-m",
-            "lmms_eval",
-            "--model",
-            model,
-            "--model_args",
-            model_args,
-            "--tasks",
-            tasks,
-            "--batch_size",
-            str(batch_size),
-            "--log_samples",
-            "--log_samples_suffix",
-            log_suffix,
-            "--output_path",
-            str(output_path),
-            "--limit",
-            limit,
-        ]
-
-        _run_lmms_eval_with_retry(cmd, timeout=3600)
-
-    def test_mmmu(self):
-        """Test MMMU evaluation with GPU-to-GPU mooncake transfer"""
-        import glob
-        import json
-
-        output_path = "./logs/epd_mooncake_rdma_mmmu"
-        self.run_mmmu_eval(self.model, output_path)
-
-        # Get the result file
-        result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-        if not result_files:
-            result_files = glob.glob(f"{output_path}/*.json")
-
-        if not result_files:
-            self.fail(f"No JSON result files found in {output_path}")
-
-        result_file_path = result_files[0]
-        with open(result_file_path, "r") as f:
-            result = json.load(f)
-            print(f"MMMU result (mooncake RDMA): {result}")
-
-        mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-        print(f"MMMU accuracy (mooncake RDMA): {mmmu_accuracy:.4f}")
-
-        # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
-        self.assertGreater(mmmu_accuracy, 0.40)
 
 
 if __name__ == "__main__":
