@@ -464,6 +464,26 @@ class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
                 ),
                 1,
             ),
+            # Only the first decode step is valid here. The later speculative slots
+            # cross into different pages and must be ignored, otherwise scatter_ can
+            # produce an out-of-bounds page index under CUDA graph replay.
+            (
+                torch.tensor(
+                    [
+                        [23, 24, 28],
+                        [31, 32, 36],
+                    ],
+                    dtype=torch.int32,
+                ),
+                torch.tensor(
+                    [
+                        [5, 6, 0],
+                        [7, 8, 0],
+                    ],
+                    dtype=torch.int32,
+                ),
+                1,
+            ),
             # Decode span multiple pages:
             # duplicated kv cache: 24, 25, 26
             # decode locations: 27, 28, 29, 30, 31, 32

@@ -3009,6 +3009,11 @@ def draft_decode_set_expand_metadata(
     cache_loc = (cache_loc // page_size).to(torch.int32)
     if cache_loc.dim() == 1:
         cache_loc = cache_loc.unsqueeze(0)
+    # Only the current replay window is valid. The cache layout keeps one extra
+    # slot beyond `decode_length`, so the metadata may legitimately reference up
+    # to `decode_length + 1` page locations.
+    valid_width = min(cache_loc.shape[1], decode_length + 1)
+    cache_loc = cache_loc[:, :valid_width]
     # Vectorized torch.unique_consecutive: track value change points then scatter
     mask = torch.ones_like(cache_loc, dtype=torch.bool)
     mask[:, 1:] = cache_loc[:, 1:] != cache_loc[:, :-1]
