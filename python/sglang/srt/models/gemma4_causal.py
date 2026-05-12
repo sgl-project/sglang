@@ -191,6 +191,12 @@ class Gemma4MoE(nn.Module):
             top_k=config.top_k_experts,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
+            # NOTE: Gemma trains with gelu_pytorch_tanh (tanh-approx GeLU),
+            # but sglang's "gelu" string maps to exact (erf-based) GeLU on
+            # most MoE backends.  We keep "gelu" here for compatibility with
+            # the BF16 triton/native paths that don't know "gelu_tanh"; the
+            # tanh approximation is wired through cutlass_moe_fp4 separately
+            # via _ACTIVATION_AND_MUL alias when needed.
             activation="gelu",
             reduce_results=True,
         )
@@ -994,7 +1000,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        expert_params_mapping = [
+        fused_expert_params_mapping = [
             # (param_name, ckpt_weight_name, shard_ids)
             # gate_up_proj is fused [E, 2*I, H] — chunk into w1 (gate) + w3 (up)
             ("experts.w13_weight", "experts.gate_up_proj", ("w1", "w3")),
@@ -1033,10 +1039,62 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 and int(m.group(1)) in k_eq_v_layers
             )
 
+            # Per-expert checkpoint format used by compressed-tensors / FP8
+            # (e.g. RedHatAI/*-FP8-Dynamic) and by ModelOpt NVFP4
+            # (e.g. nvidia/Gemma-4-*-NVFP4). Each expert is stored as a
+            # separate key with shape (out, in):
+            #   experts.<id>.gate_proj.{weight,weight_scale,weight_scale_2,input_scale}
+            #   experts.<id>.up_proj.{weight,weight_scale,weight_scale_2,input_scale}
+            #   experts.<id>.down_proj.{weight,weight_scale,weight_scale_2,input_scale}
+            # These need to be folded into sglang's fused FusedMoE params:
+            #   experts.w13_{weight,weight_scale,weight_scale_2,input_scale}
+            #     (gate->shard "w1", up->shard "w3")
+            #   experts.w2_{weight,weight_scale,weight_scale_2,input_scale}
+            #     (down->shard "w2")
+            #
+            # Note: weight_scale_2 / input_scale are per-tensor (PerTensorScale
+            # parameters in the fused MoE layer) and are routed through
+            # FusedMoE.weight_loader's ModelOpt branch via shard_id+expert_id.
+            per_expert_match = re.match(
+                r"^(.*?\.moe\.experts\.)(\d+)\.(gate_proj|up_proj|down_proj)"
+                r"\.(weight|weight_scale|weight_scale_2|input_scale)$",
+                name,
+            )
+            if per_expert_match:
+                prefix = per_expert_match.group(1)
+                expert_id = int(per_expert_match.group(2))
+                proj = per_expert_match.group(3)
+                suffix = per_expert_match.group(4)
+                if proj == "gate_proj":
+                    base, sid = "w13_weight", "w1"
+                elif proj == "up_proj":
+                    base, sid = "w13_weight", "w3"
+                else:  # down_proj
+                    base, sid = "w2_weight", "w2"
+                if suffix != "weight":
+                    # "weight_scale", "weight_scale_2", or "input_scale": replace
+                    # "weight" suffix in `base` with the actual scale suffix.
+                    # e.g. w13_weight + "_scale_2" -> w13_weight_scale_2;
+                    #      w2_weight + "_scale" -> w2_weight_scale;
+                    #      w13_weight (input_scale) -> w13_input_scale.
+                    if suffix.startswith("weight_"):
+                        base = base + "_" + suffix[len("weight_") :]
+                    elif suffix == "input_scale":
+                        # w13_weight -> w13_input_scale, w2_weight -> w2_input_scale
+                        base = base.replace("weight", "input_scale")
+                fused_name = prefix + base
+                if fused_name in params_dict:
+                    param = params_dict[fused_name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, fused_name, sid, expert_id)
+                    loaded_params.add(fused_name)
+                continue
+
             # MoE expert weights checked first (gate_up_proj contains "up_proj"
             # which would false-match the stacked dense MLP mapping).
             orig_name = name
-            for param_name, weight_name, shard_ids in expert_params_mapping:
+
+            for param_name, weight_name, shard_ids in fused_expert_params_mapping:
                 name = orig_name
                 if weight_name not in name:
                     continue
@@ -1082,10 +1140,21 @@ class Gemma4ForCausalLM(PreTrainedModel):
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
             param_names = set(dict(self.named_parameters()).keys())
+            # Some quantization methods (e.g. ModelOpt FP8 KV-cache) register
+            # parameters that are intentionally not present in the checkpoint
+            # and instead rely on default initialization or are derived in
+            # process_weights_after_loading.  Their parameters are tagged with
+            # `_skip_weight_check = True` (e.g. RadixAttention.k_scale /
+            # v_scale, FusedMoE.w13_blockscale_swizzled / w2_blockscale_swizzled).
+            skip_check = {
+                p
+                for p in unloaded_params
+                if getattr(params_dict.get(p, None), "_skip_weight_check", False)
+            }
             buckets = {
                 logging.WARNING: (
                     "Some weights are not initialized from checkpoints",
-                    lambda p: p in param_names,
+                    lambda p: p in param_names and p not in skip_check,
                 ),
                 logging.INFO: (
                     "Persistent buffers not in checkpoint (using default init)",

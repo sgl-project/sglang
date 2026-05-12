@@ -19,11 +19,25 @@ if _is_cuda:
         shuffle_rows,
     )
 
-    from sglang.jit_kernel.activation import silu_and_mul
+    from sglang.jit_kernel.activation import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+    )
     from sglang.jit_kernel.nvfp4 import (
         cutlass_fp4_group_mm,
         scaled_fp4_experts_quant,
     )
+
+    # Map activation name -> SwiGLU-style fused (act(x_gate) * x_up) kernel.
+    # Used by cutlass_moe_fp4 (and cutlass_moe_fp8 below if extended).
+    _ACTIVATION_AND_MUL = {
+        "silu": silu_and_mul,
+        "gelu": gelu_and_mul,
+        "gelu_tanh": gelu_tanh_and_mul,
+        # Gemma's HF-config string for tanh-approx GeLU; alias to gelu_tanh.
+        "gelu_pytorch_tanh": gelu_tanh_and_mul,
+    }
 
 
 def cutlass_fused_experts_fp8(
@@ -162,12 +176,12 @@ def cutlass_fused_experts_fp8(
             w2_q.shape[1] // 32,
             w2_q.shape[2],
         )
-        assert (
-            w1_scale.shape == expected_w1_scale_shape
-        ), f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {w1_scale.shape}"
-        assert (
-            w2_scale.shape == expected_w2_scale_shape
-        ), f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
+        assert w1_scale.shape == expected_w1_scale_shape, (
+            f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {w1_scale.shape}"
+        )
+        assert w2_scale.shape == expected_w2_scale_shape, (
+            f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
+        )
 
         mxfp8_blockscale_align = 128
         total_tokens = m * topk
@@ -360,6 +374,7 @@ def cutlass_moe_fp4(
     params: CutlassMoEParams,
     apply_router_weight_on_input: bool = False,
     no_combine: bool = False,
+    activation: str = "silu",
 ):
     """
     MoE implementation for FP4 Inputs
@@ -421,13 +436,13 @@ def cutlass_moe_fp4(
         "Number of experts must match",
         " between weights.",
     )
-    assert (
-        k_a // 2 == half_k_w1 and params.hidden_size == k_w2
-    ), "Hidden size mismatch between a, w1 and w2"
+    assert k_a // 2 == half_k_w1 and params.hidden_size == k_w2, (
+        "Hidden size mismatch between a, w1 and w2"
+    )
     assert (
         nx2_w1 == params.intermediate_size_per_partition * 2
         and half_n_w2 == params.intermediate_size_per_partition // 2
-    ), ("mismatch in " "expected `n`")
+    ), "mismatch in expected `n`"
     assert 2 * half_k_w1 == k_w2, "Hidden size mismatch w2 and w1"
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid input dtype"
 
@@ -468,11 +483,20 @@ def cutlass_moe_fp4(
     )
     del rep_a_fp4, rep_a_blockscale
 
-    # hidden size dimension is split to one halfpytho sized tensor.
+    # hidden size dimension is split to one half sized tensor.
     intermediate = torch.empty(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )
-    silu_and_mul(c1, intermediate)
+    # Apply gated activation (act(gate) * up).  Defaults to SiLU (matches the
+    # historical hardcoded behavior); models like Gemma that train with GeLU
+    # must pass activation="gelu_tanh" (tanh-approx) or "gelu" (erf-based).
+    act_and_mul = _ACTIVATION_AND_MUL.get(activation)
+    if act_and_mul is None:
+        raise ValueError(
+            f"Unsupported activation {activation!r} for cutlass_moe_fp4. "
+            f"Supported: {sorted(_ACTIVATION_AND_MUL)}"
+        )
+    act_and_mul(c1, intermediate)
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
         intermediate,

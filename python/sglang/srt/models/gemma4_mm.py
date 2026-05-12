@@ -803,17 +803,21 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
 
             # Per-expert checkpoint format used by compressed-tensors / FP8
-            # (e.g. RedHatAI/*-FP8-Dynamic). Each expert is stored as a
+            # (e.g. RedHatAI/*-FP8-Dynamic) and by ModelOpt NVFP4
+            # (e.g. nvidia/Gemma-4-*-NVFP4). Each expert is stored as a
             # separate key with shape (out, in):
-            #   experts.<id>.gate_proj.{weight,weight_scale}
-            #   experts.<id>.up_proj.{weight,weight_scale}
-            #   experts.<id>.down_proj.{weight,weight_scale}
+            #   experts.<id>.gate_proj.{weight,weight_scale,weight_scale_2,input_scale}
+            #   experts.<id>.up_proj.{weight,weight_scale,weight_scale_2,input_scale}
+            #   experts.<id>.down_proj.{weight,weight_scale,weight_scale_2,input_scale}
             # These need to be folded into sglang's fused FusedMoE params:
-            #   experts.w13_weight[_scale]  (gate->shard "w1", up->shard "w3")
-            #   experts.w2_weight[_scale]   (down->shard "w2")
+            #   experts.w13_{weight,weight_scale,weight_scale_2,input_scale}
+            #     (gate->shard "w1", up->shard "w3")
+            #   experts.w2_{weight,weight_scale,weight_scale_2,input_scale}
+            #     (down->shard "w2")
+
             per_expert_match = re.match(
                 r"^(.*?\.moe\.experts\.)(\d+)\.(gate_proj|up_proj|down_proj)"
-                r"\.(weight|weight_scale)$",
+                r"\.(weight|weight_scale|weight_scale_2|input_scale)$",
                 name,
             )
             if per_expert_match:
@@ -827,8 +831,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     base, sid = "w13_weight", "w3"
                 else:  # down_proj
                     base, sid = "w2_weight", "w2"
-                if suffix == "weight_scale":
-                    base += "_scale"
+                if suffix != "weight":
+                    # "weight_scale", "weight_scale_2", or "input_scale": replace
+                    # "weight" suffix in `base` with the actual scale suffix.
+                    # e.g. w13_weight + "_scale_2" -> w13_weight_scale_2;
+                    #      w2_weight + "_scale" -> w2_weight_scale;
+                    #      w13_weight (input_scale) -> w13_input_scale.
+                    if suffix.startswith("weight_"):
+                        base = base + "_" + suffix[len("weight_") :]
+                    elif suffix == "input_scale":
+                        # w13_weight -> w13_input_scale, w2_weight -> w2_input_scale
+                        base = base.replace("weight", "input_scale")
                 fused_name = prefix + base
                 if fused_name in params_dict:
                     param = params_dict[fused_name]
@@ -886,10 +899,21 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
             param_names = set(dict(self.named_parameters()).keys())
+            # Some quantization methods (e.g. ModelOpt FP8 KV-cache) register
+            # parameters that are intentionally not present in the checkpoint
+            # and instead rely on default initialization or are derived in
+            # process_weights_after_loading.  Their parameters are tagged with
+            # `_skip_weight_check = True` (e.g. RadixAttention.k_scale /
+            # v_scale, FusedMoE.w13_blockscale_swizzled / w2_blockscale_swizzled).
+            skip_check = {
+                p
+                for p in unloaded_params
+                if getattr(params_dict.get(p, None), "_skip_weight_check", False)
+            }
             buckets = {
                 logging.WARNING: (
                     "Some weights are not initialized from checkpoints",
-                    lambda p: p in param_names,
+                    lambda p: p in param_names and p not in skip_check,
                 ),
                 logging.INFO: (
                     "Persistent buffers not in checkpoint (using default init)",
