@@ -169,8 +169,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 hidden_states,
             )
 
-        exit_stack.close()
-
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
