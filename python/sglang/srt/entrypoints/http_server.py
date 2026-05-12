@@ -790,7 +790,9 @@ async def add_external_corpus(request: Request):
             {"success": False, "message": str(e)},
             status_code=HTTPStatus.BAD_REQUEST,
         )
-    result = await _global_state.tokenizer_manager.add_external_corpus(obj)
+    result = await TokenizerManager.add_external_corpus(
+        _global_state.tokenizer_manager.corpus_controller, obj
+    )
     return ORJSONResponse(
         {
             "success": result.success,
@@ -813,7 +815,9 @@ async def remove_external_corpus(request: Request):
             {"success": False, "message": "corpus_id is required."},
             status_code=HTTPStatus.BAD_REQUEST,
         )
-    result = await _global_state.tokenizer_manager.remove_external_corpus(corpus_id)
+    result = await TokenizerManager.remove_external_corpus(
+        _global_state.tokenizer_manager.corpus_controller, corpus_id
+    )
     return ORJSONResponse(
         {"success": result.success, "message": result.message},
         status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
@@ -824,7 +828,9 @@ async def remove_external_corpus(request: Request):
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def list_external_corpora():
     """List all active external corpora."""
-    result = await _global_state.tokenizer_manager.list_external_corpora()
+    result = await TokenizerManager.list_external_corpora(
+        _global_state.tokenizer_manager.corpus_controller,
+    )
     return ORJSONResponse(
         {
             "success": result.success,

@@ -130,11 +130,12 @@ class TokenizerControlMixin:
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
 
+    @staticmethod
     async def add_external_corpus(
-        self: TokenizerManager, obj: AddExternalCorpusReqInput
+        self: "CorpusController", obj: AddExternalCorpusReqInput
     ) -> AddExternalCorpusReqOutput:
         self.auto_create_handle_loop()
-        if self.server_args.speculative_algorithm != "NGRAM":
+        if self.config.speculative_algorithm != "NGRAM":
             return AddExternalCorpusReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
@@ -150,9 +151,7 @@ class TokenizerControlMixin:
                     iter_external_corpus_chunks,
                 )
 
-                max_tokens = (
-                    self.server_args.speculative_ngram_external_corpus_max_tokens
-                )
+                max_tokens = self.config.max_external_corpus_tokens
                 obj.token_chunks = list(
                     iter_external_corpus_chunks(
                         obj.file_path, self.tokenizer, max_tokens
@@ -163,9 +162,7 @@ class TokenizerControlMixin:
                     SEPARATOR_TOKEN,
                 )
 
-                max_tokens = (
-                    self.server_args.speculative_ngram_external_corpus_max_tokens
-                )
+                max_tokens = self.config.max_external_corpus_tokens
                 token_chunks = []
                 total_tokens = 0
                 has_prev = False
@@ -206,11 +203,12 @@ class TokenizerControlMixin:
         except Exception as e:
             return AddExternalCorpusReqOutput(success=False, message=str(e))
 
+    @staticmethod
     async def remove_external_corpus(
-        self: TokenizerManager, corpus_id: str
+        self: "CorpusController", corpus_id: str
     ) -> RemoveExternalCorpusReqOutput:
         self.auto_create_handle_loop()
-        if self.server_args.speculative_algorithm != "NGRAM":
+        if self.config.speculative_algorithm != "NGRAM":
             return RemoveExternalCorpusReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
@@ -221,11 +219,12 @@ class TokenizerControlMixin:
         all_success, all_message = FanOutCommunicator.merge_results(results)
         return RemoveExternalCorpusReqOutput(success=all_success, message=all_message)
 
+    @staticmethod
     async def list_external_corpora(
-        self: TokenizerManager,
+        self: "CorpusController",
     ) -> ListExternalCorporaReqOutput:
         self.auto_create_handle_loop()
-        if self.server_args.speculative_algorithm != "NGRAM":
+        if self.config.speculative_algorithm != "NGRAM":
             return ListExternalCorporaReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
