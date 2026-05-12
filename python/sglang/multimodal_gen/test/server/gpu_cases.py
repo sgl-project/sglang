@@ -635,6 +635,13 @@ TWO_GPU_CASES = [
                 "--pipeline-class-name LTX2TwoStagePipeline",
                 "--component-attention-backends transformer=fa",
             ],
+            # Two-stage LTX-2.3 cold-start has been observed running close to the
+            # default 1200s budget on the AMD MI325 runner; intermittent boots
+            # that overrun caused the test to time out and leak the HTTP +
+            # scheduler ports into follow-on tests in the same shard (CI R31
+            # cluster). Give the boot a 2x budget so a slow-but-healthy run can
+            # complete instead of cascading port-unavailable errors.
+            startup_wait_secs=2400.0,
         ),
         DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
         run_component_accuracy_check=False,

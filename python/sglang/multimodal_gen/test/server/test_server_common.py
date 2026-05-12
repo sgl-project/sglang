@@ -128,7 +128,14 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     env_vars.update(server_args.env_vars)
 
     # start server
-    wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200"))
+    # Per-case override (set on DiffusionServerArgs) takes precedence over the
+    # env var so a single slow model can have a longer budget without bumping
+    # every other case in the shard. Falls back to $SGLANG_TEST_WAIT_SECS or
+    # the historical default of 1200s.
+    if server_args.startup_wait_secs is not None:
+        wait_deadline = float(server_args.startup_wait_secs)
+    else:
+        wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200"))
     logger.info(
         "[server-test] Starting server for test case: %s\n"
         "  Model: %s\n"

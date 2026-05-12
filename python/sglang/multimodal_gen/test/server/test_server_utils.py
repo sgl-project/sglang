@@ -14,15 +14,19 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 from urllib.request import urlopen
 
+import psutil
 import pytest
 from openai import Client
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
+from sglang.multimodal_gen.runtime.utils.common import (
+    is_port_available,
+    kill_process_tree,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
@@ -53,6 +57,67 @@ globally_suppress_loggers()
 # Tracks mesh output file paths from generate_mesh for later correctness validation.
 # Keyed by case_id, cleaned up after use.
 MESH_OUTPUT_PATHS: dict[str, str] = {}
+
+# Default sglang scheduler-port window used by ServerArgs._adjust_network_ports
+# (default scheduler_port=5555, jittered by random.randint(0, 100)). Any port in
+# this range may still be held by a lingering scheduler subprocess after a
+# previous test's teardown, which causes the next --strict-ports test in the
+# same shard to fail with `Scheduler port <N> is unavailable` before any test
+# code runs. We probe / reclaim this range as part of ServerContext.cleanup.
+_DEFAULT_SCHEDULER_PORT_RANGE: range = range(5555, 5656)
+
+
+def _force_kill_listeners_on_ports(ports: Iterable[int]) -> list[int]:
+    """Best-effort: kill any process holding a LISTEN socket on one of *ports*.
+
+    Returns the list of pids that were sent SIGKILL. Silently ignores permission
+    errors (psutil.net_connections needs root on some platforms) since this is a
+    last-resort fallback before bubbling up to the next test.
+    """
+    port_set = set(ports)
+    killed: list[int] = []
+    try:
+        connections = psutil.net_connections(kind="inet")
+    except (psutil.AccessDenied, PermissionError) as exc:
+        logger.debug(
+            "[server-test cleanup] psutil.net_connections denied: %s; "
+            "skipping listener sweep.",
+            exc,
+        )
+        return killed
+
+    for conn in connections:
+        if conn.status != psutil.CONN_LISTEN:
+            continue
+        if not conn.laddr or conn.laddr.port not in port_set:
+            continue
+        if not conn.pid:
+            continue
+        try:
+            proc = psutil.Process(conn.pid)
+            cmdline = " ".join(proc.cmdline()[:5])
+            proc.kill()
+            killed.append(conn.pid)
+            logger.warning(
+                "[server-test cleanup] Force-killed pid=%d holding port %d "
+                "after parent teardown (cmdline=%s ...)",
+                conn.pid,
+                conn.laddr.port,
+                cmdline,
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return killed
+
+
+def _wait_for_port_free(port: int, timeout: float) -> bool:
+    """Poll for *port* to become bind-able. Returns True if released in time."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if is_port_available(port):
+            return True
+        time.sleep(1)
+    return is_port_available(port)
 
 
 def _urlopen_with_retry(url: str, timeout: int = 30, max_retries: int = 3) -> bytes:
@@ -181,6 +246,51 @@ class ServerContext:
             self._cleanup_hf_cache_if_not_persistent()
         else:
             # Give the runtime a brief cooldown after server shutdown.
+            time.sleep(2)
+
+        # Make sure the HTTP and scheduler ports are actually released before
+        # the next --strict-ports test in this shard starts. kill_process_tree
+        # generally handles this, but a worker that escaped its process group
+        # (or a socket still in the kernel's release path) can leak the listen
+        # port and cascade-fail every subsequent test in the rerun shard. See
+        # CI R31 (LTX-2.3 two-stage 2gpus -> port 21000/5555 cascade).
+        self._wait_for_tracked_ports_free()
+
+    def _wait_for_tracked_ports_free(self) -> None:
+        """Block until self.port + scheduler-port window are released."""
+        # 60s covers both the typical TIME_WAIT delay and any race between
+        # kill_process_tree and the OS socket teardown. If a process is still
+        # holding the port after that, it's almost certainly a detached
+        # grandchild that we need to reap explicitly.
+        primary_timeout = 60.0
+        if not _wait_for_port_free(self.port, primary_timeout):
+            killed = _force_kill_listeners_on_ports([self.port])
+            if killed:
+                logger.warning(
+                    "[server-test cleanup] HTTP port %d was still held after "
+                    "%.0fs; force-killed pids=%s.",
+                    self.port,
+                    primary_timeout,
+                    killed,
+                )
+            # Give the OS another short window to flush the kernel state.
+            if not _wait_for_port_free(self.port, 15.0):
+                logger.warning(
+                    "[server-test cleanup] HTTP port %d still busy after "
+                    "force-kill; the next test may hit --strict-ports.",
+                    self.port,
+                )
+
+        # Scheduler subprocesses (default port window 5555..5655) sometimes
+        # outlive the parent server, so we sweep listeners in that window once
+        # and rely on the OS to release the sockets quickly afterwards.
+        scheduler_killed = _force_kill_listeners_on_ports(_DEFAULT_SCHEDULER_PORT_RANGE)
+        if scheduler_killed:
+            logger.warning(
+                "[server-test cleanup] Reaped %d lingering scheduler "
+                "subprocess(es) in the 5555-5655 window.",
+                len(scheduler_killed),
+            )
             time.sleep(2)
 
     def _cleanup_hf_cache_if_not_persistent(self) -> None:

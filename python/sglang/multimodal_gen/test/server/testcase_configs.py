@@ -188,6 +188,13 @@ class DiffusionServerArgs:
     text_encoder_cpu_offload: bool = False
     enable_warmup: bool = True
 
+    # Per-case override for how long we wait for the server to become ready.
+    # When None, the test harness falls back to $SGLANG_TEST_WAIT_SECS or its
+    # default. Use this for models whose cold-start consistently runs close to
+    # the default budget (e.g. LTX-2.3 two-stage on AMD), so a single slow boot
+    # doesn't leak the listening port into the next test in the shard.
+    startup_wait_secs: float | None = None
+
     extras: list[str] = field(default_factory=lambda: [])
     env_vars: dict[str, str] = field(default_factory=dict)
 
