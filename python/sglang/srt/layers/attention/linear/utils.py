@@ -50,9 +50,7 @@ def initialize_linear_attn_config(server_args: ServerArgs):
     LINEAR_ATTN_DECODE_BACKEND = LinearAttnKernelBackend(decode)
     LINEAR_ATTN_PREFILL_BACKEND = LinearAttnKernelBackend(prefill)
 
-    rank0_log(
-        f"Linear attention kernel backend: decode={decode}, prefill={prefill}"
-    )
+    rank0_log(f"Linear attention kernel backend: decode={decode}, prefill={prefill}")
 
 
 def get_linear_attn_decode_backend() -> LinearAttnKernelBackend:
