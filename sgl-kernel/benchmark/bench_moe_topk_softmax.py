@@ -17,6 +17,23 @@ except ImportError:
     vllm_custom_ops = None
     VLLM_AVAILABLE = False
 
+# Optional MUSA import
+try:
+    from sglang.srt.utils import is_musa
+
+    if is_musa():
+        from sglang.srt.hardware_backend.musa.kernels.topk import (
+            topk_softmax as musa_topk_softmax,
+        )
+
+        MUSA_AVAILABLE = True
+    else:
+        musa_topk_softmax = None
+        MUSA_AVAILABLE = False
+except ImportError:
+    musa_topk_softmax = None
+    MUSA_AVAILABLE = False
+
 IS_CI = is_in_ci()
 
 
@@ -61,29 +78,62 @@ def sglang_topk_softmax(gating_output, topk):
     return topk_weights, topk_indices
 
 
+def musa_topk_softmax_fn(gating_output, topk):
+    num_tokens, num_experts = gating_output.shape
+
+    topk_weights = torch.empty(
+        (num_tokens, topk), device=gating_output.device, dtype=torch.float32
+    )
+    topk_indices = torch.empty(
+        (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+    )
+
+    musa_topk_softmax(
+        topk_weights,
+        topk_indices,
+        gating_output,
+    )
+
+    return topk_weights, topk_indices
+
+
 def calculate_diff(num_tokens, num_experts, topk):
     gating_output = torch.randn(
         (num_tokens, num_experts), device="cuda", dtype=torch.float32
     )
-    weights_vllm, indices_vllm = vllm_topk_softmax(gating_output.clone(), topk)
     weights_sglang, indices_sglang = sglang_topk_softmax(gating_output.clone(), topk)
 
-    weights_diff = torch.abs(weights_vllm - weights_sglang).mean().item()
-    indices_match = torch.equal(indices_vllm, indices_sglang)
+    if MUSA_AVAILABLE:
+        weights_musa, indices_musa = musa_topk_softmax_fn(gating_output.clone(), topk)
+        weights_diff = torch.abs(weights_sglang - weights_musa).mean().item()
+        indices_match = torch.equal(indices_sglang, indices_musa)
 
-    if not VLLM_AVAILABLE:
-        print("⚠️ vLLM not available, skipping comparison")
-        return
-
-    if (
-        torch.allclose(weights_vllm, weights_sglang, atol=1e-3, rtol=1e-3)
-        and indices_match
-    ):
-        print("✅ VLLM and SGLang topk_softmax implementations match")
+        if (
+            torch.allclose(weights_sglang, weights_musa, atol=1e-3, rtol=1e-3)
+            and indices_match
+        ):
+            print("✅ SGLang and MUSA topk_softmax implementations match")
+        else:
+            print(
+                f"❌ Implementations differ: Weights diff={weights_diff}, Indices match={indices_match}"
+            )
     else:
-        print(
-            f"❌ Implementations differ: Weights diff={weights_diff}, Indices match={indices_match}"
-        )
+        print("⚠️ MUSA not available, skipping MUSA comparison")
+
+    if VLLM_AVAILABLE:
+        weights_vllm, indices_vllm = vllm_topk_softmax(gating_output.clone(), topk)
+        weights_diff_vllm = torch.abs(weights_vllm - weights_sglang).mean().item()
+        indices_match_vllm = torch.equal(indices_vllm, indices_sglang)
+
+        if (
+            torch.allclose(weights_vllm, weights_sglang, atol=1e-3, rtol=1e-3)
+            and indices_match_vllm
+        ):
+            print("✅ VLLM and SGLang topk_softmax implementations match")
+        else:
+            print(
+                f"❌ VLLM vs SGLang differ: Weights diff={weights_diff_vllm}, Indices match={indices_match_vllm}"
+            )
 
 
 # CI environment uses simplified parameters
@@ -99,15 +149,20 @@ else:
 configs = list(itertools.product(num_tokens_range, num_experts_range, topk_range))
 
 
-# Filter providers based on vLLM availability
+# Filter providers based on availability
+line_vals = ["sglang"]
+line_names = ["SGLang"]
+styles = [("blue", "-")]
+
 if VLLM_AVAILABLE:
-    line_vals = ["sglang", "vllm"]
-    line_names = ["SGLang", "VLLM"]
-    styles = [("blue", "-"), ("green", "-")]
-else:
-    line_vals = ["sglang"]
-    line_names = ["SGLang"]
-    styles = [("blue", "-")]
+    line_vals.append("vllm")
+    line_names.append("VLLM")
+    styles.append(("green", "-"))
+
+if MUSA_AVAILABLE:
+    line_vals.append("musa")
+    line_names.append("MUSA")
+    styles.append(("red", "-"))
 
 
 @triton.testing.perf_report(
@@ -135,6 +190,10 @@ def benchmark(num_tokens, num_experts, topk, provider):
         fn = lambda: vllm_topk_softmax(gating_output, topk)
     elif provider == "sglang" or provider == "sglang1":
         fn = lambda: sglang_topk_softmax(gating_output, topk)
+    elif provider == "musa" or provider == "musa1":
+        if not MUSA_AVAILABLE:
+            return (0, 0, 0)
+        fn = lambda: musa_topk_softmax_fn(gating_output, topk)
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)

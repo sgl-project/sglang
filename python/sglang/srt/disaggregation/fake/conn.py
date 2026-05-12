@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVArgs,
     KVPoll,
+    KVTransferMetric,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
@@ -27,6 +28,7 @@ class FakeKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.req_to_decode_prefix_len = {}
 
     def register_to_bootstrap(self):
         pass
@@ -41,6 +43,7 @@ class FakeKVSender(BaseKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
     ):
+        self.kv_mgr = mgr
         self.has_sent = False
 
     def poll(self) -> KVPoll:
@@ -51,6 +54,9 @@ class FakeKVSender(BaseKVSender):
             # Assume transfer completed instantly
             logger.debug("FakeKVSender poll success")
             return KVPoll.Success
+
+    def get_transfer_metric(self) -> KVTransferMetric:
+        return KVTransferMetric()
 
     def init(
         self,
@@ -65,7 +71,7 @@ class FakeKVSender(BaseKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         self.has_sent = True
         logger.debug(
@@ -105,7 +111,8 @@ class FakeKVReceiver(BaseKVReceiver):
         self,
         kv_indices: list[int],
         aux_index: Optional[int] = None,
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         self.has_sent_metadata = True
         logger.debug(
