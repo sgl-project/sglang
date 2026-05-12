@@ -81,6 +81,10 @@ from sglang.srt.managers.tokenizer_manager_components.request_state import (
     ReqState,
     init_req,
 )
+from sglang.srt.managers.tokenizer_manager_components.score_request_handler import (
+    ScoreRequestHandler,
+    ScoreRequestHandlerConfig,
+)
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
@@ -175,6 +179,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
+
+        # Score request handler
+        self.score_request_handler = ScoreRequestHandler(
+            tokenizer=self.tokenizer,
+            rid_to_state=self.rid_to_state,
+            generate_request=self.generate_request,
+            config=ScoreRequestHandlerConfig(
+                is_generation=self.is_generation,
+                enable_mis=self.server_args.enable_mis,
+                model_config=self.model_config,
+            ),
+        )
 
         # Init request dispatcher
         self.init_request_dispatcher()
