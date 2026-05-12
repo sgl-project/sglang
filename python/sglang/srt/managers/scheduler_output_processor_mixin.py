@@ -528,19 +528,14 @@ class SchedulerOutputProcessorMixin:
         for i, req in enumerate(batch.reqs):
             req: Req
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
-                continue
-
-            if req.kv_committed_freed:
-                # PP stale-batch: another microbatch already finalized this req
-                # (released its KV and set finished_reason). Skipping the whole
-                # per-req body here avoids appending a duplicate next_token to
-                # req.output_ids — which would corrupt GSM8K accuracy — and
-                # avoids a second release_kv_cache call.
+            if req.finished() or req.is_retracted or req.kv_committed_freed:
+                # Skip stale-batch reqs that another microbatch (PP) or another
+                # overlap-scheduling tick has already finalized / retracted /
+                # released. Running the body would append a duplicate
+                # next_token to req.output_ids (corrupts accuracy) and trigger
+                # a second release_kv_cache. The per-iter filter in
+                # update_running_batch normally keeps these out of batch.reqs
+                # for plain non-overlap non-PP runs.
                 continue
 
             if is_spec_v1:
