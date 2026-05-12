@@ -44,7 +44,7 @@ from sglang.srt.layers.attention.compressed.metadata import (
     maybe_copy_inplace,
 )
 from sglang.srt.layers.attention.debug_flash_mla_adapter import (
-    flash_mla_with_kvcache_entrypoint,
+    flash_mla_with_kvcache_output_pcg_op,
 )
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
@@ -1124,7 +1124,21 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             )
 
             backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
-            o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
+            o = flash_mla_with_kvcache_output_pcg_op(
+                q=input_dict["q"],
+                k_cache=input_dict["k_cache"],
+                tile_scheduler_metadata=input_dict["tile_scheduler_metadata"],
+                indices=input_dict["indices"],
+                topk_length=input_dict["topk_length"],
+                attn_sink=input_dict["attn_sink"],
+                extra_k_cache=input_dict["extra_k_cache"],
+                extra_indices_in_kvcache=input_dict["extra_indices_in_kvcache"],
+                extra_topk_length=input_dict["extra_topk_length"],
+                head_dim_v=input_dict["head_dim_v"],
+                softmax_scale=input_dict["softmax_scale"],
+                is_fp8_kvcache=input_dict["is_fp8_kvcache"],
+                backend=backend,
+            )
 
             o = o.squeeze(1)
             return o
