@@ -740,10 +740,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            target_capture_mode = (
+            target_capture_mode = self.speculative_algorithm.capture_or_null(
                 CaptureHiddenMode.FULL
-                if self.speculative_algorithm.consumes_hidden_states()
-                else CaptureHiddenMode.NULL
             )
             model_worker_batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(
@@ -751,10 +749,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
             # Draft prefill
-            draft_capture_mode = (
+            draft_capture_mode = self.speculative_algorithm.capture_or_null(
                 CaptureHiddenMode.LAST
-                if self.speculative_algorithm.consumes_hidden_states()
-                else CaptureHiddenMode.NULL
             )
             model_worker_batch.capture_hidden_mode = draft_capture_mode
             with self.draft_worker.draft_tp_context(
@@ -771,10 +767,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 return batch_output
         else:
             if model_worker_batch.spec_info is None:
-                capture_mode = (
+                capture_mode = self.speculative_algorithm.capture_or_null(
                     CaptureHiddenMode.LAST
-                    if self.speculative_algorithm.consumes_hidden_states()
-                    else CaptureHiddenMode.NULL
                 )
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,

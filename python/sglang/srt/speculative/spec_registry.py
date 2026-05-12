@@ -64,6 +64,11 @@ class CustomSpecAlgo:
     def consumes_hidden_states(self) -> bool:
         return not self.is_standalone()
 
+    def capture_or_null(self, mode):
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        return mode if self.consumes_hidden_states() else CaptureHiddenMode.NULL
+
     def is_ngram(self) -> bool:
         return False
 

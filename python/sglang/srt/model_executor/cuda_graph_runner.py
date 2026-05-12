@@ -1387,10 +1387,8 @@ class CudaGraphRunner:
                 raise RuntimeError("This should not happen.")
             else:
 
-                capture_mode = (
+                capture_mode = self.model_runner.spec_algorithm.capture_or_null(
                     CaptureHiddenMode.FULL
-                    if self.model_runner.spec_algorithm.consumes_hidden_states()
-                    else CaptureHiddenMode.NULL
                 )
                 spec_info = EagleVerifyInput(
                     draft_token=None,

@@ -206,10 +206,8 @@ class EagleDraftInputV2Mixin:
         # Get a forward batch
         self.num_tokens_per_req = topk
         self.num_tokens_for_logprob_per_req = topk
-        capture_mode = (
+        capture_mode = draft_model_runner.spec_algorithm.capture_or_null(
             CaptureHiddenMode.LAST
-            if draft_model_runner.spec_algorithm.consumes_hidden_states()
-            else CaptureHiddenMode.NULL
         )
         batch.capture_hidden_mode = capture_mode
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
@@ -236,10 +234,8 @@ class EagleDraftInputV2Mixin:
         batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
-        capture_mode = (
+        capture_mode = draft_model_runner.spec_algorithm.capture_or_null(
             CaptureHiddenMode.FULL
-            if draft_model_runner.spec_algorithm.consumes_hidden_states()
-            else CaptureHiddenMode.NULL
         )
         batch.capture_hidden_mode = capture_mode
         batch.forward_mode = (
@@ -307,10 +303,8 @@ class EagleVerifyInputV2Mixin:
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        capture_mode = (
+        capture_mode = target_worker.model_runner.spec_algorithm.capture_or_null(
             CaptureHiddenMode.FULL
-            if target_worker.model_runner.spec_algorithm.consumes_hidden_states()
-            else CaptureHiddenMode.NULL
         )
         batch.capture_hidden_mode = capture_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)

@@ -572,10 +572,8 @@ class EAGLEWorker(TpModelWorker):
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
-        capture_mode = (
+        capture_mode = self.speculative_algorithm.capture_or_null(
             CaptureHiddenMode.FULL
-            if self.speculative_algorithm.consumes_hidden_states()
-            else CaptureHiddenMode.NULL
         )
         model_worker_batch.capture_hidden_mode = capture_mode
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
@@ -730,10 +728,8 @@ class EAGLEWorker(TpModelWorker):
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
-        capture_mode = (
+        capture_mode = self.speculative_algorithm.capture_or_null(
             CaptureHiddenMode.LAST
-            if self.speculative_algorithm.consumes_hidden_states()
-            else CaptureHiddenMode.NULL
         )
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
@@ -753,10 +749,8 @@ class EAGLEWorker(TpModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
 
-        draft_capture_mode = (
+        draft_capture_mode = self.speculative_algorithm.capture_or_null(
             CaptureHiddenMode.LAST
-            if self.speculative_algorithm.consumes_hidden_states()
-            else CaptureHiddenMode.NULL
         )
         spec_info.capture_hidden_mode = draft_capture_mode
         spec_info.num_tokens_per_req = self.topk
@@ -815,10 +809,8 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_draft_tokens,
         )
 
-        target_capture_mode = (
+        target_capture_mode = self.speculative_algorithm.capture_or_null(
             CaptureHiddenMode.FULL
-            if self.speculative_algorithm.consumes_hidden_states()
-            else CaptureHiddenMode.NULL
         )
         return EagleVerifyInput(
             draft_token=draft_tokens,
@@ -1115,10 +1107,8 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
-        capture_mode = (
+        capture_mode = self.speculative_algorithm.capture_or_null(
             CaptureHiddenMode.LAST
-            if self.speculative_algorithm.consumes_hidden_states()
-            else CaptureHiddenMode.NULL
         )
         batch.spec_info.capture_hidden_mode = capture_mode
         model_worker_batch = batch.get_model_worker_batch(
@@ -1149,10 +1139,8 @@ class EAGLEWorker(TpModelWorker):
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        draft_extend_capture_mode = (
+        draft_extend_capture_mode = self.speculative_algorithm.capture_or_null(
             CaptureHiddenMode.LAST
-            if self.speculative_algorithm.consumes_hidden_states()
-            else CaptureHiddenMode.NULL
         )
         if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
             # All reqs finished this verify; swap to an idle ExtendInput.
@@ -1226,10 +1214,8 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Phase 3: assemble next-iter EagleDraftInput from extend output
-        next_decode_capture_mode = (
+        next_decode_capture_mode = self.speculative_algorithm.capture_or_null(
             CaptureHiddenMode.LAST
-            if self.speculative_algorithm.consumes_hidden_states()
-            else CaptureHiddenMode.NULL
         )
         next_draft_input = EagleDraftInput(
             bonus_tokens=draft_extend_input.bonus_tokens,
