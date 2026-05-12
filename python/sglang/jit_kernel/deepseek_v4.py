@@ -438,7 +438,27 @@ def topk_transform_512_v2(
     )
 
 
-def hash_topk(
+def _hash_topk_fake(
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: float = 1.0,
+    scoring_func: str = "sqrtsoftplus",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = router_logits.size(0)
+    topk_fused = tid2eid.size(1) + num_fused_shared_experts
+    return (
+        torch.empty(
+            (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
+        ),
+        torch.empty(
+            (num_tokens, topk_fused), dtype=torch.int32, device=router_logits.device
+        ),
+    )
+
+
+def _hash_topk_impl(
     router_logits: torch.Tensor,
     input_ids: torch.Tensor,
     tid2eid: torch.Tensor,
@@ -469,6 +489,25 @@ def hash_topk(
         routed_scaling_factor,
     )
     return topk_weights, topk_ids
+
+
+@register_custom_op(fake_impl=_hash_topk_fake)
+def hash_topk(
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: float = 1.0,
+    scoring_func: str = "sqrtsoftplus",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _hash_topk_impl(
+        router_logits,
+        input_ids,
+        tid2eid,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+        scoring_func,
+    )
 
 
 def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor):
