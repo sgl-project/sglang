@@ -44,7 +44,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers import logprob_ops, request_tracing, spec_decoding_meta
-from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -71,8 +70,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
-from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -113,11 +111,6 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
-from sglang.srt.utils.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-)
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
@@ -158,8 +151,7 @@ class TokenizerManager(TokenizerControlMixin):
 
         # Initialize tokenizer and multimodal processor
         self.raw_tokenizer_wrapper = RawTokenizerWrapper()
-        TokenizerManager.init_tokenizer_and_processor(
-            self.raw_tokenizer_wrapper,
+        self.raw_tokenizer_wrapper.init_tokenizer_and_processor(
             server_args=self.server_args,
             model_config=self.model_config,
         )
@@ -227,64 +219,6 @@ class TokenizerManager(TokenizerControlMixin):
         else:
             self.num_reserved_tokens = 0
         self.validate_total_tokens = True
-
-    @staticmethod
-    def init_tokenizer_and_processor(
-        self: "RawTokenizerWrapper",
-        server_args: ServerArgs,
-        model_config: ModelConfig,
-    ) -> None:
-        # Initialize tokenizer and processor
-        if model_config.is_multimodal:
-            import_processors("sglang.srt.multimodal.processors")
-            if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
-                import_processors(mm_process_pkg, overwrite=True)
-            _processor = _get_processor_wrapper(server_args)
-            transport_mode = _determine_tensor_transport_mode(server_args)
-
-            # We want to parallelize the image pre-processing so we create an executor for it
-            # We create mm_processor for any skip_tokenizer_init to make sure we still encode
-            # images even with skip_tokenizer_init=False.
-            self.mm_processor = get_mm_processor(
-                model_config.hf_config,
-                server_args,
-                _processor,
-                transport_mode,
-                model_config=model_config,
-            )
-
-            if server_args.skip_tokenizer_init:
-                self.tokenizer = self.processor = None
-            else:
-                self.processor = _processor
-                self.tokenizer = get_tokenizer_from_processor(self.processor)
-                os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        else:
-            self.mm_processor = self.processor = None
-
-            if server_args.skip_tokenizer_init:
-                self.tokenizer = None
-            else:
-                self.tokenizer = get_tokenizer(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    tokenizer_backend=server_args.tokenizer_backend,
-                )
-
-        # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
-        if (
-            server_args.enable_dynamic_batch_tokenizer
-            and not server_args.skip_tokenizer_init
-        ):
-            self.async_dynamic_batch_tokenizer = AsyncDynamicbatchTokenizer(
-                self.tokenizer,
-                max_batch_size=server_args.dynamic_batch_tokenizer_batch_size,
-                batch_wait_timeout_s=server_args.dynamic_batch_tokenizer_batch_timeout,
-            )
-        else:
-            self.async_dynamic_batch_tokenizer = None
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -2381,45 +2315,6 @@ async def print_exception_wrapper(func):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
-
-
-def _get_processor_wrapper(server_args):
-    try:
-        processor = get_processor(
-            server_args.tokenizer_path,
-            tokenizer_mode=server_args.tokenizer_mode,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            use_fast=not server_args.disable_fast_image_processor,
-            tokenizer_backend=server_args.tokenizer_backend,
-        )
-    except ValueError as e:
-        error_message = str(e)
-        if "does not have a slow version" in error_message:
-            logger.info(
-                f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
-            )
-            processor = get_processor(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                use_fast=True,
-                tokenizer_backend=server_args.tokenizer_backend,
-            )
-        else:
-            raise e
-    return processor
-
-
-def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
-    is_cross_node = server_args.dist_init_addr
-
-    if is_cross_node:
-        # Fallback to default CPU transport for multi-node
-        return "default"
-    else:
-        return "cuda_ipc"
 
 
 class SignalHandler:
