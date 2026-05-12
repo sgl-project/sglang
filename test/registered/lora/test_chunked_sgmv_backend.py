@@ -528,6 +528,7 @@ class TestChunkedSGMV(unittest.TestCase):
                     lora_assignments_tensor,
                     seq_lengths_tensor,
                     lora_ranks_tensor,
+                    scalings_tensor,
                     self.vocab_size,
                 )
                 torch.testing.assert_close(

@@ -275,8 +275,10 @@ class UnifiedRadixCache(BasePrefixCache):
             ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
             for ct in self.tree_components
         }
-        self.ongoing_write_through: dict[int, UnifiedTreeNode] = {}
-        self.ongoing_load_back: dict[int, UnifiedTreeNode] = {}
+        self.ongoing_write_through: dict[
+            int, tuple[UnifiedTreeNode, Optional[DecLockRefParams]]
+        ] = {}
+        self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
         self.enable_storage = False
         self.ongoing_prefetch: dict = {}
         self.ongoing_backup: dict = {}
@@ -284,6 +286,16 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller is not None:
             self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
+
+        self._empty_match_result = MatchResult(
+            device_indices=torch.empty(
+                (0,),
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            last_device_node=self.root_node,
+            last_host_node=self.root_node,
+        )
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
@@ -338,16 +350,10 @@ class UnifiedRadixCache(BasePrefixCache):
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
-            return MatchResult(
-                device_indices=torch.empty(
-                    (0,),
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                last_device_node=self.root_node,
-                last_host_node=self.root_node,
-            )
+            return self._empty_match_result
         key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return self._empty_match_result
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
         return self._match_post_processor(params, value, last_node, best_value_len)
@@ -701,7 +707,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if best_value_len > 0:
             device_indices = torch.cat(value[:best_value_len])
         else:
-            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+            device_indices = self._empty_match_result.device_indices
         result = MatchResult(
             device_indices=device_indices,
             last_device_node=last_device_node,
@@ -806,6 +812,18 @@ class UnifiedRadixCache(BasePrefixCache):
 
             if node.evicted:
                 self._unevict_node_on_insert(node, value[:prefix_len])
+                # FULL was restored from the request's fresh KV. Aux
+                # components (e.g. SWA) may still hold tombstones and need
+                # to rebuild their value from the same slice.
+                for component in self._components_tuple:
+                    if component.component_type == BASE_COMPONENT_TYPE:
+                        continue
+                    component.recover_after_unevict(
+                        node=node,
+                        prefix_len=prefix_len,
+                        total_prefix_len=total_prefix_length,
+                        params=params,
+                    )
             else:
                 value_slice = value[:prefix_len]
                 consumed_from = prefix_len
@@ -1185,9 +1203,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 transfers=xfers,
             )
 
-        self.ongoing_write_through[node.id] = node
+        lock_params = None
         if not write_back:
-            self.inc_lock_ref(node)
+            lock_params = self.inc_lock_ref(node).to_dec_params()
+        self.ongoing_write_through[node.id] = (node, lock_params)
         return len(host_indices)
 
     def load_back(
@@ -1210,6 +1229,7 @@ class UnifiedRadixCache(BasePrefixCache):
         nodes_to_load = kv_xfer.nodes_to_load
         ancestor_node = nodes_to_load[0].parent if nodes_to_load else last_hit_node
         result = self.inc_lock_ref(ancestor_node)
+        ancestor_lock_params = result.to_dec_params()
         kv_tokens = len(kv_xfer.host_indices)
 
         # Build aux transfers, keyed per component.
@@ -1233,7 +1253,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
-            self.dec_lock_ref(ancestor_node)
+            self.dec_lock_ref(ancestor_node, ancestor_lock_params)
             return None
 
         avail = self.token_to_kv_pool_allocator.available_size()
@@ -1241,7 +1261,7 @@ class UnifiedRadixCache(BasePrefixCache):
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
             if result.num_tokens_evicted < needed:
-                self.dec_lock_ref(ancestor_node)
+                self.dec_lock_ref(ancestor_node, ancestor_lock_params)
                 return None
 
         # Load H→D
@@ -1253,7 +1273,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pools=aux_xfers or None,
         )
 
-        self.dec_lock_ref(ancestor_node)
+        self.dec_lock_ref(ancestor_node, ancestor_lock_params)
         if device_indices is None:
             return None
 
@@ -1272,8 +1292,10 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         self._update_evictable_leaf_sets(ancestor_node)
-        self.inc_lock_ref(last_hit_node)
-        self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        self.ongoing_load_back[last_hit_node.id] = (
+            last_hit_node,
+            self.inc_lock_ref(last_hit_node).to_dec_params(),
+        )
         return device_indices
 
     def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
@@ -1302,7 +1324,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 for _, finish_event, ack_list in cc.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        self.ongoing_write_through.pop(ack_id, None)
+                        entry = self.ongoing_write_through.pop(ack_id, None)
+                        if entry is not None:
+                            node, params = entry
+                            if params is not None:
+                                self.dec_lock_ref(node, params)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -1329,8 +1355,8 @@ class UnifiedRadixCache(BasePrefixCache):
             _, finish_event, ack_list = cc.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                node = self.ongoing_write_through.pop(ack_id)
-                self.dec_lock_ref(node)
+                node, params = self.ongoing_write_through.pop(ack_id)
+                self.dec_lock_ref(node, params)
             finish_count -= 1
 
     def loading_check(self) -> None:
@@ -1344,8 +1370,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 break
             finish_count += 1
             for ack_id in ack_list:
-                node = self.ongoing_load_back.pop(ack_id)
-                self.dec_lock_ref(node)
+                node, lock_params = self.ongoing_load_back.pop(ack_id)
+                self.dec_lock_ref(node, lock_params)
         del cc.ack_load_queue[:finish_count]
 
     # ---- HiCache: Scheduler Entry Points ----
@@ -1375,7 +1401,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 last_node = last_node.parent
 
         return (
-            torch.empty((0,), dtype=torch.int64, device=self.device),
+            self._empty_match_result.device_indices,
             last_node,
         )
 
@@ -1752,14 +1778,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
 
         # ── PART 5: Ongoing Operations ──
-        for nid, n in self.ongoing_write_through.items():
+        for nid, (n, _) in self.ongoing_write_through.items():
             if n not in all_node_set:
                 E(f"[Ongoing] write_through node {nid} not in tree")
             elif n.component_data[FCT].lock_ref <= 0:
                 E(
                     f"[Ongoing] write_through node {nid} lock_ref={n.component_data[FCT].lock_ref}"
                 )
-        for nid, n in self.ongoing_load_back.items():
+        for nid, (n, _) in self.ongoing_load_back.items():
             if n not in all_node_set:
                 E(f"[Ongoing] load_back node {nid} not in tree")
             elif n.component_data[FCT].lock_ref <= 0:

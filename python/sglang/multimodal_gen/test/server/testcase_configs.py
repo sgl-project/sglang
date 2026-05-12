@@ -442,6 +442,9 @@ HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
 MODELOPT_FLUX1_FP8_TRANSFORMER = "lmsys/flux1-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX2_FP8_TRANSFORMER = "lmsys/flux2-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_WAN22_FP8_TRANSFORMER = "lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
+MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER = (
+    "lmsys/hunyuanvideo-modelopt-fp8-sglang-transformer"
+)
 MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER = "lmsys/qwen-image-modelopt-fp8-sglang-transformer"
 MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER = (
     "lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer"
@@ -489,6 +492,8 @@ def _with_default_num_gpus(
 
 
 # Load global configuration
-BASELINE_CONFIG = BaselineConfig.load(
-    Path(__file__).with_name("perf_baselines.json")
-).update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")
+BASELINE_CONFIG = (
+    BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+    .update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")
+    .update(Path(__file__).parent / "musa" / "perf_baselines_musa.json")
+)

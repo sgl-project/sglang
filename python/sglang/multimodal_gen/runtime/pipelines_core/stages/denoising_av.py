@@ -7,6 +7,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
     clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
     LTX2DenoisingStage,
 )
@@ -137,6 +140,14 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                 memory_intensive=True,
             )
         ]
+
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        # Stage 2 is distilled and always runs with CFG disabled, so non-main
+        # CFG ranks should wait at a barrier rather than run a redundant forward.
+        if self.server_args.enable_cfg_parallel:
+            return StageParallelismType.MAIN_RANK_ONLY
+        return StageParallelismType.REPLICATED
 
     @staticmethod
     def _randn_like_with_batch_generators(
@@ -343,12 +354,11 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
 
         scheduler = clone_scheduler_runtime(original_batch_scheduler or self.scheduler)
         distilled_device = scheduler.sigmas.device
+        num_steps = len(self.distilled_sigmas) - 1
         # Inject `0.0011` before the terminal `0.0` to avoid the
         # `sigma_next==0` singularity in res2s' `(sample - denoised) /
-        # (sigma - sigma_next)`. Official `res2s_denoising_loop` does this
-        # exact injection (samplers.py:262); official `euler_denoising_loop`
-        # does NOT — it uses `sigma_next` directly. So gate on the active
-        # sampler, not on the model variant.
+        # (sigma - sigma_next)`. This changes the final sigma pair only; it
+        # must not add an extra denoising timestep.
         if self.sampler_name == "res2s" and self.distilled_sigmas[-1].item() == 0.0:
             scheduler_sigmas = torch.cat(
                 [
@@ -361,7 +371,6 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             scheduler_sigmas = self.distilled_sigmas
 
         scheduler.sigmas = scheduler_sigmas
-        num_steps = len(self.distilled_sigmas) - 1
         scheduler.num_inference_steps = num_steps
         scheduler.timesteps = (self.distilled_sigmas[:num_steps] * 1000).to(
             distilled_device

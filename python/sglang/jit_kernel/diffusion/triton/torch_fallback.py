@@ -48,6 +48,9 @@ def apply_rotary_embedding_native(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
 ) -> torch.Tensor:
     """Native fallback for rotary embedding (shared with NPU implementation)."""
+    if interleaved and cos.shape[-1] == x.shape[-1]:
+        cos = cos[..., ::2]
+        sin = sin[..., ::2]
     cos = cos.unsqueeze(-2).to(x.dtype)
     sin = sin.unsqueeze(-2).to(x.dtype)
     x1 = x[..., ::2]

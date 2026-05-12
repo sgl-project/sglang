@@ -453,7 +453,9 @@ class ComponentResidencyManager:
             return
         strategy = self.strategy_for(use.component_name, module)
         self._trace("finish", use, strategy, module)
+        was_on_cuda = self._module_on_cuda(module)
         strategy.finish_use(module, use, self.state)
+        self._empty_cache_after_large_release(use, strategy, module, was_on_cuda)
 
     def finish_request(self) -> None:
         if not self.enabled and not self._uses_seen and self._active_use is None:
@@ -492,7 +494,11 @@ class ComponentResidencyManager:
             else:
                 action = "request_resident" if preferred else "request_finish"
                 self._trace(action, use, strategy, module)
+                was_on_cuda = self._module_on_cuda(module)
                 strategy.finish_request(module, use, self.state, preferred=preferred)
+                self._empty_cache_after_large_release(
+                    use, strategy, module, was_on_cuda
+                )
         self._trace("request_end")
 
     def stage_name(self, stage: ComponentResidencyStage) -> str:
@@ -651,6 +657,28 @@ class ComponentResidencyManager:
             return param.device.type
         buffer = next(module.buffers(), None)
         return buffer.device.type if buffer is not None else None
+
+    def _module_on_cuda(self, module: nn.Module | None) -> bool:
+        return self._module_device(module) == "cuda"
+
+    def _empty_cache_after_large_release(
+        self,
+        use: ComponentUse,
+        strategy: ComponentResidencyStrategy,
+        module: nn.Module,
+        was_on_cuda: bool,
+    ) -> None:
+        """explicitly empty cache after potential release of large component"""
+        if not use.memory_intensive:
+            return
+        released_cuda_storage = was_on_cuda and not self._module_on_cuda(module)
+        released_layerwise_storage = isinstance(strategy, LayerwiseOffloadStrategy)
+        if not (released_cuda_storage or released_layerwise_storage):
+            return
+        if not torch.get_device_module().is_available():
+            return
+        torch.get_device_module().empty_cache()
+        self._trace("empty_cache", use, strategy, module, detail="after_release")
 
 
 _GLOBAL_COMPONENT_RESIDENCY_MANAGER: ComponentResidencyManager | None = None
