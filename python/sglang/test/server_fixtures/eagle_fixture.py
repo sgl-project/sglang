@@ -37,9 +37,10 @@ class EagleServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_SPEC_NAN_DETECTION.override(
-            True
-        ), envs.SGLANG_SPEC_OOB_DETECTION.override(True):
+        with (
+            envs.SGLANG_SPEC_NAN_DETECTION.override(True),
+            envs.SGLANG_SPEC_OOB_DETECTION.override(True),
+        ):
             cls.process = popen_launch_server(
                 cls.target_model,
                 cls.base_url,

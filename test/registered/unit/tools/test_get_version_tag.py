@@ -50,11 +50,14 @@ class TestGetVersionTag(unittest.TestCase):
         )
 
     def test_exact_version_tag_takes_precedence_over_latest_tag(self):
-        with patch.object(
-            self.version_helper, "get_exact_version_tag", return_value="v0.5.9"
-        ), patch.object(
-            self.version_helper, "get_latest_version_tag_describe"
-        ) as latest_describe:
+        with (
+            patch.object(
+                self.version_helper, "get_exact_version_tag", return_value="v0.5.9"
+            ),
+            patch.object(
+                self.version_helper, "get_latest_version_tag_describe"
+            ) as latest_describe,
+        ):
             self.assertEqual(self.version_helper.get_version_describe(), "v0.5.9")
 
         latest_describe.assert_not_called()
@@ -68,15 +71,16 @@ class TestGetVersionTag(unittest.TestCase):
                 self.assertIn(FALLBACK_VERSION, content)
 
     def test_tag_only_cli_mode_remains_available_for_callers_that_need_latest_tag(self):
-        with patch.object(
-            sys, "argv", ["get_version_tag.py", "--tag-only"]
-        ), patch.object(
-            self.version_helper, "get_latest_version_tag", return_value="v0.5.10"
-        ), patch.object(
-            self.version_helper, "get_version_describe"
-        ) as version_describe, patch(
-            "builtins.print"
-        ) as print_mock:
+        with (
+            patch.object(sys, "argv", ["get_version_tag.py", "--tag-only"]),
+            patch.object(
+                self.version_helper, "get_latest_version_tag", return_value="v0.5.10"
+            ),
+            patch.object(
+                self.version_helper, "get_version_describe"
+            ) as version_describe,
+            patch("builtins.print") as print_mock,
+        ):
             self.version_helper.main()
 
         version_describe.assert_not_called()

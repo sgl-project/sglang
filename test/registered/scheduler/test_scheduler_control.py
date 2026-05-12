@@ -331,9 +331,10 @@ class TestAbortWithRunningTimeout(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(
-            0.001
-        ), envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.override(False):
+        with (
+            envs.SGLANG_REQ_RUNNING_TIMEOUT.override(0.001),
+            envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.override(False),
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

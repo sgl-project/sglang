@@ -1559,9 +1559,10 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture(
-        stream=stream
-    ) as context, get_pp_group().graph_capture(context):
+    with (
+        get_tp_group().graph_capture(stream=stream) as context,
+        get_pp_group().graph_capture(context),
+    ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP)}
             for group in (_MOE_EP, _MOE_TP):

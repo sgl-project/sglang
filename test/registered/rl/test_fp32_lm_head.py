@@ -86,8 +86,9 @@ class TestLMHeadFP32(unittest.TestCase):
                 state.update(called=True, ooperationp="linear", a=x.dtype, b=w.dtype)
             return original_linear(x, w, bias)
 
-        with patch("torch.matmul", new=probe_matmul), patch(
-            "torch.nn.functional.linear", new=probe_linear
+        with (
+            patch("torch.matmul", new=probe_matmul),
+            patch("torch.nn.functional.linear", new=probe_linear),
         ):
             logits = logprocessor._get_logits(hidden_state, head, meta)
         self.assertEqual(hidden_state.dtype, hidden_state_dtype)

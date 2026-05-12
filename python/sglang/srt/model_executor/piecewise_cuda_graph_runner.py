@@ -488,9 +488,10 @@ class PiecewiseCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context:
+        with (
+            freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
+            graph_capture() as graph_capture_context,
+        ):
             stream = graph_capture_context.stream
             with set_pcg_capture_stream(stream):
                 avail_mem = get_available_gpu_memory(

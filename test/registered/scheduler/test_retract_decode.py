@@ -31,9 +31,10 @@ class TestRetractDecode(CustomTestCase):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         launch_args = ["--chunked-prefill-size", "128"] + cls.other_args
-        with envs.SGLANG_TEST_RETRACT.override(
-            True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
+        with (
+            envs.SGLANG_TEST_RETRACT.override(True),
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

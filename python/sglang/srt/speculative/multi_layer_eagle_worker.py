@@ -193,9 +193,10 @@ class MultiLayerEagleWorker(TpModelWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.mtp_model_runner(0).tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+            speculative_moe_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -265,9 +266,10 @@ class MultiLayerEagleWorker(TpModelWorker):
                 seq_lens_cpu,
                 can_run_cuda_graph,
             ) = self.forward_target_extend(batch)
-            with self.draft_tp_context(
-                self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            with (
+                self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+                speculative_moe_backend_context(),
+            ):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
@@ -278,16 +280,18 @@ class MultiLayerEagleWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
-            with self.draft_tp_context(
-                self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            with (
+                self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+                speculative_moe_backend_context(),
+            ):
                 verify_input = self.draft(batch)
             batch.spec_info = verify_input
             logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
 
-            with self.draft_tp_context(
-                self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            with (
+                self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+                speculative_moe_backend_context(),
+            ):
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 draft_extend_input = verify_output.draft_extend_input
