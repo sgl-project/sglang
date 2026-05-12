@@ -26,12 +26,7 @@ from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(
-    est_time=85,
-    suite="nightly-1-gpu-5090",
-    nightly=True,
-    tags=("scoring",),
-)
+register_cuda_ci(est_time=85, suite="stage-b-test-1-gpu-small")
 
 _CAUSAL_LM_MODEL = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 _SEQCLS_MODEL = os.environ.get("TEST_CLASSIFICATION_BASE_MODEL", "Qwen/Qwen3-0.6B")
