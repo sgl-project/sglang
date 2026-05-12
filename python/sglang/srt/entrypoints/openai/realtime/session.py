@@ -309,7 +309,19 @@ class RealtimeConnection:
                     param="session.audio.input.format.rate",
                 )
                 return
-            self.input_sample_rate = fmt.rate or DEFAULT_INPUT_SAMPLE_RATE
+            new_rate = fmt.rate or DEFAULT_INPUT_SAMPLE_RATE
+            # Changing the rate mid-item would leave already-buffered PCM
+            # at the old rate mixed with new audio at the new rate, so
+            # require the client to commit or clear before switching.
+            if new_rate != self.input_sample_rate and self.pcm_buffer:
+                await self._send_error(
+                    "invalid_state",
+                    "Cannot change audio.input.format.rate while audio is "
+                    "buffered; commit or clear the current item first.",
+                    param="session.audio.input.format.rate",
+                )
+                return
+            self.input_sample_rate = new_rate
 
         if audio.turn_detection is not None:
             await self._send_error(
@@ -420,8 +432,10 @@ class RealtimeConnection:
                 )
             return True
 
-        # One inference per chunk_size_bytes of NEW audio. A big append
-        # spanning multiple chunks fires only one inference.
+        # One inference per chunk_size_bytes of NEW audio. _run_inference
+        # processes the full cumulative buffer (prefix injection handles
+        # the already-emitted transcript), so a burst spanning multiple
+        # chunks still only needs one call.
         new_audio_bytes = len(self.pcm_buffer) - self.last_inference_offset
         if new_audio_bytes >= self.chunk_size_bytes:
             await self._run_inference(is_last=False)
@@ -557,12 +571,16 @@ class RealtimeConnection:
         return True
 
     async def _emit_transcription_delta(self, delta: str) -> None:
-        """One event per word so clients see streaming cadence."""
+        """One event per word so clients see streaming cadence. Non-first
+        deltas get a leading space so a client that concatenates them
+        cumulatively reconstructs the sentence ("a b c") rather than
+        running them together ("abc")."""
         if not delta:
             return
         for word in delta.split(" "):
             if not word:
                 continue
+            formatted = word if not self.emitted_words else f" {word}"
             self.emitted_words.append(word)
             await self._send(
                 ConversationItemInputAudioTranscriptionDeltaEvent(
@@ -570,7 +588,7 @@ class RealtimeConnection:
                     type="conversation.item.input_audio_transcription.delta",
                     item_id=self.current_item_id,
                     content_index=0,
-                    delta=word,
+                    delta=formatted,
                 )
             )
 
