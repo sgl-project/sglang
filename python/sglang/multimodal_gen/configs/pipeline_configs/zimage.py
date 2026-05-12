@@ -17,7 +17,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     TextConditioningOutput,
     pad_text_embeddings_with_mask,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config_config import (
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
