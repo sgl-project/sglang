@@ -346,14 +346,14 @@ def add_output_logprobs_for_spec_v1(
 
     top_logprobs_nums = batch.top_logprobs_nums
     token_ids_logprobs = batch.token_ids_logprobs
-    accepted_indices = res.accepted_indices
-    assert len(accepted_indices) == len(logits_output.next_token_logits)
+    accept_indices = res.accept_indices
+    assert len(accept_indices) == len(logits_output.next_token_logits)
 
     temperatures = batch.sampling_info.temperatures
     num_draft_tokens = batch.spec_info.draft_token_num
     # acceptance indices are the indices in a "flattened" batch.
     # dividing it to num_draft_tokens will yield the actual batch index.
-    temperatures = temperatures[accepted_indices // num_draft_tokens]
+    temperatures = temperatures[accept_indices // num_draft_tokens]
     if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
         logprobs = torch.nn.functional.log_softmax(
             logits_output.next_token_logits, dim=-1
