@@ -673,9 +673,7 @@ class EagleDraftWorker(BaseDraftWorker):
             self._draft_forward_steps(forward_batch)
         )
 
-        score_list = [ti[0] for ti in tree_info_list]
-        token_list = [ti[1] for ti in tree_info_list]
-        parents_list = [ti[2] for ti in tree_info_list]
+        score_list, token_list, parents_list = zip(*tree_info_list)
 
         # Organize the results
         score_list = torch.cat(score_list, dim=1).flatten(
