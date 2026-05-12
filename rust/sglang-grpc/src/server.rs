@@ -2,89 +2,24 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc::Receiver, Notify, OwnedSemaphorePermit};
-use tokio::time::{timeout, Duration};
+use tokio::sync::{Notify, mpsc::Receiver};
+use tokio::time::{Duration, timeout};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::bridge::{PyBridge, ResponseChunk};
 use crate::proto;
+use crate::utils::{
+    extract_model_path, now_timestamp, sampling_params_to_map, trace_headers_to_json,
+};
 
 pub struct SglangServiceImpl {
     pub bridge: Arc<PyBridge>,
     pub shutdown: Arc<Notify>,
 }
 
-/// Convert proto SamplingParams to a serde_json map (used as Python dict via PyO3).
-fn sampling_params_to_map(params: &Option<proto::SamplingParams>) -> serde_json::Value {
-    match params {
-        Some(p) => {
-            let mut map = serde_json::Map::new();
-            if let Some(v) = p.temperature {
-                map.insert("temperature".into(), serde_json::json!(v));
-            }
-            if let Some(v) = p.top_p {
-                map.insert("top_p".into(), serde_json::json!(v));
-            }
-            if let Some(v) = p.top_k {
-                map.insert("top_k".into(), serde_json::json!(v));
-            }
-            if let Some(v) = p.min_p {
-                map.insert("min_p".into(), serde_json::json!(v));
-            }
-            if let Some(v) = p.frequency_penalty {
-                map.insert("frequency_penalty".into(), serde_json::json!(v));
-            }
-            if let Some(v) = p.presence_penalty {
-                map.insert("presence_penalty".into(), serde_json::json!(v));
-            }
-            if let Some(v) = p.repetition_penalty {
-                map.insert("repetition_penalty".into(), serde_json::json!(v));
-            }
-            if let Some(v) = p.max_new_tokens {
-                map.insert("max_new_tokens".into(), serde_json::json!(v));
-            }
-            if let Some(v) = p.min_new_tokens {
-                map.insert("min_new_tokens".into(), serde_json::json!(v));
-            }
-            if !p.stop.is_empty() {
-                map.insert("stop".into(), serde_json::json!(p.stop));
-            }
-            if !p.stop_token_ids.is_empty() {
-                map.insert("stop_token_ids".into(), serde_json::json!(p.stop_token_ids));
-            }
-            if let Some(v) = p.ignore_eos {
-                map.insert("ignore_eos".into(), serde_json::json!(v));
-            }
-            if let Some(v) = p.n {
-                map.insert("n".into(), serde_json::json!(v));
-            }
-            if let Some(ref v) = p.json_schema {
-                map.insert("json_schema".into(), serde_json::json!(v));
-            }
-            if let Some(ref v) = p.regex {
-                map.insert("regex".into(), serde_json::json!(v));
-            }
-            serde_json::Value::Object(map)
-        }
-        None => serde_json::Value::Object(serde_json::Map::new()),
-    }
-}
-
-fn trace_headers_to_json(headers: &HashMap<String, String>) -> Option<serde_json::Value> {
-    if headers.is_empty() {
-        None
-    } else {
-        Some(serde_json::json!(headers))
-    }
-}
-
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
-/// How long an inference RPC will wait for a concurrency slot before returning
-/// RESOURCE_EXHAUSTED. 30 s is generous enough to absorb short saturation spikes
-/// while still giving clients a timely signal under sustained overload.
-const ADMIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn recv_chunk_with_timeout(
     receiver: &mut Receiver<ResponseChunk>,
@@ -93,29 +28,6 @@ async fn recv_chunk_with_timeout(
     timeout(RESPONSE_TIMEOUT, receiver.recv())
         .await
         .map_err(|_| Status::deadline_exceeded(timeout_message))
-}
-
-/// Acquire `n_tokens` permits from the prefill token-budget semaphore.
-///
-/// `n_tokens` is currently derived from the request's `max_new_tokens`. The
-/// semaphore capacity is derived from `max_total_num_tokens`, but because
-/// permits are released on the first response token this is only a coarse
-/// weighted prefill-admission guard, not a true KV-occupancy limit.
-///
-/// Returns `Err(Status::resource_exhausted(...))` when `ADMIT_TIMEOUT` elapses
-/// before enough permits are available; the client should retry with backoff.
-async fn acquire_inference_slot(
-    bridge: &Arc<PyBridge>,
-    n_tokens: u32,
-) -> Result<Option<OwnedSemaphorePermit>, Status> {
-    bridge
-        .acquire_slot(n_tokens, ADMIT_TIMEOUT)
-        .await
-        .map_err(|_| {
-            Status::resource_exhausted(
-                "prefill admission budget exhausted; server is overloaded — retry after backoff",
-            )
-        })
 }
 
 async fn recv_required_chunk(
@@ -145,18 +57,6 @@ fn openai_status_code(meta_info: &HashMap<String, String>, default: i32) -> i32 
         .get("status_code")
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(default)
-}
-
-fn extract_model_path(json_info: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(json_info)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("model_path")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-        })
-        .unwrap_or_default()
 }
 
 /// Build a request dict for GenerateReqInput from proto TextGenerateRequest fields.
@@ -307,13 +207,6 @@ fn build_classify_dict(
     d
 }
 
-fn now_timestamp() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
-}
-
 #[tonic::async_trait]
 impl proto::sglang_service_server::SglangService for SglangServiceImpl {
     // ==================================================================
@@ -327,13 +220,6 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         request: Request<proto::TextGenerateRequest>,
     ) -> Result<Response<Self::TextGenerateStream>, Status> {
         let req = request.into_inner();
-        let n_tokens = req
-            .sampling_params
-            .as_ref()
-            .and_then(|p| p.max_new_tokens)
-            .unwrap_or(512)
-            .max(1) as u32;
-        let permit = acquire_inference_slot(&self.bridge, n_tokens).await?;
         let rid = req
             .rid
             .clone()
@@ -349,14 +235,9 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let rid_clone = rid.clone();
 
         let stream = async_stream::stream! {
-            // Release the permit after the first chunk (prefill done, now in decode).
-            // This lets the next queued request enter prefill while this one decodes,
-            // so the semaphore bounds prefill-queue depth rather than total concurrency.
-            let mut permit = Some(permit);
             loop {
                 match recv_chunk_with_timeout(&mut receiver, "Stream chunk timed out").await {
                     Ok(Some(ResponseChunk::Data(data))) => {
-                        permit.take(); // drop on first token — prefill complete
                         yield Ok(proto::TextGenerateResponse {
                             text: data.text.unwrap_or_default(),
                             meta_info: data.meta_info,
@@ -364,7 +245,6 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         });
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
-                        permit.take(); // also covers single-chunk (non-streaming) responses
                         yield Ok(proto::TextGenerateResponse {
                             text: data.text.unwrap_or_default(),
                             meta_info: data.meta_info,
@@ -373,17 +253,14 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         break;
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
-                        permit.take();
                         yield Err(Status::internal(msg));
                         break;
                     }
                     Ok(None) => {
-                        permit.take();
                         yield Err(closed_stream_status(&bridge, &rid_clone));
                         break;
                     }
                     Err(status) => {
-                        permit.take();
                         let _ = bridge.abort(&rid_clone, false);
                         yield Err(status);
                         break;
@@ -402,13 +279,6 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         request: Request<proto::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let req = request.into_inner();
-        let n_tokens = req
-            .sampling_params
-            .as_ref()
-            .and_then(|p| p.max_new_tokens)
-            .unwrap_or(512)
-            .max(1) as u32;
-        let permit = acquire_inference_slot(&self.bridge, n_tokens).await?;
         let rid = req
             .rid
             .clone()
@@ -424,11 +294,9 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let rid_clone = rid.clone();
 
         let stream = async_stream::stream! {
-            let mut permit = Some(permit); // released on first token (prefill done)
             loop {
                 match recv_chunk_with_timeout(&mut receiver, "Stream chunk timed out").await {
                     Ok(Some(ResponseChunk::Data(data))) => {
-                        permit.take();
                         yield Ok(proto::GenerateResponse {
                             output_ids: data.output_ids.unwrap_or_default(),
                             meta_info: data.meta_info,
@@ -436,7 +304,6 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         });
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
-                        permit.take();
                         yield Ok(proto::GenerateResponse {
                             output_ids: data.output_ids.unwrap_or_default(),
                             meta_info: data.meta_info,
@@ -445,17 +312,14 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         break;
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
-                        permit.take();
                         yield Err(Status::internal(msg));
                         break;
                     }
                     Ok(None) => {
-                        permit.take();
                         yield Err(closed_stream_status(&bridge, &rid_clone));
                         break;
                     }
                     Err(status) => {
-                        permit.take();
                         let _ = bridge.abort(&rid_clone, false);
                         yield Err(status);
                         break;
@@ -475,8 +339,6 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         request: Request<proto::TextEmbedRequest>,
     ) -> Result<Response<proto::TextEmbedResponse>, Status> {
-        let _permit = acquire_inference_slot(&self.bridge, 1).await?;
-
         let req = request.into_inner();
         let rid = req
             .rid
@@ -506,8 +368,6 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         request: Request<proto::EmbedRequest>,
     ) -> Result<Response<proto::EmbedResponse>, Status> {
-        let _permit = acquire_inference_slot(&self.bridge, 1).await?;
-
         let req = request.into_inner();
         let rid = req
             .rid
@@ -541,8 +401,6 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         request: Request<proto::ClassifyRequest>,
     ) -> Result<Response<proto::ClassifyResponse>, Status> {
-        let _permit = acquire_inference_slot(&self.bridge, 1).await?;
-
         let req = request.into_inner();
         let rid = req
             .rid
@@ -938,13 +796,6 @@ impl SglangServiceImpl {
         method_name: &str,
     ) -> Result<Response<StreamResult<proto::OpenAiStreamChunk>>, Status> {
         let req = request.into_inner();
-        // Best-effort parse of max_tokens from OpenAI JSON body; fall back to 512.
-        let n_tokens: u32 = serde_json::from_slice::<serde_json::Value>(&req.json_body)
-            .ok()
-            .and_then(|v| v.get("max_tokens").and_then(|t| t.as_u64()))
-            .unwrap_or(512)
-            .max(1) as u32;
-        let permit = acquire_inference_slot(&self.bridge, n_tokens).await?;
         let rid = uuid::Uuid::new_v4().to_string();
 
         let mut receiver = self
@@ -956,18 +807,15 @@ impl SglangServiceImpl {
         let rid_clone = rid.clone();
 
         let stream = async_stream::stream! {
-            let mut permit = Some(permit); // released on first token (prefill done)
             loop {
                 match recv_chunk_with_timeout(&mut receiver, "Stream chunk timed out").await {
                     Ok(Some(ResponseChunk::Data(data))) => {
-                        permit.take();
                         yield Ok(proto::OpenAiStreamChunk {
                             json_chunk: data.json_bytes.unwrap_or_default(),
                             finished: false,
                         });
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
-                        permit.take();
                         let bytes = data.json_bytes.unwrap_or_default();
                         yield Ok(proto::OpenAiStreamChunk {
                             json_chunk: bytes,
@@ -976,17 +824,14 @@ impl SglangServiceImpl {
                         break;
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
-                        permit.take();
                         yield Err(Status::internal(msg));
                         break;
                     }
                     Ok(None) => {
-                        permit.take();
                         yield Err(closed_stream_status(&bridge, &rid_clone));
                         break;
                     }
                     Err(status) => {
-                        permit.take();
                         let _ = bridge.abort(&rid_clone, false);
                         yield Err(status);
                         break;
@@ -1003,8 +848,6 @@ impl SglangServiceImpl {
         request: Request<proto::OpenAiRequest>,
         method_name: &str,
     ) -> Result<Response<proto::OpenAiResponse>, Status> {
-        let _permit = acquire_inference_slot(&self.bridge, 1).await?;
-
         let req = request.into_inner();
         let rid = uuid::Uuid::new_v4().to_string();
 
@@ -1048,26 +891,6 @@ async fn recv_json_response(mut receiver: Receiver<ResponseChunk>) -> Result<Str
 }
 
 /// Start the Tonic gRPC server on the given address.
-///
-/// # Why not `tower::limit::ConcurrencyLimitLayer`?
-///
-/// Tonic is built on Tower, so one might reach for
-/// `Server::builder().layer(ConcurrencyLimitLayer::new(n))` as a two-line solution.
-/// It is intentionally NOT used here for two reasons:
-///
-/// 1. **Scope**: a Tower layer applied at the server level gates *all* RPCs, including
-///    lightweight ones like `HealthCheck`, `Tokenize`, `GetModelInfo`, and `Abort`.
-///    Those must remain unconditionally available even under full saturation (health
-///    probes from Kubernetes, abort requests from clients, etc.). The semaphore in
-///    [`PyBridge`] is applied only inside the inference RPC handlers
-///    (`text_generate`, `generate`, `*embed`, `classify`, and the OpenAI pass-throughs),
-///    leaving control-plane RPCs completely unaffected.
-///
-/// 2. **Granularity**: `ConcurrencyLimitLayer` counts concurrent *connections* or
-///    *requests at the transport level*, not concurrent requests that are actually
-///    in-flight to the Python scheduler. The semaphore tracks exactly one permit per
-///    live scheduler request, so the cap maps directly onto GPU concurrency rather
-///    than an approximation of it.
 pub async fn run_grpc_server(
     addr: std::net::SocketAddr,
     bridge: Arc<PyBridge>,
@@ -1100,8 +923,7 @@ mod tests {
 
     #[test]
     fn openai_status_code_uses_forwarded_status_when_present() {
-        let meta_info =
-            HashMap::from([(String::from("status_code"), String::from("429"))]);
+        let meta_info = HashMap::from([(String::from("status_code"), String::from("429"))]);
         assert_eq!(openai_status_code(&meta_info, 200), 429);
     }
 
@@ -1109,8 +931,7 @@ mod tests {
     fn openai_status_code_falls_back_when_missing_or_invalid() {
         assert_eq!(openai_status_code(&HashMap::new(), 200), 200);
 
-        let meta_info =
-            HashMap::from([(String::from("status_code"), String::from("not-an-int"))]);
+        let meta_info = HashMap::from([(String::from("status_code"), String::from("not-an-int"))]);
         assert_eq!(openai_status_code(&meta_info, 200), 200);
     }
 }

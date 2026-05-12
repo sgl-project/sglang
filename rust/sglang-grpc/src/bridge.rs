@@ -1,13 +1,12 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::time::Duration;
 
 use crate::tokenizer::RustTokenizer;
+use crate::utils::{json_map_to_pydict, py_value_to_json_string};
 
 #[derive(Debug, Clone)]
 pub enum ResponseChunk {
@@ -32,12 +31,6 @@ pub struct PyBridge {
     terminal_errors: Arc<Mutex<HashMap<String, String>>>,
     rust_tokenizer: Option<RustTokenizer>,
     context_len: i32,
-    /// Coarse prefill-admission semaphore: each inference RPC acquires a weighted
-    /// cost before submission and may release it on the first response token.
-    /// This is not a true KV-occupancy limiter because decode can continue after
-    /// the permit is dropped.
-    semaphore: Option<Arc<Semaphore>>,
-    semaphore_capacity: Option<u32>,
 }
 
 impl PyBridge {
@@ -45,8 +38,6 @@ impl PyBridge {
         runtime_handle: PyObject,
         rust_tokenizer: Option<RustTokenizer>,
         context_len: i32,
-        semaphore: Option<Arc<Semaphore>>,
-        semaphore_capacity: Option<u32>,
     ) -> Self {
         Self {
             runtime_handle,
@@ -54,8 +45,6 @@ impl PyBridge {
             terminal_errors: Arc::new(Mutex::new(HashMap::new())),
             rust_tokenizer,
             context_len,
-            semaphore,
-            semaphore_capacity,
         }
     }
 
@@ -67,39 +56,6 @@ impl PyBridge {
     /// Return the model's context length.
     pub fn context_len(&self) -> i32 {
         self.context_len
-    }
-
-    /// Attempt to acquire an inference concurrency slot before submitting to Python.
-    ///
-    /// - `Ok(None)`         — no limit configured; caller proceeds unconditionally.
-    /// - `Ok(Some(permit))` — limit configured and slot acquired; caller must hold
-    ///                        the permit until its chosen release point.
-    /// - `Err(())`          — limit configured but `deadline` elapsed before a slot
-    ///                        was free; caller should return `RESOURCE_EXHAUSTED`.
-    /// Acquire `n_tokens` permits from the prefill-budget semaphore.
-    ///
-    /// `n_tokens` is a caller-defined weight. The semaphore capacity is derived from
-    /// the configured budget, and oversized requests are clamped to that total
-    /// capacity so they can still make forward progress.
-    pub async fn acquire_slot(
-        &self,
-        n_tokens: u32,
-        deadline: Duration,
-    ) -> Result<Option<OwnedSemaphorePermit>, ()> {
-        match &self.semaphore {
-            None => Ok(None),
-            Some(sem) => {
-                // Clamp to semaphore capacity so a single over-sized request
-                // can always make progress (rather than deadlocking).
-                let n = n_tokens
-                    .min(self.semaphore_capacity.unwrap_or(u32::MAX))
-                    .max(1);
-                tokio::time::timeout(deadline, Arc::clone(sem).acquire_many_owned(n))
-                    .await
-                    .map(|r| Some(r.expect("inference semaphore was unexpectedly closed")))
-                    .map_err(|_| ())
-            }
-        }
     }
 
     // ------------------------------------------------------------------
@@ -568,53 +524,6 @@ impl PyBridge {
     }
 }
 
-// ======================================================================
-// Convert serde_json::Value map to PyDict
-// ======================================================================
-
-fn json_value_to_py<'py>(py: Python<'py>, v: &serde_json::Value) -> PyResult<PyObject> {
-    match v {
-        serde_json::Value::Null => Ok(py.None()),
-        serde_json::Value::Bool(b) => Ok(b.into_pyobject(py)?.to_owned().into_any().unbind()),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(i.into_pyobject(py)?.into_any().unbind())
-            } else if let Some(f) = n.as_f64() {
-                Ok(f.into_pyobject(py)?.into_any().unbind())
-            } else {
-                Ok(py.None())
-            }
-        }
-        serde_json::Value::String(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
-        serde_json::Value::Array(arr) => {
-            let items: Vec<PyObject> = arr
-                .iter()
-                .map(|item| json_value_to_py(py, item))
-                .collect::<PyResult<_>>()?;
-            let py_list = PyList::new(py, &items)?;
-            Ok(py_list.into_any().unbind())
-        }
-        serde_json::Value::Object(map) => {
-            let py_dict = PyDict::new(py);
-            for (k, val) in map {
-                py_dict.set_item(k, json_value_to_py(py, val)?)?;
-            }
-            Ok(py_dict.into_any().unbind())
-        }
-    }
-}
-
-fn json_map_to_pydict<'py>(
-    py: Python<'py>,
-    map: &HashMap<String, serde_json::Value>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let py_dict = PyDict::new(py);
-    for (k, v) in map {
-        py_dict.set_item(k, json_value_to_py(py, v)?)?;
-    }
-    Ok(py_dict)
-}
-
 fn close_channel_with_error(
     py: Python<'_>,
     rid: &str,
@@ -857,8 +766,10 @@ fn extract_meta_info(chunk: &Bound<'_, PyDict>) -> HashMap<String, String> {
     if let Ok(Some(meta_obj)) = chunk.get_item("meta_info") {
         if let Ok(meta_dict) = meta_obj.downcast::<PyDict>() {
             for (k, v) in meta_dict.iter() {
-                if let (Ok(key), Ok(val)) = (k.extract::<String>(), v.str()) {
-                    meta.insert(key, val.to_string());
+                if let Ok(key) = k.extract::<String>() {
+                    if let Ok(val) = py_value_to_json_string(&v) {
+                        meta.insert(key, val);
+                    }
                 }
             }
         }

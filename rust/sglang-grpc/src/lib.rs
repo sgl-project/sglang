@@ -1,6 +1,7 @@
 pub mod bridge;
 pub mod server;
 pub mod tokenizer;
+pub mod utils;
 
 pub mod proto {
     tonic::include_proto!("sglang.runtime.v1");
@@ -9,7 +10,7 @@ pub mod proto {
 use pyo3::prelude::*;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 
 use bridge::PyBridge;
 use tokenizer::RustTokenizer;
@@ -63,24 +64,6 @@ fn extract_tokenizer_info(runtime_handle: &PyObject) -> (Option<String>, i32) {
     })
 }
 
-/// Read `max_total_num_tokens` from the scheduler via the Python bridge's
-/// `get_server_info()` method.  Returns `None` if the field is absent or the
-/// call fails (caller should fall back to a safe static default).
-fn read_max_total_num_tokens(runtime_handle: &PyObject) -> Option<usize> {
-    let json_str: String = Python::with_gil(|py| {
-        runtime_handle
-            .call_method0(py, "get_server_info")
-            .ok()
-            .and_then(|v| v.extract::<String>(py).ok())
-    })?;
-
-    let v: serde_json::Value = serde_json::from_str(&json_str).ok()?;
-    // scheduler_info is merged flat into the JSON by grpc_bridge.py
-    v.get("max_total_num_tokens")
-        .and_then(|x| x.as_u64())
-        .map(|x| x as usize)
-}
-
 /// Start the gRPC server in a background thread with its own Tokio runtime.
 ///
 /// Args:
@@ -91,19 +74,13 @@ fn read_max_total_num_tokens(runtime_handle: &PyObject) -> Option<usize> {
 /// Returns:
 ///     GrpcServerHandle that can be used to shut down the server.
 /// Start the native gRPC server in a background thread.
-///
-/// `max_prefill_tokens`:
-///   - `None`  → auto-detect budget from scheduler's `max_total_num_tokens`
-///   - `0`     → disable admission control entirely
-///   - `N > 0` → use exactly N tokens as the prefill semaphore budget
 #[pyfunction]
-#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, max_prefill_tokens=None))]
+#[pyo3(signature = (host, port, runtime_handle, worker_threads=4))]
 fn start_server(
     host: String,
     port: u16,
     runtime_handle: PyObject,
     worker_threads: usize,
-    max_prefill_tokens: Option<usize>,
 ) -> PyResult<GrpcServerHandle> {
     let addr: SocketAddr = format!("{}:{}", host, port).parse().map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid address: {}", e))
@@ -117,52 +94,7 @@ fn start_server(
         .as_deref()
         .and_then(|p| RustTokenizer::from_model_path(p, context_len));
 
-    // Resolve the prefill token budget:
-    //   0        → disabled
-    //   Some(n)  → explicit override
-    //   None     → auto-detect from scheduler's KV cache capacity
-    //
-    // Known limitation — this semaphore is a *concurrency* limiter, not a
-    // *rate* limiter. It provides a coarse weighted bound on prefill admission,
-    // but because permits may be released on the first output token it is not a
-    // true KV-occupancy limiter. Under heavy overload (arriving rate >> serving
-    // rate) the queue can still build inside the Python scheduler, inflating
-    // TTFT regardless of the budget size.
-    //
-    // The legacy sgl-model-gateway can achieve lower overload TTFT because it
-    // has a paced ingress queue. Reaching parity likely requires a proper
-    // token-bucket rate limiter in front of the scheduler submission path
-    // (e.g. the `governor` crate). That is left as a follow-up; this semaphore
-    // remains a coarse guard against admitting too many large-prefill requests
-    // at once.
-    let budget: Option<usize> = match max_prefill_tokens {
-        Some(0) => None,
-        Some(n) => Some(n),
-        None => {
-            let detected = read_max_total_num_tokens(&runtime_handle);
-            match detected {
-                Some(b) => eprintln!(
-                    "[sglang-grpc] prefill token budget auto-detected: {} tokens",
-                    b
-                ),
-                None => eprintln!(
-                    "[sglang-grpc] could not read max_total_num_tokens; \
-                     prefill admission control disabled"
-                ),
-            }
-            detected
-        }
-    };
-
-    let semaphore = budget.map(|n| Arc::new(Semaphore::new(n)));
-    let semaphore_capacity = budget.map(|n| u32::try_from(n).unwrap_or(u32::MAX));
-    let bridge = Arc::new(PyBridge::new(
-        runtime_handle,
-        rust_tokenizer,
-        context_len,
-        semaphore,
-        semaphore_capacity,
-    ));
+    let bridge = Arc::new(PyBridge::new(runtime_handle, rust_tokenizer, context_len));
     let shutdown = Arc::new(Notify::new());
     let shutdown_clone = shutdown.clone();
 
