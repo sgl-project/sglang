@@ -277,6 +277,3 @@ sgl-kernel/csrc/**/*_musa/
 *.npz
 artifacts/
 .claude/scheduled_tasks.lock
-
-# Local-only kernel tests (not part of upstream PR)
-python/sglang/jit_kernel/tests/test_triton_store_cache_local.py
