@@ -796,17 +796,21 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
             return
 
-        if self.hidden_states is None:
+        # Detect idle stub by `bonus_tokens` length (idle inputs have
+        # shape[0] == 0 across all fields). Don't use `hidden_states is None`:
+        # for STANDALONE all non-idle inputs also have None hidden_states.
+        if len(self.bonus_tokens) == 0:
             self.hidden_states = spec_info.hidden_states
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             return
-        if spec_info.hidden_states is None:
+        if len(spec_info.bonus_tokens) == 0:
             return
-        self.hidden_states = torch.cat(
-            [self.hidden_states, spec_info.hidden_states], axis=0
-        )
+        if self.hidden_states is not None and spec_info.hidden_states is not None:
+            self.hidden_states = torch.cat(
+                [self.hidden_states, spec_info.hidden_states], axis=0
+            )
         self.bonus_tokens = torch.cat(
             [self.bonus_tokens, spec_info.bonus_tokens], axis=0
         )
