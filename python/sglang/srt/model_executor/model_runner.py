@@ -800,7 +800,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             register_forward_hooks(self.model, server_args.forward_hooks)
 
         # Initialize piecewise CUDA graph
-        self.init_piecewise_cuda_graphs()
+        self.piecewise_cuda_graph_runner = ModelRunner.create_piecewise_cuda_graphs(
+            self
+        )
 
         prealloc_symmetric_memory_pool(
             is_draft_worker=self.is_draft_worker,
@@ -2345,37 +2347,40 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ignore_tokens=None,
         )
 
-    def init_piecewise_cuda_graphs(self):
+    @staticmethod
+    def create_piecewise_cuda_graphs(model_runner: "ModelRunner"):
         """Initialize piecewise CUDA graph runner."""
-        self.piecewise_cuda_graph_runner = None
+        piecewise_cuda_graph_runner = None
 
-        if self.server_args.disable_piecewise_cuda_graph:
+        if model_runner.server_args.disable_piecewise_cuda_graph:
             logger.info(
                 "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
             )
-            return
+            return None
 
         # Draft models use decode CUDA graphs, not PCG
-        if self.is_draft_worker:
-            return
+        if model_runner.is_draft_worker:
+            return None
 
         # Disable piecewise CUDA graph for non-language models
-        if not hasattr(self.model, "model"):
+        if not hasattr(model_runner.model, "model"):
             logger.warning(
                 "Disable piecewise CUDA graph because the model is not a language model"
             )
-            return
+            return None
 
         # Disable piecewise CUDA graph for non capture size
-        if not self.server_args.piecewise_cuda_graph_tokens:
+        if not model_runner.server_args.piecewise_cuda_graph_tokens:
             logger.warning(
                 "Disable piecewise CUDA graph because the capture size is not set"
             )
-            return
+            return None
 
         # Collect attention layers and moe layers from the model
-        self.model.model = resolve_language_model(self.model)
-        language_model = getattr(self.model, "language_model", self.model)
+        model_runner.model.model = resolve_language_model(model_runner.model)
+        language_model = getattr(
+            model_runner.model, "language_model", model_runner.model
+        )
 
         # Resolve model with layers: handle CausalLM wrapper (.model.layers) and direct TextModel (.layers)
         if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
@@ -2386,11 +2391,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.warning(
                 "Disable piecewise CUDA graph because the model does not have a 'layers' attribute"
             )
-            return
+            return None
 
-        self.attention_layers = []
-        self.moe_layers = []
-        self.moe_fusions = []
+        model_runner.attention_layers = []
+        model_runner.moe_layers = []
+        model_runner.moe_fusions = []
         for layer in layer_model.layers:
             attn_layer = None
             if hasattr(layer, "self_attn"):
@@ -2420,9 +2425,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     attn_layer = layer
 
             if attn_layer is not None:
-                self.attention_layers.append(attn_layer)
+                model_runner.attention_layers.append(attn_layer)
             elif hasattr(layer, "mixer"):
-                self.attention_layers.append(None)
+                model_runner.attention_layers.append(None)
 
             moe_block = None
             moe_fusion = None
@@ -2441,35 +2446,39 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
                 moe_block = layer.mixer.experts
                 moe_fusion = layer.mixer
-            self.moe_layers.append(moe_block)
-            self.moe_fusions.append(moe_fusion)
+            model_runner.moe_layers.append(moe_block)
+            model_runner.moe_fusions.append(moe_fusion)
 
-        if len(self.attention_layers) < self.model_config.num_hidden_layers:
+        if (
+            len(model_runner.attention_layers)
+            < model_runner.model_config.num_hidden_layers
+        ):
             # TODO(yuwei): support Non-Standard GQA
             log_info_on_rank0(
                 logger,
                 "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
             )
-            return
+            return None
 
         tic = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
         logger.info(
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        if self.server_args.enable_breakable_cuda_graph:
+        if model_runner.server_args.enable_breakable_cuda_graph:
             # Experimental feature
-            self.piecewise_cuda_graph_runner = BreakableCudaGraphRunner(self)
+            piecewise_cuda_graph_runner = BreakableCudaGraphRunner(model_runner)
         else:
-            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+            piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(model_runner)
 
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
         mem_usage = before_mem - after_mem
         logger.info(
             f"Capture piecewise CUDA graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+        return piecewise_cuda_graph_runner
 
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
