@@ -41,7 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.multi_layer_eagle_utils import assign_new_state_triton
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
@@ -178,8 +178,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
             hidden_states = torch.zeros(
-                (self.max_num_token, self.model_runner.model_config.hidden_size),
-                dtype=self.model_runner.dtype,
+                (
+                    self.max_num_token,
+                    EagleDraftExtendInput.hidden_size_for(self.eagle_worker),
+                ),
+                dtype=EagleDraftExtendInput.dtype_for(self.eagle_worker),
             )
 
             if self.require_gathered_buffer:
@@ -349,7 +352,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         else:
             global_dp_buffer_len = None
 
-        spec_info = EagleDraftInput(
+        spec_info = EagleDraftExtendInput(
             hidden_states=hidden_states,
             num_accepted_drafts=num_accepted_drafts,
             num_accepted_tokens=num_accepted_tokens,

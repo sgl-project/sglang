@@ -342,11 +342,12 @@ def dispatch_custom_allreduce():
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
     Otherwise use AiterCustomAllreduce if available.
 
-    Set SGLANG_USE_JIT_ALL_REDUCE=1 to use the JIT-compiled v2 implementation.
+    On CUDA, the JIT-compiled v2 implementation is used by default.
+    Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
+    Note: ``ServerArgs._handle_environment_variables`` forces this env to "0" when
+    ``nnodes > 1`` since custom AR is intra-node only.
     """
-    # HARDCODED: opt-in flag for v2 JIT all-reduce.
-    # Set SGLANG_USE_JIT_ALL_REDUCE=1 to enable.
-    if _is_cuda and get_bool_env_var("SGLANG_USE_JIT_ALL_REDUCE", default="false"):
+    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
         from .custom_all_reduce_v2 import CustomAllReduceV2
 
         logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")

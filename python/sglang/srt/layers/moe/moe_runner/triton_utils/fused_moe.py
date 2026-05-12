@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.server_args import get_global_server_args
@@ -28,6 +29,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
+    act_and_mul_triton,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
     support_tensor_descriptor,
@@ -112,6 +114,7 @@ def inplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -142,6 +145,7 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -174,6 +178,7 @@ def outplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -204,6 +209,7 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -262,6 +268,7 @@ def fused_experts(
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
+            swiglu_limit=moe_runner_config.swiglu_limit,
         )
         return hidden_states
     else:
@@ -293,6 +300,7 @@ def fused_experts(
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
+            swiglu_limit=moe_runner_config.swiglu_limit,
         )
 
 
@@ -425,6 +433,7 @@ def _fused_moe_kernel_sequence(
     gemm1_limit: Optional[float],
     filter_expert: bool,
     hooks: Optional[Any] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -519,6 +528,7 @@ def _fused_moe_kernel_sequence(
     if activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
+        # - swiglu_limit != None: DeepSeek V4 swiglu clamp + silu_and_mul (CUDA/HIP only)
         if gemm1_alpha is not None:
             assert gemm1_limit is not None
             intermediate_cache2 = swiglu_gpt_oss_sigmoid_alpha(
@@ -528,6 +538,55 @@ def _fused_moe_kernel_sequence(
             intermediate_cache2 = _swiglu_silu_clamp_mul(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
+        elif swiglu_limit is not None:
+            # DeepSeek V4: swiglu clamp before silu_and_mul.
+            # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
+            #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
+            #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
+            assert swiglu_limit == 10
+            assert intermediate_cache1.shape == (total_tokens, N)
+            assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
+
+            swiglu_limit_for_triton: Optional[float] = None
+            swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
+
+            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+                if filter_expert:
+                    swiglu_limit_for_triton = swiglu_limit
+                else:
+                    assert (
+                        _is_cuda
+                    ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
+                    swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
+            else:
+                half = N // 2
+                intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
+                intermediate_cache1[:, half:].clamp_(
+                    min=-swiglu_limit, max=swiglu_limit
+                )
+
+            if not filter_expert:
+                if swiglu_limit_for_silu_and_mul_clamp is not None:
+                    from sglang.jit_kernel.deepseek_v4 import silu_and_mul_clamp
+
+                    silu_and_mul_clamp(
+                        intermediate_cache1.view(-1, N),
+                        intermediate_cache2,
+                        swiglu_limit_for_silu_and_mul_clamp,
+                    )
+                else:
+                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            else:
+                act_and_mul_triton(
+                    intermediate_cache1.view(-1, N),
+                    intermediate_cache2,
+                    config,
+                    topk_ids,
+                    expert_ids,
+                    down_moe_use_tma,
+                    activation,
+                    swiglu_limit=swiglu_limit_for_triton,
+                )
         elif _is_cuda or _is_hip or _is_xpu:
             if filter_expert and _is_cuda:
                 # HIP/XPU fall through to the unfiltered path: the down kernel
@@ -753,6 +812,7 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -827,6 +887,7 @@ def fused_experts_impl(
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
         hooks=None,
+        swiglu_limit=swiglu_limit,
     )
 
 
