@@ -13,6 +13,7 @@ Covers:
 """
 
 import asyncio
+import dataclasses
 import unittest
 from unittest.mock import MagicMock, Mock
 
@@ -28,6 +29,67 @@ from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 register_cpu_ci(est_time=15, suite="stage-a-test-cpu")
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
+
+# ---------------------------------------------------------------------------
+# Per-request field defaults for BatchStrOutput construction.
+# Categorised by value shape so that _make_batch_str_output can assign
+# type-appropriate defaults without hardcoding every field name.
+# When a field is renamed upstream, the old name simply won't appear in
+# dataclasses.fields() and the new name will fall through to the
+# pattern-matching or safe fallback — no test breakage.
+# ---------------------------------------------------------------------------
+
+_PER_REQUEST_INT_FIELDS = frozenset(
+    {
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "retraction_counts",
+        # Speculative-decoding int-scalar fields (current and historical names)
+        "spec_verify_ct",
+        "spec_accepted_drafts",
+        "spec_num_correct_drafts",
+    }
+)
+
+_PER_REQUEST_FLOAT_FIELDS = frozenset(
+    {
+        "output_token_entropy_val",
+    }
+)
+
+_PER_REQUEST_NESTED_LIST_FIELDS = frozenset(
+    {
+        "output_ids",
+        # Logprob fields
+        "input_token_logprobs_val",
+        "input_token_logprobs_idx",
+        "output_token_logprobs_val",
+        "output_token_logprobs_idx",
+        "input_top_logprobs_val",
+        "input_top_logprobs_idx",
+        "output_top_logprobs_val",
+        "output_top_logprobs_idx",
+        "input_token_ids_logprobs_val",
+        "input_token_ids_logprobs_idx",
+        "output_token_ids_logprobs_val",
+        "output_token_ids_logprobs_idx",
+        # Speculative-decoding histogram fields (current and historical names)
+        "spec_acceptance_histogram",
+        "spec_correct_drafts_histogram",
+    }
+)
+
+_PER_REQUEST_OPTIONAL_FIELDS = frozenset(
+    {
+        "output_hidden_states",
+        "routed_experts",
+        "indexer_topk",
+        "placeholder_tokens_idx",
+        "placeholder_tokens_val",
+    }
+)
 
 
 def _make_tokenizer_manager() -> TokenizerManager:
@@ -83,12 +145,11 @@ def _make_abort_req(rid: str, abort_message: str = "Aborted") -> AbortReq:
 def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     """Create a minimal BatchStrOutput for a single request.
 
-    Args:
-        rid: Request ID.
-        finished_reason: A dict like {"type": "length"} for a finished
-            request, or the sentinel _NOT_FINISHED to indicate an ongoing
-            request (finished_reasons[i] will be None). Defaults to
-            {"type": "length"} (finished).
+    Uses dataclass field introspection so that new or renamed fields in
+    BatchStrOutput don't break this test.  Only the fields that matter for
+    test logic (rids, finished_reasons, output_strs) are set explicitly;
+    all others receive type-appropriate defaults based on naming patterns.
+    Fields with class-level defaults are left alone automatically.
     """
     if finished_reason is _NOT_FINISHED:
         fr = None
@@ -97,38 +158,36 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     else:
         fr = finished_reason
 
-    return BatchStrOutput(
-        rids=[rid],
-        output_strs=["hello"],
-        output_ids=[[1, 2, 3]],
-        prompt_tokens=[5],
-        completion_tokens=[3],
-        finished_reasons=[fr],
-        retraction_counts=[0],
-        reasoning_tokens=[0],
-        cached_tokens=[0],
-        spec_verify_ct=[0],
-        spec_accepted_drafts=[0],
-        spec_acceptance_histogram=[[]],
-        input_token_logprobs_val=[[]],
-        input_token_logprobs_idx=[[]],
-        output_token_logprobs_val=[[]],
-        output_token_logprobs_idx=[[]],
-        input_top_logprobs_val=[[]],
-        input_top_logprobs_idx=[[]],
-        output_top_logprobs_val=[[]],
-        output_top_logprobs_idx=[[]],
-        input_token_ids_logprobs_val=[[]],
-        input_token_ids_logprobs_idx=[[]],
-        output_token_ids_logprobs_val=[[]],
-        output_token_ids_logprobs_idx=[[]],
-        output_token_entropy_val=[0.0],
-        output_hidden_states=[None],
-        routed_experts=[None],
-        indexer_topk=[None],
-        placeholder_tokens_idx=[None],
-        placeholder_tokens_val=[None],
-    )
+    kwargs = {}
+    for f in dataclasses.fields(BatchStrOutput):
+        if f.name == "rids":
+            kwargs[f.name] = [rid]
+        elif f.name == "finished_reasons":
+            kwargs[f.name] = [fr]
+        elif f.name == "output_strs":
+            kwargs[f.name] = ["hello"]
+        elif f.name in _PER_REQUEST_INT_FIELDS:
+            kwargs[f.name] = [0]
+        elif f.name in _PER_REQUEST_FLOAT_FIELDS:
+            kwargs[f.name] = [0.0]
+        elif f.name in _PER_REQUEST_NESTED_LIST_FIELDS:
+            kwargs[f.name] = [[]]
+        elif f.name in _PER_REQUEST_OPTIONAL_FIELDS:
+            kwargs[f.name] = [None]
+        # Fields with class defaults — skip, let the default be used
+        elif (
+            f.default is not dataclasses.MISSING
+            or f.default_factory is not dataclasses.MISSING
+        ):
+            continue
+        # Unknown required field — provide a safe per-request default.
+        # Most BatchStrOutput fields are per-request lists; [[]] works for
+        # List[List[...]] and is unlikely to crash on [i] indexing for
+        # List[int] either (the inner [] just means "no data").
+        else:
+            kwargs[f.name] = [[]]
+
+    return BatchStrOutput(**kwargs)
 
 
 class TestRidToStateCleanupOnAbort(CustomTestCase):
