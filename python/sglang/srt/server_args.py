@@ -6861,7 +6861,6 @@ class ServerArgs:
             "and 'xgmi' uses same-node GPU XGMI/P2P only.",
         )
         parser.add_argument(
-        parser.add_argument(
             "--disaggregation-bootstrap-port",
             type=int,
             default=ServerArgs.disaggregation_bootstrap_port,
