@@ -559,7 +559,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
 
             draft_extend_input = EagleDraftExtendInput(
-                hidden_states=batch.spec_info.hidden_states[accept_index],
+                hidden_states=(
+                    batch.spec_info.hidden_states[accept_index]
+                    if batch.spec_info.hidden_states is not None
+                    else None
+                ),
                 num_correct_drafts=num_correct_drafts,
                 num_accept_tokens=num_correct_drafts + 1,
                 num_accept_tokens_cpu=num_accept_tokens_list,
@@ -627,9 +631,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     unfinished_index_device
                 ]
                 draft_extend_input = EagleDraftExtendInput(
-                    hidden_states=batch.spec_info.hidden_states[
-                        unfinished_accept_index
-                    ],
+                    hidden_states=(
+                        batch.spec_info.hidden_states[unfinished_accept_index]
+                        if batch.spec_info.hidden_states is not None
+                        else None
+                    ),
                     num_accept_tokens_cpu=draft_input_num_accept_tokens_cpu,
                     num_correct_drafts=unfinished_num_correct_drafts,
                     num_accept_tokens=unfinished_num_correct_drafts + 1,
@@ -665,7 +671,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
-    hidden_states: torch.Tensor = None
+    # None when the spec algorithm's draft doesn't read hidden_states
+    # (e.g., STANDALONE — vanilla LLM draft).
+    hidden_states: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Per-req bonus token (the "+1" target prediction at end of each accept
@@ -712,28 +720,37 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             pt += extend_len
 
     @classmethod
-    def hidden_size_for(cls, worker) -> int:
+    def hidden_size_for(cls, worker) -> Optional[int]:
         """Decode-phase `hidden_states` width: draft self-chain output
         (draft model writes its own last hidden back via `capture_for_decode`
-        and the draft loop)."""
+        and the draft loop). Returns None when the draft architecture doesn't
+        consume the field (e.g., STANDALONE)."""
+        if worker.speculative_algorithm.is_standalone():
+            return None
         return _draft_runner_of(worker).model_config.spec_hidden_size
 
     @classmethod
-    def dtype_for(cls, worker) -> torch.dtype:
+    def dtype_for(cls, worker) -> Optional[torch.dtype]:
+        if worker.speculative_algorithm.is_standalone():
+            return None
         return _draft_runner_of(worker).model_config.dtype
 
     @classmethod
     def create_idle_input(
         cls,
         device: torch.device,
-        hidden_size: int,
-        dtype: torch.dtype,
+        hidden_size: Optional[int],
+        dtype: Optional[torch.dtype],
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
     ):
         return cls(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
-            hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
+            hidden_states=(
+                torch.empty((0, hidden_size), device=device, dtype=dtype)
+                if hidden_size is not None
+                else None
+            ),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
@@ -758,13 +775,15 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
-            self.hidden_states = self.hidden_states[: len(new_indices)]
+            if self.hidden_states is not None:
+                self.hidden_states = self.hidden_states[: len(new_indices)]
             self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
-            self.hidden_states = self.hidden_states[new_indices]
+            if self.hidden_states is not None:
+                self.hidden_states = self.hidden_states[new_indices]
             self.bonus_tokens = self.bonus_tokens[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
@@ -777,17 +796,21 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
             return
 
-        if self.hidden_states is None:
+        # Detect idle stub by `topk_index` length (idle inputs have
+        # shape[0] == 0 across all fields). Don't use `hidden_states is None`:
+        # for STANDALONE all non-idle inputs also have None hidden_states.
+        if len(self.topk_index) == 0:
             self.hidden_states = spec_info.hidden_states
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             return
-        if spec_info.hidden_states is None:
+        if len(spec_info.topk_index) == 0:
             return
-        self.hidden_states = torch.cat(
-            [self.hidden_states, spec_info.hidden_states], axis=0
-        )
+        if self.hidden_states is not None and spec_info.hidden_states is not None:
+            self.hidden_states = torch.cat(
+                [self.hidden_states, spec_info.hidden_states], axis=0
+            )
         self.bonus_tokens = torch.cat(
             [self.bonus_tokens, spec_info.bonus_tokens], axis=0
         )
@@ -805,8 +828,9 @@ class EagleDraftExtendInput(SpecInput):
     """
 
     # shape: (total_accepted, hidden_size). Sliced from verify-time hidden_states
-    # by accept_index; consumed by the draft-extend forward.
-    hidden_states: torch.Tensor = None
+    # by accept_index; consumed by the draft-extend forward. None when the spec
+    # algorithm's draft doesn't read hidden_states (e.g., STANDALONE).
+    hidden_states: Optional[torch.Tensor] = None
 
     # Per-req accept counts. `num_accept_tokens = num_correct_drafts + 1`.
     # Both kept for cuda-graph buffer indexing and the
@@ -845,9 +869,13 @@ class EagleDraftExtendInput(SpecInput):
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     @classmethod
-    def hidden_size_for(cls, worker) -> int:
+    def hidden_size_for(cls, worker) -> Optional[int]:
         """Extend-phase `hidden_states` width: target's `spec_hidden_size`,
-        widened to `num_aux * target_hidden` for EAGLE-3 aux mode."""
+        widened to `num_aux * target_hidden` for EAGLE-3 aux mode. Returns
+        None when the draft architecture doesn't consume the field
+        (e.g., STANDALONE)."""
+        if worker.speculative_algorithm.is_standalone():
+            return None
         target_cfg = worker.target_worker.model_runner.model_config
         if not (
             worker.speculative_algorithm.is_eagle3()
@@ -868,19 +896,25 @@ class EagleDraftExtendInput(SpecInput):
         return target_hidden * num_aux
 
     @classmethod
-    def dtype_for(cls, worker) -> torch.dtype:
+    def dtype_for(cls, worker) -> Optional[torch.dtype]:
+        if worker.speculative_algorithm.is_standalone():
+            return None
         return worker.target_worker.model_runner.model_config.dtype
 
     @classmethod
     def create_idle_input(
         cls,
         device: torch.device,
-        hidden_size: int,
-        dtype: torch.dtype,
+        hidden_size: Optional[int],
+        dtype: Optional[torch.dtype],
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST,
     ) -> "EagleDraftExtendInput":
         return cls(
-            hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
+            hidden_states=(
+                torch.empty((0, hidden_size), device=device, dtype=dtype)
+                if hidden_size is not None
+                else None
+            ),
             num_correct_drafts=torch.empty((0,), device=device, dtype=torch.int32),
             num_accept_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             num_accept_tokens_cpu=[],

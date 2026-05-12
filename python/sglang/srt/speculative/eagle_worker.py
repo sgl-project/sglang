@@ -989,7 +989,10 @@ class EAGLEWorker(TpModelWorker):
         logits_output.next_token_logits = logits_output.next_token_logits[
             res.accepted_indices
         ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = logits_output.hidden_states[
+                res.accepted_indices
+            ]
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
@@ -1025,7 +1028,7 @@ class EAGLEWorker(TpModelWorker):
 
         num_correct_drafts = torch.tensor(
             res.num_correct_drafts_per_req_cpu,
-            device=logits_output.hidden_states.device,
+            device=logits_output.next_token_logits.device,
             dtype=torch.int64,
         )
         cumulative_num_accept_tokens = torch.cumsum(num_correct_drafts + 1, dim=0)
@@ -1180,6 +1183,10 @@ class EAGLEWorker(TpModelWorker):
         )
 
         batch.return_hidden_states = False
+        # Verify-time construction of EagleDraftExtendInput uses the dataclass
+        # default (LAST); the worker overrides here so get_model_worker_batch()
+        # propagates the correct mode (NULL for STANDALONE).
+        draft_extend_input.capture_hidden_mode = draft_extend_capture_mode
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.capture_hidden_mode == draft_extend_capture_mode
         forward_batch = ForwardBatch.init_new(

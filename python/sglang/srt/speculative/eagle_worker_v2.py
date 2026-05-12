@@ -622,9 +622,10 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index
         ]
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-            select_index
-        ]
+        if draft_logits_output.hidden_states is not None:
+            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                select_index
+            ]
         probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
         ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
