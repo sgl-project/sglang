@@ -204,6 +204,54 @@ class TestPortArgs(unittest.TestCase):
             PortArgs.init_new(server_args)
 
 
+class TestCheckServerArgs(unittest.TestCase):
+    """Validate ServerArgs.check_server_args() rejects misconfigurations
+    that would otherwise lead to silent runtime hangs."""
+
+    def test_prefill_max_requests_none_is_accepted(self):
+        # None means "no limit" per --prefill-max-requests help text.
+        # served_model_name is set explicitly because model_path="dummy"
+        # short-circuits __post_init__ before the served_model_name default
+        # is filled in, and check_server_args() dereferences it later.
+        server_args = ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            prefill_max_requests=None,
+        )
+        server_args.check_server_args()
+
+    def test_prefill_max_requests_positive_is_accepted(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            prefill_max_requests=1,
+        )
+        server_args.check_server_args()
+
+    def test_prefill_max_requests_zero_raises(self):
+        # Regression test for sgl-project/sglang#23788: prefill_max_requests=0
+        # caused engine.generate() to hang indefinitely because the per-batch
+        # admission cap was already saturated, so no prefill batch could form.
+        server_args = ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            prefill_max_requests=0,
+        )
+        with self.assertRaises(AssertionError) as ctx:
+            server_args.check_server_args()
+        self.assertIn("prefill_max_requests", str(ctx.exception))
+
+    def test_prefill_max_requests_negative_raises(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            prefill_max_requests=-1,
+        )
+        with self.assertRaises(AssertionError) as ctx:
+            server_args.check_server_args()
+        self.assertIn("prefill_max_requests", str(ctx.exception))
+
+
 class TestSSLArgs(unittest.TestCase):
     def test_default_ssl_fields_are_none(self):
         server_args = ServerArgs(model_path="dummy")

@@ -7063,6 +7063,13 @@ class ServerArgs:
             f"Got: {self.pp_max_micro_batch_size}"
         )
 
+        assert self.prefill_max_requests is None or self.prefill_max_requests >= 1, (
+            "prefill_max_requests must be a positive integer or None (no limit). "
+            f"Got: {self.prefill_max_requests}. A non-positive value silently "
+            "deadlocks the scheduler because the per-batch admission cap is "
+            "already saturated, so no prefill batch can ever form."
+        )
+
         if self.pp_size > 1:
             assert (
                 self.disable_overlap_schedule and self.speculative_algorithm is None
