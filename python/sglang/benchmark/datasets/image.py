@@ -260,7 +260,7 @@ def sample_image_requests(
 
         # Generate text prompt
         text_prompt = gen_mm_prompt(
-            processor.tokenizer,
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor,
             processor.image_token_id if hasattr(processor, "image_token_id") else None,
             int(input_lens[i]),
         )

@@ -45,6 +45,33 @@ class PipelineExecutor(ABC):
 
     def __init__(self, server_args):
         self.server_args = server_args
+        self.component_residency_manager = None
+
+    def begin_component_residency_request(
+        self,
+        stages: List["PipelineStage"],
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        self.component_residency_manager.begin_request(stages, batch, server_args)
+
+    def before_stage(
+        self,
+        stage: "PipelineStage",
+        stage_index: int,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        stage.set_component_residency_manager(self.component_residency_manager)
+        self.component_residency_manager.before_stage(
+            stage, stage_index, batch, server_args
+        )
+
+    def after_stage(self, stage_index: int) -> None:
+        self.component_residency_manager.after_stage(stage_index)
+
+    def finish_component_residency_request(self) -> None:
+        self.component_residency_manager.finish_request()
 
     def execute_with_profiling(
         self,
@@ -57,6 +84,17 @@ class PipelineExecutor(ABC):
             batch = self.execute(stages, batch, server_args)
 
         return batch
+
+    def execute_group_with_profiling(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        """Execute a grouped request under the same profiler as a single request."""
+        with self.profile_execution(batches[0], dump_rank=0):
+            batches = self.execute_group(stages, batches, server_args)
+        return batches
 
     @abstractmethod
     def execute(
@@ -77,6 +115,22 @@ class PipelineExecutor(ABC):
             The processed batch.
         """
         raise NotImplementedError
+
+    def execute_group(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        """Execute all pipeline stages over a group of independent requests.
+
+        Executors own cross-rank scheduling, while stages own whether duplicate
+        work can be removed. The base executor simply calls
+        ``stage.run_grouped_requests`` for each stage in order.
+        """
+        for stage in stages:
+            batches = stage.run_grouped_requests(batches, server_args)
+        return batches
 
     @contextlib.contextmanager
     def profile_execution(self, batch: Req, dump_rank: int = 0):
