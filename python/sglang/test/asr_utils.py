@@ -2,7 +2,7 @@
 
 import unittest
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import openai
 import requests
@@ -16,6 +16,11 @@ from sglang.test.test_utils import (
     parse_sse_stream,
     popen_launch_server,
 )
+
+# Sentinel for _post_transcribe(language=...). ``_USE_CASE_LANG`` means
+# fall back to ``audio_case.language``; an explicit ``None`` *omits* the
+# field (e.g. to exercise Whisper's fused auto-detect path).
+_USE_CASE_LANG: Any = object()
 
 
 @dataclass
@@ -102,32 +107,79 @@ class ASRTestBase(CustomTestCase):
             return result
         return result.text
 
-    def _transcribe_stream(self, audio_case: AudioTestCase):
-        """Streaming transcription request, returns (events, full_text).
+    def _post_transcribe(
+        self,
+        audio_case: AudioTestCase,
+        *,
+        stream: bool = False,
+        language: Any = _USE_CASE_LANG,
+        response_format: Optional[str] = None,
+        timestamp_granularities: Optional[List[str]] = None,
+        timeout: float = 180,
+    ) -> requests.Response:
+        """Raw POST to ``/v1/audio/transcriptions``.
 
-        Uses raw requests because sglang's streaming format
-        (choices[0].delta.content) differs from the OpenAI SDK's expected
-        TranscriptionTextDeltaEvent format.
+        Centralises the request shape (file upload + form data) so subclasses
+        and helpers don't redo it. Use this when you need access to the raw
+        JSON body (``verbose_json``, segments, etc.) or to omit ``language``
+        entirely — both of which the openai SDK path can't easily express.
+
+        ``language`` semantics:
+
+        * ``_USE_CASE_LANG`` (default) — use ``audio_case.language``.
+        * ``None`` — omit the field (e.g. for fused auto-detect tests).
+        * explicit string — override.
         """
         audio_bytes = download_audio_bytes(audio_case.url, audio_case.local_cache_path)
-        data = {"model": self.served_model_name, "stream": "true"}
-        if audio_case.language:
-            data["language"] = audio_case.language
+        if language is _USE_CASE_LANG:
+            language = audio_case.language
+        data = {"model": self.served_model_name}
+        if stream:
+            data["stream"] = "true"
+        if language is not None:
+            data["language"] = language
+        if response_format is not None:
+            data["response_format"] = response_format
+        if timestamp_granularities is not None:
+            data["timestamp_granularities[]"] = timestamp_granularities
         response = requests.post(
             self.base_url + "/v1/audio/transcriptions",
-            files={
-                "file": (
-                    audio_case.filename,
-                    audio_bytes,
-                    audio_case.mime_type,
-                )
-            },
+            files={"file": (audio_case.filename, audio_bytes, audio_case.mime_type)},
             data=data,
-            timeout=180,
-            stream=True,
+            timeout=timeout,
+            stream=stream,
         )
-        assert response.status_code == 200, response.text
+        self.assertEqual(response.status_code, 200, response.text)
+        return response
+
+    def _transcribe_json(self, audio_case: AudioTestCase, **kwargs: Any) -> dict:
+        """Non-streaming raw POST returning the parsed JSON body.
+
+        ``**kwargs`` forwards to :py:meth:`_post_transcribe`.
+        """
+        return self._post_transcribe(audio_case, stream=False, **kwargs).json()
+
+    def _transcribe_stream(self, audio_case: AudioTestCase, **kwargs: Any):
+        """Streaming transcription, returns ``(events, full_text)``.
+
+        Uses raw requests because sglang's streaming format
+        (``choices[0].delta.content``) differs from the OpenAI SDK's
+        TranscriptionTextDeltaEvent shape. ``**kwargs`` forwards to
+        :py:meth:`_post_transcribe`.
+        """
+        response = self._post_transcribe(audio_case, stream=True, **kwargs)
         return parse_sse_stream(response)
+
+    @staticmethod
+    def _iter_deltas(events: List[dict]) -> List[str]:
+        """Extract non-empty ``delta.content`` strings from SSE events."""
+        out: List[str] = []
+        for event in events:
+            delta = event.get("choices", [{}])[0].get("delta") or {}
+            content = delta.get("content")
+            if content:
+                out.append(content)
+        return out
 
     def _assert_keywords(self, text, audio_case: AudioTestCase, label=""):
         """Assert that text contains enough expected keywords."""
