@@ -875,8 +875,8 @@ class HiCacheController:
 
         backend = self.storage_backend_type
 
-        if backend in {"mooncake", "hf3fs"}:
-            if backend == "mooncake" and self.storage_config.should_split_heads:
+        if backend == "mooncake":
+            if self.storage_config.should_split_heads:
                 logger.warning(
                     "HiCache draft L3 disabled: should_split_heads not yet "
                     "supported on the mooncake v2 path."
@@ -891,8 +891,8 @@ class HiCacheController:
             )
             return
 
-        # TODO: support "eic", "nixl", "simm"
-        if backend in {"eic", "nixl", "simm"}:
+        # TODO: support "hf3fs", "eic", "nixl", "simm"
+        if backend in {"hf3fs", "eic", "nixl", "simm"}:
             return
 
         self.draft_io_mode = "generic"

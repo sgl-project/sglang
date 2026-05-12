@@ -1010,7 +1010,11 @@ class Scheduler(
 
         pool = draft_kv_pool
         if isinstance(pool, HybridLinearKVPool):
-            pool = pool.full_kv_pool
+            logger.warning(
+                "Draft pool type %s not supported for draft HiCache, skipping.",
+                type(pool).__name__,
+            )
+            return
 
         # Create host pool for draft with the same slot count as the target host pool,
         # so that host indices stay 1-to-1 between target and draft KV caches.
