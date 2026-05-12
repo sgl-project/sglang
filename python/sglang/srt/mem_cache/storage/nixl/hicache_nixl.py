@@ -200,7 +200,9 @@ class HiCacheNixl(HiCacheStorage):
                         self.agent.release_xfer_handle(xfer_req)
                         logger.error("Transfer failed")
                         return False
-                    time.sleep(0.0001)  # Can be changed to os.sched_yield() or parametrized
+                    time.sleep(
+                        0.0001
+                    )  # Can be changed to os.sched_yield() or parametrized
 
                 self.agent.release_xfer_handle(xfer_req)
                 return True
