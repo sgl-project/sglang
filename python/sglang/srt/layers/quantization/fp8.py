@@ -1147,12 +1147,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
         elif _use_aiter:
             # Pre-shuffle weights
-            layer.w13_weight.data = shuffle_weight(
-                layer.w13_weight.contiguous(), (16, 16)
-            )
-            layer.w2_weight.data = shuffle_weight(
-                layer.w2_weight.contiguous(), (16, 16)
-            )
+            with torch.no_grad():
+                layer.w13_weight.copy_(
+                    shuffle_weight(layer.w13_weight.contiguous(), (16, 16))
+                )
+                layer.w2_weight.copy_(
+                    shuffle_weight(layer.w2_weight.contiguous(), (16, 16))
+                )
         elif _is_cpu:
             assert (
                 _is_cpu_amx_available

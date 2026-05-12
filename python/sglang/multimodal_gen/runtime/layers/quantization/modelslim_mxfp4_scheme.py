@@ -16,7 +16,13 @@ Reference: MindIE-SD W4A4MXFP4DualQuantLinear
 from typing import List, Optional
 
 import torch
-import torch_npu
+
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+_is_npu = current_platform.is_npu()
+
+if _is_npu:
+    import torch_npu
 
 from sglang.multimodal_gen.runtime.models.parameter import (
     BasevLLMParameter,
@@ -143,6 +149,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         if not mul_scale.is_npu:
             mul_scale = mul_scale.to(f"npu:{torch.npu.current_device()}")
         layer.mul_scale = torch.nn.Parameter(mul_scale, requires_grad=False)
+        layer.use_mul_scale = not torch.all(mul_scale == 1.0).item()
 
     def apply_weights(
         self,
@@ -165,7 +172,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         # so we MUST apply it here for scale alignment.
         # Reference: MindIE-SD W4A4MXFP4DualQuantLinear.quant_matmul
         mul_scale = layer.mul_scale
-        if not torch.all(mul_scale == 1.0):
+        if getattr(layer, "use_mul_scale", True):
             x_2d = x_2d * mul_scale.to(x_2d.dtype)
 
         # Dual-level MXFP4 activation quantization
