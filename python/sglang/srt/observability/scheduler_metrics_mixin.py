@@ -106,7 +106,7 @@ class SchedulerMetricsMixin:
 
         # Cumulative spec-decoding counters (reset every decode_log_interval).
         # Each update adds (num_correct_drafts + bs, bs).
-        # `*_accepted_tokens` = drafts + bonus; `*_accepted_drafts` = drafts-only.
+        # `*_accept_tokens` = drafts + bonus; `*_correct_drafts` = drafts-only.
         self.spec_num_accept_tokens = 0  # per-log-interval
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0  # lifetime

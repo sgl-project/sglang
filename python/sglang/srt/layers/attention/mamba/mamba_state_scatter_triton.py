@@ -17,7 +17,7 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     dst_ptr,
     # Raw index arrays (before index_select)
     dst_indices_raw_ptr,  # [total_requests] - state_indices_tensor
-    step_indices_raw_ptr,  # [total_requests] - accept_steps or mamba_steps_to_track
+    step_indices_raw_ptr,  # [total_requests] - last_correct_step_indices or mamba_steps_to_track
     elem_per_entry: tl.constexpr,
     src_layer_stride,
     src_req_stride,
