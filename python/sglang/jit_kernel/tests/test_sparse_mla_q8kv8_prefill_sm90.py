@@ -173,7 +173,9 @@ def test_sparse_mla_q8kv8_prefill_corner_cases(
 
 # Precision / accuracy: report distributional error of Q8KV8 kernel output
 # against the fp32 reference computed from dequantized inputs, following
-# the same metric-reporting style as test_cutedsl_gdn_precision.
+# the same metric-reporting style as test_cutedsl_gdn_precision. The medium
+# s_q cases follow the attention-test convention of covering more than tiny
+# query lengths, and exercise many CTAs/output stores.
 @pytest.mark.skipif(
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
 )
@@ -182,6 +184,8 @@ def test_sparse_mla_q8kv8_prefill_corner_cases(
     [
         (512, False, 4, 256, 512),
         (576, True, 4, 256, 512),
+        (512, False, 64, 256, 1024),
+        (576, True, 64, 256, 1024),
     ],
 )
 def test_sparse_mla_q8kv8_prefill_precision(
@@ -239,6 +243,7 @@ def test_sparse_mla_q8kv8_prefill_precision(
     assert not has_bad, "Q8KV8 output contains NaN/Inf"
     assert fail_rate < 1.0, f"fail_rate {fail_rate:.3f}% exceeds 1% threshold"
     # Tight bounds on aggregate error to lock in near-lossless behavior.
+    assert max_diff < 1e-3, f"max_diff {max_diff:.2e} exceeds 1e-3"
     assert mean_diff < 5e-3, f"mean_diff {mean_diff:.2e} exceeds 5e-3"
     assert p99_diff < 5e-2, f"p99_diff {p99_diff:.2e} exceeds 5e-2"
 
