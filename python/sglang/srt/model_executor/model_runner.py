@@ -1786,7 +1786,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device != "cuda":
             return
 
-        if self._should_run_flashinfer_autotune():
+        if ModelRunner._should_run_flashinfer_autotune(
+            server_args=self.server_args,
+            spec_algorithm=self.spec_algorithm,
+            is_draft_worker=self.is_draft_worker,
+        ):
             self._flashinfer_autotune()
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
@@ -1810,9 +1814,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dtype=self.dtype,
         )
 
-    def _should_run_flashinfer_autotune(self) -> bool:
+    @staticmethod
+    def _should_run_flashinfer_autotune(
+        *,
+        server_args: ServerArgs,
+        spec_algorithm: SpeculativeAlgorithm,
+        is_draft_worker: bool,
+    ) -> bool:
         """Check if flashinfer autotune should be run."""
-        if self.server_args.disable_flashinfer_autotune:
+        if server_args.disable_flashinfer_autotune:
             return False
 
         # CuteDSL v1 (cutedsl runner + deepep a2a) bypasses MoeRunner and must not
@@ -1821,12 +1831,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Read server_args directly to avoid depending on initialize_moe_config()
         # having already populated the MoE backend globals.
         if (
-            self.server_args.moe_runner_backend == "flashinfer_cutedsl"
-            and self.server_args.moe_a2a_backend == "deepep"
+            server_args.moe_runner_backend == "flashinfer_cutedsl"
+            and server_args.moe_a2a_backend == "deepep"
         ):
             return False
 
-        backend_str = self.server_args.moe_runner_backend
+        backend_str = server_args.moe_runner_backend
 
         # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
 
@@ -1845,8 +1855,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if major < 9:
             return False
 
-        if self.spec_algorithm.is_speculative():
-            return not self.is_draft_worker
+        if spec_algorithm.is_speculative():
+            return not is_draft_worker
 
         return True
 
@@ -1854,7 +1864,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Run flashinfer autotune."""
         from flashinfer.autotuner import autotune
 
-        cache_path = self._flashinfer_autotune_cache_path()
+        cache_path = ModelRunner._flashinfer_autotune_cache_path(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            dtype=self.dtype,
+            device=self.device,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            dp_rank=self.dp_rank,
+            dp_size=self.dp_size,
+            moe_ep_size=self.moe_ep_size,
+        )
         logger.info("Running FlashInfer autotune with cache: %s", cache_path)
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
@@ -1866,25 +1888,39 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
 
-    def _flashinfer_autotune_cache_path(self) -> Path:
+    @staticmethod
+    def _flashinfer_autotune_cache_path(
+        *,
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        dtype: torch.dtype,
+        device: str,
+        tp_rank: int,
+        tp_size: int,
+        pp_rank: int,
+        pp_size: int,
+        dp_rank: int,
+        dp_size: int,
+        moe_ep_size: int,
+    ) -> Path:
         import flashinfer
 
-        major, minor = torch.cuda.get_device_capability(self.device)
+        major, minor = torch.cuda.get_device_capability(device)
         arch = f"sm{major}{minor}"
         flashinfer_version = getattr(flashinfer, "__version__", "unknown")
 
-        server_args = self.server_args
+        server_args = server_args
         model_key = "|".join(
             [
                 str(server_args.model_path),
-                str(self.dtype),
+                str(dtype),
                 str(server_args.quantization),
                 str(server_args.moe_runner_backend),
-                str(self.tp_size),
-                str(self.pp_size),
-                str(self.dp_size),
-                str(self.moe_ep_size),
-                str(self.model_config.hf_config.__class__.__name__),
+                str(tp_size),
+                str(pp_size),
+                str(dp_size),
+                str(moe_ep_size),
+                str(model_config.hf_config.__class__.__name__),
             ]
         )
         cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
@@ -1897,10 +1933,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             / cache_key
         )
         cache_dir.mkdir(parents=True, exist_ok=True)
-        return (
-            cache_dir
-            / f"rank_tp{self.tp_rank}_pp{self.pp_rank}_dp{self.dp_rank or 0}.json"
-        )
+        return cache_dir / f"rank_tp{tp_rank}_pp{pp_rank}_dp{dp_rank or 0}.json"
 
     def _dummy_run(self, batch_size: int, run_ctx=None):
         """Run a dummy forward pass for warmup/profiling."""
