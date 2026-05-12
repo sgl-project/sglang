@@ -31,7 +31,7 @@
 
 use crate::detokenizer::runner::{self as det_runner, Args as DetokenizerArgs};
 use crate::http_server;
-use crate::tokenizer_manager::{TmConfig, TokenizerManager};
+use crate::tokenizer::{TmConfig, TokenizerManager};
 use crate::{DetokenizerConfig, EngineConfig};
 use log::info;
 use std::sync::Arc;

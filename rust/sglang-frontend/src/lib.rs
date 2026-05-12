@@ -4,7 +4,7 @@ pub mod detokenizer;
 pub mod engine;
 pub mod http_server;
 pub mod ipc;
-pub mod tokenizer_manager;
+pub mod tokenizer;
 
 // ──────────────────────── DetokenizerConfig (existing) ──────────────────────
 

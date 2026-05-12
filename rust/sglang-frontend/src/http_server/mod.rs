@@ -13,7 +13,7 @@ pub mod protocol;
 
 use crate::http_server::protocol::*;
 use crate::ipc::wire::SamplingParams;
-use crate::tokenizer_manager::{ResponseChunk, TmConfig, TokenizerManager};
+use crate::tokenizer::{ResponseChunk, TmConfig, TokenizerManager};
 use crate::HttpServerConfig;
 use axum::extract::State;
 use axum::http::StatusCode;
