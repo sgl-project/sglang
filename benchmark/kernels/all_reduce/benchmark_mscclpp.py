@@ -186,7 +186,7 @@ if __name__ == "__main__":
     result = []
 
     with ctx:
-        for i in range(15, 16):
+        for i in range(10, 20):
             sz = 2**i
             if sz * dtype.itemsize > 2**20:
                 break
