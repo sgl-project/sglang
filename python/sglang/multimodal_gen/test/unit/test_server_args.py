@@ -431,7 +431,7 @@ class TestOffloadDefaults(unittest.TestCase):
             kwargs={
                 "model_path": "Qwen/Qwen-Image",
                 "num_gpus": 2,
-                "performance_mode": "balance",
+                "performance_mode": "balanced",
             },
         )
 
