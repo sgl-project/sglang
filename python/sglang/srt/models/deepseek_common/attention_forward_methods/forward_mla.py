@@ -93,13 +93,29 @@ if _use_aiter:
             return q_out, k_out
 
     except ImportError:
-        from aiter.ops.fused_qk_norm_rope_cache_quant import (
-            fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
-        )
+        try:
+            from aiter.ops.fused_qk_norm_rope_cache_quant import (
+                fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
+            )
+        except ImportError:
+            # Older aiter wheel pinned in the docker has neither the post-#2958
+            # unified entry point nor the legacy public fused_qk_rmsnorm.  Provide
+            # a torch-native fallback so module import succeeds; the function is
+            # only called from MLA forward, which is bypassed when dummy_forward=True.
+            def fused_qk_rmsnorm_bf16(q, q_weight, q_eps, k, k_weight, k_eps):
+                raise RuntimeError(
+                    "fused_qk_rmsnorm_bf16 fallback called; aiter wheel in this docker "
+                    "lacks both the new fused_qk_rmsnorm_group_quant and the legacy "
+                    "fused_qk_norm_rope_cache_quant.fused_qk_rmsnorm symbol."
+                )
 
-    from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
-        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
-    )
+    try:
+        from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
+            batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
+        )
+    except ImportError:
+        def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(*a, **kw):
+            raise RuntimeError("batched_gemm fallback called; older aiter pinned.")
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
