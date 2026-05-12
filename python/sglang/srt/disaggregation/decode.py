@@ -251,6 +251,10 @@ class DecodeRequest:
     def seqlen(self) -> int:
         return self.req.seqlen
 
+    @property
+    def priority(self):
+        return self.req.priority
+
 
 class DecodePreallocQueue:
     """
