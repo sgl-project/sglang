@@ -437,7 +437,6 @@ def _get_mega_moe_symm_buffer(
     import deep_gemm
 
     key = (
-        id(group),
         num_max_tokens_per_rank,
         num_experts,
         num_topk,
