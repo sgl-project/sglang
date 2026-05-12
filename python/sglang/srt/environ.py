@@ -540,6 +540,7 @@ class Envs:
 
     # Dangerous untested flagas
     SGLANG_OPT_USE_FAST_MASK_EP = EnvBool(False)
+    SGLANG_EXPERIMENTAL_ENABLE_PIECEWISE_CUDA_GRAPH_MOE_A2A = EnvBool(False)
     SGLANG_OPT_USE_FLASHINFER_NORM = EnvBool(False)
 
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)

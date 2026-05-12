@@ -1595,10 +1595,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return False
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            # TODO(yuwei): fix the compilation errors for MOE A2A backend
+            if envs.SGLANG_EXPERIMENTAL_ENABLE_PIECEWISE_CUDA_GRAPH_MOE_A2A.get():
+                log_info_on_rank0(
+                    logger,
+                    "Enable experimental piecewise CUDA graph with DeepEP/Mooncake "
+                    "MOE A2A backend because "
+                    "SGLANG_EXPERIMENTAL_ENABLE_PIECEWISE_CUDA_GRAPH_MOE_A2A=1",
+                )
+                return True
+
+            # TODO(yuwei): fix the compilation errors for MOE A2A backend.
             log_info_on_rank0(
                 logger,
-                "Disable piecewise CUDA graph due to existing compilation errors",
+                "Disable piecewise CUDA graph due to existing compilation errors. "
+                "Set SGLANG_EXPERIMENTAL_ENABLE_PIECEWISE_CUDA_GRAPH_MOE_A2A=1 "
+                "to run the guarded experiment.",
             )
             return False
         return True
