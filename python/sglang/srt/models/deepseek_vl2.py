@@ -284,9 +284,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
         for item in items:
             assert item.feature.dim() == 4
             assert item.images_spatial_crop.dim() == 3
-            image_feature = vision.forward_features(
-                item.feature.type(target_dtype)
-            )
+            image_feature = vision.forward_features(item.feature.type(target_dtype))
             images_embeds = projector(image_feature)
             _, hw, n_dim = images_embeds.shape
             h = w = int(hw**0.5)
