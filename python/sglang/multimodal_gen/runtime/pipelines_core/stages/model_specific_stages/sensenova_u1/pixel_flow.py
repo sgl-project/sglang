@@ -55,6 +55,7 @@ class SenseNovaU1PixelFlowPrepared:
     image_prediction: Any
     gen_grid_hw: Any
     timesteps: Any
+    cfg_step_mask: tuple[bool, ...]
     cfg: SenseNovaU1PixelFlowCFG
     commit_generated_image: bool
     condition: SenseNovaU1PixelFlowForwardContext
@@ -194,13 +195,22 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
             dtype=dtype,
             generator=generator,
         )
-        gen_grid_hw = torch.tensor([[grid_h, grid_w]], device=device, dtype=torch.long)
+        # keep shape metadata on cpu so vision embedding loop bounds do not sync per step
+        gen_grid_hw = torch.tensor([[grid_h, grid_w]], dtype=torch.long)
+        timestep_shift = float(getattr(sampling_params, "timestep_shift", 3.0))
         timesteps = torch.linspace(0.0, 1.0, steps + 1, device=device)
         timesteps = _apply_time_schedule(
             model,
             timesteps,
             image_seq_len=token_h * token_w,
-            timestep_shift=float(getattr(sampling_params, "timestep_shift", 3.0)),
+            timestep_shift=timestep_shift,
+        )
+        cfg_step_mask = _build_cfg_step_mask(
+            model=model,
+            cfg=cfg,
+            steps=steps,
+            image_seq_len=token_h * token_w,
+            timestep_shift=timestep_shift,
         )
         packed_seqlens = torch.tensor(
             [token_h * token_w], dtype=torch.int32, device=device
@@ -247,6 +257,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
             image_prediction=image_prediction,
             gen_grid_hw=gen_grid_hw,
             timesteps=timesteps,
+            cfg_step_mask=cfg_step_mask,
             cfg=cfg,
             commit_generated_image=commit_generated_image,
             condition=condition,
@@ -304,7 +315,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
                 z=z,
                 t_eps=prepared.t_eps,
             )
-            use_cfg = _should_apply_cfg(prepared.cfg, timestep)
+            use_cfg = prepared.cfg_step_mask[step_i]
             v_pred = self._combine_cfg_velocity(
                 model=model,
                 forward_batch_provider=forward_batch_provider,
@@ -636,6 +647,7 @@ def _build_forward_context(
         generation_input={
             "packed_seqlens": packed_seqlens,
             "packed_position_ids": indexes_image,
+            "extend_num_tokens": token_h * token_w,
         },
         srt_session_id=context.session_id,
         condition_path_role=context.condition_path_role,
@@ -716,6 +728,29 @@ def _apply_time_schedule(
     else:
         raise ValueError(f"Unsupported SenseNova U1 time_schedule: {schedule}")
     return 1 - sigma
+
+
+def _build_cfg_step_mask(
+    *,
+    model: Any,
+    cfg: SenseNovaU1PixelFlowCFG,
+    steps: int,
+    image_seq_len: int,
+    timestep_shift: float,
+) -> tuple[bool, ...]:
+    if not cfg.needs_cfg:
+        return (False,) * steps
+    # cfg boundaries are control flow; compute them on cpu to avoid per-step device sync
+    timesteps = torch.linspace(0.0, 1.0, steps + 1)
+    timesteps = _apply_time_schedule(
+        model,
+        timesteps,
+        image_seq_len=image_seq_len,
+        timestep_shift=timestep_shift,
+    )
+    return tuple(
+        _should_apply_cfg_value(cfg, float(timesteps[i])) for i in range(steps)
+    )
 
 
 def _noise_scale_for_image(model: Any, *, grid_h: int, grid_w: int) -> float:
@@ -814,8 +849,7 @@ def _require_forward_batch_provider(context_ops: ContextOps) -> Any:
     return context_ops.build_temporary_forward_batch
 
 
-def _should_apply_cfg(cfg: SenseNovaU1PixelFlowCFG, timestep: Any) -> bool:
-    timestep_value = float(timestep)
+def _should_apply_cfg_value(cfg: SenseNovaU1PixelFlowCFG, timestep_value: float) -> bool:
     if cfg.start == 0.0:
         return 0.0 <= timestep_value < cfg.end
     return cfg.start < timestep_value < cfg.end

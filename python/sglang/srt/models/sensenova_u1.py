@@ -74,7 +74,7 @@ def build_abs_positions_from_grid_hw(
         grid_hw = torch.tensor(grid_hw, dtype=torch.long, device=device)
     if device is None:
         device = grid_hw.device
-    grid_hw = grid_hw.to(device=device, dtype=torch.long)
+    grid_hw = grid_hw.to(dtype=torch.long)
     if grid_hw.ndim != 2 or grid_hw.shape[-1] != 2:
         raise ValueError(f"grid_hw must have shape (B, 2), got {tuple(grid_hw.shape)}")
 
@@ -85,6 +85,11 @@ def build_abs_positions_from_grid_hw(
     if total_patches == 0:
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
+    if grid_hw.device != device:
+        grid_hw = grid_hw.to(device=device, non_blocking=True)
+        height = grid_hw[:, 0]
+        width = grid_hw[:, 1]
+        patch_counts = height * width
 
     patch_to_sample = torch.repeat_interleave(
         torch.arange(grid_hw.shape[0], device=device),
@@ -305,14 +310,20 @@ class NEOVisionEmbeddings(nn.Module):
                 "U1 native vision expects flattened patch pixels with shape "
                 f"(num_patches, 3 * patch_size^2), got {tuple(pixel_values.shape)}"
             )
-        grid_hw = grid_hw.to(device=pixel_values.device, dtype=torch.long)
+        grid_hw = grid_hw.to(dtype=torch.long)
+        grid_hw_rows = None
+        if grid_hw.device.type == "cpu":
+            grid_hw_rows = [(int(h), int(w)) for h, w in grid_hw.tolist()]
         pixel_values = pixel_values.view(-1, 3, self.patch_size, self.patch_size)
         patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(
             -1,
             self.embed_dim,
         )
         patch_embeds = self._apply_2d_rotary_pos_emb(patch_embeds, grid_hw)
-        expected_patches = int((grid_hw[:, 0] * grid_hw[:, 1]).sum().item())
+        if grid_hw_rows is None:
+            grid_hw = grid_hw.to(device=pixel_values.device, dtype=torch.long)
+            grid_hw_rows = [(int(h), int(w)) for h, w in grid_hw.tolist()]
+        expected_patches = sum(h * w for h, w in grid_hw_rows)
         if expected_patches != patch_embeds.shape[0]:
             raise ValueError(
                 "U1 grid_hw patch count does not match pixel_values: "
@@ -321,7 +332,7 @@ class NEOVisionEmbeddings(nn.Module):
 
         outputs = []
         cursor = 0
-        for h, w in grid_hw.tolist():
+        for h, w in grid_hw_rows:
             num_patches = int(h) * int(w)
             patches = patch_embeds[cursor : cursor + num_patches]
             patches = patches.view(int(h), int(w), -1).unsqueeze(0)
@@ -611,9 +622,10 @@ class NEOQwen3Attention(Qwen3Attention):
     ) -> torch.Tensor:
         """run U1 denoise attention over SRT-owned prefix KV plus query KV"""
 
-        extend_num_tokens = int(forward_batch.extend_num_tokens)
-        req_pool_idx = int(forward_batch.req_pool_indices[0].item())
-        seq_len = int(forward_batch.seq_lens[0].item())
+        metadata = forward_batch.temporary_context_forward_metadata
+        extend_num_tokens = int(metadata["extend_num_tokens"])
+        req_pool_idx = int(metadata["req_pool_idx"])
+        seq_len = int(metadata["prefix_len"]) + extend_num_tokens
 
         q = q.view(extend_num_tokens, self.num_heads, self.head_dim)
         k = k.view(extend_num_tokens, self.num_kv_heads, self.head_dim)
@@ -655,22 +667,12 @@ class NEOQwen3Attention(Qwen3Attention):
 
         # 2. materialize prefix+query K/V so full-query semantics match official U1
         if sgl_flash_attn_varlen_func is not None and attn_mask is None:
-            cu_seqlens_q = torch.tensor(
-                [0, extend_num_tokens],
-                dtype=torch.int32,
-                device=q.device,
-            )
-            cu_seqlens_k = torch.tensor(
-                [0, seq_len],
-                dtype=torch.int32,
-                device=q.device,
-            )
             attn_output = sgl_flash_attn_varlen_func(
                 q.contiguous(),
                 key_states.contiguous().to(q.dtype),
                 value_states.contiguous().to(q.dtype),
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
+                cu_seqlens_q=forward_batch.temporary_context_cu_seqlens_q,
+                cu_seqlens_k=forward_batch.temporary_context_cu_seqlens_k,
                 max_seqlen_q=extend_num_tokens,
                 max_seqlen_k=seq_len,
                 softmax_scale=self.scaling,
@@ -1075,7 +1077,7 @@ class NEOChatModel(nn.Module):
                 device=vision_model.device,
                 dtype=vision_model.dtype,
             ),
-            grid_hw=grid_hw.to(device=vision_model.device, dtype=torch.long),
+            grid_hw=grid_hw.to(dtype=torch.long),
         ).last_hidden_state
 
     def get_input_embeddings(self) -> nn.Embedding:

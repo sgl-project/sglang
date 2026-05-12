@@ -298,16 +298,18 @@ class OmniSRTSchedulerExecutor:
             raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward currently supports one packed query sequence"
             )
-        extend_num_tokens = int(packed_seqlens.to("cpu").sum().item())
-        if extend_num_tokens <= 0:
-            raise OmniSRTSchedulerExecutorError(
-                "Temporary context forward requires at least one query token"
-            )
         position_token_count = (
             int(packed_position_ids.shape[-1])
             if int(packed_position_ids.ndim) > 1
             else int(packed_position_ids.numel())
         )
+        extend_num_tokens = int(
+            generation_input.get("extend_num_tokens", position_token_count)
+        )
+        if extend_num_tokens <= 0:
+            raise OmniSRTSchedulerExecutorError(
+                "Temporary context forward requires at least one query token"
+            )
         if position_token_count != extend_num_tokens:
             raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward packed_position_ids must match packed_seqlens"
@@ -900,9 +902,20 @@ class OmniSRTSchedulerExecutor:
             # U1 pixel-flow query tokens are bidirectional while prefix KV stays read-only
             temporary_context_attention_mode="full_query",
         )
+        forward_batch.temporary_context_cu_seqlens_q = torch.tensor(
+            [0, extend_num_tokens],
+            dtype=torch.int32,
+            device=device,
+        )
+        forward_batch.temporary_context_cu_seqlens_k = torch.tensor(
+            [0, seq_len],
+            dtype=torch.int32,
+            device=device,
+        )
         forward_batch.temporary_context_forward_metadata = {
             "session_id": binding.session_id,
             "request_id": binding.request_id,
+            "req_pool_idx": req_pool_idx,
             "prefix_len": prefix_len,
             "extend_num_tokens": extend_num_tokens,
             "attention_mode": "full_query",
