@@ -26,11 +26,7 @@ from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
@@ -48,12 +44,14 @@ from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner imp
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    draft_capture_hidden_mode,
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
     load_token_map,
     maybe_detect_nan,
     select_top_k_tokens,
+    target_capture_hidden_mode,
 )
 from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda, is_npu
 
@@ -349,7 +347,9 @@ class MultiLayerEagleWorker(TpModelWorker):
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        model_worker_batch.capture_hidden_mode = target_capture_hidden_mode(
+            self.server_args, ForwardMode.EXTEND
+        )
         model_worker_batch.return_hidden_states_before_norm = True
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
         logits_output, next_token_ids = (
@@ -385,14 +385,18 @@ class MultiLayerEagleWorker(TpModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
 
-        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        spec_info.capture_hidden_mode = draft_capture_hidden_mode(
+            self.server_args, ForwardMode.DECODE
+        )
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
         batch.return_hidden_states = False
 
         # Get forward batch
         model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
+        assert model_worker_batch.capture_hidden_mode == draft_capture_hidden_mode(
+            self.server_args, ForwardMode.DECODE
+        )
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.mtp_model_runner(0)
         )
@@ -481,7 +485,9 @@ class MultiLayerEagleWorker(TpModelWorker):
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.server_args.speculative_num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=target_capture_hidden_mode(
+                self.server_args, ForwardMode.TARGET_VERIFY
+            ),
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
@@ -633,7 +639,9 @@ class MultiLayerEagleWorker(TpModelWorker):
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.spec_info.capture_hidden_mode = draft_capture_hidden_mode(
+            self.server_args, ForwardMode.EXTEND
+        )
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=seq_lens_cpu
         )
@@ -690,7 +698,9 @@ class MultiLayerEagleWorker(TpModelWorker):
                 device=self.device,
                 hidden_size=EagleDraftExtendInput.hidden_size_for(self),
                 dtype=EagleDraftExtendInput.dtype_for(self),
-                capture_hidden_mode=CaptureHiddenMode.LAST,
+                capture_hidden_mode=draft_capture_hidden_mode(
+                    self.server_args, ForwardMode.DRAFT_EXTEND
+                ),
             )
             batch.spec_info = draft_extend_input
 
@@ -709,7 +719,9 @@ class MultiLayerEagleWorker(TpModelWorker):
 
         batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
+        assert model_worker_batch.capture_hidden_mode == draft_capture_hidden_mode(
+            self.server_args, ForwardMode.DRAFT_EXTEND
+        )
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.mtp_model_runner(0)
         )
@@ -766,7 +778,9 @@ class MultiLayerEagleWorker(TpModelWorker):
             hidden_states=logits_output.hidden_states,
             topk_p=torch.cat(topk_p_list, dim=1),
             topk_index=torch.cat(topk_index_list, dim=1),
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=draft_capture_hidden_mode(
+                self.server_args, ForwardMode.DECODE
+            ),
         )
 
         # Restore batch fields. `seq_lens` etc. were modified by

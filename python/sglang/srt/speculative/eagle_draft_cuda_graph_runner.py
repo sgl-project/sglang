@@ -26,7 +26,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.spec_utils import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.speculative.spec_utils import (
+    draft_capture_hidden_mode,
+    maybe_detect_nan,
+    maybe_detect_oob,
+)
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -302,7 +306,9 @@ class EAGLEDraftCudaGraphRunner:
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+            capture_hidden_mode=draft_capture_hidden_mode(
+                self.model_runner.server_args, ForwardMode.DECODE
+            ),
         )
 
         # Forward batch

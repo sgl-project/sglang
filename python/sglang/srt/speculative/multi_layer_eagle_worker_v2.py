@@ -28,7 +28,11 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -44,10 +48,12 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    draft_capture_hidden_mode,
     draft_tp_context,
     maybe_detect_nan,
     maybe_detect_oob,
     select_top_k_tokens,
+    target_capture_hidden_mode,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
 
@@ -658,7 +664,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            model_worker_batch.capture_hidden_mode = target_capture_hidden_mode(
+                self.server_args, ForwardMode.EXTEND
+            )
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
@@ -683,7 +691,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
                     dtype=EagleDraftInput.dtype_for(self.draft_worker),
                     topk=self.topk * self.speculative_num_steps,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                    capture_hidden_mode=draft_capture_hidden_mode(
+                        self.server_args, ForwardMode.DECODE
+                    ),
                 )
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
