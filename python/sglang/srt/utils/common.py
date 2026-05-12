@@ -495,6 +495,25 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
+def empty_device_cache(device_module: Optional[Any] = None) -> bool:
+    """Release unused cached blocks from the active device allocator.
+
+    This does not clear SGLang KV/radix/request caches and does not free live
+    tensors. It only forwards to the backend allocator's empty_cache hook when
+    one is available.
+    """
+
+    if device_module is None:
+        device_module = torch.get_device_module()
+
+    empty_cache = getattr(device_module, "empty_cache", None)
+    if empty_cache is None:
+        return False
+
+    empty_cache()
+    return True
+
+
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
@@ -513,7 +532,7 @@ def get_available_gpu_memory(
             )
 
         if empty_cache:
-            torch.cuda.empty_cache()
+            empty_device_cache(torch.cuda)
         props = torch.cuda.get_device_properties(gpu_id)
         if props.is_integrated:
             # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
@@ -535,7 +554,7 @@ def get_available_gpu_memory(
             )
 
         if empty_cache:
-            torch.xpu.empty_cache()
+            empty_device_cache(torch.xpu)
         used_memory = torch.xpu.memory_allocated()
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
@@ -567,7 +586,7 @@ def get_available_gpu_memory(
                 "which may cause useless memory allocation for torch NPU context.",
             )
         if empty_cache:
-            torch.npu.empty_cache()
+            empty_device_cache(torch.npu)
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
     elif device == "musa":
         num_gpus = torch.musa.device_count()
@@ -579,7 +598,7 @@ def get_available_gpu_memory(
                 "which may cause useless memory allocation for torch MUSA context.",
             )
         if empty_cache:
-            torch.musa.empty_cache()
+            empty_device_cache(torch.musa)
         props = torch.musa.get_device_properties(gpu_id)
         if props.is_integrated:
             # On these devices, which use sysmem as device mem, torch.musa.mem_get_info()
@@ -1228,6 +1247,11 @@ def configure_logger(server_args, prefix: str = ""):
     # don't inherit the parent's logger state, so this must run here too.
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    if is_flashinfer_available():
+        from flashinfer.jit.core import logger as flashinfer_logger
+
+        flashinfer_logger.setLevel(logging.ERROR)
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9

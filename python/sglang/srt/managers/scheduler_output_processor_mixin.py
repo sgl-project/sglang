@@ -108,15 +108,47 @@ class SchedulerOutputProcessorMixin:
             self.token_to_kv_pool_allocator.free_group_end()
 
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
-        """Collect routed experts for a finished request."""
+        """Collect routed experts for a finished request.
+
+        Returns immediately if `return_routed_experts` was not set on the
+        request, so non-opted-in reqs don't pay the host-gather cost.
+
+        Honors the caller's absolute start so the response covers
+        `[start_len, seqlen - 1)`. The default start_len is 0, which returns
+        the full sequence.
+
+        Logs a soft warning if the resulting tensor's row count differs from
+        the expected `seqlen - 1 - start_len`, to catch silent regressions.
+        """
+        if not req.return_routed_experts:
+            return
         capturer = get_global_experts_capturer()
         if capturer is None:
             return
+        start_len = req.routed_experts_start_len
         req.routed_experts = capturer.get_topk(
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
+            start_len=start_len,
         )
+
+        expected_rows = max(0, req.seqlen - 1 - start_len)
+        if (
+            req.routed_experts is not None
+            and req.routed_experts.shape[0] != expected_rows
+        ):
+            logger.warning(
+                "routed_experts row-count mismatch for req %s: got %d, "
+                "expected %d (seqlen=%d, cached_tokens=%d, start_len=%s). "
+                "This indicates a silent bug.",
+                req.rid,
+                req.routed_experts.shape[0],
+                expected_rows,
+                req.seqlen,
+                req.cached_tokens,
+                req.routed_experts_start_len,
+            )
 
     def maybe_collect_indexer_topk(self: Scheduler, req: Req):
         capturer = get_global_indexer_capturer()
@@ -398,11 +430,21 @@ class SchedulerOutputProcessorMixin:
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
         for i, req in enumerate(batch.reqs):
-            # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
             predict_tokens.append(
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
+
+            if req.is_retracted:
+                # reset_for_retract() already zeroes committed/allocated KV.
+                continue
+
+            if req.finished():
+                # -1 because prepare_for_decode pre-claimed the bonus slot.
+                req.kv_committed_len -= 1
+                continue
+
+            # -1 because prepare_for_decode pre-claimed the bonus slot.
+            req.kv_committed_len += accept_lens[i] - 1
             req.spec_verify_ct += 1
 
             accepted_draft_tokens = result.num_accepted_drafts_per_req_cpu[i]
