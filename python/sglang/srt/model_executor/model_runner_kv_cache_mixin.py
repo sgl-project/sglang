@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
+    NoOpMHATokenToKVPool,
     NSATokenToKVPool,
     ReqToTokenPool,
 )
@@ -196,6 +197,44 @@ class ModelRunnerKVCacheMixin:
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
 
+    def _validate_prefill_only_disable_kv_cache_pool_family(
+        self: ModelRunner,
+        is_nsa_model: bool,
+        is_dsv4_model: bool,
+        current_platform,
+    ):
+        if not self.server_args.prefill_only_disable_kv_cache or self.is_draft_worker:
+            return
+
+        unsupported_pool_family = None
+        if is_dsv4_model:
+            unsupported_pool_family = "DeepSeekV4TokenToKVPool"
+        elif current_platform.is_out_of_tree() and not self.mambaish_config:
+            unsupported_pool_family = "out-of-tree platform KV pool"
+        elif (
+            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+        ):
+            unsupported_pool_family = "NPU/Ascend KV pool"
+        elif self.use_mla_backend and is_nsa_model:
+            unsupported_pool_family = "NSA/MLA KV pool"
+        elif self.use_mla_backend and not self.mambaish_config:
+            unsupported_pool_family = "MLA KV pool"
+        elif self.is_hybrid_swa:
+            unsupported_pool_family = "SWA KV pool"
+        elif self.mambaish_config:
+            unsupported_pool_family = "hybrid linear/Mamba KV pool"
+        elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            unsupported_pool_family = "FP4 MHA KV pool"
+
+        if unsupported_pool_family is not None:
+            raise RuntimeError(
+                "--prefill-only-disable-kv-cache is not supported for "
+                f"{unsupported_pool_family}. Supported configurations today: plain MHA "
+                "models on CUDA with the FA (fa3/fa4) prefill backend, --is-embedding, "
+                "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
+                "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
+            )
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
@@ -291,6 +330,10 @@ class ModelRunnerKVCacheMixin:
 
         # Out-of-tree platform plugin system — used by elif below
         from sglang.srt.platforms import current_platform
+
+        self._validate_prefill_only_disable_kv_cache_pool_family(
+            is_nsa_model, is_dsv4_model, current_platform
+        )
 
         if is_dsv4_model:
             swa_page_size = self.page_size
@@ -591,7 +634,12 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
-                    self.token_to_kv_pool = MHATokenToKVPool(
+                    pool_cls = (
+                        NoOpMHATokenToKVPool
+                        if self.server_args.prefill_only_disable_kv_cache
+                        else MHATokenToKVPool
+                    )
+                    self.token_to_kv_pool = pool_cls(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
@@ -718,6 +766,24 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
                     swa_allocator.full_to_swa_index_mapping
                 )
+
+        # Defensive check: the explicit validation above should reject known
+        # unsupported pool families before allocation. Keep this guard here so
+        # future pool-selection refactors fail at boot instead of on first use.
+        if (
+            self.server_args.prefill_only_disable_kv_cache
+            and not self.is_draft_worker
+            and not isinstance(self.token_to_kv_pool, NoOpMHATokenToKVPool)
+        ):
+            raise RuntimeError(
+                "--prefill-only-disable-kv-cache expected NoOpMHATokenToKVPool but the "
+                f"runtime pool is {type(self.token_to_kv_pool).__name__}. This pool "
+                "family is not yet supported by --prefill-only-disable-kv-cache. "
+                "Supported configurations today: plain MHA models on CUDA with the FA "
+                "(fa3/fa4) prefill backend, --is-embedding, --chunked-prefill-size=-1, "
+                "--disable-radix-cache, no context-parallel attention, no HiSparse, "
+                "and --kv-cache-dtype != fp4_e2m1."
+            )
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
