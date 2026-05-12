@@ -17,6 +17,7 @@ from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
+    _quantize_fp8_qkv,
 )
 
 if TYPE_CHECKING:
@@ -187,16 +188,19 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
     ):
         from tokenspeed_mla import tokenspeed_mla_prefill
 
-        # tokenspeed's prefill kernel has no output-scale knob, so it assumes V
-        # is at scale=1.0 and we pass ``softmax_scale = layer.scaling`` (no
-        # k_scale baked in). K/V are cast to match Q's dtype.
-        if q.dtype == torch.float8_e4m3fn:
-            k = k.to(torch.float8_e4m3fn)
-            v = v.to(torch.float8_e4m3fn)
-
-        # V arrives as a non-contiguous split of kv_nope in forward_mha; force
-        # contig so the kernel's internal reshape doesn't silently copy.
-        v = v.contiguous()
+        # Quantize to FP8 for the Blackwell FP8 GEMM speedup (mirrors trtllm-gen).
+        # The kernel has no per-tensor scale knob for either K or V, so we
+        # require both ``k_scale_float`` and ``v_scale_float`` to be 1.0 — the
+        # case for Kimi K2.5 and other NVFP4 / fp8_e4m3-KV setups. This matches
+        # tokenspeed's own engine (uses ``softmax_scale = layer.scaling`` with
+        # no per-tensor scale baked in).
+        if self.data_type == torch.float8_e4m3fn:
+            q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
+            assert k_scale == 1.0 and v_scale == 1.0, (
+                "tokenspeed_mla prefill kernel has no per-tensor K/V scale "
+                "knob; both k_scale_float and v_scale_float must be 1.0, got "
+                f"k_scale={k_scale}, v_scale={v_scale}."
+            )
 
         return tokenspeed_mla_prefill(
             query=q,
