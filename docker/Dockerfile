@@ -544,12 +544,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps; \
-    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-        python3 -m pip install "nvidia-cutlass-dsl-libs-cu13>=4.4.2" --no-deps ; \
-    fi
-
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
