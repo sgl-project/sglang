@@ -472,7 +472,7 @@ class EAGLEWorker(TpModelWorker):
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_drafts=0,
+                num_correct_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
@@ -491,7 +491,7 @@ class EAGLEWorker(TpModelWorker):
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
-                    accepted = verify_output.num_accepted_drafts_per_req_cpu[idx]
+                    accepted = verify_output.num_correct_drafts_per_req_cpu[idx]
                     req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
 
             set_time_batch(
@@ -526,14 +526,14 @@ class EAGLEWorker(TpModelWorker):
 
             if self.adaptive_controller is not None:
                 self.adaptive_controller.on_verify_complete(
-                    verify_output.num_accepted_drafts_per_req_cpu
+                    verify_output.num_correct_drafts_per_req_cpu
                 )
 
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=verify_output.accept_tokens,
-                num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
-                num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
+                num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
+                num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
@@ -727,8 +727,8 @@ class EAGLEWorker(TpModelWorker):
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
-            hidden_size=self.model_config.spec_hidden_size,
-            dtype=self.model_config.dtype,
+            hidden_size=EagleDraftInput.hidden_size_for(self),
+            dtype=EagleDraftInput.dtype_for(self),
             topk=self.topk,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
@@ -1003,24 +1003,24 @@ class EAGLEWorker(TpModelWorker):
         if batch.forward_mode.is_idle():
             return
 
-        accepted_length = (
+        num_accept_tokens = (
             torch.tensor(
-                res.num_accepted_drafts_per_req_cpu,
+                res.num_correct_drafts_per_req_cpu,
                 device=logits_output.hidden_states.device,
                 dtype=torch.int64,
             )
             + 1
         )
-        cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
-        # prepend 0 to the cumulative_accepted_lengths
+        cumulative_num_accept_tokens = torch.cumsum(num_accept_tokens, dim=0)
+        # prepend 0 to the cumulative_num_accept_tokens
         accepted_indices_start = torch.cat(
             [
                 torch.zeros(
                     1,
-                    dtype=cumulative_accepted_lengths.dtype,
-                    device=cumulative_accepted_lengths.device,
+                    dtype=cumulative_num_accept_tokens.dtype,
+                    device=cumulative_num_accept_tokens.device,
                 ),
-                cumulative_accepted_lengths[:-1],
+                cumulative_num_accept_tokens[:-1],
             ]
         )
         accepted_indices_offset = torch.arange(
@@ -1034,17 +1034,17 @@ class EAGLEWorker(TpModelWorker):
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
         if spec_info.topk > 1 and res.accepted_indices.shape[0] > 0:
-            # accepted_indices=[0,2,3,4,5,7,9,10,11], accepted_length=[4, 3, 2], cumulative_accepted_lengths=[4, 7, 9]
-            # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_accepted_lengths[:-1]]) = [0, 5, 10]
-            # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
-            # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
+            # accepted_indices=[0,2,3,4,5,7,9,10,11], num_accept_tokens=[4, 3, 2], cumulative_num_accept_tokens=[4, 7, 9]
+            # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_num_accept_tokens[:-1]]) = [0, 5, 10]
+            # last_token_indices_per_req=accepted_indices[cumulative_num_accept_tokens - 1] = [4, 9, 11] (last token ID of each req)
+            # accept_steps = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
             # first_token_indices_per_req = res.accepted_indices[accepted_indices_start]
-            accepted_steps = (
-                res.accepted_indices[cumulative_accepted_lengths - 1]
+            accept_steps = (
+                res.accepted_indices[cumulative_num_accept_tokens - 1]
                 - accepted_indices_offset
             )
         else:
-            accepted_steps = accepted_length - 1
+            accept_steps = num_accept_tokens - 1
 
         if batch.mamba_track_indices is not None:
             # If after verify, the request's seq_lens has crossed a mamba track interval,
@@ -1068,7 +1068,7 @@ class EAGLEWorker(TpModelWorker):
             mamba_steps_to_track = None
 
         self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-            accepted_steps=accepted_steps,
+            accept_steps=accept_steps,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
@@ -1130,17 +1130,10 @@ class EAGLEWorker(TpModelWorker):
             # All reqs finished this verify; swap to an idle ExtendInput.
             batch = batch.copy()
             batch.prepare_for_idle()
-            target_cfg = self.target_worker.model_runner.model_config
-            hidden_size = (
-                target_cfg.hidden_size * 3
-                if self.speculative_algorithm.is_eagle3()
-                and self.eagle_use_aux_hidden_state
-                else target_cfg.spec_hidden_size
-            )
             draft_extend_input = EagleDraftExtendInput.create_idle_input(
                 device=self.device,
-                hidden_size=hidden_size,
-                dtype=target_cfg.dtype,
+                hidden_size=EagleDraftExtendInput.hidden_size_for(self),
+                dtype=EagleDraftExtendInput.dtype_for(self),
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             batch.spec_info = draft_extend_input
