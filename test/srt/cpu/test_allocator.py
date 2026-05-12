@@ -2,7 +2,6 @@
 Unit tests for alloc_extend_kernel_cpu and alloc_decode_kernel_cpu.
 """
 
-import time
 import unittest
 
 import torch
