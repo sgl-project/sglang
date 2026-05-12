@@ -593,10 +593,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             else:
                 last_correct_step_indices = num_correct_drafts
             self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=None,
-                mamba_steps_to_track=None,
-                model=self.target_worker.model_runner.model,
+                last_correct_step_indices, self.target_worker.model_runner.model
             )
 
         if batch.return_logprob:
