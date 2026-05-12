@@ -1,17 +1,15 @@
 """
-    ServerArgsAutoTuner tunes the ServerArgs based on the desired performance mode
+ServerArgsAutoTuner tunes the ServerArgs based on the desired performance mode
 """
-
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
-
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
