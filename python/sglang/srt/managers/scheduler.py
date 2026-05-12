@@ -2787,13 +2787,14 @@ class Scheduler(
             return None
 
         can_run_set = set(can_run_list)
-        # Keep chunked reqs in waiting_queue (they will be re-admitted as
-        # chunked-resume next iter). _is_unfinished_chunked is safe to call
-        # here because PrefillAdder truncated fill_ids for the admitted chunk.
+        # Drop everything that just got admitted (including still-chunked reqs
+        # — they're re-added to waiting_queue by process_batch_result_prefill
+        # once their forward + OP completes). This keeps PP correct: while a
+        # chunk is mid-flight in one microbatch, the req is OUT of
+        # waiting_queue, so the next microbatch in the same outer iter can't
+        # also admit it and re-prefill the same KV range concurrently.
         self.waiting_queue = [
-            x
-            for x in self.waiting_queue
-            if x not in can_run_set or _is_unfinished_chunked(x)
+            x for x in self.waiting_queue if x not in can_run_set
         ]
         if adder.preempt_list:
             for req in adder.preempt_list:
