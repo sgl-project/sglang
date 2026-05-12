@@ -236,6 +236,16 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
+            if r.req_pool_idx is not None:
+                # Chunked-resume req: prefix_indices was already set by the
+                # previous iteration's stash (cache_unfinished_req chunked=True)
+                # and req.cache_protected_len matches it. Re-running match_prefix
+                # here would silently widen prefix_indices (if the tree grew
+                # since the stash), making prepare_for_extend re-stage tree
+                # slots as "uncached" without bumping cache_protected_len —
+                # the slots end up double-counted in self_check_during_busy.
+                continue
+
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             match_result = match_prefix_for_req(self.tree_cache, r, prefix_ids)
