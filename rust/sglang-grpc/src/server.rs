@@ -34,17 +34,17 @@ async fn recv_chunk_with_timeout(
         .map_err(|_| Status::deadline_exceeded(timeout_message.to_string()))
 }
 
-struct RequestAbortGuard<'a> {
-    bridge: &'a Arc<PyBridge>,
-    rid: &'a str,
+struct RequestAbortGuard {
+    bridge: Arc<PyBridge>,
+    rid: String,
     armed: bool,
 }
 
-impl<'a> RequestAbortGuard<'a> {
-    fn new(bridge: &'a Arc<PyBridge>, rid: &'a str) -> Self {
+impl RequestAbortGuard {
+    fn new(bridge: Arc<PyBridge>, rid: impl Into<String>) -> Self {
         Self {
             bridge,
-            rid,
+            rid: rid.into(),
             armed: true,
         }
     }
@@ -52,12 +52,32 @@ impl<'a> RequestAbortGuard<'a> {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn abort_now(&mut self) {
+        if self.armed {
+            self.armed = false;
+            spawn_abort(self.bridge.clone(), self.rid.clone());
+        }
+    }
 }
 
-impl Drop for RequestAbortGuard<'_> {
+impl Drop for RequestAbortGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.bridge.abort(self.rid, false);
+            spawn_abort(self.bridge.clone(), self.rid.clone());
+        }
+    }
+}
+
+fn spawn_abort(bridge: Arc<PyBridge>, rid: String) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let _ = handle.spawn_blocking(move || {
+                let _ = bridge.abort(&rid, false);
+            });
+        }
+        Err(_) => {
+            let _ = bridge.abort(&rid, false);
         }
     }
 }
@@ -68,7 +88,7 @@ async fn recv_required_chunk_for_request(
     receiver: &mut Receiver<ResponseChunk>,
     response_timeout: Duration,
 ) -> Result<ResponseChunk, Status> {
-    let mut abort_guard = RequestAbortGuard::new(bridge, rid);
+    let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid.to_string());
     let timeout_message = format!("Request timed out after {}s", response_timeout.as_secs());
     let result = match recv_chunk_with_timeout(receiver, response_timeout, &timeout_message).await {
         Ok(Some(chunk)) => Ok(chunk),
@@ -138,6 +158,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let response_timeout = self.response_timeout;
 
         let stream = async_stream::stream! {
+            let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid_clone.clone());
             loop {
                 match recv_chunk_with_timeout(&mut receiver, response_timeout, "Stream chunk timed out").await {
                     Ok(Some(ResponseChunk::Data(data))) => {
@@ -148,6 +169,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         });
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
+                        abort_guard.disarm();
                         yield Ok(proto::TextGenerateResponse {
                             text: data.text.unwrap_or_default(),
                             meta_info: data.meta_info,
@@ -156,15 +178,17 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         break;
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
+                        abort_guard.disarm();
                         yield Err(Status::internal(msg));
                         break;
                     }
                     Ok(None) => {
+                        abort_guard.disarm();
                         yield Err(closed_stream_status(&bridge, &rid_clone));
                         break;
                     }
                     Err(status) => {
-                        let _ = bridge.abort(&rid_clone, false);
+                        abort_guard.abort_now();
                         yield Err(status);
                         break;
                     }
@@ -198,6 +222,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         let response_timeout = self.response_timeout;
 
         let stream = async_stream::stream! {
+            let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid_clone.clone());
             loop {
                 match recv_chunk_with_timeout(&mut receiver, response_timeout, "Stream chunk timed out").await {
                     Ok(Some(ResponseChunk::Data(data))) => {
@@ -208,6 +233,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         });
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
+                        abort_guard.disarm();
                         yield Ok(proto::GenerateResponse {
                             output_ids: data.output_ids.unwrap_or_default(),
                             meta_info: data.meta_info,
@@ -216,15 +242,17 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         break;
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
+                        abort_guard.disarm();
                         yield Err(Status::internal(msg));
                         break;
                     }
                     Ok(None) => {
+                        abort_guard.disarm();
                         yield Err(closed_stream_status(&bridge, &rid_clone));
                         break;
                     }
                     Err(status) => {
-                        let _ = bridge.abort(&rid_clone, false);
+                        abort_guard.abort_now();
                         yield Err(status);
                         break;
                     }
@@ -737,6 +765,7 @@ impl SglangServiceImpl {
         let response_timeout = self.response_timeout;
 
         let stream = async_stream::stream! {
+            let mut abort_guard = RequestAbortGuard::new(bridge.clone(), rid_clone.clone());
             loop {
                 match recv_chunk_with_timeout(&mut receiver, response_timeout, "Stream chunk timed out").await {
                     Ok(Some(ResponseChunk::Data(data))) => {
@@ -747,6 +776,7 @@ impl SglangServiceImpl {
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
                         let bytes = data.json_bytes.unwrap_or_default();
+                        abort_guard.disarm();
                         yield Ok(proto::OpenAiStreamChunk {
                             json_chunk: bytes,
                             finished: true,
@@ -754,15 +784,17 @@ impl SglangServiceImpl {
                         break;
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
+                        abort_guard.disarm();
                         yield Err(Status::internal(msg));
                         break;
                     }
                     Ok(None) => {
+                        abort_guard.disarm();
                         yield Err(closed_stream_status(&bridge, &rid_clone));
                         break;
                     }
                     Err(status) => {
-                        let _ = bridge.abort(&rid_clone, false);
+                        abort_guard.abort_now();
                         yield Err(status);
                         break;
                     }
