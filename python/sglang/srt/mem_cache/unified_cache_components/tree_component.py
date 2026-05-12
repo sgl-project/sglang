@@ -163,6 +163,19 @@ class TreeComponent(ABC):
         be a tombstone for this component."""
         return False
 
+    def recover_after_unevict(
+        self,
+        node: UnifiedTreeNode,
+        prefix_len: int,
+        total_prefix_len: int,
+        params: InsertParams,
+    ) -> None:
+        """Called after _unevict_node_on_insert restores the base (Full) value
+        on an evicted node. Aux components (e.g. SWA) override this to rebuild
+        their own data from the freshly assigned base value when their entry
+        is still tombstoned. Default no-op."""
+        return None
+
     def commit_insert_component_data(
         self,
         node: UnifiedTreeNode,
