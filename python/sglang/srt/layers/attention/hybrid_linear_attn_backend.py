@@ -153,8 +153,13 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
-        # Clear is skipped here — alloc() already clears at allocation time.
-        # Only COW (copy-on-write from radix cache) needs the forward stream.
+        if (
+            forward_batch.mamba_clear_indices is not None
+            and len(forward_batch.mamba_clear_indices) > 0
+        ):
+            self.req_to_token_pool.mamba_pool.clear_slots(
+                forward_batch.mamba_clear_indices
+            )
         if (
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
