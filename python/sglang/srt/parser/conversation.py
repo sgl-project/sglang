@@ -1150,10 +1150,19 @@ def match_qwen_chat_ml(model_path: str):
 
 @register_conv_template_matching_function
 def match_minicpm(model_path: str):
+    # MiniCPM-V 4.6+ uses its own chat_template.jinja with `<|image_pad|>` and
+    # must NOT fall back to the legacy `minicpmv` conv template (which encodes
+    # the old `(<image>./</image>)` placeholder used by 2.x/4.0/4.5).
+    model_type = get_model_type(model_path)
+    if model_type == "minicpmv4_6":
+        return None
+    # For HF-hub paths (where config.json isn't on local disk yet), fall back
+    # to a path-version check: exclude 4.6 and later, match only legacy 2.x/4.0/4.5.
+    if re.search(r"minicpm-(v|o)-4[._]6", model_path, re.IGNORECASE):
+        return None
     match = re.search(r"minicpm-(v|o)", model_path, re.IGNORECASE)
     if match:
         return f"minicpm{match.group(1).lower()}"
-    model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)
 
 
