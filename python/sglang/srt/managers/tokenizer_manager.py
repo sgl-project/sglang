@@ -77,6 +77,9 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
+from sglang.srt.managers.tokenizer_manager_components.raw_tokenizer_wrapper import (
+    RawTokenizerWrapper,
+)
 from sglang.srt.managers.tokenizer_manager_components.request_state import (
     ReqState,
     init_req,
@@ -153,8 +156,13 @@ class TokenizerManager(TokenizerControlMixin):
         # Init model config
         self.init_model_config()
 
-        # Initialize tokenizer and multimodalprocessor
-        self.init_tokenizer_and_processor()
+        # Initialize tokenizer and multimodal processor
+        self.raw_tokenizer_wrapper = RawTokenizerWrapper()
+        TokenizerManager.init_tokenizer_and_processor(
+            self.raw_tokenizer_wrapper,
+            server_args=self.server_args,
+            model_config=self.model_config,
+        )
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -220,26 +228,29 @@ class TokenizerManager(TokenizerControlMixin):
             self.num_reserved_tokens = 0
         self.validate_total_tokens = True
 
-    def init_tokenizer_and_processor(self):
-        server_args = self.server_args
-
+    @staticmethod
+    def init_tokenizer_and_processor(
+        self: "RawTokenizerWrapper",
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+    ) -> None:
         # Initialize tokenizer and processor
-        if self.model_config.is_multimodal:
+        if model_config.is_multimodal:
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
             _processor = _get_processor_wrapper(server_args)
-            transport_mode = _determine_tensor_transport_mode(self.server_args)
+            transport_mode = _determine_tensor_transport_mode(server_args)
 
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode
             # images even with skip_tokenizer_init=False.
             self.mm_processor = get_mm_processor(
-                self.model_config.hf_config,
+                model_config.hf_config,
                 server_args,
                 _processor,
                 transport_mode,
-                model_config=self.model_config,
+                model_config=model_config,
             )
 
             if server_args.skip_tokenizer_init:
@@ -2327,6 +2338,27 @@ class TokenizerManager(TokenizerControlMixin):
             and self.default_priority_value is not None
         ):
             obj.priority = self.default_priority_value
+
+    # ---- raw_tokenizer_wrapper facade -----------------------------------
+    # ``tokenizer`` / ``processor`` / ``mm_processor`` are the TokenizerManager
+    # public read-API; storage is delegated to ``self.raw_tokenizer_wrapper``.
+    # Read-only by design — writes go through ``self.raw_tokenizer_wrapper``
+    # directly (the only writes happen inside
+    # ``RawTokenizerWrapper.init_tokenizer_and_processor``).
+    # ``async_dynamic_batch_tokenizer`` stays internal — access via
+    # ``self.raw_tokenizer_wrapper.async_dynamic_batch_tokenizer`` directly.
+
+    @property
+    def tokenizer(self):
+        return self.raw_tokenizer_wrapper.tokenizer
+
+    @property
+    def processor(self):
+        return self.raw_tokenizer_wrapper.processor
+
+    @property
+    def mm_processor(self):
+        return self.raw_tokenizer_wrapper.mm_processor
 
 
 class ServerStatus(Enum):
