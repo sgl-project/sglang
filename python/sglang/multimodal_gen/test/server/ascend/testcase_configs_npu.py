@@ -51,16 +51,13 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
         T2I_sampling_params,
         run_consistency_check=False,
     ),
-]
-
-EIGHT_NPU_CASES: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
     DiffusionTestCase(
         "wan2_2_t2v_14b_w8a8_8npu",
         DiffusionServerArgs(
             model_path="/root/.cache/modelscope/hub/models/Eco-Tech/Wan2.2-T2V-A14B-Diffusers-w8a8",
-            num_gpus=8,
-            tp_size=4,
+            num_gpus=2,
+            tp_size=1,
             ulysses_degree=2,
         ),
         DiffusionSamplingParams(
@@ -82,10 +79,6 @@ SUITES = {
     "2-npu": [
         "ascend/test_server_2_npu.py",
         # add new 2-npu test files here
-    ],
-    "8-npu": [
-        "ascend/test_server_8_npu.py",
-        # add new 8-npu test files here
     ],
 }
 

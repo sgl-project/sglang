@@ -44,7 +44,7 @@ SUITE_OUTPUT_NAMES = {"1-gpu": "1gpu", "2-gpu": "2gpu", "1-gpu-b200": "b200"}
 use_npu_conf = get_bool_env_var("USE_NPU_CONFIGS")
 
 if use_npu_conf:
-    SUITE_OUTPUT_NAMES = {"1-npu": "1npu", "2-npu": "2npu", "8-npu": "8npu"}
+    SUITE_OUTPUT_NAMES = {"1-npu": "1npu", "2-npu": "2npu"}
 
 DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
 

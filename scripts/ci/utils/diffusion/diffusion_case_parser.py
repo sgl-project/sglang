@@ -51,7 +51,6 @@ if get_bool_env_var("USE_NPU_CONFIGS"):
     CASE_LIST_TO_SUITE = {
         "ONE_NPU_CASES": "1-npu",
         "TWO_NPU_CASES": "2-npu",
-        "EIGHT_NPU_CASES": "8-npu",
     }
 
 
