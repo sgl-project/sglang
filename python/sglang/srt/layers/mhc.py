@@ -654,6 +654,92 @@ def mhc_pre_big_fuse_with_norm_tilelang(
             T.pdl_trigger()
 
 
+@register_custom_op(mutates_args=["post_mix", "comb_mix", "layer_input"])
+def mhc_pre_big_fuse_tilelang_op(
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual_flat: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    hidden_size: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int,
+    hc_mult: int,
+    gemm_last_dim: int,
+) -> None:
+    mhc_pre_big_fuse_tilelang(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_flat,
+        post_mix,
+        comb_mix,
+        layer_input,
+        hidden_size,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        hc_mult,
+        gemm_last_dim,
+    )
+
+
+@register_custom_op(mutates_args=["post_mix", "comb_mix", "layer_input"])
+def mhc_pre_big_fuse_with_norm_tilelang_op(
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual_flat: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    hidden_size: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    n_splits: int,
+    hc_mult: int,
+    gemm_last_dim: int,
+) -> None:
+    mhc_pre_big_fuse_with_norm_tilelang(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_flat,
+        post_mix,
+        comb_mix,
+        layer_input,
+        norm_weight,
+        hidden_size,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_eps,
+        n_splits,
+        hc_mult,
+        gemm_last_dim,
+    )
+
+
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -791,7 +877,7 @@ def mhc_pre(
             norm_weight = norm_weight.to(torch.bfloat16)
         if not norm_weight.is_contiguous():
             norm_weight = norm_weight.contiguous()
-        mhc_pre_big_fuse_with_norm_tilelang(
+        mhc_pre_big_fuse_with_norm_tilelang_op(
             gemm_out_mul,
             gemm_out_sqrsum,
             hc_scale,
@@ -813,7 +899,7 @@ def mhc_pre(
             gemm_last_dim,
         )
     else:
-        mhc_pre_big_fuse_tilelang(
+        mhc_pre_big_fuse_tilelang_op(
             gemm_out_mul,
             gemm_out_sqrsum,
             hc_scale,
