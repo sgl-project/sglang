@@ -178,8 +178,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
             hidden_states = torch.zeros(
-                (self.max_num_token, self.model_runner.model_config.hidden_size),
-                dtype=self.model_runner.dtype,
+                (
+                    self.max_num_token,
+                    EagleDraftExtendInput.hidden_size_for(self.eagle_worker),
+                ),
+                dtype=EagleDraftExtendInput.dtype_for(self.eagle_worker),
             )
 
             if self.require_gathered_buffer:

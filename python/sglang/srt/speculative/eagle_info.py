@@ -56,6 +56,18 @@ if is_cuda() or is_musa():
 logger = logging.getLogger(__name__)
 
 
+def _draft_runner_of(worker):
+    """Draft model_runner accessor that handles v1 / v2 worker naming.
+
+    v1 (`EAGLEWorker` and subclasses) exposes the draft model_runner as
+    `model_runner` (the worker itself runs the draft model);
+    v2 (`EagleDraftWorker` and subclasses) exposes it as `draft_runner`.
+    """
+    return (
+        worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
+    )
+
+
 @dataclass
 class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
@@ -699,6 +711,17 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             pt += extend_len
 
     @classmethod
+    def hidden_size_for(cls, worker) -> int:
+        """Decode-phase `hidden_states` width: draft self-chain output
+        (draft model writes its own last hidden back via `capture_for_decode`
+        and the draft loop)."""
+        return _draft_runner_of(worker).model_config.spec_hidden_size
+
+    @classmethod
+    def dtype_for(cls, worker) -> torch.dtype:
+        return _draft_runner_of(worker).model_config.dtype
+
+    @classmethod
     def create_idle_input(
         cls,
         device: torch.device,
@@ -819,6 +842,24 @@ class EagleDraftExtendInput(SpecInput):
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
+
+    @classmethod
+    def hidden_size_for(cls, worker) -> int:
+        """Extend-phase `hidden_states` width: target verify output (EAGLE
+        paper's "feature"). Widened to `target.hidden_size * 3` for EAGLE-3
+        aux mode (low/mid/high features fused into a 3k-dim vector, reduced
+        by draft's FC)."""
+        target_cfg = worker.target_worker.model_runner.model_config
+        if (
+            worker.speculative_algorithm.is_eagle3()
+            and worker.eagle_use_aux_hidden_state
+        ):
+            return target_cfg.hidden_size * 3
+        return target_cfg.spec_hidden_size
+
+    @classmethod
+    def dtype_for(cls, worker) -> torch.dtype:
+        return worker.target_worker.model_runner.model_config.dtype
 
     @classmethod
     def create_idle_input(
