@@ -132,16 +132,16 @@ class AdaptiveSpeculativeParams:
             f"steps={self.current_steps}, candidate_steps={self.candidate_steps}",
         )
 
-    def update(self, num_accepted_drafts_per_req: list[int]) -> bool:
+    def update(self, num_correct_drafts_per_req: list[int]) -> bool:
         """Update EMA with observed accept lengths. Returns True if params changed.
 
         Args:
-            num_accepted_drafts_per_req: Per-request accepted draft token counts from last verify.
+            num_correct_drafts_per_req: Per-request accepted draft token counts from last verify.
         """
-        if not num_accepted_drafts_per_req:
+        if not num_correct_drafts_per_req:
             return False
 
-        batch_avg = sum(num_accepted_drafts_per_req) / len(num_accepted_drafts_per_req)
+        batch_avg = sum(num_correct_drafts_per_req) / len(num_correct_drafts_per_req)
         self.ema_accept_len = (
             1 - self.ema_alpha
         ) * self.ema_accept_len + self.ema_alpha * batch_avg
