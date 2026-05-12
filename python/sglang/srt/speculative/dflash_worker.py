@@ -356,6 +356,9 @@ class DFlashWorker:
         # Delegate anything not implemented yet to the target worker.
         return getattr(self.target_worker, name)
 
+    def on_verify_complete_cpu(self, num_accepted_drafts_per_req: list[int]) -> None:
+        pass
+
     def clear_cache_pool(self):
         # The target worker owns the shared KV allocator/cache. For the compact
         # sliding-window path, the draft req->token view is rebuilt from committed
@@ -581,7 +584,7 @@ class DFlashWorker:
         try:
             block_ids = self._draft_block_ids_buf[:bs]
             block_ids.fill_(int(self._mask_token_id))
-            block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
+            block_ids[:, 0].copy_(draft_input.bonus_tokens.to(torch.long))
 
             noise_embedding = embed_module(block_ids)
             input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
@@ -1380,7 +1383,7 @@ class DFlashWorker:
                 model_worker_batch.extend_seq_lens
             )
             draft_input = DFlashDraftInput(
-                verified_id=next_token_ids.to(torch.int64),
+                bonus_tokens=next_token_ids.to(torch.int64),
                 target_hidden=logits_output.hidden_states,
                 ctx_lens=extend_seq_lens,
                 draft_seq_lens=(
@@ -1395,7 +1398,7 @@ class DFlashWorker:
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
+                num_accepted_drafts=0,
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
             )
 
@@ -1430,10 +1433,10 @@ class DFlashWorker:
         )
 
         (
-            new_verified_id,
+            new_bonus_tokens,
             commit_lens,
             next_target_hidden,
-            accept_length_per_req_cpu,
+            num_accepted_drafts_per_req_cpu,
         ) = verify_input.verify(
             batch=batch,
             logits_output=logits_output,
@@ -1449,25 +1452,25 @@ class DFlashWorker:
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
-        draft_input.verified_id = new_verified_id
+        draft_input.bonus_tokens = new_bonus_tokens
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
         self._append_target_hidden_to_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
-        num_accepted_tokens = sum(accept_length_per_req_cpu)
+        num_accepted_drafts = sum(num_accepted_drafts_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:
             logger.info(
-                "DFLASH verify completed. accept_length_per_req=%s",
-                accept_length_per_req_cpu,
+                "DFLASH verify completed. num_accepted_drafts_per_req=%s",
+                num_accepted_drafts_per_req_cpu,
             )
             self._logged_first_verify = True
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=new_verified_id,
-            num_accepted_tokens=num_accepted_tokens,
-            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            next_token_ids=new_bonus_tokens,
+            num_accepted_drafts=num_accepted_drafts,
+            num_accepted_drafts_per_req_cpu=num_accepted_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )

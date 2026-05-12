@@ -248,6 +248,7 @@ class DFlashWorkerV2(DFlashWorker):
                 accept_lens=empty_lens,
                 next_draft_input=next_draft_input,
                 can_run_cuda_graph=False,
+                speculative_num_draft_tokens=int(self.block_size),
             )
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
@@ -620,4 +621,5 @@ class DFlashWorkerV2(DFlashWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             prepared_kv_allocated_lens_cpu=draft_input.reserved_seq_lens_cpu,
+            speculative_num_draft_tokens=int(self.block_size),
         )
