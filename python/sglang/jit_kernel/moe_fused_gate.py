@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -37,7 +38,7 @@ def can_use_moe_fused_gate() -> bool:
         return False
 
 
-def moe_fused_gate(
+def _moe_fused_gate_impl(
     input: torch.Tensor,
     bias: torch.Tensor,
     topk: int,
@@ -80,3 +81,50 @@ def moe_fused_gate(
     )
 
     return output, indices
+
+
+def _moe_fused_gate_fake(
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    scoring_func: str = "sigmoid",
+    num_fused_shared_experts: int = 0,
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
+    apply_routed_scaling_factor_on_output: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    _ = (
+        bias,
+        scoring_func,
+        num_fused_shared_experts,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    )
+    return (
+        input.new_empty((input.shape[0], topk), dtype=torch.float32),
+        input.new_empty((input.shape[0], topk), dtype=torch.int32),
+    )
+
+
+@register_custom_op(fake_impl=_moe_fused_gate_fake)
+def moe_fused_gate(
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    scoring_func: str = "sigmoid",
+    num_fused_shared_experts: int = 0,
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
+    apply_routed_scaling_factor_on_output: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _moe_fused_gate_impl(
+        input,
+        bias,
+        topk,
+        scoring_func,
+        num_fused_shared_experts,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    )
