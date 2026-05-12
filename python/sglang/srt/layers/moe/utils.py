@@ -201,7 +201,7 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
         if input_global_scale is not None:
             return DeepEPOutputDtype.NVFP4
 
-        # 3. Parse quant config to to determine the output dtype of dispatcher
+        # 3. Parse quant config to determine the output dtype of dispatcher
         dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
         if dispatcher_output_dtype is not None:
             return DeepEPOutputDtype(dispatcher_output_dtype)
