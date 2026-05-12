@@ -217,12 +217,16 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
         cd = node.component_data[ct]
         value = cd.value
-        if value is not None:
-            if cd.lock_ref == 0:
-                vlen = len(value)
-                self.cache.component_evictable_size_[ct] -= vlen
-                self.cache.component_protected_size_[ct] += vlen
-            cd.lock_ref += 1
+        # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
+        if value is None:
+            result.skip_lock_node_ids.setdefault(ct, set()).add(node.id)
+            return result
+
+        if cd.lock_ref == 0:
+            vlen = len(value)
+            self.cache.component_evictable_size_[ct] -= vlen
+            self.cache.component_protected_size_[ct] += vlen
+        cd.lock_ref += 1
         return result
 
     def release_component_lock(
@@ -230,6 +234,10 @@ class MambaComponent(TreeComponent):
     ) -> None:
         ct = self.component_type
         cd = node.component_data[ct]
+        skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
+        if node.id in skip_lock_node_ids:
+            return
+
         value = cd.value
         if value is not None and cd.lock_ref > 0:
             if cd.lock_ref == 1:
