@@ -80,6 +80,7 @@ class TritonAttnBackend(AttentionBackend):
             build_unified_kv_indices,
             extend_attention_fwd,
             extend_attention_fwd_unified,
+            extend_attention_fwd_with_lse,
         )
 
         super().__init__()
@@ -88,6 +89,9 @@ class TritonAttnBackend(AttentionBackend):
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
+        )
+        self.extend_attention_fwd_with_lse = torch.compiler.disable(
+            extend_attention_fwd_with_lse
         )
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
 
@@ -1068,7 +1072,7 @@ class TritonAttnBackend(AttentionBackend):
             causal = False
 
         if self.dcp_size > 1:
-            return self._forward_extend_dcp_torch(
+            return self._forward_extend_dcp(
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
             )
 
@@ -1124,7 +1128,7 @@ class TritonAttnBackend(AttentionBackend):
         )
         return o
 
-    def _forward_extend_dcp_torch(
+    def _forward_extend_dcp(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -1136,20 +1140,17 @@ class TritonAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor],
     ):
         if sinks is not None:
-            raise NotImplementedError("DCP Triton extend fallback does not support sinks")
+            raise NotImplementedError("DCP Triton extend does not support sinks")
         if self.forward_metadata.custom_mask is not None:
-            raise NotImplementedError(
-                "DCP Triton extend fallback does not support custom masks"
-            )
+            raise NotImplementedError("DCP Triton extend does not support custom masks")
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            raise NotImplementedError("DCP Triton extend does not support sliding window")
 
         group = get_dcp_group()
         q_local = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
-        q_all = group.all_gather(q_local, dim=1)
+        q_all = group.all_gather(q_local, dim=1).contiguous()
         total_tokens, total_heads, _ = q_all.shape
         local_heads = layer.tp_q_head_num
-        kv_heads = self.num_kv_head
-        total_kv_group_num = total_heads // kv_heads
-        local_kv_group_num = local_heads // kv_heads
 
         prefix_out = torch.zeros(
             (total_tokens, total_heads, layer.v_head_dim),
@@ -1174,79 +1175,74 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
         )
 
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        k_descale = layer.k_scale_float if layer.k_scale is not None else 1.0
-        v_descale = layer.v_scale_float if layer.v_scale is not None else 1.0
-
-        qo_indptr = self.forward_metadata.qo_indptr
         kv_indptr = self.forward_metadata.kv_indptr
         kv_indices = self.forward_metadata.kv_indices
-        for b in range(forward_batch.batch_size):
-            q_start = int(qo_indptr[b].item())
-            q_end = int(qo_indptr[b + 1].item())
-            prefix_len = int(forward_batch.extend_prefix_lens[b].item())
-            extend_len = int(forward_batch.extend_seq_lens[b].item())
-            extend_start = int(forward_batch.extend_start_loc[b].item())
-            m = q_end - q_start
+        max_extend_len = self.forward_metadata.max_extend_len
 
-            prefix_start = int(kv_indptr[b].item())
-            prefix_end = int(kv_indptr[b + 1].item())
-            prefix_indices = kv_indices[prefix_start:prefix_end].long()
-            if prefix_indices.numel() > 0:
-                pk = k_buffer[prefix_indices].to(q.dtype) * k_descale
-                pv = v_buffer[prefix_indices].to(q.dtype) * v_descale
-                q_seq = q_all[q_start:q_end].view(
-                    m, kv_heads, total_kv_group_num, layer.qk_head_dim
-                )
-                scores = torch.einsum("mkgd,skd->mkgs", q_seq, pk)
-                scores = scores.reshape(m, total_heads, pk.shape[0]) * layer.scaling
-                if logits_soft_cap > 0:
-                    scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
-                lse = torch.logsumexp(scores.float(), dim=-1)
-                probs = torch.exp(scores.float() - lse.unsqueeze(-1))
-                probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-                values_by_head = pv[:, :, None, :].expand(
-                    -1, kv_heads, total_kv_group_num, -1
-                )
-                values_by_head = values_by_head.reshape(
-                    pk.shape[0], total_heads, layer.v_head_dim
-                )
-                prefix_out[q_start:q_end] = torch.einsum(
-                    "mhs,shd->mhd", probs, values_by_head.float()
-                )
-                prefix_lse[q_start:q_end] = lse
+        if layer.k_scale is not None and layer.v_scale is not None:
+            k_descale = layer.k_scale_float
+            v_descale = layer.v_scale_float
+        else:
+            k_descale = 1.0
+            v_descale = 1.0
 
-            ck = k[extend_start : extend_start + extend_len].contiguous()
-            cv = v[extend_start : extend_start + extend_len].contiguous()
-            if ck.numel() > 0:
-                q_seq = q_local[q_start:q_end].view(
-                    m, kv_heads, local_kv_group_num, layer.qk_head_dim
-                )
-                scores = torch.einsum("mkgd,skd->mkgs", q_seq, ck.to(q.dtype))
-                scores = scores.reshape(m, local_heads, ck.shape[0]) * layer.scaling
-                if logits_soft_cap > 0:
-                    scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
-                if causal:
-                    key_pos = prefix_len + torch.arange(extend_len, device=q.device)
-                    query_pos = prefix_len + torch.arange(m, device=q.device)
-                    scores = scores.masked_fill(
-                        key_pos[None, None, :] > query_pos[:, None, None],
-                        -float("inf"),
-                    )
-                lse = torch.logsumexp(scores.float(), dim=-1)
-                probs = torch.exp(scores.float() - lse.unsqueeze(-1))
-                probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-                values_by_head = cv[:, :, None, :].expand(
-                    -1, kv_heads, local_kv_group_num, -1
-                )
-                values_by_head = values_by_head.reshape(
-                    ck.shape[0], local_heads, layer.v_head_dim
-                )
-                current_out[q_start:q_end] = torch.einsum(
-                    "mhs,shd->mhd", probs, values_by_head.float()
-                )
-                current_lse[q_start:q_end] = lse
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        # Prefix KV is sharded across DCP ranks, so compute each rank's
+        # partial attention with all gathered query heads and merge by LSE.
+        if kv_indices.numel() > 0:
+            empty_k = k[:0].contiguous()
+            empty_v = v[:0].contiguous()
+            self.extend_attention_fwd_with_lse(
+                q_all,
+                empty_k,
+                empty_v,
+                prefix_out,
+                prefix_lse,
+                k_buffer,
+                v_buffer,
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                False,
+                None,
+                max_extend_len,
+                k_descale,
+                v_descale,
+                sm_scale=layer.scaling,
+                logit_cap=logits_soft_cap,
+                xai_temperature_len=layer.xai_temperature_len,
+                skip_extend=True,
+            )
+
+        # Current chunk K/V is still local before masked cache write, so it can
+        # use the original extend kernel's current-token stage directly.
+        if k.numel() > 0:
+            empty_kv_indptr = torch.zeros_like(kv_indptr)
+            self.extend_attention_fwd_with_lse(
+                q_local,
+                k.contiguous(),
+                v.contiguous(),
+                current_out,
+                current_lse,
+                k_buffer,
+                v_buffer,
+                self.forward_metadata.qo_indptr,
+                empty_kv_indptr,
+                kv_indices[:0],
+                None,
+                causal,
+                None,
+                max_extend_len,
+                1.0,
+                1.0,
+                sm_scale=layer.scaling,
+                logit_cap=logits_soft_cap,
+                xai_temperature_len=layer.xai_temperature_len,
+                skip_prefix=True,
+            )
 
         prefix_out, prefix_lse = cp_lse_ag_out_rs(
             prefix_out, prefix_lse, group, return_lse=True
