@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
@@ -13,6 +13,7 @@ from einops import rearrange, repeat
 
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.layers.attention.mamba.ops import selective_state_update
+from sglang.srt.utils import get_device
 
 
 def selective_state_update_ref(
@@ -92,10 +93,9 @@ def selective_state_update_ref(
 @pytest.mark.parametrize("dstate", [16, 32, 64])
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 def test_selective_state_update(dim, dstate, has_z, itype):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
-
-    device = "cuda"
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
     if itype == torch.bfloat16:
@@ -136,10 +136,9 @@ def test_selective_state_update(dim, dstate, has_z, itype):
 def test_selective_state_update_with_batch_indices(
     with_padding, dim, dstate, has_z, itype
 ):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
-
-    device = "cuda"
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
     if itype == torch.bfloat16:
         rtol, atol = 1e-1, 1e-1
@@ -229,10 +228,9 @@ def test_selective_state_update_with_batch_indices(
 def test_selective_state_update_with_heads_with_batch_indices(
     dim, dstate, ngroups, has_z, tie_hdim, itype
 ):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
-
-    device = "cuda"
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 3e-2)
     if itype == torch.bfloat16:
         rtol, atol = 1e-1, 1e-1

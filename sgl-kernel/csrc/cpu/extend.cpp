@@ -363,21 +363,6 @@ void extend_attention_cpu(
     double logit_cap,
     bool is_cross_attn,
     std::optional<at::Tensor> encoder_lens) {
-  RECORD_FUNCTION(
-      "sgl-kernel::extend_attention_cpu",
-      std::vector<c10::IValue>(
-          {q_extend,
-           k_extend_opt,
-           v_extend_opt,
-           o_extend,
-           k_buffer,
-           v_buffer,
-           req_to_token,
-           req_pool_indices,
-           seq_lens,
-           extend_seq_lens,
-           extend_start_loc,
-           max_len_extend}));
   if (!is_cross_attn) {
     TORCH_CHECK(
         k_extend_opt.has_value() && v_extend_opt.has_value(),
