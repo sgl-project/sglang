@@ -671,7 +671,6 @@ class Gemma4TextModel(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
-        self.layers_to_capture = []
         self.vocab_size = config.vocab_size
         self.padding_idx = getattr(config, "pad_token_id", None)
 
@@ -830,9 +829,10 @@ class Gemma4TextModel(PreTrainedModel):
             per_layer_inputs = self.get_per_layer_inputs(input_ids)
         per_layer_inputs = self.project_per_layer_inputs(input_embeds, per_layer_inputs)
 
+        hidden_states = input_embeds
+
         aux_hidden_states = []
         num_layers = len(self.layers)
-        hidden_states = input_embeds
 
         for layer_idx, layer in enumerate(self.layers):
             if layer_idx in self.layers_to_capture:
@@ -924,7 +924,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
         self.logits_processor = LogitsProcessor(config)
-        self.capture_aux_hidden_states = False
 
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
@@ -935,10 +934,14 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
+        self.capture_aux_hidden_states = False
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
+
+    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.model.embed_tokens.weight, self.lm_head.weight
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
