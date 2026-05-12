@@ -5,7 +5,7 @@ Covers non-streaming and normal (token-level) streaming transcription,
 plus Whisper-specific fused auto-detect (language=None) regression tests.
 
 Usage:
-    python3 test_serving_transcription.py -v
+    python3 test_serving_transcription_whisper.py -v
 """
 
 import unittest
@@ -16,7 +16,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=60, suite="stage-b-test-1-gpu-small")
 
 
-class TestServingTranscription(ASRTestBase):
+class TestServingTranscriptionWhisper(ASRTestBase):
     """Test Whisper transcription via /v1/audio/transcriptions endpoint."""
 
     model = "openai/whisper-large-v3"
