@@ -2648,9 +2648,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
-            mamba_cow_src_indices=self.mamba_cow_src_indices,
-            mamba_cow_dst_indices=self.mamba_cow_dst_indices,
-            mamba_clear_indices=self.mamba_clear_indices,
+            mamba_cow_src_indices=(
+                self.mamba_cow_src_indices
+                if self.forward_mode == ForwardMode.EXTEND
+                else None
+            ),
+            mamba_cow_dst_indices=(
+                self.mamba_cow_dst_indices
+                if self.forward_mode == ForwardMode.EXTEND
+                else None
+            ),
+            mamba_clear_indices=(
+                self.mamba_clear_indices
+                if self.forward_mode == ForwardMode.EXTEND
+                else None
+            ),
         )
 
     def copy(self):

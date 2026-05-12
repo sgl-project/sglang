@@ -460,9 +460,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
-            mamba_cow_src_indices=batch.mamba_cow_src_indices,
-            mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
-            mamba_clear_indices=batch.mamba_clear_indices,
+            mamba_cow_src_indices=(
+                batch.mamba_cow_src_indices
+                if batch.forward_mode == ForwardMode.EXTEND
+                else None
+            ),
+            mamba_cow_dst_indices=(
+                batch.mamba_cow_dst_indices
+                if batch.forward_mode == ForwardMode.EXTEND
+                else None
+            ),
+            mamba_clear_indices=(
+                batch.mamba_clear_indices
+                if batch.forward_mode == ForwardMode.EXTEND
+                else None
+            ),
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
@@ -498,6 +510,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             rids=[req.rid for req in batch.reqs],
         )
+
         device = model_runner.device
 
         if batch.extend_input_logprob_token_ids is not None:

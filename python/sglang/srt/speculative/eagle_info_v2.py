@@ -174,6 +174,36 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
+        # Set mamba tracking indices for the ScheduleBatch so that
+        # batch.copy() in the overlap scheduler preserves them for
+        # process_batch_result_decode → _mamba_prefix_cache_update.
+        # ScheduleBatch.prepare_for_decode returns early for spec v2,
+        # skipping the normal mamba tracking setup.
+        if get_global_server_args().enable_mamba_extra_buffer():
+            all_buffers = torch.stack(
+                [req.mamba_ping_pong_track_buffer for req in batch.reqs]
+            )
+            idx = (
+                torch.tensor(
+                    [req.mamba_next_track_idx for req in batch.reqs],
+                    dtype=torch.int64,
+                    pin_memory=True,
+                )
+                .unsqueeze(1)
+                .to(device=all_buffers.device, non_blocking=True)
+            )
+            batch.mamba_track_indices = (
+                torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+            )
+            batch.mamba_track_mask = (
+                (
+                    batch.seq_lens_cpu % get_global_server_args().mamba_track_interval
+                    == 0
+                )
+                .pin_memory()
+                .to(device=batch.device, non_blocking=True)
+            )
+
     def prepare_for_v2_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
@@ -267,22 +297,33 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
-            # Set mamba_track_indices for mamba prefix-cache state tracking
+            # Set mamba_track_indices for mamba prefix-cache state tracking.
+            # Read from req objects directly (not the mapping table) because
+            # cache_unfinished_req may have donated and replaced ping-pong
+            # buffer entries without updating the mapping.
             if get_global_server_args().enable_mamba_extra_buffer():
-                mapping = (
-                    req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+                import logging as _logging
+
+                _logging.getLogger(__name__).info(
+                    f"[DEBUG verify_v2] USING REQ OBJECTS for mamba_track_indices, bs={len(batch.reqs)}"
                 )
-                req_pool_idx_tensor = batch.req_pool_indices.to(
-                    device=mapping.device, dtype=torch.int64
+                all_buffers = torch.stack(
+                    [req.mamba_ping_pong_track_buffer for req in batch.reqs]
                 )
-                track_col_idx = torch.tensor(
-                    [req.mamba_next_track_idx for req in batch.reqs],
-                    dtype=torch.int64,
-                    pin_memory=True,
-                ).to(mapping.device, non_blocking=True)
-                batch.mamba_track_indices = mapping[
-                    req_pool_idx_tensor, track_col_idx
-                ].to(dtype=torch.int64)
+                track_col_idx = (
+                    torch.tensor(
+                        [req.mamba_next_track_idx for req in batch.reqs],
+                        dtype=torch.int64,
+                        pin_memory=True,
+                    )
+                    .unsqueeze(1)
+                    .to(device=all_buffers.device, non_blocking=True)
+                )
+                batch.mamba_track_indices = (
+                    torch.gather(all_buffers, 1, track_col_idx)
+                    .squeeze(1)
+                    .to(dtype=torch.int64)
+                )
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
