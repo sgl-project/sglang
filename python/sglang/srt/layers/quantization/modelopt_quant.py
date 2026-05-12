@@ -1760,7 +1760,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if (
             self.enable_flashinfer_trtllm_moe
-            and envs.SGLANG_FLASHINFER_PER_TOKEN_NVFP4_MOE.get()
+            and envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
         ):
             w13_input_scale = torch.ones_like(w13_input_scale, dtype=torch.float32)
             w2_input_scale = torch.ones_like(w2_input_scale, dtype=torch.float32)

@@ -889,7 +889,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    use_per_token_nvfp4 = envs.SGLANG_FLASHINFER_PER_TOKEN_NVFP4_MOE.get()
+    use_per_token_nvfp4 = envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
 
     # Quantize hidden states to FP4
     hs_fp4, hs_scale_linear, per_token_scale = quantize_hidden_states_fp4(

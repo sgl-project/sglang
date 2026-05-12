@@ -127,7 +127,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_FORCE_FP8_MARLIN` | Force using FP8 MARLIN kernels even if other FP8 kernels are available | `false` |
 | `SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN` | Quantize q_b_proj from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
 | `SGLANG_MOE_NVFP4_DISPATCH` | Use nvfp4 for moe dispatch (on flashinfer_cutlass or flashinfer_cutedsl moe runner backend) | `"false"` |
-| `SGLANG_FLASHINFER_PER_TOKEN_NVFP4_MOE` | Enable FlashInfer TRTLLM per-token NVFP4 activation scaling; ignores checkpoint activation FP32 scale by treating it as `1` | `false` |
+| `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION` | Enable FlashInfer TRTLLM per-token NVFP4 activation scaling; ignores checkpoint activation FP32 scale by treating it as `1` | `false` |
 | `SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE` | Quantize moe of nextn layer from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
 | `SGLANG_QUANT_ALLOW_DOWNCASTING` | Allow weight dtype downcasting during loading (e.g., fp32 → fp16). By default, SGLang rejects this kind of downcasting when using quantization. | `false` |
 | `SGLANG_FP8_IGNORED_LAYERS` | A comma-separated list of layer names to ignore during FP8 quantization. For example: `model.layers.0,model.layers.1.,qkv_proj`. | `""` |
