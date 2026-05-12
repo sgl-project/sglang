@@ -297,20 +297,6 @@ class TritonLoRABackend(BaseLoRABackend):
         )
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
 
-        batch_info.weight_indices_cpu = weight_indices_tensor
-        if forward_batch.forward_mode.is_extend():
-            batch_info.seg_lens_cpu = torch.tensor(
-                forward_batch.extend_seq_lens_cpu,
-                dtype=torch.int32,
-                pin_memory=True,
-                device="cpu",
-            )
-        else:
-            batch_info.seg_lens_cpu = torch.full(
-                (bs,), 1, dtype=torch.int32, pin_memory=True, device="cpu"
-            )
-        batch_info.active_weight_indices_cpu = tuple(dict.fromkeys(weight_indices))
-
         self.batch_info = batch_info
 
         # Biggest win is in decode.

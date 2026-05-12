@@ -1780,6 +1780,31 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32),
         )
 
+        # Per-expert ``[E]`` view of the input-scale-quant tensors.  Both
+        # ``CutlassFp4LoraRunnerCore`` and ``cutlass_moe_fp4`` consume per-expert
+        # fp32 scales of shape ``[E]``; the source ``w13_input_scale_quant`` /
+        # ``w2_input_scale_quant`` may be scalar (FlashInfer paths reduce all
+        # experts to a single max above) or already ``[E]``-shaped.  Pre-expand
+        # once at load time so the hot path never has to ``.expand(E).contiguous()``.
+        E = layer.num_local_experts
+
+        def _to_per_expert(src: torch.Tensor) -> torch.Tensor:
+            flat = src.view(-1).to(torch.float32)
+            if flat.shape[0] != E:
+                flat = flat.expand(E).contiguous()
+            return flat.contiguous()
+
+        copy_or_rebind_param(
+            layer,
+            "w13_input_scale_quant_per_expert",
+            _to_per_expert(layer.w13_input_scale_quant),
+        )
+        copy_or_rebind_param(
+            layer,
+            "w2_input_scale_quant_per_expert",
+            _to_per_expert(layer.w2_input_scale_quant),
+        )
+
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         layer.dispatcher.set_quant_config(
             {
@@ -1983,6 +2008,43 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self.enable_flashinfer_cutlass_moe or self._is_cutedsl_v2_standard
         )
 
+    def get_cutlass_fp4_quant_info(self, layer: torch.nn.Module):
+        """Build the LoRA-aware NVFP4 quant payload for ``CutlassFp4LoraRunnerCore``.
+
+        Per-expert ``[E]``-expanded input scales are precomputed in
+        ``process_weights_after_loading`` (see
+        ``w13_input_scale_quant_per_expert`` / ``w2_input_scale_quant_per_expert``),
+        so this just packages references into the dataclass — no per-forward
+        expansion work.
+        """
+        from sglang.srt.lora.lora_moe_runner_cutlass_fp4 import (
+            CutlassFp4MoeQuantInfo,
+        )
+
+        E = layer.num_local_experts
+        w13_input_scale = layer.w13_input_scale_quant_per_expert
+        w2_input_scale = layer.w2_input_scale_quant_per_expert
+        assert w13_input_scale.shape == (E,), w13_input_scale.shape
+        assert w2_input_scale.shape == (E,), w2_input_scale.shape
+
+        return CutlassFp4MoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_blockscale_swizzled=layer.w13_blockscale_swizzled,
+            w2_blockscale_swizzled=layer.w2_blockscale_swizzled,
+            g1_alphas=layer.g1_alphas,
+            g2_alphas=layer.g2_alphas,
+            w13_input_scale_expanded=w13_input_scale,
+            w2_input_scale_expanded=w2_input_scale,
+            cutlass_moe_params=layer.cutlass_moe_params,
+            num_local_experts=E,
+            hidden_size=layer.hidden_size,
+            intermediate_size_per_partition=layer.intermediate_size_per_partition,
+            moe_ep_rank=layer.moe_ep_rank,
+            moe_ep_size=layer.moe_ep_size,
+            w13_swap_halves=self.load_up_proj_weight_first,
+        )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -2161,6 +2223,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        # ``cutlass_moe_fp4`` already casts its output to ``a.dtype`` (== x.dtype)
+        # internally; no extra cast required.
         output = cutlass_moe_fp4(
             a=x,
             a1_gscale=layer.w13_input_scale_quant,
@@ -2176,6 +2240,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             params=layer.cutlass_moe_params,
             apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
             no_combine=moe_runner_config.no_combine,
-        ).to(x.dtype)
+        )
         # Scale by routed_scaling_factor is fused into select_experts.
         return StandardCombineInput(hidden_states=output)
