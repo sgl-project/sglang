@@ -25,6 +25,9 @@ from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
+if _is_npu:
+    import torch_npu
+
 
 class MoeA2ABackend(Enum):
 
@@ -37,6 +40,7 @@ class MoeA2ABackend(Enum):
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
     CUSTOMIZED = "customized"
+    ALLTOALLV = "alltoallv"
 
     @classmethod
     def _missing_(cls, value):
@@ -64,6 +68,9 @@ class MoeA2ABackend(Enum):
 
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP
+
+    def is_alltoallv(self):
+        return self == MoeA2ABackend.ALLTOALLV
 
     def is_mori(self):
         return self == MoeA2ABackend.MORI
@@ -353,7 +360,7 @@ def is_sbo_enabled() -> bool:
 def is_deepep_class_backend() -> bool:
     """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori()
+    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_deepep()
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:
@@ -551,3 +558,42 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+COMM_STREAM = None
+
+
+def async_all_to_all(input_, output_split_sizes, input_split_sizes, group, event=None):
+    if output_split_sizes is None:
+        # Equal split (all2all)
+        a2a_out = torch.empty_like(input_)
+    else:
+        # Unequal split (all2all-v)
+        a2a_out = input_.new_empty(
+            size=[sum(output_split_sizes)] + list(input_.size()[1:]),
+            dtype=input_.dtype,
+            device=torch.npu.current_device(),
+        )
+    if event:
+        # multi stream wait event
+        global COMM_STREAM
+        if COMM_STREAM is None:
+            COMM_STREAM = torch_npu.npu.Stream(device=torch.npu.current_device())
+        with torch_npu.npu.stream(COMM_STREAM):
+            event.wait()
+            handle = group.all_to_all_single(
+                a2a_out,
+                input_.contiguous(),
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                async_op=True,
+            )
+    else:
+        handle = group.all_to_all_single(
+            a2a_out,
+            input_.contiguous(),
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            async_op=True,
+        )
+    return input_, a2a_out, handle

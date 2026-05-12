@@ -1379,6 +1379,24 @@ class GroupCoordinator:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
+    def all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        output_split_sizes: List[int],
+        input_split_sizes: List[int],
+        async_op: bool = False,
+    ):
+        handle = torch.distributed.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=self.device_group,
+            async_op=async_op,
+        )
+        return handle
+
     def destroy(self):
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)

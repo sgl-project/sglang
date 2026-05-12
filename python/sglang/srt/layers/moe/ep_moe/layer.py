@@ -201,7 +201,7 @@ class DeepEPMoE(FusedMoE):
         if self.deprecate_flag:
             return super().run_moe_core(dispatch_output)
 
-        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker, NpuDispatcherWithAllToAllVOutput
 
         if _is_npu:
             assert DispatchOutputChecker.format_is_deepep(dispatch_output)
@@ -220,7 +220,14 @@ class DeepEPMoE(FusedMoE):
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
-
+        if isinstance(dispatch_output, NpuDispatcherWithAllToAllVOutput):
+            return NpuDispatcherWithAllToAllVOutput(
+                hidden_states=output,
+                group_list=dispatch_output.group_list,
+                group_list_type=dispatch_output.group_list_type,
+                combine_metadata=dispatch_output.combine_metadata,
+                dynamic_scale=dispatch_output.dynamic_scale,
+            )
         combine_input_wrapper = (
             DeepEPNormalCombineInput
             if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
@@ -271,7 +278,7 @@ class DeepEPMoE(FusedMoE):
 
     def forward_npu(
         self,
-        dispatch_output: Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput],
+        dispatch_output: Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput, NpuDispatcherWithAllToAllVOutput],
     ):
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
@@ -279,24 +286,32 @@ class DeepEPMoE(FusedMoE):
         from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
             npu_fused_moe_without_routing_weights_bf16,
         )
-        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker, DeepEPNormalDispatchOutput, NpuDispatcherWithAllToAllVOutput
 
         # NOTE: Ascend's Dispatch & Combine does not support FP16
         output_dtype = torch.bfloat16
         group_list_type = 1
 
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
-            if TYPE_CHECKING:
-                assert isinstance(dispatch_output, DeepEPNormalDispatchOutput)
-            hidden_states, hidden_states_scale, _, _, num_recv_tokens_per_expert = (
-                dispatch_output
-            )
+            # if TYPE_CHECKING:
+            #     assert isinstance(dispatch_output, DeepEPNormalDispatchOutput)
+            if isinstance(dispatch_output, DeepEPNormalDispatchOutput):
+                hidden_states, hidden_states_scale, _, _, num_recv_tokens_per_expert = (
+                    dispatch_output
+                )
 
-            group_list = torch.tensor(
-                num_recv_tokens_per_expert,
-                dtype=torch.int64,
-                device=hidden_states.device,
-            )
+                group_list = torch.tensor(
+                    num_recv_tokens_per_expert,
+                    dtype=torch.int64,
+                    device=hidden_states.device,
+                )
+
+            elif isinstance(dispatch_output, NpuDispatcherWithAllToAllVOutput):
+                hidden_states = dispatch_output.hidden_states
+                hidden_states_scale = dispatch_output.dynamic_scale
+                group_list = dispatch_output.group_list
+            else:
+                raise ValueError(f"Not Supported DeepEP format {dispatch_output.format}")
 
             if self.w13_weight.dtype == torch.bfloat16:
                 hidden_states = npu_fused_moe_without_routing_weights_bf16(
@@ -512,6 +527,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         or get_moe_a2a_backend().is_deepep()
         or get_moe_a2a_backend().is_mooncake()
         or get_moe_a2a_backend().is_nixl()
+        or get_moe_a2a_backend().is_alltoallv()
     ):
         return DeepEPMoE
     if get_moe_a2a_backend().is_ascend_fuseep():

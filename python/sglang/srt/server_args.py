@@ -216,6 +216,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+    "alltoallv",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
