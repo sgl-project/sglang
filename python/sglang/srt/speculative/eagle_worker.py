@@ -1003,15 +1003,12 @@ class EAGLEWorker(TpModelWorker):
         if batch.forward_mode.is_idle():
             return
 
-        num_accept_tokens = (
-            torch.tensor(
-                res.num_correct_drafts_per_req_cpu,
-                device=logits_output.hidden_states.device,
-                dtype=torch.int64,
-            )
-            + 1
+        num_correct_drafts = torch.tensor(
+            res.num_correct_drafts_per_req_cpu,
+            device=logits_output.hidden_states.device,
+            dtype=torch.int64,
         )
-        cumulative_num_accept_tokens = torch.cumsum(num_accept_tokens, dim=0)
+        cumulative_num_accept_tokens = torch.cumsum(num_correct_drafts + 1, dim=0)
         # prepend 0 to the cumulative_num_accept_tokens
         accepted_indices_start = torch.cat(
             [
@@ -1037,14 +1034,15 @@ class EAGLEWorker(TpModelWorker):
             # accepted_indices=[0,2,3,4,5,7,9,10,11], num_accept_tokens=[4, 3, 2], cumulative_num_accept_tokens=[4, 7, 9]
             # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_num_accept_tokens[:-1]]) = [0, 5, 10]
             # last_token_indices_per_req=accepted_indices[cumulative_num_accept_tokens - 1] = [4, 9, 11] (last token ID of each req)
-            # accept_steps = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
-            # first_token_indices_per_req = res.accepted_indices[accepted_indices_start]
-            accept_steps = (
+            # last_correct_step_indices = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
+            # equivalent: last_correct_step_indices = last_token_indices_per_req - first_token_indices_per_req;
+            # `accepted_indices_offset` equals `first_token_indices_per_req` because the first accepted slot of each req is its "current token" at logical position i * draft_token_num.
+            last_correct_step_indices = (
                 res.accepted_indices[cumulative_num_accept_tokens - 1]
                 - accepted_indices_offset
             )
         else:
-            accept_steps = num_accept_tokens - 1
+            last_correct_step_indices = num_correct_drafts
 
         if batch.mamba_track_indices is not None:
             # If after verify, the request's seq_lens has crossed a mamba track interval,
@@ -1068,7 +1066,7 @@ class EAGLEWorker(TpModelWorker):
             mamba_steps_to_track = None
 
         self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-            accept_steps=accept_steps,
+            last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,

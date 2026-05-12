@@ -576,7 +576,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 # accepted_indices=[0,2,3,4,5,7,9,10,11], num_accept_tokens=[4, 3, 2], cumulative_num_accept_tokens=[4, 7, 9]
                 # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_num_accept_tokens[:-1]]) = [0, 5, 10]
                 # last_token_indices_per_req=accepted_indices[cumulative_num_accept_tokens - 1] = [4, 9, 11] (last token ID of each req)
-                # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
+                # last_correct_step_indices = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
                 cumulative_num_accept_tokens = torch.cumsum(num_accept_tokens, dim=0)
                 req_start_positions = torch.cat(
                     [
@@ -592,13 +592,13 @@ class MultiLayerEagleWorker(TpModelWorker):
                 last_token_indices_per_req = res.accepted_indices[
                     cumulative_num_accept_tokens - 1
                 ]
-                max_relative_indices_per_req = (
+                last_correct_step_indices = (
                     last_token_indices_per_req - first_token_indices_per_req
                 )
             else:
-                max_relative_indices_per_req = num_accept_tokens - 1
+                last_correct_step_indices = num_accept_tokens - 1
             self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                max_relative_indices_per_req, self.target_worker.model_runner.model
+                last_correct_step_indices, self.target_worker.model_runner.model
             )
 
         if batch.return_logprob:

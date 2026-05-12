@@ -613,9 +613,9 @@ class SchedulerDisaggregationPrefillMixin:
                     KVPoll.Success,
                     KVPoll.Failed,
                 ):
-                    logger.warning(
+                    logger.warning_once(
                         f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
-                        f"from consensus; treating as undone"
+                        f"from consensus; treating as undone",
                     )
                     undone_reqs.append(req)
                     continue
@@ -646,9 +646,9 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
-                logger.warning(
+                logger.warning_once(
                     f"Unexpected polling state {poll} for rid {req.rid} in inflight queue; "
-                    f"treating as undone"
+                    f"treating as undone",
                 )
                 undone_reqs.append(req)
 
