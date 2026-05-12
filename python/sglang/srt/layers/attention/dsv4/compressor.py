@@ -44,6 +44,7 @@ if _is_hip:
     )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
         DeepseekV4HipRadixBackend,
     )
@@ -374,7 +375,6 @@ class Compressor(nn.Module):
         self.dim = config.hidden_size
         self.head_dim = head_dim
         self.rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
-        self.nope_head_dim = head_dim - self.rope_head_dim
         assert compress_ratio != 0, "compress_ratio should not be 0"
         self.ratio = compress_ratio
         self.overlap = self.ratio == 4
@@ -743,232 +743,6 @@ class Compressor(nn.Module):
         self.print_tensor(kv_compressed, "compressed_kv_output")
         return kv_compressed
 
-    def compress_extend(
-        self,
-        kv_and_scores: KVAndScore,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        assert self.ape_converted  # Please keep this assertion
-
-        # kv_and_score_states: [max_num_reqs, compress_ratio * coff, head_dim * coff]
-        kv_and_score_states = self._get_states(forward_batch)
-        _, _, head_dim_times_coff = kv_and_score_states.kv.shape
-
-        # extract some info
-        prefix_lens = forward_batch.extend_prefix_lens_cpu
-        extend_lens = forward_batch.extend_seq_lens_cpu
-        req_pool_indices = forward_batch.req_pool_indices
-        assert extend_lens is not None and prefix_lens is not None
-
-        # compress info
-        # TODO: reuse the buffer across layers and reduce the sizes
-        max_buffer_size = 2 * kv_and_score_states.shape[1] + kv_and_scores.shape[0]
-        temp_buffer_shape = [max_buffer_size, head_dim_times_coff]
-        temp_buffer = kv_and_scores.new_empty(temp_buffer_shape)
-
-        # Deliberately fill w/ huge values, s.t. when misuse and access the unfilled values,
-        # we have higher probability to see something very weird
-        assert kv_and_scores.kv.shape[-1] == self.head_dim * self.coff
-        compressed_kv_output = torch.full(
-            (kv_and_scores.kv.size(0), self.head_dim),
-            fill_value=10000.0,
-            dtype=kv_and_scores.kv.dtype,
-            device=kv_and_scores.kv.device,
-        )
-
-        bs = forward_batch.batch_size
-        pt = 0
-        for i in range(bs):
-            # Definitions of variables
-            #
-            # kv_and_score_state: (compress_ratio * coff, head_dim * coff)
-            #     only it[:old_valid_state_len] has valid data
-            #
-            # kv_and_score_buffer: (old_valid_state_len + valid_kv_len, head_dim * coff)
-            #     content is cat(kv_and_score_state[:old_valid_state_len], kv_and_score)
-
-            kv_and_score = kv_and_scores[pt : pt + extend_lens[i]]
-            kv_and_score_state = kv_and_score_states[req_pool_indices[i]]
-            if prefix_lens[i] == 0:
-                # NOTE: padding with default values for overlap
-                kv_and_score_state.clear()
-
-            # Create kv_and_score_buffer
-            pre_state_len = self.compute_state_len(
-                seq_len=prefix_lens[i], ratio=self.ratio
-            )
-            valid_kv_len = pre_state_len + extend_lens[i]
-            kv_and_score_buffer = temp_buffer[:valid_kv_len]
-            kv_and_score_buffer[:pre_state_len] = kv_and_score_state[:pre_state_len]
-            kv_and_score_buffer[pre_state_len:valid_kv_len] = kv_and_score
-
-            # Write to kv_and_score_states
-            post_state_len = self.compute_state_len(
-                seq_len=valid_kv_len, ratio=self.ratio
-            )
-            kv_and_score_state[:post_state_len] = kv_and_score_buffer[
-                valid_kv_len - post_state_len : valid_kv_len
-            ]
-
-            # Get the part that can be compressed (ratio-aligned)
-            compress_len = valid_kv_len // self.ratio * self.ratio
-            if compress_len == 0:
-                # Nothing to compress yet, just update pointers
-                pt += extend_lens[i]
-                continue
-
-            # kv to compress: [compressed_len, ratio, head_dim * coff]
-            kv_and_score_to_compress = kv_and_score_buffer[:compress_len].view(
-                compress_len // self.ratio, self.ratio, -1
-            )
-            # NOTE: apply ape only when compressing
-            kv_and_score_to_compress.score.add_(self.ape.unsqueeze(0))
-
-            # Apply overlap transformation if enabled
-            if self.overlap:
-                new_kv = self.overlap_transform(
-                    kv_and_score_to_compress.kv, fill_value=0
-                )
-                new_score = self.overlap_transform(
-                    kv_and_score_to_compress.score, fill_value=float("-inf")
-                )
-                kv_and_score_to_compress = KVAndScore.from_kv_score(
-                    kv=new_kv, score=new_score
-                )
-                del new_kv, new_score
-                # remove the first block before compression
-                kv_and_score_to_compress = kv_and_score_to_compress[1:]
-
-                if kv_and_score_to_compress.kv.size(0) == 0:
-                    pt += extend_lens[i]
-                    continue
-
-            kv_compressed = (
-                kv_and_score_to_compress.kv
-                * kv_and_score_to_compress.score.softmax(dim=1)
-            ).sum(dim=1)
-
-            # NOTE: ref code requires dtype as the same as hidden states (float32)
-            # the raw output of kv_compressed is float32 already
-            assert kv_compressed.dtype == torch.float32
-
-            beg_idx = prefix_lens[i] // self.ratio * self.ratio
-            end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
-            freqs_cis = self.freqs_cis[beg_idx : end_idx : self.ratio]
-            assert freqs_cis.size(0) == kv_compressed.size(
-                0
-            ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            if self.use_hip_fused_compress:
-                fused_norm_rope_inplace_triton(
-                    kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
-                )
-            else:
-                kv_compressed = self.norm(kv_compressed)
-                apply_rotary_emb_triton(
-                    kv_compressed[..., -self.rope_head_dim :], freqs_cis
-                )
-            del beg_idx, end_idx
-
-            if self.rotate:
-                kv_compressed = rotate_activation(kv_compressed)
-
-            # get all the pos: ratio * n + (ratio - 1) > prefix_len - 1
-            start = prefix_lens[i]
-            start = start + self.ratio - 1 - start % self.ratio
-            indices_in_seq = torch.arange(
-                start,
-                prefix_lens[i] + extend_lens[i],
-                self.ratio,
-                device=kv_and_scores.kv.device,
-            )
-            assert indices_in_seq.size(0) == kv_compressed.size(0)
-            compressed_kv_output[indices_in_seq - prefix_lens[i] + pt] = kv_compressed
-
-            pt += extend_lens[i]
-
-        return compressed_kv_output
-
-    def compress_decode(
-        self,
-        kv_and_scores: KVAndScore,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        assert self.ape_converted  # Please keep this assertion
-
-        seq_lens = forward_batch.seq_lens
-        kv_and_score_states_pool = self._get_states(forward_batch)
-        req_pool_indices = forward_batch.req_pool_indices
-
-        # NOTE: first, write to the states
-        bs = kv_and_scores.kv.size(0)
-        write_pos = (seq_lens - 1) % self.ratio + self.overlap * self.ratio
-        kv_and_score_states_pool[req_pool_indices, write_pos] = kv_and_scores
-
-        # NOTE: need to copy out before modifying overlap states
-        # kv_states: [bs, coff * ratio, coff * head_dim]
-        kv_and_score_to_compress = kv_and_score_states_pool[req_pool_indices]
-
-        # Shift just compressed kv states left by ratio
-        if self.overlap:
-            should_shift = seq_lens % self.ratio == 0
-            kv_and_score_states_pool[req_pool_indices, : self.ratio] = KVAndScore(
-                kv_score=torch.where(
-                    should_shift[:, None, None],
-                    kv_and_score_to_compress.kv_score[:, self.ratio :],
-                    kv_and_score_to_compress.kv_score[:, : self.ratio],
-                )
-            )
-
-        # shape: [bs * coff, ratio, coff * head_dim]
-        kv_and_score_to_compress = kv_and_score_to_compress.view(
-            -1, self.ratio, self.coff * self.head_dim
-        )
-        kv_and_score_to_compress.score.add_(self.ape.unsqueeze(0))
-
-        if self.overlap:
-            # shape: [bs, coff * ratio, coff * head_dim]
-            kv_and_score_to_compress = kv_and_score_to_compress.view(
-                bs, self.coff * self.ratio, self.coff * self.head_dim
-            )
-            kv_and_score_to_compress = KVAndScore.from_kv_score(
-                kv=self.overlap_transform_decode(kv_and_score_to_compress.kv),
-                score=self.overlap_transform_decode(kv_and_score_to_compress.score),
-            )
-
-        self.print_tensor(kv_and_score_to_compress.kv, "kv_to_compress")
-        self.print_tensor(kv_and_score_to_compress.score, "score_to_compress")
-
-        # kv_to_compress: [bs, ratio * coff, head_dim]
-        kv_and_score_to_compress = kv_and_score_to_compress.view(
-            bs, self.ratio * self.coff, self.head_dim
-        )
-
-        kv_compressed = (
-            kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
-        ).sum(dim=1)
-        self.print_tensor(kv_compressed, "kv_before_norm")
-        if self.use_hip_fused_compress:
-            # HIP-only: share the per-step freqs_cis gather across layers.
-            freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
-            fused_norm_rope_inplace_triton(
-                kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
-            )
-        else:
-            kv_compressed = self.norm(kv_compressed)
-            self.print_tensor(kv_compressed, "kv_after_norm")
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-            self.print_tensor(freqs_cis, "freqs_cis")
-            apply_rotary_emb_triton(
-                kv_compressed[..., -self.rope_head_dim :], freqs_cis
-            )
-        self.print_tensor(kv_compressed, "kv_after_rope")
-        if self.rotate:
-            kv_compressed = rotate_activation(kv_compressed)
-
-        # `new_compressed_list` format is only used for testing
-        self.print_tensor(kv_compressed, "compressed_kv_output")
-        return kv_compressed
-
     def compress_fused(
         self,
         kv_score: torch.Tensor,
@@ -978,12 +752,9 @@ class Compressor(nn.Module):
         backend = forward_batch.attn_backend
         if TYPE_CHECKING:
             assert isinstance(backend, DeepseekV4HipRadixBackend)
-        is_paged = envs.SGLANG_OPT_DPSK_V4_RADIX.get()
-        if is_paged:
-            kv_score_buffer = self._get_state_pool(forward_batch)
-            kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
-        else:
-            kv_score_buffer = self._get_states(forward_batch).kv_score
+        kv_score_buffer = self._get_state_pool(forward_batch)
+        kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
+
         return backend.forward_compress(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score,
@@ -994,7 +765,7 @@ class Compressor(nn.Module):
             rotate=self.rotate,
             compress_ratio=self.ratio,
             forward_batch=forward_batch,
-            is_paged=is_paged,
+            is_paged=True,
         )
 
     def compress_dispatch(
@@ -1005,12 +776,10 @@ class Compressor(nn.Module):
         if self.use_fused_compress:
             return self.compress_fused(kv_score, forward_batch)
 
-        if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
-            self.compress_decode = self.compress_decode_paged
-            self.compress_extend = self.compress_extend_paged
-            kv_and_scores = KVAndScore(kv_score)
-        else:
-            kv_and_scores = KVAndScore(kv_score)
+        self.compress_decode = self.compress_decode_paged
+        self.compress_extend = self.compress_extend_paged
+        kv_and_scores = KVAndScore(kv_score)
+
         if TYPE_CHECKING:
             assert isinstance(kv_and_scores, KVAndScore)
 
@@ -1068,7 +837,7 @@ class Compressor(nn.Module):
 
         backend = forward_batch.attn_backend
         if TYPE_CHECKING:
-            assert isinstance(backend, DeepseekV4HipRadixBackend)
+            assert isinstance(backend, DeepseekV4AttnBackend)
         kv_score_buffer = self._get_state_pool(forward_batch)
         kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
         return backend.forward_compress(

@@ -558,8 +558,6 @@ class Envs:
 
     # ====================================================================
     # DeepSeek V4
-    SGLANG_DSV4_MODE = EnvStr("2604")
-    SGLANG_DSV4_2604_SUBMODE = EnvStr("2604B")
     SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
     SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
     SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)

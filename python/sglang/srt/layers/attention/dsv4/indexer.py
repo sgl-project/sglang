@@ -316,7 +316,6 @@ class C4IndexerBackendMixin:
         q_lora: torch.Tensor,
         c4_indexer: C4Indexer,
         forward_batch: ForwardBatch,
-        x_for_compressor: Optional[torch.Tensor] = None,
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
@@ -546,7 +545,6 @@ class C4Indexer(nn.Module):
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
-        x_for_compressor: Optional[torch.Tensor] = None,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
     ) -> None:
@@ -555,7 +553,6 @@ class C4Indexer(nn.Module):
             q_lora=q_lora,
             forward_batch=forward_batch,
             c4_indexer=self,
-            x_for_compressor=x_for_compressor if x_for_compressor is not None else x,
             alt_streams=self.alt_streams,
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,

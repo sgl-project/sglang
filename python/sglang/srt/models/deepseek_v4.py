@@ -499,26 +499,13 @@ class MQALayer(nn.Module):
             positions=positions,
         )
 
-        _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
-        if _use_cp:
+        if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
             kv = cp_all_gather_rerange_output(
                 kv.contiguous(),
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-            x_for_compressor = (
-                cp_all_gather_rerange_output(
-                    x.contiguous(),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                if self.compressor is not None
-                else x
-            )
-        else:
-            x_for_compressor = x
 
         if self.overlap_store_cache:
             attn_backend.store_cache(
@@ -528,15 +515,13 @@ class MQALayer(nn.Module):
             )
 
         if self.indexer is not None:
-            self.indexer(
-                x=x,
-                q_lora=q_lora,
-                forward_batch=forward_batch,
-                x_for_compressor=x_for_compressor if _use_cp else None,
-            )
+            self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
-                x_for_compressor, forward_batch, self.layer_id, self.compressor
+                x,
+                forward_batch,
+                self.layer_id,
+                self.compressor,
             )
 
         if q_out is not None:
