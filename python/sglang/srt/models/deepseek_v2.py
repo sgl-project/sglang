@@ -565,11 +565,7 @@ class DeepseekV2MoE(nn.Module):
                 reduce_results=False,
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 prefix=add_prefix("shared_experts", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if _shared_expert_use_tp1
-                    else {}
-                ),
+                **(dict(tp_rank=0, tp_size=1) if _shared_expert_use_tp1 else {}),
             )
             self._shared_expert_tp1 = _shared_expert_use_tp1
             is_packed_weight = hasattr(
