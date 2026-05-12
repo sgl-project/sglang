@@ -305,6 +305,10 @@ def add_rl_on_policy_target_choices(choices):
     RL_ON_POLICY_TARGET_CHOICES.extend(choices)
 
 
+def add_linear_attn_kernel_backend_choices(choices):
+    LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
+
+
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
@@ -7061,6 +7065,14 @@ class ServerArgs:
         ), (
             "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
             f"Got: {self.pp_max_micro_batch_size}"
+        )
+
+        assert not (self.disable_cuda_graph_padding and self.enable_torch_compile), (
+            "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
+            "With padding disabled, every distinct batch size gets its own torch.compile + "
+            "Triton autotune cycle (O(max_batch_size) compilations) instead of the small fixed "
+            "set of padded bucket sizes, causing engine initialisation to stall for many minutes. "
+            "Remove --disable-cuda-graph-padding or --enable-torch-compile."
         )
 
         if self.pp_size > 1:
