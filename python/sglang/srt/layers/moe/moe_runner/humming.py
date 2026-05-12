@@ -392,8 +392,6 @@ class HummingRunnerCore(MoeRunnerCore):
         hooks: Optional[Any] = None,
     ) -> HummingRunnerOutput:
         if runner_input.hidden_states.size(0) == 0:
-            if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-                deepseek_v4_moe_code_path_checker.observed += 1
             return HummingRunnerOutput(
                 hidden_states=torch.empty_like(runner_input.hidden_states)
             )
