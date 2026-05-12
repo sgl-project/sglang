@@ -1,6 +1,6 @@
 pub mod bridge;
 pub mod server;
-pub mod tokenizer;
+pub mod tokenizers;
 pub mod utils;
 
 pub mod proto {
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 use bridge::PyBridge;
-use tokenizer::RustTokenizer;
+use tokenizers::RustTokenizer;
 
 /// Handle returned to Python that controls the running gRPC server.
 #[pyclass]
@@ -40,17 +40,41 @@ impl GrpcServerHandle {
     }
 }
 
-/// Extract tokenizer path and context_len from the Python RuntimeHandle (one-time GIL).
-fn extract_tokenizer_info(runtime_handle: &PyObject) -> (Option<String>, i32) {
+struct TokenizerInfo {
+    tokenizer_path: Option<String>,
+    tokenizer_mode: Option<String>,
+    context_len: i32,
+}
+
+/// Extract tokenizer path/mode and context_len from the Python RuntimeHandle (one-time GIL).
+fn extract_tokenizer_info(runtime_handle: &PyObject) -> TokenizerInfo {
     Python::with_gil(|py| {
         let tm = match runtime_handle.getattr(py, "tokenizer_manager") {
             Ok(tm) => tm,
-            Err(_) => return (None, 0),
+            Err(_) => {
+                return TokenizerInfo {
+                    tokenizer_path: None,
+                    tokenizer_mode: None,
+                    context_len: 0,
+                };
+            }
         };
 
-        let model_path: Option<String> = tm
-            .getattr(py, "model_path")
-            .ok()
+        let server_args = tm.getattr(py, "server_args").ok();
+
+        let tokenizer_path: Option<String> = server_args
+            .as_ref()
+            .and_then(|args| args.getattr(py, "tokenizer_path").ok())
+            .and_then(|v| v.extract(py).ok())
+            .or_else(|| {
+                tm.getattr(py, "model_path")
+                    .ok()
+                    .and_then(|v| v.extract(py).ok())
+            });
+
+        let tokenizer_mode: Option<String> = server_args
+            .as_ref()
+            .and_then(|args| args.getattr(py, "tokenizer_mode").ok())
             .and_then(|v| v.extract(py).ok());
 
         let context_len: i32 = tm
@@ -60,7 +84,11 @@ fn extract_tokenizer_info(runtime_handle: &PyObject) -> (Option<String>, i32) {
             .and_then(|v| v.extract(py).ok())
             .unwrap_or(0);
 
-        (model_path, context_len)
+        TokenizerInfo {
+            tokenizer_path,
+            tokenizer_mode,
+            context_len,
+        }
     })
 }
 
@@ -87,14 +115,22 @@ fn start_server(
     })?;
 
     // Extract tokenizer info from Python (one-time GIL acquisition)
-    let (model_path, context_len) = extract_tokenizer_info(&runtime_handle);
+    let tokenizer_info = extract_tokenizer_info(&runtime_handle);
 
     // Attempt to load the Rust tokenizer
-    let rust_tokenizer = model_path
-        .as_deref()
-        .and_then(|p| RustTokenizer::from_model_path(p, context_len));
+    let rust_tokenizer = tokenizer_info.tokenizer_path.as_deref().and_then(|p| {
+        RustTokenizer::from_tokenizer_path(
+            p,
+            tokenizer_info.tokenizer_mode.as_deref(),
+            tokenizer_info.context_len,
+        )
+    });
 
-    let bridge = Arc::new(PyBridge::new(runtime_handle, rust_tokenizer, context_len));
+    let bridge = Arc::new(PyBridge::new(
+        runtime_handle,
+        rust_tokenizer,
+        tokenizer_info.context_len,
+    ));
     let shutdown = Arc::new(Notify::new());
     let shutdown_clone = shutdown.clone();
 

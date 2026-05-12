@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-use crate::tokenizer::RustTokenizer;
+use crate::tokenizers::RustTokenizer;
 use crate::utils::{json_map_to_pydict, py_value_to_json_string};
 
 #[derive(Debug, Clone)]
