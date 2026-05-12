@@ -435,7 +435,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_drafts=0,
+                num_correct_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
@@ -453,8 +453,10 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         if get_global_tracing_enabled():
             for idx, req in enumerate(batch.reqs):
-                accepted = verify_output.num_accepted_drafts_per_req_cpu[idx]
-                req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+                num_correct_drafts = verify_output.num_correct_drafts_per_req_cpu[idx]
+                req.time_stats.set_spec_verify_end_time(
+                    num_correct_drafts=num_correct_drafts
+                )
 
         set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
         with self.draft_tp_context(
@@ -463,11 +465,11 @@ class FrozenKVMTPWorker(TpModelWorker):
             draft_extend_input = verify_output.draft_extend_input
             if (
                 self.server_args.enable_dp_attention
-                or draft_extend_input.input_ids.numel() > 0
+                or draft_extend_input.input_ids.shape[0] > 0
             ):
                 # Install draft_extend_input as `batch.spec_info` for the seed
-                # step (`_run_assistant_seed_step` replaces it with a fresh
-                # `FrozenKVMTPDraftInput` for next iter).
+                # step; `_run_assistant_seed_step` replaces it with a fresh
+                # `FrozenKVMTPDraftInput` for next iter.
                 batch.spec_info = draft_extend_input
                 self.forward_draft_extend_after_decode(batch)
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
@@ -475,8 +477,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         return GenerationBatchResult(
             logits_output=verify_output.logits_output,
             next_token_ids=verify_output.accept_tokens,
-            num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
-            num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
+            num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
+            num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=verify_output.can_run_cuda_graph,
         )
 
@@ -514,7 +516,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         draft_extend_input: FrozenKVMTPDraftExtendInput = batch.spec_info
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and draft_extend_input.input_ids.numel() == 0:
+        if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
             # All reqs finished. Install an idle FrozenKVMTPDraftInput so the
             # next-iter draft sees a valid spec_info.
             batch = batch.copy()
@@ -757,9 +759,9 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
 
         logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepted_indices
+            res.accept_indices
         ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+        logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None

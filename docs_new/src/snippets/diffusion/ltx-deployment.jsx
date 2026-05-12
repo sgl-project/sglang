@@ -141,7 +141,7 @@ export const LTXDeployment = () => {
 
     let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --pipeline-class-name ${pipelineClass}`;
     command += getParallelFlags();
-    if (values.pipeline !== 'one-stage') {
+    if (values.model === 'ltx23' && values.pipeline !== 'one-stage') {
       command += ` \\\n  --ltx2-two-stage-device-mode ${getDeviceMode()}`;
     }
 
