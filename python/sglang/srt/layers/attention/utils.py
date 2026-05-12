@@ -54,7 +54,7 @@ def create_flashinfer_kv_indices_triton(
 
 
 @triton.jit
-def create_flashinfer_kv_indices_for_dcp_triton(
+def create_triton_kv_indices_for_dcp_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
     req_pool_indices_ptr,
     dcp_kernel_lens_ptr,

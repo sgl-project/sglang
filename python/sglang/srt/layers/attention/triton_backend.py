@@ -15,7 +15,7 @@ from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
     cp_lse_ag_out_rs,
-    create_flashinfer_kv_indices_for_dcp_triton,
+    create_triton_kv_indices_for_dcp_triton,
     create_flashinfer_kv_indices_triton,
     get_dcp_lens,
 )
@@ -278,7 +278,7 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices = torch.empty(
             int(dcp_lens.sum().item()), dtype=torch.int64, device=self.device
         )
-        create_flashinfer_kv_indices_for_dcp_triton[(len(req_pool_indices),)](
+        create_triton_kv_indices_for_dcp_triton[(len(req_pool_indices),)](
             self.req_to_token,
             req_pool_indices,
             dcp_lens,
@@ -302,7 +302,7 @@ class TritonAttnBackend(AttentionBackend):
         dcp_lens = self._dcp_lens(lens, kv_start_idx)
         kv_indptr[1 : len(req_pool_indices) + 1] = torch.cumsum(dcp_lens, dim=0)
         kv_indptr = kv_indptr[: len(req_pool_indices) + 1]
-        create_flashinfer_kv_indices_for_dcp_triton[(len(req_pool_indices),)](
+        create_triton_kv_indices_for_dcp_triton[(len(req_pool_indices),)](
             self.req_to_token,
             req_pool_indices,
             dcp_lens,
@@ -338,7 +338,7 @@ class TritonAttnBackend(AttentionBackend):
                         dtype=torch.int64,
                         device=self.device,
                     )
-                    create_flashinfer_kv_indices_for_dcp_triton[(bs,)](
+                    create_triton_kv_indices_for_dcp_triton[(bs,)](
                         self.req_to_token,
                         forward_batch.req_pool_indices,
                         dcp_seq_lens,
@@ -1610,7 +1610,7 @@ class TritonMultiStepDraftBackend:
         kv_indices = torch.empty(
             int(dcp_lens.sum().item()), dtype=torch.int64, device=self.device
         )
-        create_flashinfer_kv_indices_for_dcp_triton[(len(req_pool_indices),)](
+        create_triton_kv_indices_for_dcp_triton[(len(req_pool_indices),)](
             self.req_to_token,
             req_pool_indices,
             dcp_lens,
@@ -1634,7 +1634,7 @@ class TritonMultiStepDraftBackend:
         dcp_lens = self._dcp_lens(lens, kv_start_idx)
         kv_indptr[1 : len(req_pool_indices) + 1] = torch.cumsum(dcp_lens, dim=0)
         kv_indptr = kv_indptr[: len(req_pool_indices) + 1]
-        create_flashinfer_kv_indices_for_dcp_triton[(len(req_pool_indices),)](
+        create_triton_kv_indices_for_dcp_triton[(len(req_pool_indices),)](
             self.req_to_token,
             req_pool_indices,
             dcp_lens,
