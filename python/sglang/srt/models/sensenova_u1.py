@@ -9,9 +9,11 @@ import torch.nn.functional as F
 from torch import nn
 
 try:
-    from flash_attn import flash_attn_func
+    from sglang.jit_kernel.flash_attention import (
+        flash_attn_varlen_func as sgl_flash_attn_varlen_func,
+    )
 except ImportError:
-    flash_attn_func = None
+    sgl_flash_attn_varlen_func = None
 
 from sglang.srt.configs.sensenova_u1 import SenseNovaU1Config
 from sglang.srt.distributed import get_pp_group
@@ -652,15 +654,30 @@ class NEOQwen3Attention(Qwen3Attention):
             attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
 
         # 2. materialize prefix+query K/V so full-query semantics match official U1
-        if flash_attn_func is not None and attn_mask is None:
-            attn_output = flash_attn_func(
-                q.unsqueeze(0),
-                key_states.unsqueeze(0),
-                value_states.unsqueeze(0),
-                dropout_p=0.0,
+        if sgl_flash_attn_varlen_func is not None and attn_mask is None:
+            cu_seqlens_q = torch.tensor(
+                [0, extend_num_tokens],
+                dtype=torch.int32,
+                device=q.device,
+            )
+            cu_seqlens_k = torch.tensor(
+                [0, seq_len],
+                dtype=torch.int32,
+                device=q.device,
+            )
+            attn_output = sgl_flash_attn_varlen_func(
+                q.contiguous(),
+                key_states.contiguous().to(q.dtype),
+                value_states.contiguous().to(q.dtype),
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=extend_num_tokens,
+                max_seqlen_k=seq_len,
                 softmax_scale=self.scaling,
                 causal=False,
             )
+            if isinstance(attn_output, tuple):
+                attn_output = attn_output[0]
             return attn_output.reshape(extend_num_tokens, self.q_size)
 
         if self.num_heads != self.num_kv_heads:
