@@ -90,6 +90,10 @@ from sglang.srt.managers.tokenizer_manager_components.score_request_handler impo
     ScoreRequestHandler,
     ScoreRequestHandlerConfig,
 )
+from sglang.srt.managers.tokenizer_manager_components.tokenized_request_builder import (
+    TokenizedRequestBuilder,
+    TokenizedRequestBuilderConfig,
+)
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -172,6 +176,17 @@ class TokenizerManager(TokenizerControlMixin):
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
+
+        # Tokenized request builder
+        self.tokenized_request_builder = TokenizedRequestBuilder(
+            tokenizer=self.tokenizer,
+            config=TokenizedRequestBuilderConfig(
+                vocab_size=self.model_config.vocab_size,
+                preferred_sampling_params=self.preferred_sampling_params,
+                sampling_params_class=SamplingParams,
+                disaggregation_transfer_backend=self.server_args.disaggregation_transfer_backend,
+            ),
+        )
 
         # Request validator
         self.request_validator = RequestValidator(
@@ -575,12 +590,22 @@ class TokenizerManager(TokenizerControlMixin):
             mm_inputs = None
 
         self.request_validator.validate_one(obj=obj, input_ids=input_ids)
-        return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+        tokenized_obj = TokenizerManager._create_tokenized_object(
+            self.tokenized_request_builder,
+            obj,
+            input_text,
+            input_ids,
+            input_embeds,
+            mm_inputs,
+            token_type_ids,
         )
+        tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
+        self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
+        return tokenized_obj
 
+    @staticmethod
     def _create_tokenized_object(
-        self,
+        self: "TokenizedRequestBuilder",
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         input_text: str,
         input_ids: List[int],
@@ -592,13 +617,16 @@ class TokenizerManager(TokenizerControlMixin):
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
-        if self.preferred_sampling_params:
-            sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
+        if self.config.preferred_sampling_params:
+            sampling_kwargs = {
+                **self.config.preferred_sampling_params,
+                **obj.sampling_params,
+            }
         else:
             sampling_kwargs = obj.sampling_params
-        sampling_params = self.sampling_params_class(**sampling_kwargs)
+        sampling_params = self.config.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
-        sampling_params.verify(self.model_config.vocab_size)
+        sampling_params.verify(self.config.vocab_size)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
@@ -609,7 +637,7 @@ class TokenizerManager(TokenizerControlMixin):
             bootstrap_room = obj.bootstrap_room
             if (
                 bootstrap_room is None
-                and self.server_args.disaggregation_transfer_backend == "fake"
+                and self.config.disaggregation_transfer_backend == "fake"
             ):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
@@ -677,9 +705,6 @@ class TokenizerManager(TokenizerControlMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
-        tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
-        self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
-
         return tokenized_obj
 
     @staticmethod
@@ -742,11 +767,18 @@ class TokenizerManager(TokenizerControlMixin):
             token_type_ids = (
                 token_type_ids_list[i] if token_type_ids_list is not None else None
             )
-            tokenized_objs.append(
-                self._create_tokenized_object(
-                    req, req.text, input_ids_list[i], None, None, token_type_ids
-                )
+            tokenized_obj = TokenizerManager._create_tokenized_object(
+                self.tokenized_request_builder,
+                req,
+                req.text,
+                input_ids_list[i],
+                None,
+                None,
+                token_type_ids,
             )
+            tokenized_obj.time_stats = self.rid_to_state[req.rid].time_stats
+            self.rid_to_state[req.rid].time_stats.set_tokenize_finish_time()
+            tokenized_objs.append(tokenized_obj)
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
