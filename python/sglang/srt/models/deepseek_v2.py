@@ -196,7 +196,7 @@ elif _is_npu:
         forward_mla_prepare_npu,
     )
 elif _is_musa:
-    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+    from sgl_kernel import dsv3_fused_a_gemm
 else:
     pass
 
