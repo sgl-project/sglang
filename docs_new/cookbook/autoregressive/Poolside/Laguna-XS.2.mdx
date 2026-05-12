@@ -86,7 +86,7 @@ import { LagunaXS2Deployment } from '/src/snippets/autoregressive/laguna-xs2-dep
 - **Reasoning parser** (`--reasoning-parser poolside_v1`): Splits `<think>...</think>` segments into `reasoning_content` so `content` holds only the final answer. Disable only if you want the raw `<think>` tags in `content`.
 - **Tool call parser** (`--tool-call-parser poolside_v1`): Required for OpenAI-compatible tool-call streaming. Disable only for chat-only deployments.
 - **DP attention**: For higher-throughput deployments, enable the DP-Attention toggle — it emits `--dp <N> --enable-dp-attention` with `--dp` matching `--tp` (tune independently if needed).
-- **Thinking default**: Thinking is **off by default** at the model level. Opt in per request with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`, or flip the server default by appending `--chat-template-kwargs '{"enable_thinking": true}'` to the launch command.
+- **Thinking default**: Thinking is **off by default** at the model level. Opt in per request with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`.
 
 ## 4. Model Invocation
 
