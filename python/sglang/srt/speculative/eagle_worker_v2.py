@@ -137,7 +137,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 "spec_v2_zero_bubble is enabled. This feature improves performance by "
                 "skipping seq_lens_cpu synchronization (GPU->CPU copy) during the draft phase. "
                 "This is optimal for models like DeepSeek-V3.2 that do not depend on seq_lens_cpu. "
-                "For models that do, skipping this sync may affect acceptance length, though it "
+                "For other models, skipping this sync may affect acceptance length, though it "
                 "can be re-enabled in the code for correctness at the cost of some performance."
             )
 
