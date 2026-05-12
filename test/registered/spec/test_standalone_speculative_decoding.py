@@ -6,6 +6,7 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_STANDALONE,
@@ -81,12 +82,13 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
         envs.SGLANG_ENABLE_SPEC_V2.set(False)
         model = cls.model
-        cls.process = popen_launch_server(
-            model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=cls.get_server_args(),
-        )
+        with envs.SGLANG_TEST_RETRACT.override(True):
+            cls.process = popen_launch_server(
+                model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=cls.get_server_args(),
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -121,6 +123,10 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, self.spec_decode_threshold)
 
+    def test_radix_attention(self):
+        run_radix_attention_test(self.base_url)
+        assert self.process.poll() is None
+
 
 class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
 
@@ -142,12 +148,13 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
         model = cls.model
-        cls.process = popen_launch_server(
-            model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=cls.get_server_args(),
-        )
+        with envs.SGLANG_TEST_RETRACT.override(True):
+            cls.process = popen_launch_server(
+                model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=cls.get_server_args(),
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -180,6 +187,10 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
         ]
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, self.spec_decode_threshold)
+
+    def test_radix_attention(self):
+        run_radix_attention_test(self.base_url)
+        assert self.process.poll() is None
 
 
 class TestStandaloneSpeculativeDecodingTriton(TestStandaloneSpeculativeDecodingBase):
