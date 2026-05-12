@@ -3,6 +3,7 @@ import unittest
 from sglang.srt.utils import is_blackwell
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(est_time=249, suite="stage-b-test-2-gpu-large")
@@ -57,6 +58,10 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, DefaultServerBase)
         '{"vocab_size": 131072}',
     ]
 
+    def test_radix_attention(self):
+        run_radix_attention_test(self.base_url)
+        assert self.process.poll() is None
+
 
 class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(
     GSM8KMixin, DefaultServerBase
@@ -85,6 +90,10 @@ class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(
         "--mamba-ssm-dtype",
         "bfloat16",
     ]
+
+    def test_radix_attention(self):
+        run_radix_attention_test(self.base_url)
+        assert self.process.poll() is None
 
 
 if __name__ == "__main__":
