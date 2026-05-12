@@ -51,8 +51,11 @@ device_module = get_device_module()
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        self.load_events = [
+            device_module.Event(enable_timing=(i == num_layers - 1))
+            for i in range(num_layers)
+        ]
+        self.start_event = device_module.Event(enable_timing=True)
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -77,11 +80,9 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ].finish_event.query(), (
-            "Producer finish event should be ready before being reused."
-        )
+        ev = self.events[self.producer_index].finish_event
+        if not ev.query():
+            ev.synchronize()
         return self.producer_index
 
     def set_consumer(self, index: int):
@@ -142,6 +143,7 @@ class HiCacheAck(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
     node_ids: List[int]
+    num_tokens: int = 0
 
 
 class TransferBuffer:
@@ -528,7 +530,7 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "umbp"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -619,7 +621,7 @@ class HiCacheController:
         else:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
-            self.dp_rank = 0
+            self.dp_rank = int(os.environ.get("SGLANG_DP_RANK", "0"))
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
@@ -714,8 +716,8 @@ class HiCacheController:
         )
         self.write_queue.clear()
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        start_event = device_module.Event(enable_timing=True)
+        finish_event = device_module.Event(enable_timing=True)
 
         start_event.record()
         with device_module.stream(self.write_stream):
@@ -739,7 +741,9 @@ class HiCacheController:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
 
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        self.ack_write_queue.append(
+            HiCacheAck(start_event, finish_event, op.node_ids, len(device_indices))
+        )
 
     def load(
         self,
@@ -825,6 +829,7 @@ class HiCacheController:
                 start_event=producer_event.start_event,
                 finish_event=producer_event.finish_event,
                 node_ids=op.node_ids,
+                num_tokens=len(device_indices),
             )
         )
         return producer_id

@@ -53,6 +53,12 @@ class PrefillStats:
     num_new_seqs: int  # len(can_run_list)
     num_pending_tokens: int = 0
 
+    # Per-tier cache hit breakdown (raw token counts, no page alignment)
+    log_l1_hit_tokens: int = 0
+    log_l2_hit_tokens: int = 0
+    log_l3_hit_tokens: int = 0
+    log_miss_tokens: int = 0
+
     @classmethod
     def from_adder(
         cls,
@@ -70,6 +76,10 @@ class PrefillStats:
             ),
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
+            log_l1_hit_tokens=adder.log_l1_hit_tokens,
+            log_l2_hit_tokens=adder.log_l2_hit_tokens,
+            log_l3_hit_tokens=adder.log_l3_hit_tokens,
+            log_miss_tokens=adder.log_miss_tokens,
         )
 
 
@@ -442,6 +452,7 @@ class SchedulerMetricsMixin:
 
             # Basics
             self.stats.num_running_reqs = prefill_stats.num_running_reqs
+
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.waiting_queue, priority_enabled
             )
@@ -450,6 +461,13 @@ class SchedulerMetricsMixin:
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
+
+            # UMBP/feat: per-tier cache hit tokens + max_total
+            self.stats.l1_hit_tokens = prefill_stats.log_l1_hit_tokens
+            self.stats.l2_hit_tokens = prefill_stats.log_l2_hit_tokens
+            self.stats.l3_hit_tokens = prefill_stats.log_l3_hit_tokens
+            self.stats.cache_miss_tokens = prefill_stats.log_miss_tokens
+            self.stats.max_total_num_tokens = self.max_total_num_tokens
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
@@ -571,7 +589,6 @@ class SchedulerMetricsMixin:
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
-        cache_hit_rate = 0.0
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
@@ -619,6 +636,7 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs = QueueCount.from_reqs(
                 batch.reqs, priority_enabled
             )
+
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.waiting_queue, priority_enabled
             )

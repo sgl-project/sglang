@@ -1340,7 +1340,14 @@ class DummyModelLoader(BaseModelLoader):
             # random values to the weights.
             initialize_dummy_weights(model)
 
-            _post_load_weights(model)
+            try:
+                _post_load_weights(model)
+            except (AssertionError, RuntimeError) as e:
+                logger.warning(
+                    "post_load_weights skipped for dummy model (expected for "
+                    "quantized checkpoints): %s",
+                    e,
+                )
 
         return model.eval()
 
