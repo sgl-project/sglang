@@ -22,6 +22,7 @@ PERFORMANCE_MODES = ("auto", "speed", "memory", "balanced")
 
 
 class ServerArgsAutoTuner:
+    """Auto-tunes the server-arg for the given performance-mode, based on practical deployment experience with different model architectures"""
     def __init__(self, server_args: "ServerArgs"):
         self.server_args = server_args
 
@@ -92,6 +93,7 @@ class ServerArgsAutoTuner:
         ):
             return
         if args.use_fsdp_inference:
+            # if fsdp is enabled, layerwise-offload is weakened since the parameter has already been sharded
             args.dit_layerwise_offload = False
             return
 
@@ -106,6 +108,7 @@ class ServerArgsAutoTuner:
             and current_platform.is_cuda()
             and disable_threshold_gb is not None
         ):
+            # auto turn off layerwise-offload if we have sufficient VRAM headroom
             device_total_memory_gb = current_platform.get_device_total_memory() / (
                 1 << 30
             )

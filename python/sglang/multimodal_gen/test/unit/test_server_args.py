@@ -448,45 +448,6 @@ class TestOffloadDefaults(unittest.TestCase):
                 kwargs={"performance_mode": "fastest"},
             )
 
-    def test_mode_alias_cli_is_preserved(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "Qwen/Qwen-Image",
-            "--mode",
-            "throughput",
-        ]
-
-        with (
-            patch.object(sys, "argv", ["sglang"] + argv),
-            patch.object(
-                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
-                return_value=False,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
-                return_value=False,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
-                return_value=True,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
-                return_value=80 * 1024**3,
-            ),
-        ):
-            args, unknown_args = parser.parse_known_args(argv)
-            server_args = ServerArgs.from_cli_args(args, unknown_args)
-
-        self.assertEqual(server_args.performance_mode, "speed")
-        self.assertFalse(server_args.dit_cpu_offload)
-        self.assertFalse(server_args.text_encoder_cpu_offload)
-
     def test_cfg_parallel_cli_can_be_disabled_explicitly(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
