@@ -217,8 +217,13 @@ class HummingConfig(QuantizationConfig):
         if hasattr(self, "hf_to_sglang_mapper"):
             ignored_layers = self.hf_to_sglang_mapper.apply_list(ignored_layers)
 
-        if any(module_name in prefix for module_name in ignored_layers):
-            return True
+        for entry in ignored_layers:
+            if isinstance(entry, str) and entry.startswith("re:"):
+                if re.match(entry[3:], prefix):
+                    return True
+            elif entry in prefix:
+                return True
+
         if "lm_head" in prefix:
             return True
 
