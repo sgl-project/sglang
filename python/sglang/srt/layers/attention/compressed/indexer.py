@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.indexer_topk_capturer import (
     get_global_indexer_capturer,
 )
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.compressor import CompressorBackend
@@ -84,6 +85,45 @@ def fp8_paged_mqa_logits_torch(
         logits[i, :seq_len] = score[:seq_len]
 
     return logits
+
+
+def _fp8_paged_mqa_logits_pcg_fake(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: torch.Tensor,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    _ = kvcache_fp8, weight, seq_lens, page_table, deep_gemm_metadata, clean_logits
+    return q_fp8.new_empty((q_fp8.shape[0], max_seq_len), dtype=torch.float32)
+
+
+@register_custom_op(fake_impl=_fp8_paged_mqa_logits_pcg_fake)
+def fp8_paged_mqa_logits_pcg_op(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: torch.Tensor,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    from deep_gemm import fp8_paged_mqa_logits
+
+    return fp8_paged_mqa_logits(
+        q_fp8,
+        kvcache_fp8,
+        weight,
+        seq_lens,
+        page_table,
+        deep_gemm_metadata,
+        max_seq_len,
+        clean_logits,
+    )
 
 
 def topk_transform_512_pytorch_vectorized(
@@ -381,7 +421,7 @@ class C4IndexerBackend:
                     fp8_paged_mqa_logits_chunked as fn,
                 )
             else:
-                from deep_gemm import fp8_paged_mqa_logits as fn
+                fn = fp8_paged_mqa_logits_pcg_op
 
         _c4sl = indexer_metadata.c4_seq_lens
         if _c4sl.dim() == 1:
