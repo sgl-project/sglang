@@ -450,9 +450,7 @@ class TokenizerManager(TokenizerControlMixin):
             disagg_mode=self.disaggregation_mode,
         )
         if self.server_args.language_only:
-            TokenizerManager._handle_epd_disaggregation_encode_request(
-                self.multimodal_processor, obj
-            )
+            self.multimodal_processor.maybe_dispatch_to_encoder(obj)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
 
@@ -1839,67 +1837,6 @@ class TokenizerManager(TokenizerControlMixin):
             sub_obj.lora_id = (
                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
             )
-
-    @staticmethod
-    def _should_dispatch_to_encoder(
-        self: "MultimodalProcessor",
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-    ) -> bool:
-        """Check if the request should be dispatched to encoder for processing.
-
-        Returns True if the request should be dispatched to encoder (multiple multimodal items),
-        False if it should be processed locally (single multimodal item or no multimodal items).
-
-        Args:
-            obj: The request input object
-
-        Returns:
-            bool: True if should dispatch to encoder, False otherwise
-        """
-        if obj.batch_size > 1:
-            logger.warning(
-                "Batch request (batch_size=%d) is not supported in EPD disaggregation mode; skipping encoder dispatch.",
-                obj.batch_size,
-            )
-            return False
-        if not isinstance(obj, GenerateReqInput) or not obj.contains_mm_input():
-            return False
-
-        # Count image / video / audio items for dispatch threshold
-        def _count_mm_items(data):
-            return (
-                len(data) if isinstance(data, list) else (1 if data is not None else 0)
-            )
-
-        total_mm_items = (
-            _count_mm_items(getattr(obj, "image_data", None))
-            + _count_mm_items(getattr(obj, "video_data", None))
-            + _count_mm_items(getattr(obj, "audio_data", None))
-        )
-        return total_mm_items >= self.config.encoder_dispatch_min_items
-
-    @staticmethod
-    def _handle_epd_disaggregation_encode_request(
-        self: "MultimodalProcessor",
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-    ):
-        """Handle EPD-disaggregation mode encoding request."""
-        if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
-            # dispatch to encoder by default
-            should_dispatch = True
-            if self.config.enable_adaptive_dispatch_to_encoder:
-                should_dispatch = TokenizerManager._should_dispatch_to_encoder(
-                    self, obj
-                )
-
-            # Set need_wait_for_mm_inputs flag based on whether we dispatch to encoder
-            # This flag will be used in _tokenize_one_request to determine processing path
-            if should_dispatch:
-                obj.need_wait_for_mm_inputs = True
-                if self.config.encoder_transfer_backend == "zmq_to_scheduler":
-                    self.mm_receiver.send_encode_request(obj)
-            else:
-                obj.need_wait_for_mm_inputs = False
 
     def _set_default_priority(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         """Set the default priority value."""
