@@ -396,8 +396,8 @@ struct SparseMlaQ8Kv8PrefillKernel {
                 *reinterpret_cast<uint32_t*>(cur_rOb + i * 8 + 6),
                 *reinterpret_cast<uint128_t*>(stsm_addrs[i] + tile_idx * (B_H * 64)));
           }
-          // STSM is generic proxy, not async; the barrier provides release/acquire ordering.
-          asm volatile("" ::: "memory");
+          // Make the STSM writes visible to the subsequent TMA store proxy.
+          cute::tma_store_fence();
           NamedBarrier::arrive_and_wait(
               128, warpgroup_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
           if (s2g_pred) {
