@@ -137,7 +137,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        exit_stack = ExitStack()
 
         assert input_embeds is None
         input_embeds = forward_batch.mm_input_embeds
