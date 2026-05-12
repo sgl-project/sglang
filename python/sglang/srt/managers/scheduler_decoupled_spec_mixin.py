@@ -74,7 +74,6 @@ class SchedulerDecoupledSpecMixin:
             required_tail_len=max(
                 0, int(self.server_args.speculative_num_draft_tokens) - 1
             ),
-            enable_debug_prints=False,
         )
 
     def start_verify_proxy(self: Scheduler, context) -> None:
@@ -157,7 +156,10 @@ class SchedulerDecoupledSpecMixin:
         return time.perf_counter_ns()
 
     def record_forward_latency(
-        self: Scheduler, batch: ScheduleBatch, start_ns: Optional[int]
+        self: Scheduler,
+        batch: ScheduleBatch,
+        start_ns: Optional[int],
+        result: object | None = None,
     ) -> None:
         if start_ns is None:
             return
@@ -165,6 +167,7 @@ class SchedulerDecoupledSpecMixin:
         self._record_forward_trace(
             batch,
             duration_ms=(time.perf_counter_ns() - start_ns) / 1_000_000,
+            result=result,
         )
 
     def flush_draft_updates(
@@ -238,15 +241,19 @@ class SchedulerDecoupledSpecMixin:
         batch: ScheduleBatch,
         *,
         duration_ms: float,
+        result: object | None = None,
     ) -> None:
         if not self.trace_enabled():
             return
         component = self._trace_component()
         if component is None:
             return
+        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", None)
+        model_forward_mode = getattr(result, "model_forward_mode", None)
         fields = dict(
             duration_ms=duration_ms,
             forward_mode=str(batch.forward_mode),
+            model_forward_mode=model_forward_mode or str(batch.forward_mode),
             batch_size=len(batch.reqs),
             rids=[
                 (
@@ -258,6 +265,12 @@ class SchedulerDecoupledSpecMixin:
             ],
             output_lens_by_req=[len(req.output_ids) for req in batch.reqs],
         )
+        if can_run_cuda_graph is not None:
+            can_run_cuda_graph = bool(can_run_cuda_graph)
+            fields["can_run_cuda_graph"] = can_run_cuda_graph
+            fields["graph_path"] = self._infer_forward_graph_path(
+                batch, can_run_cuda_graph
+            )
         if component != "decode":
             if self.spec_algorithm.is_decoupled_draft():
                 fields["committed_lens_by_req"] = [
@@ -273,6 +286,31 @@ class SchedulerDecoupledSpecMixin:
                     len(req.output_ids) for req in batch.reqs
                 ]
         self.decoupled_spec_tracer.record(component, "forward_batch", **fields)
+        if component == "verifier":
+            timings = getattr(result, "decoupled_verify_timings", None)
+            if timings:
+                timing_fields = dict(timings)
+                timing_fields["duration_ms"] = timing_fields.get(
+                    "total_worker_ms", duration_ms
+                )
+                self.decoupled_spec_tracer.record(
+                    "verifier", "verify_worker_timing", **timing_fields
+                )
+
+    def _infer_forward_graph_path(
+        self: Scheduler, batch: ScheduleBatch, can_run_cuda_graph: bool
+    ) -> str:
+        if not can_run_cuda_graph:
+            return "eager"
+        if batch.forward_mode.is_decode():
+            if self.spec_algorithm.is_decoupled_verify():
+                return "cuda_graph_target_verify"
+            return "cuda_graph_decode"
+        if batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            return "piecewise_cuda_graph"
+        if batch.forward_mode.is_idle():
+            return "cuda_graph_idle"
+        return "cuda_graph"
 
     def is_draft_entry_rank(self: Scheduler) -> bool:
         return (
@@ -1057,7 +1095,11 @@ class SchedulerDecoupledSpecMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ) -> None:
-        accept_lens = result.accept_length_per_req_cpu
+        accept_lens = result.num_accepted_drafts_per_req_cpu
+        if accept_lens is None:
+            # Compatibility with older decoupled verifier results during rolling
+            # migrations from v0.5.10-dev.
+            accept_lens = getattr(result, "accept_length_per_req_cpu", None)
         if accept_lens is None:
             raise RuntimeError("Decoupled verify result is missing accept lengths.")
         if len(accept_lens) != len(batch.reqs):
@@ -1602,25 +1644,6 @@ class SchedulerDecoupledSpecMixin:
                 if 0 <= accepted_tail_len < len(snapshot_raw_tail_tokens)
                 else -1
             )
-            if getattr(draft_tail_buffer, "enable_debug_prints", False):
-                print(
-                    "[decoupled_verify][build_commit] "
-                    f"forward_mode={batch.forward_mode} "
-                    f"is_extend={batch.forward_mode.is_extend()} "
-                    f"is_decode={batch.forward_mode.is_decode()} "
-                    f"request_id={req.rid} "
-                    f"pre_committed_len={pre_verify_committed_len} "
-                    f"output_len={len(req.output_ids)} "
-                    f"bonus_token_pos={bonus_token_pos} "
-                    f"accepted_tail_len={accepted_tail_len} "
-                    f"bonus_token_id={bonus_token_id} "
-                    f"snapshot_candidate_token_id={snapshot_candidate_token_id} "
-                    f"draft_buffer_len={len(draft_buffer)} "
-                    f"draft_buffer={draft_buffer} "
-                    f"is_retracted={req.is_retracted} "
-                    f"finished={req.finished()}",
-                    flush=True,
-                )
 
             verify_commit_messages.append(
                 VerifyCommit(
@@ -1642,12 +1665,6 @@ class SchedulerDecoupledSpecMixin:
                 delattr(req, "_decoupled_verify_pre_committed_len")
             if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
                 delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
-        if verify_commit_messages:
-            # Applying a VerifyCommit needs the raw bonus-candidate anchor.
-            draft_tail_buffer.wait_for_draft_tokens(
-                [message.request_id for message in verify_commit_messages],
-                1,
-            )
         if trace_enabled:
             duration_ms = (time.perf_counter_ns() - trace_start_ns) / 1_000_000
             self.decoupled_spec_tracer.record(

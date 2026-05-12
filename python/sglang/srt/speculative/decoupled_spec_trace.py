@@ -24,13 +24,48 @@ def _fields(*fieldnames: str) -> list[str]:
 TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
     ("verifier", "forward_batch"): _fields(
         "forward_mode",
+        "model_forward_mode",
+        "can_run_cuda_graph",
+        "graph_path",
         "batch_size",
         "rids",
         "committed_lens_by_req",
         "output_lens_by_req",
     ),
+    ("verifier", "verify_worker_timing"): _fields(
+        "model_forward_mode",
+        "batch_size",
+        "draft_token_num",
+        "num_input_tokens",
+        "seq_lens_sum",
+        "draft_tree_mask_numel",
+        "target_can_run_cuda_graph",
+        "reported_can_run_cuda_graph",
+        "valid_tail_sum",
+        "valid_tail_min",
+        "valid_tail_max",
+        "num_accepted_drafts",
+        "accepted_tokens_num",
+        "draft_ms",
+        "draft_preamble_ms",
+        "draft_build_tokens_ms",
+        "draft_get_verify_buffers_ms",
+        "draft_build_tree_ms",
+        "draft_terminal_mask_ms",
+        "prepare_verify_ms",
+        "target_forward_ms",
+        "cuda_graph_replay_prepare_ms",
+        "cuda_graph_replay_ms",
+        "verify_impl",
+        "eagle_verify_ms",
+        "assert_ms",
+        "total_worker_ms",
+    ),
     ("decode", "forward_batch"): _fields(
         "forward_mode",
+        "model_forward_mode",
+        "can_run_cuda_graph",
+        "graph_path",
         "batch_size",
         "rids",
         "output_lens_by_req",
@@ -75,6 +110,9 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
     ),
     ("drafter", "forward_batch"): _fields(
         "forward_mode",
+        "model_forward_mode",
+        "can_run_cuda_graph",
+        "graph_path",
         "batch_size",
         "rids",
         "committed_lens_by_req",
@@ -307,6 +345,9 @@ class DecoupledSpecCsvTracer:
         for key, value in event.row.items():
             row[key] = self._serialize_value(value)
         writer.writerow(row)
+        # Scheduler processes may be killed during engine shutdown; flush each
+        # event so trace CSVs are usable even without a graceful close.
+        self._files[(event.component, op)].flush()
 
     def _flush_files(self) -> None:
         for file in self._files.values():

@@ -65,7 +65,6 @@ def get_decoupled_spec_actor_env_vars(
             "1" if args.decoupled_spec_allow_partial else "0"
         )
     for env_name in (
-        "SGLANG_DECOUPLED_SPEC_DEBUG",
         "SGLANG_DECOUPLED_SPEC_TRACE_DIR",
         "SGLANG_DECOUPLED_SPEC_SUMMARY_INTERVAL",
     ):

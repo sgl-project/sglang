@@ -500,7 +500,11 @@ class SchedulerOutputProcessorMixin:
 
         # Spec V1 handles output_ids, check_finished, grammar, and reasoning tokens
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
-        is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
+        is_spec_v1 = (
+            not batch.spec_algorithm.is_none()
+            and not is_decoupled_draft
+            and not batch.is_spec_v2
+        )
 
         decoded_draft_tokens = [None] * len(batch.reqs) if is_decoupled_draft else []
 

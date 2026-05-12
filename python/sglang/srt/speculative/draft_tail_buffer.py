@@ -54,11 +54,9 @@ class DraftTailBuffer:
         *,
         verifier_rank: int,
         required_tail_len: int,
-        enable_debug_prints: bool = False,
     ) -> None:
         self.verifier_rank = int(verifier_rank)
         self.required_tail_len = max(0, int(required_tail_len))
-        self.enable_debug_prints = bool(enable_debug_prints)
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._closed = False
@@ -141,21 +139,6 @@ class DraftTailBuffer:
         )
 
         if state.tail_tokens and not (0 <= accepted_tail_len < len(state.tail_tokens)):
-            if self.enable_debug_prints:
-                print(
-                    "[decoupled_verify][apply_commit_invalid] "
-                    f"request_id={message.request_id} "
-                    f"drafter_rank={state.drafter_rank} "
-                    f"state_committed_len={state.committed_len} "
-                    f"state_can_accept_prefix_len={state.can_accept_prefix_len} "
-                    f"state_tail_len={len(state.tail_tokens)} "
-                    f"state_tail_tokens={list(state.tail_tokens)} "
-                    f"message_pre_verify_committed_len={old_committed_len} "
-                    f"message_bonus_token_pos={int(message.bonus_token_pos)} "
-                    f"message_bonus_token_id={int(message.bonus_token_id)} "
-                    f"accepted_tail_len={accepted_tail_len}",
-                    flush=True,
-                )
             raise RuntimeError(
                 "Decoupled verify consumed all buffered draft tokens without a "
                 "reserved bonus-token anchor: "

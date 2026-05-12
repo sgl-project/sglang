@@ -314,6 +314,7 @@ class RankZeroFilter(logging.Filter):
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
+    model_forward_timings: Optional[dict] = None
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
@@ -2663,11 +2664,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         def get_spec_info():
             spec_info = None
-            if (
-                self.spec_algorithm.is_eagle()
-                or self.spec_algorithm.is_standalone()
-                or self.spec_algorithm.is_decoupled_verify()
-            ):
+            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
                 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
                 if self.is_draft_worker:
@@ -2688,6 +2685,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
                     )
+            elif self.spec_algorithm.is_decoupled_verify():
+                from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+                spec_info = NgramVerifyInput(
+                    draft_token=None,
+                    tree_mask=buffers.custom_mask,
+                    positions=None,
+                    retrieve_index=None,
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
+                    draft_token_num=num_tokens_per_bs,
+                )
+                spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
             elif self.spec_algorithm.is_dflash():
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
@@ -2912,8 +2922,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # Draft models use decode CUDA graphs, not PCG
-        if self.is_draft_worker:
+        # Non-decoupled draft models use decode CUDA graphs, not PCG.  A
+        # decoupled draft worker still runs normal prefill batches, so keep PCG
+        # enabled for its EXTEND path.
+        if self.is_draft_worker and not self.spec_algorithm.is_decoupled_draft():
             return
 
         # Disable piecewise CUDA graph for non-language models
@@ -3344,7 +3356,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+            return ModelRunnerOutput(
+                logits_output=ret,
+                can_run_graph=can_run_graph,
+                model_forward_timings=getattr(
+                    self.graph_runner, "last_replay_timings", None
+                ),
+            )
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:

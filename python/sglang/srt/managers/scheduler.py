@@ -1690,7 +1690,6 @@ class Scheduler(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-
         if self.recv_skipper is not None:
             last_forward_mode = (
                 self.last_batch.forward_mode if self.last_batch is not None else None
@@ -3140,8 +3139,8 @@ class Scheduler(
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                 )
         if should_trace_decoupled_spec_forward:
-            self.record_forward_latency(batch, decoupled_trace_forward_start_ns)
-            
+            self.record_forward_latency(batch, decoupled_trace_forward_start_ns, ret)
+
         if (
             self.server_args.enable_dp_attention
             and self.server_args.elastic_ep_backend is not None

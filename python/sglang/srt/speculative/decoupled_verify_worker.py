@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+import time
+from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftInput,
+    EagleVerifyInput,
+    EagleVerifyOutput,
+)
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
+from sglang.srt.speculative.spec_utils import generate_token_bitmask, maybe_detect_nan
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
@@ -28,19 +35,6 @@ def _get_req_tail_token_id(req) -> int:
     raise RuntimeError(
         f"Request {req.rid} has no committed token to anchor external draft verification."
     )
-
-
-def _slice_tensor_head_or_empty(
-    value: torch.Tensor | None,
-    live_count: int,
-    *,
-    empty_shape: tuple[int, ...],
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    if value is None:
-        return torch.empty(empty_shape, dtype=dtype, device=device)
-    return value[:live_count]
 
 
 def _normalize_token_id(value) -> int | None:
@@ -83,6 +77,20 @@ def _build_linear_topk1_tree_metadata(
 
     return selected_index, parent_list
 
+
+def _slice_tensor_head_or_empty(
+    value: torch.Tensor | None,
+    live_count: int,
+    *,
+    empty_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if value is None:
+        return torch.empty(empty_shape, dtype=dtype, device=device)
+    return value[:live_count]
+
+
 def normalize_external_draft_batch_spec_info(batch: ScheduleBatch) -> None:
     spec_info = getattr(batch, "spec_info", None)
     if not isinstance(spec_info, EagleDraftInput):
@@ -96,7 +104,9 @@ def normalize_external_draft_batch_spec_info(batch: ScheduleBatch) -> None:
         seq_lens_cpu.dtype if isinstance(seq_lens_cpu, torch.Tensor) else torch.int32
     )
     req_pool_indices_dtype = (
-        req_pool_indices.dtype if isinstance(req_pool_indices, torch.Tensor) else torch.int32
+        req_pool_indices.dtype
+        if isinstance(req_pool_indices, torch.Tensor)
+        else torch.int32
     )
 
     live_count = sum(1 for req in batch.reqs if not req.is_retracted and not req.finished())
@@ -117,29 +127,24 @@ def normalize_external_draft_batch_spec_info(batch: ScheduleBatch) -> None:
         dtype=batch.model_config.dtype,
         device=batch.device,
     )
-    verified_dtype = (
-        spec_info.verified_id.dtype
-        if isinstance(spec_info.verified_id, torch.Tensor)
-        else torch.int32
+    seq_lens_for_draft_extend_cpu = getattr(
+        spec_info, "seq_lens_for_draft_extend_cpu", seq_lens_cpu
     )
-    capture_hidden_mode = getattr(
-        spec_info, "capture_hidden_mode", CaptureHiddenMode.LAST
-    )
-
     batch.spec_info = EagleDraftInput(
         hidden_states=hidden_states,
-        verified_id=_slice_tensor_head_or_empty(
-            spec_info.verified_id,
-            live_count,
-            empty_shape=(live_count,),
-            dtype=verified_dtype,
-            device=batch.device,
+        bonus_tokens=torch.empty((live_count,), dtype=torch.int32, device=batch.device),
+        accept_tokens=torch.empty((0,), dtype=torch.long, device=batch.device),
+        num_accepted_drafts=torch.zeros(
+            (live_count,), dtype=torch.int32, device=batch.device
         ),
+        num_accepted_tokens=torch.zeros(
+            (live_count,), dtype=torch.int32, device=batch.device
+        ),
+        num_accepted_drafts_cpu=[0] * live_count,
+        num_accepted_tokens_cpu=[0] * live_count,
         topk_p=torch.empty((live_count, 1), dtype=torch.float32, device=batch.device),
         topk_index=torch.empty((live_count, 1), dtype=torch.int64, device=batch.device),
-        capture_hidden_mode=capture_hidden_mode,
-        accept_length=torch.zeros((live_count,), dtype=torch.int32, device=batch.device),
-        accept_length_cpu=[0] * live_count,
+        capture_hidden_mode=CaptureHiddenMode.LAST,
         seq_lens_for_draft_extend=_slice_tensor_head_or_empty(
             getattr(spec_info, "seq_lens_for_draft_extend", seq_lens),
             live_count,
@@ -147,10 +152,8 @@ def normalize_external_draft_batch_spec_info(batch: ScheduleBatch) -> None:
             dtype=seq_lens_dtype,
             device=batch.device,
         ),
-        seq_lens_for_draft_extend_cpu=getattr(
-            spec_info, "seq_lens_for_draft_extend_cpu", seq_lens_cpu
-        )[:live_count]
-        if getattr(spec_info, "seq_lens_for_draft_extend_cpu", seq_lens_cpu) is not None
+        seq_lens_for_draft_extend_cpu=seq_lens_for_draft_extend_cpu[:live_count]
+        if seq_lens_for_draft_extend_cpu is not None
         else torch.empty((0,), dtype=seq_lens_cpu_dtype),
         req_pool_indices_for_draft_extend=_slice_tensor_head_or_empty(
             getattr(spec_info, "req_pool_indices_for_draft_extend", req_pool_indices),
@@ -163,7 +166,6 @@ def normalize_external_draft_batch_spec_info(batch: ScheduleBatch) -> None:
 
 
 class VerifyWorker:
-    verify = EAGLEWorker.verify
     _mamba_verify_update = EAGLEWorker._mamba_verify_update
 
     def __init__(
@@ -196,11 +198,28 @@ class VerifyWorker:
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        self.trace_timing_enabled = bool(
+            getattr(server_args, "decoupled_spec_trace_dir", None)
+        )
         self.total_accept_length = 0
         self.total_num_verified_reqs = 0
 
     def clear_cache_pool(self):
         return
+
+    def _trace_timestamp_ns(self) -> int | None:
+        if not self.trace_timing_enabled:
+            return None
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return time.perf_counter_ns()
+
+    def _trace_elapsed_ms(self, start_ns: int | None) -> float:
+        if start_ns is None:
+            return 0.0
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return (time.perf_counter_ns() - start_ns) / 1_000_000
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         return self.target_worker.update_weights_from_tensor(recv_req)
@@ -264,19 +283,24 @@ class VerifyWorker:
             draft_tokens.extend([int(pad_token_id)] * (spec_depth - len(draft_tokens)))
         return [tail_token, *draft_tokens]
 
-    def _assert_verify_output_within_snapshot_tail(
-        self, batch: ScheduleBatch, verify_output
-    ):
-        # req.draft_buffer is a per-forward snapshot bound before verify. Any
-        # concurrent drafter appends belong to later verify rounds.
-        real_tail_lens = [
+    def _get_snapshot_tail_lens(self, batch: ScheduleBatch) -> list[int]:
+        return [
             min(
                 len(list(getattr(req, "draft_buffer", []) or [])),
                 self.speculative_num_draft_tokens - 1,
             )
             for req in batch.reqs
         ]
-        raw_accept_lens = [int(x) for x in verify_output.accept_length_per_req_cpu]
+
+    def _assert_verify_output_within_snapshot_tail(
+        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+    ) -> list[int]:
+        # req.draft_buffer is a per-forward snapshot bound before verify. Any
+        # concurrent drafter appends belong to later verify rounds.
+        real_tail_lens = self._get_snapshot_tail_lens(batch)
+        raw_accept_lens = [
+            int(x) for x in verify_output.num_accepted_drafts_per_req_cpu
+        ]
         for req, raw_accept_len, real_tail_len in zip(
             batch.reqs, raw_accept_lens, real_tail_lens
         ):
@@ -287,27 +311,30 @@ class VerifyWorker:
                 f"snapshot_tail_len={real_tail_len}"
             )
 
-        return verify_output.verified_id, raw_accept_lens
+        if verify_output.accept_tokens is None:
+            raise RuntimeError("Decoupled verify did not produce accepted tokens.")
 
-    def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
-        if batch.forward_mode.is_idle():
-            return EagleVerifyInput.create_idle_input(
-                self.topk,
-                self.speculative_num_steps,
-                self.speculative_num_draft_tokens,
-            )
+        return raw_accept_lens
 
+    def draft(
+        self,
+        batch: ScheduleBatch,
+        timings: dict | None = None,
+    ) -> EagleVerifyInput:
         draft_token_num = self.speculative_num_draft_tokens
         if draft_token_num < 2:
             raise RuntimeError(
                 "External draft verification requires at least one draft token per request."
             )
 
+        start_ns = self._trace_timestamp_ns()
         batch.maybe_evict_swa()
         for req in batch.reqs:
             req.decode_batch_idx += 1
         seq_lens_sum = int(torch.sum(batch.seq_lens).item())
         batch.seq_lens_sum = seq_lens_sum
+        if timings is not None:
+            timings["seq_lens_sum"] = seq_lens_sum
 
         # Accumulate penalty
         sampling_info = getattr(batch, "sampling_info", None)
@@ -328,11 +355,15 @@ class VerifyWorker:
             )
 
         pad_token_id = self._get_pad_token_id()
+        if timings is not None:
+            timings["draft_preamble_ms"] = self._trace_elapsed_ms(start_ns)
+
+        start_ns = self._trace_timestamp_ns()
         full_draft_tokens_by_req = [
             self._build_req_verify_tokens(req, pad_token_id) for req in batch.reqs
         ]
         spec_steps = draft_token_num - 1
-        verified_id = torch.tensor(
+        bonus_tokens = torch.tensor(
             [tokens[0] for tokens in full_draft_tokens_by_req],
             dtype=torch.long,
             device=batch.device,
@@ -349,17 +380,24 @@ class VerifyWorker:
             spec_steps,
             batch.device,
         )
+        if timings is not None:
+            timings["draft_build_tokens_ms"] = self._trace_elapsed_ms(start_ns)
 
+        start_ns = self._trace_timestamp_ns()
         tree_mask_buf, position_buf = self._get_verify_buffers(draft_token_num)
+        if timings is not None:
+            timings["draft_get_verify_buffers_ms"] = self._trace_elapsed_ms(start_ns)
+
+        start_ns = self._trace_timestamp_ns()
         (
             tree_mask,
             positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             flat_draft_tokens,
         ) = build_tree_kernel_efficient(
-            verified_id=verified_id,
+            bonus_tokens=bonus_tokens,
             parent_list=parent_list,
             top_scores_index=selected_index,
             draft_tokens=draft_tokens,
@@ -372,15 +410,29 @@ class VerifyWorker:
             tree_mask_buf=tree_mask_buf,
             position_buf=position_buf,
         )
+        if timings is not None:
+            timings["draft_tree_mask_numel"] = int(tree_mask.numel())
+            timings["draft_build_tree_ms"] = self._trace_elapsed_ms(start_ns)
+
+        start_ns = self._trace_timestamp_ns()
+        terminal_indices = torch.tensor(
+            self._get_snapshot_tail_lens(batch),
+            dtype=torch.long,
+            device=batch.device,
+        )
+        row_indices = torch.arange(batch_size, dtype=torch.long, device=batch.device)
+        retrieve_next_token[row_indices, terminal_indices] = -1
+        if timings is not None:
+            timings["draft_terminal_mask_ms"] = self._trace_elapsed_ms(start_ns)
 
         return EagleVerifyInput(
             draft_token=flat_draft_tokens,
             custom_mask=tree_mask,
             positions=positions,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
             spec_steps=spec_steps,
             topk=1,
             draft_token_num=draft_token_num,
@@ -389,30 +441,192 @@ class VerifyWorker:
             seq_lens_cpu=batch.seq_lens_cpu,
         )
 
+    def verify(
+        self,
+        batch: ScheduleBatch,
+        spec_info: EagleVerifyInput,
+        timings: dict | None = None,
+    ):
+        if timings is None:
+            timings = {}
+
+        was_idle = batch.forward_mode.is_idle()
+        seq_lens_pre_verify = batch.seq_lens.clone()
+
+        start_ns = self._trace_timestamp_ns()
+        spec_info.prepare_for_verify(batch, self.page_size)
+        spec_info.num_tokens_per_req = self.speculative_num_steps + 1
+        batch.return_hidden_states = False
+        batch.forward_mode = ForwardMode.IDLE if was_idle else ForwardMode.TARGET_VERIFY
+        batch.spec_info = spec_info
+
+        model_worker_batch = batch.get_model_worker_batch(
+            seq_lens_cpu_cache=spec_info.seq_lens_cpu
+        )
+        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
+
+        if batch.has_grammar:
+            retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
+            retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
+            draft_tokens_cpu = spec_info.draft_token.view(
+                spec_info.retrieve_next_token.shape
+            ).cpu()
+        timings["prepare_verify_ms"] = self._trace_elapsed_ms(start_ns)
+
+        start_ns = self._trace_timestamp_ns()
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True
+        )
+        timings["target_forward_ms"] = self._trace_elapsed_ms(start_ns)
+        logits_output, can_run_cuda_graph = (
+            batch_result.logits_output,
+            batch_result.can_run_cuda_graph,
+        )
+        if batch_result.model_forward_timings:
+            timings.update(batch_result.model_forward_timings)
+
+        vocab_mask = None
+        if batch.has_grammar:
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                spec_info,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+
+            if vocab_mask is not None:
+                assert spec_info.grammar is not None
+                vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
+                batch.sampling_info.vocab_mask = None
+
+        maybe_detect_nan(
+            logits_output.next_token_logits, "decoupled_verify: target model logits"
+        )
+
+        start_ns = self._trace_timestamp_ns()
+        spec_info.hidden_states = logits_output.hidden_states
+        verify_output: EagleVerifyOutput = spec_info.verify(
+            batch,
+            logits_output,
+            self.token_to_kv_pool_allocator,
+            self.page_size,
+            vocab_mask,
+        )
+
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            verify_output.accepted_indices
+        ]
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = logits_output.hidden_states[
+                verify_output.accepted_indices
+            ]
+
+        if (
+            self.target_worker.model_runner.hybrid_gdn_config is not None
+            or self.target_worker.model_runner.mamba2_config is not None
+            or self.target_worker.model_runner.hybrid_lightning_config is not None
+        ):
+            self._mamba_verify_update(
+                batch, verify_output, logits_output, spec_info, seq_lens_pre_verify
+            )
+
+        timings["eagle_verify_ms"] = self._trace_elapsed_ms(start_ns)
+
+        if batch.return_logprob:
+            add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
+
+        batch.forward_mode = ForwardMode.IDLE if was_idle else ForwardMode.DECODE
+        batch.spec_info = verify_output.draft_input
+        return (
+            logits_output,
+            verify_output,
+            can_run_cuda_graph,
+            timings,
+        )
+
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+        if (
+            batch.forward_mode.is_extend()
+            or batch.is_extend_in_batch
+            or batch.forward_mode.is_idle()
+        ):
             model_worker_batch = batch.get_model_worker_batch()
             result = self.target_worker.forward_batch_generation(model_worker_batch)
             return result
 
-        spec_info = self.draft(batch)
+        total_start_ns = self._trace_timestamp_ns()
+        timings = {}
+        start_ns = self._trace_timestamp_ns()
+        spec_info = self.draft(batch, timings if self.trace_timing_enabled else None)
+        draft_ms = self._trace_elapsed_ms(start_ns)
+        valid_tail_lens = self._get_snapshot_tail_lens(batch)
         can_use_full_graph_path = (
             spec_info.draft_token_num == self.speculative_num_draft_tokens
         )
-        logits_output, verify_output, _, can_run_cuda_graph = self.verify(batch, spec_info)
-        verified_id, accept_length_per_req_cpu = (
+        (
+            logits_output,
+            verify_output,
+            can_run_cuda_graph,
+            timings,
+        ) = self.verify(batch, spec_info, timings)
+
+        start_ns = self._trace_timestamp_ns()
+        num_accepted_drafts_per_req_cpu = (
             self._assert_verify_output_within_snapshot_tail(batch, verify_output)
         )
-
+        assert_ms = self._trace_elapsed_ms(start_ns)
+        accepted_tokens = verify_output.accept_tokens
+        num_accepted_drafts = sum(num_accepted_drafts_per_req_cpu)
+        reported_can_run_cuda_graph = can_run_cuda_graph and can_use_full_graph_path
         normalize_external_draft_batch_spec_info(batch)
+
         result = GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=verified_id,
-            num_accepted_tokens=sum(accept_length_per_req_cpu),
-            accept_length_per_req_cpu=accept_length_per_req_cpu,
-            can_run_cuda_graph=can_run_cuda_graph and can_use_full_graph_path,
+            next_token_ids=accepted_tokens,
+            num_accepted_drafts=num_accepted_drafts,
+            num_accepted_drafts_per_req_cpu=num_accepted_drafts_per_req_cpu,
+            can_run_cuda_graph=reported_can_run_cuda_graph,
+            model_forward_mode=str(ForwardMode.TARGET_VERIFY),
         )
-        num_verified_reqs = len(accept_length_per_req_cpu)
-        self.total_accept_length += int(result.num_accepted_tokens)
+        if self.trace_timing_enabled:
+            if torch.is_tensor(accepted_tokens):
+                accepted_tokens_num = int(accepted_tokens.numel())
+            else:
+                accepted_tokens_num = len(accepted_tokens or [])
+            timings.update(
+                model_forward_mode=str(ForwardMode.TARGET_VERIFY),
+                batch_size=batch.batch_size(),
+                draft_token_num=int(spec_info.draft_token_num),
+                num_input_tokens=int(spec_info.draft_token.numel()),
+                target_can_run_cuda_graph=bool(can_run_cuda_graph),
+                reported_can_run_cuda_graph=bool(reported_can_run_cuda_graph),
+                valid_tail_sum=int(sum(valid_tail_lens)),
+                valid_tail_min=int(min(valid_tail_lens)) if valid_tail_lens else 0,
+                valid_tail_max=int(max(valid_tail_lens)) if valid_tail_lens else 0,
+                num_accepted_drafts=int(num_accepted_drafts),
+                accepted_tokens_num=accepted_tokens_num,
+                draft_ms=draft_ms,
+                verify_impl="eagle",
+                assert_ms=assert_ms,
+                total_worker_ms=self._trace_elapsed_ms(total_start_ns),
+            )
+            timings.setdefault("cuda_graph_replay_prepare_ms", 0.0)
+            timings.setdefault("cuda_graph_replay_ms", 0.0)
+            timings.setdefault("seq_lens_sum", 0)
+            timings.setdefault("draft_tree_mask_numel", 0)
+            timings.setdefault("eagle_verify_ms", 0.0)
+            for timing_name in (
+                "draft_preamble_ms",
+                "draft_build_tokens_ms",
+                "draft_get_verify_buffers_ms",
+                "draft_build_tree_ms",
+                "draft_terminal_mask_ms",
+            ):
+                timings.setdefault(timing_name, 0.0)
+            result.decoupled_verify_timings = timings
+        num_verified_reqs = len(num_accepted_drafts_per_req_cpu)
+        self.total_accept_length += int(result.num_accepted_drafts)
         self.total_num_verified_reqs += num_verified_reqs
         return result
