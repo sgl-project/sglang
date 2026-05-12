@@ -54,7 +54,7 @@ For details, see the [Hugging Face model card](https://huggingface.co/poolside/L
 Laguna-XS.2 support is on `main` but not yet in a tagged release; install from the SGLang nightly wheel index, or pull a pre-built Docker image:
 
 ```bash Command
-# Install SGLang via pip (CUDA 13)
+# Install SGLang via pip (CUDA 13) — requires Python 3.10 (nightly wheels are cp310 only)
 python3 -m pip install --upgrade pip
 python3 -m pip install --extra-index-url https://docs.sglang.ai/whl/cu130 \
   "sglang[all]==0.5.12.dev20260509+g096ad02b0"
