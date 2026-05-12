@@ -1103,7 +1103,7 @@ def silu_and_mul_contig_post_quant(
     )
 
 
-def mega_moe_pre_dispatch(
+def _mega_moe_pre_dispatch_impl(
     x: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -1122,6 +1122,31 @@ def mega_moe_pre_dispatch(
         buf_x_sf,
         buf_topk_idx,
         buf_topk_weights,
+    )
+
+
+@register_custom_op(
+    mutates_args=["buf_x", "buf_x_sf", "buf_topk_idx", "buf_topk_weights"]
+)
+def mega_moe_pre_dispatch(
+    x: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    buf_x: torch.Tensor,
+    buf_x_sf: torch.Tensor,
+    buf_topk_idx: torch.Tensor,
+    buf_topk_weights: torch.Tensor,
+    quant_group_size: int = 32,
+) -> None:
+    _mega_moe_pre_dispatch_impl(
+        x,
+        topk_idx,
+        topk_weights,
+        buf_x,
+        buf_x_sf,
+        buf_topk_idx,
+        buf_topk_weights,
+        quant_group_size,
     )
 
 
