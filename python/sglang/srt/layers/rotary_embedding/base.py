@@ -211,7 +211,6 @@ class RotaryEmbedding(MultiPlatformOp):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         positions = torch.add(positions, offsets) if offsets is not None else positions
         flat_positions = positions.flatten()
-        self._ensure_cos_sin_cache_length(int(flat_positions.max().item()) + 1)
         cos_sin = self.cos_sin_cache.index_select(0, flat_positions.to(torch.long))
         last_dim = cos_sin.size(-1)
         cos, sin = (
@@ -234,7 +233,22 @@ class RotaryEmbedding(MultiPlatformOp):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         positions = torch.add(positions, offsets) if offsets is not None else positions
         flat_positions = positions.flatten()
-        self._ensure_cos_sin_cache_length(int(flat_positions.max().item()) + 1)
+        cos_sin = self.cos_sin_cache.index_select(0, flat_positions.to(torch.long))
+        last_dim = cos_sin.size(-1)
+        cos, sin = (
+            cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
+        )
+        self.cos_cached = (
+            cos.view(-1, 1, 1, last_dim)
+            .to(device=positions.device, dtype=dtype)
+            .contiguous()
+        )
+        self.sin_cached = (
+            sin.view(-1, 1, 1, last_dim)
+            .to(device=positions.device, dtype=dtype)
+            .contiguous()
+        )
+        return self.cos_cached, self.sin_cached
 
     def forward_native(
         self,
