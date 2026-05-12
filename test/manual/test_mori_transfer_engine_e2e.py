@@ -146,6 +146,77 @@ class TestMoriTransferEngineE2E(PDDisaggregationServerBase):
         self.assertGreater(len(out["text"]), 0)
 
 
+class TestMoriXgmiTransferEngineE2E(PDDisaggregationServerBase):
+    """
+    Run:
+        SGLANG_MORI_XGMI_MANUAL_E2E=1 python3 test/manual/test_mori_transfer_engine_e2e.py
+
+    This test uses Mori XGMI for same-node PD disaggregation, with prefill on
+    GPU 0 and decode on GPU 1.
+    """
+
+    _PORT_DELTA = 20
+    extra_prefill_args = ["--disaggregation-mori-io-backend", "xgmi"]
+    extra_decode_args = ["--disaggregation-mori-io-backend", "xgmi"]
+
+    @classmethod
+    def setUpClass(cls):
+        if os.environ.get("SGLANG_MORI_XGMI_MANUAL_E2E", "") not in (
+            "1",
+            "true",
+            "True",
+        ):
+            raise unittest.SkipTest(
+                "Set SGLANG_MORI_XGMI_MANUAL_E2E=1 to run this manual MORI XGMI E2E test."
+            )
+
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                raise unittest.SkipTest("torch.cuda is not available.")
+            if torch.cuda.device_count() < 2:
+                raise unittest.SkipTest("Mori XGMI test requires >= 2 visible GPUs.")
+        except Exception as e:
+            raise unittest.SkipTest(f"torch is not available/usable: {e}")
+
+        os.environ["SGLANG_TEST_PD_DISAGG_BACKEND"] = "mori"
+        super().setUpClass()
+
+        cls.lb_port = str(int(cls.lb_port) + cls._PORT_DELTA)
+        cls.prefill_port = str(int(cls.prefill_port) + cls._PORT_DELTA)
+        cls.decode_port = str(int(cls.decode_port) + cls._PORT_DELTA)
+        cls.bootstrap_port = str(int(cls.bootstrap_port) + cls._PORT_DELTA)
+        cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
+        cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
+        cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
+
+        cls.model = os.environ.get(
+            "SGLANG_MORI_E2E_TEST_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        )
+        cls.launch_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("SGLANG_TEST_PD_DISAGG_BACKEND", None)
+        super().tearDownClass()
+
+    def test_generate_with_xgmi(self):
+        resp = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "text": "Hello",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+            },
+            timeout=120,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        out = resp.json()
+        self.assertIn("text", out)
+        self.assertIsInstance(out["text"], str)
+        self.assertGreater(len(out["text"]), 0)
+
+
 class TestMoriTransferEngineTPMismatchE2E(PDDisaggregationServerBase):
     """Manual MORI PD-disaggregation E2E with TP mismatch.
 
