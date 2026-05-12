@@ -77,6 +77,9 @@ from sglang.srt.managers.tokenizer_manager_components.multimodal_processor_owner
 from sglang.srt.managers.tokenizer_manager_components.raw_tokenizer_wrapper import (
     RawTokenizerWrapper,
 )
+from sglang.srt.managers.tokenizer_manager_components.request_log_manager import (
+    RequestLogManager,
+)
 from sglang.srt.managers.tokenizer_manager_components.request_preparer import (
     RequestPreparer,
     RequestPreparerConfig,
@@ -165,9 +168,6 @@ class TokenizerManager(TokenizerControlMixin):
         # Init running status
         self.init_running_status()
 
-        # Init logging and dumping
-        self.init_request_logging_and_dumping()
-
         # Init weight update
         self.init_weight_update()
 
@@ -196,6 +196,11 @@ class TokenizerManager(TokenizerControlMixin):
                 sampling_params_class=SamplingParams,
                 disaggregation_transfer_backend=self.server_args.disaggregation_transfer_backend,
             ),
+        )
+
+        # Request log manager
+        self.request_log_manager = RequestLogManager.from_server_args(
+            server_args=self.server_args,
         )
 
         # Request validator
@@ -479,7 +484,9 @@ class TokenizerManager(TokenizerControlMixin):
             self._attach_multi_http_worker_info(obj)
 
         # Log the request
-        self.request_logger.log_received_request(obj, self.tokenizer, request)
+        self.request_log_manager.request_logger.log_received_request(
+            obj, self.tokenizer, request
+        )
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -661,15 +668,19 @@ class TokenizerManager(TokenizerControlMixin):
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.time_stats.get_response_sent_to_client_realtime()
-                self.request_logger.log_finished_request(
+                self.request_log_manager.request_logger.log_finished_request(
                     obj,
                     out,
                     request=request,
                 )
 
-                if self.request_metrics_exporter_manager.exporter_enabled():
+                if (
+                    self.request_log_manager.request_metrics_exporter_manager.exporter_enabled()
+                ):
                     asyncio.create_task(
-                        self.request_metrics_exporter_manager.write_record(obj, out)
+                        self.request_log_manager.request_metrics_exporter_manager.write_record(
+                            obj, out
+                        )
                     )
 
                 # Check if this was an abort/error created by scheduler
@@ -913,21 +924,23 @@ class TokenizerManager(TokenizerControlMixin):
             return all_success, all_message, all_paused_requests
 
     def configure_logging(self, obj: ConfigureLoggingReq):
-        self.request_logger.configure(
+        self.request_log_manager.request_logger.configure(
             log_requests=obj.log_requests,
             log_requests_level=obj.log_requests_level,
             log_requests_format=obj.log_requests_format,
         )
         if obj.dump_requests_folder is not None:
-            self.dump_requests_folder = obj.dump_requests_folder
+            self.request_log_manager.dump_requests_folder = obj.dump_requests_folder
         if obj.dump_requests_threshold is not None:
-            self.dump_requests_threshold = obj.dump_requests_threshold
+            self.request_log_manager.dump_requests_threshold = (
+                obj.dump_requests_threshold
+            )
         if obj.dump_requests_exclude_meta_keys is not None:
-            self.dump_requests_exclude_meta_keys = list(
+            self.request_log_manager.dump_requests_exclude_meta_keys = list(
                 obj.dump_requests_exclude_meta_keys
             )
         if obj.crash_dump_folder is not None:
-            self.crash_dump_folder = obj.crash_dump_folder
+            self.request_log_manager.crash_dump_folder = obj.crash_dump_folder
         logging.info(f"Config logging: {obj=}")
 
     async def freeze_gc(self):
@@ -1234,10 +1247,18 @@ class TokenizerManager(TokenizerControlMixin):
 
             if self.enable_metrics and state.obj.log_metrics:
                 self.collect_metrics(state, recv_obj, i)
-            if self.dump_requests_folder and state.finished and state.obj.log_metrics:
-                self.dump_requests(state, out_dict)
+            if (
+                self.request_log_manager.dump_requests_folder
+                and state.finished
+                and state.obj.log_metrics
+            ):
+                TokenizerManager.dump_requests(
+                    self.request_log_manager, state, out_dict
+                )
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
-                self.record_request_for_crash_dump(state, out_dict)
+                TokenizerManager.record_request_for_crash_dump(
+                    self.request_log_manager, state, out_dict
+                )
 
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():
@@ -1315,7 +1336,8 @@ class TokenizerManager(TokenizerControlMixin):
                 cached_tokens_details,
             )
 
-    def dump_requests(self, state: ReqState, out_dict: dict):
+    @staticmethod
+    def dump_requests(self: "RequestLogManager", state: ReqState, out_dict: dict):
         if self.dump_requests_exclude_meta_keys and isinstance(
             out_dict.get("meta_info"), dict
         ):
@@ -1340,14 +1362,18 @@ class TokenizerManager(TokenizerControlMixin):
                 self.dump_requests_folder,
                 datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl",
             )
-            self._dump_data_to_file(
+            TokenizerManager._dump_data_to_file(
+                self,
                 data_list=self.dump_request_list,
                 filename=filename,
                 log_message=f"Dump {len(self.dump_request_list)} requests to {filename}",
             )
             self.dump_request_list = []
 
-    def record_request_for_crash_dump(self, state: ReqState, out_dict: dict):
+    @staticmethod
+    def record_request_for_crash_dump(
+        self: "RequestLogManager", state: ReqState, out_dict: dict
+    ):
         current_time = real_time()
         self.crash_dump_request_list.append(
             (
@@ -1364,8 +1390,12 @@ class TokenizerManager(TokenizerControlMixin):
         ):
             self.crash_dump_request_list.popleft()
 
+    @staticmethod
     def _dump_data_to_file(
-        self, data_list: List[Tuple], filename: str, log_message: str
+        self: "RequestLogManager",
+        data_list: List[Tuple],
+        filename: str,
+        log_message: str,
     ):
         logger.info(log_message)
         to_dump_with_server_args = {
@@ -1393,8 +1423,12 @@ class TokenizerManager(TokenizerControlMixin):
 
         asyncio.create_task(asyncio.to_thread(background_task))
 
+    @staticmethod
     def dump_requests_before_crash(
-        self, hostname: str = os.getenv("HOSTNAME", socket.gethostname())
+        self: "RequestLogManager",
+        *,
+        rid_to_state: Dict[str, ReqState],
+        hostname: str = os.getenv("HOSTNAME", socket.gethostname()),
     ):
         if not self.crash_dump_folder:
             return
@@ -1416,7 +1450,7 @@ class TokenizerManager(TokenizerControlMixin):
 
         # Add unfinished requests from rid_to_state
         unfinished_requests = []
-        for rid, state in self.rid_to_state.items():
+        for rid, state in rid_to_state.items():
             if not state.finished:
                 state.time_stats.set_finished_time()
                 unfinished_requests.append(
@@ -1485,7 +1519,10 @@ class TokenizerManager(TokenizerControlMixin):
                 logger.error(
                     "Signal SIGTERM received while health check failed. Force exiting."
                 )
-                self.dump_requests_before_crash()
+                TokenizerManager.dump_requests_before_crash(
+                    self.request_log_manager,
+                    rid_to_state=self.rid_to_state,
+                )
                 self.force_exit_handler()
                 break
 
@@ -1503,7 +1540,10 @@ class TokenizerManager(TokenizerControlMixin):
             if remain_num_req > 0:
                 await asyncio.sleep(5)
             else:
-                self.dump_requests_before_crash()
+                TokenizerManager.dump_requests_before_crash(
+                    self.request_log_manager,
+                    rid_to_state=self.rid_to_state,
+                )
                 break
 
         kill_process_tree(os.getpid(), include_parent=True)

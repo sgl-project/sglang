@@ -85,7 +85,7 @@ class OpenAIServingBase(ABC):
                 return self.create_error_response(error_msg)
 
             # Log the raw OpenAI request payload before conversion to tokenized form.
-            request_logger = self.tokenizer_manager.request_logger
+            request_logger = self.tokenizer_manager.request_log_manager.request_logger
             if request_logger.log_requests and request_logger.log_requests_level >= 2:
                 request_logger.log_openai_received_request(request, request=raw_request)
 
