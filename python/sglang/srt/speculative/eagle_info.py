@@ -426,11 +426,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
-            num_accepted = 0
+            num_accept_tokens = 0
             for j, idx in enumerate(accept_index_row):
                 if idx == -1:
                     break
-                num_accepted += 1
+                num_accept_tokens += 1
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
                 if req.require_reasoning and think_end_id is not None:
@@ -451,7 +451,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     accept_index[i, j + 1 :] = -1
                     break
             # Update KV cache tracking for the accepted tokens
-            req.kv_committed_len += num_accepted
+            req.kv_committed_len += num_accept_tokens
             req.kv_allocated_len = req.kv_committed_len
             if not req.finished():
                 unfinished_index.append(i)
