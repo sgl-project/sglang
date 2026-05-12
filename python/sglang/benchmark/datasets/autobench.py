@@ -113,8 +113,7 @@ def _normalize_prompt(row: Dict[str, Any]) -> Tuple[Any, str]:
                 isinstance(item, list)
                 and item
                 and all(
-                    isinstance(m, dict) and "role" in m and "content" in m
-                    for m in item
+                    isinstance(m, dict) and "role" in m and "content" in m for m in item
                 )
                 for item in prompt
             )
