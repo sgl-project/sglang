@@ -13,6 +13,13 @@ from sglang.srt.layers.utils.common import strict_contiguous
 
 tilelang.set_log_level("WARNING")
 
+try:
+    import deep_gemm as _deep_gemm_for_dynamo
+
+    torch.compiler.allow_in_graph(_deep_gemm_for_dynamo.tf32_hc_prenorm_gemm)
+except Exception:
+    pass
+
 pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
