@@ -264,7 +264,11 @@ class TestOffloadDefaults(unittest.TestCase):
     def test_manual_mode_preserves_unset_performance_args(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
-            kwargs={"model_path": "Qwen/Qwen-Image", "num_gpus": 2},
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "num_gpus": 2,
+                "performance_mode": "manual",
+            },
         )
 
         self.assertEqual(args.performance_mode, "manual")
@@ -274,6 +278,19 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertIsNone(args.text_encoder_cpu_offload)
         self.assertIsNone(args.image_encoder_cpu_offload)
         self.assertFalse(args.enable_cfg_parallel)
+
+    def test_default_auto_keeps_legacy_single_gpu_offload_defaults(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={"model_path": "Qwen/Qwen-Image"},
+        )
+
+        self.assertEqual(args.performance_mode, "auto")
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
 
     def test_auto_wan_layerwise_offload_is_enabled_without_fsdp(self):
         args = self._from_dict_with_pipeline_config(

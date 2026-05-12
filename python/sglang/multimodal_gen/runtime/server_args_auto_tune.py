@@ -150,7 +150,7 @@ class ServerArgsAutoTuner:
 
     def _normalize_performance_mode(self) -> str:
         args = self.server_args
-        mode = (args.performance_mode or "manual").lower()
+        mode = (args.performance_mode or "auto").lower()
         if mode not in PERFORMANCE_MODES:
             valid_modes = PERFORMANCE_MODES
             raise ValueError(

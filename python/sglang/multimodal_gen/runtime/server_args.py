@@ -141,7 +141,7 @@ class ServerArgs(DisaggArgsMixin):
 
     # Parallelism
     num_gpus: int = 1
-    performance_mode: str = "manual"
+    performance_mode: str = "auto"
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
