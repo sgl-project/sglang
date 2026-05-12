@@ -101,7 +101,7 @@ def topk_transform_512_pytorch_vectorized(
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
 
-    TOPK = 512
+    TOPK = out_page_indices.shape[1]
     batch_size = scores.shape[0]
     max_seq_len = scores.shape[1]
     device = scores.device
