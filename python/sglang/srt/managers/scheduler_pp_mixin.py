@@ -22,11 +22,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
-from sglang.srt.managers.io_struct import (
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromTensorReqInput,
-)
+from sglang.srt.managers.io_struct import is_cross_pp_collective_req
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -40,19 +36,6 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_py
 from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
-
-
-_CROSS_PP_COLLECTIVE_REQ_TYPES = (
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromIPCReqInput,
-)
-
-
-def _has_cross_pp_collective(recv_reqs) -> bool:
-    if not recv_reqs:
-        return False
-    return any(isinstance(r, _CROSS_PP_COLLECTIVE_REQ_TYPES) for r in recv_reqs)
 
 
 if TYPE_CHECKING:
@@ -100,14 +83,9 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.recv_requests()
-                # When a cross-PP collective control op is in the batch
-                # (e.g. update_weights_from_distributed), forward BEFORE
-                # processing locally — otherwise PP0 deadlocks in the
-                # collective waiting for PP1, while PP1 is still waiting
-                # on _pp_recv_pyobj_from_prev_stage. For normal inference
-                # traffic, keep the original "process first, forward after"
-                # ordering to avoid changing inference-hot-path semantics.
-                forwarded_early = _has_cross_pp_collective(recv_reqs)
+                forwarded_early = any(
+                    is_cross_pp_collective_req(r) for r in recv_reqs or ()
+                )
                 if forwarded_early and not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
@@ -249,8 +227,9 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.recv_requests()
-                # See event_loop_pp for the conditional-forward rationale.
-                forwarded_early = _has_cross_pp_collective(recv_reqs)
+                forwarded_early = any(
+                    is_cross_pp_collective_req(r) for r in recv_reqs or ()
+                )
                 if forwarded_early and not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -403,8 +382,9 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.recv_requests()
-                # See event_loop_pp for the conditional-forward rationale.
-                forwarded_early = _has_cross_pp_collective(recv_reqs)
+                forwarded_early = any(
+                    is_cross_pp_collective_req(r) for r in recv_reqs or ()
+                )
                 if forwarded_early and not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
