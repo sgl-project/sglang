@@ -5,6 +5,10 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    mamba2_config,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -1041,8 +1045,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Update mamba state for hybrid GDN models after verification
         if (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
+            hybrid_gdn_config(self.target_worker.model_runner.model_config) is not None
+            or mamba2_config(self.target_worker.model_runner.model_config) is not None
         ):
             self._mamba_verify_update(
                 batch, verify_input, accept_lens, accept_index, bs
