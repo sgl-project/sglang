@@ -6,54 +6,11 @@ from contextlib import nullcontext
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_hip = is_hip()
-
-
-@dataclasses.dataclass
-class KVAndScoreOld:
-    kv: torch.Tensor
-    score: torch.Tensor
-
-    def __post_init__(self):
-        assert self.kv.shape == self.score.shape
-
-    @staticmethod
-    def empty_like(new_shape, old: KVAndScoreOld) -> KVAndScoreOld:
-        return KVAndScoreOld(
-            kv=torch.empty(*new_shape, dtype=old.kv.dtype, device=old.kv.device),
-            score=torch.empty(
-                *new_shape, dtype=old.score.dtype, device=old.score.device
-            ),
-        )
-
-    @property
-    def shape(self):
-        return self.kv.shape
-
-    def __getitem__(self, index) -> KVAndScoreOld:
-        return KVAndScoreOld(kv=self.kv[index], score=self.score[index])
-
-    def __setitem__(self, index, value: KVAndScore):
-        self.kv[index] = value.kv
-        self.score[index] = value.score
-
-    def clear(self):
-        self.kv.zero_()
-        self.score.fill_(float("-inf"))
-
-    def view(self, *args):
-        return KVAndScoreOld(
-            kv=self.kv.view(*args),
-            score=self.score.view(*args),
-        )
-
-    def clone(self) -> KVAndScoreOld:
-        return KVAndScoreOld(kv=self.kv.clone(), score=self.score.clone())
 
 
 @dataclasses.dataclass
@@ -140,12 +97,6 @@ class DeepSeekV4CompressState:
         self.kv_score_state = torch.zeros(state_shape, dtype=dtype, device=device)
 
     def get_state(self) -> KVAndScore:
-        if envs.SGLANG_OPT_USE_OLD_COMPRESSOR.get():
-            half_dim = self.head_dim * (1 + self.overlap)
-            return KVAndScoreOld(
-                self.kv_score_state[..., :half_dim],
-                self.kv_score_state[..., half_dim:],
-            )
         return KVAndScore(self.kv_score_state)
 
 

@@ -14,7 +14,6 @@ from sglang.srt.layers.attention.dsv4 import (
 )
 from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.layers.attention.nsa import index_buf_accessor
-from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.utils import is_hip
 
 if is_hip():
@@ -24,43 +23,30 @@ if is_hip():
     )
 
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ceil_div
 
 logger = logging.getLogger(__name__)
 
+ONLINE_C128 = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
 
 def get_compress_state_ring_size(
     compress_ratio: int, is_speculative: bool = False
 ) -> int:
-    """Get ring size for given compression ratio.
-
-    This is the single source of truth for ring size calculation.
-    All other code should call this function instead of duplicating the logic.
-
-    Args:
-        compress_ratio: Compression ratio (4 or 128)
-        is_speculative: Whether speculative decoding is enabled
-
-    Returns:
-        Ring size for the given compression ratio
-    """
     assert compress_ratio in [4, 128], f"Unsupported {compress_ratio = }"
-    if is_hip():
-        if is_speculative:
-            return 8 if compress_ratio == 4 else 128
-        else:
-            return 16 if compress_ratio == 4 else 256
+    # Online c128 keeps a single (max, sum, kv) state per index instead of a
+    # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
+    # is incompatible with speculative decode for now.
+    if compress_ratio == 128 and ONLINE_C128:
+        assert not is_speculative, "online c128 does not support MTP"
+        return 1
+    if is_speculative:
+        return 16 if compress_ratio == 4 else 256
     else:
-        ONLINE_C128 = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-        if compress_ratio == 128 and ONLINE_C128:
-            assert not is_speculative, "online c128 does not support MTP"
-            return 1
-        if is_speculative:
-            return 16 if compress_ratio == 4 else 256
-        else:
-            return 8 if compress_ratio == 4 else 128
+        return 8 if compress_ratio == 4 else 128
 
 
 class DeepSeekV4SingleKVPool(KVCache):
