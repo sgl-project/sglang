@@ -151,7 +151,7 @@ For debugging or quick testing, you may pass a **JSON-style string** directly vi
 
 This requires explicitly specifying the plugin type via an environment variable, and this method can be applicable to **only a few** plugins (e.g., POSIX, GDS, GDS_MT)
 
-The below example shows how to use command-line string to use the POSIX plugin where URING is enabled for async POSIX storage.
+The below example shows how to use command-line string to use the POSIX plugin where URING is enabled for async POSIX storage, with O_DIRECT enabled (the default).
 
 ```bash
 export SGLANG_HICACHE_NIXL_BACKEND_PLUGIN=POSIX
@@ -166,7 +166,17 @@ python3 -m sglang.launch_server \
   --hicache-size 64 \
   --hicache-write-policy write_through \
   --hicache-storage-backend nixl \
-  --hicache-storage-backend-extra-config "{'use_uring': 'true'}"
+  --hicache-storage-backend-extra-config '{"use_uring": "true"}'
+```
+
+To disable O_DIRECT (e.g. for debugging or unsupported filesystems), set the top-level `use_direct_io` key:
+
+```bash
+export SGLANG_HICACHE_NIXL_BACKEND_PLUGIN=POSIX
+
+python3 -m sglang.launch_server \
+  ... \
+  --hicache-storage-backend-extra-config '{"use_direct_io": false, "use_uring": "true"}'
 ```
 
 ⚠️ **Note**:
@@ -350,6 +360,33 @@ An example of the configuration is provided in [`nixl.config.toml.sample`](./nix
 * Unless otherwise stated, all configuration keys are **optional** and have sensible defaults.
 
 For object storage, `bucket` may also be omitted from the config if `AWS_DEFAULT_BUCKET` is already defined in the environment.
+
+### 1a. Top-Level Configuration Keys
+
+The following keys are placed at the **top level** of the config file (not inside any `[plugin.*]` section) and apply globally to the NIXL backend:
+
+| Key              | Type    | Default  | Description |
+| ---------------- | ------- | -------- | ----------- |
+| `use_direct_io`  | boolean | `true`   | Open cache files with `O_DIRECT` to bypass the OS page cache. Reduces memory pressure and improves NVMe throughput. Falls back to buffered I/O with a warning if `O_DIRECT` is unavailable on the current OS. Can also be overridden via the `SGLANG_HICACHE_NIXL_USE_DIRECT_IO` environment variable. |
+
+**Page-alignment and `O_DIRECT`**
+
+When `use_direct_io = true` with any file-based backend (POSIX, GDS, GDS_MT, 3FS), the kernel requires every I/O buffer pointer to be OS-page-aligned (4 KiB). SGLang handles this automatically:
+
+* **Zero-copy mode** (`page_first` / `page_first_direct` layout): the host memory pool is always mmap-backed and therefore page-aligned. If the per-page stride is also a multiple of 4 KiB, zero-copy transfers are used as-is.
+* **Copy mode** (all other layouts, or if stride alignment cannot be satisfied): SGLang pre-allocates page-aligned bounce buffers via `mmap` and falls back to copy mode, logging a warning. No user action is required -- this is fully automatic.
+
+To disable `O_DIRECT` (e.g. for debugging or when the filesystem does not support it):
+
+```toml
+use_direct_io = false
+
+[plugin.posix]
+use_uring = "true"
+active = true
+```
+
+or via environment variable: `SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0`.
 
 
 ### 2. POSIX File System Backend (`plugin.posix`)

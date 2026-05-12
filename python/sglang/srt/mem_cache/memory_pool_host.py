@@ -322,6 +322,19 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        """Return True if per-page strides are multiples of *page_size_bytes*.
+
+        Subclasses should override this with a layout-specific stride formula.
+        This base implementation logs a warning and returns False (safe default).
+        """
+        logger.warning(
+            "%s does not implement is_stride_page_aligned(); assuming not aligned. "
+            "O_DIRECT with a file-based NIXL backend will fall back to copy mode for this pool.",
+            type(self).__name__,
+        )
+        return False
+
     @synchronized
     def clear(self):
         # Initialize memory states and tracking structures.
@@ -848,6 +861,30 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
 
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        """Return True if per-page strides are multiples of *page_size_bytes*.
+
+        When O_DIRECT is used with any file-based NIXL backend, every data pointer
+        passed to the kernel must be page-aligned.  In zero-copy mode the
+        pointer for KV page ``p`` is:
+
+            base_ptr + p * page_size * layer_num * head_num * head_dim * itemsize
+
+        For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
+        stride must itself be a multiple of the OS page size.
+        """
+        if self.layout not in ("page_first", "page_first_direct", "page_head"):
+            return False
+        stride = (
+            self.page_size
+            * self.layer_num
+            * self.head_num
+            * self.head_dim
+            * self.dtype.itemsize
+        )
+        base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
+        return base_aligned and stride % page_size_bytes == 0
+
 
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
@@ -1247,6 +1284,26 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        """Return True if per-page strides are multiples of *page_size_bytes*.
+
+        When O_DIRECT is used with any file-based NIXL backend, every data pointer
+        passed to the kernel must be page-aligned.  In zero-copy mode the
+        pointer for KV page ``p`` is:
+
+            base_ptr + p * page_size * layer_num * kv_cache_dim * itemsize
+
+        For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
+        stride must itself be a multiple of the OS page size.
+        """
+        if self.layout not in ("page_first", "page_first_direct"):
+            return False
+        stride = (
+            self.page_size * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
+        )
+        base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
+        return base_aligned and stride % page_size_bytes == 0
 
 
 class MambaPoolHost(HostKVCache):
