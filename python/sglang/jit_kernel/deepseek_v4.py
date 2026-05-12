@@ -974,7 +974,7 @@ def fused_store_cache(
     module.run(input, cache, indices)
 
 
-def silu_and_mul_clamp(
+def _silu_and_mul_clamp_impl(
     input: torch.Tensor,
     output: torch.Tensor,
     swiglu_limit: float,
@@ -992,6 +992,16 @@ def silu_and_mul_clamp(
     else:
         module = _jit_silu_and_mul_clamp_tmp_module(input.dtype)
     module.run(input, output, float(swiglu_limit))
+
+
+@register_custom_op(mutates_args=["output"])
+def silu_and_mul_clamp(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    swiglu_limit: float,
+    observe: bool = True,
+) -> None:
+    _silu_and_mul_clamp_impl(input, output, swiglu_limit, observe)
 
 
 def silu_and_mul_masked_post_quant(
