@@ -535,6 +535,15 @@ class SchedulerOutputProcessorMixin:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
+            if self.pp_size > 1 and (req.finished() or req.is_retracted):
+                # PP stale-batch: another microbatch already finalized / retracted
+                # this req. Without this guard, the body would append a duplicate
+                # next_token to req.output_ids (corrupting accuracy under PP) and
+                # call release_kv_cache a second time. Spec v1 paths intentionally
+                # rely on processing req.finished()=True at entry, so we do NOT
+                # apply this guard outside PP.
+                continue
+
             if req.kv_committed_freed:
                 # PP stale-batch: another microbatch already finalized this req
                 # (released its KV and set finished_reason). Skipping the whole
