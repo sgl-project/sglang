@@ -200,7 +200,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
             model,
             timesteps,
             image_seq_len=token_h * token_w,
-            timestep_shift=float(getattr(sampling_params, "timestep_shift", 1.0)),
+            timestep_shift=float(getattr(sampling_params, "timestep_shift", 3.0)),
         )
         packed_seqlens = torch.tensor(
             [token_h * token_w], dtype=torch.int32, device=device
