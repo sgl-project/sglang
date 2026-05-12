@@ -160,8 +160,8 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         if self.needs_quant_draft:
             cxt = contextlib.nullcontext()
         else:
-            # SGLANG_DEEPEP_BF16_DISPATCH is deprecated, will need  
-            # to be removed in the future and moved to a new 
+            # SGLANG_DEEPEP_BF16_DISPATCH is deprecated, will need
+            # to be removed in the future and moved to a new
             # --deepep-dispatcher-output-dtype server argument.
             unquant_patch = {
                 "SGLANG_DEEPEP_BF16_DISPATCH": "1",
