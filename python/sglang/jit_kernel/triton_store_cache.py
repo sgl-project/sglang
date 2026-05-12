@@ -9,6 +9,22 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 _FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 _FP8_INFO = torch.finfo(_FP8_DTYPE)
 
+# DeepSeek-V4 MLA paged FP8 cache layout
+_MLA_HEAD_DIM = 512               # full MLA token dim (elements per input row)
+_MLA_NOPE_DIM = 448               # nope sub-dim (elements)
+_MLA_TILE_SIZE = 64               # FP8 tile width (also rope copy stride)
+_MLA_SLOT_BYTES = 576             # bytes per slot in the paged FP8 cache
+_MLA_BF16_SLOT_ELEMS = _MLA_SLOT_BYTES // 2     # bf16-view slot stride (elements)
+_MLA_BF16_ROPE_OFFSET = _MLA_NOPE_DIM // 2      # bf16-view rope offset (elements)
+_MLA_SCALES_PER_TOKEN = 8         # UE8M0 scales per token (7 nope tiles + 1 padding)
+_MLA_NUM_TILES = 8                # 7 nope quant tiles + 1 rope copy tile
+_MLA_ROPE_TILE_ID = 7             # tile id reserved for the rope copy
+
+# C4 indexer paged FP8 cache layout
+_INDEXER_HEAD_DIM = 128
+
+_UE8M0_EXPONENT_BIAS = 127
+
 
 @triton.jit
 def _triton_fused_store_flashmla_kernel(
@@ -23,6 +39,14 @@ def _triton_fused_store_flashmla_kernel(
     BYTES_PER_PAGE_BF16: tl.constexpr,
     S_OFFSET: tl.constexpr,
     TILE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    SLOT_BYTES: tl.constexpr,
+    BF16_SLOT_ELEMS: tl.constexpr,
+    BF16_ROPE_OFFSET: tl.constexpr,
+    SCALES_PER_TOKEN: tl.constexpr,
+    ROPE_TILE_ID: tl.constexpr,
+    UE8M0_BIAS: tl.constexpr,
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
     EPS: tl.constexpr,
@@ -37,18 +61,16 @@ def _triton_fused_store_flashmla_kernel(
     page = loc // PAGE_SIZE
     slot = loc % PAGE_SIZE
 
-    if tile_id == 7:
-        # copy rope part (last 64 dims)
+    if tile_id == ROPE_TILE_ID:
         rope_lane = tl.arange(0, TILE_SIZE)
-        rope_vals = tl.load(input_ptr + token_id * 512 + 448 + rope_lane)
+        rope_vals = tl.load(input_ptr + token_id * HEAD_DIM + NOPE_DIM + rope_lane)
         rope_bf16_offset = (
-            page * BYTES_PER_PAGE_BF16 + slot * 288 + 224 + rope_lane
+            page * BYTES_PER_PAGE_BF16 + slot * BF16_SLOT_ELEMS + BF16_ROPE_OFFSET + rope_lane
         )
         tl.store(cache_bf16_ptr + rope_bf16_offset, rope_vals)
     else:
-        # do nope quantization (tile_id < 7)
         tile_lane = tl.arange(0, TILE_SIZE)
-        x_bf16 = tl.load(input_ptr + token_id * 512 + tile_id * TILE_SIZE + tile_lane)
+        x_bf16 = tl.load(input_ptr + token_id * HEAD_DIM + tile_id * TILE_SIZE + tile_lane)
         x_fp32 = x_bf16.to(tl.float32)
 
         abs_max = tl.max(tl.abs(x_fp32))
@@ -64,12 +86,12 @@ def _triton_fused_store_flashmla_kernel(
         )
 
         nope_offset = (
-            page * BYTES_PER_PAGE + slot * 576 + tile_id * TILE_SIZE + tile_lane
+            page * BYTES_PER_PAGE + slot * SLOT_BYTES + tile_id * TILE_SIZE + tile_lane
         )
         tl.store(cache_fp8_ptr + nope_offset, x_fp8)
 
-        ue8m0 = (ceil_log2.to(tl.int32) + 127).to(tl.uint8)
-        scale_offset = page * BYTES_PER_PAGE + S_OFFSET + slot * 8 + tile_id
+        ue8m0 = (ceil_log2.to(tl.int32) + UE8M0_BIAS).to(tl.uint8)
+        scale_offset = page * BYTES_PER_PAGE + S_OFFSET + slot * SCALES_PER_TOKEN + tile_id
         tl.store(cache_u8_ptr + scale_offset, ue8m0)
 
 
@@ -89,8 +111,7 @@ def triton_fused_store_flashmla(
     cache_bf16 = cache.view(torch.bfloat16)
     indices_i32 = indices.to(torch.int32) if indices.dtype != torch.int32 else indices
 
-    # additional block (tile_id == 7) to handle rope copy
-    _triton_fused_store_flashmla_kernel[(N, 8)](
+    _triton_fused_store_flashmla_kernel[(N, _MLA_NUM_TILES)](
         input,
         cache_fp8,
         cache_bf16,
@@ -100,8 +121,16 @@ def triton_fused_store_flashmla(
         PAGE_SIZE=page_size,
         BYTES_PER_PAGE=bytes_per_page,
         BYTES_PER_PAGE_BF16=bytes_per_page // 2,
-        S_OFFSET=page_size * 576,
-        TILE_SIZE=64,
+        S_OFFSET=page_size * _MLA_SLOT_BYTES,
+        TILE_SIZE=_MLA_TILE_SIZE,
+        HEAD_DIM=_MLA_HEAD_DIM,
+        NOPE_DIM=_MLA_NOPE_DIM,
+        SLOT_BYTES=_MLA_SLOT_BYTES,
+        BF16_SLOT_ELEMS=_MLA_BF16_SLOT_ELEMS,
+        BF16_ROPE_OFFSET=_MLA_BF16_ROPE_OFFSET,
+        SCALES_PER_TOKEN=_MLA_SCALES_PER_TOKEN,
+        ROPE_TILE_ID=_MLA_ROPE_TILE_ID,
+        UE8M0_BIAS=_UE8M0_EXPONENT_BIAS,
         FP8_MIN=_FP8_INFO.min,
         FP8_MAX=_FP8_INFO.max,
         EPS=1e-8,
@@ -119,6 +148,7 @@ def _triton_fused_store_indexer_kernel(
     BYTES_PER_PAGE: tl.constexpr,
     BYTES_PER_PAGE_F32: tl.constexpr,
     SCALE_PAGE_OFFSET_F32: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
     EPS: tl.constexpr,
@@ -131,8 +161,8 @@ def _triton_fused_store_indexer_kernel(
     page = loc // PAGE_SIZE
     slot = loc % PAGE_SIZE
 
-    lane = tl.arange(0, 128)
-    x_fp32 = tl.load(input_ptr + token_id * 128 + lane).to(tl.float32)
+    lane = tl.arange(0, HEAD_DIM)
+    x_fp32 = tl.load(input_ptr + token_id * HEAD_DIM + lane).to(tl.float32)
 
     abs_max = tl.max(tl.abs(x_fp32))
     scale = tl.maximum(abs_max, EPS) / FP8_MAX
@@ -142,7 +172,7 @@ def _triton_fused_store_indexer_kernel(
         cache_fp8_ptr.dtype.element_ty
     )
 
-    fp8_offset = page * BYTES_PER_PAGE + slot * 128 + lane
+    fp8_offset = page * BYTES_PER_PAGE + slot * HEAD_DIM + lane
     tl.store(cache_fp8_ptr + fp8_offset, x_fp8)
 
     f32_offset = page * BYTES_PER_PAGE_F32 + SCALE_PAGE_OFFSET_F32 + slot
@@ -162,7 +192,7 @@ def triton_fused_store_indexer(
 
     bytes_per_page = cache.shape[1]
     bytes_per_page_f32 = bytes_per_page // 4
-    scale_page_offset_f32 = (128 * page_size) // 4
+    scale_page_offset_f32 = (_INDEXER_HEAD_DIM * page_size) // 4
 
     cache_fp8 = cache.view(_FP8_DTYPE)
     cache_f32 = cache.view(torch.float32)
@@ -178,6 +208,7 @@ def triton_fused_store_indexer(
         BYTES_PER_PAGE=bytes_per_page,
         BYTES_PER_PAGE_F32=bytes_per_page_f32,
         SCALE_PAGE_OFFSET_F32=scale_page_offset_f32,
+        HEAD_DIM=_INDEXER_HEAD_DIM,
         FP8_MIN=_FP8_INFO.min,
         FP8_MAX=_FP8_INFO.max,
         EPS=1e-8,
