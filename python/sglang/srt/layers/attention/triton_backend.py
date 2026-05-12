@@ -7,13 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_npu
-
-if not is_npu():
-    from sgl_kernel.utils import is_arch_support_pdl
-else:
-    is_arch_support_pdl = lambda: False
-
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -34,6 +27,8 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
+else:
+    is_arch_support_pdl = lambda: False
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
