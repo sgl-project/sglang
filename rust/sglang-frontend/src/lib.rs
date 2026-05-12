@@ -262,7 +262,7 @@ impl EngineConfig {
 // ──────────────────────────── pymodule ──────────────────────────────────────
 
 #[pymodule]
-mod sglang_detokenizer {
+mod sglang_frontend {
     use pyo3::prelude::*;
     use crate::{engine, http_server};
 

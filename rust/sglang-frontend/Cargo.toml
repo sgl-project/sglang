@@ -1,11 +1,11 @@
 [package]
-name = "sglang-detokenizer"
+name = "sglang-frontend"
 version = "0.1.0"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
-name = "sglang_detokenizer"
+name = "sglang_frontend"
 crate-type = ["cdylib"]
 
 [dependencies]

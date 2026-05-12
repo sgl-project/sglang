@@ -2637,6 +2637,39 @@ def launch_server(
     )
 
 
+def _wait_for_ipc_socket(ipc_addr: str, timeout: float = 30.0) -> None:
+    """Block until the ipc:// socket file exists, confirming the Rust engine has bound it."""
+    import time
+
+    # ipc://path/to/file  →  path/to/file
+    path = ipc_addr.removeprefix("ipc://")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(path):
+            return
+        time.sleep(0.05)
+    raise TimeoutError(
+        f"Rust engine did not bind {ipc_addr} within {timeout}s"
+    )
+
+
+def _run_rust_engine(config_kwargs: dict) -> None:
+    """Subprocess entry point: build EngineConfig and start the Rust engine.
+
+    Must be a module-level function so it is picklable by the 'spawn' context.
+    """
+    try:
+        from setproctitle import setproctitle
+
+        setproctitle("sglang::frontend")
+    except ImportError:
+        pass
+
+    from sglang_frontend import EngineConfig, start_engine
+
+    start_engine(EngineConfig(**config_kwargs))
+
+
 def launch_rust_server(
     server_args: ServerArgs,
     run_scheduler_process_func: Callable = run_scheduler_process,
@@ -2644,32 +2677,25 @@ def launch_rust_server(
     """Launch the SRT server using the Rust engine for HTTP/TM/Detokenizer.
 
     Startup order (solves ZMQ bind/connect sequencing):
-      1. Rust engine starts in a background thread — binds all ZMQ sockets
+      1. Rust engine starts in a subprocess — binds all ZMQ sockets
          (scheduler_input_ipc_name, tokenizer_ipc_name, detokenizer_ipc_name)
          within the first few milliseconds of the tokio runtime starting.
       2. Scheduler subprocess starts — connects to already-bound sockets,
          then loads model weights.
-      3. SIGINT/SIGTERM kills the scheduler subprocess tree and exits.
+      3. SIGINT/SIGTERM terminates the engine subprocess, kills the scheduler
+         subprocess tree, and exits.
 
-    This function blocks until the Rust HTTP server shuts down.
+    This function blocks until the Rust engine subprocess exits.
     """
+    import multiprocessing
     import signal
-    import threading
     import time
     import sys
-
-    try:
-        from sglang_detokenizer import EngineConfig, start_engine
-    except ImportError as exc:
-        raise ImportError(
-            "sglang_detokenizer Rust extension is not installed. "
-            "Build it with `maturin develop` inside rust/sglang-detokenizer."
-        ) from exc
 
     port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
 
-    config = EngineConfig(
+    config_kwargs = dict(
         detokenizer_ipc_name=port_args.detokenizer_ipc_name,
         tokenizer_ipc_name=port_args.tokenizer_ipc_name,
         scheduler_ipc_name=port_args.scheduler_input_ipc_name,
@@ -2682,15 +2708,16 @@ def launch_rust_server(
         tool_call_parser=server_args.tool_call_parser or "",
     )
 
-    # 1. Start Rust engine in a background thread. start_engine releases the
-    #    GIL (py.allow_threads) so the main thread can continue immediately.
-    #    The tokio runtime binds all ZMQ sockets synchronously at startup.
-    engine_thread = threading.Thread(target=start_engine, args=(config,), daemon=True)
-    engine_thread.start()
+    # 1. Start Rust engine in a subprocess. Use 'spawn' so the child gets a
+    #    clean Python interpreter — 'fork' is unsafe after PyO3 extensions load.
+    ctx = multiprocessing.get_context("spawn")
+    engine_proc = ctx.Process(target=_run_rust_engine, args=(config_kwargs,), daemon=True)
+    engine_proc.start()
 
-    # Wait for ZMQ sockets to bind. Binding happens in the first few ms of
-    # tokio startup; 500 ms is a generous upper bound.
-    time.sleep(0.5)
+    # Wait until the scheduler input socket is reachable, confirming that the
+    # Rust tokio runtime has bound all ZMQ sockets. Probe with a PUSH socket
+    # (connect is non-blocking on ipc://) and check for a bound ipc file.
+    _wait_for_ipc_socket(port_args.scheduler_input_ipc_name, timeout=30.0)
 
     # 2. Start scheduler — sockets are already bound so connects succeed immediately.
     port_args, _scheduler_init_result, _subprocess_watchdog = (
@@ -2708,14 +2735,14 @@ def launch_rust_server(
         port_args.scheduler_input_ipc_name,
     )
 
-    # 3. On Ctrl-C or SIGTERM kill the scheduler subprocess tree then exit.
-    atexit.register(kill_process_tree, os.getpid(), include_parent=False)
-
+    # 3. On Ctrl-C or SIGTERM: stop engine subprocess, kill scheduler tree, exit.
     def _on_exit(signum, frame):
+        engine_proc.terminate()
         kill_process_tree(os.getpid(), include_parent=False)
         sys.exit(0)
 
+    atexit.register(_on_exit, None, None)
     signal.signal(signal.SIGINT, _on_exit)
     signal.signal(signal.SIGTERM, _on_exit)
 
-    engine_thread.join()
+    engine_proc.join()

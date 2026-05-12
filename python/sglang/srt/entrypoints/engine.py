@@ -796,7 +796,7 @@ class Engine(EngineScoreMixin, EngineBase):
     ) -> Tuple[PortArgs, SchedulerInitResult, "SubprocessWatchdog"]:
         """Launch scheduler subprocesses and wait until the model is ready.
 
-        Used when the Rust engine (``sglang_detokenizer.start_engine``) handles
+        Used when the Rust engine (``sglang_frontend.start_engine``) handles
         HTTP serving, TokenizerManager, and Detokenizer — the only pieces that
         need Python/CUDA are the scheduler processes launched here.
 

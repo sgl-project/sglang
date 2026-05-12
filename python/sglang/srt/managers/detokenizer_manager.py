@@ -54,14 +54,6 @@ from sglang.utils import (
     get_exception_traceback,
 )
 
-try:
-    from sglang_detokenizer.sglang_detokenizer import DetokenizerConfig, start_detokenizer
-except ImportError:
-    # This is to prevent import error when the detokenizer_manager.py is imported in other contexts (e.g., for testing) without the sglang_detokenizer dependency.
-    # The actual DetokenizerConfig and start function will be imported and used in the run_detokenizer_process function, which is the only place that needs them.
-    start_detokenizer = None
-    DetokenizerConfig = None
-
 
 logger = logging.getLogger(__name__)
 
@@ -434,25 +426,11 @@ def run_detokenizer_process(
 
     manager = None
     try:
-        # If SGLANG_RUST_DETOKENIZER and SGLANG_IPC_USE_MSGPACK both enabled, try to start the Rust-based detokenizer.
-        # Otherwise, start the Python-based DetokenizerManager.
-        if envs.SGLANG_RUST_DETOKENIZER.get() and envs.SGLANG_IPC_USE_MSGPACK.get() and start_detokenizer is not None:
-            config = DetokenizerConfig(
-                detokenizer_ipc_name=port_args.detokenizer_ipc_name,
-                tokenizer_ipc_name=port_args.tokenizer_ipc_name,
-                tokenizer_path=server_args.tokenizer_path,
-                skip_tokenizer_init=server_args.skip_tokenizer_init,
-                max_states=DETOKENIZER_MAX_STATES,
-                disable_tokenizer_batch_decode=server_args.disable_tokenizer_batch_decode,
-                tool_call_parser='' if server_args.tool_call_parser is None else server_args.tool_call_parser,
-            )
-            start_detokenizer(config)
+        manager = detokenizer_manager_class(server_args, port_args)
+        if server_args.tokenizer_worker_num == 1:
+            manager.event_loop()
         else:
-            manager = detokenizer_manager_class(server_args, port_args)
-            if server_args.tokenizer_worker_num == 1:
-                manager.event_loop()
-            else:
-                manager.multi_http_worker_event_loop()
+            manager.multi_http_worker_event_loop()
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")

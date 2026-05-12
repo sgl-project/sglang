@@ -3,7 +3,7 @@ requires = ["maturin>=1.13,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "sglang-detokenizer"
+name = "sglang-frontend"
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Rust",
