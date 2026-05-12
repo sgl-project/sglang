@@ -1108,7 +1108,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dtype=accept_lens.dtype,
                 device=accept_lens.device,
             )
-            accept_steps = accept_lens - 1
+            last_correct_step_indices = accept_lens - 1
 
             if batch.mamba_track_indices is not None:
                 # If after verify, the request's seq_lens has crossed a mamba track interval,
@@ -1143,7 +1143,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 mamba_steps_to_track = None
 
             self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                accept_steps=accept_steps,
+                last_correct_step_indices=last_correct_step_indices,
                 mamba_track_indices=batch.mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=self.target_worker.model_runner.model,
