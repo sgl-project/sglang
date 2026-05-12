@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import os
 from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import fused_rope, rmsnorm_self
@@ -15,35 +16,22 @@ from sglang.srt.configs.deepseek_v4 import (
     DeepSeekV4Config,
     set_fp4_experts,
 )
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.attention.dsv4.compressor import (
-    Compressor,
-    rms_normalize_triton,
-)
+from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
     can_nsa_cp_split,
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_round_robin_split,
     nsa_use_prefill_cp,
-    prepare_input_dp_with_cp_dsa,
 )
-from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
-from sglang.srt.layers.deepseek_v4_rope import (
-    apply_rotary_emb_triton,
-)
+from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
+    attn_tp_all_gather,
     dp_gather_partial,
     dp_scatter,
     get_attention_cp_rank,
@@ -63,9 +51,16 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_runner import (
+    compile_in_capture_mode,
     get_is_capture_mode,
 )
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
@@ -80,27 +75,26 @@ if not _is_hip:
 
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
-    BumpAllocator,
     LazyValue,
     add_prefix,
     log_info_on_rank0,
     make_layers,
-    maybe_torch_compile,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
-from sglang.srt.environ import envs
-
-MOE_BIT_WISE_EQUAL_MODE = False
-ATTN_BIT_WISE_EQUAL_MODE = False
-COMPRESSOR_BIT_WISE_EQUAL_MODE = False
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        DeepseekV4AttnBackend,
+    )
     from sglang.srt.layers.attention.deepseek_v4_backend_hip import DeepseekV4Backend
+    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+        DeepseekV4HipRadixBackend,
+    )
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import (
         ForwardBatch,
@@ -108,12 +102,55 @@ if TYPE_CHECKING:
     )
 
 
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    import math
+@triton.jit
+def _rms_normalize_kernel(
+    x_ptr,
+    weight_ptr,
+    eps,
+    stride_row,
+    dim,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+):
+    pid = tl.program_id(0)
 
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < dim
+
+    base = pid * stride_row
+    x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+
+    mean_sq = tl.sum(x * x, axis=0) / dim
+    rms_inv = tl.rsqrt(mean_sq + eps)
+    out = x * rms_inv
+
+    if HAS_WEIGHT:
+        weight = tl.load(weight_ptr + offs, mask=mask, other=0.0)
+        out = out * weight
+
+    tl.store(x_ptr + base + offs, out, mask=mask)
+
+
+def rms_normalize_triton(
+    x: torch.Tensor, eps: float, weight: torch.Tensor = None
+) -> torch.Tensor:
+    dim = x.shape[-1]
+    x_flat = x.view(-1, dim)
+    num_rows = x_flat.shape[0]
+
+    BLOCK_SIZE = triton.next_power_of_2(dim)
+    grid = (num_rows,)
+
+    _rms_normalize_kernel[grid](
+        x_flat,
+        weight,
+        eps,
+        x_flat.stride(0),
+        dim,
+        BLOCK_SIZE=BLOCK_SIZE,
+        HAS_WEIGHT=(weight is not None),
+    )
+    return x
 
 
 class MQALayer(nn.Module):
@@ -131,18 +168,13 @@ class MQALayer(nn.Module):
         self.tp_size = attn_tp_size = get_attention_tp_size()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = (
-                get_attention_tp_size() if _is_hip else get_attention_cp_size()
-            )
+            self.cp_size = get_attention_cp_size()
             self.tp_rank = attn_tp_rank = 0
             self.tp_size = attn_tp_size = 1
         self.layer_id = layer_id
         self.dim = config.hidden_size
         self.qk_rope_head_dim = config.qk_rope_head_dim
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            self.qk_nope_head_dim = config.head_dim - config.qk_rope_head_dim
-        else:
-            self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_nope_head_dim = config.head_dim - config.qk_rope_head_dim
         self.head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
         self.n_heads = config.num_attention_heads
         self.n_local_heads = self.n_heads // attn_tp_size
@@ -160,36 +192,10 @@ class MQALayer(nn.Module):
             else config.compress_ratios[layer_id]
         )
         assert compress_ratio in [0, 4, 128]
-        self.compress_ratio: Literal[0, 4, 128] = compress_ratio  # type: ignore
+        self.compress_ratio: Literal[0, 4, 128] = compress_ratio
 
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            assert self.head_dim == config.head_dim
-        else:
-            assert self.head_dim == config.v_head_dim
+        assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
-
-        # need a indexer for compress ratio = 4
-        rope_scaling = config.rope_scaling
-        if rope_scaling:
-            rope_scaling["rope_type"] = "deepseek_yarn"
-
-        # Please keep this assertion and not remove it
-        # NOTE:
-        # 1. 2601
-        #    The `260119-updated` code changed compress_rope_theta
-        # 2. 2604
-        #    `official_code_0409/code/config.json` is 160000
-        #    while `official_code_0409/config.json` is 40000
-        #    maybe the latter is buggy? b/c dpsk's official generate.py uses `code/config.json`
-        expected_compress_rope_theta = os.environ.get(
-            "SGLANG_HACK_ASSERT_COMPRESS_ROPE_THETA"
-        )
-        if expected_compress_rope_theta is None:
-            expected_compress_rope_theta = "160000"
-        expected_compress_rope_theta = int(expected_compress_rope_theta)
-        assert (
-            config.compress_rope_theta == expected_compress_rope_theta
-        ), f"{config.compress_rope_theta=} {expected_compress_rope_theta=}"
 
         rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling:
@@ -207,27 +213,14 @@ class MQALayer(nn.Module):
             device=get_global_server_args().device,
         )
 
-        # naive impl: copy from reference code
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            assert rope_scaling["factor"] == 16
-        elif envs.SGLANG_DSV4_MODE.get() == "2601":
-            assert rope_scaling["factor"] == 4
-        else:
-            raise NotImplementedError
-
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            assert self.compress_ratio in {0, 4, 128}
-            if self.compress_ratio:
-                original_seq_len = rope_scaling["original_max_position_embeddings"]
-                assert original_seq_len == 65536
-            else:
-                original_seq_len = 0
-        else:
+        assert self.compress_ratio in {0, 4, 128}
+        if self.compress_ratio:
             original_seq_len = rope_scaling["original_max_position_embeddings"]
+        else:
+            original_seq_len = 0
 
-        rope_scaling = config.rope_scaling
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
             seqlen=config.max_position_embeddings,
@@ -241,10 +234,8 @@ class MQALayer(nn.Module):
         self.freqs_cis: torch.Tensor
 
         if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() and alt_streams is not None:
-            self.alt_streams = alt_streams[:3]  # use first 3 streams for mqa layer
-            self.alt_streams_indexer = alt_streams[
-                -2:
-            ]  # use last 2 streams for indexer
+            self.alt_streams = alt_streams[:3]
+            self.alt_streams_indexer = alt_streams[-2:]
         else:
             self.alt_streams = None
             self.alt_streams_indexer = None
@@ -278,9 +269,7 @@ class MQALayer(nn.Module):
                     rotary_emb=getattr(self, "rotary_emb", None),
                 )
 
-        # Note: attention sink should be replicated
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-
         self.fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
@@ -298,6 +287,13 @@ class MQALayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("wq_a", prefix),
             )
+            self.wkv = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wkv", prefix),
+            )
         self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
@@ -308,14 +304,6 @@ class MQALayer(nn.Module):
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
         )
-        if not self.fuse_wqa_wkv:
-            self.wkv = ReplicatedLinear(
-                self.hidden_size,
-                self.head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("wkv", prefix),
-            )
         self.kv_norm = RMSNorm(self.head_dim, eps=self.eps)
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
@@ -328,7 +316,6 @@ class MQALayer(nn.Module):
             **({} if _FP8_WO_A_GEMM else {"params_dtype": torch.bfloat16}),
         )
         if _FP8_WO_A_GEMM:
-            # fp8_einsum handles scale transform internally — skip UE8M0 conversion
             assert hasattr(
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
@@ -374,7 +361,6 @@ class MQALayer(nn.Module):
         self,
         q: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
@@ -382,7 +368,6 @@ class MQALayer(nn.Module):
             q = rmsnorm_self(q, self.eps)
         else:
             q = rms_normalize_triton(q, self.eps)
-
         if positions is not None:
             fused_rope(
                 q[..., -self.qk_rope_head_dim :],
@@ -398,14 +383,12 @@ class MQALayer(nn.Module):
         self,
         x: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[torch.Tensor] = None,
         qkv_a: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
-        # [bs, head_dim]
         kv = self.kv_norm(kv)
         if positions is not None:
             fused_rope(
@@ -423,8 +406,7 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: DeepseekV4Backend,
-        freqs_cis: Optional[torch.Tensor] = None,
+        attn_backend,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert self.alt_streams is not None
@@ -461,7 +443,7 @@ class MQALayer(nn.Module):
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
-            kv = self._compute_kv(x, positions, freqs_cis, qkv_a=qkv_a)
+            kv = self._compute_kv(x, positions, qkv_a=qkv_a)
             if self.overlap_store_cache:
                 attn_backend.store_cache(
                     layer_id=self.layer_id,
@@ -477,7 +459,7 @@ class MQALayer(nn.Module):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_lora, positions, freqs_cis)
+        q = self._compute_q_b(q_lora, positions)
         if q_out is not None:
             q_out.copy_(q)
 
@@ -493,7 +475,6 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend,
-        freqs_cis: Optional[torch.Tensor] = None,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.fuse_wqa_wkv:
@@ -502,8 +483,8 @@ class MQALayer(nn.Module):
             kv = qkv_a[..., self.q_lora_rank :]
             del qkv_a
         else:
+            kv, _ = self.wkv(x)
             q, _ = self.wq_a(x)
-            kv = None
         q = self.q_norm(q)
         q_lora = q
         q, _ = self.wq_b(q)
@@ -513,9 +494,6 @@ class MQALayer(nn.Module):
         else:
             q = rms_normalize_triton(q, self.eps)
 
-        if kv is None:
-            kv, _ = self.wkv(x)
-        # [bs, head_dim]
         kv = self.kv_norm(kv)
 
         fused_rope(
@@ -574,7 +552,6 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        debug_return_kv: bool = False,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             assert (
@@ -584,9 +561,10 @@ class MQALayer(nn.Module):
 
         attn_backend = forward_batch.attn_backend
         if TYPE_CHECKING:
-            assert isinstance(attn_backend, DeepseekV4Backend)
-
-        freqs_cis = None
+            assert isinstance(
+                attn_backend,
+                (DeepseekV4AttnBackend, DeepseekV4Backend, DeepseekV4HipRadixBackend),
+            )
 
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
@@ -598,7 +576,6 @@ class MQALayer(nn.Module):
 
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.tp_size > 1:
-            # pad the q to [batch_size, n_heads]
             q_padded = x.new_empty(x.shape[0], self.n_heads, self.head_dim)
             rank = self.tp_rank
             tp_slice = slice(rank * self.n_local_heads, (rank + 1) * self.n_local_heads)
@@ -606,14 +583,13 @@ class MQALayer(nn.Module):
 
         if enable_multi_stream:
             q, kv = self._forward_prepare_multi_stream(
-                x, positions, forward_batch, attn_backend, freqs_cis, q_out
+                x, positions, forward_batch, attn_backend, q_out
             )
         else:
             q, kv = self._forward_prepare(
-                x, positions, forward_batch, attn_backend, freqs_cis, q_out
+                x, positions, forward_batch, attn_backend, q_out
             )
 
-        # for TP attention, use the padded q, since q_out is set to the correct slice
         o = attn_backend.forward(
             q=q_padded if q_padded is not None else q,
             k=kv,
@@ -624,7 +600,6 @@ class MQALayer(nn.Module):
             attn_sink=self.attn_sink,
             save_kv_cache=not self.overlap_store_cache,
         )
-        # NOTE: no-op for pure DP-attention
         o = o[:, tp_slice, :]
         fused_rope(
             o[..., -self.qk_rope_head_dim :],
@@ -679,7 +654,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
-        self.is_nextn = is_nextn
         self.self_attn = MQALayer(
             config=config,
             layer_id=layer_id,
@@ -688,18 +662,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
-        self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
-        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
-        # TODO: check whether the implementation matches
-        # TODO: make necessary changes if possible
         self.mlp = deepseek_v2.DeepseekV2MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
@@ -714,15 +676,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        # self.layer_communicator = LayerCommunicator(
-        #     layer_scatter_modes=self.layer_scatter_modes,
-        #     input_layernorm=self.input_layernorm,
-        #     post_attention_layernorm=self.post_attention_layernorm,
-        #     allow_reduce_scatter=True,
-        #     is_last_layer=(
-        #         is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-        #     ),
-        # )
 
         self.hc_mult = hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
@@ -737,19 +690,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.rms_norm_eps = config.rms_norm_eps
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-
-    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            first_k_dense_replace = 0
-            moe_layer_freq = 1
-        else:
-            first_k_dense_replace = self.config.first_k_dense_replace
-            moe_layer_freq = self.config.moe_layer_freq
-        return is_nextn or (
-            self.config.n_routed_experts is not None
-            and layer_id >= first_k_dense_replace
-            and layer_id % moe_layer_freq == 0
-        )
 
     def hc_pre(
         self,
@@ -771,10 +711,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
             return x_flat, mixes
 
-        # x: [n,hc,d] -> y: [n,d], where n=b*s
         shape, dtype = x.size(), x.dtype
 
-        # Handle empty batch
         if x.shape[0] == 0:
             y = torch.empty((0, shape[-1]), dtype=dtype, device=x.device)
             post = torch.empty((0, self.hc_mult), dtype=dtype, device=x.device)
@@ -803,7 +741,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
                 **norm_kwargs,
             )
-            # returned post should be [n, hc_mult]
             return y, post.squeeze(-1), comb, norm is not None
 
         if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
@@ -820,11 +757,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hc_post_mult_value=2.0,
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
             )
-            # returned post should be [n, hc_mult]
             return y, post.squeeze(-1), comb, False
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-            # DeepGEMM implementation
             import deep_gemm
 
             x_flat = x.flatten(1).bfloat16()
@@ -833,14 +768,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             mix_hc = hc_fn.size(0)
             d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
             s_out = torch.empty((m,), dtype=torch.float, device=x.device)
-            # TODO: maybe remove the contiguity requirement?
             deep_gemm.tf32_hc_prenorm_gemm(
                 x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
             )
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
-            # Naive Torch implementation
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
         from sglang.srt.layers.mhc import hc_split_sinkhorn
@@ -864,10 +797,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         comb: torch.Tensor,
     ):
 
-        # x: [n,d], residual: [n,hc,d] -> y: [n,hc,d]
-        # post: [n,hc], comb: [n,hc,hc]
-
-        # Handle empty batch
         if x.shape[0] == 0:
             return torch.empty(
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
@@ -876,30 +805,27 @@ class DeepseekV4DecoderLayer(nn.Module):
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.srt.layers.mhc import mhc_post
 
-            result = mhc_post(x, residual, post, comb)
-            return result
+            return mhc_post(x, residual, post, comb)
 
         elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
             from aiter.ops.mhc import mhc_post
 
             result = torch.empty_like(residual)
             mhc_post(result, x, residual, post, comb)
-
             return result
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
         assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
 
-        @maybe_torch_compile
+        @compile_in_capture_mode
         def hc_post_torch_impl(x, residual, post, comb):
             return (
                 post.unsqueeze(-1) * x.unsqueeze(1)
                 + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
             ).type_as(x)
 
-        result = hc_post_torch_impl(x, residual, post, comb)
-        return result
+        return hc_post_torch_impl(x, residual, post, comb)
 
     def forward(
         self,
@@ -909,9 +835,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            pass
-
         residual = hidden_states
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
@@ -941,73 +864,53 @@ class DeepseekV4DecoderLayer(nn.Module):
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # Communication logic (equivalent to LayerCommunicator):
-        #
-        # ======================== i. TP MoE ========================
-        # DP attn + TP moe (moe_a2a_backend=none):
-        # * mlp_mode = FULL (each-rank-has-whole-world-tokens)
-        # * prepare_mlp -> _gather_hidden_states_and_residual -> dp_gather_partial
-        # * postprocess_layer -> _scatter_hidden_states -> dp_scatter
-        # Need Gather before MoE and Scatter after MoE.
-        #
-        # ======================== ii. DeepEP MoE ========================
-        # DP attn + DeepEP moe (moe_a2a_backend=deepep/flashinfer/etc):
-        # * mlp_mode = SCATTERED (each-rank-only-has-this-rank-tokens)
-        # * prepare_mlp -> _simple (just layernorm, no gather)
-        # * postprocess_layer -> _trivial (no scatter)
-        # Because attn_tp_size==1 when tp==dp==ep, SCATTERED and TP_ATTN_FULL
-        # have the same group_size. Token dispatch/combine is handled by
-        # DeepEP inside MoE forward. No Gather/Scatter around MoE.
         _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
             not _use_cp
             and get_attention_dp_size() > 1
             and get_moe_a2a_backend().is_none()
         )
-        # ----------------------------------- CP: fix input_ids to LOCAL ----------------
+        _use_tp_attn_a2a_scatter = (
+            not _use_cp
+            and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
+            and get_attention_tp_size() > 1
+            and not get_moe_a2a_backend().is_none()
+        )
         if _use_cp:
-            # CP requires DeepEP — TP MoE's all-reduce assumes identical tokens
-            # across ranks, which CP violates. (Analogous to NSACPLayerCommunicator's
-            # assert mlp_mode==SCATTERED when dp_size>1.)
             assert get_moe_a2a_backend().is_deepep(), (
                 "CP requires DeepEP (moe_a2a_backend == deepep). "
                 "Only DeepEP is tested with CP's per-rank token split."
             )
-            # DeepEP handles cross-rank MoE dispatch/combine internally.
-            # No gather/scatter needed — tokens stay LOCAL (SCATTERED).
-            # This matches DSV3.2's mlp_mode=SCATTERED behavior with DeepEP + CP.
-            #
-            # Hash gating (n_hash_layers=3) needs input_ids[i] to correspond to
-            # hidden_states[i]. hidden_states is LOCAL [N/cp_size] (round-robin).
-            # input_ids is ORIGINAL [N] on every rank (never CP-split).
-            # Slice to LOCAL to match hidden_states.
-            cp_rank = get_attention_tp_rank()
-            cp_size = get_attention_tp_size()
+            cp_rank = get_attention_cp_rank()
+            cp_size = get_attention_cp_size()
             input_ids = input_ids[cp_rank::cp_size].contiguous()
-            # TODO: improve the name - it is indeed local in CP, but is only used by e.g. Hash gating
             input_ids_global = input_ids
-        # ----------------------------------- DP: gather for TP MoE --------------------
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = get_global_dp_buffer(), hidden_states
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-        # ----------------------------------- MoE ------------------------------------
+        _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
+        if _use_tp_attn_a2a_scatter:
+            s, r = get_attention_tp_size(), get_attention_tp_rank()
+            _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
+            hidden_states = _a2a_scatter_chunks[r].contiguous()
+            input_ids = input_ids.tensor_split(s)[r].contiguous()
+            input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
         hidden_states = self.mlp(
             hidden_states,
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
-        # ----------------------------------- Scatter (DP only, not CP) ----------------
         if _use_tp_moe_gather:
             hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
+        if _use_tp_attn_a2a_scatter:
+            assert _a2a_scatter_chunks is not None
+            gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
+            attn_tp_all_gather(gathered, hidden_states.contiguous())
+            hidden_states = torch.cat(gathered)
 
-        hidden_states = self.hc_post(
-            hidden_states, residual, post, comb
-        )  # [n, d] -> [n, hc, d]
-
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            deepseek_v4_moe_code_path_checker.observed = 0
+        hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states
 
@@ -1022,10 +925,7 @@ class DeepseekV4Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.padding_id = config.pad_token_id
-        self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        self.first_k_dense_replace = config.first_k_dense_replace
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -1033,7 +933,7 @@ class DeepseekV4Model(nn.Module):
         )
         self.rms_norm_eps = config.rms_norm_eps
         self.alt_streams = (
-            [torch.cuda.Stream() for _ in range(5)] if (_is_cuda) else None
+            [torch.cuda.Stream() for _ in range(5)] if (_is_cuda or _is_hip) else None
         )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -1050,12 +950,6 @@ class DeepseekV4Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gemm_output_zero_allocator_size = 0
-        self.layers_to_capture = []
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            self.enable_a2a_moe = True
-        else:
-            self.enable_a2a_moe = False
-
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
@@ -1068,7 +962,7 @@ class DeepseekV4Model(nn.Module):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
 
     def hc_head(
         self,
@@ -1096,35 +990,13 @@ class DeepseekV4Model(nn.Module):
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
 
-    # TODO
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
-        pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> torch.Tensor:
-        total_num_layers = self.end_layer - self.start_layer
-        device = input_embeds.device if input_embeds is not None else input_ids.device
-        zero_allocator = BumpAllocator(
-            buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
-            dtype=torch.float32,
-            device=device,
-        )
-        has_gemm_output_zero_allocator = hasattr(
-            self, "gemm_output_zero_allocator_size"
-        )
-        gemm_output_zero_allocator = (
-            BumpAllocator(
-                buffer_size=self.gemm_output_zero_allocator_size,
-                dtype=torch.float32,
-                device=device,
-            )
-            if has_gemm_output_zero_allocator
-            and self.gemm_output_zero_allocator_size > 0
-            else None
-        )
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
@@ -1143,13 +1015,7 @@ class DeepseekV4Model(nn.Module):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
-        # Reset Compressor's per-step freqs_cis cache from any previous step.
-        for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
-            if hasattr(forward_batch, _attr):
-                delattr(forward_batch, _attr)
-
         for i in range(self.start_layer, self.end_layer):
-            # TODO: ctx?
             layer = self.layers[i]
             hidden_states = layer(
                 positions=positions,
@@ -1157,8 +1023,6 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
-                # zero_allocator,
-                # gemm_output_zero_allocator,
             )
 
         if nsa_use_prefill_cp(forward_batch):
@@ -1169,21 +1033,14 @@ class DeepseekV4Model(nn.Module):
                 torch.cuda.current_stream(),
             )
 
-        pre_hc_head = (
-            hidden_states.flatten(1)
-            if envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
-            else None
-        )
+        pre_hc_head = hidden_states.flatten(1)
 
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         hidden_states = self.norm(hidden_states)
 
-        if pre_hc_head is not None:
-            return hidden_states, pre_hc_head
-        return hidden_states
+        return hidden_states, pre_hc_head
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -1215,7 +1072,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
-        # TODO: is this true that compress is kind of NSA
         get_attn_tp_context().init_context(config.q_lora_rank, is_nsa=True)
 
         self._routed_experts_weights_of_layer = LazyValue(
@@ -1228,12 +1084,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            if _is_hip:
-                self.cp_rank = get_attention_tp_rank()
-                self.cp_size = get_attention_tp_size()
-            else:
-                self.cp_rank = get_attention_cp_rank()
-                self.cp_size = get_attention_cp_size()
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -1244,41 +1096,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         if get_global_server_args().disable_shared_experts_fusion:
             return
 
-        # Only Deepseek V3/R1 can use shared experts fusion optimization now.
-        disable_reason = None
-        if self.config.n_routed_experts != 256 or self.config.n_shared_experts != 1:
-            disable_reason = "Config not support fused shared expert(s)."
-        elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
-            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
-        ):
-            disable_reason = (
-                "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
-                "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
-            )
-        elif get_moe_expert_parallel_world_size() > 1 and (
-            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
-        ):
-            disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
-        elif disable_reason is None and get_moe_a2a_backend().is_deepep():
-            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
-        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
-            disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
-        elif getattr(self.config, "expert_dtype", None) == "fp4":
-            disable_reason = "Routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
-
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            disable_reason = "2604B checkpoint requires different clamping for shared and routed experts"
-
-        if disable_reason is not None:
-            get_global_server_args().disable_shared_experts_fusion = True
-            self.num_fused_shared_experts = 0
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
+        get_global_server_args().disable_shared_experts_fusion = True
+        log_info_on_rank0(
+            logger,
+            "DeepSeek V4 requires different clamping for shared and routed experts. "
+            "Shared experts fusion optimization is disabled.",
+        )
 
     @torch.no_grad()
     def forward(
@@ -1289,56 +1112,40 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-
         if self.nsa_enable_prefill_cp:
-            if _is_hip:
-                if can_cp_split(len(input_ids), self.cp_size, True, forward_batch):
-                    forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
-                        len(input_ids),
-                        self.cp_rank,
-                        self.cp_size,
-                        forward_batch.seq_lens_cpu.tolist(),
-                    )
-            else:
-                if can_nsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
-                    forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                        len(input_ids),
-                        self.cp_rank,
-                        self.cp_size,
-                        forward_batch.seq_lens_cpu.tolist(),
-                    )
-                    if is_nsa_prefill_cp_round_robin_split():
-                        metadata = forward_batch.attn_backend.forward_metadata
-                        core_meta = metadata.core_attn_metadata
-                        core_meta.apply_cp_reindex()
-                        core_meta.init_flashmla_related()
-                        if metadata.indexer_metadata is not None:
-                            metadata.indexer_metadata = forward_batch.attn_backend.init_forward_metadata_indexer(
+            if can_nsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
+                if is_nsa_prefill_cp_round_robin_split():
+                    metadata = forward_batch.attn_backend.forward_metadata
+                    core_meta = metadata.core_attn_metadata
+                    core_meta.apply_cp_reindex()
+                    core_meta.init_flashmla_related()
+                    if metadata.indexer_metadata is not None:
+                        metadata.indexer_metadata = (
+                            forward_batch.attn_backend.init_forward_metadata_indexer(
                                 core_meta
                             )
+                        )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
-                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+                input_ids, positions, forward_batch, input_embeds
             )
         aux_hidden_states = None
-        pre_hc_head = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
-        if (
-            envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
-        ):
-            hidden_states, pre_hc_head = hidden_states
+        hidden_states, pre_hc_head = hidden_states
         return self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
             forward_batch,
             aux_hidden_states,
-            # TODO: indeed ours is "hidden_states_before_hc_head" instead of "before norm"
-            #       abuse the existing field temporarily to minimize code diff
-            #       should rename and generalize later, e.g. "hidden_states_for_spec"
             hidden_states_before_norm=pre_hc_head,
         )
 
@@ -1352,8 +1159,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             R = attn.o_lora_rank
             D = attn.wo_a.weight.shape[1]
 
-            # Pre-transform weight scale to DeepGEMM required layout (TMA-aligned / UE8M0 packed)
-            # fp8_einsum('bhr,hdr->bhd') maps B=[h,d,r]=[G,R,D], so N=R, K=D for the B-side scale
             raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
             attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
                 raw_scale,
@@ -1368,7 +1173,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         if _FP8_WO_A_GEMM:
             self._setup_fp8_wo_a_scales(is_nextn)
 
-        # ================ apply_ape_hotfix, should not be needed for final ckpt ================
         if is_nextn:
             return
         for layer in self.model.layers:
@@ -1381,7 +1185,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
 
-    # This is used externally, please try to keep the API mostly unchanged
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
         name: str, is_nextn: bool = False, num_hidden_layers: Optional[int] = None
@@ -1430,35 +1233,20 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
-        if not ATTN_BIT_WISE_EQUAL_MODE:
-            if "self_attn" in name and (
-                "compressor" not in name or not COMPRESSOR_BIT_WISE_EQUAL_MODE
-            ):
-                name = name.replace(".scale", ".weight_scale_inv")
+        if "self_attn" in name:
+            name = name.replace(".scale", ".weight_scale_inv")
 
-        if not MOE_BIT_WISE_EQUAL_MODE:
-            name = name.replace(".gate.tid2eid", ".topk.tid2eid")
-            name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
-            name = name.replace(".w1.", ".gate_proj.")
-            name = name.replace(".w2.", ".down_proj.")
-            name = name.replace(".w3.", ".up_proj.")
-            if "mlp" in name:
-                name = name.replace(".scale", ".weight_scale_inv")
+        name = name.replace(".gate.tid2eid", ".topk.tid2eid")
+        name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
+        name = name.replace(".w1.", ".gate_proj.")
+        name = name.replace(".w2.", ".down_proj.")
+        name = name.replace(".w3.", ".up_proj.")
+        if "mlp" in name:
+            name = name.replace(".scale", ".weight_scale_inv")
 
         return name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        assert envs.SGLANG_DSV4_MODE.get() in ["2601", "2604"]
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            assert envs.SGLANG_DSV4_2604_SUBMODE.get() in ["2604A", "2604B"]
-        else:
-            assert envs.SGLANG_DSV4_2604_SUBMODE.get() == ""
-
-        if MOE_BIT_WISE_EQUAL_MODE:
-            assert (
-                self.num_fused_shared_experts == 0
-            ), "use --disable-shared-experts-fusion for MoE bit-wise equal mode"
-
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -1466,7 +1254,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
-                # compatible with old design
                 nextn_layer_id = (
                     0
                     if self.config.num_hidden_layers == 1
@@ -1475,52 +1262,38 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        # Ignore this, b/c it is for nvfp4 ckpt
-        # weights = self._maybe_quant_weights_to_fp8_ue8m0(
-        #     weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, is_nextn
-        # )
-
-        if (
-            envs.SGLANG_DSV4_MODE.get() == "2604"
-            and not envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
-        ):
-            if getattr(self.config, "expert_dtype", None) == "fp4":
+        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+            weights = list(weights)
+            exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
+            if exists_wo_a_scale:
+                logger.info("Execute dequant fp8 wo_a")
                 weights = _dequant_fp8_wo_a(weights)
             else:
-                # Converted FP8 checkpoint: wo_a is already bf16; drop stale wo_a.scale if present
-                weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
+                logger.info("Skip dequant fp8 wo_a")
 
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
-        # Params for special naming rules in mixed-precision models, for example:
-        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
-        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
 
         if self.quant_config and self.quant_config.get_name() == "w4afp8":
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
 
-        # fuse compressor wkv and wgate weights into wkv_gate
         cache_compressor_weight = {}
-        COMPRESSOR_PART = ".compressor.w"  # match wkv and wgate, skip ape
+        COMPRESSOR_PART = ".compressor.w"
 
         fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
-        # use default weight loader if module has no custom weight_loader
         def auto_weight_loader(module):
             return getattr(module, "weight_loader", default_weight_loader)
 
@@ -1530,7 +1303,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "shared_head.norm",
                 "shared_head.head",
                 "embed_tokens",
-                ".e_proj",  # Note that we need a . here to avoid confusion with gate_proj
+                ".e_proj",
                 "h_proj",
                 "enorm",
                 "hnorm",
@@ -1550,7 +1323,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                 try:
                     use_async_loading = should_async_load(loaded_weight)
 
-                    # remap reference's temp ckpt weight -> deepseek hf format
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
                         is_nextn=is_nextn,
@@ -1593,48 +1365,35 @@ class DeepseekV4ForCausalLM(nn.Module):
                             if name.startswith("mtp"):
                                 continue
                     else:
-                        # Use shared head and embed weights from target model
                         if "shared_head.head" in name or "embed_tokens" in name:
                             continue
 
-                        # Skip target model weights
                         if not name.startswith(nextn_layer_prefix):
                             continue
 
                         in_decoder = True
-                        # For nextn specific weights (out of layer)
-                        # The nextn layer prefix of these weights has been removed
                         for weight_name in nextn_spec_weight_names_out_of_layer:
                             if weight_name in name:
                                 in_decoder = False
                                 name = name.replace(nextn_layer_prefix, "model")
                                 break
 
-                        # For decoder layer weights
                         if in_decoder:
                             name = name.replace(nextn_layer_prefix, "model.decoder")
 
                     if "rotary_emb.inv_freq" in name:
                         continue
                     for param_name, weight_name, shard_id in stacked_params_mapping:
-                        # Skip non-stacked layers and experts (experts handled below).
                         if weight_name not in name:
                             continue
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
-                        # We have mlp.experts[0].gate_proj in the checkpoint.
-                        # Since we handle the experts below in expert_params_mapping,
-                        # we need to skip here BEFORE we update the name, otherwise
-                        # name will be updated to mlp.experts[0].gate_up_proj, which
-                        # will then be updated below in expert_params_mapping
-                        # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                         if ("mlp.experts." in name) and name not in params_dict:
                             continue
                         name = name.replace(weight_name, param_name)
-                        # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
-                        if name not in params_dict and name.startswith("mtp"):  # TODO
+                        if name not in params_dict and name.startswith("mtp"):
                             break
                         param = params_dict[name]
                         weight_loader = param.weight_loader
@@ -1649,8 +1408,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                         break
                     else:
                         for mapping in expert_params_mapping:
-                            if MOE_BIT_WISE_EQUAL_MODE:
-                                continue
                             param_name, weight_name, expert_id, shard_id = mapping
                             if weight_name not in name:
                                 continue
@@ -1679,22 +1436,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                             loaded_params.add(name)
                             break
                         else:
-                            # Skip loading extra bias for GPTQ models.
                             if name.endswith(".bias") and name not in params_dict:
                                 continue
-                            # Skip loading embed_tokens if not first rank in pipeline parallelism
                             if (
                                 ".embed_tokens." in name
                                 and not self.pp_group.is_first_rank
                             ):
                                 continue
-                            # Skip loading norm if not last rank in pipeline parallelism
                             if ".norm." in name and not self.pp_group.is_last_rank:
                                 continue
                             elif COMPRESSOR_PART in name:
                                 is_kv = name.endswith(".wkv.weight")
                                 is_wgate = name.endswith(".wgate.weight")
-                                assert is_kv != is_wgate  # exactly one is true
+                                assert is_kv != is_wgate
                                 key = name.rsplit(".", 2)[0]
                                 assert key.endswith(".compressor")
                                 if key not in cache_compressor_weight:
@@ -1758,7 +1512,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 if (
                                     "k_scale" in name or "v_scale" in name
                                 ) and name not in params_dict:
-                                    # modelopt attn kv scale is named differently
                                     for scale in ["k_scale", "v_scale"]:
                                         if scale in name:
                                             name = name.replace(
@@ -1766,24 +1519,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                                             )
                                             break
                                 if name not in params_dict:
-                                    # modelopt ckpt contains not needed weights for MTP module:
-                                    # model.decoder.self_attn.attn_mqa.v_scale and
-                                    # model.decoder.self_attn.attn_mqa.k_scale
-                                    if not name.startswith("mtp"):  # TODO: mtp
+                                    if not name.startswith("mtp"):
                                         logger.warning(
                                             f"{name} not found in params_dict."
                                         )
                                     continue
                                 param = params_dict[name]
-
-                                # if "attn_sink" in name:
-                                #     attn_tp_rank = get_attention_tp_rank()
-                                #     start = attn_tp_rank * param.numel()
-                                #     param.data.copy_(
-                                #         loaded_weight[start : start + param.numel()]
-                                #     )
-                                #     loaded_params.add(name)
-                                #     continue
 
                                 weight_loader = auto_weight_loader(param)
                                 maybe_executor_submit(
@@ -1798,7 +1539,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                     e.add_note(f"{name=} {loaded_weight.shape=}")
                     raise
 
-            # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
@@ -1812,17 +1552,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         unloaded_params = {
             p
             for p in unloaded_params
-            # hack to skip checking these in default ckpt. should have more rigorous check.
             if all(
                 skipped_checking_pattern not in p
                 for skipped_checking_pattern in skipped_checking_patterns
             )
         }
-        if os.environ.get("SGLANG_SKIP_CHECKPOINT_LOAD_CHECK", "0") == "0":
-            if unloaded_params:
-                raise RuntimeError(
-                    f"Some weights are not initialized from checkpoints: {unloaded_params}"
-                )
+        if unloaded_params:
+            logger.warning(
+                f"Some weights are not initialized from checkpoints: {unloaded_params}"
+            )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
@@ -1850,28 +1588,15 @@ EntryClass = [DeepseekV4ForCausalLM]
 
 
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Dequant fp8 block-quantized wo_a weight: bf16 = fp8_weight * e8m0_scale.
-
-    The weight and scale use 128x128 block quantization:
-      weight: [N, K] fp8_e4m3fn   (N and K must be divisible by 128)
-      scale:  [N//128, K//128]    fp8_e8m0fnu  (per 128x128 block)
-    """
     from einops import rearrange
 
     assert (
         weight.dtype == torch.float8_e4m3fn
     ), f"expected fp8_e4m3fn, got {weight.dtype}"
-    assert (
-        scale.dtype == torch.float8_e8m0fnu
-    ), f"expected fp8_e8m0fnu, got {scale.dtype}"
-    N, K = weight.shape
-    assert (
-        N % 128 == 0 and K % 128 == 0
-    ), f"weight dims must be divisible by 128, got {weight.shape}"
-    assert scale.shape == (
-        N // 128,
-        K // 128,
-    ), f"scale shape {scale.shape} doesn't match weight shape {weight.shape}"
+    assert scale.dtype in (
+        torch.float8_e8m0fnu,
+        torch.float32,
+    ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
 
     weight_f32 = rearrange(
         weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=128, bk=128
@@ -1886,30 +1611,17 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 def _dequant_fp8_wo_a(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
-    """Dequant fp8 wo_a weights inline: pair (wo_a.scale, wo_a.weight) -> bf16 wo_a.weight.
+    weights_dict = dict(weights)
 
-    Streaming version: buffers only wo_a.scale tensors (tiny) until the
-    corresponding wo_a.weight arrives.  All other weights pass through
-    immediately so we never materialise the full checkpoint in memory.
-    """
-    pending_scales: dict[str, torch.Tensor] = {}
-
-    for name, tensor in weights:
-        if name.endswith(".wo_a.scale"):
-            pending_scales[name] = tensor
+    for name in list(weights_dict.keys()):
+        if name not in weights_dict:
             continue
-
-        if name.endswith(".wo_a.weight") and tensor.dtype == torch.float8_e4m3fn:
-            scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
-            assert scale_name in pending_scales, (
-                f"wo_a.scale must appear before wo_a.weight in checkpoint, "
-                f"missing {scale_name}"
-            )
-            scale = pending_scales.pop(scale_name)
-            yield name, _dequant_fp8(tensor, scale)
+        if not name.endswith(".wo_a.weight"):
             continue
+        scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
+        assert scale_name in weights_dict
+        weight = weights_dict.pop(name)
+        scale = weights_dict.pop(scale_name)
+        yield name, _dequant_fp8(weight, scale)
 
-        yield name, tensor
-
-    for scale_name, scale_tensor in pending_scales.items():
-        yield scale_name, scale_tensor
+    yield from weights_dict.items()
