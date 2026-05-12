@@ -222,14 +222,16 @@ class KimiK2Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text)
 
         normal_text = ""
-        if self.current_tool_id == -1 and has_tool_call:
-            # Now there are some text in the buffer that needs to be extracted as normal test.
-            toolcall_indice = current_text.find(self.bot_token)
-            if toolcall_indice == -1:
-                toolcall_indice = current_text.find(self.tool_call_start_token)
-            if toolcall_indice > 0:
-                normal_text = _strip_special_tokens(current_text[:toolcall_indice])
-                self._buffer = current_text[toolcall_indice:]
+        if self.current_tool_id == -1:
+            # Now there is some text in the buffer that needs to be extracted as normal text.
+            # bot_token always precedes tool_call_start_token in valid output;
+            # fall back to start_token only when bot_token is absent.
+            toolcall_index = current_text.find(self.bot_token)
+            if toolcall_index == -1:
+                toolcall_index = current_text.find(self.tool_call_start_token)
+            if toolcall_index > 0:
+                normal_text = _strip_special_tokens(current_text[:toolcall_index])
+                self._buffer = current_text[toolcall_index:]
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
