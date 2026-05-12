@@ -387,11 +387,11 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            if self._engine_paused:
-                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -420,11 +420,11 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            if self._engine_paused:
-                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -504,6 +504,11 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            forced_output_id = req.pd_rebootstrap_forced_output_id
+            if forced_output_id is not None:
+                next_token_id = forced_output_id
+                req.pd_rebootstrap_forced_output_id = None
+
             if req.is_chunked <= 0:
                 req.time_stats.set_prefill_finished_time()
 
