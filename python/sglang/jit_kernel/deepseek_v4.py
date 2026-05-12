@@ -963,7 +963,7 @@ def fused_store_cache(
     indices: torch.Tensor,
     *,
     page_size: int,
-    type: Literal["flashmla", "indexer"],
+    type: str,
 ) -> None:
     module = _jit_fused_store_module(
         name=type,
@@ -1108,6 +1108,18 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return _dispatch_bf16_fp32_backend(x, y, algo=algo)
 
 
+@register_custom_op(mutates_args=["cache"])
+def fused_store_cache_pcg_op(
+    input: torch.Tensor,
+    cache: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    page_size: int,
+    type: Literal["flashmla", "indexer"],
+) -> None:
+    fused_store_cache(input, cache, indices, page_size=page_size, type=type)
+
+
 @register_custom_op(mutates_args=["kv"])
 def fused_norm_rope_inplace_pcg_op(
     kv: torch.Tensor,
@@ -1139,6 +1151,22 @@ def fused_q_norm_rope_pcg_op(
     positions: torch.Tensor,
 ) -> None:
     fused_q_norm_rope(q_input, q_output, eps, freqs_cis, positions)
+
+
+@register_custom_op(mutates_args=["kvcache"])
+def fused_k_norm_rope_flashmla_pcg_op(
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+) -> None:
+    fused_k_norm_rope_flashmla(
+        kv, kv_weight, eps, freqs_cis, positions, out_loc, kvcache, page_size
+    )
 
 
 def _fused_q_indexer_rope_hadamard_quant_fake(
