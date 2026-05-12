@@ -1156,7 +1156,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if not write_back and (
             node.parent is not self.root_node and not node.parent.backuped
         ):
-            return 0
+            if self.write_backup(node.parent) <= 0:
+                return 0
 
         # Build aux transfers, keyed per component
         comp_xfers: dict[ComponentType, list] = {}
