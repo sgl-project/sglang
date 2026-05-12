@@ -40,6 +40,10 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
+# Blockwise quantization group sizes: number of elements sharing one scale factor
+FP8_BLOCK_SIZE = 128
+MXFP4_BLOCK_SIZE = 32
+
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -248,14 +252,14 @@ def init_mori_op(
     scale_type_size = torch.float32.itemsize
 
     if dispatch_dtype == DispatchDtype.fp8:
-        scale_dim = hidden_size // 128
+        scale_dim = hidden_size // FP8_BLOCK_SIZE
     elif dispatch_dtype == DispatchDtype.fp4:
         # FP4 kernel still takes the original hidden size and do quantization
         # internally, so hidden_dim is not reduced. The reason is that for FP4
         # quantization, we need to keep the original hidden size to calculate
         # the quantization scale correctly. Don't use packed hidden size for FP4 kernel.
         hidden_dim = hidden_size
-        scale_dim = hidden_size // 32
+        scale_dim = hidden_size // MXFP4_BLOCK_SIZE
         data_type = torch.float4_e2m1fn_x2
         scale_type_size = torch.float8_e8m0fnu.itemsize
 
@@ -545,7 +549,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
                 )
                 scale = torch.empty(
-                    (0, self.hidden_size // 128),
+                    (0, self.hidden_size // FP8_BLOCK_SIZE),
                     dtype=torch.float32,
                     device=hidden_states.device,
                 )
@@ -561,7 +565,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     device=hidden_states.device,
                 )
                 scale = torch.empty(
-                    (0, self.hidden_size // 32),
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
                     dtype=torch.float8_e8m0fnu,
                     device=hidden_states.device,
                 )
@@ -801,7 +805,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
                     hidden_states.shape, dtype=fp8_dtype, device=hidden_states.device
                 )
                 scale = torch.empty(
-                    (0, self.hidden_size // 128),
+                    (0, self.hidden_size // FP8_BLOCK_SIZE),
                     dtype=torch.float32,
                     device=hidden_states.device,
                 )
@@ -817,7 +821,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
                     device=hidden_states.device,
                 )
                 scale = torch.empty(
-                    (0, self.hidden_size // 32),
+                    (0, self.hidden_size // MXFP4_BLOCK_SIZE),
                     dtype=torch.float8_e8m0fnu,
                     device=hidden_states.device,
                 )
