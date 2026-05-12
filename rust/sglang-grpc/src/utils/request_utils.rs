@@ -76,15 +76,17 @@ pub(crate) fn now_timestamp() -> f64 {
 }
 
 pub(crate) fn extract_model_path(json_info: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(json_info)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("model_path")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-        })
-        .unwrap_or_default()
+    match serde_json::from_str::<serde_json::Value>(json_info) {
+        Ok(value) => value
+            .get("model_path")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .unwrap_or_default(),
+        Err(err) => {
+            tracing::warn!("Failed to parse model info JSON: {}", err);
+            String::new()
+        }
+    }
 }
 
 /// Build a request dict for GenerateReqInput from proto TextGenerateRequest fields.

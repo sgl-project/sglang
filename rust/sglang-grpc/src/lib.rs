@@ -1,7 +1,7 @@
 pub mod bridge;
 pub mod server;
 pub mod tokenizers;
-pub mod utils;
+pub(crate) mod utils;
 
 pub mod proto {
     tonic::include_proto!("sglang.runtime.v1");
@@ -56,7 +56,7 @@ fn extract_tokenizer_info(runtime_handle: &PyObject) -> PyResult<TokenizerInfo> 
         let tm = runtime_handle
             .getattr(py, "tokenizer_manager")
             .map_err(|err| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                pyo3::exceptions::PyValueError::new_err(format!(
                     "runtime_handle.tokenizer_manager is required: {}",
                     err
                 ))
@@ -184,9 +184,9 @@ fn start_server(
         )
         .try_init();
 
-    let addr: SocketAddr = format!("{}:{}", host, port).parse().map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid address: {}", e))
-    })?;
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid address: {}", e)))?;
     let worker_threads = worker_threads.max(1);
     let response_channel_capacity = if response_channel_capacity == 0 {
         tracing::warn!(
@@ -208,13 +208,13 @@ fn start_server(
     };
     let response_timeout = Duration::from_secs(response_timeout_secs);
     let listener = TcpListener::bind(addr).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
             "Failed to bind gRPC server to {}: {}",
             addr, e
         ))
     })?;
     listener.set_nonblocking(true).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
             "Failed to configure gRPC listener for {}: {}",
             addr, e
         ))
@@ -236,7 +236,7 @@ fn start_server(
         .thread_name("sglang-grpc-tokio")
         .build()
         .map_err(|err| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "Failed to build Tokio runtime for gRPC server: {}",
                 err
             ))
@@ -267,10 +267,7 @@ fn start_server(
             }
         })
         .map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to spawn gRPC thread: {}",
-                e
-            ))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to spawn gRPC thread: {}", e))
         })?;
 
     Ok(GrpcServerHandle {

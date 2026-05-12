@@ -17,7 +17,6 @@ use crate::utils::{
 
 pub struct SglangServiceImpl {
     pub bridge: Arc<PyBridge>,
-    pub shutdown: Arc<Notify>,
     pub response_timeout: Duration,
 }
 
@@ -133,18 +132,22 @@ async fn recv_terminal_chunk_for_request(
 
 fn closed_stream_status(bridge: &Arc<PyBridge>, rid: &str) -> (Status, bool) {
     if let Some(error) = bridge.take_terminal_error(rid) {
-        let message = error.message();
-        match error {
-            TerminalError::ChannelFull { .. } => (Status::resource_exhausted(message), false),
-            TerminalError::ClientDisconnected { .. } | TerminalError::Aborted { .. } => {
-                (Status::cancelled(message), false)
-            }
-        }
+        (terminal_error_status(error), false)
     } else {
         (
             Status::internal("gRPC response stream closed before a terminal response"),
             true,
         )
+    }
+}
+
+fn terminal_error_status(error: TerminalError) -> Status {
+    let message = error.message();
+    match error {
+        TerminalError::ChannelFull { .. } => Status::resource_exhausted(message),
+        TerminalError::ClientDisconnected { .. } | TerminalError::Aborted { .. } => {
+            Status::cancelled(message)
+        }
     }
 }
 
@@ -512,10 +515,13 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         _request: Request<proto::HealthCheckRequest>,
     ) -> Result<Response<proto::HealthCheckResponse>, Status> {
-        let healthy = self
-            .bridge
-            .health_check()
-            .map_err(|e| Status::internal(format!("Health check failed: {}", e)))?;
+        let healthy = tokio::task::spawn_blocking({
+            let bridge = self.bridge.clone();
+            move || bridge.health_check()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Status::internal(format!("Health check failed: {}", e)))?;
 
         Ok(Response::new(proto::HealthCheckResponse { healthy }))
     }
@@ -524,10 +530,13 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         _request: Request<proto::GetModelInfoRequest>,
     ) -> Result<Response<proto::GetModelInfoResponse>, Status> {
-        let json_info = self
-            .bridge
-            .get_model_info()
-            .map_err(|e| Status::internal(format!("Failed to get model info: {}", e)))?;
+        let json_info = tokio::task::spawn_blocking({
+            let bridge = self.bridge.clone();
+            move || bridge.get_model_info()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Status::internal(format!("Failed to get model info: {}", e)))?;
 
         Ok(Response::new(proto::GetModelInfoResponse {
             model_path: extract_model_path(&json_info),
@@ -539,10 +548,13 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         _request: Request<proto::GetServerInfoRequest>,
     ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
-        let json_info = self
-            .bridge
-            .get_server_info()
-            .map_err(|e| Status::internal(format!("Failed to get server info: {}", e)))?;
+        let json_info = tokio::task::spawn_blocking({
+            let bridge = self.bridge.clone();
+            move || bridge.get_server_info()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Task join error: {}", e)))?
+        .map_err(|e| Status::internal(format!("Failed to get server info: {}", e)))?;
 
         Ok(Response::new(proto::GetServerInfoResponse { json_info }))
     }
@@ -599,6 +611,11 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         request: Request<proto::AbortRequest>,
     ) -> Result<Response<proto::AbortResponse>, Status> {
         let req = request.into_inner();
+        if req.abort_all {
+            tracing::warn!(
+                "Received abort_all over gRPC; this endpoint must only be exposed to trusted clients"
+            );
+        }
         self.bridge
             .abort(&req.rid, req.abort_all)
             .map_err(|e| Status::internal(format!("Failed to abort: {}", e)))?;
@@ -921,7 +938,6 @@ pub async fn run_grpc_server(
     let listener = tokio::net::TcpListener::from_std(listener)?;
     let service = SglangServiceImpl {
         bridge,
-        shutdown: shutdown.clone(),
         response_timeout,
     };
 
@@ -941,21 +957,4 @@ pub async fn run_grpc_server(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::openai_status_code;
-    use std::collections::HashMap;
-
-    #[test]
-    fn openai_status_code_uses_forwarded_status_when_present() {
-        let meta_info = HashMap::from([(String::from("status_code"), String::from("429"))]);
-        assert_eq!(openai_status_code(&meta_info, 200), 429);
-    }
-
-    #[test]
-    fn openai_status_code_falls_back_when_missing_or_invalid() {
-        assert_eq!(openai_status_code(&HashMap::new(), 200), 200);
-
-        let meta_info = HashMap::from([(String::from("status_code"), String::from("not-an-int"))]);
-        assert_eq!(openai_status_code(&meta_info, 200), 200);
-    }
-}
+mod tests;

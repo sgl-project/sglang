@@ -471,6 +471,32 @@ fn notify_ready(py: Python<'_>, rid: &str, callback: PyObject) {
     }
 }
 
+fn set_on_ready_for_rid(
+    py: Python<'_>,
+    rid: &str,
+    state: &BridgeStateRef,
+    on_ready: PyObject,
+) -> PyResult<()> {
+    let should_notify = {
+        let mut state = lock_or_recover(state.as_ref(), "state");
+        state
+            .ready_callbacks
+            .insert(rid.to_string(), on_ready.clone_ref(py));
+        state.ready_signals.remove(rid)
+    };
+    if should_notify {
+        on_ready.call0(py)?;
+    }
+    Ok(())
+}
+
+fn clear_on_ready_for_rid(rid: &str, state: &BridgeStateRef) {
+    // End notifications for this rid. Do not call set_on_ready again for the same rid.
+    let mut state = lock_or_recover(state.as_ref(), "state");
+    state.ready_callbacks.remove(rid);
+    state.ready_signals.remove(rid);
+}
+
 fn try_send_chunk(
     py: Python<'_>,
     rid: &str,
@@ -573,24 +599,11 @@ impl ChunkCallback {
     /// Register before producing chunks. If a parked chunk drained before registration,
     /// Rust fires `on_ready` immediately so late registration cannot miss the edge.
     fn set_on_ready(&self, py: Python<'_>, on_ready: PyObject) -> PyResult<()> {
-        let should_notify = {
-            let mut state = lock_or_recover(self.state.as_ref(), "state");
-            state
-                .ready_callbacks
-                .insert(self.rid.clone(), on_ready.clone_ref(py));
-            state.ready_signals.remove(&self.rid)
-        };
-        if should_notify {
-            on_ready.call0(py)?;
-        }
-        Ok(())
+        set_on_ready_for_rid(py, &self.rid, &self.state, on_ready)
     }
 
     fn clear_on_ready(&self) {
-        // End notifications for this rid. Do not call set_on_ready again for the same rid.
-        let mut state = lock_or_recover(self.state.as_ref(), "state");
-        state.ready_callbacks.remove(&self.rid);
-        state.ready_signals.remove(&self.rid);
+        clear_on_ready_for_rid(&self.rid, &self.state);
     }
 
     #[pyo3(signature = (chunk, finished=false, error=None))]
@@ -677,24 +690,11 @@ impl JsonChunkCallback {
     /// Register before producing chunks. If a parked chunk drained before registration,
     /// Rust fires `on_ready` immediately so late registration cannot miss the edge.
     fn set_on_ready(&self, py: Python<'_>, on_ready: PyObject) -> PyResult<()> {
-        let should_notify = {
-            let mut state = lock_or_recover(self.state.as_ref(), "state");
-            state
-                .ready_callbacks
-                .insert(self.rid.clone(), on_ready.clone_ref(py));
-            state.ready_signals.remove(&self.rid)
-        };
-        if should_notify {
-            on_ready.call0(py)?;
-        }
-        Ok(())
+        set_on_ready_for_rid(py, &self.rid, &self.state, on_ready)
     }
 
     fn clear_on_ready(&self) {
-        // End notifications for this rid. Do not call set_on_ready again for the same rid.
-        let mut state = lock_or_recover(self.state.as_ref(), "state");
-        state.ready_callbacks.remove(&self.rid);
-        state.ready_signals.remove(&self.rid);
+        clear_on_ready_for_rid(&self.rid, &self.state);
     }
 
     #[pyo3(signature = (chunk_bytes, finished=false, error=None, status_code=None))]
@@ -781,3 +781,6 @@ fn extract_meta_info(chunk: &Bound<'_, PyDict>) -> HashMap<String, String> {
     }
     meta
 }
+
+#[cfg(test)]
+mod tests;

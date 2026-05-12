@@ -55,6 +55,16 @@ pub(crate) fn py_value_to_json_string(value: &Bound<'_, PyAny>) -> PyResult<Stri
         .and_then(|json_str| json_str.extract::<String>())
     {
         Ok(s) => Ok(s),
-        Err(_) => value.str().map(|s| s.to_string()),
+        Err(_) => {
+            let fallback = value.str()?.to_string();
+            Ok(json_encode_string(&fallback))
+        }
     }
 }
+
+fn json_encode_string(value: &str) -> String {
+    serde_json::Value::String(value.to_string()).to_string()
+}
+
+#[cfg(test)]
+mod tests;
