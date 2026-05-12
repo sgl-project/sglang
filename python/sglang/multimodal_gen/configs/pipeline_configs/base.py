@@ -22,7 +22,7 @@ from sglang.multimodal_gen.configs.models import (
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
-from sglang.multimodal_gen.configs.pipeline_configs.model_deployment import (
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType

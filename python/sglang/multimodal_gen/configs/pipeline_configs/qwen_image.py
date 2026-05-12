@@ -19,7 +19,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.model_deployment import (
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (

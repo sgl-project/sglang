@@ -18,7 +18,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.model_deployment import (
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
