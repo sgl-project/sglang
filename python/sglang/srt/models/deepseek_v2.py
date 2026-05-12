@@ -28,7 +28,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.jit_kernel.deepseek_v4 import (
-    linear_bf16_fp32,
+    linear_bf16_fp32_pcg_op as linear_bf16_fp32,
     mega_moe_pre_dispatch,
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
