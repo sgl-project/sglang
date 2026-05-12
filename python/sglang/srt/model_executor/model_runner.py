@@ -770,7 +770,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     ),
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 )
-            self._pre_initialize_flashinfer_allreduce_workspace()
+            ModelRunner._pre_initialize_flashinfer_allreduce_workspace(
+                server_args=self.server_args,
+                model_config=self.model_config,
+                dtype=self.dtype,
+            )
             self.graph_runner, self.graph_mem_usage = (
                 device_graphs.create_device_graphs(self)
             )
@@ -1780,14 +1784,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
         return attn_backend_wrapper(self, full_attention_backend)
 
-    def _pre_initialize_flashinfer_allreduce_workspace(self):
+    @staticmethod
+    def _pre_initialize_flashinfer_allreduce_workspace(
+        *,
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        dtype: torch.dtype,
+    ):
         """Pre-initialize flashinfer allreduce fusion workspaces.
 
         Must run before CUDA graph capture to avoid collective operations
         (broadcasts, barriers) inside the graph capture context, which can
         deadlock with custom_all_reduce.register_graph_buffers.
         """
-        if not self.server_args.enable_flashinfer_allreduce_fusion:
+        if not server_args.enable_flashinfer_allreduce_fusion:
             return
 
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
@@ -1797,8 +1807,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         pre_initialize_workspaces(
             max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
-            hidden_dim=self.model_config.hidden_size,
-            dtype=self.dtype,
+            hidden_dim=model_config.hidden_size,
+            dtype=dtype,
         )
 
     def maybe_init_ngram_embedding(self):
