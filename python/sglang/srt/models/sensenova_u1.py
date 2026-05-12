@@ -8,6 +8,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    flash_attn_func = None
+
 from sglang.srt.configs.sensenova_u1 import SenseNovaU1Config
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
@@ -635,11 +640,6 @@ class NEOQwen3Attention(Qwen3Attention):
             self.attn.layer_id
         ).index_select(0, token_indices)
 
-        if self.num_heads != self.num_kv_heads:
-            kv_groups = self.num_heads // self.num_kv_heads
-            key_states = key_states.repeat_interleave(kv_groups, dim=1)
-            value_states = value_states.repeat_interleave(kv_groups, dim=1)
-
         attn_mask = None
         custom_mask = forward_batch.cross_attention_custom_mask
         if custom_mask is not None:
@@ -652,6 +652,22 @@ class NEOQwen3Attention(Qwen3Attention):
             attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
 
         # 2. materialize prefix+query K/V so full-query semantics match official U1
+        if flash_attn_func is not None and attn_mask is None:
+            attn_output = flash_attn_func(
+                q.unsqueeze(0),
+                key_states.unsqueeze(0),
+                value_states.unsqueeze(0),
+                dropout_p=0.0,
+                softmax_scale=self.scaling,
+                causal=False,
+            )
+            return attn_output.reshape(extend_num_tokens, self.q_size)
+
+        if self.num_heads != self.num_kv_heads:
+            kv_groups = self.num_heads // self.num_kv_heads
+            key_states = key_states.repeat_interleave(kv_groups, dim=1)
+            value_states = value_states.repeat_interleave(kv_groups, dim=1)
+
         attn_output = F.scaled_dot_product_attention(
             q.transpose(0, 1).unsqueeze(0),
             key_states.transpose(0, 1).unsqueeze(0),
