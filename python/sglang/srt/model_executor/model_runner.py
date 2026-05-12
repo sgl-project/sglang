@@ -2813,9 +2813,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             req_idx, exact_matched_len:prefix_len
         ]
 
-        rotary_emb, cos_sin_cache, is_neox_style, rotary_dim = (
-            self._fuzzy_get_rotary_emb()
-        )
+        rotary_emb, _, _, _ = self._fuzzy_get_rotary_emb()
         if rotary_emb is None:
             self.token_to_kv_pool_allocator.free(new_fuzzy_locs)
             logger.warning(
@@ -2834,28 +2832,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=device, dtype=torch.long,
         )
 
-        old_cos_sin = cos_sin_cache.index_select(0, old_positions)
-        new_cos_sin = cos_sin_cache.index_select(0, new_positions)
-        old_cos, old_sin = old_cos_sin.chunk(2, dim=-1)
-        new_cos, new_sin = new_cos_sin.chunk(2, dim=-1)
-
-        from sglang.srt.layers.rotary_embedding.utils import (
-            apply_rotary_emb,
-            reverse_rotary_emb,
+        from sglang.srt.mem_cache.fuzzy_match.rope_correction import (
+            copy_kv_with_rope_correction,
         )
 
-        for layer_id in range(pool.layer_num):
-            pool.v_buffer[layer_id][new_fuzzy_locs] = (
-                pool.v_buffer[layer_id][old_fuzzy_locs]
-            )
-            k = pool.k_buffer[layer_id][old_fuzzy_locs]
-            k_rot = k[..., :rotary_dim]
-            k_pass = k[..., rotary_dim:]
-            k_raw = reverse_rotary_emb(k_rot, old_cos, old_sin, is_neox_style)
-            k_new = apply_rotary_emb(k_raw, new_cos, new_sin, is_neox_style)
-            pool.k_buffer[layer_id][new_fuzzy_locs] = torch.cat(
-                (k_new, k_pass), dim=-1
-            )
+        copy_kv_with_rope_correction(
+            pool=pool,
+            rotary_emb=rotary_emb,
+            old_locs=old_fuzzy_locs,
+            new_locs=new_fuzzy_locs,
+            old_positions=old_positions,
+            new_positions=new_positions,
+        )
 
         # Point req_to_token_pool at the new recipient-owned slots.
         # The donor's slots remain protected by its TreeNode lock_ref.
@@ -2888,9 +2876,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        rotary_emb, cos_sin_cache, is_neox_style, rotary_dim = (
-            self._fuzzy_get_rotary_emb()
-        )
+        rotary_emb, _, _, _ = self._fuzzy_get_rotary_emb()
         if rotary_emb is None:
             self.token_to_kv_pool_allocator.free(realized_locs)
             logger.warning(
@@ -2899,9 +2885,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        from sglang.srt.layers.rotary_embedding.utils import (
-            apply_rotary_emb,
-            reverse_rotary_emb,
+        from sglang.srt.mem_cache.fuzzy_match.rope_correction import (
+            copy_kv_with_rope_correction,
         )
 
         req_idx = forward_batch.req_pool_indices[0].item()
@@ -2941,27 +2926,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if displaced.numel() > 0:
                 self.token_to_kv_pool_allocator.free(displaced)
 
-            old_cos_sin = cos_sin_cache.index_select(0, donor_positions)
-            new_cos_sin = cos_sin_cache.index_select(0, target_positions)
-            old_cos, old_sin = old_cos_sin.chunk(2, dim=-1)
-            new_cos, new_sin = new_cos_sin.chunk(2, dim=-1)
-
-            for layer_id in range(pool.layer_num):
-                pool.v_buffer[layer_id][new_locs] = (
-                    pool.v_buffer[layer_id][donor_locs]
-                )
-                k = pool.k_buffer[layer_id][donor_locs]
-                k_rot = k[..., :rotary_dim]
-                k_pass = k[..., rotary_dim:]
-                k_raw = reverse_rotary_emb(
-                    k_rot, old_cos, old_sin, is_neox_style
-                )
-                k_new = apply_rotary_emb(
-                    k_raw, new_cos, new_sin, is_neox_style
-                )
-                pool.k_buffer[layer_id][new_locs] = torch.cat(
-                    (k_new, k_pass), dim=-1
-                )
+            copy_kv_with_rope_correction(
+                pool=pool,
+                rotary_emb=rotary_emb,
+                old_locs=donor_locs,
+                new_locs=new_locs,
+                old_positions=donor_positions,
+                new_positions=target_positions,
+                layer_recompute_mask=seg.layer_recompute_mask,
+            )
 
             req_to_token[req_idx, target_positions] = new_locs.to(
                 req_to_token.dtype
@@ -3211,18 +3184,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        rotary_emb, cos_sin_cache, is_neox_style, rotary_dim = (
-            self._fuzzy_get_rotary_emb()
-        )
+        rotary_emb, _, _, _ = self._fuzzy_get_rotary_emb()
         if rotary_emb is None:
             logger.warning(
                 "[FUZZY] match_block: could not resolve rotary_emb; skipping block placement"
             )
             return
 
-        from sglang.srt.layers.rotary_embedding.utils import (
-            apply_rotary_emb,
-            reverse_rotary_emb,
+        from sglang.srt.mem_cache.fuzzy_match.rope_correction import (
+            as_long_tensor,
+            copy_kv_with_rope_correction,
         )
 
         device = pool.k_buffer[0].device
@@ -3236,36 +3207,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         new_positions = torch.arange(
             target_start, target_start + block_len, device=device, dtype=torch.long
         )
-        old_cos_sin = cos_sin_cache.index_select(0, old_positions)
-        new_cos_sin = cos_sin_cache.index_select(0, new_positions)
-        old_cos, old_sin = old_cos_sin.chunk(2, dim=-1)
-        new_cos, new_sin = new_cos_sin.chunk(2, dim=-1)
 
-        donor_kv_indices = block.donor_kv_indices
-        if not isinstance(donor_kv_indices, torch.Tensor):
-            donor_kv_indices = torch.as_tensor(
-                list(donor_kv_indices), device=device, dtype=torch.long
-            )
-        else:
-            donor_kv_indices = donor_kv_indices.to(device).to(torch.long)
+        donor_kv_indices = as_long_tensor(block.donor_kv_indices, device)
+        new_locs = as_long_tensor(realized_locs, device)
 
-        if not isinstance(realized_locs, torch.Tensor):
-            new_locs = torch.as_tensor(
-                list(realized_locs), device=device, dtype=torch.long
-            )
-        else:
-            new_locs = realized_locs.to(device).to(torch.long)
-
-        for layer_id in range(pool.layer_num):
-            pool.v_buffer[layer_id][new_locs] = pool.v_buffer[layer_id][
-                donor_kv_indices
-            ]
-            k = pool.k_buffer[layer_id][donor_kv_indices]
-            k_rot = k[..., :rotary_dim]
-            k_pass = k[..., rotary_dim:]
-            k_raw = reverse_rotary_emb(k_rot, old_cos, old_sin, is_neox_style)
-            k_new = apply_rotary_emb(k_raw, new_cos, new_sin, is_neox_style)
-            pool.k_buffer[layer_id][new_locs] = torch.cat((k_new, k_pass), dim=-1)
+        copy_kv_with_rope_correction(
+            pool=pool,
+            rotary_emb=rotary_emb,
+            old_locs=donor_kv_indices,
+            new_locs=new_locs,
+            old_positions=old_positions,
+            new_positions=new_positions,
+        )
 
         # Repoint req_to_token: attention in pass 2 reads K,V from these
         # slots for absolute positions [target_start..target_start+L-1].

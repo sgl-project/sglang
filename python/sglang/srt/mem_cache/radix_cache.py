@@ -842,17 +842,57 @@ class RadixCache(BasePrefixCache):
 
         key, value = self.maybe_bigram_convert(key, value)
 
-        prefix_len, last_node = self._insert_helper(
+        prefix_len = self._insert_helper(
             self.root_node, key, value, priority, chunked
         )
 
         # Register the root node (always registered)
         self._register_node(self.root_node)
 
+        # Resolve the deepest TreeNode for the just-inserted ``key`` via a
+        # side-effect-free tree walk. The id is surfaced as
+        # ``last_node_id`` so RadixCache.match_prefix's fuzzy path can
+        # ``inc_lock_ref`` the donor TreeNode at match time and prevent
+        # LRU eviction while a recipient request is consuming its KV.
+        # Computing this here (rather than threading it back through
+        # ``_insert_helper``'s return) preserves the helper's original
+        # int-return ABI so subclasses overriding ``_insert_helper`` are
+        # not forced to update their signature.
+        last_node = self._find_leaf_for_key(key)
+
         return InsertResult(
             prefix_len=prefix_len,
             last_node_id=last_node.id if last_node is not None else None,
         )
+
+    def _find_leaf_for_key(self, key: RadixKey) -> Optional[TreeNode]:
+        """Walk the radix tree from root following ``key`` and return the leaf.
+
+        Side-effect free: does not update access times, does not split
+        nodes, does not allocate. Assumes ``key`` was just successfully
+        inserted via ``_insert_helper`` so the path is expected to exist;
+        returns the deepest reachable node if the trie shape is
+        unexpected (e.g. a downstream subclass diverged from the base's
+        insert semantics).
+
+        Returns ``self.root_node`` when ``key`` is empty.
+        """
+        node = self.root_node
+        if len(key) == 0:
+            return node
+        child_key = self.get_child_key_fn(key)
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            prefix_len = self.key_match_fn(child.key, key)
+            node = child
+            key = key[prefix_len:]
+            if prefix_len < len(child.key):
+                # Partial match within child; insert would have split here
+                # and the leaf we want is this node.
+                break
+            if len(key) > 0:
+                child_key = self.get_child_key_fn(key)
+        return node
     
     def _register_node(self, node: TreeNode):
         """Register a TreeNode in the node registry for reference resolution by non_prefix_store."""
@@ -1195,7 +1235,16 @@ class RadixCache(BasePrefixCache):
         value,
         priority: int = 0,
         chunked: bool = False,
-    ):
+    ) -> int:
+        """Insert ``key``/``value`` into the radix tree rooted at ``node``.
+
+        Returns the total prefix length matched against existing nodes.
+        The deepest inserted/touched node is reachable via
+        ``_find_leaf_for_key(key)`` from ``insert()``; we deliberately do
+        NOT thread it back through the return value here so the helper's
+        original int-return ABI stays stable for subclasses that override
+        ``_insert_helper``.
+        """
         # Convert None priority to 0
         if priority is None:
             priority = 0
@@ -1204,7 +1253,7 @@ class RadixCache(BasePrefixCache):
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return 0, node
+            return 0
 
         child_key = self.get_child_key_fn(key)
 
@@ -1241,9 +1290,7 @@ class RadixCache(BasePrefixCache):
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
-            node = new_node
-        # Return the deepest node touched so callers can resolve a NodeRef.
-        return total_prefix_length, node
+        return total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
