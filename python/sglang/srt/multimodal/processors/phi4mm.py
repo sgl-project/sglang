@@ -88,17 +88,13 @@ class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
             audio_token_id=self.AUDIO_TOKEN_ID,
         ).build(self.processor)
 
-    def collect_mm_items_from_processor_output(
-        self, data_dict: dict, modality=None
-    ):
+    def collect_mm_items_from_processor_output(self, data_dict: dict, modality=None):
         # Normalise HF Phi-4 native keys to sglang-standard names before the
         # base implementation walks the dict; otherwise keys like
         # `input_image_embeds` aren't in `ATTR_NAME_TO_MODALITY` and the
         # IMAGE mm_item ends up without a `feature` set, blowing up at
         # `phi4mm.get_image_feature` with `expected Tensor ... got NoneType`.
-        renamed = {
-            _PHI4MM_HF_TO_SGLANG_KEYS.get(k, k): v for k, v in data_dict.items()
-        }
+        renamed = {_PHI4MM_HF_TO_SGLANG_KEYS.get(k, k): v for k, v in data_dict.items()}
         return super().collect_mm_items_from_processor_output(renamed, modality)
 
     async def process_mm_data_async(

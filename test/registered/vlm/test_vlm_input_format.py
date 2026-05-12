@@ -710,7 +710,6 @@ class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         return dict(processor_output, format="processor_output")
 
 
-
 class TestPhi4mmUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
     model_path = "microsoft/Phi-4-multimodal-instruct"
     chat_template = "phi-4-mm"
@@ -754,7 +753,6 @@ class TestPhi4mmUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
 
     def _processor_output_image_data(self, processor_output):
         return dict(processor_output, format="processor_output")
-
 
 
 if __name__ == "__main__":
