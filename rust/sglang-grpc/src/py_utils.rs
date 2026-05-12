@@ -50,6 +50,8 @@ pub(crate) fn py_value_to_json_string(value: &Bound<'_, PyAny>) -> PyResult<Stri
         return Ok(s);
     }
 
+    // gRPC meta_info is a map<string, string>. Prefer JSON for structured Python
+    // values, but keep a string fallback so non-serializable metadata still crosses.
     match value
         .py()
         .import("json")

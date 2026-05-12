@@ -8,11 +8,12 @@ pub mod proto {
 }
 
 use pyo3::prelude::*;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{SocketAddr, TcpListener};
+use std::sync::{Arc, mpsc};
 use tokio::sync::Notify;
+use tokio::time::Duration;
 
-use bridge::PyBridge;
+use bridge::{DEFAULT_RESPONSE_CHANNEL_CAPACITY, PyBridge};
 use tokenizers::RustTokenizer;
 
 /// Handle returned to Python that controls the running gRPC server.
@@ -34,9 +35,7 @@ impl GrpcServerHandle {
 
     /// Check if the server thread is still running.
     fn is_alive(&self) -> bool {
-        self.join_handle
-            .as_ref()
-            .map_or(false, |h| !h.is_finished())
+        self.join_handle.as_ref().is_some_and(|h| !h.is_finished())
     }
 }
 
@@ -51,7 +50,11 @@ fn extract_tokenizer_info(runtime_handle: &PyObject) -> TokenizerInfo {
     Python::with_gil(|py| {
         let tm = match runtime_handle.getattr(py, "tokenizer_manager") {
             Ok(tm) => tm,
-            Err(_) => {
+            Err(err) => {
+                tracing::warn!(
+                    "Runtime handle is missing tokenizer_manager; Rust tokenizer disabled: {}",
+                    err
+                );
                 return TokenizerInfo {
                     tokenizer_path: None,
                     tokenizer_mode: None,
@@ -71,6 +74,9 @@ fn extract_tokenizer_info(runtime_handle: &PyObject) -> TokenizerInfo {
                     .ok()
                     .and_then(|v| v.extract(py).ok())
             });
+        if tokenizer_path.is_none() {
+            tracing::warn!("Could not extract tokenizer path; Rust tokenizer disabled");
+        }
 
         let tokenizer_mode: Option<String> = server_args
             .as_ref()
@@ -82,7 +88,10 @@ fn extract_tokenizer_info(runtime_handle: &PyObject) -> TokenizerInfo {
             .ok()
             .and_then(|mc| mc.getattr(py, "context_len").ok())
             .and_then(|v| v.extract(py).ok())
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                tracing::warn!("Could not extract model_config.context_len; defaulting to 0");
+                0
+            });
 
         TokenizerInfo {
             tokenizer_path,
@@ -103,15 +112,49 @@ fn extract_tokenizer_info(runtime_handle: &PyObject) -> TokenizerInfo {
 ///     GrpcServerHandle that can be used to shut down the server.
 /// Start the native gRPC server in a background thread.
 #[pyfunction]
-#[pyo3(signature = (host, port, runtime_handle, worker_threads=4))]
+#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, response_channel_capacity=64, response_timeout_secs=300))]
 fn start_server(
     host: String,
     port: u16,
     runtime_handle: PyObject,
     worker_threads: usize,
+    response_channel_capacity: usize,
+    response_timeout_secs: u64,
 ) -> PyResult<GrpcServerHandle> {
     let addr: SocketAddr = format!("{}:{}", host, port).parse().map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid address: {}", e))
+    })?;
+    let worker_threads = worker_threads.max(1);
+    let response_channel_capacity = if response_channel_capacity == 0 {
+        tracing::warn!(
+            default = DEFAULT_RESPONSE_CHANNEL_CAPACITY,
+            "response_channel_capacity must be positive; using default"
+        );
+        DEFAULT_RESPONSE_CHANNEL_CAPACITY
+    } else {
+        response_channel_capacity
+    };
+    let response_timeout_secs = if response_timeout_secs == 0 {
+        tracing::warn!(
+            default = server::DEFAULT_RESPONSE_TIMEOUT_SECS,
+            "response_timeout_secs must be positive; using default"
+        );
+        server::DEFAULT_RESPONSE_TIMEOUT_SECS
+    } else {
+        response_timeout_secs
+    };
+    let response_timeout = Duration::from_secs(response_timeout_secs);
+    let listener = TcpListener::bind(addr).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to bind gRPC server to {}: {}",
+            addr, e
+        ))
+    })?;
+    listener.set_nonblocking(true).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to configure gRPC listener for {}: {}",
+            addr, e
+        ))
     })?;
 
     // Extract tokenizer info from Python (one-time GIL acquisition)
@@ -130,22 +173,40 @@ fn start_server(
         runtime_handle,
         rust_tokenizer,
         tokenizer_info.context_len,
+        response_channel_capacity,
     ));
     let shutdown = Arc::new(Notify::new());
     let shutdown_clone = shutdown.clone();
+    let (startup_tx, startup_rx) = mpsc::channel();
 
     let join_handle = std::thread::Builder::new()
         .name("sglang-grpc".to_string())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
+            let rt = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(worker_threads)
                 .enable_all()
                 .thread_name("sglang-grpc-tokio")
                 .build()
-                .expect("Failed to build Tokio runtime for gRPC server");
+            {
+                Ok(rt) => {
+                    let _ = startup_tx.send(Ok(()));
+                    rt
+                }
+                Err(err) => {
+                    let message = format!("Failed to build Tokio runtime for gRPC server: {}", err);
+                    tracing::error!("{}", message);
+                    let _ = startup_tx.send(Err(message));
+                    return;
+                }
+            };
 
-            if let Err(e) = rt.block_on(server::run_grpc_server(addr, bridge, shutdown_clone)) {
-                eprintln!("gRPC server error: {}", e);
+            if let Err(e) = rt.block_on(server::run_grpc_server(
+                listener,
+                bridge,
+                shutdown_clone,
+                response_timeout,
+            )) {
+                tracing::error!("gRPC server exited with error: {}", e);
             }
         })
         .map_err(|e| {
@@ -154,6 +215,20 @@ fn start_server(
                 e
             ))
         })?;
+    match startup_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => {
+            let _ = join_handle.join();
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(message));
+        }
+        Err(err) => {
+            let _ = join_handle.join();
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "gRPC server thread exited before startup: {}",
+                err
+            )));
+        }
+    }
 
     Ok(GrpcServerHandle {
         shutdown,

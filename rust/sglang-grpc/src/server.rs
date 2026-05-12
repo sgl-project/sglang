@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::{Notify, mpsc::Receiver};
 use tokio::time::{Duration, timeout};
 use tokio_stream::Stream;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
 use crate::bridge::{PyBridge, ResponseChunk};
@@ -17,26 +18,74 @@ use crate::utils::{
 pub struct SglangServiceImpl {
     pub bridge: Arc<PyBridge>,
     pub shutdown: Arc<Notify>,
+    pub response_timeout: Duration,
 }
 
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+pub const DEFAULT_RESPONSE_TIMEOUT_SECS: u64 = 300;
 
 async fn recv_chunk_with_timeout(
     receiver: &mut Receiver<ResponseChunk>,
-    timeout_message: &'static str,
+    response_timeout: Duration,
+    timeout_message: &str,
 ) -> Result<Option<ResponseChunk>, Status> {
-    timeout(RESPONSE_TIMEOUT, receiver.recv())
+    timeout(response_timeout, receiver.recv())
         .await
-        .map_err(|_| Status::deadline_exceeded(timeout_message))
+        .map_err(|_| Status::deadline_exceeded(timeout_message.to_string()))
 }
 
-async fn recv_required_chunk(
+struct RequestAbortGuard<'a> {
+    bridge: &'a Arc<PyBridge>,
+    rid: &'a str,
+    armed: bool,
+}
+
+impl<'a> RequestAbortGuard<'a> {
+    fn new(bridge: &'a Arc<PyBridge>, rid: &'a str) -> Self {
+        Self {
+            bridge,
+            rid,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RequestAbortGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.bridge.abort(self.rid, false);
+        }
+    }
+}
+
+async fn recv_required_chunk_for_request(
+    bridge: &Arc<PyBridge>,
+    rid: &str,
     receiver: &mut Receiver<ResponseChunk>,
+    response_timeout: Duration,
 ) -> Result<ResponseChunk, Status> {
-    recv_chunk_with_timeout(receiver, "Request timed out after 300s")
-        .await?
-        .ok_or_else(|| Status::internal("Channel closed before response"))
+    let mut abort_guard = RequestAbortGuard::new(bridge, rid);
+    let timeout_message = format!("Request timed out after {}s", response_timeout.as_secs());
+    let result = match recv_chunk_with_timeout(receiver, response_timeout, &timeout_message).await {
+        Ok(Some(chunk)) => Ok(chunk),
+        Ok(None) => Err(closed_stream_status(bridge, rid)),
+        Err(status) => Err(status),
+    };
+
+    if result.is_ok()
+        || !matches!(
+            result.as_ref().map_err(Status::code),
+            Err(tonic::Code::DeadlineExceeded)
+        )
+    {
+        abort_guard.disarm();
+    }
+
+    result
 }
 
 fn closed_stream_status(bridge: &Arc<PyBridge>, rid: &str) -> Status {
@@ -86,10 +135,11 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
 
         let bridge = self.bridge.clone();
         let rid_clone = rid.clone();
+        let response_timeout = self.response_timeout;
 
         let stream = async_stream::stream! {
             loop {
-                match recv_chunk_with_timeout(&mut receiver, "Stream chunk timed out").await {
+                match recv_chunk_with_timeout(&mut receiver, response_timeout, "Stream chunk timed out").await {
                     Ok(Some(ResponseChunk::Data(data))) => {
                         yield Ok(proto::TextGenerateResponse {
                             text: data.text.unwrap_or_default(),
@@ -145,10 +195,11 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
 
         let bridge = self.bridge.clone();
         let rid_clone = rid.clone();
+        let response_timeout = self.response_timeout;
 
         let stream = async_stream::stream! {
             loop {
-                match recv_chunk_with_timeout(&mut receiver, "Stream chunk timed out").await {
+                match recv_chunk_with_timeout(&mut receiver, response_timeout, "Stream chunk timed out").await {
                     Ok(Some(ResponseChunk::Data(data))) => {
                         yield Ok(proto::GenerateResponse {
                             output_ids: data.output_ids.unwrap_or_default(),
@@ -204,7 +255,13 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .submit_request(&rid, "embed", req_dict)
             .map_err(|e| Status::internal(format!("Failed to submit request: {}", e)))?;
 
-        let chunk = recv_required_chunk(&mut receiver).await?;
+        let chunk = recv_required_chunk_for_request(
+            &self.bridge,
+            &rid,
+            &mut receiver,
+            self.response_timeout,
+        )
+        .await?;
 
         match chunk {
             ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
@@ -233,7 +290,13 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .submit_request(&rid, "embed", req_dict)
             .map_err(|e| Status::internal(format!("Failed to submit request: {}", e)))?;
 
-        let chunk = recv_required_chunk(&mut receiver).await?;
+        let chunk = recv_required_chunk_for_request(
+            &self.bridge,
+            &rid,
+            &mut receiver,
+            self.response_timeout,
+        )
+        .await?;
 
         match chunk {
             ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
@@ -266,7 +329,13 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .submit_request(&rid, "embed", req_dict)
             .map_err(|e| Status::internal(format!("Failed to submit request: {}", e)))?;
 
-        let chunk = recv_required_chunk(&mut receiver).await?;
+        let chunk = recv_required_chunk_for_request(
+            &self.bridge,
+            &rid,
+            &mut receiver,
+            self.response_timeout,
+        )
+        .await?;
 
         match chunk {
             ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
@@ -294,7 +363,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         if let Some(tok) = self.bridge.rust_tokenizer() {
             let tokens = tok
                 .encode(&req.text, add_special)
-                .map_err(|e| Status::internal(e))?;
+                .map_err(Status::internal)?;
             let count = tokens.len() as i32;
             return Ok(Response::new(proto::TokenizeResponse {
                 tokens: tokens.iter().map(|&t| t as i32).collect(),
@@ -345,7 +414,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         // Try Rust-native tokenizer first (no GIL)
         if let Some(tok) = self.bridge.rust_tokenizer() {
             let ids: Vec<u32> = req.tokens.iter().map(|&t| t as u32).collect();
-            let text = tok.decode(&ids, true).map_err(|e| Status::internal(e))?;
+            let text = tok.decode(&ids, true).map_err(Status::internal)?;
             return Ok(Response::new(proto::DetokenizeResponse { text }));
         }
 
@@ -451,7 +520,8 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .submit_get_load(&rid, req.dp_rank)
             .map_err(|e| Status::internal(format!("Failed to get load: {}", e)))?;
 
-        let json_info = recv_json_response(receiver).await?;
+        let json_info =
+            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
         Ok(Response::new(proto::GetLoadResponse { json_info }))
     }
 
@@ -477,7 +547,8 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .submit_flush_cache(&rid)
             .map_err(|e| Status::internal(format!("Failed to flush cache: {}", e)))?;
 
-        let json_str = recv_json_response(receiver).await?;
+        let json_str =
+            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
         Ok(Response::new(proto::FlushCacheResponse {
@@ -497,7 +568,8 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .submit_pause_generation(&rid, &req.mode)
             .map_err(|e| Status::internal(format!("Failed to pause generation: {}", e)))?;
 
-        let json_str = recv_json_response(receiver).await?;
+        let json_str =
+            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
         Ok(Response::new(proto::PauseGenerationResponse {
@@ -515,7 +587,8 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .submit_continue_generation(&rid)
             .map_err(|e| Status::internal(format!("Failed to continue generation: {}", e)))?;
 
-        let json_str = recv_json_response(receiver).await?;
+        let json_str =
+            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
         Ok(Response::new(proto::ContinueGenerationResponse {
@@ -591,7 +664,8 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .submit_start_profile(&rid, req.output_dir.as_deref())
             .map_err(|e| Status::internal(format!("Failed to start profile: {}", e)))?;
 
-        let json_str = recv_json_response(receiver).await?;
+        let json_str =
+            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
         Ok(Response::new(proto::StartProfileResponse {
@@ -609,7 +683,8 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .submit_stop_profile(&rid)
             .map_err(|e| Status::internal(format!("Failed to stop profile: {}", e)))?;
 
-        let json_str = recv_json_response(receiver).await?;
+        let json_str =
+            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
         Ok(Response::new(proto::StopProfileResponse {
@@ -628,7 +703,8 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .submit_update_weights(&rid, &req.model_path, req.load_format.as_deref())
             .map_err(|e| Status::internal(format!("Failed to update weights: {}", e)))?;
 
-        let json_str = recv_json_response(receiver).await?;
+        let json_str =
+            recv_json_response(&self.bridge, &rid, receiver, self.response_timeout).await?;
         let v: serde_json::Value = serde_json::from_str(&json_str)
             .map_err(|e| Status::internal(format!("Failed to parse JSON response: {}", e)))?;
         Ok(Response::new(proto::UpdateWeightsResponse {
@@ -658,10 +734,11 @@ impl SglangServiceImpl {
 
         let bridge = self.bridge.clone();
         let rid_clone = rid.clone();
+        let response_timeout = self.response_timeout;
 
         let stream = async_stream::stream! {
             loop {
-                match recv_chunk_with_timeout(&mut receiver, "Stream chunk timed out").await {
+                match recv_chunk_with_timeout(&mut receiver, response_timeout, "Stream chunk timed out").await {
                     Ok(Some(ResponseChunk::Data(data))) => {
                         yield Ok(proto::OpenAiStreamChunk {
                             json_chunk: data.json_bytes.unwrap_or_default(),
@@ -709,7 +786,13 @@ impl SglangServiceImpl {
             .submit_openai(&rid, method_name, &req.json_body, &req.trace_headers)
             .map_err(|e| Status::internal(format!("Failed to submit request: {}", e)))?;
 
-        let chunk = recv_required_chunk(&mut receiver).await?;
+        let chunk = recv_required_chunk_for_request(
+            &self.bridge,
+            &rid,
+            &mut receiver,
+            self.response_timeout,
+        )
+        .await?;
 
         match chunk {
             ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
@@ -730,8 +813,14 @@ impl SglangServiceImpl {
 }
 
 /// Receive a single JSON response from the bridge channel.
-async fn recv_json_response(mut receiver: Receiver<ResponseChunk>) -> Result<String, Status> {
-    let chunk = recv_required_chunk(&mut receiver).await?;
+async fn recv_json_response(
+    bridge: &Arc<PyBridge>,
+    rid: &str,
+    mut receiver: Receiver<ResponseChunk>,
+    response_timeout: Duration,
+) -> Result<String, Status> {
+    let chunk =
+        recv_required_chunk_for_request(bridge, rid, &mut receiver, response_timeout).await?;
 
     match chunk {
         ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
@@ -745,13 +834,17 @@ async fn recv_json_response(mut receiver: Receiver<ResponseChunk>) -> Result<Str
 
 /// Start the Tonic gRPC server on the given address.
 pub async fn run_grpc_server(
-    addr: std::net::SocketAddr,
+    listener: std::net::TcpListener,
     bridge: Arc<PyBridge>,
     shutdown: Arc<Notify>,
+    response_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = listener.local_addr()?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
     let service = SglangServiceImpl {
         bridge,
         shutdown: shutdown.clone(),
+        response_timeout,
     };
 
     let svc = proto::sglang_service_server::SglangServiceServer::new(service);
@@ -760,7 +853,7 @@ pub async fn run_grpc_server(
 
     tonic::transport::Server::builder()
         .add_service(svc)
-        .serve_with_shutdown(addr, async move {
+        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.notified().await;
             tracing::info!("gRPC server shutting down");
         })

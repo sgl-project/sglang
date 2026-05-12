@@ -19,7 +19,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 async-stream = "0.3"
 
 [build-dependencies]
