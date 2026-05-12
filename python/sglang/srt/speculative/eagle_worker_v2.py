@@ -134,11 +134,11 @@ class EagleDraftWorker(BaseDraftWorker):
         self.enable_spec_v2_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
         if self.enable_spec_v2_zero_bubble:
             logger.warning(
-                "spec_v2_zero_bubble is enabled. This feature requires seq_lens_cpu "
-                "synchronization (GPU->CPU copy) during draft, which may reduce the "
-                "overlap benefit. It works best with architectures like DeepSeek-V3.2 "
-                "that do not depend on seq_lens_cpu. For other models, acceptance "
-                "length accuracy may be affected if the sync is skipped."
+                "spec_v2_zero_bubble is enabled. This feature improves performance by "
+                "skipping seq_lens_cpu synchronization (GPU->CPU copy) during the draft phase. "
+                "This is optimal for models like DeepSeek-V3.2 that do not depend on seq_lens_cpu. "
+                "For models that do, skipping this sync may affect acceptance length, though it "
+                "can be re-enabled in the code for correctness at the cost of some performance."
             )
 
         # Do not capture cuda graph in `TpModelWorker` init,
@@ -579,6 +579,13 @@ class EagleDraftWorker(BaseDraftWorker):
             offset += step_size
 
         # Organize the results
+        parent_list, top_scores_index, draft_tokens = self._organize_draft_results(
+            score_list, token_list, parents_list
+        )
+
+        return parent_list, top_scores_index, draft_tokens
+
+    def _organize_draft_results(self, score_list, token_list, parents_list):
         score_list = torch.cat(score_list, dim=1).flatten(
             1
         )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
@@ -590,6 +597,12 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            ss_token_list.shape[1],
+            "draft_forward: top_scores_index OOB for gather on ss_token_list",
+        )
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
         if len(parents_list) > 1:
@@ -675,31 +688,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         score_list, token_list, parents_list = zip(*tree_info_list)
 
-        # Organize the results
-        score_list = torch.cat(score_list, dim=1).flatten(
-            1
-        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
-        ss_token_list = torch.cat(
-            token_list, dim=1
-        )  # b, (self.topk + (num_steps-1) * self.topk)
-        top_scores = torch.topk(
-            score_list, self.speculative_num_draft_tokens - 1, dim=-1
+        parent_list, top_scores_index, draft_tokens = self._organize_draft_results(
+            score_list, token_list, parents_list
         )
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
-        maybe_detect_oob(
-            top_scores_index,
-            0,
-            ss_token_list.shape[1],
-            "draft_forward: top_scores_index OOB for gather on ss_token_list",
-        )
-        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
-
-        if len(parents_list) > 1:
-            parent_list = torch.cat(parents_list[:-1], dim=1)
-        else:
-            batch_size = parents_list[0].shape[0]
-            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
 
         return parent_list, top_scores_index, draft_tokens
 
