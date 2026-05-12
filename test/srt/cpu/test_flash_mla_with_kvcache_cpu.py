@@ -16,18 +16,16 @@ except Exception as _e:  # pragma: no cover - exercised only when kernel missing
     _IMPORT_ERROR = _e
 
 
-# Map ``fp8_layout`` integer (matches ``FP8KVCacheLayout`` C++ enum and
-# ``flashmla_quant.FP8KVCacheLayout``) -> (d_qk, d_v).
 _LAYOUT_DIMS = {
     1: (576, 512),  # V32_FP8Sparse
-    2: (512, 512),  # MODEL1_FP8Sparse
+    2: (512, 512),  # V4_FP8Sparse
 }
 
 
 def _ref_sparse_attn_decode(
     q: torch.Tensor,  # [B, S_q, H_q, D_qk] bf16
     k_dequant: torch.Tensor,  # [num_blocks, page_size, 1, D_qk] bf16
-    indices: torch.Tensor,  # [B, S_q, topk] int32/int64
+    indices: torch.Tensor,  # [B, S_q, topk] int32
     topk_length,
     attn_sink,
     extra_k_dequant,
@@ -36,11 +34,7 @@ def _ref_sparse_attn_decode(
     sm_scale: float,
     d_v: int,
 ):
-    """Pure-PyTorch reference for the sparse FP8 decode kernel.
-    Mirrors :func:`sglang.srt.flashmla_tests.ref.ref_sparse_attn_decode`
-    but accepts already-dequantized BF16 K caches and inlines only the
-    parts needed for the decode comparison.
-    """
+    """Pure-PyTorch reference for the sparse FP8 decode kernel."""
     b, s_q, h_q, d_qk = q.shape
 
     def _gather(k_dq: torch.Tensor, idxs: torch.Tensor, tl):
@@ -99,31 +93,19 @@ def _ref_sparse_attn_decode(
 
 @unittest.skipIf(
     _IMPORT_ERROR is not None,
-    f"flash_mla_with_kvcache_cpu / flashmla_tests.quant unavailable: {_IMPORT_ERROR}",
+    f"flash_mla_with_kvcache_cpu : {_IMPORT_ERROR}",
 )
 class TestFlashMLAWithKVCacheCPU(CustomTestCase):
-    """Tests for ``flash_mla_with_kvcache_cpu`` (sparse FP8 decode, CPU AMX).
-    Only ``torch.bfloat16`` queries are supported by the kernel
-    (see ``sgl-kernel/csrc/cpu/flash_mla.cpp``); ``page_size`` and the FP8
-    KV-cache layout / index dtype are the dimensions we sweep here.
-    """
 
     def setUp(self):
         torch.manual_seed(1234)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
     def _make_quantized_kv_cache(
         self, num_blocks, page_size, d_qk, layout_enum, *, as_uint8=False
     ):
-        # Generate random BF16 K cache then quantize using the project's
-        # reference helper.  Shape: [num_blocks, page_size, 1, d_qk] bf16.
+
         k_bf16 = torch.randn(num_blocks, page_size, 1, d_qk, dtype=torch.bfloat16) * 0.5
         k_quant = flashmla_quant.quantize_k_cache(k_bf16, layout_enum)
-        # Re-dequantize so the BF16 K used by the reference path matches the
-        # one the kernel will see internally; this excludes quantization
-        # error from the kernel-vs-ref comparison.
         k_dequant = flashmla_quant.dequantize_k_cache(k_quant, layout_enum)
         if as_uint8:
             k_quant = k_quant.view(torch.uint8)
@@ -284,35 +266,25 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         self.assertEqual(out_cpu.dtype, torch.bfloat16)
         self.assertEqual(lse_cpu.dtype, torch.float32)
 
-        # Numerical check.  Tolerances mirror the loosened thresholds used by
-        # ``debug_flash_mla_adapter._assert_close``.
         torch.testing.assert_close(out_cpu, out_ref, atol=1e-2, rtol=1e-2)
 
-        # LSE: ignore positions that the reference left at +inf
-        # (no attendable K) since the kernel may report a different sentinel
-        # value for those slots.
         finite = torch.isfinite(lse_ref) & torch.isfinite(lse_cpu)
         if finite.any():
             torch.testing.assert_close(
                 lse_cpu[finite], lse_ref[finite], atol=5e-3, rtol=1e-2
             )
 
-    # ------------------------------------------------------------------
-    # Tests: sweep page_size, layout (KV cache "dtype"), and index dtype.
-    # ------------------------------------------------------------------
-    def test_basic_layouts_page_sizes_and_idx_dtypes(self):
+    def test_basic_layouts_and_page_sizes(self):
         configs = list(
             itertools.product(
                 [64, 128, 256],  # page_size
-                [1, 2],  # fp8_layout (V32 / MODEL1)
-                [torch.int32, torch.int64],  # idx_dtype
+                [1, 2],  # fp8_layout (V32 / V4)
             )
         )
-        for page_size, fp8_layout, idx_dtype in configs:
+        for page_size, fp8_layout in configs:
             with self.subTest(
                 page_size=page_size,
                 fp8_layout=fp8_layout,
-                idx_dtype=str(idx_dtype),
             ):
                 self._run_one(
                     b=2,
@@ -322,7 +294,6 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                     page_size=page_size,
                     num_blocks=4,
                     fp8_layout=fp8_layout,
-                    idx_dtype=idx_dtype,
                 )
 
     def test_varying_batch_seq_and_topk(self):

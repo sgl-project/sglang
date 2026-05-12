@@ -8,13 +8,13 @@ FP8_DTYPE = torch.float8_e4m3fn
 
 class FP8KVCacheLayout(enum.Enum):
     V32_FP8Sparse = 1
-    MODEL1_FP8Sparse = 2
+    V4_FP8Sparse = 2
 
     def get_meta(self) -> Tuple[int, int, int, int, int]:
         # Return: (d, d_nope, d_rope, tile_size, num_tiles)
         return {
             FP8KVCacheLayout.V32_FP8Sparse: (576, 512, 64, 128, 4),
-            FP8KVCacheLayout.MODEL1_FP8Sparse: (512, 448, 64, 64, 7),
+            FP8KVCacheLayout.V4_FP8Sparse: (512, 448, 64, 64, 7),
         }[self]
 
 
@@ -83,7 +83,7 @@ def quantize_k_cache(
         result = result.view(num_blocks, block_size, 1, -1)
         return result
 
-    elif kvcache_layout == FP8KVCacheLayout.MODEL1_FP8Sparse:
+    elif kvcache_layout == FP8KVCacheLayout.V4_FP8Sparse:
         bytes_per_token = d_nope + 2 * d_rope + num_tiles + 1
         size_per_block_padded = (block_size * bytes_per_token + 576 - 1) // 576 * 576
         result = torch.empty(
@@ -179,7 +179,7 @@ def dequantize_k_cache(
                 cur_nope * cur_scales
             )
 
-    elif kvcache_layout == FP8KVCacheLayout.MODEL1_FP8Sparse:
+    elif kvcache_layout == FP8KVCacheLayout.V4_FP8Sparse:
         quant_k_cache = quant_k_cache.view(num_blocks, -1)  # [num_blocks, ...]
         input_nope_rope = quant_k_cache[:, : block_size * (d_nope + 2 * d_rope)].view(
             num_blocks, block_size, d_nope + 2 * d_rope

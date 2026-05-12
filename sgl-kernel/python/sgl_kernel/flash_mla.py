@@ -183,8 +183,7 @@ def flash_mla_with_kvcache_cpu(
     extra_topk_length: Optional[torch.Tensor] = None,
     fp8_layout: int = 2,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Intel CPU AMX implementation of FlashMLA's sparse decode.
-
+    """
     Returns:
         out: ``(B, S_q, H_q, head_dim_v)``, ``bfloat16``.
         softmax_lse: ``(B, H_q, S_q)``, ``float32``.
