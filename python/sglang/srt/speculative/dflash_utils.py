@@ -418,7 +418,7 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
-def compute_dflash_accept_len_and_bonus(
+def compute_dflash_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
     target_predict: torch.Tensor,
@@ -459,7 +459,7 @@ def compute_dflash_accept_len_and_bonus(
     return accept_len, bonus.to(torch.int64)
 
 
-def compute_dflash_sampling_accept_len_and_bonus(
+def compute_dflash_sampling_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
     next_token_logits: torch.Tensor,
