@@ -150,6 +150,13 @@ inline void fill_stub(scalar_t* __restrict__ out, float val, int64_t size) {
   }
 }
 
+template <typename scalar_t, typename packed_t>
+inline void copy_stub(scalar_t* __restrict__ out, const packed_t* __restrict__ src, int64_t size) {
+  for (int64_t i = 0; i < size; ++i) {
+    out[i] = static_cast<scalar_t>(src[i]);
+  }
+}
+
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc, float s, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -1363,11 +1370,11 @@ void decode_set_kv_buffer(
       int64_t loc_val = loc[bs];
       packed_t* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_kv_id * k_strideH;
       const scalar_t* new_key_ptr = key + bs * nk_strideN + head_kv_id * nk_strideH;
-      copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size);
+      copy_stub(k_buffer_ptr, new_key_ptr, head_size);
       if (!is_mla) {
         packed_t* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
         const scalar_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
-        copy_stub<scalar_t>(v_buffer_ptr, new_value_ptr, head_size_v);
+        copy_stub(v_buffer_ptr, new_value_ptr, head_size_v);
       }
 
       // move to the next index
@@ -2084,6 +2091,21 @@ void decode_attention_cpu(
   void* v_buffer_data = v_buffer.data_ptr();
   const bool is_mla = (k_buffer_data == v_buffer_data) && (num_heads_kv == 1) && (head_size == head_size_v + 64);
 
+  auto kv_dtype = k_buffer.scalar_type();
+  if (kv_dtype == at::ScalarType::Float8_e4m3fn) {
+    TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have the same dtype");
+    TORCH_CHECK(k_buf_scale.has_value() && v_buf_scale.has_value(), "Float8 kv_buffer requires scale tensors");
+    at::Tensor k_scale = k_buf_scale.value();
+    at::Tensor v_scale = v_buf_scale.value();
+    TORCH_CHECK(k_scale.scalar_type() == at::kFloat, "k_buf_scale should be float32");
+    TORCH_CHECK(v_scale.scalar_type() == at::kFloat, "v_buf_scale should be float32");
+    if (is_mla) {
+      TORCH_CHECK(k_scale.data_ptr() == v_scale.data_ptr(), "k_scale and v_scale should be the same one in mla");
+    }
+  } else if (kv_dtype == at::ScalarType::Float8_e5m2) {
+    TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have the same dtype");
+  }
+
   // block length for k_buffer and v_buffer
   constexpr int BLOCK_N = 256;
 
@@ -2091,138 +2113,120 @@ void decode_attention_cpu(
   int num_threads = at::get_num_threads();
   int64_t size_per_thread = is_mla ? BLOCK_N * head_size + BLOCK_N * head_size_v : 0;
   auto buffer = at::empty({num_threads, size_per_thread}, key.options());
-  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(
-      query.scalar_type(), k_buffer.scalar_type(), at::kFloat, "decode_attention_kernel", [&] {
-        AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
-          // update the kv buffer
-          auto kv_dtype = k_buffer.scalar_type();
-          float* __restrict__ k_buf_scale_ptr = nullptr;
-          float* __restrict__ v_buf_scale_ptr = nullptr;
-          if (kv_dtype == at::ScalarType::Float8_e4m3fn) {
-            TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have the same dtype");
-            TORCH_CHECK(k_buf_scale.has_value() && v_buf_scale.has_value(), "Float8 kv_buffer requires scale tensors");
-            at::Tensor k_scale = k_buf_scale.value();
-            at::Tensor v_scale = v_buf_scale.value();
-            TORCH_CHECK(k_scale.scalar_type() == at::kFloat, "k_buf_scale should be float32");
-            TORCH_CHECK(v_scale.scalar_type() == at::kFloat, "v_buf_scale should be float32");
-            if (is_mla) {
-              TORCH_CHECK(
-                  k_scale.data_ptr() == v_scale.data_ptr(), "k_scale and v_scale should be the same one in mla");
-            }
-            k_buf_scale_ptr = k_scale.data_ptr<float>();
-            v_buf_scale_ptr = v_scale.data_ptr<float>();
-          } else if (kv_dtype == at::ScalarType::Float8_e5m2) {
-            TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have the same dtype");
-          }
-          decode_set_kv_buffer(
-              (packed_t*)k_buffer_data,
-              (packed_t*)v_buffer_data,
-              k_buf_scale_ptr,
-              v_buf_scale_ptr,
-              key.data_ptr<scalar_t>(),
-              value.data_ptr<scalar_t>(),
-              loc.data_ptr<int64_t>(),
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "decode_attention_kernel", [&] {
+    AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
+      CPU_DISPATCH_PACKED_TYPES(k_buffer.scalar_type(), "decode_attention_packed_types", [&] {
+        // update the kv buffer
+        decode_set_kv_buffer(
+            (packed_t*)k_buffer_data,
+            (packed_t*)v_buffer_data,
+            conditional_data_ptr<float>(k_buf_scale),
+            conditional_data_ptr<float>(v_buf_scale),
+            key.data_ptr<scalar_t>(),
+            value.data_ptr<scalar_t>(),
+            loc.data_ptr<int64_t>(),
+            num_seqs,
+            num_heads_kv,
+            head_size,
+            head_size_v,
+            k_strideN,
+            k_strideH,
+            v_strideN,
+            v_strideH,
+            nk_strideN,
+            nk_strideH,
+            nv_strideN,
+            nv_strideH,
+            is_mla);
+        if (num_heads == num_heads_kv) {
+          decode_attention_kernel_impl<scalar_t, packed_t, index_t, BLOCK_N>(
+              output.data_ptr<scalar_t>(),
+              attn_logits.data_ptr<float>(),
+              query.data_ptr<scalar_t>(),
+              (const packed_t*)k_buffer_data,
+              (const packed_t*)v_buffer_data,
+              conditional_data_ptr<float>(k_buf_scale),
+              conditional_data_ptr<float>(v_buf_scale),
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
               num_seqs,
-              num_heads_kv,
+              num_heads,
               head_size,
               head_size_v,
+              num_kv_splits,
+              q_strideM,
+              q_strideH,
               k_strideN,
               k_strideH,
               v_strideN,
               v_strideH,
-              nk_strideN,
-              nk_strideH,
-              nv_strideN,
-              nv_strideH,
-              is_mla);
-          if (num_heads == num_heads_kv) {
-            decode_attention_kernel_impl<scalar_t, packed_t, index_t, BLOCK_N>(
-                output.data_ptr<scalar_t>(),
-                attn_logits.data_ptr<float>(),
-                query.data_ptr<scalar_t>(),
-                (const packed_t*)k_buffer_data,
-                (const packed_t*)v_buffer_data,
-                k_buf_scale_ptr,
-                v_buf_scale_ptr,
-                req_to_token.data_ptr<index_t>(),
-                req_pool_indices.data_ptr<int64_t>(),
-                seq_lens.data_ptr<int64_t>(),
-                num_seqs,
-                num_heads,
-                head_size,
-                head_size_v,
-                num_kv_splits,
-                q_strideM,
-                q_strideH,
-                k_strideN,
-                k_strideH,
-                v_strideN,
-                v_strideH,
-                sm_scale,
-                logit_cap,
-                max_num_reqs,
-                max_context_len,
-                max_total_num_tokens);
-          } else if (is_mla) {
-            decode_attention_mla_kernel_impl<scalar_t, packed_t, index_t, BLOCK_N>(
-                output.data_ptr<scalar_t>(),
-                attn_logits.data_ptr<float>(),
-                query.data_ptr<scalar_t>(),
-                (const packed_t*)k_buffer_data,
-                (const packed_t*)v_buffer_data,
-                k_buf_scale_ptr,
-                v_buf_scale_ptr,
-                req_to_token.data_ptr<index_t>(),
-                req_pool_indices.data_ptr<int64_t>(),
-                seq_lens.data_ptr<int64_t>(),
-                buffer.data_ptr<scalar_t>(),
-                num_seqs,
-                num_heads,
-                head_size,
-                head_size_v,
-                num_kv_splits,
-                q_strideM,
-                q_strideH,
-                k_strideN,
-                k_strideH,
-                v_strideN,
-                v_strideH,
-                sm_scale,
-                logit_cap,
-                max_num_reqs,
-                max_context_len,
-                max_total_num_tokens,
-                size_per_thread);
-          } else {
-            decode_attention_grouped_kernel_impl<scalar_t, packed_t, index_t, BLOCK_N>(
-                output.data_ptr<scalar_t>(),
-                attn_logits.data_ptr<float>(),
-                query.data_ptr<scalar_t>(),
-                (const packed_t*)k_buffer_data,
-                (const packed_t*)v_buffer_data,
-                k_buf_scale_ptr,
-                v_buf_scale_ptr,
-                req_to_token.data_ptr<index_t>(),
-                req_pool_indices.data_ptr<int64_t>(),
-                seq_lens.data_ptr<int64_t>(),
-                num_seqs,
-                num_heads,
-                num_heads_kv,
-                head_size,
-                head_size_v,
-                num_kv_splits,
-                q_strideM,
-                q_strideH,
-                k_strideN,
-                k_strideH,
-                v_strideN,
-                v_strideH,
-                sm_scale,
-                logit_cap,
-                max_num_reqs,
-                max_context_len,
-                max_total_num_tokens);
-          }
-        });
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens);
+        } else if (is_mla) {
+          decode_attention_mla_kernel_impl<scalar_t, packed_t, index_t, BLOCK_N>(
+              output.data_ptr<scalar_t>(),
+              attn_logits.data_ptr<float>(),
+              query.data_ptr<scalar_t>(),
+              (const packed_t*)k_buffer_data,
+              (const packed_t*)v_buffer_data,
+              conditional_data_ptr<float>(k_buf_scale),
+              conditional_data_ptr<float>(v_buf_scale),
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
+              buffer.data_ptr<scalar_t>(),
+              num_seqs,
+              num_heads,
+              head_size,
+              head_size_v,
+              num_kv_splits,
+              q_strideM,
+              q_strideH,
+              k_strideN,
+              k_strideH,
+              v_strideN,
+              v_strideH,
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens,
+              size_per_thread);
+        } else {
+          decode_attention_grouped_kernel_impl<scalar_t, packed_t, index_t, BLOCK_N>(
+              output.data_ptr<scalar_t>(),
+              attn_logits.data_ptr<float>(),
+              query.data_ptr<scalar_t>(),
+              (const packed_t*)k_buffer_data,
+              (const packed_t*)v_buffer_data,
+              conditional_data_ptr<float>(k_buf_scale),
+              conditional_data_ptr<float>(v_buf_scale),
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
+              num_seqs,
+              num_heads,
+              num_heads_kv,
+              head_size,
+              head_size_v,
+              num_kv_splits,
+              q_strideM,
+              q_strideH,
+              k_strideN,
+              k_strideH,
+              v_strideN,
+              v_strideH,
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens);
+        }
       });
+    });
+  });
 }

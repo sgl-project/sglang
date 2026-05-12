@@ -1008,8 +1008,6 @@ INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, uint8_t, uint8_t);
 INSTANTIATE_TINYGEMM_TEMPLATE2(at::BFloat16);
 
 std::tuple<at::Tensor, at::Tensor> quantize_fp8_e4m3fn_cpu(at::Tensor& A) {
-  RECORD_FUNCTION("sgl-kernel::quantize_fp8_e4m3fn_cpu", std::vector<c10::IValue>({A}));
-
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(A);
   CHECK_DIM(3, A);
   int64_t B = A.size(0);

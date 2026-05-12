@@ -300,8 +300,8 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         v_extend.data_ptr<scalar_t>(),                                                     \
         k_buffer.data_ptr<packed_t>(),                                                     \
         v_buffer.data_ptr<packed_t>(),                                                     \
-        k_buf_scale_ptr,                                                                   \
-        v_buf_scale_ptr,                                                                   \
+        conditional_data_ptr<float>(k_buf_scale),                                          \
+        conditional_data_ptr<float>(v_buf_scale),                                          \
         req_to_token.data_ptr<index_t>(),                                                  \
         req_pool_indices.data_ptr<int64_t>(),                                              \
         seq_lens.data_ptr<int64_t>(),                                                      \
@@ -423,37 +423,33 @@ void extend_attention_cpu(
   // D and DV need to be 32x as we transpose by 512-bit
   TORCH_CHECK(head_size % 32 == 0, "invalid head_size ", head_size);
   TORCH_CHECK(head_size_v % 32 == 0, "invalid head_size_v ", head_size_v);
-
+  auto kv_dtype = k_buffer.scalar_type();
+  if (kv_dtype == at::ScalarType::Float8_e4m3fn) {
+    TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have same data type");
+    TORCH_CHECK(k_buf_scale.has_value() && v_buf_scale.has_value(), "float8 scale tensors are required");
+    at::Tensor k_buf_scale_tensor = k_buf_scale.value();
+    at::Tensor v_buf_scale_tensor = v_buf_scale.value();
+    TORCH_CHECK(k_buf_scale_tensor.scalar_type() == at::kFloat, "k_buf_scale should be float32");
+    TORCH_CHECK(v_buf_scale_tensor.scalar_type() == at::kFloat, "v_buf_scale should be float32");
+  } else if (kv_dtype == at::ScalarType::Float8_e5m2) {
+    TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have same data type");
+  }
   int num_threads = at::get_num_threads();
   auto buffer = at::empty({}, q_extend.options().dtype(at::kChar));
 
-  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(
-      q_extend.scalar_type(), k_buffer.scalar_type(), at::kFloat, "extend_attention_kernel", [&] {
-        AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
-          auto kv_dtype = k_buffer.scalar_type();
-          float* __restrict__ k_buf_scale_ptr = nullptr;
-          float* __restrict__ v_buf_scale_ptr = nullptr;
-          if (kv_dtype == at::ScalarType::Float8_e4m3fn) {
-            TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have same data type");
-            TORCH_CHECK(k_buf_scale.has_value() && v_buf_scale.has_value(), "float8 scale tensors are required");
-            at::Tensor k_buf_scale_tensor = k_buf_scale.value();
-            at::Tensor v_buf_scale_tensor = v_buf_scale.value();
-            TORCH_CHECK(k_buf_scale_tensor.scalar_type() == at::kFloat, "k_buf_scale should be float32");
-            TORCH_CHECK(v_buf_scale_tensor.scalar_type() == at::kFloat, "v_buf_scale should be float32");
-            k_buf_scale_ptr = k_buf_scale_tensor.data_ptr<float>();
-            v_buf_scale_ptr = v_buf_scale_tensor.data_ptr<float>();
-          } else if (kv_dtype == at::ScalarType::Float8_e5m2) {
-            TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have same data type");
-          }
-          if (max_len_extend <= 256) {
-            LAUNCH_EXTEND_ATTENTION_KERNEL(32, 64);
-          } else if (max_len_extend <= 1024) {
-            LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);
-          } else if (max_len_extend <= 4096) {
-            LAUNCH_EXTEND_ATTENTION_KERNEL(256, 768);
-          } else {  // max_len_extend > 4096
-            LAUNCH_EXTEND_ATTENTION_KERNEL(512, 768);
-          }
-        });
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
+    AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
+      CPU_DISPATCH_PACKED_TYPES(k_buffer.scalar_type(), "extend_attention_packed_types", [&] {
+        if (max_len_extend <= 256) {
+          LAUNCH_EXTEND_ATTENTION_KERNEL(32, 64);
+        } else if (max_len_extend <= 1024) {
+          LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);
+        } else if (max_len_extend <= 4096) {
+          LAUNCH_EXTEND_ATTENTION_KERNEL(256, 768);
+        } else {  // max_len_extend > 4096
+          LAUNCH_EXTEND_ATTENTION_KERNEL(512, 768);
+        }
       });
+    });
+  });
 }
