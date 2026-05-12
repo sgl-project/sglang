@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -348,7 +349,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.clear()
         self._kvcache = kvcache
-        self._kvcache.register_mapping(weakref.proxy(self.full_to_swa_index_mapping))
+        full_to_swa_index_mapping = self.full_to_swa_index_mapping
+        if not envs.SGLANG_EXPERIMENTAL_ENABLE_PIECEWISE_CUDA_GRAPH_MOE_A2A.get():
+            full_to_swa_index_mapping = weakref.proxy(full_to_swa_index_mapping)
+        self._kvcache.register_mapping(full_to_swa_index_mapping)
 
     def available_size(self):
         return min(
