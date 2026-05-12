@@ -515,6 +515,7 @@ def get_activation_type(activation: str) -> int:
     _ACTIVATION_STR_TO_TYPE = {
         "silu": ActivationType.Swiglu,
         "relu2": ActivationType.Relu2,
+        "gelu": ActivationType.Gelu,
     }
     act = _ACTIVATION_STR_TO_TYPE.get(activation)
     if act is None:
@@ -862,7 +863,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-    _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2"}
+    _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2", "gelu"}
     assert runner_config.activation in _SUPPORTED_FP4_ACTIVATIONS, (
         f"Only {_SUPPORTED_FP4_ACTIVATIONS} are supported for FP4 MoE, "
         f"got '{runner_config.activation}'."

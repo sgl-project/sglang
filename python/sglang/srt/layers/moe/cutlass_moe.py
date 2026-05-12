@@ -30,7 +30,6 @@ if _is_cuda:
     )
 
     # Map activation name -> SwiGLU-style fused (act(x_gate) * x_up) kernel.
-    # Used by cutlass_moe_fp4 (and cutlass_moe_fp8 below if extended).
     _ACTIVATION_AND_MUL = {
         "silu": silu_and_mul,
         "gelu": gelu_and_mul,
@@ -487,9 +486,6 @@ def cutlass_moe_fp4(
     intermediate = torch.empty(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )
-    # Apply gated activation (act(gate) * up).  Defaults to SiLU (matches the
-    # historical hardcoded behavior); models like Gemma that train with GeLU
-    # must pass activation="gelu_tanh" (tanh-approx) or "gelu" (erf-based).
     act_and_mul = _ACTIVATION_AND_MUL.get(activation)
     if act_and_mul is None:
         raise ValueError(

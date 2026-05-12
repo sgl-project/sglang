@@ -191,12 +191,6 @@ class Gemma4MoE(nn.Module):
             top_k=config.top_k_experts,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
-            # NOTE: Gemma trains with gelu_pytorch_tanh (tanh-approx GeLU),
-            # but sglang's "gelu" string maps to exact (erf-based) GeLU on
-            # most MoE backends.  We keep "gelu" here for compatibility with
-            # the BF16 triton/native paths that don't know "gelu_tanh"; the
-            # tanh approximation is wired through cutlass_moe_fp4 separately
-            # via _ACTIVATION_AND_MUL alias when needed.
             activation="gelu",
             reduce_results=True,
         )
@@ -1051,10 +1045,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
             #     (gate->shard "w1", up->shard "w3")
             #   experts.w2_{weight,weight_scale,weight_scale_2,input_scale}
             #     (down->shard "w2")
-            #
-            # Note: weight_scale_2 / input_scale are per-tensor (PerTensorScale
-            # parameters in the fused MoE layer) and are routed through
-            # FusedMoE.weight_loader's ModelOpt branch via shard_id+expert_id.
             per_expert_match = re.match(
                 r"^(.*?\.moe\.experts\.)(\d+)\.(gate_proj|up_proj|down_proj)"
                 r"\.(weight|weight_scale|weight_scale_2|input_scale)$",
@@ -1074,9 +1064,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 if suffix != "weight":
                     # "weight_scale", "weight_scale_2", or "input_scale": replace
                     # "weight" suffix in `base` with the actual scale suffix.
-                    # e.g. w13_weight + "_scale_2" -> w13_weight_scale_2;
-                    #      w2_weight + "_scale" -> w2_weight_scale;
-                    #      w13_weight (input_scale) -> w13_input_scale.
                     if suffix.startswith("weight_"):
                         base = base + "_" + suffix[len("weight_") :]
                     elif suffix == "input_scale":
@@ -1140,21 +1127,10 @@ class Gemma4ForCausalLM(PreTrainedModel):
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
             param_names = set(dict(self.named_parameters()).keys())
-            # Some quantization methods (e.g. ModelOpt FP8 KV-cache) register
-            # parameters that are intentionally not present in the checkpoint
-            # and instead rely on default initialization or are derived in
-            # process_weights_after_loading.  Their parameters are tagged with
-            # `_skip_weight_check = True` (e.g. RadixAttention.k_scale /
-            # v_scale, FusedMoE.w13_blockscale_swizzled / w2_blockscale_swizzled).
-            skip_check = {
-                p
-                for p in unloaded_params
-                if getattr(params_dict.get(p, None), "_skip_weight_check", False)
-            }
             buckets = {
                 logging.WARNING: (
                     "Some weights are not initialized from checkpoints",
-                    lambda p: p in param_names and p not in skip_check,
+                    lambda p: p in param_names,
                 ),
                 logging.INFO: (
                     "Persistent buffers not in checkpoint (using default init)",
