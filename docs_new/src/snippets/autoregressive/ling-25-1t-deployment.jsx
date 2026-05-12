@@ -81,7 +81,7 @@ export const Ling251TDeployment = () => {
     const { hardware, parallelism, toolcall } = values;
 
     const isGB = hardware === 'gb200' || hardware === 'gb300';
-    const envPrefix = isGB ? 'NCCL_IB_DISABLE=1 ' : '';
+    const envPrefix = isGB ? 'NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1 ' : '';
 
     let tp, pp;
     if (isGB && parallelism === 'tp8') {
