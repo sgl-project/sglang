@@ -562,10 +562,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32
+                batch.extend_seq_lens, dtype=torch.int32, pin_memory=_pin
             ).to(device, non_blocking=True)
             ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, dtype=torch.int32
+                batch.extend_prefix_lens, dtype=torch.int32, pin_memory=_pin
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
