@@ -1386,10 +1386,11 @@ class CudaGraphRunner:
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
-                from sglang.srt.speculative.spec_utils import null_if_not_consumed
 
-                capture_mode = null_if_not_consumed(
-                    CaptureHiddenMode.FULL, self.model_runner.spec_algorithm
+                capture_mode = (
+                    CaptureHiddenMode.FULL
+                    if self.model_runner.spec_algorithm.consumes_hidden_states()
+                    else CaptureHiddenMode.NULL
                 )
                 spec_info = EagleVerifyInput(
                     draft_token=None,

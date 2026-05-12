@@ -43,7 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.multi_layer_eagle_utils import assign_new_state_triton
-from sglang.srt.speculative.spec_utils import fast_topk, null_if_not_consumed
+from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     get_available_gpu_memory,
     require_attn_tp_gather,
@@ -359,8 +359,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         )
         spec_info.positions = None
 
-        capture_mode = null_if_not_consumed(
-            CaptureHiddenMode.FULL, self.model_runner.spec_algorithm
+        capture_mode = (
+            CaptureHiddenMode.FULL
+            if self.model_runner.spec_algorithm.consumes_hidden_states()
+            else CaptureHiddenMode.NULL
         )
 
         # Forward batch

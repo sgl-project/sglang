@@ -29,7 +29,6 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_utils import (
     maybe_detect_nan,
     maybe_detect_oob,
-    null_if_not_consumed,
 )
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -302,8 +301,10 @@ class EAGLEDraftCudaGraphRunner:
             global_dp_buffer_len = None
             global_num_tokens_for_logprob = None
 
-        capture_mode = null_if_not_consumed(
-            CaptureHiddenMode.LAST, self.model_runner.spec_algorithm
+        capture_mode = (
+            CaptureHiddenMode.LAST
+            if self.model_runner.spec_algorithm.consumes_hidden_states()
+            else CaptureHiddenMode.NULL
         )
         spec_info = EagleDraftInput(
             topk_p=topk_p,

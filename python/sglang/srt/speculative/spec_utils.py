@@ -28,10 +28,7 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-    from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 
 
 if _is_cuda:
@@ -53,20 +50,6 @@ TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
     _is_cuda or _is_musa
 )  # This kernel is only available for CUDA and MUSA now
-
-
-def null_if_not_consumed(
-    mode: "CaptureHiddenMode",
-    spec_algorithm: "SpeculativeAlgorithm | CustomSpecAlgo",
-) -> "CaptureHiddenMode":
-    """Downgrade `mode` to NULL when the draft architecture doesn't consume
-    `spec_info.hidden_states`. Otherwise pass through. Architectural fact
-    lives on `SpeculativeAlgorithm.consumes_hidden_states()`."""
-    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-
-    if not spec_algorithm.consumes_hidden_states():
-        return CaptureHiddenMode.NULL
-    return mode
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:

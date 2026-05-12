@@ -50,7 +50,6 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     maybe_detect_nan,
     maybe_detect_oob,
-    null_if_not_consumed,
     select_top_k_tokens,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
@@ -662,8 +661,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            target_capture_mode = null_if_not_consumed(
-                CaptureHiddenMode.FULL, self.speculative_algorithm
+            target_capture_mode = (
+                CaptureHiddenMode.FULL
+                if self.speculative_algorithm.consumes_hidden_states()
+                else CaptureHiddenMode.NULL
             )
             model_worker_batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(
@@ -685,8 +686,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             return batch_output
         else:
             if model_worker_batch.spec_info is None:
-                capture_mode = null_if_not_consumed(
-                    CaptureHiddenMode.LAST, self.speculative_algorithm
+                capture_mode = (
+                    CaptureHiddenMode.LAST
+                    if self.speculative_algorithm.consumes_hidden_states()
+                    else CaptureHiddenMode.NULL
                 )
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
