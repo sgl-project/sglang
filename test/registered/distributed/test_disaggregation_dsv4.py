@@ -17,6 +17,12 @@ register_cuda_ci(est_time=500, suite="stage-c-test-dsv4-8-gpu-h200")
 
 DSV4_FLASH_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 
+DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
+
+DSV4_FLASH_ENV = {
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+}
+
 _EAGLE_SPEC_ARGS = [
     "--speculative-algorithm",
     "EAGLE",
@@ -58,6 +64,10 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
             "--dp",
             4,
             "--enable-dp-attention",
+            "--moe-a2a-backend",
+            "deepep",
+            "--deepep-config",
+            DEEPEP_CONFIG,
             "--cuda-graph-max-bs",
             "128",
             "--max-running-requests",
@@ -72,6 +82,7 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
             cls.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
+            env=DSV4_FLASH_ENV,
         )
 
     @classmethod
@@ -89,6 +100,10 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
             "--enable-dp-attention",
             "--base-gpu-id",
             4,
+            "--moe-a2a-backend",
+            "deepep",
+            "--deepep-config",
+            DEEPEP_CONFIG,
             "--cuda-graph-max-bs",
             "128",
             "--max-running-requests",
@@ -103,6 +118,7 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
             cls.decode_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
+            env=DSV4_FLASH_ENV,
         )
 
     def test_gsm8k(self):
