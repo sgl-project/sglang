@@ -151,11 +151,14 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         preallocated, failed = queue.pop_preallocated()
 
-        self.assertEqual([decode_req.req.rid for decode_req in preallocated], [
-            "high",
-            "mid",
-            "low",
-        ])
+        self.assertEqual(
+            [decode_req.req.rid for decode_req in preallocated],
+            [
+                "high",
+                "mid",
+                "low",
+            ],
+        )
         self.assertEqual(failed, [])
 
     def test_prealloc_queue_can_schedule_lower_priority_values_first(self):
@@ -168,11 +171,14 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         preallocated, failed = queue.pop_preallocated()
 
-        self.assertEqual([decode_req.req.rid for decode_req in preallocated], [
-            "low",
-            "mid",
-            "high",
-        ])
+        self.assertEqual(
+            [decode_req.req.rid for decode_req in preallocated],
+            [
+                "low",
+                "mid",
+                "high",
+            ],
+        )
         self.assertEqual(failed, [])
 
     def test_failed_request_indices_stay_valid_after_priority_sort(self):
@@ -182,12 +188,10 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         preallocated, failed = queue.pop_preallocated()
 
-        self.assertEqual([decode_req.req.rid for decode_req in preallocated], [
-            "healthy-high"
-        ])
-        self.assertEqual([decode_req.req.rid for decode_req in failed], [
-            "failed-low"
-        ])
+        self.assertEqual(
+            [decode_req.req.rid for decode_req in preallocated], ["healthy-high"]
+        )
+        self.assertEqual([decode_req.req.rid for decode_req in failed], ["failed-low"])
         self.assertEqual(queue.queue, [])
         queue.scheduler.stream_output.assert_called_once_with(
             [failed_low.req], failed_low.req.return_logprob
@@ -218,8 +222,8 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         )
         scheduler.future_map = MagicMock()
         scheduler.policy = MagicMock()
-        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: waiting_queue.sort(
-            key=lambda req: -req.priority
+        scheduler.policy.calc_priority.side_effect = (
+            lambda waiting_queue, _: waiting_queue.sort(key=lambda req: -req.priority)
         )
 
         new_batch = MagicMock()
