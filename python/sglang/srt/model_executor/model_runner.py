@@ -777,14 +777,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 )
             self._pre_initialize_flashinfer_allreduce_workspace()
-            self.init_device_graphs()
+            self.graph_runner, self.graph_mem_usage = ModelRunner.create_device_graphs(
+                self
+            )
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
-            self.init_device_graphs()
+            self.graph_runner, self.graph_mem_usage = ModelRunner.create_device_graphs(
+                self
+            )
         elif current_platform.is_out_of_tree():
             self.init_attention_backend()
             if current_platform.support_cuda_graph():
-                self.init_device_graphs()
+                self.graph_runner, self.graph_mem_usage = (
+                    ModelRunner.create_device_graphs(self)
+                )
             else:
                 self.graph_runner = None
                 self.graph_mem_usage = 0
@@ -2342,26 +2348,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ignore_tokens=None,
         )
 
-    def init_device_graphs(self):
+    @staticmethod
+    def create_device_graphs(model_runner: "ModelRunner") -> tuple[object, float]:
         """Capture device graphs."""
-        self.graph_runner = None
-        self.graph_mem_usage = 0
+        graph_runner = None
+        graph_mem_usage = 0
 
-        if not self.is_generation:
+        if not model_runner.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
-            return
+            return None, 0
 
-        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
-            return
+        if model_runner.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
+            return None, 0
 
-        if self.device != "cpu" and self.server_args.disable_cuda_graph:
-            return
+        if model_runner.device != "cpu" and model_runner.server_args.disable_cuda_graph:
+            return None, 0
 
-        if self.device == "cpu" and not self.server_args.enable_torch_compile:
-            return
+        if (
+            model_runner.device == "cpu"
+            and not model_runner.server_args.enable_torch_compile
+        ):
+            return None, 0
 
         tic = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
         graph_backend = defaultdict(
             lambda: f"{current_platform.device_name} graph",
             {
@@ -2372,11 +2382,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             },
         )
         logger.info(
-            f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            f"Capture {graph_backend[model_runner.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
         if current_platform.is_out_of_tree():
             GraphRunnerCls = current_platform.get_graph_runner_cls()
-            self.graph_runner = GraphRunnerCls(self)
+            graph_runner = GraphRunnerCls(model_runner)
         else:
             graph_runners = defaultdict(
                 lambda: CudaGraphRunner,
@@ -2385,14 +2395,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "npu": NPUGraphRunner,
                 },
             )
-            self.graph_runner = graph_runners[self.device](self)
+            graph_runner = graph_runners[model_runner.device](model_runner)
 
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        self.graph_mem_usage = before_mem - after_mem
+        after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
+        graph_mem_usage = before_mem - after_mem
         logger.info(
-            f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+            f"Capture {graph_backend[model_runner.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"mem usage={graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+        return graph_runner, graph_mem_usage
 
     def init_piecewise_cuda_graphs(self):
         """Initialize piecewise CUDA graph runner."""
