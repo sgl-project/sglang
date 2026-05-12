@@ -6,12 +6,10 @@ and asserts outputs match within fp16 tolerance.
 
 import os
 
-import mlx.core as mx
 import pytest
 
-from sglang.srt.hardware_backend.mlx.moe.fused_switch_glu import (
-    FusedSwitchUpGate,
-)
+mx = pytest.importorskip("mlx.core")
+
 
 # Skip if MLX not available or if running in a CI that doesn't have model cache
 pytestmark = pytest.mark.skipif(
@@ -27,6 +25,10 @@ def test_fused_switch_up_gate_matches_unfused():
     'mlx-community/Qwen1.5-MoE-A2.7B-4bit'.
     """
     from mlx_lm import load
+
+    from sglang.srt.hardware_backend.mlx.moe.fused_switch_glu import (
+        FusedSwitchUpGate,
+    )
 
     model_id = os.environ["SGLANG_MLX_TEST_MODEL"]
     model, _ = load(model_id)
