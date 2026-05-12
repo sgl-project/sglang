@@ -13,9 +13,7 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 suites = {
     # quantization_test suite migrated to test/registered/quant/
     # All CUDA tests migrated to test/registered/
-    "__not_in_ci__": [
-        TestFile("mem_cache/test_model_identity_hash.py"),
-    ],
+    "__not_in_ci__": [],
 }
 
 # Add AMD tests

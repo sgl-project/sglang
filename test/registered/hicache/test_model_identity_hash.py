@@ -1,5 +1,11 @@
 """Unit tests for model identity hash computation and storage key isolation."""
 
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+# CPU-only hash computation, runs in milliseconds on any runner
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
+
 import unittest
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
