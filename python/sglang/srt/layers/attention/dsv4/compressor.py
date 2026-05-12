@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import cached_property
-from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union, Any
 
 import torch
 import torch.nn as nn
