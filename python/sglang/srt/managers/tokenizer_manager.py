@@ -2147,10 +2147,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         valid_accepted_tokens = recv_obj.spec_valid_accepted_tokens[i]
         meta_info["spec_valid_draft_token_num"] = valid_draft_tokens
         meta_info["spec_valid_accept_token_num"] = valid_accepted_tokens
-        meta_info["spec_valid_accept_rate"] = (
+        valid_accept_rate = (
             valid_accepted_tokens / valid_draft_tokens
             if valid_draft_tokens > 0
             else 0
+        )
+        meta_info["spec_valid_accept_rate"] = valid_accept_rate
+
+        # For decoupled verification, the meaningful denominator is the number
+        # of real draft tokens present in verifier snapshots, not the fixed graph
+        # capacity. Expose the same real-token acceptance through the main spec
+        # metrics.
+        meta_info["spec_accept_rate"] = valid_accept_rate
+        verify_ct = recv_obj.spec_verify_ct[i]
+        meta_info["spec_accept_length"] = (
+            valid_accepted_tokens / verify_ct if verify_ct > 0 else 0
         )
 
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:

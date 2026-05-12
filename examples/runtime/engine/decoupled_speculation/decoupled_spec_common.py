@@ -680,10 +680,10 @@ def _messages_to_fallback_text(messages: list[dict[str, Any]]) -> str:
 def _get_real_verify_acceptance_stats(
     meta_info: dict[str, Any],
 ) -> tuple[float | None, float | None, int, int, int]:
-    """Extract real draft-token acceptance metrics from SGLang meta_info."""
+    """Extract draft-token acceptance metrics from current SGLang meta_info."""
     verify_ct = meta_info.get("spec_verify_ct")
-    accepted_tokens = meta_info.get("spec_accept_token_num")
-    draft_tokens = meta_info.get("spec_draft_token_num")
+    accepted_tokens = meta_info.get("spec_accepted_drafts")
+    draft_tokens = meta_info.get("spec_proposed_drafts")
     if verify_ct is None or accepted_tokens is None or draft_tokens is None:
         return None, None, 0, 0, 0
 

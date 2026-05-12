@@ -1062,6 +1062,40 @@ def _get_valid_draft_acceptance_stats(
     return valid_draft_tokens, valid_accepted_tokens, valid_accept_rate
 
 
+def _get_decoupled_verify_acceptance_stats(
+    meta_info: dict[str, Any],
+) -> tuple[float | None, float | None, int, int, int]:
+    verify_ct = meta_info.get("spec_verify_ct")
+    valid_draft_tokens = meta_info.get("spec_valid_draft_token_num")
+    valid_accepted_tokens = meta_info.get("spec_valid_accept_token_num")
+    if (
+        verify_ct is None
+        or valid_draft_tokens is None
+        or valid_accepted_tokens is None
+    ):
+        return None, None, 0, 0, 0
+
+    verify_ct = int(verify_ct)
+    valid_draft_tokens = int(valid_draft_tokens)
+    valid_accepted_tokens = int(valid_accepted_tokens)
+    if verify_ct <= 0:
+        return None, None, 0, valid_draft_tokens, 0
+
+    accept_length = valid_accepted_tokens / verify_ct
+    accept_rate = (
+        valid_accepted_tokens / valid_draft_tokens
+        if valid_draft_tokens > 0
+        else None
+    )
+    return (
+        accept_length,
+        accept_rate,
+        valid_accepted_tokens,
+        valid_draft_tokens,
+        verify_ct,
+    )
+
+
 def collect_mode_metrics(
     *,
     mode: str,
@@ -1088,17 +1122,26 @@ def collect_mode_metrics(
 
         meta_info = output.get("meta_info", {}) or {}
         (
-            accept_length,
-            accept_rate,
-            accepted_tokens,
-            draft_tokens,
-            verify_ct,
-        ) = _get_real_verify_acceptance_stats(meta_info)
-        (
             valid_draft_tokens,
             valid_accepted_tokens,
             valid_accept_rate,
         ) = _get_valid_draft_acceptance_stats(meta_info)
+        if mode == "decoupled_spec":
+            (
+                accept_length,
+                accept_rate,
+                accepted_tokens,
+                draft_tokens,
+                verify_ct,
+            ) = _get_decoupled_verify_acceptance_stats(meta_info)
+        else:
+            (
+                accept_length,
+                accept_rate,
+                accepted_tokens,
+                draft_tokens,
+                verify_ct,
+            ) = _get_real_verify_acceptance_stats(meta_info)
         total_accepted_tokens += accepted_tokens
         total_draft_tokens += draft_tokens
         total_valid_draft_tokens += valid_draft_tokens
@@ -1123,8 +1166,6 @@ def collect_mode_metrics(
             "request_latency_s": request_latency_s,
             "spec_accept_length": accept_length,
             "spec_accept_rate": accept_rate,
-            "spec_accept_token_num": accepted_tokens or None,
-            "spec_draft_token_num": draft_tokens or None,
             "spec_valid_accept_rate": valid_accept_rate,
             "spec_valid_accept_token_num": valid_accepted_tokens or None,
             "spec_valid_draft_token_num": valid_draft_tokens or None,
