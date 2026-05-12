@@ -2125,9 +2125,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
 
+                meta_info["spec_num_correct_drafts"] = num_correct_drafts
+                meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
+                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+
+                # FIXME: backward-compat aliases, remove in next release.
                 meta_info["spec_accepted_drafts"] = num_correct_drafts
                 meta_info["spec_proposed_drafts"] = num_proposed_drafts
-                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
@@ -2135,6 +2139,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and len(recv_obj.spec_correct_drafts_histogram) > i
                 and recv_obj.spec_correct_drafts_histogram[i]
             ):
+                meta_info["spec_correct_drafts_histogram"] = (
+                    recv_obj.spec_correct_drafts_histogram[i]
+                )
+                # FIXME: backward-compat alias, remove in next release.
                 meta_info["spec_accept_histogram"] = (
                     recv_obj.spec_correct_drafts_histogram[i]
                 )

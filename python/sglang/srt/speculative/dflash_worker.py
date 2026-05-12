@@ -738,7 +738,7 @@ class DFlashWorker:
         added_vocab_start = int(shard.added_vocab_start_index)
 
         num_tokens = int(hidden_states.shape[0])
-        out_token_ids = torch.empty(
+        out_tokens = torch.empty(
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
 
@@ -753,13 +753,13 @@ class DFlashWorker:
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
-                    out_token_ids[start:end] = (
+                    out_tokens[start:end] = (
                         torch.argmax(base_logits, dim=-1).to(torch.long)
                         + org_vocab_start
                     )
                 else:
-                    out_token_ids[start:end] = 0
-            return out_token_ids
+                    out_tokens[start:end] = 0
+            return out_tokens
 
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
@@ -812,7 +812,7 @@ class DFlashWorker:
                 )
 
             if tp_size == 1:
-                out_token_ids[start:end] = global_ids.to(torch.long)
+                out_tokens[start:end] = global_ids.to(torch.long)
                 continue
 
             # Gather per-rank maxima and associated global ids, then select the global max.
@@ -869,9 +869,9 @@ class DFlashWorker:
             rank_index[0].copy_(best_rank)
             selected_ids = self._draft_greedy_selected_ids_buf[:, :chunk_len]
             torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
-            out_token_ids[start:end].copy_(selected_ids.view(-1))
+            out_tokens[start:end].copy_(selected_ids.view(-1))
 
-        return out_token_ids
+        return out_tokens
 
     def _append_target_hidden_to_draft_kv(
         self,
