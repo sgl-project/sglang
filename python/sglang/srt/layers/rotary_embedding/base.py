@@ -66,6 +66,10 @@ class RotaryEmbedding(MultiPlatformOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+        self.use_explicit_npu_interleaved_rope = False
+
+        self.register_buffer("cos_cached_total", None, persistent=False)
+        self.register_buffer("sin_cached_total", None, persistent=False)
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
@@ -147,6 +151,7 @@ class RotaryEmbedding(MultiPlatformOp):
         cos = freqs.cos()
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
+
         return cache
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
@@ -203,52 +208,84 @@ class RotaryEmbedding(MultiPlatformOp):
         cos, sin = cos_sin.chunk(2, dim=-1)
         return cos, sin
 
-    def get_npu_interleaved_cos_sin(
+    def get_cos_cached_total(self):
+        return self.cos_cached_total
+
+    def get_sin_cached_total(self):
+        return self.sin_cached_total
+
+    def sync_explicit_npu_interleaved_cache(self):
+        if not getattr(self, "use_explicit_npu_interleaved_rope", False):
+            return
+        cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
+        self.cos_cached_total = cos.repeat(1, 2).contiguous()
+        self.sin_cached_total = sin.repeat(1, 2).contiguous()
+
+    def update_and_get_cos_sin_cache(
+        self, positions, layer_id, dtype, offsets: Optional[torch.Tensor] = None
+    ):
+        if layer_id == 0:
+            self.cos_cached = (
+                self.cos_cached_total[
+                    torch.add(positions, offsets) if offsets is not None else positions
+                ]
+                .unsqueeze(-2)
+                .unsqueeze(-2)
+                .to(dtype)
+            )
+            self.sin_cached = (
+                self.sin_cached_total[
+                    torch.add(positions, offsets) if offsets is not None else positions
+                ]
+                .unsqueeze(-2)
+                .unsqueeze(-2)
+                .to(dtype)
+            )
+        cos = self.cos_cached.to(positions.device)
+        sin = self.sin_cached.to(positions.device)
+        return cos, sin
+
+    def explicit_npu_interleave_rope(
         self,
         positions: torch.Tensor,
-        dtype: torch.dtype,
+        query: torch.Tensor,
+        key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        positions = torch.add(positions, offsets) if offsets is not None else positions
-        flat_positions = positions.flatten()
-        cos_sin = self.cos_sin_cache.index_select(0, flat_positions.to(torch.long))
-        last_dim = cos_sin.size(-1)
-        cos, sin = (
-            cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_tokens, num_q_heads, _ = query.shape
+        num_k_heads = key.shape[1]
+
+        cos, sin = self.cos_cached.to(positions.device), self.sin_cached.to(
+            positions.device
         )
-        return (
-            cos.view(-1, 1, 1, last_dim)
-            .to(device=positions.device, dtype=dtype)
-            .contiguous(),
-            sin.view(-1, 1, 1, last_dim)
-            .to(device=positions.device, dtype=dtype)
-            .contiguous(),
+        query_rot = query[..., : self.rotary_dim]
+        key_rot = key[..., : self.rotary_dim]
+        if self.rotary_dim < self.head_size:
+            query_pass = query[..., self.rotary_dim :]
+            key_pass = key[..., self.rotary_dim :]
+
+        query_rot = torch_npu.npu_interleave_rope(
+            query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim),
+            cos,
+            sin,
+        )
+        key_rot = torch_npu.npu_interleave_rope(
+            key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim),
+            cos,
+            sin,
         )
 
-    def update_npu_interleaved_cos_sin(
-        self,
-        positions: torch.Tensor,
-        dtype: torch.dtype,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        positions = torch.add(positions, offsets) if offsets is not None else positions
-        flat_positions = positions.flatten()
-        cos_sin = self.cos_sin_cache.index_select(0, flat_positions.to(torch.long))
-        last_dim = cos_sin.size(-1)
-        cos, sin = (
-            cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
-        )
-        self.cos_cached = (
-            cos.view(-1, 1, 1, last_dim)
-            .to(device=positions.device, dtype=dtype)
-            .contiguous()
-        )
-        self.sin_cached = (
-            sin.view(-1, 1, 1, last_dim)
-            .to(device=positions.device, dtype=dtype)
-            .contiguous()
-        )
-        return self.cos_cached, self.sin_cached
+        query_rot = query_rot.reshape(num_tokens, -1, self.rotary_dim)
+        key_rot = key_rot.reshape(num_tokens, -1, self.rotary_dim)
+
+        if self.rotary_dim < self.head_size:
+            query = torch.cat((query_rot, query_pass), dim=-1)
+            key = torch.cat((key_rot, key_pass), dim=-1)
+        else:
+            query = query_rot
+            key = key_rot
+
+        return query, key
 
     def forward_native(
         self,
@@ -305,6 +342,12 @@ class RotaryEmbedding(MultiPlatformOp):
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
         if (
+            getattr(self, "use_explicit_npu_interleaved_rope", False)
+            and self.rotary_dim == 64
+            and not self.is_neox_style
+        ):
+            return self.explicit_npu_interleave_rope(positions, query, key, offsets)
+        elif (
             query.dtype == torch.bfloat16
             and self.cos_sin_cache.dtype == torch.float
             or key.ndim == 3

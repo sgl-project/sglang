@@ -90,8 +90,8 @@ def forward_mha_prepare_npu(
                 positions, hidden_states.dtype, offsets=None
             )
         else:
-            cos, sin = m.rotary_emb.get_npu_interleaved_cos_sin(
-                positions, hidden_states.dtype, offsets=None
+            cos, sin = m.rotary_emb.update_and_get_cos_sin_cache(
+                positions, m.layer_id, hidden_states.dtype, offsets=None
             )
         q_pe = torch_npu.npu_interleave_rope(
             q_pe.reshape(B, -1, S, m.qk_rope_head_dim),
@@ -237,8 +237,8 @@ def forward_mla_prepare_npu(
         q_nope_out = q_nope_out.transpose(0, 1)
 
         if _use_explicit_npu_interleaved_rope(m):
-            m.rotary_emb.get_npu_interleaved_cos_sin(
-                positions, hidden_states.dtype, offsets=None
+            m.rotary_emb.update_and_get_cos_sin_cache(
+                positions, m.layer_id, hidden_states.dtype, offsets=None
             )
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
