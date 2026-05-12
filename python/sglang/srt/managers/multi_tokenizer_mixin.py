@@ -129,11 +129,11 @@ def _handle_output_by_index(output, i):
         new_output = BatchTokenIDOutput(
             rids=[output.rids[i]],
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_accepted_drafts=_extract_field_by_index(
-                output, "spec_accepted_drafts", i
+            spec_num_correct_drafts=_extract_field_by_index(
+                output, "spec_num_correct_drafts", i
             ),
-            spec_acceptance_histogram=_extract_field_by_index(
-                output, "spec_acceptance_histogram", i
+            spec_correct_drafts_histogram=_extract_field_by_index(
+                output, "spec_correct_drafts_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
@@ -217,11 +217,11 @@ def _handle_output_by_index(output, i):
         new_output = BatchStrOutput(
             rids=[output.rids[i]],
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_accepted_drafts=_extract_field_by_index(
-                output, "spec_accepted_drafts", i
+            spec_num_correct_drafts=_extract_field_by_index(
+                output, "spec_num_correct_drafts", i
             ),
-            spec_acceptance_histogram=_extract_field_by_index(
-                output, "spec_acceptance_histogram", i
+            spec_correct_drafts_histogram=_extract_field_by_index(
+                output, "spec_correct_drafts_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),

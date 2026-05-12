@@ -338,11 +338,11 @@ def add_output_logprobs_for_spec_v1(
     if logits_output is None:
         logits_output = res.logits_output
 
-    if hasattr(res, "num_accepted_drafts_per_req_cpu"):
-        num_accepted_drafts_per_req_cpu = res.num_accepted_drafts_per_req_cpu
+    if hasattr(res, "num_correct_drafts_per_req_cpu"):
+        num_correct_drafts_per_req_cpu = res.num_correct_drafts_per_req_cpu
     else:
         # FIXME: Get a NgramVerifyOutput class and use that instead of this hack.
-        num_accepted_drafts_per_req_cpu = res.num_accepted_drafts.tolist()
+        num_correct_drafts_per_req_cpu = res.num_correct_drafts.tolist()
 
     top_logprobs_nums = batch.top_logprobs_nums
     token_ids_logprobs = batch.token_ids_logprobs
@@ -363,7 +363,7 @@ def add_output_logprobs_for_spec_v1(
             logits_output.next_token_logits / temperatures, dim=-1
         )
     batch_next_token_ids = res.accept_tokens
-    num_tokens_per_req = [accept + 1 for accept in num_accepted_drafts_per_req_cpu]
+    num_tokens_per_req = [accept + 1 for accept in num_correct_drafts_per_req_cpu]
 
     # We should repeat top_logprobs_nums to match num_tokens_per_req.
     top_logprobs_nums_repeat_interleaved = [
