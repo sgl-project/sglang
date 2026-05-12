@@ -12,7 +12,7 @@ Usage:
     # Tag the run for later compare_perf.py usage
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --label tuned
 
-    # All 14 preset models
+    # All 19 preset models
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --all
 
     # Show preset order, model path, and nightly mapping
@@ -42,7 +42,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from diffusion_skill_env import (
+from diffusion_skill_env import (  # noqa: E402
     ensure_dir,
     get_assets_dir,
     get_output_dir,
@@ -58,10 +58,13 @@ DIFFUSERS_FALLBACK_SIGNALS = (
     "using diffusers backend",
     "loaded diffusers pipeline",
 )
+CATALOG_TABLE_WIDTH = 105
+RESULTS_TABLE_WIDTH = 105
 
 # ---------------------------------------------------------------------------
 # Model configs — kept in exact sync with benchmark-and-profile.md
-# Nightly-aligned presets come first, followed by skill-only extras.
+# Nightly-aligned presets mirror scripts/ci/utils/diffusion/comparison_configs.json
+# first, followed by skill-only extras.
 # Each entry produces the same `sglang generate` command as shown in that doc.
 # ---------------------------------------------------------------------------
 MODELS = {
@@ -166,19 +169,36 @@ MODELS = {
     "ltx2": {
         "nightly_case_id": "ltx2_twostage_t2v",
         "path": "Lightricks/LTX-2",
-        "prompt": "A beautiful sunset over the ocean",
-        "negative_prompt": "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static.",
-        "seed": 1234,
+        "prompt": "A cat and a dog baking a cake together in a kitchen.",
         "extra_args": [
             "--pipeline-class-name=LTX2TwoStagePipeline",
-            "--width=1536",
-            "--height=1024",
+            "--width=768",
+            "--height=512",
             "--num-frames=121",
-            "--fps=24",
-            "--num-gpus=1",
+            "--num-inference-steps=50",
+            "--guidance-scale=4.0",
+            "--num-gpus=2",
+            "--enable-cfg-parallel",
         ],
     },
-    # 9. Nightly: wan22_i2v_a14b_720p
+    # 9. Nightly: ltx2.3_twostage_ti2v_2gpus
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "ltx23-ti2v-two-stage": {
+        "nightly_case_id": "ltx2.3_twostage_ti2v_2gpus",
+        "path": "Lightricks/LTX-2.3",
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--pipeline-class-name=LTX2TwoStagePipeline",
+            "--width=768",
+            "--height=512",
+            "--num-frames=121",
+            "--num-inference-steps=50",
+            "--guidance-scale=4.0",
+            "--num-gpus=2",
+        ],
+    },
+    # 10. Nightly: wan22_i2v_a14b_720p
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "wan-i2v": {
         "nightly_case_id": "wan22_i2v_a14b_720p",
@@ -197,7 +217,7 @@ MODELS = {
             "--pin-cpu-memory",
         ],
     },
-    # 10. Skill-only extra preset
+    # 11. Skill-only extra preset
     "ltx23-one-stage": {
         "path": "Lightricks/LTX-2.3",
         "prompt": "A beautiful sunset over the ocean",
@@ -213,7 +233,7 @@ MODELS = {
             "--num-gpus=2",
         ],
     },
-    # 11. Skill-only extra preset
+    # 12. Skill-only extra preset
     "ltx23-two-stage": {
         "path": "Lightricks/LTX-2.3",
         "prompt": "A beautiful sunset over the ocean",
@@ -230,7 +250,25 @@ MODELS = {
             "--num-gpus=2",
         ],
     },
-    # 12. Skill-only extra preset
+    # 13. Skill-only extra preset
+    "ltx23-two-stage-cfg-parallel": {
+        "path": "Lightricks/LTX-2.3",
+        "prompt": "A beautiful sunset over the ocean",
+        "negative_prompt": "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static.",
+        "seed": 1234,
+        "extra_args": [
+            "--pipeline-class-name=LTX2TwoStagePipeline",
+            "--width=1536",
+            "--height=1024",
+            "--num-frames=121",
+            "--fps=24",
+            "--num-inference-steps=30",
+            "--guidance-scale=3.0",
+            "--num-gpus=2",
+            "--cfg-parallel-size=2",
+        ],
+    },
+    # 14. Skill-only extra preset
     "hunyuanvideo": {
         "path": "hunyuanvideo-community/HunyuanVideo",
         "prompt": "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
@@ -243,7 +281,7 @@ MODELS = {
             "--num-inference-steps=30",
         ],
     },
-    # 13. Skill-only extra preset
+    # 15. Skill-only extra preset
     # Requires: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
     "mova-720p": {
         "path": "OpenMOSS-Team/MOVA-720p",
@@ -259,7 +297,7 @@ MODELS = {
             "--num-inference-steps=2",
         ],
     },
-    # 14. Skill-only extra preset
+    # 16. Skill-only extra preset
     "helios": {
         "path": "BestWishYsh/Helios-Base",
         "prompt": "A curious raccoon",
@@ -277,6 +315,84 @@ MODELS = {
             "false",
         ],
     },
+    # 16. Skill-only extra preset
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "joyai-edit": {
+        "path": "jdopensource/JoyAI-Image-Edit-Diffusers",
+        "prompt": "Make the cat wear a red hat",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=40",
+            "--guidance-scale=4.0",
+            "--dit-layerwise-offload",
+            "false",
+            "--dit-cpu-offload",
+            "false",
+            "--num-gpus=2",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=1",
+        ],
+    },
+    # 17. Skill-only extra preset
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "firered-edit-1.0": {
+        "path": "FireRedTeam/FireRed-Image-Edit-1.0",
+        "prompt": "Make the cat wear a red hat",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=40",
+            "--guidance-scale=4.0",
+            "--dit-layerwise-offload",
+            "false",
+            "--dit-cpu-offload",
+            "false",
+            "--num-gpus=2",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=1",
+        ],
+    },
+    # 18. Skill-only extra preset
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "firered-edit-1.1": {
+        "path": "FireRedTeam/FireRed-Image-Edit-1.1",
+        "prompt": "Make the cat wear a red hat",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=40",
+            "--guidance-scale=4.0",
+            "--dit-layerwise-offload",
+            "false",
+            "--dit-cpu-offload",
+            "false",
+            "--num-gpus=2",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=1",
+        ],
+    },
+    # 19. Skill-only extra preset
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "hunyuan3d-shape": {
+        "path": "tencent/Hunyuan3D-2",
+        "prompt": "generate 3d mesh",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "config_overrides": {
+            "paint_enable": False,
+        },
+        "extra_args": [
+            "--num-inference-steps=50",
+            "--guidance-scale=5.0",
+            "--dit-layerwise-offload",
+            "false",
+            "--dit-cpu-offload",
+            "false",
+        ],
+    },
 }
 
 
@@ -285,7 +401,15 @@ def required_gpus_for_model(model_key: str) -> int:
         return 4
     if model_key == "mova-720p":
         return 4
-    if model_key in {"ltx23-one-stage", "ltx23-two-stage"}:
+    if model_key in {
+        "ltx2",
+        "ltx23-ti2v-two-stage",
+        "ltx23-one-stage",
+        "ltx23-two-stage",
+        "joyai-edit",
+        "firered-edit-1.0",
+        "firered-edit-1.1",
+    }:
         return 2
     return 1
 
@@ -297,16 +421,16 @@ def model_nightly_case_id(model_key: str) -> str:
 def print_model_catalog():
     """Print preset order, model path, and whether each preset maps to nightly."""
     print()
-    print("=" * 95)
+    print("=" * CATALOG_TABLE_WIDTH)
     print("MODEL PRESETS — Nightly-aligned first, skill-only extras after")
-    print("=" * 95)
-    print(f"{'Preset':<17} {'Nightly':<28} {'Model Path':<46} {'GPUs':>4}")
-    print("-" * 95)
+    print("=" * CATALOG_TABLE_WIDTH)
+    print(f"{'Preset':<24} {'Nightly':<28} {'Model Path':<46} {'GPUs':>4}")
+    print("-" * CATALOG_TABLE_WIDTH)
     for model_key, cfg in MODELS.items():
         print(
-            f"{model_key:<17} {model_nightly_case_id(model_key):<28} {cfg['path']:<46} {required_gpus_for_model(model_key):>4}"
+            f"{model_key:<24} {model_nightly_case_id(model_key):<28} {cfg['path']:<46} {required_gpus_for_model(model_key):>4}"
         )
-    print("-" * 112)
+    print("-" * CATALOG_TABLE_WIDTH)
     print(
         "Nightly column shows the comparison_configs.json case id; '-' means skill-only."
     )
@@ -344,6 +468,15 @@ def build_sglang_cmd(
 
     if "image_path" in cfg:
         cmd.append(f"--image-path={cfg['image_path']}")
+
+    if "config_overrides" in cfg:
+        config_dir = ensure_dir(
+            get_output_dir("benchmarks", REPO_ROOT) / "generated_configs"
+        )
+        config_path = config_dir / f"{model_key}.json"
+        with open(config_path, "w") as f:
+            json.dump(cfg["config_overrides"], f, indent=2, sort_keys=True)
+        cmd.append(f"--config={config_path}")
 
     cmd.extend(cfg["extra_args"])
 
@@ -498,15 +631,15 @@ def run_benchmark_once(
 def print_results_table(results: list[dict]):
     """Print a compact table for one or more benchmark runs."""
     print()
-    print("=" * 80)
+    print("=" * RESULTS_TABLE_WIDTH)
     print("BENCHMARK RESULTS — Denoise Latency (primary metric ★)")
     print("(Models and params match benchmark-and-profile.md)")
-    print("=" * 80)
+    print("=" * RESULTS_TABLE_WIDTH)
 
     print(
-        f"{'Model':<14} {'Nightly':<24} {'Label':<12} {'Denoise(s)':>12} {'E2E(s)':>10} {'Peak Mem(GB)':>14}"
+        f"{'Model':<24} {'Nightly':<28} {'Label':<12} {'Denoise(s)':>12} {'E2E(s)':>10} {'Peak Mem(GB)':>14}"
     )
-    print("-" * 92)
+    print("-" * RESULTS_TABLE_WIDTH)
 
     for result in results:
         denoise_s = result.get("denoise_latency_s")
@@ -516,10 +649,10 @@ def print_results_table(results: list[dict]):
         e2e_text = f"{e2e_s:.2f}" if isinstance(e2e_s, float) else "n/a"
         mem_text = f"{peak_mem:.1f}" if isinstance(peak_mem, float) else "n/a"
         print(
-            f"{result['model']:<14} {model_nightly_case_id(result['model']):<24} {result['label']:<12} {denoise_text:>12} {e2e_text:>10} {mem_text:>14}"
+            f"{result['model']:<24} {model_nightly_case_id(result['model']):<28} {result['label']:<12} {denoise_text:>12} {e2e_text:>10} {mem_text:>14}"
         )
 
-    print("-" * 92)
+    print("-" * RESULTS_TABLE_WIDTH)
     print()
     print(
         "★ Denoise latency = sum of stages ending with DenoisingStage plus any RefinementStage."
@@ -538,7 +671,7 @@ def main():
         choices=list(MODELS.keys()),
         help="Model to benchmark (default: flux)",
     )
-    parser.add_argument("--all", action="store_true", help="Benchmark all 14 models")
+    parser.add_argument("--all", action="store_true", help="Benchmark all 19 models")
     parser.add_argument(
         "--list-models",
         action="store_true",

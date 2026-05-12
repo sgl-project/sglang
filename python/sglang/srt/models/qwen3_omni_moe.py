@@ -31,6 +31,9 @@ from sglang.srt.configs.qwen3_omni import (
     Qwen3OmniMoeVisionEncoderConfig,
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -82,20 +85,37 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
         self.activation_dropout = config.activation_dropout
-        self.fc1 = ColumnParallelLinear(
-            self.embed_dim,
-            config.encoder_ffn_dim,
-            quant_config=quant_config,
-            bias=True,
-            prefix=f"{prefix}.fc1",
-        )
-        self.fc2 = RowParallelLinear(
-            config.encoder_ffn_dim,
-            self.embed_dim,
-            quant_config=quant_config,
-            bias=True,
-            prefix=f"{prefix}.fc2",
-        )
+        tp_size = get_tensor_model_parallel_world_size()
+        if config.encoder_ffn_dim % tp_size != 0:
+            self.fc1 = ReplicatedLinear(
+                self.embed_dim,
+                config.encoder_ffn_dim,
+                quant_config=quant_config,
+                bias=True,
+                prefix=f"{prefix}.fc1",
+            )
+            self.fc2 = ReplicatedLinear(
+                config.encoder_ffn_dim,
+                self.embed_dim,
+                quant_config=quant_config,
+                bias=True,
+                prefix=f"{prefix}.fc2",
+            )
+        else:
+            self.fc1 = ColumnParallelLinear(
+                self.embed_dim,
+                config.encoder_ffn_dim,
+                quant_config=quant_config,
+                bias=True,
+                prefix=f"{prefix}.fc1",
+            )
+            self.fc2 = RowParallelLinear(
+                config.encoder_ffn_dim,
+                self.embed_dim,
+                quant_config=quant_config,
+                bias=True,
+                prefix=f"{prefix}.fc2",
+            )
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
     def forward(

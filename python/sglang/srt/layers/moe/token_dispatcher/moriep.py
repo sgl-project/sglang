@@ -190,6 +190,7 @@ def init_mori_op(
     instance_id=0,
     fp8_dispatch=False,
     fp4_dispatch=False,
+    enable_sdma=False,
 ):
 
     import mori
@@ -218,7 +219,7 @@ def init_mori_op(
         mori.shmem.shmem_torch_process_group_init(group_name)
 
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
-    async_mode = deepep_mode.enable_low_latency()
+    async_mode = deepep_mode.enable_low_latency() or enable_sdma
     if async_mode:
         mode = EpMode.LOW_LATENCY
 
@@ -361,6 +362,8 @@ class _MoriEPDispatcherImplBase:
             "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
         )
 
+        self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")
+
         self._mori_op = None
         self.fp8_dispatch = False
         self.fp4_dispatch = False
@@ -388,6 +391,7 @@ class _MoriEPDispatcherImplBase:
                 self.instance_id,
                 self.fp8_dispatch,
                 self.fp4_dispatch,
+                self.enable_sdma,
             )
         return self._mori_op
 
@@ -604,13 +608,20 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 else:
                     comm_stream.wait_stream(compute_stream)
 
+                dispatch_fn = (
+                    self.mori_op.dispatch_send
+                    if self.enable_sdma
+                    else self.mori_op.dispatch
+                )
                 (
                     packed_recv_hidden,
                     recv_topk_weights,
                     recv_scales,
                     recv_topk_ids,
                     packed_recv_count,
-                ) = self.mori_op.dispatch(hidden_states, topk_weights, scale, topk_ids)
+                ) = dispatch_fn(hidden_states, topk_weights, scale, topk_ids)
+                if self.enable_sdma:
+                    self.mori_op.dispatch_recv()
 
                 if self.async_finish:
                     done_event = torch.cuda.Event(blocking=False, interprocess=False)
@@ -690,9 +701,14 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 else:
                     comm_stream.wait_stream(compute_stream)
 
-                combined_hidden_states = self.mori_op.combine(
-                    hidden_states, None, topk_ids
-                )[0]
+                combine_fn = (
+                    self.mori_op.combine_send
+                    if self.enable_sdma
+                    else self.mori_op.combine
+                )
+                combined_hidden_states = combine_fn(hidden_states, None, topk_ids)[0]
+                if self.enable_sdma:
+                    self.mori_op.combine_recv()
 
                 if self.async_finish:
                     done_event = torch.cuda.Event(blocking=False, interprocess=False)
@@ -915,6 +931,18 @@ class MoriEPDispatcher(BaseDispatcher):
         super().__init__()
 
         self.deepep_mode = deepep_mode
+
+        async_mode = self.deepep_mode.enable_low_latency()
+        if get_bool_env_var("SGLANG_ROCM_USE_MULTI_STREAM") and not async_mode:
+            logger.warning_once(
+                "SGLANG_ROCM_USE_MULTI_STREAM=1 is set but Mori AsyncLL is "
+                "not enabled (--deepep-mode=%s). The alt-stream overlap only "
+                "frees up CUs when dispatch/combine runs on the AsyncLL "
+                "copy-engine kernel; otherwise it stays on CUs and competes "
+                "with the alt-stream work. Pass --deepep-mode low_latency "
+                "(or auto) to enable the AsyncLL kernel.",
+                self.deepep_mode.value,
+            )
 
         common_kwargs = dict(
             group=group,

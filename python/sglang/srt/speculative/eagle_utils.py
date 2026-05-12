@@ -4,13 +4,14 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
@@ -45,7 +46,7 @@ class TreeMaskMode(IntEnum):
 
 
 def build_tree_kernel_efficient(
-    verified_id: torch.Tensor,
+    bonus_tokens: torch.Tensor,
     parent_list: List[torch.Tensor],
     top_scores_index: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -58,7 +59,7 @@ def build_tree_kernel_efficient(
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
 ):
-    draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
+    draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
 
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
     bs = seq_lens.numel()
@@ -169,7 +170,7 @@ def verify_tree_greedy_func(
     target_predict: torch.Tensor,
     topk: int = -1,
 ):
-    if _is_cuda or _is_hip:
+    if _is_cuda or _is_hip or _is_musa:
         from sgl_kernel import verify_tree_greedy
 
         verify_tree_greedy(

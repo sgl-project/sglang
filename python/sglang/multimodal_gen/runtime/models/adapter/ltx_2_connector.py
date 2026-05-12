@@ -1,6 +1,8 @@
+import functools
 import math
 from typing import Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,8 +21,7 @@ def apply_interleaved_rotary_emb(
     cos, sin = freqs
     x_real, x_imag = x.unflatten(2, (-1, 2)).unbind(-1)  # [B, S, C // 2]
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(2)
-    out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
-    return out
+    return x * cos + x_rotated * sin
 
 
 def apply_split_rotary_emb(
@@ -47,7 +48,7 @@ def apply_split_rotary_emb(
     r = last // 2
 
     # (..., 2, r)
-    split_x = x.reshape(*x.shape[:-1], 2, r).float()
+    split_x = x.reshape(*x.shape[:-1], 2, r)
     first_x = split_x[..., :1, :]  # (..., 1, r)
     second_x = split_x[..., 1:, :]  # (..., 1, r)
 
@@ -68,6 +69,19 @@ def apply_split_rotary_emb(
 
     out = out.to(dtype=x_dtype)
     return out
+
+
+@functools.lru_cache(maxsize=5)
+def _ltx2_connector_rope_freq_grid_np(
+    theta: float, num_pos_dims: int, dim: int
+) -> torch.Tensor:
+    # Official LTX uses NumPy float64 for double-precision RoPE frequencies.
+    n_elem = 2 * num_pos_dims
+    pow_indices = np.power(
+        theta,
+        np.linspace(0.0, 1.0, dim // n_elem, dtype=np.float64),
+    )
+    return torch.tensor(pow_indices * math.pi / 2.0, dtype=torch.float32)
 
 
 class LTX2Attention(torch.nn.Module):
@@ -261,18 +275,22 @@ class LTX2RotaryPosEmbed1d(nn.Module):
 
         # 2. Calculate 1D RoPE frequencies
         num_rope_elems = 2  # 1 (because 1D) * 2 (for cos, sin) = 2
-        freqs_dtype = torch.float64 if self.double_precision else torch.float32
-        pow_indices = torch.pow(
-            self.theta,
-            torch.linspace(
-                start=0.0,
-                end=1.0,
-                steps=self.dim // num_rope_elems,
-                dtype=freqs_dtype,
-                device=device,
-            ),
-        )
-        freqs = (pow_indices * torch.pi / 2.0).to(dtype=torch.float32)
+        if self.double_precision:
+            freqs = _ltx2_connector_rope_freq_grid_np(self.theta, 1, self.dim).to(
+                device=device
+            )
+        else:
+            pow_indices = torch.pow(
+                self.theta,
+                torch.linspace(
+                    start=0.0,
+                    end=1.0,
+                    steps=self.dim // num_rope_elems,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
+            freqs = (pow_indices * torch.pi / 2.0).to(dtype=torch.float32)
 
         # 3. Matrix-vector outer product between pos ids of shape (batch_size, seq_len) and freqs vector of shape
         # (self.dim // 2,).
@@ -487,7 +505,12 @@ class LTX2ConnectorTransformer1d(nn.Module):
             attention_mask = torch.zeros_like(attention_mask)
 
         # 2. Calculate 1D RoPE positional embeddings
-        rotary_emb = self.rope(batch_size, seq_len, device=hidden_states.device)
+        rotary_emb = self.rope(
+            batch_size,
+            seq_len,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
 
         # 3. Run 1D transformer blocks
         for block in self.transformer_blocks:
