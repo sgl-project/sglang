@@ -278,18 +278,16 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         # B vector 2 * d_ssm -> 2 * d_ssm + (n_group * d_state)
         mup_vector[
             :,
-            (2 * self.d_ssm) // self.tp_size : (
-                2 * self.d_ssm + self.groups_time_state_size
-            )
+            (2 * self.d_ssm)
+            // self.tp_size : (2 * self.d_ssm + self.groups_time_state_size)
             // self.tp_size,
         ] *= self.zxbcdt_multipliers[2]
         # C vector 2 * d_ssm + (n_group * d_state)
         # -> 2 * d_ssm + 2 * (n_group * d_state)
         mup_vector[
             :,
-            (2 * self.d_ssm + self.groups_time_state_size) // self.tp_size : (
-                2 * self.d_ssm + 2 * self.groups_time_state_size
-            )
+            (2 * self.d_ssm + self.groups_time_state_size)
+            // self.tp_size : (2 * self.d_ssm + 2 * self.groups_time_state_size)
             // self.tp_size,
         ] *= self.zxbcdt_multipliers[3]
         # dt vector 2 * d_ssm + 2 * (n_group * d_state)
