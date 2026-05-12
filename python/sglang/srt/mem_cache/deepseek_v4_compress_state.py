@@ -6,7 +6,6 @@ from contextlib import nullcontext
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -40,9 +39,7 @@ class KVAndScore:
 
 @dataclasses.dataclass
 class KVAndScoreSeparate:
-    """Legacy layout: kv and score stored as separate tensors of equal shape.
-    (``SGLANG_CPU_USE_COMPRESS_SEPARATE=1``).
-    """
+    """Legacy layout: kv and score stored as separate tensors of equal shape."""
 
     kv: torch.Tensor
     score: torch.Tensor
@@ -109,7 +106,7 @@ class DeepSeekV4CompressState:
             self.kv_score_state = torch.empty(state_shape, dtype=dtype, device=device)
 
     def get_state(self):
-        if envs.SGLANG_CPU_USE_COMPRESS_SEPARATE.get() or (_is_cpu and _cpu_amx):
+        if _is_cpu and _cpu_amx:
             half_dim = self.head_dim * (1 + self.overlap)
             return KVAndScoreSeparate(
                 kv=self.kv_score_state[..., :half_dim],

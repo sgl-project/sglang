@@ -386,7 +386,7 @@ class Compressor(nn.Module):
 
     @cached_property
     def use_fused_compress(self) -> bool:
-        if envs.SGLANG_CPU_USE_COMPRESS_SEPARATE.get() or (_is_cpu and _cpu_amx):
+        if _is_cpu and _cpu_amx:
             return False
         return True
 
