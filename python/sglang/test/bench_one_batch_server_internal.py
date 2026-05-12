@@ -1032,12 +1032,12 @@ def run_benchmark_internal(
             kv_footprint_bs = (
                 bs if effective_running_cap is None else min(bs, effective_running_cap)
             )
-            # if should_skip_due_to_max_running_requests(
-            #     bs, skip_max_running_requests_threshold
-            # ) or should_skip_due_to_token_capacity(
-            #     kv_footprint_bs, il, ol, skip_token_capacity_threshold
-            # ):
-            #     continue
+            if should_skip_due_to_max_running_requests(
+                bs, skip_max_running_requests_threshold
+            ) or should_skip_due_to_token_capacity(
+                kv_footprint_bs, il, ol, skip_token_capacity_threshold
+            ):
+                continue
             results.append(
                 run_one_case(
                     base_url,
@@ -1076,12 +1076,12 @@ def run_benchmark_internal(
                         if effective_running_cap is None
                         else min(bs, effective_running_cap)
                     )
-                    # if should_skip_due_to_max_running_requests(
-                    #     bs, skip_max_running_requests_threshold
-                    # ) or should_skip_due_to_token_capacity(
-                    #     kv_footprint_bs, il, ol, skip_token_capacity_threshold
-                    # ):
-                    #     continue
+                    if should_skip_due_to_max_running_requests(
+                        bs, skip_max_running_requests_threshold
+                    ) or should_skip_due_to_token_capacity(
+                        kv_footprint_bs, il, ol, skip_token_capacity_threshold
+                    ):
+                        continue
                     profile_prefix = (
                         bench_args.profile_prefix or ""
                     ) + f"bs-{bs}-il-{il}"
