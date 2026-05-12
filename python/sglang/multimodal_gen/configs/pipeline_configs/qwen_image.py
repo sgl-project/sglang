@@ -183,7 +183,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
     )
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(fsdp_cfg_auto_min_available_memory_gb=70)
+        return ModelDeploymentConfig(fsdp_auto_min_available_memory_gb=70)
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)

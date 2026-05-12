@@ -84,7 +84,7 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     F_PATCH_SIZE: int = 1
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(fsdp_cfg_auto_min_available_memory_gb=40)
+        return ModelDeploymentConfig(fsdp_auto_min_available_memory_gb=40)
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         rendered_prompts = [

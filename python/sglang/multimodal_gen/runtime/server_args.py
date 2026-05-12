@@ -944,10 +944,9 @@ class ServerArgs(DisaggArgsMixin):
             help=(
                 "Preset for performance and memory defaults. "
                 "'manual' keeps performance-related server args under explicit user control; "
-                "'auto' only applies high-confidence defaults; "
+                "'auto' keeps safe defaults and applies high-confidence FSDP/CFG improvements; "
                 "'speed' favors GPU-resident execution for lower latency and higher throughput, and may OOM; "
                 "'memory' favors lower GPU memory usage; "
-                "'balanced' prefers FSDP+CFG on validated multi-GPU Qwen/Wan CFG models. "
                 "Explicit offload/FSDP/parallelism flags take precedence."
             ),
         )

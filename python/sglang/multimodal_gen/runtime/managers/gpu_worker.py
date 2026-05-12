@@ -875,14 +875,14 @@ OOM detected. Possible solutions:
        In multi-GPU runs, the least-free selected GPU is the bottleneck.
     2. For single-GPU deployment, use `--performance-mode memory`, component CPU offload,
        or `--dit-layerwise-offload` for supported Wan/MOVA DiTs.
-    3. For multi-GPU deployment, use `--performance-mode balanced` or explicit
+    3. For multi-GPU deployment, keep the default `--performance-mode auto` or set
        `--use-fsdp-inference true` to shard DiT weights with FSDP. FSDP is not a
        single-GPU substitute for CPU offload.
   - If the OOM occurs during runtime:
     1. Reduce resolution, `--num-frames`, or batch size.
     2. Use `--performance-mode memory` for lower memory usage.
     3. Enable SP/Ulysses/Ring for sequence-heavy workloads in multi-GPU setups.
-    4. Use FSDP+CFG for validated multi-GPU Qwen/Wan CFG workloads.
+    4. Use FSDP, with CFG parallelism when supported, for validated multi-GPU workloads.
     5. Use a lower-memory attention backend or quantization when available.
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """

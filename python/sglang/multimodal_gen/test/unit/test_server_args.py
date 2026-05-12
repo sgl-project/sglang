@@ -249,16 +249,18 @@ class TestOffloadDefaults(unittest.TestCase):
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
 
-        self.assertEqual(qwen_deployment.fsdp_cfg_auto_min_available_memory_gb, 70)
+        self.assertEqual(qwen_deployment.fsdp_auto_min_available_memory_gb, 70)
         self.assertFalse(qwen_deployment.auto_dit_layerwise_offload)
 
-        self.assertEqual(wan_deployment.fsdp_cfg_auto_min_available_memory_gb, 40)
+        self.assertEqual(wan_deployment.fsdp_auto_min_available_memory_gb, 40)
+        self.assertFalse(wan_deployment.fsdp_auto_requires_cfg)
         self.assertTrue(wan_deployment.auto_dit_layerwise_offload)
 
-        self.assertIsNone(mova_deployment.fsdp_cfg_auto_min_available_memory_gb)
+        self.assertIsNone(mova_deployment.fsdp_auto_min_available_memory_gb)
         self.assertTrue(mova_deployment.auto_dit_layerwise_offload)
 
-        self.assertEqual(zimage_deployment.fsdp_cfg_auto_min_available_memory_gb, 40)
+        self.assertEqual(zimage_deployment.fsdp_auto_min_available_memory_gb, 40)
+        self.assertTrue(zimage_deployment.fsdp_auto_requires_cfg)
         self.assertFalse(zimage_deployment.auto_dit_layerwise_offload)
 
     def test_manual_mode_preserves_unset_performance_args(self):
@@ -324,6 +326,22 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.dit_layerwise_offload)
         self.assertTrue(args.use_fsdp_inference)
 
+    def test_auto_multi_gpu_wan_can_use_fsdp_without_cfg(self):
+        with patch.object(ServerArgs, "_model_default_uses_cfg", return_value=False):
+            args = self._from_dict_with_pipeline_config(
+                WanT2V480PConfig(),
+                kwargs={
+                    "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+                    "num_gpus": 2,
+                    "performance_mode": "auto",
+                },
+            )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertFalse(args.enable_cfg_parallel)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.dit_layerwise_offload)
+
     def test_auto_multi_gpu_qwen_prefers_fsdp_cfg(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
@@ -341,74 +359,40 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
 
-    def test_balanced_multi_gpu_qwen_prefers_fsdp_cfg(self):
-        args = self._from_dict_with_pipeline_config(
-            QwenImagePipelineConfig(),
-            kwargs={
-                "model_path": "Qwen/Qwen-Image",
-                "num_gpus": 2,
-                "performance_mode": "balanced",
-            },
-        )
-
-        self.assertTrue(args.use_fsdp_inference)
-        self.assertTrue(args.enable_cfg_parallel)
-        self.assertFalse(args.dit_cpu_offload)
-        self.assertFalse(args.dit_layerwise_offload)
-        self.assertFalse(args.text_encoder_cpu_offload)
-        self.assertFalse(args.image_encoder_cpu_offload)
-
-    def test_balanced_multi_gpu_zimage_base_prefers_fsdp_cfg(self):
+    def test_auto_multi_gpu_zimage_base_prefers_fsdp(self):
         args = self._from_dict_with_pipeline_config(
             ZImagePipelineConfig(),
             kwargs={
                 "model_path": "Tongyi-MAI/Z-Image",
                 "num_gpus": 2,
-                "performance_mode": "balanced",
+                "performance_mode": "auto",
             },
         )
 
         self.assertTrue(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
-    def test_balanced_multi_gpu_zimage_turbo_skips_fsdp_cfg(self):
+    def test_auto_multi_gpu_zimage_turbo_skips_fsdp(self):
         args = self._from_dict_with_pipeline_config(
             ZImagePipelineConfig(),
             kwargs={
                 "model_path": "Tongyi-MAI/Z-Image-Turbo",
                 "num_gpus": 2,
-                "performance_mode": "balanced",
+                "performance_mode": "auto",
             },
         )
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.enable_cfg_parallel)
 
-    def test_balanced_multi_gpu_qwen_preserves_explicit_fsdp_false(self):
+    def test_auto_multi_gpu_qwen_preserves_explicit_fsdp_false(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={
                 "model_path": "Qwen/Qwen-Image",
                 "num_gpus": 2,
-                "performance_mode": "balanced",
+                "performance_mode": "auto",
                 "use_fsdp_inference": False,
-            },
-        )
-
-        self.assertFalse(args.use_fsdp_inference)
-        self.assertTrue(args.enable_cfg_parallel)
-        self.assertFalse(args.dit_cpu_offload)
-        self.assertFalse(args.text_encoder_cpu_offload)
-        self.assertFalse(args.image_encoder_cpu_offload)
-
-    def test_balanced_multi_gpu_qwen_skips_fsdp_when_available_memory_is_low(self):
-        args = self._from_dict_with_pipeline_config(
-            QwenImagePipelineConfig(),
-            memory_gb=50,
-            kwargs={
-                "model_path": "Qwen/Qwen-Image",
-                "num_gpus": 2,
-                "performance_mode": "balanced",
             },
         )
 
@@ -418,7 +402,24 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
 
-    def test_balanced_multi_gpu_qwen_uses_selected_gpu_min_available_memory(self):
+    def test_auto_multi_gpu_qwen_skips_fsdp_when_available_memory_is_low(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            memory_gb=50,
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+
+    def test_auto_multi_gpu_qwen_uses_selected_gpu_min_available_memory(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             available_memory_gb={1: 50, 2: 80},
@@ -426,14 +427,14 @@ class TestOffloadDefaults(unittest.TestCase):
                 "model_path": "Qwen/Qwen-Image",
                 "base_gpu_id": 1,
                 "num_gpus": 2,
-                "performance_mode": "balanced",
+                "performance_mode": "auto",
             },
         )
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
-    def test_balanced_multi_gpu_qwen_accepts_when_all_selected_gpus_have_headroom(self):
+    def test_auto_multi_gpu_qwen_accepts_when_all_selected_gpus_have_headroom(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             available_memory_gb={1: 72, 2: 80},
@@ -441,7 +442,7 @@ class TestOffloadDefaults(unittest.TestCase):
                 "model_path": "Qwen/Qwen-Image",
                 "base_gpu_id": 1,
                 "num_gpus": 2,
-                "performance_mode": "balanced",
+                "performance_mode": "auto",
             },
         )
 
@@ -509,22 +510,6 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.dit_layerwise_offload)
         self.assertFalse(args.dit_cpu_offload)
 
-    def test_balanced_mode_multi_gpu_qwen_prefers_fsdp_cfg(self):
-        args = self._from_dict_with_pipeline_config(
-            QwenImagePipelineConfig(),
-            kwargs={
-                "model_path": "Qwen/Qwen-Image",
-                "num_gpus": 2,
-                "performance_mode": "balanced",
-            },
-        )
-
-        self.assertEqual(args.performance_mode, "balanced")
-        self.assertTrue(args.use_fsdp_inference)
-        self.assertTrue(args.enable_cfg_parallel)
-        self.assertFalse(args.dit_cpu_offload)
-        self.assertFalse(args.text_encoder_cpu_offload)
-
     def test_invalid_performance_mode_raises(self):
         with self.assertRaises(ValueError):
             self._from_dict_with_pipeline_config(
@@ -541,7 +526,7 @@ class TestOffloadDefaults(unittest.TestCase):
             "--num-gpus",
             "2",
             "--performance-mode",
-            "balanced",
+            "auto",
             "--enable-cfg-parallel",
             "false",
         ]

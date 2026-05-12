@@ -98,7 +98,8 @@ class WanT2V480PConfig(PipelineConfig):
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
             auto_dit_layerwise_offload_high_memory_disable_gb=130,
-            fsdp_cfg_auto_min_available_memory_gb=40,
+            fsdp_auto_min_available_memory_gb=40,
+            fsdp_auto_requires_cfg=False,
         )
 
 

@@ -21,17 +21,16 @@ Base the decision on available memory on the selected GPU(s).
 
 ## Performance Modes
 
-`--performance-mode` applies safe presets without overriding explicit offload, FSDP, or parallelism flags. `manual` is the default and does not apply performance presets. `--mode` is a short alias.
+`--performance-mode` applies safe presets without overriding explicit offload, FSDP, or parallelism flags. `auto` is the default. Use `manual` when you need to keep performance-related server args under explicit user control. `--mode` is a short alias.
 
 | Mode       | Meaning                                                                                                                   |
 |------------|---------------------------------------------------------------------------------------------------------------------------|
-| `manual`   | Default. Keeps performance-related server args under explicit user control.                                               |
-| `auto`     | Applies only high-confidence defaults, currently multi-GPU Qwen/Wan CFG models and validated layerwise offload defaults. |
+| `manual`   | Keeps performance-related server args under explicit user control.                                                       |
+| `auto`     | Default. Keeps legacy safe offload defaults and uses FSDP/CFG on validated multi-GPU deployments when it is likely better. |
 | `speed`    | Favors GPU-resident execution for lower latency and higher throughput. Disables CPU offload when unset; may OOM.           |
 | `memory`   | Favors lower GPU memory. Uses component offload, or Wan/MOVA layerwise DiT offload when supported.                         |
-| `balanced` | Keeps existing single-GPU defaults; on validated multi-GPU Qwen/Wan CFG models prefers FSDP+CFG.                          |
 
-`auto` and `balanced` check selected GPU memory before applying GPU-resident FSDP+CFG defaults. In multi-GPU runs they use the least available memory across selected GPUs. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk.
+`auto` checks selected GPU memory before applying GPU-resident FSDP defaults. In multi-GPU runs it uses the least available memory across selected GPUs. When the model default uses CFG and the user did not set a parallelism policy, `auto` also enables CFG parallelism. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk.
 
 The modes tune residency for native pipeline components declared to the component residency manager. Today this covers the major DiT, text/image encoder, VAE, vocoder, and upsampler components; DiT can use layerwise offload when supported, while text encoders use either resident execution or component CPU offload. Do not assume text-encoder layerwise offload unless a model implements and validates it.
 
@@ -44,7 +43,7 @@ Examples:
 sglang generate \
   --model-path Qwen/Qwen-Image \
   --num-gpus 2 \
-  --performance-mode balanced
+  --performance-mode auto
 ```
 
 ```bash
@@ -59,11 +58,11 @@ Explicit flags win over the mode:
 sglang generate \
   --model-path Qwen/Qwen-Image \
   --num-gpus 2 \
-  --performance-mode balanced \
+  --performance-mode auto \
   --use-fsdp-inference false
 ```
 
-In this example, `balanced` will not re-enable FSDP. The same applies to parallelism; for example, `--enable-cfg-parallel false` keeps CFG parallelism disabled.
+In this example, `auto` will not re-enable FSDP. The same applies to parallelism; for example, `--enable-cfg-parallel false` keeps CFG parallelism disabled.
 
 ## Interpreting The Levers
 

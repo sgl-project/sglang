@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-PERFORMANCE_MODES = ("manual", "auto", "speed", "memory", "balanced")
+PERFORMANCE_MODES = ("manual", "auto", "speed", "memory")
 
 
 class ServerArgsAutoTuner:
@@ -40,11 +40,11 @@ class ServerArgsAutoTuner:
 
         if args.performance_mode == "speed":
             logger.info("Applying performance_mode=speed")
-            if args.num_gpus >= 2 and self._can_apply_fsdp_cfg_policy(
+            if args.num_gpus >= 2 and self._can_apply_fsdp_policy(
                 require_memory_headroom=False
             ):
                 self._set_gpu_resident_defaults(use_fsdp=True)
-                self._enable_cfg_parallel_if_unset()
+                self._enable_cfg_parallel_if_supported()
             else:
                 self._set_gpu_resident_defaults(use_fsdp=False)
             return
@@ -62,27 +62,18 @@ class ServerArgsAutoTuner:
                 self._set_component_offload_defaults()
             return
 
-        if args.performance_mode == "balanced":
-            logger.info("Applying performance_mode=balanced")
-            if args.num_gpus >= 2 and self._can_apply_fsdp_cfg_policy(
-                require_memory_headroom=True
-            ):
-                self._set_gpu_resident_defaults(use_fsdp=True)
-                self._enable_cfg_parallel_if_unset()
-            return
-
         if (
             args.performance_mode == "auto"
             and args.num_gpus >= 2
             and not self._has_explicit_memory_policy()
-            and not self._has_explicit_parallel_policy()
-            and self._can_apply_fsdp_cfg_policy(require_memory_headroom=True)
+            and self._can_apply_fsdp_policy(require_memory_headroom=True)
         ):
             logger.info(
-                "Automatically selecting FSDP+CFG defaults for multi-GPU Qwen/Wan CFG model"
+                "Automatically selecting FSDP defaults for multi-GPU %s",
+                args.pipeline_config.__class__.__name__,
             )
             self._set_gpu_resident_defaults(use_fsdp=True)
-            args.enable_cfg_parallel = True
+            self._enable_cfg_parallel_if_supported()
 
     def adjust_auto_dit_layerwise_offload(self) -> None:
         args = self.server_args
@@ -263,31 +254,34 @@ class ServerArgsAutoTuner:
             or args.enable_cfg_parallel is not None
         )
 
-    def _enable_cfg_parallel_if_unset(self) -> None:
+    def _enable_cfg_parallel_if_supported(self) -> None:
         args = self.server_args
-        if args.enable_cfg_parallel is None:
+        if (
+            args.enable_cfg_parallel is None
+            and not self._has_explicit_parallel_policy()
+            and args._model_default_uses_cfg()
+        ):
             args.enable_cfg_parallel = True
 
-    def _supports_high_confidence_fsdp_cfg(self) -> bool:
-        """whether applying fsdp cfg will very-likely to bring performance gain"""
-        args = self.server_args
-        return (
-            self._deployment_config().fsdp_cfg_auto_min_available_memory_gb is not None
-            and args._model_default_uses_cfg()
+    def _supports_high_confidence_fsdp(self) -> bool:
+        deployment_config = self._deployment_config()
+        return deployment_config.fsdp_auto_min_available_memory_gb is not None and (
+            not deployment_config.fsdp_auto_requires_cfg
+            or self.server_args._model_default_uses_cfg()
         )
 
-    def _has_enough_available_memory_for_fsdp_cfg(self) -> bool:
+    def _has_enough_available_memory_for_fsdp(self) -> bool:
         args = self.server_args
         min_available_gb = self._get_min_available_device_memory_gb()
         if min_available_gb is None:
             return True
 
-        required_gb = self._deployment_config().fsdp_cfg_auto_min_available_memory_gb
+        required_gb = self._deployment_config().fsdp_auto_min_available_memory_gb
         if required_gb is None:
             return False
         if min_available_gb < required_gb:
             logger.info(
-                "Skipping automatic FSDP+CFG defaults: minimum available memory on selected GPUs %.2f GiB is below %.2f GiB for %s",
+                "Skipping automatic FSDP defaults: minimum available memory on selected GPUs %.2f GiB is below %.2f GiB for %s",
                 min_available_gb,
                 required_gb,
                 args.pipeline_config.__class__.__name__,
@@ -295,10 +289,9 @@ class ServerArgsAutoTuner:
             return False
         return True
 
-    def _can_apply_fsdp_cfg_policy(self, *, require_memory_headroom: bool) -> bool:
-        if not self._supports_high_confidence_fsdp_cfg():
+    def _can_apply_fsdp_policy(self, *, require_memory_headroom: bool) -> bool:
+        if not self._supports_high_confidence_fsdp():
             return False
         return (
-            not require_memory_headroom
-            or self._has_enough_available_memory_for_fsdp_cfg()
+            not require_memory_headroom or self._has_enough_available_memory_for_fsdp()
         )
