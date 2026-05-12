@@ -743,8 +743,12 @@ class NixlKVManager(CommonKVManager):
             num_heads_to_send = dst_heads_per_rank
             dst_head_start_offset = 0
 
+        # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set, e.g.
+        # 0xffff81ab54e01000). Use np.uint64 to prevent overflow on XPU.
+        kv_data_ptrs = np.array(self.kv_args.kv_data_ptrs, dtype=np.uint64)
+        dst_kv_ptrs = np.array(dst_kv_ptrs, dtype=np.uint64)
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            self.get_mha_kv_ptrs_with_pp(kv_data_ptrs, dst_kv_ptrs)
         )
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
@@ -765,11 +769,11 @@ class NixlKVManager(CommonKVManager):
             for layer_id in range(layers_current_pp_stage)
         ]
 
-        prefill_indices = np.asarray(prefill_kv_indices, dtype=np.int64)
-        dst_indices = np.asarray(dst_kv_indices, dtype=np.int64)
+        prefill_indices = np.asarray(prefill_kv_indices, dtype=np.uint64)
+        dst_indices = np.asarray(dst_kv_indices, dtype=np.uint64)
         bytes_per_token_prefill = src_kv_item_len // page_size
         bytes_per_token_decode = dst_kv_item_len // page_size
-        token_offsets = np.arange(page_size, dtype=np.int64)
+        token_offsets = np.arange(page_size, dtype=np.uint64)
 
         src_addrs = []
         dst_addrs = []
@@ -1010,62 +1014,6 @@ class NixlKVManager(CommonKVManager):
             raise Exception("Failed to post Mamba state slice transfer")
         return xfer_handle
 
-    def _send_state_pages_flat(
-        self,
-        peer_name: str,
-        prefill_state_indices: List[int],
-        dst_state_data_ptrs: list[int],
-        dst_state_indices: List[int],
-        dst_state_item_lens: list[int],
-        dst_gpu_id: int,
-        notif: str,
-    ):
-        """Per-page WRITE transfer of a flat (heterogeneous) state pool.
-
-        Used by V4 whose state pool is a flat list of buffers (SWA + compress
-        + indexer pools) that does not match the per-layer K/V layout assumed
-        by ``_send_kvcache_generic``. Both sides must have identical
-        ``state_item_lens`` (no TP-slicing path).
-        """
-        src_state_ptrs = self.kv_args.state_data_ptrs
-        src_state_item_lens = self.kv_args.state_item_lens
-        assert len(src_state_ptrs) == len(dst_state_data_ptrs)
-        assert len(src_state_item_lens) == len(dst_state_item_lens)
-        assert len(prefill_state_indices) == len(dst_state_indices), (
-            f"State index length mismatch: prefill={len(prefill_state_indices)}, "
-            f"dst={len(dst_state_indices)}"
-        )
-        for i in range(len(src_state_item_lens)):
-            assert src_state_item_lens[i] == dst_state_item_lens[i], (
-                f"V4 state item length mismatch at index {i}: "
-                f"{src_state_item_lens[i]} != {dst_state_item_lens[i]}"
-            )
-
-        src_addrs = []
-        dst_addrs = []
-        for i in range(len(src_state_ptrs)):
-            item_len = src_state_item_lens[i]
-            for src_idx, dst_idx in zip(prefill_state_indices, dst_state_indices):
-                src_addr = src_state_ptrs[i] + int(src_idx) * item_len
-                dst_addr = dst_state_data_ptrs[i] + int(dst_idx) * item_len
-                src_addrs.append((src_addr, item_len, self.kv_args.gpu_id))
-                dst_addrs.append((dst_addr, item_len, dst_gpu_id))
-
-        if not src_addrs:
-            return None
-
-        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
-        )
-        if not xfer_handle:
-            raise Exception("KVSender failed to create state transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post state transfer")
-        return xfer_handle
-
     def maybe_send_extra(
         self,
         peer_name: str,
@@ -1123,16 +1071,6 @@ class NixlKVManager(CommonKVManager):
                 dst_data_indices=np.array(dst_state_indices, dtype=np.int32),
                 dst_gpu_id=dst_gpu_id,
                 notif=notif,
-            )
-        elif state_type == "dsv4":
-            return self._send_state_pages_flat(
-                peer_name,
-                prefill_state_indices,
-                dst_state_data_ptrs,
-                dst_state_indices,
-                dst_state_item_lens or [],
-                dst_gpu_id,
-                notif,
             )
         else:
             if state_type != "none":

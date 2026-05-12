@@ -74,8 +74,8 @@ class DFlashWorker:
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
         self.draft_window_size: Optional[int] = (
-            int(server_args.speculative_dflash_draft_window_size)
-            if server_args.speculative_dflash_draft_window_size is not None
+            int(server_args.speculative_draft_window_size)
+            if server_args.speculative_draft_window_size is not None
             else None
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
@@ -1080,7 +1080,7 @@ class DFlashWorker:
         if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             return
 
-        accepted_steps = commit_lens.to(torch.int64) - 1
+        accept_steps = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
@@ -1103,7 +1103,7 @@ class DFlashWorker:
             )
 
         attn_backend.update_mamba_state_after_mtp_verify(
-            accepted_steps=accepted_steps,
+            accept_steps=accept_steps,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
@@ -1178,7 +1178,7 @@ class DFlashWorker:
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_drafts=0,
+                num_correct_drafts=0,
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
             )
 
@@ -1216,7 +1216,7 @@ class DFlashWorker:
             new_bonus_tokens,
             commit_lens,
             next_target_hidden,
-            num_accepted_drafts_per_req_cpu,
+            num_correct_drafts_per_req_cpu,
         ) = verify_input.verify(
             batch=batch,
             logits_output=logits_output,
@@ -1239,18 +1239,18 @@ class DFlashWorker:
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
-        num_accepted_drafts = sum(num_accepted_drafts_per_req_cpu)
+        num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:
             logger.info(
-                "DFLASH verify completed. num_accepted_drafts_per_req=%s",
-                num_accepted_drafts_per_req_cpu,
+                "DFLASH verify completed. num_correct_drafts_per_req=%s",
+                num_correct_drafts_per_req_cpu,
             )
             self._logged_first_verify = True
 
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=new_bonus_tokens,
-            num_accepted_drafts=num_accepted_drafts,
-            num_accepted_drafts_per_req_cpu=num_accepted_drafts_per_req_cpu,
+            num_correct_drafts=num_correct_drafts,
+            num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )
