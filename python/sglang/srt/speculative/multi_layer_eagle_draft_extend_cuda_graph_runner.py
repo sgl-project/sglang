@@ -359,8 +359,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         )
         spec_info.positions = None
 
-        capture_mode = self.model_runner.spec_algorithm.capture_or_null(
-            CaptureHiddenMode.FULL
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.model_runner.spec_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
         )
 
         # Forward batch

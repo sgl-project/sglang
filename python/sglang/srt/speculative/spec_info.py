@@ -17,7 +17,6 @@ from sglang.srt.speculative.spec_registry import (
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
-    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
@@ -106,21 +105,6 @@ class SpeculativeAlgorithm(Enum):
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
-
-    def consumes_hidden_states(self) -> bool:
-        """Whether this algorithm's draft architecture reads
-        `spec_info.hidden_states` as input (chain-style drafts do; STANDALONE
-        does not)."""
-        return not self.is_standalone()
-
-    def capture_or_null(self, mode: "CaptureHiddenMode") -> "CaptureHiddenMode":
-        """Return `mode` if the draft architecture consumes hidden_states,
-        else NULL. Call-site pattern: `algo.capture_or_null(FULL)` for target
-        prefill / v2 draft-extend, `algo.capture_or_null(LAST)` for draft
-        chain-seed."""
-        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-
-        return mode if self.consumes_hidden_states() else CaptureHiddenMode.NULL
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
