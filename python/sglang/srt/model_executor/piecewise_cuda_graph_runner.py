@@ -426,6 +426,10 @@ class PiecewiseCudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         num_tokens = len(forward_batch.input_ids)
+        if self.require_mlp_tp_gather:
+            global_num_tokens = forward_batch.global_num_tokens_cpu
+            if global_num_tokens is None or any(x <= 0 for x in global_num_tokens):
+                return False
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
                 forward_batch.extend_logprob_start_lens_cpu,
