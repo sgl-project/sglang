@@ -2027,7 +2027,7 @@ class Scheduler(
         recv_req: BatchTokenizedGenerateReqInput,
     ):
         """Handle optimized batch generate request."""
-        logger.debug(f"Processing batch generate request with {len(recv_req)} requests")
+        logger.info(f"Processing batch generate request with {len(recv_req)} requests")
 
         # Process each request in the batch
         for tokenized_req in recv_req:
@@ -2047,7 +2047,7 @@ class Scheduler(
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                logger.debug(
+                logger.info(
                     "[prefetch_kvcache] submit rid=%s matched_len=%d new_tokens=%d "
                     "last_host_node_id=%s backuped=%s pass_prefix_keys=%s",
                     req.rid,
@@ -2065,7 +2065,7 @@ class Scheduler(
                     prefix_keys,
                 )
             else:
-                logger.debug(
+                logger.info(
                     "[prefetch_kvcache] skip rid=%s last_host_node_id=%s backuped=%s "
                     "(eligible only when backuped or root)",
                     req.rid,
@@ -2267,7 +2267,7 @@ class Scheduler(
         recv_req: BatchTokenizedEmbeddingReqInput,
     ):
         """Handle optimized batch embedding request."""
-        logger.debug(
+        logger.info(
             f"Processing batch embedding request with {len(recv_req)} requests"
         )
 
@@ -3381,7 +3381,7 @@ class Scheduler(
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
-            logger.debug(f"Abort queued request. {req.rid=}")
+            logger.info(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`
@@ -3394,14 +3394,14 @@ class Scheduler(
             # Abort requests that have not yet been bootstrapped
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+                    logger.info(f"Abort bootstrap queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    logger.info(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -3409,13 +3409,13 @@ class Scheduler(
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+                    logger.info(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                    logger.info(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
 
             # Abort requests already retracted to CPU cache
@@ -3445,7 +3445,7 @@ class Scheduler(
                 # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
-                logger.debug(f"Abort running request. {req.rid=}")
+                logger.info(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
