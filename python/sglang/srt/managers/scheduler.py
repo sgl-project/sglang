@@ -418,8 +418,7 @@ class Scheduler(
         self.init_ipc_channels(port_args)
 
         # Init ZBAL, switch allocator should before any torch alloc action
-        if _is_npu:
-            self.init_zbal()
+        self.init_zbal_on_npu()
 
         # Init PD-multiplexing context
         if self.enable_pdmux:
@@ -500,16 +499,15 @@ class Scheduler(
 
         self.is_initializing = False
 
-    def init_zbal(self):
-        from sglang.srt.hardware_backend.npu.utils import init_zbal
+    def init_zbal_on_npu(self):
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import init_zbal
 
-        if self.pp_size > 1:
-            logger.error(f"only zbal mix mode support pp_size > 1!")
-        if not _is_npu:
-            logger.warning("currently zbal only support npu")
-        init_zbal(
-            self.tp_size, self.gpu_id, self.tp_rank
-        )  # only switch allocator if is mix mode
+            if self.pp_size > 1:
+                logger.error(f"only zbal mix mode support pp_size > 1!")
+            init_zbal(
+                self.tp_size, self.gpu_id, self.tp_rank
+            )  # only switch allocator if is mix mode
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
