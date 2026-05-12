@@ -130,7 +130,7 @@ class ModelSlimW4A4Int4MoE(ModelSlimMoEScheme):
         output_dtype,
     ):
         logger.warning_once(
-            "Warning: Performance may be reduced, because DeepEP Dispatcher does not support 4-bit quantization,"
+            "Warning: Performance may be reduced, because DeepEP Dispatcher does not support 4-bit quantization, "
             "switching to the bf16 dispatcher, quantization will be performed separately..."
         )
         return self.kernel.apply_without_routing_weights(
