@@ -82,13 +82,12 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
         envs.SGLANG_ENABLE_SPEC_V2.set(False)
         model = cls.model
-        with envs.SGLANG_TEST_RETRACT.override(True):
-            cls.process = popen_launch_server(
-                model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=cls.get_server_args(),
-            )
+        cls.process = popen_launch_server(
+            model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=cls.get_server_args(),
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -148,13 +147,12 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
         model = cls.model
-        with envs.SGLANG_TEST_RETRACT.override(True):
-            cls.process = popen_launch_server(
-                model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=cls.get_server_args(),
-            )
+        cls.process = popen_launch_server(
+            model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=cls.get_server_args(),
+        )
 
     @classmethod
     def tearDownClass(cls):

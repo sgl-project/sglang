@@ -66,8 +66,7 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, DefaultServerBase)
     @classmethod
     def setUpClass(cls):
         envs.SGLANG_ENABLE_SPEC_V2.set(True)
-        with envs.SGLANG_TEST_RETRACT.override(True):
-            super().setUpClass()
+        super().setUpClass()
 
     @classmethod
     def tearDownClass(cls):
@@ -108,8 +107,7 @@ class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(
     @classmethod
     def setUpClass(cls):
         envs.SGLANG_ENABLE_SPEC_V2.set(True)
-        with envs.SGLANG_TEST_RETRACT.override(True):
-            super().setUpClass()
+        super().setUpClass()
 
     @classmethod
     def tearDownClass(cls):
