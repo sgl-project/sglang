@@ -1183,6 +1183,10 @@ class EAGLEWorker(TpModelWorker):
         )
 
         batch.return_hidden_states = False
+        # Verify-time construction of EagleDraftExtendInput uses the dataclass
+        # default (LAST); the worker overrides here so get_model_worker_batch()
+        # propagates the correct mode (NULL for STANDALONE).
+        draft_extend_input.capture_hidden_mode = draft_extend_capture_mode
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.capture_hidden_mode == draft_extend_capture_mode
         forward_batch = ForwardBatch.init_new(
