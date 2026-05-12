@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -11,6 +12,12 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
+
+
+class StateType(str, enum.Enum):
+    MAMBA = "mamba"
+    SWA = "swa"
+    NSA = "nsa"
 
 
 @dataclasses.dataclass
@@ -28,12 +35,12 @@ class KVArgs:
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
-    state_data_ptrs: List[int]
-    state_data_lens: List[int]
-    state_item_lens: List[int]
-    state_type: str  # "none", "mamba", "swa", "nsa"
-    # for mamba state different tp slice transfer
-    state_dim_per_tensor: List[int]  # dimension to slice for each state tensor
+    state_types: List[StateType]
+    state_data_ptrs: List[List[int]]
+    state_data_lens: List[List[int]]
+    state_item_lens: List[List[int]]
+    # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
+    state_dim_per_tensor: List[List[int]]
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
@@ -96,7 +103,7 @@ class BaseKVSender(ABC):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
@@ -154,7 +161,7 @@ class BaseKVReceiver(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
     ):
         """

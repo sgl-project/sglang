@@ -3442,7 +3442,7 @@ class Scheduler(
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
-                self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
+                self.spec_total_num_accept_tokens / self.spec_total_num_forward_ct
             )
 
         if RECORD_STEP_TIME:
@@ -3481,10 +3481,10 @@ class Scheduler(
         if if_success:
             if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
                 avg_spec_accept_length = (
-                    self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
+                    self.spec_total_num_accept_tokens / self.spec_total_num_forward_ct
                 )
                 logger.info(f"{avg_spec_accept_length=}")
-            self.spec_total_num_accepted_tokens = self.spec_total_num_forward_ct = 0
+            self.spec_total_num_accept_tokens = self.spec_total_num_forward_ct = 0
             for k, v in server_args_dict.items():
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")

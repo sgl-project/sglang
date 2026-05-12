@@ -59,7 +59,7 @@ def pad_draft_extend_query_kernel(
     q_ptr,  # Input query tensor [total_seq_len, num_heads, head_dim]
     padded_q_ptr,  # Output padded query tensor [batch_size, max_seq_len, num_heads, head_dim]
     seq_lens_q_ptr,  # Sequence lengths for each sequence [batch_size]
-    cumsum_ptr,  # Cumulative sum of accept lengths [batch_size + 1]
+    cumsum_ptr,  # Cumulative sum of sequence lengths [batch_size + 1]
     batch_size,
     max_seq_len,
     num_heads,
@@ -78,7 +78,7 @@ def pad_draft_extend_query_kernel(
     if batch_id >= batch_size:
         return
 
-    # Load accept length for this batch
+    # Load sequence length for this batch
     seq_len = tl.load(seq_lens_q_ptr + batch_id)
 
     if seq_pos >= seq_len:
@@ -131,7 +131,7 @@ def pad_draft_extend_query_kernel(
 def unpad_draft_extend_output_kernel(
     raw_out_ptr,  # Input raw output tensor (batch_size, token_per_batch, tp_q_head_num, v_head_dim)
     output_ptr,  # Output tensor (-1, tp_q_head_num, v_head_dim)
-    accept_length_ptr,  # Accept lengths for each sequence [batch_size]
+    num_accept_tokens_ptr,  # Accept lengths for each sequence [batch_size]
     cumsum_ptr,  # Cumulative sum of accept lengths [batch_size + 1]
     batch_size,
     token_per_batch,
@@ -151,7 +151,7 @@ def unpad_draft_extend_output_kernel(
         return
 
     # Load accept length for this batch
-    accept_len = tl.load(accept_length_ptr + batch_id)
+    accept_len = tl.load(num_accept_tokens_ptr + batch_id)
 
     if seq_pos >= accept_len:
         return
@@ -745,7 +745,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         unpad_draft_extend_output_kernel[grid](
             raw_out_ptr=raw_out,
             output_ptr=output,
-            accept_length_ptr=seq_lens_q,
+            num_accept_tokens_ptr=seq_lens_q,
             cumsum_ptr=cu_seqlens_q,
             batch_size=batch_size,
             token_per_batch=token_per_batch,
@@ -1006,7 +1006,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
                 needs_unpad = False
             else:
-                # draft_extend: handle varying num_accepted_drafts_per_req. If total_tokens % bs == 0,
+                # draft_extend: handle varying num_correct_drafts_per_req. If total_tokens % bs == 0,
                 # we can directly reshape q; otherwise, pad to max_seq_len_q.
                 total_tokens = q.shape[0]
                 tokens_per_seq = total_tokens // bs if bs > 0 else 0
