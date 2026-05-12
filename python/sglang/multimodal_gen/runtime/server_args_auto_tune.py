@@ -66,10 +66,11 @@ class ServerArgsAutoTuner:
             args.performance_mode == "auto"
             and args.num_gpus >= 2
             and not self._has_explicit_memory_policy()
+            and self._auto_would_use_component_offload_without_fsdp()
             and self._can_apply_fsdp_policy(require_memory_headroom=True)
         ):
             logger.info(
-                "Automatically selecting FSDP defaults for multi-GPU %s",
+                "Automatically selecting FSDP defaults for multi-GPU %s to replace component offload",
                 args.pipeline_config.__class__.__name__,
             )
             self._set_gpu_resident_defaults(use_fsdp=True)
@@ -217,6 +218,22 @@ class ServerArgsAutoTuner:
             and not envs.SGLANG_CACHE_DIT_ENABLED
             and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
         )
+
+    def _auto_would_use_component_offload_without_fsdp(self) -> bool:
+        """try fsdp only with offload enabled for some components"""
+        args = self.server_args
+        explicit_offload_flags = (
+            args.dit_cpu_offload,
+            args.dit_layerwise_offload,
+            args.text_encoder_cpu_offload,
+            args.image_encoder_cpu_offload,
+        )
+        if any(flag is not None for flag in explicit_offload_flags):
+            return any(flag is True for flag in explicit_offload_flags)
+        if self._can_apply_dit_layerwise_offload_policy():
+            return True
+        # legacy automatic defaults keep large components offloaded on non-CPU platforms
+        return True
 
     def _get_min_available_device_memory_gb(self) -> float | None:
         args = self.server_args

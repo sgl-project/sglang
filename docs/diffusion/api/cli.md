@@ -73,6 +73,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 - `--model-path {MODEL}`: model path or Hugging Face model ID
 - `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter
+- `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
 - `--num-gpus {N}`: number of GPUs to use
 - `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default; use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
 - `--tp-size {N}`: tensor parallelism size, mainly for encoders

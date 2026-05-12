@@ -26,11 +26,11 @@ Base the decision on available memory on the selected GPU(s).
 | Mode       | Meaning                                                                                                                   |
 |------------|---------------------------------------------------------------------------------------------------------------------------|
 | `manual`   | Keeps performance-related server args under explicit user control.                                                       |
-| `auto`     | Default. Keeps legacy safe offload defaults and uses FSDP/CFG on validated multi-GPU deployments when it is likely better. |
+| `auto`     | Default. Keeps legacy safe offload defaults and uses FSDP/CFG on validated multi-GPU deployments when FSDP can replace component offload. |
 | `speed`    | Favors GPU-resident execution for lower latency and higher throughput. Disables CPU offload when unset; may OOM.           |
 | `memory`   | Favors lower GPU memory. Uses component offload, or Wan/MOVA layerwise DiT offload when supported.                         |
 
-`auto` checks selected GPU memory before applying GPU-resident FSDP defaults. In multi-GPU runs it uses the least available memory across selected GPUs. When the model default uses CFG and the user did not set a parallelism policy, `auto` also enables CFG parallelism. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk.
+`auto` checks selected GPU memory before applying GPU-resident FSDP defaults. In multi-GPU runs it uses the least available memory across selected GPUs, and only turns on FSDP automatically when doing so can replace component offload. When the model default uses CFG and the user did not set a parallelism policy, `auto` also enables CFG parallelism. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk.
 
 The modes tune residency for native pipeline components declared to the component residency manager. Today this covers the major DiT, text/image encoder, VAE, vocoder, and upsampler components; DiT can use layerwise offload when supported, while text encoders use either resident execution or component CPU offload. Do not assume text-encoder layerwise offload unless a model implements and validates it.
 

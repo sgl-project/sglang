@@ -70,6 +70,7 @@ LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
+LORA_MERGE_MODES = ("auto", "merge", "dynamic")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -173,6 +174,7 @@ class ServerArgs(DisaggArgsMixin):
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_merge_mode: str = "auto"
     lora_weight_name: str | None = None
 
     # Component path overrides (key = model_index.json component name, value = path)
@@ -1252,6 +1254,17 @@ class ServerArgs(DisaggArgsMixin):
             type=float,
             default=ServerArgs.lora_scale,
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
+        )
+        parser.add_argument(
+            "--lora-merge-mode",
+            type=str,
+            choices=LORA_MERGE_MODES,
+            default=ServerArgs.lora_merge_mode,
+            help=(
+                "How LoRA is applied: auto keeps static merge for regular weights "
+                "and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather; "
+                "merge always merges into base weights; dynamic always applies LoRA at forward time."
+            ),
         )
         parser.add_argument(
             "--lora-weight-name",

@@ -769,6 +769,7 @@ class GPUWorker:
         lora_path: Union[str, None, List[Union[str, None]]] = None,
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
+        merge_mode: str | None = None,
     ) -> OutputBatch:
         """
         Set the LoRA adapter(s) for the pipeline.
@@ -779,10 +780,13 @@ class GPUWorker:
             lora_path: Path(s) to the LoRA adapter(s). Can be a string, None, or a list of strings/None.
             target: Which transformer(s) to apply the LoRA to. Can be a string or a list of strings.
             strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
+            merge_mode: Optional per-request LoRA merge mode.
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.set_lora(lora_nickname, lora_path, target, strength)
+        self.pipeline.set_lora(
+            lora_nickname, lora_path, target, strength, merge_mode=merge_mode
+        )
         return OutputBatch()
 
     def merge_lora_weights(
