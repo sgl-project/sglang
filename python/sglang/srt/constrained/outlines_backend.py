@@ -29,6 +29,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
+from sglang.srt.constrained.utils import is_dense_bool_mask_allowed_token
 
 try:
     from outlines.fsm.json_schema import build_regex_from_schema
@@ -49,9 +50,22 @@ class OutlinesGrammar(BaseGrammarObject):
         self.guide = guide
         self.jump_forward_map = jump_forward_map
         self.state = 0
+        self._state_history: List[int] = []
 
     def accept_token(self, token: int):
+        self._state_history.append(self.state)
         self.state = self.guide.get_next_state(self.state, token)
+
+    def rollback(self, k: int):
+        if k <= 0:
+            return
+        if k > len(self._state_history):
+            raise ValueError(
+                f"Cannot rollback {k} tokens with only {len(self._state_history)}"
+                " accepted tokens in history."
+            )
+        self.state = self._state_history[-k]
+        del self._state_history[-k:]
 
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
@@ -69,6 +83,14 @@ class OutlinesGrammar(BaseGrammarObject):
         vocab_mask = vocab_mask[idx]
         vocab_mask.fill_(1)
         vocab_mask.scatter_(0, tokens, torch.zeros_like(tokens, dtype=torch.bool))
+
+    def is_vocab_mask_allowed_token(
+        self,
+        vocab_mask: torch.Tensor,
+        token_id: int,
+        vocab_size: Optional[int] = None,
+    ) -> bool:
+        return is_dense_bool_mask_allowed_token(vocab_mask, token_id, vocab_size)
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor):

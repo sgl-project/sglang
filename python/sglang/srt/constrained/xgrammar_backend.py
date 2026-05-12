@@ -38,7 +38,10 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.torch_ops.bitmask_ops import (
     apply_token_bitmask_inplace_torch,
 )
-from sglang.srt.constrained.utils import is_legacy_structural_tag
+from sglang.srt.constrained.utils import (
+    is_legacy_structural_tag,
+    is_packed_bitmask_allowed_token,
+)
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -106,6 +109,14 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
+
+    def is_vocab_mask_allowed_token(
+        self,
+        vocab_mask: torch.Tensor,
+        token_id: int,
+        vocab_size: Optional[int] = None,
+    ) -> bool:
+        return is_packed_bitmask_allowed_token(vocab_mask, token_id, vocab_size)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
@@ -229,6 +240,14 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     @staticmethod
     def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
         return allocate_token_bitmask(batch_size, vocab_size)
+
+    @staticmethod
+    def is_vocab_mask_allowed_token(
+        vocab_mask: torch.Tensor,
+        token_id: int,
+        vocab_size: Optional[int] = None,
+    ) -> bool:
+        return is_packed_bitmask_allowed_token(vocab_mask, token_id, vocab_size)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:

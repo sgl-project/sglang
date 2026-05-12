@@ -57,6 +57,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         enable_token_filter: bool = False,
         token_filter_fn=None,
         allocate_vocab_mask_fn=None,
+        is_vocab_mask_allowed_token_fn=None,
         move_vocab_mask_fn=None,
         apply_vocab_mask_fn=None,
     ):
@@ -68,6 +69,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.enable_token_filter = enable_token_filter
         self.token_filter_fn = token_filter_fn
         self.allocate_vocab_mask_fn = allocate_vocab_mask_fn
+        self.is_vocab_mask_allowed_token_fn = is_vocab_mask_allowed_token_fn
         self.move_vocab_mask_fn = move_vocab_mask_fn
         self.apply_vocab_mask_fn = apply_vocab_mask_fn
         self._think_end_id_list = [think_end_id]
@@ -155,6 +157,22 @@ class ReasonerGrammarObject(BaseGrammarObject):
             return self.allocate_vocab_mask_fn(vocab_size, batch_size, device)
         return None
 
+    def is_vocab_mask_allowed_token(
+        self,
+        vocab_mask: torch.Tensor,
+        token_id: int,
+        vocab_size: Optional[int] = None,
+    ) -> bool:
+        if self.grammar is not None:
+            return self.grammar.is_vocab_mask_allowed_token(
+                vocab_mask, token_id, vocab_size=vocab_size
+            )
+        if self.is_vocab_mask_allowed_token_fn is not None:
+            return self.is_vocab_mask_allowed_token_fn(
+                vocab_mask, token_id, vocab_size=vocab_size
+            )
+        raise NotImplementedError()
+
     def move_vocab_mask(self, vocab_mask, device):
         if self.grammar is not None:
             return self.grammar.move_vocab_mask(vocab_mask, device)
@@ -177,6 +195,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.enable_token_filter,
             self.token_filter_fn,
             self.allocate_vocab_mask_fn,
+            self.is_vocab_mask_allowed_token_fn,
             self.move_vocab_mask_fn,
             self.apply_vocab_mask_fn,
         )
@@ -295,6 +314,9 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             enable_token_filter=self.enable_token_filter,
             token_filter_fn=self._token_filter_fn,
             allocate_vocab_mask_fn=self.grammar_backend.allocate_vocab_mask,
+            is_vocab_mask_allowed_token_fn=(
+                self.grammar_backend.is_vocab_mask_allowed_token
+            ),
             move_vocab_mask_fn=self.grammar_backend.move_vocab_mask,
             apply_vocab_mask_fn=self.grammar_backend.apply_vocab_mask,
         )
