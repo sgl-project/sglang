@@ -120,6 +120,9 @@ elif _is_hip:
     from sglang.srt.layers.quantization.awq.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
+elif _is_npu:
+    from sgl_kernel_npu.moe.zero_experts_compute_identity import zero_experts_compute_identity_triton
+    from sglang.srt.layers.moe import get_moe_a2a_backend
 else:
     pass
 
@@ -272,13 +275,24 @@ class LongcatFlashMoE(nn.Module):
             router_logits,
         )
         if self.zero_expert_type is not None:
-            zero_expert_result = zero_experts_compute_triton(
-                expert_indices=topk_idx,
-                expert_scales=topk_weights,
-                num_experts=self.num_experts,
-                zero_expert_type=self.zero_expert_type,
-                hidden_states=hidden_states,
-            )
+            if not _is_npu:
+                zero_expert_result = zero_experts_compute_triton(
+                    expert_indices=topk_idx,
+                    expert_scales=topk_weights,
+                    num_experts=self.num_experts,
+                    zero_expert_type=self.zero_expert_type,
+                    hidden_states=hidden_states,
+                )
+            else:
+                identity_mask_value = -1 if get_moe_a2a_backend().is_deepep() else 0
+                zero_expert_result = zero_experts_compute_identity_triton(
+                    expert_indices=topk_idx,
+                    expert_scales=topk_weights,
+                    num_experts=self.num_experts,
+                    zero_expert_type=self.zero_expert_type,
+                    hidden_states=hidden_states,
+                    identity_mask_value=identity_mask_value,
+                )
         topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
         final_hidden_states = self.experts(hidden_states, topk_output)

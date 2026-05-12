@@ -236,6 +236,11 @@ def forward_mla_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
+        if _use_explicit_npu_interleaved_rope(m):
+            m.rotary_emb.get_npu_interleaved_cos_sin(
+                positions, hidden_states.dtype, offsets=None
+            )
+
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if nsa_use_prefill_cp(forward_batch):

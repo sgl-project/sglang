@@ -226,44 +226,15 @@ class RotaryEmbedding(MultiPlatformOp):
             .contiguous(),
         )
 
-    def apply_npu_interleaved_rope(
+    def update_npu_interleaved_cos_sin(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        num_tokens, num_q_heads, _ = query.shape
-        num_k_heads = key.shape[1]
-
-        query_rot = query[..., : self.rotary_dim]
-        key_rot = key[..., : self.rotary_dim]
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
-
-        query_rot = torch_npu.npu_interleave_rope(
-            query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim),
-            cos,
-            sin,
-        )
-        key_rot = torch_npu.npu_interleave_rope(
-            key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim),
-            cos,
-            sin,
-        )
-
-        query_rot = query_rot.reshape(num_tokens, -1, self.rotary_dim)
-        key_rot = key_rot.reshape(num_tokens, -1, self.rotary_dim)
-
-        if self.rotary_dim < self.head_size:
-            query = torch.cat((query_rot, query_pass), dim=-1)
-            key = torch.cat((key_rot, key_pass), dim=-1)
-        else:
-            query = query_rot
-            key = key_rot
-
-        return query, key
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = torch.add(positions, offsets) if offsets is not None else positions
+        flat_positions = positions.flatten()
+        self._ensure_cos_sin_cache_length(int(flat_positions.max().item()) + 1)
 
     def forward_native(
         self,
@@ -339,9 +310,6 @@ class RotaryEmbedding(MultiPlatformOp):
                 )
             else:
                 return self.forward_native(positions, query, key, offsets)
-        elif self.rotary_dim == 64 and not self.is_neox_style:
-            cos, sin = self.get_npu_interleaved_cos_sin(positions, query.dtype, offsets)
-            return self.apply_npu_interleaved_rope(query, key, cos, sin)
         if self.is_neox_style:
             rotary_mode = "half"
         else:
