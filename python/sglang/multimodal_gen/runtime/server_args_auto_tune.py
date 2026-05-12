@@ -257,7 +257,7 @@ class ServerArgsAutoTuner:
             args.enable_cfg_parallel = True
 
     def _supports_high_confidence_fsdp_cfg(self) -> bool:
-        """wheter applying fsdp cfg will very-likely to bring performance gain"""
+        """whether applying fsdp cfg will very-likely to bring performance gain"""
         args = self.server_args
         return (
             self._deployment_config().fsdp_cfg_auto_min_available_memory_gb is not None
