@@ -1150,10 +1150,17 @@ def match_qwen_chat_ml(model_path: str):
 
 @register_conv_template_matching_function
 def match_minicpm(model_path: str):
+    # MiniCPM-V 4.6 (and any future versions) ship a real HF jinja chat
+    # template that uses <|image_pad|> / <|video_pad|> instead of the legacy
+    # (<image>./</image>) placeholder. Returning None here lets the
+    # TemplateManager fall back to the HF tokenizer/processor template,
+    # which keeps the prompt aligned with the multimodal processor.
+    model_type = get_model_type(model_path)
+    if model_type == "minicpmv4_6":
+        return None
     match = re.search(r"minicpm-(v|o)", model_path, re.IGNORECASE)
     if match:
         return f"minicpm{match.group(1).lower()}"
-    model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)
 
 
