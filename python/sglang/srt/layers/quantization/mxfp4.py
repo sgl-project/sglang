@@ -27,7 +27,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.amx_utils import (
-    CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
@@ -807,32 +806,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
 
         if use_intel_amx_backend(layer):
-            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+            from sglang.srt.layers.amx_utils import amx_fused_experts_mxfp4
 
-            topk_weights, topk_ids, _ = dispatch_output.topk_output
-            x, topk_weights = apply_topk_weights_cpu(
-                self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
+            return amx_fused_experts_mxfp4(
+                layer, dispatch_output, self.moe_runner_config
             )
-            output = torch.ops.sgl_kernel.fused_experts_cpu(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                False,  # inplace See [Note] inplace should be False in fused_experts.
-                CPUQuantMethod.MXFP4,
-                layer.w13_weight_scale,  # w1_scale
-                layer.w2_weight_scale,  # w2_scale
-                None,  # w1_zp
-                None,  # w2_zp
-                None,  # block_size
-                getattr(layer, "w13_weight_bias", None),
-                getattr(layer, "w2_weight_bias", None),
-                layer.moe_runner_config.gemm1_alpha,
-                layer.moe_runner_config.gemm1_clamp_limit,
-                True,  # is_vnni
-            )
-            return StandardCombineInput(hidden_states=output)
 
         if self.use_flashinfer:
             # When bf16 mode is enabled, we don't need to quantize the input,
