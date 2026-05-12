@@ -36,13 +36,14 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.multi_layer_eagle_utils import assign_new_state_triton
-from sglang.srt.speculative.spec_utils import draft_capture_hidden_mode, fast_topk
+from sglang.srt.speculative.spec_utils import fast_topk, null_if_not_consumed
 from sglang.srt.utils import (
     get_available_gpu_memory,
     require_attn_tp_gather,
@@ -358,6 +359,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         )
         spec_info.positions = None
 
+        capture_mode = null_if_not_consumed(
+            CaptureHiddenMode.FULL, self.model_runner.server_args
+        )
+
         # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
@@ -380,9 +385,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            capture_hidden_mode=draft_capture_hidden_mode(
-                self.model_runner.server_args, ForwardMode.DRAFT_EXTEND_V2
-            ),
+            capture_hidden_mode=capture_mode,
             attn_backend=self.eagle_worker.draft_extend_attn_backend_list[self.step],
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,

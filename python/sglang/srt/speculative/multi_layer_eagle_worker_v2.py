@@ -31,7 +31,6 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
@@ -48,12 +47,11 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
-    draft_capture_hidden_mode,
     draft_tp_context,
     maybe_detect_nan,
     maybe_detect_oob,
+    null_if_not_consumed,
     select_top_k_tokens,
-    target_capture_hidden_mode,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
 
@@ -664,9 +662,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            model_worker_batch.capture_hidden_mode = target_capture_hidden_mode(
-                self.server_args, ForwardMode.EXTEND
+            target_capture_mode = null_if_not_consumed(
+                CaptureHiddenMode.FULL, self.server_args
             )
+            model_worker_batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
@@ -686,14 +685,15 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             return batch_output
         else:
             if model_worker_batch.spec_info is None:
+                capture_mode = null_if_not_consumed(
+                    CaptureHiddenMode.LAST, self.server_args
+                )
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
                     hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
                     dtype=EagleDraftInput.dtype_for(self.draft_worker),
                     topk=self.topk * self.speculative_num_steps,
-                    capture_hidden_mode=draft_capture_hidden_mode(
-                        self.server_args, ForwardMode.DECODE
-                    ),
+                    capture_hidden_mode=capture_mode,
                 )
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)

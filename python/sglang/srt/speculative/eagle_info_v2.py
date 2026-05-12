@@ -22,16 +22,19 @@ from sglang.srt.mem_cache.common import (
     get_last_loc,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
-    draft_capture_hidden_mode,
     generate_simulated_accept_index,
-    target_capture_hidden_mode,
+    null_if_not_consumed,
 )
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
@@ -204,9 +207,10 @@ class EagleDraftInputV2Mixin:
         # Get a forward batch
         self.num_tokens_per_req = topk
         self.num_tokens_for_logprob_per_req = topk
-        batch.capture_hidden_mode = draft_capture_hidden_mode(
-            draft_model_runner.server_args, ForwardMode.DECODE
+        capture_mode = null_if_not_consumed(
+            CaptureHiddenMode.LAST, draft_model_runner.server_args
         )
+        batch.capture_hidden_mode = capture_mode
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
@@ -231,9 +235,10 @@ class EagleDraftInputV2Mixin:
         batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
-        batch.capture_hidden_mode = draft_capture_hidden_mode(
-            draft_model_runner.server_args, ForwardMode.DRAFT_EXTEND_V2
+        capture_mode = null_if_not_consumed(
+            CaptureHiddenMode.FULL, draft_model_runner.server_args
         )
+        batch.capture_hidden_mode = capture_mode
         batch.forward_mode = (
             ForwardMode.IDLE
             if batch.forward_mode.is_idle()
@@ -299,9 +304,10 @@ class EagleVerifyInputV2Mixin:
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        batch.capture_hidden_mode = target_capture_hidden_mode(
-            target_worker.server_args, ForwardMode.TARGET_VERIFY
+        capture_mode = null_if_not_consumed(
+            CaptureHiddenMode.FULL, target_worker.server_args
         )
+        batch.capture_hidden_mode = capture_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
         # Run attention backend plan and cuda graph preparation

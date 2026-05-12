@@ -27,9 +27,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_utils import (
-    draft_capture_hidden_mode,
     maybe_detect_nan,
     maybe_detect_oob,
+    null_if_not_consumed,
 )
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -302,13 +302,14 @@ class EAGLEDraftCudaGraphRunner:
             global_dp_buffer_len = None
             global_num_tokens_for_logprob = None
 
+        capture_mode = null_if_not_consumed(
+            CaptureHiddenMode.LAST, self.model_runner.server_args
+        )
         spec_info = EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
-            capture_hidden_mode=draft_capture_hidden_mode(
-                self.model_runner.server_args, ForwardMode.DECODE
-            ),
+            capture_hidden_mode=capture_mode,
         )
 
         # Forward batch

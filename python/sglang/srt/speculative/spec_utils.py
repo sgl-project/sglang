@@ -28,10 +28,7 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import (
-        CaptureHiddenMode,
-        ForwardMode,
-    )
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
@@ -65,56 +62,27 @@ def spec_info_consumes_hidden_states(
     True  - EAGLE / EAGLE3 / MIMO / multi-layer EAGLE (all chain-style drafts).
     False - STANDALONE (vanilla LLM draft; ignores the field).
 
-    All `capture_hidden_mode` decisions on the spec connector route through
-    `target_capture_hidden_mode` / `draft_capture_hidden_mode`, which use
-    this predicate.
+    Each call site already knows the `CaptureHiddenMode` it wants (FULL for
+    target / v2 draft-extend, LAST for chain-seed). The only algo-dependent
+    twist is "if the draft doesn't consume hidden_states, skip capture
+    entirely" — applied via `null_if_not_consumed` at the call site.
     """
     if server_args is None:
         server_args = get_global_server_args()
     return server_args.speculative_algorithm != "STANDALONE"
 
 
-def target_capture_hidden_mode(
-    server_args: Optional[ServerArgs],
-    forward_mode: "ForwardMode",
+def null_if_not_consumed(
+    mode: "CaptureHiddenMode",
+    server_args: Optional[ServerArgs] = None,
 ) -> "CaptureHiddenMode":
-    """Target-side `capture_hidden_mode`. Both target prefill (EXTEND) and
-    target verify (TARGET_VERIFY) emit FULL so the draft can read every
-    token's hidden state. NULL when the draft doesn't consume."""
-    from sglang.srt.model_executor.forward_batch_info import (
-        CaptureHiddenMode,
-        ForwardMode,
-    )
+    """Downgrade `mode` to NULL when the draft architecture doesn't consume
+    `spec_info.hidden_states` (currently: STANDALONE). Otherwise pass through."""
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
-    assert forward_mode in (ForwardMode.EXTEND, ForwardMode.TARGET_VERIFY)
     if not spec_info_consumes_hidden_states(server_args):
         return CaptureHiddenMode.NULL
-    return CaptureHiddenMode.FULL
-
-
-def draft_capture_hidden_mode(
-    server_args: Optional[ServerArgs],
-    forward_mode: "ForwardMode",
-) -> "CaptureHiddenMode":
-    """Draft-side `capture_hidden_mode`. Default LAST (chain-seed feature
-    for the next iter); FULL only for v2 draft extend. NULL when the draft
-    doesn't consume."""
-    from sglang.srt.model_executor.forward_batch_info import (
-        CaptureHiddenMode,
-        ForwardMode,
-    )
-
-    assert forward_mode in (
-        ForwardMode.EXTEND,
-        ForwardMode.DECODE,
-        ForwardMode.DRAFT_EXTEND,
-        ForwardMode.DRAFT_EXTEND_V2,
-    )
-    if not spec_info_consumes_hidden_states(server_args):
-        return CaptureHiddenMode.NULL
-    if forward_mode == ForwardMode.DRAFT_EXTEND_V2:
-        return CaptureHiddenMode.FULL
-    return CaptureHiddenMode.LAST
+    return mode
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
