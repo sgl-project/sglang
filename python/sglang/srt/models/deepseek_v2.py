@@ -123,7 +123,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.lora.layers import BaseLayerWithLoRA
+from sglang.srt.model_executor.cuda_graph_runner import (
+    get_capture_lora_variant,
+    get_is_capture_mode,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
@@ -1687,11 +1691,26 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+
+        needs_lora_wrapper = False
+        if (
+            isinstance(self.fused_qkv_a_proj_with_mqa, BaseLayerWithLoRA)
+            and self.fused_qkv_a_proj_with_mqa.set_lora
+        ):
+            lora_batch_info = self.fused_qkv_a_proj_with_mqa.lora_backend.batch_info
+            needs_lora_wrapper = (
+                get_capture_lora_variant() != "nolora"
+                if get_is_capture_mode()
+                else lora_batch_info is not None and lora_batch_info.has_active_lora
+            )
+        # The min-latency fused-A kernel takes raw base weights and bypasses the
+        # LoRA wrapper, so only use it when this forward does not need LoRA.
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
             and hidden_states.shape[0] <= 16
             and self.use_min_latency_fused_a_gemm
+            and not needs_lora_wrapper
         ):
             qkv_latent = dsv3_fused_a_gemm(
                 hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
