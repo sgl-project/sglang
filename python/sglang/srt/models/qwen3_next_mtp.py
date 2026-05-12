@@ -15,7 +15,6 @@
 """Inference-only Qwen3Next MTP Speculative Decoding."""
 
 import logging
-from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
