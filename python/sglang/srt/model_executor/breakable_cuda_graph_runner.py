@@ -122,12 +122,22 @@ class BreakableCudaGraphRunner:
         language_model = getattr(
             model_runner.model, "language_model", model_runner.model
         )
-        self.layer_model = (
-            language_model.model
-            if hasattr(language_model, "model")
-            and hasattr(language_model.model, "layers")
-            else language_model
-        )
+        if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
+            self.layer_model = language_model.model
+        else:
+            # Fall back to capturing the outer model. Bs-shaped kernels in the
+            # outer forward (logits_processor gather, sampler) will bake
+            # batch_size=1 into captured launch params — multi-req prefill on
+            # this path silently produces wrong-shaped logits. Warn so the
+            # failure mode is visible instead of silent.
+            self.layer_model = language_model
+            logger.warning(
+                "[BCG] Could not resolve inner layer_model on %s; capturing "
+                "the outer model.forward. Multi-batch prefill may bake "
+                "batch_size=1 into the captured graph. Consider exposing an "
+                "explicit `.model.layers` attribute on the model class.",
+                type(language_model).__name__,
+            )
 
         # Memory pool
         if get_global_graph_memory_pool() is None:
