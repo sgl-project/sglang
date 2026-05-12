@@ -324,6 +324,8 @@ class Engine(EngineScoreMixin, EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+        # See GenerateReqInput.mm_hashes / async_generate for the contract.
+        mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -361,6 +363,7 @@ class Engine(EngineScoreMixin, EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
+            mm_hashes=mm_hashes,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
@@ -416,6 +419,13 @@ class Engine(EngineScoreMixin, EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+        # Optional per-image hashes the caller has already computed (hex strings,
+        # one per image in `image_data`). When supplied, each MultimodalDataItem's
+        # `hash` is initialised from this list and `set_pad_value` skips the
+        # internal `hash_feature()` recompute. Intended for external KV routers
+        # that compute their own per-image hash for routing decisions and need
+        # sglang's prefix-cache key to align. See GenerateReqInput.mm_hashes.
+        mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
@@ -453,6 +463,7 @@ class Engine(EngineScoreMixin, EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
+            mm_hashes=mm_hashes,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
