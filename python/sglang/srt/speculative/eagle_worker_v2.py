@@ -745,6 +745,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 model_worker_batch
             )
 
+            # Target forward already executed deferred mamba clear/COW.
+            # Prevent the draft forward from re-executing them.
+            model_worker_batch.mamba_clear_indices = None
+            model_worker_batch.mamba_cow_src_indices = None
+            model_worker_batch.mamba_cow_dst_indices = None
+
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
             with self.draft_worker.draft_tp_context(
