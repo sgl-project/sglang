@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-PERFORMANCE_MODES = ("auto", "speed", "memory", "balanced")
+PERFORMANCE_MODES = ("manual", "auto", "speed", "memory", "balanced")
 
 
 class ServerArgsAutoTuner:
@@ -72,7 +72,8 @@ class ServerArgsAutoTuner:
             return
 
         if (
-            args.num_gpus >= 2
+            args.performance_mode == "auto"
+            and args.num_gpus >= 2
             and not self._has_explicit_memory_policy()
             and not self._has_explicit_parallel_policy()
             and self._can_apply_fsdp_cfg_policy(require_memory_headroom=True)
@@ -85,6 +86,8 @@ class ServerArgsAutoTuner:
 
     def adjust_auto_dit_layerwise_offload(self) -> None:
         args = self.server_args
+        if not self.should_apply_performance_defaults():
+            return
         deployment_config = self._deployment_config()
         if envs.SGLANG_CACHE_DIT_ENABLED:
             return
@@ -131,6 +134,8 @@ class ServerArgsAutoTuner:
 
     def finalize_auto_flags(self) -> None:
         """if some args are unset after all the adjustment, set them to defaults"""
+        if not self.should_apply_performance_defaults():
+            return
         args = self.server_args
         if args.use_fsdp_inference is None:
             args.use_fsdp_inference = False
@@ -145,7 +150,7 @@ class ServerArgsAutoTuner:
 
     def _normalize_performance_mode(self) -> str:
         args = self.server_args
-        mode = (args.performance_mode or "auto").lower()
+        mode = (args.performance_mode or "manual").lower()
         if mode not in PERFORMANCE_MODES:
             valid_modes = PERFORMANCE_MODES
             raise ValueError(
@@ -153,6 +158,9 @@ class ServerArgsAutoTuner:
                 f"Expected one of {valid_modes}."
             )
         return mode
+
+    def should_apply_performance_defaults(self) -> bool:
+        return self.server_args.performance_mode != "manual"
 
     def _set_gpu_resident_defaults(self, *, use_fsdp: bool) -> None:
         """set all components to be resident"""

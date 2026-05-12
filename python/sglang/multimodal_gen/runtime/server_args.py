@@ -141,7 +141,7 @@ class ServerArgs(DisaggArgsMixin):
 
     # Parallelism
     num_gpus: int = 1
-    performance_mode: str = "auto"
+    performance_mode: str = "manual"
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
@@ -316,7 +316,8 @@ class ServerArgs(DisaggArgsMixin):
         """set defaults and normalize values."""
         auto_tuner = ServerArgsAutoTuner(self)
         auto_tuner.adjust()
-        self._adjust_offload()
+        if auto_tuner.should_apply_performance_defaults():
+            self._adjust_offload()
         self._adjust_ltx2_two_stage_device_mode()
         self._adjust_path()
         self._adjust_quant_config()
@@ -694,7 +695,8 @@ class ServerArgs(DisaggArgsMixin):
         if cfg_unspecified:
             cfg_group_size = self.dp_size * self.tp_size * 2
             if (
-                self.num_gpus >= 2
+                self.performance_mode != "manual"
+                and self.num_gpus >= 2
                 and self.num_gpus % cfg_group_size == 0
                 and sp_unspecified
                 and ulysses_unspecified
@@ -941,11 +943,11 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.performance_mode,
             help=(
                 "Preset for performance and memory defaults. "
+                "'manual' keeps performance-related server args under explicit user control; "
                 "'auto' only applies high-confidence defaults; "
                 "'speed' favors GPU-resident execution for lower latency and higher throughput, and may OOM; "
                 "'memory' favors lower GPU memory usage; "
                 "'balanced' prefers FSDP+CFG on validated multi-GPU Qwen/Wan CFG models. "
-                "Aliases: throughput=speed, aggressive=speed, conservative=memory, balance=balanced. "
                 "Explicit offload/FSDP/parallelism flags take precedence."
             ),
         )

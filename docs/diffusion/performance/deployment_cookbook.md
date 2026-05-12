@@ -21,16 +21,15 @@ Base the decision on available memory on the selected GPU(s).
 
 ## Performance Modes
 
-`--performance-mode` applies safe presets without overriding explicit offload, FSDP, or parallelism flags. `--mode` is a short alias.
+`--performance-mode` applies safe presets without overriding explicit offload, FSDP, or parallelism flags. `manual` is the default and does not apply performance presets. `--mode` is a short alias.
 
 | Mode       | Meaning                                                                                                                   |
 |------------|---------------------------------------------------------------------------------------------------------------------------|
-| `auto`     | Default. Applies only high-confidence defaults, currently multi-GPU Qwen/Wan CFG models.                                  |
+| `manual`   | Default. Keeps performance-related server args under explicit user control.                                               |
+| `auto`     | Applies only high-confidence defaults, currently multi-GPU Qwen/Wan CFG models and validated layerwise offload defaults. |
 | `speed`    | Favors GPU-resident execution for lower latency and higher throughput. Disables CPU offload when unset; may OOM.           |
 | `memory`   | Favors lower GPU memory. Uses component offload, or Wan/MOVA layerwise DiT offload when supported.                         |
 | `balanced` | Keeps existing single-GPU defaults; on validated multi-GPU Qwen/Wan CFG models prefers FSDP+CFG.                          |
-
-Aliases: `throughput` and `aggressive` map to `speed`; `conservative` maps to `memory`; `balance` maps to `balanced`.
 
 `auto` and `balanced` check selected GPU memory before applying GPU-resident FSDP+CFG defaults. In multi-GPU runs they use the least available memory across selected GPUs. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk.
 
