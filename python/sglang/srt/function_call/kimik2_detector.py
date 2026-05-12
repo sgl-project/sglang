@@ -221,6 +221,16 @@ class KimiK2Detector(BaseFormatDetector):
             normal_text = _strip_special_tokens(new_text)
             return StreamingParseResult(normal_text=normal_text)
 
+        normal_text = ""
+        if self.current_tool_id == -1 and has_tool_call:
+            # Now there are some text in the buffer that needs to be extracted as normal test.
+            toolcall_indice = current_text.find(self.bot_token)
+            if toolcall_indice == -1:
+                toolcall_indice = current_text.find(self.tool_call_start_token)
+            if toolcall_indice > 0:
+                normal_text = _strip_special_tokens(current_text[:toolcall_indice])
+                self._buffer = current_text[toolcall_indice:]
+
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
@@ -240,7 +250,7 @@ class KimiK2Detector(BaseFormatDetector):
                         function_id, tools, function_args
                     )
                 if function_name is None:
-                    return StreamingParseResult(normal_text="", calls=calls)
+                    return StreamingParseResult(normal_text=normal_text, calls=calls)
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -314,14 +324,16 @@ class KimiK2Detector(BaseFormatDetector):
                         else:
                             self._buffer = ""
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
+                        result = StreamingParseResult(
+                            normal_text=normal_text, calls=calls
+                        )
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
                         self._current_stream_function_name = None
                         return result
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
             logger.error("Error in parse_streaming_increment: %s", e, exc_info=True)
