@@ -1,6 +1,5 @@
 from typing import List, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -29,6 +28,14 @@ class HierarchyBlock(DllmAlgorithm):
     ) -> Tuple[
         Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool
     ]:
+        # Per-request inheritance state (last_inherited_token, positions[0]==0
+        # new-request detection) assumes a single in-flight request. DLLM is
+        # launched with --max-running-requests=1, so enforce that here.
+        assert forward_batch.batch_size == 1, (
+            "HierarchyBlock requires batch_size == 1; "
+            f"got {forward_batch.batch_size}"
+        )
+
         total_len = len(forward_batch.input_ids)
         block_mask = forward_batch.input_ids == self.mask_id
         num_masked = block_mask.sum().item()
@@ -37,10 +44,9 @@ class HierarchyBlock(DllmAlgorithm):
 
         # Detect new request (positions start from 0) and clear inheritance.
         is_new_request = False
-        if hasattr(forward_batch, "positions") and forward_batch.positions is not None:
-            if forward_batch.positions[0] == 0:
-                is_new_request = True
-                self.last_inherited_token = None
+        if forward_batch.positions is not None and forward_batch.positions[0] == 0:
+            is_new_request = True
+            self.last_inherited_token = None
 
         # Handle token inheritance for all-mask blocks.
         first_token_is_mask = forward_batch.input_ids[0] == self.mask_id
@@ -83,9 +89,7 @@ class HierarchyBlock(DllmAlgorithm):
                 preds = sub_logits.argmax(dim=-1)
                 probs = F.softmax(sub_logits, dim=-1)
                 conf = probs.gather(dim=-1, index=preds.unsqueeze(-1)).squeeze(-1)
-                conf = torch.where(
-                    sub_mask, conf, torch.tensor(-np.inf, device=conf.device)
-                )
+                conf = torch.where(sub_mask, conf, float("-inf"))
 
                 # Confidence-based unmask: accept tokens above threshold, or
                 # fall back to the single highest-confidence token.

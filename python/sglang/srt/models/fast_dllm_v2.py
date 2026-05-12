@@ -1,4 +1,4 @@
-﻿# Copyright 2023-2024 SGLang Team
+# Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -549,15 +549,23 @@ class FastDLLMV2(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
-                    # Handle pp weight tying here
-                    # find the embed_tokens.weight in the weights
-                    embed_token_weights = next(
-                        filter(lambda x: x[0] == "model.embed_tokens.weight", weights)
-                    )[1]
-                    loaded_weight = embed_token_weights
-                else:
+            if self.config.tie_word_embeddings:
+                # Mirror embed_tokens onto lm_head as we encounter it. lm_head
+                # lives only on the last pp rank, so multi-pp setups also load
+                # it here. Done inline to avoid consuming the `weights`
+                # iterator with a second-pass filter.
+                if name == "model.embed_tokens.weight" and (
+                    self.pp_group.world_size == 1 or self.pp_group.is_last_rank
+                ):
+                    lm_head_param = params_dict.get("lm_head.weight")
+                    if lm_head_param is not None:
+                        lm_head_loader = getattr(
+                            lm_head_param, "weight_loader", default_weight_loader
+                        )
+                        lm_head_loader(lm_head_param, loaded_weight)
+                if "lm_head.weight" in name:
+                    # Skip standalone lm_head entries; handled via embed_tokens
+                    # above (or by Python-level weight sharing on single pp).
                     continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
