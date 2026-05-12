@@ -51,6 +51,46 @@ struct TokenizerInfo {
 /// Missing `tokenizer_manager` indicates a misconfigured runtime handle and should surface at
 /// startup. Sub-fields are best-effort because unsupported native tokenizer backends can still
 /// fall back to Python tokenization.
+fn try_get_attr(
+    py: Python<'_>,
+    obj: &PyObject,
+    attr: &'static str,
+    context: &'static str,
+) -> Option<PyObject> {
+    obj.getattr(py, attr).map(Some).unwrap_or_else(|err| {
+        tracing::debug!("{}.{} is unavailable: {}", context, attr, err);
+        None
+    })
+}
+
+fn try_get_attr_str(
+    py: Python<'_>,
+    obj: &PyObject,
+    attr: &'static str,
+    context: &'static str,
+) -> Option<String> {
+    try_get_attr(py, obj, attr, context).and_then(|value| {
+        value.extract(py).map(Some).unwrap_or_else(|err| {
+            tracing::debug!("Could not extract {}.{} as string: {}", context, attr, err);
+            None
+        })
+    })
+}
+
+fn try_get_attr_i32(
+    py: Python<'_>,
+    obj: &PyObject,
+    attr: &'static str,
+    context: &'static str,
+) -> Option<i32> {
+    try_get_attr(py, obj, attr, context).and_then(|value| {
+        value.extract(py).map(Some).unwrap_or_else(|err| {
+            tracing::debug!("Could not extract {}.{} as i32: {}", context, attr, err);
+            None
+        })
+    })
+}
+
 fn extract_tokenizer_info(runtime_handle: &PyObject) -> PyResult<TokenizerInfo> {
     Python::with_gil(|py| {
         let tm = runtime_handle
@@ -62,88 +102,28 @@ fn extract_tokenizer_info(runtime_handle: &PyObject) -> PyResult<TokenizerInfo> 
                 ))
             })?;
 
-        let server_args = match tm.getattr(py, "server_args") {
-            Ok(args) => Some(args),
-            Err(err) => {
-                tracing::debug!("Could not extract tokenizer_manager.server_args: {}", err);
-                None
-            }
-        };
+        let server_args = try_get_attr(py, &tm, "server_args", "tokenizer_manager");
 
-        let tokenizer_path: Option<String> = if let Some(args) = server_args.as_ref() {
-            match args.getattr(py, "tokenizer_path") {
-                Ok(value) => value.extract(py).map(Some).unwrap_or_else(|err| {
-                    tracing::debug!("Could not extract server_args.tokenizer_path: {}", err);
-                    None
-                }),
-                Err(err) => {
-                    tracing::debug!("server_args.tokenizer_path is unavailable: {}", err);
-                    None
-                }
-            }
-            .or_else(|| match args.getattr(py, "model_path") {
-                Ok(value) => value.extract(py).map(Some).unwrap_or_else(|err| {
-                    tracing::debug!("Could not extract server_args.model_path: {}", err);
-                    None
-                }),
-                Err(err) => {
-                    tracing::debug!("server_args.model_path is unavailable: {}", err);
-                    None
-                }
+        let tokenizer_path = server_args
+            .as_ref()
+            .and_then(|args| try_get_attr_str(py, args, "tokenizer_path", "server_args"))
+            .or_else(|| {
+                server_args
+                    .as_ref()
+                    .and_then(|args| try_get_attr_str(py, args, "model_path", "server_args"))
             })
-        } else {
-            None
-        }
-        .or_else(|| match tm.getattr(py, "model_path") {
-            Ok(value) => value.extract(py).map(Some).unwrap_or_else(|err| {
-                tracing::debug!("Could not extract tokenizer_manager.model_path: {}", err);
-                None
-            }),
-            Err(err) => {
-                tracing::debug!("tokenizer_manager.model_path is unavailable: {}", err);
-                None
-            }
-        });
+            .or_else(|| try_get_attr_str(py, &tm, "model_path", "tokenizer_manager"));
         if tokenizer_path.is_none() {
             tracing::warn!("Could not extract tokenizer path; Rust tokenizer disabled");
         }
 
-        let tokenizer_mode: Option<String> =
-            server_args
-                .as_ref()
-                .and_then(|args| match args.getattr(py, "tokenizer_mode") {
-                    Ok(value) => value.extract(py).map(Some).unwrap_or_else(|err| {
-                        tracing::debug!("Could not extract server_args.tokenizer_mode: {}", err);
-                        None
-                    }),
-                    Err(err) => {
-                        tracing::debug!("server_args.tokenizer_mode is unavailable: {}", err);
-                        None
-                    }
-                });
+        let tokenizer_mode = server_args
+            .as_ref()
+            .and_then(|args| try_get_attr_str(py, args, "tokenizer_mode", "server_args"));
 
-        let context_len: i32 = tm
-            .getattr(py, "model_config")
-            .map_err(|err| {
-                tracing::debug!("tokenizer_manager.model_config is unavailable: {}", err);
-                err
-            })
-            .ok()
-            .and_then(|mc| {
-                mc.getattr(py, "context_len")
-                    .map_err(|err| {
-                        tracing::debug!("model_config.context_len is unavailable: {}", err);
-                        err
-                    })
-                    .ok()
-            })
-            .and_then(|v| {
-                v.extract(py)
-                    .map_err(|err| {
-                        tracing::debug!("Could not extract model_config.context_len: {}", err);
-                        err
-                    })
-                    .ok()
+        let context_len = try_get_attr(py, &tm, "model_config", "tokenizer_manager")
+            .and_then(|model_config| {
+                try_get_attr_i32(py, &model_config, "context_len", "model_config")
             })
             .unwrap_or_else(|| {
                 tracing::warn!("Could not extract model_config.context_len; defaulting to 0");

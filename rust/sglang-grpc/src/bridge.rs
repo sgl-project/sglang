@@ -1,4 +1,4 @@
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use std::collections::{HashMap, HashSet};
@@ -99,12 +99,16 @@ impl PyBridge {
         response_channel_capacity: usize,
         tokio_handle: Handle,
     ) -> Self {
+        debug_assert!(
+            response_channel_capacity > 0,
+            "response_channel_capacity must be normalized by start_server"
+        );
         Self {
             runtime_handle,
             state: Arc::new(Mutex::new(BridgeState::default())),
             rust_tokenizer,
             context_len,
-            response_channel_capacity: response_channel_capacity.max(1),
+            response_channel_capacity,
             tokio_handle,
         }
     }
@@ -207,13 +211,20 @@ impl PyBridge {
     // ------------------------------------------------------------------
 
     pub fn abort(&self, rid: &str, abort_all: bool) -> PyResult<()> {
-        if abort_all {
+        if !abort_all && rid.trim().is_empty() {
+            return Err(PyValueError::new_err(
+                "Abort requires a non-empty rid unless abort_all is true",
+            ));
+        }
+
+        let should_call_python = if abort_all {
             let mut state = lock_or_recover(self.state.as_ref(), "state");
             let rids = state
                 .channels
                 .drain()
                 .map(|(rid, _)| rid)
                 .collect::<Vec<_>>();
+            let affected = rids.len();
             state.pending_sends.clear();
             state.ready_callbacks.clear();
             state.ready_signals.clear();
@@ -223,13 +234,25 @@ impl PyBridge {
                     TerminalError::Aborted { rid: channel_rid },
                 );
             }
+            tracing::debug!(affected, "gRPC abort_all cleared active response channels");
+            true
         } else {
             let mut state = lock_or_recover(self.state.as_ref(), "state");
-            remove_channel_refs_locked(&mut state, rid);
-            state
-                .terminal_errors
-                .insert(rid.to_string(), TerminalError::Aborted { rid: rid.into() });
+            let was_active = remove_channel_refs_locked(&mut state, rid);
+            if was_active {
+                state
+                    .terminal_errors
+                    .insert(rid.to_string(), TerminalError::Aborted { rid: rid.into() });
+            } else {
+                tracing::debug!(rid, "Ignoring abort for inactive gRPC request id");
+            }
+            was_active
+        };
+
+        if !should_call_python {
+            return Ok(());
         }
+
         Python::with_gil(|py| {
             self.runtime_handle
                 .call_method1(py, "abort", (rid, abort_all))?;
@@ -437,11 +460,12 @@ fn close_channel_with_error(
     let _ = runtime_handle.call_method1(py, "abort", (rid, false));
 }
 
-fn remove_channel_refs_locked(state: &mut BridgeState, rid: &str) {
-    state.channels.remove(rid);
-    state.pending_sends.remove(rid);
-    state.ready_callbacks.remove(rid);
-    state.ready_signals.remove(rid);
+fn remove_channel_refs_locked(state: &mut BridgeState, rid: &str) -> bool {
+    let had_channel = state.channels.remove(rid).is_some();
+    let had_pending = state.pending_sends.remove(rid);
+    let had_callback = state.ready_callbacks.remove(rid).is_some();
+    let had_signal = state.ready_signals.remove(rid);
+    had_channel || had_pending || had_callback || had_signal
 }
 
 fn remove_channel_refs(rid: &str, state: &BridgeStateRef) {

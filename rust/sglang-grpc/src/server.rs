@@ -78,7 +78,10 @@ fn spawn_abort(bridge: Arc<PyBridge>, rid: String) {
             });
         }
         Err(_) => {
-            let _ = bridge.abort(&rid, false);
+            tracing::warn!(
+                rid,
+                "Skipping gRPC request abort because no Tokio runtime is available"
+            );
         }
     }
 }
@@ -611,6 +614,11 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         request: Request<proto::AbortRequest>,
     ) -> Result<Response<proto::AbortResponse>, Status> {
         let req = request.into_inner();
+        if !req.abort_all && req.rid.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "Abort requires a non-empty rid unless abort_all is true",
+            ));
+        }
         if req.abort_all {
             tracing::warn!(
                 "Received abort_all over gRPC; this endpoint must only be exposed to trusted clients"

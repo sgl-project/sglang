@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::proto;
 
 /// Convert proto SamplingParams to a serde_json map (used as Python dict via PyO3).
-pub(crate) fn sampling_params_to_map(params: &Option<proto::SamplingParams>) -> serde_json::Value {
+fn sampling_params_to_map(params: &Option<proto::SamplingParams>) -> serde_json::Value {
     match params {
         Some(p) => {
             let mut map = serde_json::Map::new();
@@ -58,9 +58,7 @@ pub(crate) fn sampling_params_to_map(params: &Option<proto::SamplingParams>) -> 
     }
 }
 
-pub(crate) fn trace_headers_to_json(
-    headers: &HashMap<String, String>,
-) -> Option<serde_json::Value> {
+fn trace_headers_to_json(headers: &HashMap<String, String>) -> Option<serde_json::Value> {
     if headers.is_empty() {
         None
     } else {
@@ -68,7 +66,7 @@ pub(crate) fn trace_headers_to_json(
     }
 }
 
-pub(crate) fn now_timestamp() -> f64 {
+fn now_timestamp() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
