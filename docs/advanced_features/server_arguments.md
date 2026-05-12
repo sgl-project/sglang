@@ -486,7 +486,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--disaggregation-mode` | Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated | `null` | `null`, `prefill`, `decode` |
-| `--disaggregation-transfer-backend` | The backend for disaggregation transfer. Default is mooncake. | `mooncake` | `mooncake`, `nixl`, `ascend`, `fake` |
+| `--disaggregation-transfer-backend` | The backend for disaggregation transfer. Default is mooncake. | `mooncake` | `mooncake`, `nixl`, `ascend`, `mori`, `fake` |
+| `--disaggregation-mori-io-backend` | Mori IO backend for PD disaggregation. `rdma` preserves the existing behavior, and `xgmi` uses same-node GPU XGMI/P2P only. | `rdma` | `rdma`, `xgmi` |
 | `--disaggregation-bootstrap-port` | Bootstrap server port on the prefill server. Default is 8998. | `8998` | Type: int |
 | `--disaggregation-ib-device` | The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when mooncake backend is enabled. | `None` | Type: str |
 | `--disaggregation-decode-enable-offload-kvcache` | Enable async KV cache offloading on decode server (PD mode). | `False` | bool flag (set to enable) |
