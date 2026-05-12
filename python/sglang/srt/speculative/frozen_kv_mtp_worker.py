@@ -755,9 +755,9 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
 
         logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepted_indices
+            res.accept_indices
         ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+        logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None

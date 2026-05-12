@@ -574,7 +574,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
                 num_correct_drafts_per_req_cpu=num_correct_drafts_list,
-                accepted_indices=accept_index,
+                accept_indices=accept_index,
             )
         else:
             if page_size == 1 or self.topk == 1:
@@ -651,7 +651,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
                 num_correct_drafts_per_req_cpu=num_correct_drafts_list,
-                accepted_indices=accept_index,
+                accept_indices=accept_index,
             )
 
 
@@ -972,7 +972,7 @@ class EagleVerifyOutput:
     # Accepted token length per sequence in a batch in CPU (full set).
     num_correct_drafts_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
-    accepted_indices: torch.Tensor
+    accept_indices: torch.Tensor
 
     @classmethod
     def create_idle(
@@ -988,7 +988,7 @@ class EagleVerifyOutput:
             logits_output=logits_output,
             accept_tokens=torch.empty(0, dtype=torch.long, device=device),
             num_correct_drafts_per_req_cpu=[],
-            accepted_indices=torch.full(
+            accept_indices=torch.full(
                 (0, spec_steps + 1), -1, dtype=torch.int32, device=device
             ),
         )
