@@ -359,6 +359,7 @@ class MambaPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        self.clear_slots(select_index)
         return select_index
 
     def clear_slots(self, indices: torch.Tensor):
