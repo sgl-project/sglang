@@ -8,13 +8,9 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
+    can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
-    prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
@@ -29,6 +25,12 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -234,8 +236,8 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if self.nsa_enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, True, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+            if can_nsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
