@@ -8,15 +8,27 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.utils import is_hip
+
 from .causal_conv1d_triton import PAD_SLOT_ID
 from .causal_conv1d_triton import causal_conv1d_fn as _causal_conv1d_fn_triton
 from .causal_conv1d_triton import causal_conv1d_update as _causal_conv1d_update_triton
 
+# JIT CUDA kernel uses CUB (cub::BlockLoad/BlockStore) and is not yet ROCm-compatible,
+# so we explicitly skip it on HIP and let the Triton fallback take over.
 try:
-    from sgl_kernel import causal_conv1d_fwd
-    from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
+    if is_hip():
+        raise ImportError(
+            "causal_conv1d JIT CUDA kernel uses CUB and is not ROCm-compatible; "
+            "falling back to Triton."
+        )
+    from sglang.jit_kernel.causal_conv1d import (
+        causal_conv1d_fwd,
+    )
+    from sglang.jit_kernel.causal_conv1d import (
+        causal_conv1d_update as causal_conv1d_update_kernel,
+    )
 
-    torch.ops.sgl_kernel.causal_conv1d_update
     _HAS_SGL_KERNEL = True
 except (ImportError, AttributeError):
     _HAS_SGL_KERNEL = False
