@@ -326,7 +326,7 @@ class NGRAMWorker:
                         if verify_input.num_correct_drafts is not None
                         else 0
                     )
-                    req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+                    req.time_stats.set_spec_verify_end_time(num_correct_drafts=accepted)
 
             # Store accept_lens (with bonus) for per-request metrics; downstream
             # subtracts 1 to recover drafts-only counts.
