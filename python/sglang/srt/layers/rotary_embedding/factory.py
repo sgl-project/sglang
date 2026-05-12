@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -58,6 +59,7 @@ if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
 
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
+_ROPE_LOCK = threading.Lock()
 
 
 def get_rope(
@@ -103,8 +105,9 @@ def get_rope(
         dual_chunk_attention_args,
         dtype,
     )
-    if key in _ROPE_DICT:
-        return _ROPE_DICT[key]
+    with _ROPE_LOCK:
+        if key in _ROPE_DICT:
+            return _ROPE_DICT[key]
 
     if dual_chunk_attention_config is not None:
         extra_kwargs = {
@@ -373,8 +376,9 @@ def get_rope_cpu(
         rope_scaling_args,
         dtype,
     )
-    if key in _ROPE_DICT:
-        return _ROPE_DICT[key]
+    with _ROPE_LOCK:
+        if key in _ROPE_DICT:
+            return _ROPE_DICT[key]
 
     assert rope_scaling is not None
     scaling_type = rope_scaling["rope_type"]
@@ -410,7 +414,8 @@ def get_rope_cpu(
         dtype,
         **extra_kwargs,
     )
-    _ROPE_DICT[key] = rotary_emb
+    with _ROPE_LOCK:
+        _ROPE_DICT[key] = rotary_emb
     return rotary_emb
 
 
