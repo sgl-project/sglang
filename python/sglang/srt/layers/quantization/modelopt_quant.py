@@ -1775,6 +1775,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
+        del layer.w13_input_scale, layer.w2_input_scale
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         layer.dispatcher.set_quant_config(
@@ -1827,6 +1828,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # FlashInfer TRTLLM processing - handles both w13 and w2
             align_fp4_moe_weights_for_flashinfer_trtllm(layer)
+            del layer.w13_blockscale_swizzled, layer.w2_blockscale_swizzled
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
@@ -1960,6 +1962,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     intermediate_size_per_partition=inter_size,  # n
                     hidden_size=hidden_size,
                 )  # k
+            del layer.w13_weight_scale, layer.w2_weight_scale
 
     @property
     def load_up_proj_weight_first(self) -> bool:
