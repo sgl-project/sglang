@@ -1089,34 +1089,48 @@ class AscendAttnBackend(AttentionBackend):
                 return attn_output
 
             if self.use_fia:
-                """FIA will support multi-bs in the later version of CANN"""
+                """FIA supports multi-bs in the current version of CANN"""
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                attn_output = torch.empty(
-                    (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
-                    device=q.device,
-                    dtype=q.dtype,
+                num_token_padding = q.shape[0]
+                if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                    q, k, v = [
+                        data[: forward_batch.num_token_non_padded_cpu]
+                        for data in [q, k, v]
+                    ]
+                attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                    query=q,
+                    key=k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+                    ),
+                    value=v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+                    ),
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
+                    atten_mask=self.fia_mask,
+                    input_layout="TND",
+                    actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
+                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    num_heads=layer.tp_q_head_num,
+                    scale=layer.scaling,
+                    sparse_mode=3,
                 )
-                q_len_offset = 0
-                for q_len in forward_batch.extend_seq_lens_cpu:
-                    attn_output[q_len_offset : q_len_offset + q_len] = (
-                        torch.ops.npu.npu_fused_infer_attention_score(
-                            q[None, q_len_offset : q_len_offset + q_len],
-                            k[None, q_len_offset : q_len_offset + q_len],
-                            v[None, q_len_offset : q_len_offset + q_len],
-                            num_heads=layer.tp_q_head_num,
-                            num_key_value_heads=layer.tp_k_head_num,
-                            input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                            atten_mask=self.fia_mask.unsqueeze(0),
-                            sparse_mode=3 if q_len != 1 else 0,
-                            scale=layer.scaling,
-                            next_tokens=0,
-                        )[0]
-                    )
-                    q_len_offset += q_len
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
 
+                if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - attn_output.shape[0],
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
             else:
                 causal = True
                 if (
@@ -1994,10 +2008,13 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_len_kv = (
                         self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                     )
+                num_token_padding = q.shape[0]
+                actual_bs = self.forward_metadata.block_tables.shape[0]
+                q = q[:actual_bs]
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q.view(
-                        forward_batch.batch_size,
                         -1,
+                        1,
                         layer.tp_q_head_num,
                         layer.qk_head_dim,
                     ),
@@ -2016,6 +2033,17 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
                 )
+                if actual_bs != num_token_padding:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - actual_bs,
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
             # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
             # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
             elif forward_batch.encoder_lens is None and layer.logit_cap == 0:
