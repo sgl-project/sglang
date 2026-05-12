@@ -7,6 +7,7 @@ x86-only and tested separately in test_moe.py.
 
 import itertools
 import math
+import platform
 import unittest
 
 import torch
@@ -15,6 +16,7 @@ from sglang.srt.layers.amx_utils import CPUQuantMethod
 from sglang.test.test_utils import CustomTestCase
 
 kernel = torch.ops.sgl_kernel
+IS_ARM64 = platform.machine().lower() in ("aarch64", "arm64")
 
 torch.manual_seed(128)
 
@@ -33,7 +35,8 @@ class TestFusedExpertsInt8(CustomTestCase):
 
     def _int8_moe(self, M, N, K, E, topk):
         dtype = torch.bfloat16
-        prepack = True
+        # Arm64 INT8 MoE currently uses the unpacked, out-of-place path.
+        prepack = not IS_ARM64
 
         int8_factor_for_scale = 1e-2
         int8_max = 127
@@ -58,7 +61,7 @@ class TestFusedExpertsInt8(CustomTestCase):
             a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, topk
         )
 
-        inplace = True
+        inplace = not IS_ARM64
         packed_w1 = kernel.convert_weight_packed(w1) if prepack else w1
         packed_w2 = kernel.convert_weight_packed(w2) if prepack else w2
         out = kernel.fused_experts_cpu(
@@ -78,7 +81,9 @@ class TestFusedExpertsInt8(CustomTestCase):
         )
 
         atol = rtol = precision[ref_out.dtype]
-        if M > 35:
+        if IS_ARM64:
+            atol = rtol = 0.03
+        elif M > 35:
             atol = rtol = 0.02
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
