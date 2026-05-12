@@ -472,10 +472,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self._init_compressed_layer_mapping()
 
         # Mutually exclusive: paged ring pools (radix path) vs. non-paged
-        # per-request states used by the SGLANG_CPU_USE_COMPRESS_SEPARATE=1
-        if not envs.SGLANG_CPU_USE_COMPRESS_SEPARATE.get() and not (
-            _is_cpu and _cpu_amx
-        ):
+        if not (_is_cpu and _cpu_amx):
             self._init_paged_compress_states(enable_memory_saver)
             self.compress_states: List[Optional[DeepSeekV4CompressState]] = []
             self.indexer_compress_states: List[Optional[DeepSeekV4CompressState]] = []
@@ -591,7 +588,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def _init_compress_states(self, enable_memory_saver: bool):
         """Allocate non-paged DeepSeekV4CompressState buffers used by the
-        old-compressor fallback (SGLANG_CPU_USE_COMPRESS_SEPARATE=1).
+        old-compressor fallback.
 
         Layout per layer: ``(max_num_reqs, ratio*coff, 2*head_dim*coff)``.
         The buffers are small relative to the paged ring pools and only
@@ -663,9 +660,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_attention_compress_states(
         self, layer_id: int
     ) -> Union[CompressStatePool, KVAndScore, KVAndScoreSeparate]:
-        if not envs.SGLANG_CPU_USE_COMPRESS_SEPARATE.get() and not (
-            _is_cpu and _cpu_amx
-        ):
+        if not (_is_cpu and _cpu_amx):
             compress_state_pool = self.compress_state_pools[layer_id]
             assert (
                 compress_state_pool is not None
@@ -678,9 +673,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_indexer_compress_states(
         self, layer_id: int
     ) -> Union[CompressStatePool, KVAndScore, KVAndScoreSeparate]:
-        if not envs.SGLANG_CPU_USE_COMPRESS_SEPARATE.get() and not (
-            _is_cpu and _cpu_amx
-        ):
+        if not (_is_cpu and _cpu_amx):
             indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
             assert (
                 indexer_compress_state_pool is not None
