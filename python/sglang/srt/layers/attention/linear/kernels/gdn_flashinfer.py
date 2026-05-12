@@ -96,7 +96,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             raise RuntimeError("FlashInfer GDN decode kernel is unavailable.")
 
         sm_major = torch.cuda.get_device_capability()[0]
-        self.is_sm100plus = sm_major != 9
+        self.is_sm100plus = sm_major >= 10
 
         if sm_major == 9:
             if self._prefill_fn is None:
@@ -204,18 +204,11 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # assigned to a real sequence; clamp them to 0 (the reserved dummy
             # slot) so the FlashInfer kernel never reads out-of-bounds state.
             ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
-            num_seqs = ssm_cache_indices.shape[0]
-            num_sab_heads = max(q.shape[2], num_v_heads)
-            head_k_dim = q.shape[3]
+            initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
             # Pre-allocate bf16 output_state so the kernel compiles and writes the
             # bf16 state path directly, avoiding a fp32 allocation and a subsequent
             # fp32->bf16 conversion in the scatter step.
-            output_state_fi = torch.empty(
-                (num_seqs, num_sab_heads, head_v_dim, head_k_dim),
-                dtype=ssm_states.dtype,
-                device=ssm_states.device,
-            )
-            initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
+            output_state_fi = torch.empty_like(initial_state_fi)
             output_fi, output_state_fi = self._prefill_fn(
                 q=q_fi,
                 k=k_fi,

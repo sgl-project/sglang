@@ -15,10 +15,12 @@ register_cuda_ci(est_time=720, suite="stage-c-test-4-gpu-b200")
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}
 
+_cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+
 _is_sm100_cuda13 = (
     torch.cuda.is_available()
     and torch.cuda.get_device_capability()[0] >= 10
-    and int(torch.version.cuda.split(".")[0]) >= 13
+    and _cuda_major >= 13
 )
 
 
