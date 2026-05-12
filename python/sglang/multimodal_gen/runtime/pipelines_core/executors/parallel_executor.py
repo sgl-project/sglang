@@ -82,8 +82,12 @@ class ParallelExecutor(PipelineExecutor):
 
                 elif paradigm == StageParallelismType.CFG_PARALLEL:
                     obj_list = [batch] if rank == 0 else []
+                    # `dist.broadcast(src=...)` expects a global rank for process groups.
                     broadcasted_list = broadcast_pyobj(
-                        obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
+                        obj_list,
+                        rank=get_world_rank(),
+                        dist_group=cfg_group.cpu_group,
+                        src=cfg_group.ranks[0],
                     )
                     if rank != 0:
                         batch = broadcasted_list[0]

@@ -313,10 +313,9 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     quant_info: CuteDslFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    from flashinfer import fp4_quantize
-
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
 
