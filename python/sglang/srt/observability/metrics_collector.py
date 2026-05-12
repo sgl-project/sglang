@@ -68,6 +68,7 @@ class SchedulerStats:
     num_grammar_queue_reqs: int = 0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
+    eic_cache_hit_rate: float = 0.0
     decode_sum_seq_lens: int = 0
 
     # Memory pool usage ratios (0.0–1.0).
@@ -286,6 +287,13 @@ class SchedulerMetricsCollector:
         self.kv_used_tokens = Gauge(
             name="sglang:kv_used_tokens",
             documentation="Number of actively used token slots in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.eic_cache_hit_rate = Gauge(
+            name="sglang:eic_cache_hit_rate",
+            documentation="The EIC cache hit rate.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1056,6 +1064,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+        self._log_gauge(self.eic_cache_hit_rate, stats.eic_cache_hit_rate)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
 
         # Memory pool usage ratios

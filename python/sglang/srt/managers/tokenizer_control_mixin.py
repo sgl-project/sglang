@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EICSwitchOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -121,6 +122,11 @@ _COMMUNICATOR_SPECS = [
     ("update_lora_adapter", LoRAUpdateOutput),
     ("get_loads", GetLoadsReqOutput, "watching"),
     ("dumper_control", DumperControlReqOutput),
+    # EIC toggle (PR #440 originally wired this in the old hand-built dispatcher
+    # but registered the *input* types instead of the response, so the await
+    # never unblocked. Declaring the response here in the spec restores the
+    # correct mapping: EICSwitchOutput -> eic_switch_communicator.handle_recv.
+    ("eic_switch", EICSwitchOutput),
 ]
 
 
