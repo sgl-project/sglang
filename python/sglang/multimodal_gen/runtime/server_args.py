@@ -42,7 +42,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args_auto_tune import (
-    PERFORMANCE_MODE_ALIASES,
     PERFORMANCE_MODES,
     ServerArgsAutoTuner,
 )
@@ -938,7 +937,7 @@ class ServerArgs(DisaggArgsMixin):
             "--performance-mode",
             "--mode",
             type=str,
-            choices=PERFORMANCE_MODES + tuple(PERFORMANCE_MODE_ALIASES),
+            choices=PERFORMANCE_MODES,
             default=ServerArgs.performance_mode,
             help=(
                 "Preset for performance and memory defaults. "
