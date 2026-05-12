@@ -281,6 +281,7 @@ class PiecewiseCudaGraphRunner:
                     )
 
         self.raw_num_tokens = 0
+        self._logged_first_replay = False
 
     def warmup_torch_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
@@ -676,6 +677,15 @@ class PiecewiseCudaGraphRunner:
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph():
+            if not self._logged_first_replay:
+                log_info_on_rank0(
+                    logger,
+                    "Replay piecewise CUDA graph first time: "
+                    f"forward_mode={forward_batch.forward_mode.name}, "
+                    f"num_tokens={len(forward_batch.input_ids)}, "
+                    f"max_captured_tokens={self.max_num_tokens}",
+                )
+                self._logged_first_replay = True
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
