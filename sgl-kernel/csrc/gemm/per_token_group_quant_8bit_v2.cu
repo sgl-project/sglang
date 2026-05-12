@@ -271,6 +271,10 @@ __global__ void per_token_group_quant_8bit_kernel(
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  cudaGridDependencySynchronize();
+#endif
+
   SCHEDULER::execute<FUSE_SILU_AND_MUL, GROUP_SIZE, THREADS_PER_SUBWARP>(
       subwarps_per_block,
       hidden_dim_num_groups,
@@ -398,6 +402,10 @@ __global__ void per_token_group_quant_8bit_kernel(
             reinterpret_cast<int4*>(output_q + offset_num_groups * GROUP_SIZE + lane_id * INPUT_PRIMARY_VEC_SIZE),
             output_buf);
       });
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 void sgl_per_token_group_quant_8bit_v2(
@@ -445,17 +453,28 @@ void sgl_per_token_group_quant_8bit_v2(
     SCHEDULER::compute_exec_config(                                                                                  \
         THREADS_PER_SUBWARP, num_local_experts, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block); \
                                                                                                                      \
-    per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, __VA_ARGS__>         \
-        <<<grid, block, 0, stream>>>(                                                                                \
-            static_cast<T*>(input.data_ptr()),                                                                       \
-            static_cast<DST_DTYPE*>(output_q.data_ptr()),                                                            \
-            static_cast<output_s_dtype*>(output_s.data_ptr()),                                                       \
-            static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr() : 0),                                  \
-            subwarps_per_block,                                                                                      \
-            hidden_dim_num_groups,                                                                                   \
-            scale_expert_stride,                                                                                     \
-            scale_hidden_stride,                                                                                     \
-            num_tokens_per_expert);                                                                                  \
+    cudaLaunchConfig_t config;                                                                                       \
+    config.gridDim = grid;                                                                                           \
+    config.blockDim = block;                                                                                         \
+    config.dynamicSmemBytes = 0;                                                                                     \
+    config.stream = stream;                                                                                          \
+    cudaLaunchAttribute attrs[1];                                                                                    \
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                                                \
+    attrs[0].val.programmaticStreamSerializationAllowed = getEnvEnablePDL();                                         \
+    config.numAttrs = 1;                                                                                             \
+    config.attrs = attrs;                                                                                            \
+    cudaLaunchKernelEx(                                                                                              \
+        &config,                                                                                                     \
+        per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, __VA_ARGS__>,    \
+        static_cast<T*>(input.data_ptr()),                                                                           \
+        static_cast<DST_DTYPE*>(output_q.data_ptr()),                                                                \
+        static_cast<output_s_dtype*>(output_s.data_ptr()),                                                           \
+        static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr() : 0),                                      \
+        subwarps_per_block,                                                                                          \
+        hidden_dim_num_groups,                                                                                       \
+        scale_expert_stride,                                                                                         \
+        scale_hidden_stride,                                                                                         \
+        num_tokens_per_expert);                                                                                      \
   } while (0)
 
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                                     \

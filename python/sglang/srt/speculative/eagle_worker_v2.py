@@ -49,7 +49,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
-    fill_new_verified_id,
+    fill_bonus_tokens,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -383,7 +383,7 @@ class EagleDraftWorker(BaseDraftWorker):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            draft_input.verified_id,
+            draft_input.bonus_tokens,
             parent_list,
             top_scores_index,
             draft_tokens,
@@ -537,7 +537,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Construct spec_info
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
-            verified_id=next_token_ids,
+            bonus_tokens=next_token_ids,
             new_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
@@ -593,11 +593,11 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.plan_stream
             )
 
-        if forward_batch.spec_info.num_accepted_drafts is None:
+        if forward_batch.spec_info.num_correct_drafts is None:
             # `batch_result.accept_lens` already includes the bonus token, so use it
-            # directly for `num_accepted_tokens` and subtract 1 for `num_accepted_drafts`.
-            forward_batch.spec_info.num_accepted_drafts = batch_result.accept_lens - 1
-            forward_batch.spec_info.num_accepted_tokens = batch_result.accept_lens
+            # directly for `num_accept_tokens` and subtract 1 for `num_correct_drafts`.
+            forward_batch.spec_info.num_correct_drafts = batch_result.accept_lens - 1
+            forward_batch.spec_info.num_accept_tokens = batch_result.accept_lens
 
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
@@ -763,8 +763,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
-                    hidden_size=self.target_worker.model_config.spec_hidden_size,
-                    dtype=self.target_worker.model_config.dtype,
+                    hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
+                    dtype=EagleDraftInput.dtype_for(self.draft_worker),
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
@@ -793,9 +793,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             return batch_output
 
-    def on_verify_complete_cpu(self, accepted_draft_tokens: list[int]) -> None:
+    def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.on_verify_complete(accepted_draft_tokens)
+            self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
     # -- Adaptive speculative decoding protocol --
 
@@ -969,6 +969,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
+            if (
+                _is_npu
+                and self._target_worker.model_runner.model_is_mrope
+                and batch.spec_info is not None
+                and getattr(batch.spec_info, "positions", None) is not None
+                and not batch.forward_mode.is_idle()
+            ):
+                # mrope_position depends on draft output in default stream and is computed in plan stream,
+                # causing errors. Compute it here for correct values.
+                verify_forward_batch.compute_spec_mrope_positions(
+                    self._target_worker.model_runner, batch
+                )
 
             # Some values such as custom_mask and position depend on the output of draft,
             # so the previous plan step used the wrong values. Here, we need to run the related
@@ -1041,16 +1053,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
-            all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_lens, dtype=torch.int32)
-            fill_new_verified_id[(bs,)](
-                all_verified_id,
+            accept_tokens = predict[accept_index]
+            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+            fill_bonus_tokens[(bs,)](
+                accept_tokens,
                 accept_lens,
-                verified_id,
+                bonus_tokens,
                 self.speculative_num_draft_tokens,
             )
         else:
-            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(
@@ -1059,7 +1071,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
-            verified_id=verified_id,
+            bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
         )
@@ -1085,7 +1097,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
     ):
         """Update mamba state for hybrid GDN models after verification."""
         # `accept_lens` already includes the bonus token (drafts + 1 per req).
-        accepted_length_with_bonus = accept_lens
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
             if verify_input.topk != 1:
                 raise ValueError("Spec v2 currently only supports topk = 1.")
@@ -1094,16 +1105,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 0,
                 bs * self.speculative_num_draft_tokens,
                 step=self.speculative_num_draft_tokens,
-                dtype=accepted_length_with_bonus.dtype,
-                device=accepted_length_with_bonus.device,
+                dtype=accept_lens.dtype,
+                device=accept_lens.device,
             )
-            accepted_steps = accepted_length_with_bonus - 1
+            last_correct_step_indices = accept_lens - 1
 
             if batch.mamba_track_indices is not None:
                 # If after verify, the request's seq_lens has crossed a mamba track interval,
                 # we need to update the mamba state for the request at the crossing point.
                 seq_lens_pre_verify = batch.seq_lens
-                seq_lens_post_verify = batch.seq_lens + accepted_length_with_bonus
+                seq_lens_post_verify = batch.seq_lens + accept_lens
                 mamba_track_interval = self.server_args.mamba_track_interval
                 to_track_mask = (
                     seq_lens_pre_verify // mamba_track_interval
@@ -1118,7 +1129,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 req_idx = torch.arange(
                     bs,
                     dtype=torch.int64,
-                    device=accepted_length_with_bonus.device,
+                    device=accept_lens.device,
                 )
                 candidate_track_steps = (
                     accept_index[req_idx, to_track_ith] - accepted_indices_offset
@@ -1132,7 +1143,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 mamba_steps_to_track = None
 
             self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-                accepted_steps=accepted_steps,
+                last_correct_step_indices=last_correct_step_indices,
                 mamba_track_indices=batch.mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=self.target_worker.model_runner.model,
@@ -1142,15 +1153,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         batch: ModelWorkerBatch,
         accept_index: torch.Tensor,
-        num_accepted_drafts: torch.Tensor,
+        num_correct_drafts: torch.Tensor,
     ):
         """
-        Move accepted tokens to the target KV cache.
+        Move accepted tokens (drafts + bonus) to the target KV cache.
 
         Args:
             batch: The batch to run.
-            accept_index: The index of the accepted tokens.
-            num_accepted_drafts: The length of the accepted tokens.
+            accept_index: The index of the accepted tokens (incl. bonus).
+            num_correct_drafts: Per-req count of correct drafts (excludes bonus);
+                seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
         """
         bs = len(batch.seq_lens)
         size = bs * self.speculative_num_draft_tokens
@@ -1167,7 +1179,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            batch.seq_lens + num_accepted_drafts,
+            batch.seq_lens + num_correct_drafts + 1,
             tgt_cache_loc,
             self.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
