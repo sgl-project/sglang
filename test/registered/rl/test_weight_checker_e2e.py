@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=150, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=150, suite="nightly-1-gpu", nightly=True)
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 # We address the up half via the HF-style unfused name "up_proj.weight". sglang's
@@ -55,10 +55,17 @@ class TestWeightCheckerE2E(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.url = DEFAULT_URL_FOR_TEST
+        # --mem-fraction-static 0.7 leaves enough free GPU for _check_tensors's
+        # CPU->GPU round trip: snapshot lives on CPU, then _compare moves each
+        # snapshot tensor back to GPU for byte equality. With the default 0.88,
+        # sglang holds ~29GB on a 32GB GPU and only ~200MB is free, so the
+        # vocab-embedding round-trip (~600MB) OOMs the snapshot/reset/compare
+        # cycle in test_z_*.
         cls.process = popen_launch_server(
             _MODEL_NAME,
             cls.url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--mem-fraction-static", "0.7"],
         )
 
     @classmethod

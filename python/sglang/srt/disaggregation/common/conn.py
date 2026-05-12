@@ -96,7 +96,7 @@ class CommonKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.kv_item_lens_sum = sum(args.kv_item_lens)
-        self.state_item_lens_sum = sum(args.state_item_lens)
+        self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
@@ -183,12 +183,6 @@ class CommonKVManager(BaseKVManager):
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        if (
-            status == KVPoll.Failed
-            and self.disaggregation_mode == DisaggregationMode.PREFILL
-            and hasattr(self, "req_to_decode_prefix_len")
-        ):
-            self.req_to_decode_prefix_len.pop(bootstrap_room, None)
         if bootstrap_room not in self.request_status:
             # Do not resurrect a cleared entry with Failed: once clear() has
             # popped the room from request_status, any late update_status(Failed)
@@ -526,16 +520,18 @@ class CommonKVSender(BaseKVSender):
     def _record_transfer_indices(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]],
+        state_indices: Optional[List],
     ):
         self._transfer_num_kv_indices += len(kv_indices)
-        if state_indices is not None:
-            self._transfer_num_state_indices += len(state_indices)
+        if state_indices:
+            for component_indices in state_indices:
+                if component_indices is not None:
+                    self._transfer_num_state_indices += len(component_indices)
 
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         pass
 
@@ -544,6 +540,13 @@ class CommonKVSender(BaseKVSender):
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
+
+    def clear(self) -> None:
+        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
+            self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "transfer_infos"):
+            self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -607,6 +610,8 @@ class CommonKVReceiver(BaseKVReceiver):
 
         self.prefill_dp_rank = prefill_dp_rank
         self._setup_bootstrap_infos()
+        if self.conclude_state == KVPoll.Failed:
+            return
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def _setup_bootstrap_infos(self):
@@ -649,6 +654,7 @@ class CommonKVReceiver(BaseKVReceiver):
                             self.kv_mgr.update_status(
                                 self.bootstrap_room, KVPoll.Failed
                             )
+                            self.bootstrap_infos = None
                             return
 
                 self.bootstrap_infos = bootstrap_infos
@@ -739,6 +745,11 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
+
+    def clear(self) -> None:
+        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
+        self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(

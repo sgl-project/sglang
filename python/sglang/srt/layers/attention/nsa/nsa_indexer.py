@@ -148,7 +148,6 @@ class BaseIndexerMetadata(ABC):
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    assert x.dtype == torch.bfloat16
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
@@ -267,15 +266,8 @@ class Indexer(MultiPlatformOp):
         # avoiding an expensive FP8-to-bf16 dequantization.
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            weight = self.weights_proj.weight
-            out = torch.empty(
-                (x.shape[0], weight.shape[0]),
-                dtype=torch.float32,
-                device=x.device,
-            )
-            deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
-            return out
+        if _is_cuda:
+            return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
 
         weights, _ = self.weights_proj(x)
         if _is_hip:
@@ -299,6 +291,12 @@ class Indexer(MultiPlatformOp):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
+
+    @torch.compile(dynamic=True)
+    def _apply_q_scale_and_softmax_scale(
+        self, weights: torch.Tensor, q_scale: torch.Tensor
+    ):
+        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     def _get_q_k_bf16(
         self,
@@ -456,10 +454,18 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        # DeepGEMM release-0426 requires context_lens of shape [batch_size, next_n]
+        # to match q.shape = [batch_size, next_n, heads, head_dim]. The indexer uses
+        # next_n=1 with batch_size=N_total via q_fp8.unsqueeze(1) below, so mirror
+        # that layout here.
+        if seqlens_32.dim() == 2:
+            seqlens_32_2d = seqlens_32
+        else:
+            seqlens_32_2d = seqlens_32.unsqueeze(-1)
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, blocksize, self.sm_count
+                    seqlens_32_2d, blocksize, self.sm_count
                 )
 
         assert len(q_fp8.shape) == 3
@@ -508,7 +514,7 @@ class Indexer(MultiPlatformOp):
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
-                seqlens_32,
+                seqlens_32_2d,
                 block_tables,
                 schedule_metadata,
                 max_seq_len,
@@ -1154,7 +1160,7 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+            weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
