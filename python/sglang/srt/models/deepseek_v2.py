@@ -164,6 +164,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -459,6 +460,47 @@ def _get_mega_moe_symm_buffer(
     return buf
 
 
+@register_custom_op(mutates_args=["y"])
+def _deep_gemm_fp8_fp4_mega_moe_pcg_op(
+    y: torch.Tensor,
+    l1_weight: torch.Tensor,
+    l1_scale: torch.Tensor,
+    l2_weight: torch.Tensor,
+    l2_scale: torch.Tensor,
+    cumulative_local_expert_recv_stats: Optional[torch.Tensor],
+    sym_buffer: torch.Tensor,
+    sym_buffer_ptrs: torch.Tensor,
+    rank: int,
+    num_max_tokens_per_rank: int,
+    num_experts: int,
+    num_topk: int,
+    recipe_m: int,
+    recipe_n: int,
+    recipe_k: int,
+    activation: str,
+    activation_clamp: Optional[float],
+    fast_math: bool,
+) -> None:
+    import deep_gemm
+
+    deep_gemm._C.fp8_fp4_mega_moe(
+        y,
+        (l1_weight, l1_scale),
+        (l2_weight, l2_scale),
+        cumulative_local_expert_recv_stats,
+        sym_buffer,
+        sym_buffer_ptrs,
+        rank,
+        num_max_tokens_per_rank,
+        num_experts,
+        num_topk,
+        (recipe_m, recipe_n, recipe_k),
+        activation,
+        activation_clamp,
+        fast_math,
+    )
+
+
 class DeepseekV2MoE(nn.Module):
 
     def __init__(
@@ -486,6 +528,8 @@ class DeepseekV2MoE(nn.Module):
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
         self._pcg_mega_moe_symm_buffer = None
+        self._pcg_mega_moe_symm_buffer_ptrs = None
+        self._pcg_mega_moe_rank = 0
 
         if envs.SGLANG_DSV4_MODE.get() == "2604":
             n_hash_layers = config.num_hash_layers
@@ -1184,6 +1228,10 @@ class DeepseekV2MoE(nn.Module):
             hidden=self.config.hidden_size,
             intermediate_hidden=self.config.moe_intermediate_size,
         )
+        self._pcg_mega_moe_symm_buffer_ptrs = (
+            self._pcg_mega_moe_symm_buffer.handle.buffer_ptrs
+        )
+        self._pcg_mega_moe_rank = self._pcg_mega_moe_symm_buffer.group.rank()
         return True
 
     def forward_mega_moe(
@@ -1235,8 +1283,6 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor],
         num_tokens: int,
     ) -> torch.Tensor:
-        import deep_gemm
-
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8_ue8m0,
         )
@@ -1335,16 +1381,40 @@ class DeepseekV2MoE(nn.Module):
             device=hidden_states.device,
         )
         swiglu_limit = getattr(self.config, "swiglu_limit", None)
-        deep_gemm.fp8_fp4_mega_moe(
-            y,
-            self.experts.mega_l1_weights,
-            self.experts.mega_l2_weights,
-            buf,
-            recipe=(1, 1, 32),
-            activation="swiglu",
-            activation_clamp=swiglu_limit,
-            fast_math=True,
-        )
+        if is_in_piecewise_cuda_graph():
+            _deep_gemm_fp8_fp4_mega_moe_pcg_op(
+                y,
+                self.experts.mega_l1_weights[0],
+                self.experts.mega_l1_weights[1],
+                self.experts.mega_l2_weights[0],
+                self.experts.mega_l2_weights[1],
+                None,
+                buf.buffer,
+                self._pcg_mega_moe_symm_buffer_ptrs,
+                self._pcg_mega_moe_rank,
+                buf.num_max_tokens_per_rank,
+                buf.num_experts,
+                buf.num_topk,
+                1,
+                1,
+                32,
+                "swiglu",
+                swiglu_limit,
+                True,
+            )
+        else:
+            import deep_gemm
+
+            deep_gemm.fp8_fp4_mega_moe(
+                y,
+                self.experts.mega_l1_weights,
+                self.experts.mega_l2_weights,
+                buf,
+                recipe=(1, 1, 32),
+                activation="swiglu",
+                activation_clamp=swiglu_limit,
+                fast_math=True,
+            )
 
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             y.mul_(self.routed_scaling_factor)
