@@ -959,6 +959,8 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     from sglang.srt.environ import envs
 
     algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
+    if _is_cpu and _cpu_amx:
+        algo = "cpu_amx"
     return _dispatch_bf16_fp32_backend(x, y, algo=algo)
 
 

@@ -8,7 +8,11 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 
 
 @dataclasses.dataclass
@@ -105,7 +109,7 @@ class DeepSeekV4CompressState:
             self.kv_score_state = torch.empty(state_shape, dtype=dtype, device=device)
 
     def get_state(self):
-        if envs.SGLANG_CPU_USE_COMPRESS_SEPARATE.get():
+        if envs.SGLANG_CPU_USE_COMPRESS_SEPARATE.get() or (_is_cpu and _cpu_amx):
             half_dim = self.head_dim * (1 + self.overlap)
             return KVAndScoreSeparate(
                 kv=self.kv_score_state[..., :half_dim],

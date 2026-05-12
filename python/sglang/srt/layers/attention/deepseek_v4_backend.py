@@ -907,23 +907,28 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         raw_loc = forward_batch.out_cache_loc
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+
+        if _is_cpu and _cpu_amx:
+            from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
+                NopeFp8RopeBf16Pack,
+            )
+
+            swa_k_pack = NopeFp8RopeBf16Pack(
+                *torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(swa_k)
+            )
+            self.token_to_kv_pool.set_swa_key_buffer_radix(
+                layer_id=layer_id,
+                raw_loc=raw_loc,
+                cache_nope_fp8_rope_bf16_pack=swa_k_pack,
+            )
+        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
                 raw_loc=raw_loc,
                 cache_k=swa_k,
             )
         else:
-            if _is_cpu and _cpu_amx:
-                from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
-                    NopeFp8RopeBf16Pack,
-                )
-
-                swa_k_pack = NopeFp8RopeBf16Pack(
-                    *torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(swa_k)
-                )
-            else:
-                swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
+            swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
             self.token_to_kv_pool.set_swa_key_buffer_radix(
                 layer_id=layer_id,
                 raw_loc=raw_loc,

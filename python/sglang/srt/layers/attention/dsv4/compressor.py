@@ -153,27 +153,25 @@ class CompressorBackendMixin:
             if compressor.ratio == 4
             else core_metadata.c128_out_loc
         )
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        if _is_cpu and _cpu_amx:
+            from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
+                NopeFp8RopeBf16Pack,
+            )
+
+            pack = NopeFp8RopeBf16Pack(
+                *torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(
+                    new_compressed_kv.bfloat16()
+                )
+            )
+            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_extra_key_buffer_fused(
                 layer_id=layer_id,
                 loc=out_loc,
                 cache_k=new_compressed_kv,
             )
         else:
-            if _is_cpu and _cpu_amx:
-                from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
-                    NopeFp8RopeBf16Pack,
-                )
-
-                pack = NopeFp8RopeBf16Pack(
-                    *torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(
-                        new_compressed_kv.bfloat16()
-                    )
-                )
-            else:
-                pack = quant_to_nope_fp8_rope_bf16_pack_triton(
-                    new_compressed_kv.bfloat16()
-                )
+            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
             token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
 
     def forward_indexer_compressor(
@@ -191,21 +189,27 @@ class CompressorBackendMixin:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+
+        if _is_cpu and _cpu_amx:
+            new_compressed_kv_fp8, new_compressed_kv_scale = (
+                torch.ops.sgl_kernel.act_quant_cpu(new_compressed_kv)
+            )
+            token_to_kv_pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                index_k=new_compressed_kv_fp8,
+                index_k_scale=new_compressed_kv_scale,
+            )
+        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
                 loc=self.forward_metadata.core_metadata.c4_out_loc,
                 cache_k=new_compressed_kv,
             )
         else:
-            if _is_cpu and _cpu_amx:
-                new_compressed_kv_fp8, new_compressed_kv_scale = (
-                    torch.ops.sgl_kernel.act_quant_cpu(new_compressed_kv)
-                )
-            else:
-                new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
-                    new_compressed_kv
-                )
+            new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
+                new_compressed_kv
+            )
             token_to_kv_pool.set_index_k_scale_buffer(
                 layer_id=layer_id,
                 loc=self.forward_metadata.core_metadata.c4_out_loc,
@@ -382,7 +386,7 @@ class Compressor(nn.Module):
 
     @cached_property
     def use_fused_compress(self) -> bool:
-        if envs.SGLANG_CPU_USE_COMPRESS_SEPARATE.get():
+        if envs.SGLANG_CPU_USE_COMPRESS_SEPARATE.get() or (_is_cpu and _cpu_amx):
             return False
         return True
 

@@ -404,6 +404,8 @@ class MQALayer(nn.Module):
         )
 
         self.overlap_store_cache = envs.SGLANG_OPT_USE_OVERLAP_STORE_CACHE.get()
+        if _is_cpu and _cpu_amx:
+            self.overlap_store_cache = False
         self.use_jit_norm = envs.SGLANG_OPT_USE_JIT_NORM.get()
 
     def _compute_q_a(
@@ -785,6 +787,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
+        if _is_cpu and _cpu_amx:
+            y, post, comb = torch.ops.sgl_kernel.hc_pre_fused_cpu(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+            return y, post, comb, False
+
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
 
@@ -822,20 +837,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
-            if _is_cpu and _cpu_amx:
-                y, post, comb = torch.ops.sgl_kernel.hc_pre_fused_cpu(
-                    x,
-                    hc_fn,
-                    hc_scale,
-                    hc_base,
-                    self.hc_mult,
-                    self.hc_sinkhorn_iters,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                )
-                return y, post, comb, False
-            else:
-                x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
         from sglang.srt.layers.mhc import hc_split_sinkhorn
 
@@ -863,11 +865,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            from sglang.srt.layers.mhc import mhc_post
-
-            return mhc_post(x, residual, post, comb)
-
         if _is_cpu and _cpu_amx:
             return torch.ops.sgl_kernel.hc_post_fused_cpu(
                 x,
@@ -875,6 +872,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 post,
                 comb,
             )
+
+        if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+            from sglang.srt.layers.mhc import mhc_post
+
+            return mhc_post(x, residual, post, comb)
+
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
         assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
