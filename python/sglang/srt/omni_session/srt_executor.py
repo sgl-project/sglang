@@ -908,23 +908,21 @@ class OmniSRTSchedulerExecutor:
             "attention_mode": "full_query",
             "attention_mask_shape": (extend_num_tokens, seq_len),
         }
-        if cross_attention_custom_mask is None:
-            cross_attention_custom_mask = torch.ones(
-                extend_num_tokens * seq_len,
-                dtype=torch.bool,
-                device=device,
-            )
-        elif int(cross_attention_custom_mask.numel()) != extend_num_tokens * seq_len:
+        if (
+            cross_attention_custom_mask is not None
+            and int(cross_attention_custom_mask.numel()) != extend_num_tokens * seq_len
+        ):
             raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward custom mask has inconsistent size: "
                 f"{int(cross_attention_custom_mask.numel())} != "
                 f"{extend_num_tokens * seq_len}"
             )
-        forward_batch.cross_attention_custom_mask = cross_attention_custom_mask.to(
-            device=device,
-            dtype=torch.bool,
-            non_blocking=True,
-        )
+        if cross_attention_custom_mask is not None:
+            forward_batch.cross_attention_custom_mask = cross_attention_custom_mask.to(
+                device=device,
+                dtype=torch.bool,
+                non_blocking=True,
+            )
         return forward_batch
 
     def _request_token_indices(

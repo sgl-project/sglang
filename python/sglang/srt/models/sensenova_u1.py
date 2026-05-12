@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Iterable, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.sensenova_u1 import SenseNovaU1Config
@@ -581,9 +582,90 @@ class NEOQwen3Attention(Qwen3Attention):
             dim=-1,
         ).reshape(num_tokens, self.kv_size)
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        if forward_batch.use_temporary_full_query_attention():
+            attn_output = self._forward_temporary_full_query_attention(
+                q=q,
+                k=k,
+                v=v,
+                forward_batch=forward_batch,
+            )
+        else:
+            attn_output = self.attn(q, k, v, forward_batch)
         output, _ = output_proj(attn_output)
         return output
+
+    def _forward_temporary_full_query_attention(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """run U1 denoise attention over SRT-owned prefix KV plus query KV"""
+
+        extend_num_tokens = int(forward_batch.extend_num_tokens)
+        req_pool_idx = int(forward_batch.req_pool_indices[0].item())
+        seq_len = int(forward_batch.seq_lens[0].item())
+
+        q = q.view(extend_num_tokens, self.num_heads, self.head_dim)
+        k = k.view(extend_num_tokens, self.num_kv_heads, self.head_dim)
+        v = v.view(extend_num_tokens, self.num_kv_heads, self.head_dim)
+
+        # 1. write current image-query KV into the same temporary slots used by SRT
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.attn,
+            forward_batch.out_cache_loc,
+            k,
+            v,
+            self.attn.k_scale,
+            self.attn.v_scale,
+        )
+
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        token_indices = req_to_token[req_pool_idx, :seq_len].to(
+            device=q.device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
+        key_states = forward_batch.token_to_kv_pool.get_key_buffer(
+            self.attn.layer_id
+        ).index_select(0, token_indices)
+        value_states = forward_batch.token_to_kv_pool.get_value_buffer(
+            self.attn.layer_id
+        ).index_select(0, token_indices)
+
+        if self.num_heads != self.num_kv_heads:
+            kv_groups = self.num_heads // self.num_kv_heads
+            key_states = key_states.repeat_interleave(kv_groups, dim=1)
+            value_states = value_states.repeat_interleave(kv_groups, dim=1)
+
+        attn_mask = None
+        custom_mask = forward_batch.cross_attention_custom_mask
+        if custom_mask is not None:
+            custom_mask = custom_mask.view(extend_num_tokens, seq_len)
+            attn_mask = torch.zeros(
+                (extend_num_tokens, seq_len),
+                dtype=torch.float32,
+                device=q.device,
+            ).masked_fill_(~custom_mask, float("-inf"))
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+
+        # 2. materialize prefix+query K/V so full-query semantics match official U1
+        attn_output = F.scaled_dot_product_attention(
+            q.transpose(0, 1).unsqueeze(0),
+            key_states.transpose(0, 1).unsqueeze(0),
+            value_states.transpose(0, 1).unsqueeze(0),
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.scaling,
+        )
+        # 3. return the normal flattened SRT attention output layout
+        return attn_output.squeeze(0).transpose(0, 1).reshape(
+            extend_num_tokens,
+            self.q_size,
+        )
 
     def _apply_rotary(
         self,

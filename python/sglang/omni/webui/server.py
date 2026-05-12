@@ -116,10 +116,10 @@ class U1OmniUIHandler(BaseHTTPRequestHandler):
                 )
                 self.send_header("cache-control", "no-cache")
                 self.end_headers()
-                while True:
-                    chunk = response.read(65536)
+                # upstream SSE frames are small; large reads buffer until completion
+                for chunk in response:
                     if not chunk:
-                        break
+                        continue
                     self.wfile.write(chunk)
                     self.wfile.flush()
         except urllib.error.HTTPError as exc:
