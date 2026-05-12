@@ -435,7 +435,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_drafts=0,
+                num_correct_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
@@ -452,7 +452,7 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         if get_global_tracing_enabled():
             for idx, req in enumerate(batch.reqs):
-                accepted = verify_output.num_accepted_drafts_per_req_cpu[idx]
+                accepted = verify_output.num_correct_drafts_per_req_cpu[idx]
                 req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
 
         set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
@@ -473,8 +473,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=verify_output.accept_tokens,
-            num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
-            num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
+            num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
+            num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
