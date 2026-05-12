@@ -1776,6 +1776,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32),
         )
         del layer.w13_input_scale, layer.w2_input_scale
+        # TODO: w13_weight_scale_2 / w2_weight_scale_2 are also unused by apply()
+        # after this point. flashinfer_cutedsl reads them via hasattr() but has a
+        # mathematically-equivalent fallback through w13_input_scale_quant and
+        # g1_alphas. Kept for now to avoid a silent code-path switch and possible
+        # sub-ULP precision drift; revisit once the fallback is validated.
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         layer.dispatcher.set_quant_config(
