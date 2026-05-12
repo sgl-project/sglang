@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_blackwell
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
@@ -37,6 +38,8 @@ class TestNvidiaNemotronNanoV2NVFP4(GSM8KMixin, DefaultServerBase):
 class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+    # NemotronH + STANDALONE + radix cache requires spec v2 +
+    # `mamba-scheduler-strategy extra_buffer` (see server_args.py guard).
     other_args = [
         "--speculative-algorithm",
         "STANDALONE",
@@ -56,7 +59,19 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, DefaultServerBase)
         "2048",
         "--json-model-override-args",
         '{"vocab_size": 131072}',
+        "--mamba-scheduler-strategy",
+        "extra_buffer",
     ]
+
+    @classmethod
+    def setUpClass(cls):
+        envs.SGLANG_ENABLE_SPEC_V2.set(True)
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        envs.SGLANG_ENABLE_SPEC_V2.clear()
 
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)
@@ -89,7 +104,19 @@ class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(
         '{"vocab_size": 131072}',
         "--mamba-ssm-dtype",
         "bfloat16",
+        "--mamba-scheduler-strategy",
+        "extra_buffer",
     ]
+
+    @classmethod
+    def setUpClass(cls):
+        envs.SGLANG_ENABLE_SPEC_V2.set(True)
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        envs.SGLANG_ENABLE_SPEC_V2.clear()
 
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)
