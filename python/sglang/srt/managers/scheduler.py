@@ -303,10 +303,12 @@ class EmbeddingBatchResult:
         self.copy_done.record()
 
 
-def validate_dflash_request(req: Req) -> Optional[str]:
+def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
 
+    if enable_overlap and req.return_hidden_states:
+        return "DFLASH speculative decoding does not support return_hidden_states yet."
     if (
         req.sampling_params.json_schema is not None
         or req.sampling_params.regex is not None
@@ -2085,13 +2087,12 @@ class Scheduler(
             return
 
         if self.spec_algorithm.is_dflash():
-            error_msg = validate_dflash_request(req)
+            error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
-
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)

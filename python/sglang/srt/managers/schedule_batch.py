@@ -2388,10 +2388,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
-        if self.is_spec_v2:
-            draft_input: EagleDraftInput = self.spec_info
-            if draft_input.verify_done is not None:
-                draft_input.verify_done.synchronize()
+        if not self.is_spec_v2:
+            return
+
+        draft_input: EagleDraftInput = self.spec_info
+        verify_done = getattr(draft_input, "verify_done", None)
+        if verify_done is None:
+            return
+
+        if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+            torch.get_device_module(self.device).current_stream().wait_event(
+                verify_done
+            )
+        else:
+            verify_done.synchronize()
 
     def filter_batch(
         self,
