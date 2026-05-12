@@ -742,7 +742,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             # Target prefill
             target_capture_mode = null_if_not_consumed(
-                CaptureHiddenMode.FULL, self.server_args
+                CaptureHiddenMode.FULL, self.speculative_algorithm
             )
             model_worker_batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(
@@ -751,7 +751,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             draft_capture_mode = null_if_not_consumed(
-                CaptureHiddenMode.LAST, self.server_args
+                CaptureHiddenMode.LAST, self.speculative_algorithm
             )
             model_worker_batch.capture_hidden_mode = draft_capture_mode
             with self.draft_worker.draft_tp_context(
@@ -769,7 +769,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         else:
             if model_worker_batch.spec_info is None:
                 capture_mode = null_if_not_consumed(
-                    CaptureHiddenMode.LAST, self.server_args
+                    CaptureHiddenMode.LAST, self.speculative_algorithm
                 )
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,

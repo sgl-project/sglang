@@ -303,7 +303,7 @@ class EAGLEDraftCudaGraphRunner:
             global_num_tokens_for_logprob = None
 
         capture_mode = null_if_not_consumed(
-            CaptureHiddenMode.LAST, self.model_runner.server_args
+            CaptureHiddenMode.LAST, self.model_runner.spec_algorithm
         )
         spec_info = EagleDraftInput(
             topk_p=topk_p,

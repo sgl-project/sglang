@@ -106,6 +106,12 @@ class SpeculativeAlgorithm(Enum):
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
+    def consumes_hidden_states(self) -> bool:
+        """Whether this algorithm's draft architecture reads
+        `spec_info.hidden_states` as input (chain-style drafts do; STANDALONE
+        does not)."""
+        return not self.is_standalone()
+
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 

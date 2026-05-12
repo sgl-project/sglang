@@ -30,6 +30,8 @@ _is_musa = is_musa()
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 
 
 if _is_cuda:
@@ -53,34 +55,16 @@ TREE_SPEC_KERNEL_AVAILABLE = (
 )  # This kernel is only available for CUDA and MUSA now
 
 
-def spec_info_consumes_hidden_states(
-    server_args: Optional[ServerArgs] = None,
-) -> bool:
-    """Architectural fact: does the draft architecture consume
-    `spec_info.hidden_states` as input via an fc-cat / input_proj layer?
-
-    True  - EAGLE / EAGLE3 / MIMO / multi-layer EAGLE (all chain-style drafts).
-    False - STANDALONE (vanilla LLM draft; ignores the field).
-
-    Each call site already knows the `CaptureHiddenMode` it wants (FULL for
-    target / v2 draft-extend, LAST for chain-seed). The only algo-dependent
-    twist is "if the draft doesn't consume hidden_states, skip capture
-    entirely" — applied via `null_if_not_consumed` at the call site.
-    """
-    if server_args is None:
-        server_args = get_global_server_args()
-    return server_args.speculative_algorithm != "STANDALONE"
-
-
 def null_if_not_consumed(
     mode: "CaptureHiddenMode",
-    server_args: Optional[ServerArgs] = None,
+    spec_algorithm: "SpeculativeAlgorithm | CustomSpecAlgo",
 ) -> "CaptureHiddenMode":
     """Downgrade `mode` to NULL when the draft architecture doesn't consume
-    `spec_info.hidden_states` (currently: STANDALONE). Otherwise pass through."""
+    `spec_info.hidden_states`. Otherwise pass through. Architectural fact
+    lives on `SpeculativeAlgorithm.consumes_hidden_states()`."""
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
-    if not spec_info_consumes_hidden_states(server_args):
+    if not spec_algorithm.consumes_hidden_states():
         return CaptureHiddenMode.NULL
     return mode
 

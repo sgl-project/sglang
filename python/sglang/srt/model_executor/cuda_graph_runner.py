@@ -1389,7 +1389,7 @@ class CudaGraphRunner:
                 from sglang.srt.speculative.spec_utils import null_if_not_consumed
 
                 capture_mode = null_if_not_consumed(
-                    CaptureHiddenMode.FULL, self.model_runner.server_args
+                    CaptureHiddenMode.FULL, self.model_runner.spec_algorithm
                 )
                 spec_info = EagleVerifyInput(
                     draft_token=None,

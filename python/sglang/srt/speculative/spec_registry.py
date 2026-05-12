@@ -61,6 +61,9 @@ class CustomSpecAlgo:
     def is_standalone(self) -> bool:
         return False
 
+    def consumes_hidden_states(self) -> bool:
+        return not self.is_standalone()
+
     def is_ngram(self) -> bool:
         return False
 
