@@ -58,17 +58,33 @@ async def warm_up_compile(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
 ):
     print("\nGenerate warm up request for compiling DeepGEMM...\n")
-    generate_req_input = GenerateReqInput(
-        input_ids=[0, 1, 2, 3],
-        sampling_params={
-            "temperature": 0.0,
-            "max_new_tokens": 8,
-            "ignore_eos": True,
-        },
-    )
+    server_args = tokenizer_manager.server_args
+    dp_size = server_args.dp_size
+    base_ids = [0, 1, 2, 3]
+    sampling_params = {
+        "temperature": 0.0,
+        "max_new_tokens": 8,
+        "ignore_eos": True,
+    }
+
     if disaggregation_mode != "null":
-        generate_req_input.bootstrap_room = 0
-        generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        input_ids = [list(base_ids) for _ in range(dp_size)]
+        generate_req_input = GenerateReqInput(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+        )
+        generate_req_input.bootstrap_host = [FAKE_BOOTSTRAP_HOST] * dp_size
+        generate_req_input.bootstrap_room = [
+            i * (2**63 // dp_size) + (i % server_args.tp_size) for i in range(dp_size)
+        ]
+    else:
+        input_ids = (
+            base_ids if dp_size == 1 else [list(base_ids) for _ in range(dp_size)]
+        )
+        generate_req_input = GenerateReqInput(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+        )
 
     await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
@@ -104,17 +120,27 @@ def launch_server_process_and_send_one_request(
             if response.status_code == 200:
                 # Rank-0 node send a request to sync with other node and then return.
                 if server_args.node_rank == 0:
+                    dp_size = server_args.dp_size
+                    base_ids = [0, 1, 2, 3]
                     payload = {
-                        "input_ids": [0, 1, 2, 3],
                         "sampling_params": {
                             "max_new_tokens": 8,
                             "temperature": 0,
                         },
                     }
-                    # In PD mode, include fake bootstrap fields so workers don't assert
                     if server_args.disaggregation_mode != "null":
-                        payload["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
-                        payload["bootstrap_room"] = 0
+                        payload["input_ids"] = [list(base_ids) for _ in range(dp_size)]
+                        payload["bootstrap_host"] = [FAKE_BOOTSTRAP_HOST] * dp_size
+                        payload["bootstrap_room"] = [
+                            i * (2**63 // dp_size) + (i % server_args.tp_size)
+                            for i in range(dp_size)
+                        ]
+                    else:
+                        payload["input_ids"] = (
+                            base_ids
+                            if dp_size == 1
+                            else [list(base_ids) for _ in range(dp_size)]
+                        )
 
                     response = requests.post(
                         f"{base_url}/generate",

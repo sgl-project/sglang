@@ -1,11 +1,29 @@
 name: Nightly Test (GB200 72GPU)
 
-# NOTE: This workflow is intentionally cron-only.
-# It must NOT be triggered manually (no workflow_dispatch) to prevent
-# individuals from queuing arbitrary jobs on the shared GB200 cluster.
+# NOTE: Nightly (schedule) runs require no approval.
+# Manual (workflow_dispatch) runs are gated by the gb200-ci environment
+# to prevent individuals from queuing arbitrary jobs on the shared GB200 cluster.
 on:
   schedule:
     - cron: '0 2 * * *'  # 2 AM UTC daily (offset from other nightly runs)
+  workflow_dispatch:  # allow manual trigger; gated by gb200-ci environment
+    inputs:
+      image:
+        description: 'Optional. SGLang Docker image to benchmark. Leave empty for the default nightly image. Mutually exclusive with pr_number and sglang_branch.'
+        required: false
+        default: ''
+      pr_number:
+        description: 'Optional. PR number to build from (works for PRs from forks too, via refs/pull/<N>/head). Preferred over sglang_branch when a PR exists. Mutually exclusive with image and sglang_branch.'
+        required: false
+        default: ''
+      sglang_branch:
+        description: 'Optional. Branch name on sgl-project/sglang to build from (use when no PR is open yet). For fork branches, open a PR and use pr_number instead. Mutually exclusive with image and pr_number.'
+        required: false
+        default: ''
+      configs:
+        description: 'Optional. Comma-separated names to run only a subset. Format: {model-prefix}-{precision}-{isl}{osl}-{recipe}. E.g. "dsr1-fp8-1k1k-max-tpt" or "dsr1-fp8-1k1k-max-tpt,dsr1-fp4-1k1k-mid-curve". Leave empty to run all. Available names are listed in the setup job log.'
+        required: false
+        default: ''
 
 concurrency:
   group: nightly-test-gb200
@@ -16,8 +34,41 @@ env:
   SRT_SLURM_BRANCH: sglang-nightly-regression
   SLURM_PARTITION: batch
   SLURM_ACCOUNT: sglang
+  # Docker Hub repo for ephemeral branch/PR build images (kept separate from
+  # the released `lmsysorg/sglang` repo). Cleaned up by `cleanup-image`.
+  CI_IMAGE_REPO: lmsysorg/sglang-staging
+  # How many most recent staging tags to retain after each run.
+  CI_IMAGE_KEEP_TAGS: 60
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Reject conflicting inputs early. At most one of `image`, `pr_number`,
+  # `sglang_branch` may be set — they select different image sources. Only runs
+  # on manual dispatch; all downstream jobs chain through this so invalid
+  # inputs halt the pipeline before cluster resources are reserved.
+  # ---------------------------------------------------------------------------
+  validate-inputs:
+    if: github.repository == 'sgl-project/sglang' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject conflicting inputs
+        run: |
+          IMAGE="${{ inputs.image }}"
+          PR="${{ inputs.pr_number }}"
+          BRANCH="${{ inputs.sglang_branch }}"
+          sources=0
+          [ -n "$IMAGE" ]  && sources=$((sources + 1))
+          [ -n "$PR" ]     && sources=$((sources + 1))
+          [ -n "$BRANCH" ] && sources=$((sources + 1))
+          if [ "$sources" -gt 1 ]; then
+            echo "::error::Specify at most one of 'image' ('$IMAGE'), 'pr_number' ('$PR'), or 'sglang_branch' ('$BRANCH')."
+            exit 1
+          fi
+          if [ -n "$PR" ] && ! echo "$PR" | grep -Eq '^[0-9]+$'; then
+            echo "::error::pr_number must be a positive integer, got '$PR'."
+            exit 1
+          fi
+
   # ---------------------------------------------------------------------------
   # Reads scripts/ci/slurm/nightly-configs.yaml and generates one matrix entry
   # per recipe YAML. Each job runs the full concurrency sweep defined in the
@@ -25,7 +76,11 @@ jobs:
   # To add/remove configs, edit nightly-configs.yaml only.
   # ---------------------------------------------------------------------------
   setup:
-    if: github.repository == 'sgl-project/sglang'
+    needs: validate-inputs
+    # Run if validate-inputs succeeded (dispatch) or was skipped (cron).
+    if: |
+      always() && github.repository == 'sgl-project/sglang'
+      && (needs.validate-inputs.result == 'success' || needs.validate-inputs.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.generate.outputs.matrix }}
@@ -35,28 +90,161 @@ jobs:
 
       - name: Generate benchmark matrix
         id: generate
+        env:
+          CONFIGS_FILTER: ${{ inputs.configs }}
         run: |
           pip install pyyaml -q
-          MATRIX=$(python3 scripts/ci/slurm/generate_matrix.py scripts/ci/slurm/nightly-configs.yaml --runner gb200)
+
+          # List all available config names first so they're visible in logs
+          # even when a filter rejects an unknown name.
+          ALL_MATRIX=$(python3 scripts/ci/slurm/generate_matrix.py \
+            scripts/ci/slurm/nightly-configs.yaml --runner gb200)
+          echo "Available config names for runner gb200:"
+          echo "$ALL_MATRIX" | python3 -c "import json,sys; [print(f'  - {e[\"name\"]}') for e in json.load(sys.stdin)]"
+
+          FILTER_ARG=()
+          if [ -n "$CONFIGS_FILTER" ]; then
+            echo ""
+            echo "Filtering to: $CONFIGS_FILTER"
+            FILTER_ARG=(--filter "$CONFIGS_FILTER")
+          fi
+          MATRIX=$(python3 scripts/ci/slurm/generate_matrix.py \
+            scripts/ci/slurm/nightly-configs.yaml --runner gb200 "${FILTER_ARG[@]}")
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # When pr_number or sglang_branch is provided, build an ARM64 (GB200) image
+  # from that ref and push it to Docker Hub under lmsysorg/sglang-staging.
+  # Uses refs/pull/<N>/head for PRs so fork PRs work without cross-repo auth.
+  # Old staging tags are pruned by `cleanup-image` at the end of the run.
+  # Skipped on nightly (cron) runs and manual runs with neither pr_number nor
+  # sglang_branch.
+  # ---------------------------------------------------------------------------
+  build-image:
+    needs: [validate-inputs, setup]
+    if: |
+      github.repository == 'sgl-project/sglang' && github.event_name == 'workflow_dispatch'
+      && (inputs.pr_number != '' || inputs.sglang_branch != '')
+    runs-on: arm-docker-build-node
+    outputs:
+      image_ref: ${{ steps.build.outputs.image_ref }}
+      image_tag: ${{ steps.build.outputs.image_tag }}
+    steps:
+      # Self-hosted runners retain the workspace across jobs. Prior `docker buildx`
+      # runs on this node leave root-owned build artifacts (e.g. sgl-kernel/build/)
+      # that actions/checkout cannot remove, causing EACCES on rmdir. Wipe them
+      # via a throwaway root container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # PRs (including fork PRs) resolve via refs/pull/<N>/head on upstream.
+          # Otherwise fall back to the branch name on sgl-project/sglang.
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || inputs.sglang_branch }}
+
+      - name: Verify checkout
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BRANCH: ${{ inputs.sglang_branch }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          echo "Commit SHA: $SHA"
+          echo "Author:     $(git log -1 --format='%an <%ae>')"
+          echo "Date:       $(git log -1 --format='%aI')"
+          echo "Subject:    $(git log -1 --format='%s')"
+          echo ""
+          if [ -n "$PR_NUMBER" ]; then
+            echo "Cross-check: https://github.com/sgl-project/sglang/pull/${PR_NUMBER}/commits"
+          else
+            echo "Cross-check: https://github.com/sgl-project/sglang/commits/${BRANCH}"
+          fi
+          echo "Commit URL:  https://github.com/sgl-project/sglang/commit/${SHA}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push ARM64 image
+        id: build
+        run: |
+          if [ -n "${{ inputs.pr_number }}" ]; then
+            TAG_STUB="pr-${{ inputs.pr_number }}"
+            SOURCE_DESC="PR #${{ inputs.pr_number }}"
+          else
+            TAG_STUB=$(echo "${{ inputs.sglang_branch }}" | tr '/' '-' | tr -cd '[:alnum:]._-')
+            SOURCE_DESC="branch ${{ inputs.sglang_branch }}"
+          fi
+          # run_attempt disambiguates "Re-run jobs" so the squash filename
+          # (derived from the image URL) doesn't collide with a stale one.
+          TAG="${TAG_STUB}-${{ github.run_id }}-${{ github.run_attempt }}"
+          IMAGE_REF="${CI_IMAGE_REPO}:${TAG}"
+          echo "Building ${IMAGE_REF} from ${SOURCE_DESC}"
+
+          docker buildx build \
+            --platform linux/arm64 \
+            --output type=image,name=${IMAGE_REF},push=true \
+            --target framework_final \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
+            --build-arg GRACE_BLACKWELL=1 \
+            --build-arg BRANCH_TYPE=local \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --no-cache \
+            .
+
+          echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
+          echo "image_tag=${TAG}" >> $GITHUB_OUTPUT
 
   # ---------------------------------------------------------------------------
   # Import Docker images to Lustre squash files once before all benchmark jobs.
   # This avoids parallel jobs racing to enroot import the same image.
+  # When build-image ran, we import the freshly built Docker Hub staging image
+  # (lmsysorg/sglang-staging is public → no auth needed for enroot pull).
+  # Otherwise we use the `image` input (or its default public nightly image).
   # ---------------------------------------------------------------------------
   prepare-image:
-    needs: setup
-    if: github.repository == 'sgl-project/sglang'
+    needs: [setup, build-image]
+    if: |
+      always() && github.repository == 'sgl-project/sglang'
+      && needs.setup.result == 'success'
+      && (needs.build-image.result == 'success' || needs.build-image.result == 'skipped')
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'gb200-ci' || '' }}
     runs-on: 72-gpu-gb200
     outputs:
       squash_file: ${{ steps.import.outputs.squash_file }}
       nginx_squash_file: ${{ steps.import.outputs.nginx_squash_file }}
+      image: ${{ steps.resolve.outputs.image }}
     env:
-      IMAGE: lmsysorg/sglang:dev-cu13
       NGINX_IMAGE: nginx:1.27.4
     steps:
+      - name: Resolve image to import
+        id: resolve
+        run: |
+          BUILT_IMAGE="${{ needs.build-image.outputs.image_ref }}"
+          if [ -n "$BUILT_IMAGE" ]; then
+            echo "Using freshly built image: $BUILT_IMAGE"
+            echo "image=$BUILT_IMAGE" >> $GITHUB_OUTPUT
+          else
+            IMAGE="${{ inputs.image || 'lmsysorg/sglang:dev-cu13' }}"
+            echo "Using pre-existing image: $IMAGE"
+            echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          fi
+
       - name: Import Docker images to Lustre
         id: import
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
         run: |
           SQUASH_FILE="/mnt/lustre01/users-public/sglang-ci/$(echo "$IMAGE" | sed 's/[\/:@#]/_/g')_$(date +%Y%m%d).sqsh"
           NGINX_SQUASH_FILE="/mnt/lustre01/users-public/sglang-ci/$(echo "$NGINX_IMAGE" | sed 's/[\/:@#]/_/g').sqsh"
@@ -78,7 +266,13 @@ jobs:
 
   nightly-gb200-benchmark:
     needs: [setup, prepare-image]
-    if: github.repository == 'sgl-project/sglang'
+    # Use always() + explicit success checks so a skipped transitive upstream
+    # (e.g. build-image when neither pr_number nor sglang_branch is set) does
+    # not propagate a skip to this job. Direct deps must still have succeeded.
+    if: |
+      always() && github.repository == 'sgl-project/sglang'
+      && needs.setup.result == 'success'
+      && needs.prepare-image.result == 'success'
     runs-on: 72-gpu-gb200
     strategy:
       fail-fast: false
@@ -93,8 +287,15 @@ jobs:
       OSL: ${{ matrix.config.osl }}
       CONFIG_FILE: ${{ matrix.config.config_file }}
       RESULT_FILENAME: gb200-${{ matrix.config.name }}
+      MATRIX_CONFIG_NAME: ${{ matrix.config.name }}
       SQUASH_FILE: ${{ needs.prepare-image.outputs.squash_file }}
       NGINX_SQUASH_FILE: ${{ needs.prepare-image.outputs.nginx_squash_file }}
+      # S3 log-upload credentials — consumed by srt-slurm's postprocess stage
+      # to upload /logs after each Slurm job; prefix derived in launch_gb200.sh.
+      AWS_ACCESS_KEY_ID: ${{ secrets.NV_S3_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.NV_S3_SECRET_ACCESS_KEY }}
+      S3_BUCKET: ${{ secrets.NV_S3_BUCKET }}
+      S3_ENDPOINT_URL: ${{ secrets.NV_S3_ENDPOINT_URL }}
 
     steps:
       - name: Checkout code
@@ -146,6 +347,47 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
+      - name: Analyze logs with AI on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.NV_MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.NV_MODAL_TOKEN_SECRET }}
+        run: |
+          TARBALL="${{ github.workspace }}/multinode_server_logs.tar.gz"
+          if [ -f "$TARBALL" ]; then
+            uv run --with modal python scripts/ci/slurm/analyze_logs_with_modal.py \
+              --tarball "$TARBALL" \
+              --job-id "${{ matrix.config.name }}-${{ github.run_id }}" \
+              --output "${{ github.workspace }}/ai_analysis.md"
+            if [ -f "${{ github.workspace }}/ai_analysis.md" ]; then
+              echo "## AI Log Analysis" >> $GITHUB_STEP_SUMMARY
+              cat "${{ github.workspace }}/ai_analysis.md" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "No log tarball found, skipping analysis"
+          fi
+
+      - name: Upload AI analysis to S3
+        if: failure()
+        continue-on-error: true
+        env:
+          ISL: ${{ matrix.config.isl }}
+          OSL: ${{ matrix.config.osl }}
+        run: |
+          ANALYSIS="${{ github.workspace }}/ai_analysis.md"
+          [ -f "$ANALYSIS" ] || { echo "no ai_analysis.md, skipping"; exit 0; }
+          case "${{ github.event_name }}" in
+            schedule)          TRIGGER=cron ;;
+            workflow_dispatch) TRIGGER=manual ;;
+            *)                 TRIGGER="${{ github.event_name }}" ;;
+          esac
+          fmt() { if [ $(( $1 % 1024 )) -eq 0 ]; then echo "$(( $1 / 1024 ))k"; else echo "$1"; fi; }
+          SEQ_LEN="$(fmt "$ISL")$(fmt "$OSL")"
+          KEY="${TRIGGER}/${{ github.run_id }}-${{ github.run_attempt }}/${SEQ_LEN}/${{ matrix.config.name }}/ai_analysis.md"
+          aws --endpoint-url "$S3_ENDPOINT_URL" s3 cp "$ANALYSIS" "s3://${S3_BUCKET}/${KEY}"
+          echo "uploaded to s3://${S3_BUCKET}/${KEY}"
+
       - name: Clean up Slurm jobs on failure/cancel
         if: failure() || cancelled()
         continue-on-error: true
@@ -176,3 +418,48 @@ jobs:
         run: |
           pip install tabulate -q
           python3 scripts/ci/slurm/summarize.py results/ >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # Prune old tags in the staging repo, keeping only the most recent N. Mirrors
+  # the pattern used by release-docker-dev.yml. Runs after benchmarks so the
+  # freshly built image (whose sqsh is already on Lustre) becomes a regular
+  # aged-out tag over time. No-op when the repo has ≤ CI_IMAGE_KEEP_TAGS tags.
+  # ---------------------------------------------------------------------------
+  cleanup-image:
+    needs: [build-image, nightly-gb200-benchmark]
+    if: always() && needs.build-image.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune old staging tags on Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          TOKEN=$(curl -s -H "Content-Type: application/json" \
+            -X POST -d "{\"username\": \"${DOCKERHUB_USERNAME}\", \"password\": \"${DOCKERHUB_TOKEN}\"}" \
+            https://hub.docker.com/v2/users/login/ | jq -r .token)
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Docker Hub login failed"
+            exit 1
+          fi
+
+          TAGS_RESPONSE=$(curl -s -H "Authorization: JWT $TOKEN" \
+            "https://hub.docker.com/v2/repositories/${CI_IMAGE_REPO}/tags/?page_size=100")
+
+          # Sort tags by last_updated (newest first), keep names only.
+          TAGS=$(echo "$TAGS_RESPONSE" | jq -r \
+            '.results[] | "\(.last_updated)|\(.name)"' \
+            | sort -r | cut -d'|' -f2)
+
+          TAG_COUNT=$(echo "$TAGS" | grep -c . || true)
+          if [ "$TAG_COUNT" -gt "$CI_IMAGE_KEEP_TAGS" ]; then
+            echo "Found $TAG_COUNT tags in ${CI_IMAGE_REPO}, keeping $CI_IMAGE_KEEP_TAGS most recent"
+            TAGS_TO_DELETE=$(echo "$TAGS" | tail -n +$((CI_IMAGE_KEEP_TAGS + 1)))
+            for tag in $TAGS_TO_DELETE; do
+              echo "Deleting ${CI_IMAGE_REPO}:${tag}"
+              curl -s -X DELETE -H "Authorization: JWT $TOKEN" \
+                "https://hub.docker.com/v2/repositories/${CI_IMAGE_REPO}/tags/${tag}/"
+            done
+          else
+            echo "Only $TAG_COUNT tags in ${CI_IMAGE_REPO}, no cleanup needed"
+          fi

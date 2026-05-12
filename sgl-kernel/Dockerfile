@@ -1,12 +1,12 @@
 ARG BASE_IMG=pytorch/manylinux2_28-builder
-ARG CUDA_VERSION=12.9
+ARG CUDA_VERSION=13.0
 
 # Dependency stage: install system deps, CMake, ccache, Python deps (including torch)
 FROM ${BASE_IMG}:cuda${CUDA_VERSION} AS deps
 
 # Overridable build arguments
 ARG ARCH=x86_64
-ARG CUDA_VERSION=12.9
+ARG CUDA_VERSION=13.0
 ARG PYTHON_VERSION=3.10
 # Manylinux python path tag, e.g. cp310-cp310 / cp312-cp312
 ARG PYTHON_TAG=cp310-cp310
@@ -79,10 +79,10 @@ RUN set -eux; \
 RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
     set -eux; \
     case "${CUDA_VERSION}" in \
-      13.0) TORCH_VER=2.9.1; CU_TAG=cu130 ;; \
-      12.9) TORCH_VER=2.9.1; CU_TAG=cu128 ;; \
-      12.8) TORCH_VER=2.9.1; CU_TAG=cu128 ;; \
-      *)    TORCH_VER=2.9.1; CU_TAG=cu126 ;; \
+      13.0) TORCH_VER=2.11.0; CU_TAG=cu130 ;; \
+      12.9) TORCH_VER=2.11.0; CU_TAG=cu129 ;; \
+      12.8) TORCH_VER=2.11.0; CU_TAG=cu128 ;; \
+      *)    TORCH_VER=2.11.0; CU_TAG=cu126 ;; \
     esac; \
     ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${CU_TAG}; \
     ${PYTHON_ROOT_PATH}/bin/pip install ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core --index-url ${PIP_DEFAULT_INDEX}
