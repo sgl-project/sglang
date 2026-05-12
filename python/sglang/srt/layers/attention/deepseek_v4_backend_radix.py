@@ -1096,8 +1096,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
 
             assert attn_sink is not None
 
-            flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
-
             assert (
                 swa_page_indices.shape[-1] % 64 == 0
             ), f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
@@ -1112,7 +1110,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 head_dim_v=self.head_dim_v,
                 block_table=None,
                 cache_seqlens=None,
-                tile_scheduler_metadata=flashmla_metadata,
                 softmax_scale=self.softmax_scale,
                 is_fp8_kvcache=True,
                 indices=swa_page_indices,
@@ -1127,7 +1124,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             o = flash_mla_with_kvcache_output_pcg_op(
                 q=input_dict["q"],
                 k_cache=input_dict["k_cache"],
-                tile_scheduler_metadata=input_dict["tile_scheduler_metadata"],
                 indices=input_dict["indices"],
                 topk_length=input_dict["topk_length"],
                 attn_sink=input_dict["attn_sink"],
@@ -1137,6 +1133,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 head_dim_v=input_dict["head_dim_v"],
                 softmax_scale=input_dict["softmax_scale"],
                 is_fp8_kvcache=input_dict["is_fp8_kvcache"],
+                metadata_slot=compress_ratio,
                 backend=backend,
             )
 
