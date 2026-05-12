@@ -92,7 +92,6 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        exit_stack = ExitStack()
 
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)
