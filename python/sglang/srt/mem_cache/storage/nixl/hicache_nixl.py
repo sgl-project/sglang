@@ -45,10 +45,12 @@ class HiCacheNixl(HiCacheStorage):
         # select the NIXL backend plugin from extra_config or environment variable
         plugin = nixlconfig.get_specified_plugin()
 
+        use_direct_io = nixlconfig.get_use_direct_io()
+
         # Might be better to be unified across HiCache backends and moved to HiCacheController
         file_path = envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
         self.file_manager = (
-            NixlFileManager(file_path)
+            NixlFileManager(file_path, use_direct_io=use_direct_io)
             if plugin not in NixlBackendSelection.OBJ_PLUGINS
             else None
         )
@@ -97,6 +99,16 @@ class HiCacheNixl(HiCacheStorage):
             self.backend_selector.mem_type,
             self.file_manager,
         )
+        # O_DIRECT requires OS-page-aligned I/O buffers on all file-based backends
+        # (POSIX, GDS, GDS_MT, 3FS). OBJ backends never open files so they are exempt
+        # (file_manager is None for OBJ).
+        self.needs_page_alignment = use_direct_io and self.file_manager is not None
+        if self.needs_page_alignment:
+            logger.info(
+                "HiCacheNixl: O_DIRECT is active with a file-based backend (%s). "
+                "Page-aligned host buffers are required (needs_page_alignment=True).",
+                self.backend_selector.backend_name,
+            )
         # Pre-registered host regions (set by register_mem_pool_host):
         # zero-copy: one registration covering mem_pool_host.kv_buffer
         # non-zero-copy: two registrations, one bounce buffer per direction
@@ -221,6 +233,22 @@ class HiCacheNixl(HiCacheStorage):
             "page_first_direct",
         ]
 
+        if self.needs_page_alignment and self.is_zero_copy:
+            # Check that the kv_buffer base AND per-page strides are multiples of
+            # the OS page size so every pointer passed to NIXL (base + p * stride)
+            # is page-aligned. The base is whatever torch.empty() happened to give
+            # us -- it is not guaranteed to be page-aligned. Fall back to copy mode
+            # if either condition fails.
+            # 4096: O_DIRECT alignment is FS-dependent (some allow 512 B); 4 KiB
+            # is the safe lower bound all known FSes accept, and real page-sizes meet it.
+            if not self.mem_pool_host.is_stride_page_aligned(4096):
+                logger.warning(
+                    "HiCacheNixl: O_DIRECT is active but the host kv_buffer is "
+                    "not OS-page-aligned (base or per-page stride). Falling back "
+                    "to copy mode for this pool."
+                )
+                self.is_zero_copy = False
+
         if self.is_zero_copy:
             kv = mem_pool_host.kv_buffer
             self._pre_register_host(
@@ -266,17 +294,13 @@ class HiCacheNixl(HiCacheStorage):
 
     def _pre_register_host(self, base_addr: int, total_size: int, kind: str) -> None:
         """Register a single DRAM region up-front and remember the handle."""
-        reg_descs = self.agent.get_reg_descs(
-            [(base_addr, total_size, 0, "")], "DRAM"
-        )
+        reg_descs = self.agent.get_reg_descs([(base_addr, total_size, 0, "")], "DRAM")
         if reg_descs is None:
             raise RuntimeError(f"Failed to build reg descs for host {kind}")
         try:
             self._host_regs.append(self.agent.register_memory(reg_descs))
         except Exception as e:
-            raise RuntimeError(
-                f"Failed to pre-register host {kind} with NIXL"
-            ) from e
+            raise RuntimeError(f"Failed to pre-register host {kind} with NIXL") from e
 
     def clear(self) -> None:
         if self.file_manager is None:
@@ -369,9 +393,7 @@ class HiCacheNixl(HiCacheStorage):
             for i in range(page_num)
         ]
 
-    def _batch_preprocess(
-        self, keys: List[str], host_indices: torch.Tensor, op: str
-    ):
+    def _batch_preprocess(self, keys: List[str], host_indices: torch.Tensor, op: str):
         """Build (key_list, host_buffers) for the v1 path.
 
         For zero-copy: ``host_buffers`` are ``(addr, size)`` tuples inside the

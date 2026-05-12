@@ -85,9 +85,7 @@ class NixlRegistry:
                 try:
                     reg = self.agent.register_memory(reg_descs)
                 except Exception as e:
-                    logger.error(
-                        f"Failed to register memory of type {mem_type}: {e}"
-                    )
+                    logger.error(f"Failed to register memory of type {mem_type}: {e}")
         try:
             yield reg
         finally:
@@ -114,9 +112,7 @@ class NixlRegistry:
                 if fds is None:
                     yield None
                     return
-                tuples = [
-                    (0, sizes[i], fds[i], keys[i]) for i in range(len(keys))
-                ]
+                tuples = [(0, sizes[i], fds[i], keys[i]) for i in range(len(keys))]
                 with self._registered(tuples, "FILE") as reg:
                     if reg is None:
                         yield None
@@ -137,9 +133,7 @@ class NixlRegistry:
                 base = self._obj_devid_next
                 self._obj_devid_next += n
             dev_ids = list(range(base, base + n))
-            tuples = [
-                (0, sizes[i], dev_ids[i], keys[i]) for i in range(n)
-            ]
+            tuples = [(0, sizes[i], dev_ids[i], keys[i]) for i in range(n)]
             with self._registered(tuples, "OBJ") as reg:
                 if reg is None:
                     yield None

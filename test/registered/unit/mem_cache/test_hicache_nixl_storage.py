@@ -108,6 +108,11 @@ class MockMemPoolHost:
             2, self.layer_num, self.page_size, self.head_num, self.head_dim
         )
 
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        # Test tensors are too small to satisfy 4 KiB stride alignment; the
+        # O_DIRECT path correctly falls back to copy mode in this case.
+        return False
+
 
 class MinioFixture:
     """Spin up a single-node MinIO server on localhost and create a bucket.
@@ -167,9 +172,7 @@ class MinioFixture:
         deadline = time.time() + 15.0
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                raise RuntimeError(
-                    f"minio exited early with rc={self.proc.returncode}"
-                )
+                raise RuntimeError(f"minio exited early with rc={self.proc.returncode}")
             try:
                 with socket.create_connection(
                     ("127.0.0.1", self.api_port), timeout=0.5
@@ -189,9 +192,7 @@ class MinioFixture:
             endpoint_url=f"http://{self.endpoint}",
             aws_access_key_id=self.user,
             aws_secret_access_key=self.password,
-            config=Config(
-                s3={"addressing_style": "path"}, signature_version="s3v4"
-            ),
+            config=Config(s3={"addressing_style": "path"}, signature_version="s3v4"),
         )
         s3.create_bucket(Bucket=self.bucket)
 
@@ -214,6 +215,10 @@ class TestNixlUnified(CustomTestCase):
         self.test_dir = "/tmp/test_nixl_unified"
         os.makedirs(self.test_dir, exist_ok=True)
 
+        # Disable O_DIRECT here: these tests use small, arbitrarily-aligned
+        # tensors that do not satisfy the sector-alignment constraints required
+        # by O_DIRECT. O_DIRECT-specific behaviour is exercised in
+        # TestNixlDirectIO below.
         self.storage_config = HiCacheStorageConfig(
             tp_rank=0,
             tp_size=2,
@@ -225,7 +230,10 @@ class TestNixlUnified(CustomTestCase):
             is_page_first_layout=False,
             model_name="test_model",
             enable_storage_metrics=False,
-            extra_config={"plugin": {"posix": {"active": True}}},
+            extra_config={
+                "plugin": {"posix": {"active": True}},
+                "use_direct_io": False,
+            },
         )
 
         try:
@@ -332,9 +340,7 @@ class TestNixlUnified(CustomTestCase):
                 ranges = []
                 for it in items:
                     if isinstance(it, torch.Tensor):
-                        ranges.append(
-                            (it.data_ptr(), it.numel() * it.element_size())
-                        )
+                        ranges.append((it.data_ptr(), it.numel() * it.element_size()))
                     elif isinstance(it, tuple):
                         ranges.append((it[0], it[1]))
                 last_host_xfer.clear()
@@ -351,7 +357,7 @@ class TestNixlUnified(CustomTestCase):
                 for (a, s, mt) in entries
                 if mt in (None, "DRAM")
             ]
-            for (a, s) in last_host_xfer:
+            for a, s in last_host_xfer:
                 if not any(ra <= a and a + s <= ra + rs for (ra, rs) in host_regs):
                     violations.append((a, s, dict(host_regs=host_regs)))
             last_host_xfer.clear()
@@ -589,9 +595,7 @@ class TestNixlUnified(CustomTestCase):
                 for i in range(num_pages):
                     got = mock_host.kv_buffer[page_index(getter_dst[0] + i, 1)]
                     if not torch.equal(got, expected_pages[i]):
-                        record_error(
-                            f"getter loop {loops}: preset page {i} corrupted"
-                        )
+                        record_error(f"getter loop {loops}: preset page {i} corrupted")
                         return
                 loops += 1
 
@@ -660,6 +664,113 @@ class TestNixlUnified(CustomTestCase):
         self._run_concurrent_stress(
             is_zero_copy_mode=False, hicache=self._make_obj_hicache()
         )
+
+
+@unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT not available on this platform")
+class TestNixlDirectIO(CustomTestCase):
+    """Tests for the O_DIRECT file I/O path in NixlFileManager and HiCacheNixl."""
+
+    def setUp(self):
+        self.test_dir = "/tmp/test_nixl_direct_io"
+        os.makedirs(self.test_dir, exist_ok=True)
+
+    def tearDown(self):
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_open_file_sets_o_direct(self):
+        """open_file sets O_DIRECT on the file descriptor when use_direct_io=True."""
+        import fcntl
+
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+
+        fm = NixlFileManager(self.test_dir, use_direct_io=True)
+        test_file = os.path.join(self.test_dir, "test_odirect.bin")
+        fd = fm.open_file(test_file, create=True)
+        try:
+            self.assertTrue(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_DIRECT)
+        finally:
+            os.close(fd)
+
+    def test_open_file_no_o_direct(self):
+        """open_file does not set O_DIRECT when use_direct_io=False."""
+        import fcntl
+
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+
+        fm = NixlFileManager(self.test_dir, use_direct_io=False)
+        test_file = os.path.join(self.test_dir, "test_buffered.bin")
+        fd = fm.open_file(test_file, create=True)
+        try:
+            self.assertFalse(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_DIRECT)
+        finally:
+            os.close(fd)
+
+    def _make_direct_io_hicache(self) -> HiCacheNixl:
+        """Return a HiCacheNixl configured for O_DIRECT (default) with the POSIX backend."""
+        storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+            enable_storage_metrics=False,
+            extra_config={"plugin": {"posix": {"active": True}}},
+            # use_direct_io defaults to True (env var)
+        )
+        try:
+            return HiCacheNixl(storage_config=storage_config, file_path=self.test_dir)
+        except ImportError:
+            self.skipTest("NIXL not available")
+
+    def test_needs_page_alignment_true_for_file_backend(self):
+        """File-based backend + use_direct_io=True must set needs_page_alignment."""
+        hicache = self._make_direct_io_hicache()
+        self.assertTrue(hicache.needs_page_alignment)
+
+    def test_odirect_unaligned_pool_falls_back_to_copy(self):
+        """O_DIRECT with non-aligned pool strides falls back to copy mode."""
+        hicache = self._make_direct_io_hicache()
+
+        mock_host = MockMemPoolHost(is_zero_copy_mode=True)
+        hicache.register_mem_pool_host(mock_host)
+
+        # MockMemPoolHost.is_stride_page_aligned() returns False, so even though
+        # the layout would otherwise enable zero-copy, the backend must fall back.
+        self.assertFalse(hicache.is_zero_copy)
+        self.assertIsNotNone(hicache._bounce_set)
+        self.assertIsNotNone(hicache._bounce_get)
+
+    def test_odirect_disabled_via_config(self):
+        """Top-level use_direct_io=false in extra_config disables O_DIRECT."""
+        storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+            enable_storage_metrics=False,
+            extra_config={
+                "plugin": {"posix": {"active": True}},
+                "use_direct_io": False,
+            },
+        )
+        try:
+            hicache = HiCacheNixl(
+                storage_config=storage_config, file_path=self.test_dir
+            )
+        except ImportError:
+            self.skipTest("NIXL not available")
+        self.assertFalse(hicache.needs_page_alignment)
+        self.assertFalse(hicache.file_manager.use_direct_io)
 
 
 if __name__ == "__main__":

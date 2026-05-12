@@ -979,9 +979,7 @@ class HiCacheController:
         for start in range(
             0, len(tokens_to_fetch), self.page_size * STORAGE_BATCH_SIZE
         ):
-            end = min(
-                start + self.page_size * STORAGE_BATCH_SIZE, len(tokens_to_fetch)
-            )
+            end = min(start + self.page_size * STORAGE_BATCH_SIZE, len(tokens_to_fetch))
             batch_tokens = tokens_to_fetch[start:end]
             batch_hashes = []
             for i in range(0, len(batch_tokens), self.page_size):
