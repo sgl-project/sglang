@@ -23,7 +23,7 @@ HW_MAPPING = {
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["stage-a-test-cpu"],
+    HWBackend.CPU: ["stage-a-test-cpu", "stage-b-test-cpu"],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",
@@ -54,6 +54,8 @@ PER_COMMIT_SUITES = {
         "stage-c-test-8-gpu-b200",
         "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
+        "stage-c-test-dsv4-4-gpu-b200",
+        "stage-c-test-dsv4-8-gpu-h200",
     ],
     HWBackend.NPU: [
         "stage-a-test-1-gpu-small",
@@ -236,7 +238,9 @@ def run_a_suite(args):
         for f in glob.glob(
             os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
         )
-        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
+        if not f.endswith("/conftest.py")
+        and not f.endswith("/__init__.py")
+        and not f.endswith("/cpu/utils.py")
     ]
 
     # JIT kernel tests and benchmarks (live alongside kernel source)

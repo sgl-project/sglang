@@ -338,11 +338,11 @@ def add_output_logprobs_for_spec_v1(
     if logits_output is None:
         logits_output = res.logits_output
 
-    if hasattr(res, "num_accepted_drafts_per_req_cpu"):
-        num_accepted_drafts_per_req_cpu = res.num_accepted_drafts_per_req_cpu
+    if hasattr(res, "num_correct_drafts_per_req_cpu"):
+        num_correct_drafts_per_req_cpu = res.num_correct_drafts_per_req_cpu
     else:
         # FIXME: Get a NgramVerifyOutput class and use that instead of this hack.
-        num_accepted_drafts_per_req_cpu = res.num_accepted_drafts.tolist()
+        num_correct_drafts_per_req_cpu = res.num_correct_drafts.tolist()
 
     top_logprobs_nums = batch.top_logprobs_nums
     token_ids_logprobs = batch.token_ids_logprobs
@@ -362,8 +362,8 @@ def add_output_logprobs_for_spec_v1(
         logprobs = torch.nn.functional.log_softmax(
             logits_output.next_token_logits / temperatures, dim=-1
         )
-    batch_next_token_ids = res.verified_id
-    num_tokens_per_req = [accept + 1 for accept in num_accepted_drafts_per_req_cpu]
+    batch_next_token_ids = res.accept_tokens
+    num_tokens_per_req = [accept + 1 for accept in num_correct_drafts_per_req_cpu]
 
     # We should repeat top_logprobs_nums to match num_tokens_per_req.
     top_logprobs_nums_repeat_interleaved = [
@@ -407,7 +407,7 @@ def add_output_logprobs_for_spec_v1(
     # Add output logprobs to the request
     pt = 0
     next_token_logprobs = logits_output.next_token_logprobs.tolist()
-    verified_ids = batch_next_token_ids.tolist()
+    accept_tokens_list = batch_next_token_ids.tolist()
     token_top_logprobs_val = logits_output.next_token_top_logprobs_val
     token_top_logprobs_idx = logits_output.next_token_top_logprobs_idx
     token_ids_logprobs_val = logits_output.next_token_token_ids_logprobs_val
@@ -416,7 +416,7 @@ def add_output_logprobs_for_spec_v1(
         for _ in range(num_tokens):
             if req.return_logprob:
                 req.output_token_logprobs_val.append(next_token_logprobs[pt])
-                req.output_token_logprobs_idx.append(verified_ids[pt])
+                req.output_token_logprobs_idx.append(accept_tokens_list[pt])
                 if req.top_logprobs_num > 0:
                     assert (
                         should_top_logprobs
