@@ -53,7 +53,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         cache_indices = self.forward_metadata.mamba_cache_indices
-        self.num_accepted_tokens = torch.ones(
+        self.num_accept_tokens = torch.ones(
             [bs], dtype=torch.int32, device=cache_indices.device
         )
         self.actual_seq_lengths = torch.ones(
@@ -237,7 +237,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 seq_len = forward_batch.num_token_non_padded_cpu
 
             mixed_qkv_reshaped = mixed_qkv.view(batch_size, draft_token_num, -1)
-            num_accepted_tokens = torch.full(
+            num_accept_tokens = torch.full(
                 (batch_size,),
                 draft_token_num,
                 dtype=torch.int32,
@@ -249,7 +249,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 conv_states,
                 cache_indices,
                 layer.bias,
-                num_accepted_tokens,
+                num_accept_tokens,
                 None,
                 layer.activation == "silu",
                 self.pad_slot_id,
@@ -391,7 +391,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
 
         if self.graph_mode:
-            num_accepted_tokens = torch.full(
+            num_accept_tokens = torch.full(
                 [batch_size], 1, dtype=torch.int32, device=cache_indices.device
             )
             actual_seq_lengths = torch.full(
@@ -399,7 +399,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
             ssm_state_indices = self.forward_metadata.mamba_cache_indices_gdn
         else:
-            num_accepted_tokens = self.num_accepted_tokens
+            num_accept_tokens = self.num_accept_tokens
             actual_seq_lengths = self.actual_seq_lengths
             ssm_state_indices = self.ssm_state_indices
 
@@ -414,7 +414,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             nv=num_value_heads,
             intermediate_state=intermediate_state,
             cache_indices=cache_indices,
-            num_accepted_tokens=num_accepted_tokens,
+            num_accept_tokens=num_accept_tokens,
             g=g,
         )
 
