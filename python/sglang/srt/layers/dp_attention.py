@@ -465,10 +465,6 @@ def memcpy_triton_with_zero_fill_kernel(
     chunk_size,  # multiplied for offset and sz
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Fused equivalent of `dst.fill_(0)` followed by `memcpy_triton(dst, ...)`.
-    # Each dst element is written exactly once: source data inside the copy
-    # range, zero outside. Halves HBM write traffic on dst for memory-bound
-    # DP-attn gather/scatter (see #24938).
     pid = tl.program_id(axis=0).to(tl.int64)
     offset = tl.load(offset_ptr).to(tl.int64) * chunk_size
     sz = tl.load(sz_ptr).to(tl.int64) * chunk_size
@@ -504,16 +500,30 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
 
 
-def memcpy_triton_with_zero_fill(dst, src, dim, offset, sz, offset_src):
+def memcpy_triton_with_zero_fill(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    dim: int,
+    offset: torch.Tensor,
+    sz: torch.Tensor,
+    offset_src: bool,
+) -> None:
     assert dim == 0, "dim != 0 unsupported"
     assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"
-    dst_numel = dst.numel()
-    chunk_size = prod(src.shape[1:])
-    BLOCK_SIZE = 8192
+    dst_numel: int = dst.numel()
+    chunk_size: int = prod(src.shape[1:])
+    BLOCK_SIZE: int = 8192
     grid = (triton.cdiv(dst_numel, BLOCK_SIZE),)
 
     memcpy_triton_with_zero_fill_kernel[grid](
-        dst, src, offset, sz, dst_numel, offset_src, chunk_size, BLOCK_SIZE
+        dst_ptr=dst,
+        src_ptr=src,
+        offset_ptr=offset,
+        sz_ptr=sz,
+        dst_numel=dst_numel,
+        offset_src=offset_src,
+        chunk_size=chunk_size,
+        BLOCK_SIZE=BLOCK_SIZE,
     )
 
 
@@ -534,7 +544,12 @@ def _dp_gather_via_all_reduce(
         ), "aliasing between global_tokens and local_tokens not allowed"
 
         memcpy_triton_with_zero_fill(
-            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+            dst=global_tokens,
+            src=local_tokens,
+            dim=0,
+            offset=local_start_pos,
+            sz=local_num_tokens,
+            offset_src=False,
         )
     else:
         global_tokens.fill_(0)
@@ -710,7 +725,12 @@ def dp_scatter(
         ), "aliasing between local_tokens and global_tokens not allowed"
 
         memcpy_triton_with_zero_fill(
-            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+            dst=local_tokens,
+            src=global_tokens,
+            dim=0,
+            offset=local_start_pos,
+            sz=local_num_tokens,
+            offset_src=True,
         )
     else:
         local_tokens.fill_(0)

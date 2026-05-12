@@ -1,9 +1,6 @@
-"""Microbenchmark: dst.fill_(0) + memcpy_triton(...) vs memcpy_triton_with_zero_fill(...)
+"""Microbench for #24938: dst.fill_(0) + memcpy_triton vs memcpy_triton_with_zero_fill."""
 
-Measures the kernel-level speedup for #24938 at shapes representative of
-DP-attention's gather/scatter buffers (DeepSeek-V3-ish: hidden=7168,
-global = `tp_size` DP ranks * `padded_per_rank`).
-"""
+from typing import Callable
 
 import torch
 
@@ -13,7 +10,7 @@ from sglang.srt.layers.dp_attention import (
 )
 
 
-def _bench(fn, iters=200, warmup=20):
+def _bench(fn: Callable[[], None], iters: int = 200, warmup: int = 20) -> float:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -27,7 +24,16 @@ def _bench(fn, iters=200, warmup=20):
     return start.elapsed_time(end) / iters  # ms per call
 
 
-def run_shape(label, dst_rows, src_rows, hidden, offset, sz, offset_src, dtype=torch.bfloat16):
+def run_shape(
+    label: str,
+    dst_rows: int,
+    src_rows: int,
+    hidden: int,
+    offset: int,
+    sz: int,
+    offset_src: bool,
+    dtype: torch.dtype = torch.bfloat16,
+) -> None:
     device = "cuda"
     src = torch.randn((src_rows, hidden), dtype=dtype, device=device)
     dst = torch.empty((dst_rows, hidden), dtype=dtype, device=device)
@@ -36,10 +42,14 @@ def run_shape(label, dst_rows, src_rows, hidden, offset, sz, offset_src, dtype=t
 
     def unfused():
         dst.fill_(0)
-        memcpy_triton(dst, src, 0, offset_t, sz_t, offset_src)
+        memcpy_triton(
+            dst=dst, src=src, dim=0, offset=offset_t, sz=sz_t, offset_src=offset_src
+        )
 
     def fused():
-        memcpy_triton_with_zero_fill(dst, src, 0, offset_t, sz_t, offset_src)
+        memcpy_triton_with_zero_fill(
+            dst=dst, src=src, dim=0, offset=offset_t, sz=sz_t, offset_src=offset_src
+        )
 
     t_unfused = _bench(unfused)
     t_fused = _bench(fused)
@@ -62,24 +72,34 @@ def main():
     print(f"torch {torch.__version__} on {torch.cuda.get_device_name(0)}")
     print("=" * 110)
 
-    # DeepSeek-V3 hidden=7168, tp=8. Padded DP batch sizes that show up in practice.
-    hidden = 7168
-    for tp in (8,):
-        for padded_per_rank in (256, 512, 1024, 2048):
+    # Common LLM hidden sizes:
+    #   2048 = small LLMs, 4096 = Llama-7B / Qwen3 / Pixtral,
+    #   5120 = Llama-13B / Llama-4-Scout / DeepSeek-V2,
+    #   7168 = DeepSeek-V3 / Kimi-K2, 8192 = Llama-70B / Qwen-72B.
+    tp = 8
+    for hidden in (2048, 4096, 5120, 7168, 8192):
+        for padded_per_rank in (128, 256, 512, 1024, 2048, 4096):
             global_rows = tp * padded_per_rank
-            for fill_ratio in (1.0, 0.5, 0.25, 0.125):
-                sz = max(1, int(padded_per_rank * fill_ratio))
-                run_shape(
-                    f"gather  tp={tp} per={padded_per_rank} fill={fill_ratio:.3f}",
-                    dst_rows=global_rows, src_rows=padded_per_rank, hidden=hidden,
-                    offset=(tp // 2) * padded_per_rank, sz=sz, offset_src=False,
-                )
-                run_shape(
-                    f"scatter tp={tp} per={padded_per_rank} fill={fill_ratio:.3f}",
-                    dst_rows=padded_per_rank, src_rows=global_rows, hidden=hidden,
-                    offset=(tp // 2) * padded_per_rank, sz=sz, offset_src=True,
-                )
-            print()
+            sz = padded_per_rank
+            run_shape(
+                f"gather  hidden={hidden:5d} per={padded_per_rank:5d}",
+                dst_rows=global_rows,
+                src_rows=padded_per_rank,
+                hidden=hidden,
+                offset=(tp // 2) * padded_per_rank,
+                sz=sz,
+                offset_src=False,
+            )
+            run_shape(
+                f"scatter hidden={hidden:5d} per={padded_per_rank:5d}",
+                dst_rows=padded_per_rank,
+                src_rows=global_rows,
+                hidden=hidden,
+                offset=(tp // 2) * padded_per_rank,
+                sz=sz,
+                offset_src=True,
+            )
+        print()
 
 
 if __name__ == "__main__":
