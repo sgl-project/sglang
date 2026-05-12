@@ -204,4 +204,12 @@ class TestDeepseekV4Fp4(CustomTestCase):
 
 
 if __name__ == "__main__":
+    # run_suite.py's run_one_file launches each test file with `python3 <file> -f`,
+    # which enables unittest fail-fast. For this file, `test_a_gsm8k` (accuracy)
+    # and `test_b_perf_8k_1k` (performance) are independent measurements that
+    # share a very expensive server launch in setUpClass; we want perf data even
+    # if accuracy fails. Strip `-f` locally so subsequent test methods still run.
+    import sys
+
+    sys.argv = [a for a in sys.argv if a not in ("-f", "--failfast")]
     unittest.main()
