@@ -15,9 +15,12 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     _mask_topk_ids_padded_region,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class HashTopK(nn.Module):
@@ -109,16 +112,31 @@ class HashTopK(nn.Module):
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
         if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            from sglang.jit_kernel.deepseek_v4 import hash_topk
+            if _is_cpu and _is_cpu_amx_available:
+                # CPU SGL kernel path: tid2eid lookup done in Python, kernel does scoring + gather
+                tid2eid_for_tokens = self.tid2eid[
+                    input_ids
+                ]  # [num_tokens, routed_topk]
+                topk_weights, topk_ids = torch.ops.sgl_kernel.hash_topk_cpu(
+                    router_logits,
+                    tid2eid_for_tokens,
+                    self.topk,
+                    self.score_func,
+                    self.num_fused_shared_experts,
+                    self.num_experts,
+                    self.routed_scaling_factor,
+                )
+            else:
+                from sglang.jit_kernel.deepseek_v4 import hash_topk
 
-            topk_weights, topk_ids = hash_topk(
-                router_logits=router_logits,
-                input_ids=input_ids,
-                tid2eid=self.tid2eid,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                routed_scaling_factor=self.routed_scaling_factor,
-                scoring_func=self.score_func,
-            )
+                topk_weights, topk_ids = hash_topk(
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                    tid2eid=self.tid2eid,
+                    num_fused_shared_experts=self.num_fused_shared_experts,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    scoring_func=self.score_func,
+                )
         else:
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
 

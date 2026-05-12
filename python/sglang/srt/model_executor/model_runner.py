@@ -192,6 +192,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_cpu,
     is_hip,
     is_host_cpu_arm64,
     is_npu,
@@ -222,6 +223,7 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+_is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -3250,6 +3252,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         step_span_ctx = (
             torch.profiler.record_function(_build_step_span_name(forward_batch))
             if torch.autograd._profiler_enabled()
+            and not (_is_cpu and _is_cpu_amx_available)
             else contextlib.nullcontext()
         )
         with (
