@@ -37,7 +37,6 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers import logprob_ops, request_tracing, spec_decoding_meta
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
@@ -66,6 +65,9 @@ from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
+from sglang.srt.managers.tokenizer_manager_components.lora_controller import (
+    LoraController,
+)
 from sglang.srt.managers.tokenizer_manager_components.multimodal_processor_owner import (
     MultimodalProcessor,
 )
@@ -168,8 +170,11 @@ class TokenizerManager(TokenizerControlMixin):
         # Init weight update
         self.init_weight_update()
 
-        # Init LoRA status
-        self.init_lora()
+        # Init LoRA controller
+        self.lora_controller = LoraController(
+            server_args=self.server_args,
+            auto_create_handle_loop=self.auto_create_handle_loop,
+        )
 
         # Init PD disaggregation and encoder disaggregation
         self.init_disaggregation()
@@ -348,25 +353,6 @@ class TokenizerManager(TokenizerControlMixin):
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
-    def init_lora(self):
-        # LoRA
-        # Initialize the `LoRARegistry` with initial LoRA adapter paths provided in `server_args`.
-        # The registry dynamically updates as adapters are loaded / unloaded during runtime. It
-        # serves as the source of truth for available adapters and maps user-friendly LoRA names
-        # to internally used unique LoRA IDs.
-        self.lora_registry = LoRARegistry(self.server_args.lora_paths)
-        # Lock to serialize LoRA update operations.
-        # Please note that, unlike `model_update_lock`, this does not block inference, allowing
-        # LoRA updates and inference to overlap.
-        self.lora_update_lock = asyncio.Lock()
-        # A cache for mapping the lora_name for LoRA adapters that have been loaded at any
-        # point to their latest LoRARef objects, so that they can be
-        # dynamically loaded if needed for inference
-        self.lora_ref_cache: Dict[str, LoRARef] = {}
-        if self.server_args.lora_paths is not None:
-            for lora_ref in self.server_args.lora_paths:
-                self.lora_ref_cache[lora_ref.lora_name] = lora_ref
-
     def init_disaggregation(self):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(
@@ -405,6 +391,9 @@ class TokenizerManager(TokenizerControlMixin):
             ]
         )
         self.init_communicators(self.server_args)
+        self.lora_controller.update_lora_adapter_communicator = (
+            self.update_lora_adapter_communicator
+        )
 
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
@@ -452,7 +441,7 @@ class TokenizerManager(TokenizerControlMixin):
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
-            await self._validate_and_resolve_lora(obj)
+            await TokenizerManager._validate_and_resolve_lora(self.lora_controller, obj)
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
@@ -556,7 +545,7 @@ class TokenizerManager(TokenizerControlMixin):
 
             # Mark ongoing LoRA request as finished.
             if self.server_args.enable_lora and state.obj.lora_path:
-                await self.lora_registry.release(state.obj.lora_id)
+                await self.lora_controller.lora_registry.release(state.obj.lora_id)
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -1132,7 +1121,9 @@ class TokenizerManager(TokenizerControlMixin):
 
                 # Mark ongoing LoRA request as finished.
                 if self.server_args.enable_lora and state.obj.lora_path:
-                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+                    asyncio.create_task(
+                        self.lora_controller.lora_registry.release(state.obj.lora_id)
+                    )
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -1262,8 +1253,10 @@ class TokenizerManager(TokenizerControlMixin):
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.send_to_scheduler.send_pyobj(ranks)
 
+    @staticmethod
     async def _validate_and_resolve_lora(
-        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+        self: "LoraController",
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
     ) -> None:
         if not obj.lora_path:
             return
@@ -1281,9 +1274,13 @@ class TokenizerManager(TokenizerControlMixin):
                 "using --lora-paths or /load_lora_adapter endpoint."
             )
 
-        await self._resolve_lora_path(obj)
+        await TokenizerManager._resolve_lora_path(self, obj)
 
-    async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
+    @staticmethod
+    async def _resolve_lora_path(
+        self: "LoraController",
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+    ):
         if isinstance(obj.lora_path, str):
             unique_lora_paths = set([obj.lora_path])
         else:
@@ -1314,12 +1311,13 @@ class TokenizerManager(TokenizerControlMixin):
 
             logger.info(f"Reloading evicted adapter: {lora_path}")
             new_lora_ref = self.lora_ref_cache[lora_path]
-            load_result = await self.load_lora_adapter(
+            load_result = await TokenizerManager.load_lora_adapter(
+                self,
                 LoadLoRAAdapterReqInput(
                     lora_name=new_lora_ref.lora_name,
                     lora_path=new_lora_ref.lora_path,
                     pinned=new_lora_ref.pinned,
-                )
+                ),
             )
             if (
                 not load_result.success
