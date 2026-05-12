@@ -452,8 +452,9 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         if get_global_tracing_enabled():
             for idx, req in enumerate(batch.reqs):
+                num_correct_drafts = verify_output.num_correct_drafts_per_req_cpu[idx]
                 req.time_stats.set_spec_verify_end_time(
-                    num_correct_drafts=verify_output.num_correct_drafts_per_req_cpu[idx]
+                    num_correct_drafts=num_correct_drafts
                 )
 
         set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
