@@ -44,9 +44,12 @@ if TYPE_CHECKING:
 
 
 try:
-    from flashinfer import fp4_quantize as fp4_quantize_flashinfer
     from flashinfer import (
         nvfp4_block_scale_interleave as nvfp4_block_scale_interleave_flashinfer,
+    )
+
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        fp4_quantize as fp4_quantize_flashinfer,
     )
 except ImportError:
     fp4_quantize_flashinfer = None
