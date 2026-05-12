@@ -166,8 +166,8 @@ class AdaptiveSpeculativeParams:
 
         self.candidate_steps = sorted(candidates)
         assert (
-            len(self.candidate_steps) >= 2
-        ), "candidate_steps must have at least 2 distinct values"
+            len(self.candidate_steps) >= 1
+        ), "candidate_steps must have at least 1 value"
 
         self.min_steps = self.candidate_steps[0]
         self.max_steps = self.candidate_steps[-1]
