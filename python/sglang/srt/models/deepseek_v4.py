@@ -88,7 +88,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
     )
-    from sglang.srt.layers.attention.deepseek_v4_backend_hip import DeepseekV4Backend
     from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
         DeepseekV4HipRadixBackend,
     )
@@ -560,7 +559,7 @@ class MQALayer(nn.Module):
         if TYPE_CHECKING:
             assert isinstance(
                 attn_backend,
-                (DeepseekV4AttnBackend, DeepseekV4Backend, DeepseekV4HipRadixBackend),
+                (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
 
         enable_multi_stream = (

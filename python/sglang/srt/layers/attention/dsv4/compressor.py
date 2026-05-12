@@ -44,8 +44,9 @@ if _is_hip:
     )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
-    from sglang.srt.layers.attention.deepseek_v4_backend_hip import DeepseekV4Backend
+    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+        DeepseekV4HipRadixBackend,
+    )
     from sglang.srt.layers.rotary_embedding import RotaryEmbedding
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -508,7 +509,7 @@ class Compressor(nn.Module):
     ):
         backend = forward_batch.attn_backend
         if TYPE_CHECKING:
-            assert isinstance(backend, DeepseekV4Backend)
+            assert isinstance(backend, DeepseekV4HipRadixBackend)
         token_to_kv_pool = forward_batch.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
@@ -976,7 +977,7 @@ class Compressor(nn.Module):
         # TODO: this should be the final implementation after verifying correctness
         backend = forward_batch.attn_backend
         if TYPE_CHECKING:
-            assert isinstance(backend, DeepseekV4Backend)
+            assert isinstance(backend, DeepseekV4HipRadixBackend)
         is_paged = envs.SGLANG_OPT_DPSK_V4_RADIX.get()
         if is_paged:
             kv_score_buffer = self._get_state_pool(forward_batch)
@@ -1067,7 +1068,7 @@ class Compressor(nn.Module):
 
         backend = forward_batch.attn_backend
         if TYPE_CHECKING:
-            assert isinstance(backend, DeepseekV4AttnBackend)
+            assert isinstance(backend, DeepseekV4HipRadixBackend)
         kv_score_buffer = self._get_state_pool(forward_batch)
         kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
         return backend.forward_compress(
