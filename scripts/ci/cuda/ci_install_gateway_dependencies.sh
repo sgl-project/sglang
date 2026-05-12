@@ -10,13 +10,29 @@ set -euxo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 GATEWAY_APT_PACKAGES=(libssl-dev pkg-config redis-server)
-if command -v sudo >/dev/null 2>&1; then
-    sudo apt-get update
-    sudo apt-get install -y "${GATEWAY_APT_PACKAGES[@]}"
-else
-    apt-get update
-    apt-get install -y "${GATEWAY_APT_PACKAGES[@]}"
-fi
+APT_OPTS=(
+    -y
+    -o "Acquire::Retries=5"
+    -o "Acquire::http::Timeout=30"
+    -o "Acquire::https::Timeout=30"
+)
+SUDO=""
+command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+
+# GH-hosted runners' Azure Ubuntu mirrors flake periodically. Retry the
+# whole install with backoff so we don't fail the whole CI on a 1-min
+# DNS hiccup at apt-mirrors.txt → azure.archive.ubuntu.com.
+for attempt in 1 2 3 4 5; do
+    if $SUDO apt-get update "${APT_OPTS[@]}" \
+       && $SUDO apt-get install "${APT_OPTS[@]}" "${GATEWAY_APT_PACKAGES[@]}"; then
+        break
+    fi
+    if [ "$attempt" = 5 ]; then
+        echo "apt-get install failed after 5 attempts; giving up." >&2
+        exit 1
+    fi
+    sleep $((attempt * 15))
+done
 
 bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
 

@@ -26,6 +26,9 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.state_capturer.indexer_topk import (
+    maybe_capture_indexer_topk,
+)
 from sglang.srt.utils import BumpAllocator
 
 if TYPE_CHECKING:
@@ -61,9 +64,39 @@ if _is_cuda:
 
 
 if _use_aiter:
-    from aiter.ops.fused_qk_norm_rope_cache_quant import (
-        fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
-    )
+    # aiter ROCm/aiter#2958 renamed the public `fused_qk_rmsnorm` in
+    # `aiter.ops.fused_qk_norm_rope_cache_quant` to a private `_fused_qk_rmsnorm`
+    # and introduced a unified entry point in `aiter.ops.fused_qk_rmsnorm_group_quant`
+    # with a different (in-place, kwarg-only, no-return) signature. Probe for the
+    # new symbol first so SGLang works with both pre- and post-#2958 aiter without
+    # requiring the docker pin to be bumped atomically.
+    try:
+        from aiter.ops.enum import QuantType as _AiterQuantType
+        from aiter.ops.fused_qk_rmsnorm_group_quant import (
+            fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm_unified,
+        )
+
+        def fused_qk_rmsnorm_bf16(q, q_weight, q_eps, k, k_weight, k_eps):
+            q_out = torch.empty_like(q)
+            k_out = torch.empty_like(k)
+            _aiter_fused_qk_rmsnorm_unified(
+                q_out_quantized=q_out,
+                k_out=k_out,
+                q=q,
+                q_weight=q_weight,
+                q_epsilon=q_eps,
+                k=k,
+                k_weight=k_weight,
+                k_epsilon=k_eps,
+                quant_type=_AiterQuantType.No,
+            )
+            return q_out, k_out
+
+    except ImportError:
+        from aiter.ops.fused_qk_norm_rope_cache_quant import (
+            fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
+        )
+
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
@@ -205,7 +238,11 @@ class DeepseekMLAForwardMixin:
                         layer_id=self.layer_id,
                     )
                 else:
-                    topk_indices = prev_topk_indices
+                    # skip_topk reuses prev layer's indices; mirror into this
+                    # layer's slot so the captured buffer matches what's used.
+                    topk_indices = maybe_capture_indexer_topk(
+                        self.layer_id, prev_topk_indices
+                    )
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
@@ -220,7 +257,9 @@ class DeepseekMLAForwardMixin:
                             layer_id=self.layer_id,
                         )
                     else:
-                        topk_indices = prev_topk_indices
+                        topk_indices = maybe_capture_indexer_topk(
+                            self.layer_id, prev_topk_indices
+                        )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim

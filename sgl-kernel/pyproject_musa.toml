@@ -3,14 +3,14 @@ requires = [
   "setuptools>=75.0",
   "scikit-build-core>=0.10",
   "torch",
-  "torchada>=0.1.50",
+  "torchada>=0.1.55",
   "wheel",
 ]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang-kernel"
-version = "0.4.1.post1"
+version = "0.4.2.post1"
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.10"

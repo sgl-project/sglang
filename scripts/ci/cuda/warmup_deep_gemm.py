@@ -235,8 +235,11 @@ def compile_one_shape(kernel_type, n, k, num_groups, m_list):
         )
         m_list = [m for m in m_list if m <= max_m]
 
-    old_mode = deep_gemm.get_compile_mode()
-    deep_gemm.set_compile_mode(1)
+    get_compile_mode = getattr(deep_gemm, "get_compile_mode", None)
+    set_compile_mode = getattr(deep_gemm, "set_compile_mode", None)
+    old_mode = get_compile_mode() if get_compile_mode is not None else None
+    if set_compile_mode is not None:
+        set_compile_mode(1)
     try:
         if kernel_type == "NORMAL":
             lhs_q, lhs_s = _empty_token_fp8((max_m, k))
@@ -255,7 +258,7 @@ def compile_one_shape(kernel_type, n, k, num_groups, m_list):
                     (lhs_q[:m], lhs_s[:m]),
                     (rhs_q, rhs_s),
                     out[:m],
-                    m_indices=m_indices[:m],
+                    m_indices[:m],
                 )
 
         elif kernel_type == "MASKED":
@@ -274,7 +277,8 @@ def compile_one_shape(kernel_type, n, k, num_groups, m_list):
                     expected_m=m,
                 )
     finally:
-        deep_gemm.set_compile_mode(old_mode)
+        if set_compile_mode is not None and old_mode is not None:
+            set_compile_mode(old_mode)
 
     torch.cuda.current_stream().synchronize()
     torch.cuda.empty_cache()
