@@ -238,6 +238,7 @@ class PiecewiseCudaGraphRunner:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
+        self._prepare_piecewise_cuda_graph_modules()
 
         with enable_piecewise_cuda_graph():
             language_model = getattr(
@@ -282,6 +283,22 @@ class PiecewiseCudaGraphRunner:
 
         self.raw_num_tokens = 0
         self._logged_first_replay = False
+
+    def _prepare_piecewise_cuda_graph_modules(self):
+        language_model = getattr(
+            self.model_runner.model, "language_model", self.model_runner.model
+        )
+        model = getattr(language_model, "model", language_model)
+        prepared = 0
+        for module in model.modules():
+            prepare = getattr(module, "prepare_piecewise_cuda_graph", None)
+            if prepare is not None and prepare():
+                prepared += 1
+        if prepared:
+            log_info_on_rank0(
+                logger,
+                f"Prepared {prepared} modules before piecewise CUDA graph compile",
+            )
 
     def warmup_torch_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""

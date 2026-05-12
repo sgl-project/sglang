@@ -485,6 +485,7 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
+        self._pcg_mega_moe_symm_buffer = None
 
         if envs.SGLANG_DSV4_MODE.get() == "2604":
             n_hash_layers = config.num_hash_layers
@@ -1159,6 +1160,32 @@ class DeepseekV2MoE(nn.Module):
         cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
         return max_tokens_per_rank <= cap
 
+    def prepare_piecewise_cuda_graph(self) -> bool:
+        if not envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
+            return False
+        if not getattr(self.experts, "_mega_moe_weights_built", False):
+            return False
+        if not envs.SGLANG_OPT_FIX_NEXTN_MEGA_MOE.get() and self.is_nextn:
+            return False
+        if not envs.SGLANG_OPT_FIX_HASH_MEGA_MOE.get() and self.is_hash:
+            return False
+
+        from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+        num_max_tokens_per_rank = (
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        )
+        self._pcg_mega_moe_symm_buffer = _get_mega_moe_symm_buffer(
+            get_moe_ep_group().device_group,
+            num_experts=self.experts.num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_topk=self.config.num_experts_per_tok
+            + self.num_fused_shared_experts,
+            hidden=self.config.hidden_size,
+            intermediate_hidden=self.config.moe_intermediate_size,
+        )
+        return True
+
     def forward_mega_moe(
         self,
         hidden_states: torch.Tensor,
@@ -1210,7 +1237,6 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         import deep_gemm
 
-        from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8_ue8m0,
         )
@@ -1239,7 +1265,6 @@ class DeepseekV2MoE(nn.Module):
             topk_ids = None
             topk_weights = None
 
-        ep_group = get_moe_ep_group().device_group
         num_experts = self.experts.num_experts
         top_k = self.config.num_experts_per_tok + self.num_fused_shared_experts
         intermediate_size = self.config.moe_intermediate_size
@@ -1253,14 +1278,23 @@ class DeepseekV2MoE(nn.Module):
             f"cuda_graph_max_bs / chunked_prefill_size accordingly"
         )
 
-        buf = _get_mega_moe_symm_buffer(
-            ep_group,
-            num_experts=num_experts,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            num_topk=top_k,
-            hidden=hidden_size,
-            intermediate_hidden=intermediate_size,
+        buf = (
+            self._pcg_mega_moe_symm_buffer
+            if is_in_piecewise_cuda_graph()
+            else None
         )
+        if buf is None:
+            from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+            ep_group = get_moe_ep_group().device_group
+            buf = _get_mega_moe_symm_buffer(
+                ep_group,
+                num_experts=num_experts,
+                num_max_tokens_per_rank=num_max_tokens_per_rank,
+                num_topk=top_k,
+                hidden=hidden_size,
+                intermediate_hidden=intermediate_size,
+            )
 
         padded_max = buf.topk_idx.shape[0]
         if envs.SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH.get():
