@@ -12,10 +12,7 @@ import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import fused_rope, rmsnorm_self
-from sglang.srt.configs.deepseek_v4 import (
-    DeepSeekV4Config,
-    set_fp4_experts,
-)
+from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -1052,7 +1049,6 @@ class DeepseekV4ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        set_fp4_experts(getattr(config, "expert_dtype", None) == "fp4")
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()

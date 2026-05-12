@@ -36,7 +36,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.utils import add_prefix, get_bool_env_var, maybe_torch_compile
+from sglang.srt.utils import add_prefix, get_bool_env_var
 
 if _is_hip:
     from sglang.srt.layers.deepseek_v4_rope import (
@@ -922,7 +922,6 @@ class Compressor(nn.Module):
 
         return compressed_kv_output
 
-    @maybe_torch_compile
     def compress_decode(
         self,
         kv_and_scores: KVAndScore,
