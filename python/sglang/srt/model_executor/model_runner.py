@@ -116,6 +116,7 @@ from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components import device_graphs
 from sglang.srt.model_executor.model_runner_components.dummy_run import dummy_run
 from sglang.srt.model_executor.model_runner_components.kernel_warmup import (
+    _pre_initialize_flashinfer_allreduce_workspace,
     kernel_warmup,
 )
 from sglang.srt.model_executor.model_runner_components.pool_configurator import (
@@ -770,7 +771,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     ),
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 )
-            ModelRunner._pre_initialize_flashinfer_allreduce_workspace(
+            _pre_initialize_flashinfer_allreduce_workspace(
                 server_args=self.server_args,
                 model_config=self.model_config,
                 dtype=self.dtype,
@@ -1783,33 +1784,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_new_workspace = init_new_workspace
         full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
         return attn_backend_wrapper(self, full_attention_backend)
-
-    @staticmethod
-    def _pre_initialize_flashinfer_allreduce_workspace(
-        *,
-        server_args: ServerArgs,
-        model_config: ModelConfig,
-        dtype: torch.dtype,
-    ):
-        """Pre-initialize flashinfer allreduce fusion workspaces.
-
-        Must run before CUDA graph capture to avoid collective operations
-        (broadcasts, barriers) inside the graph capture context, which can
-        deadlock with custom_all_reduce.register_graph_buffers.
-        """
-        if not server_args.enable_flashinfer_allreduce_fusion:
-            return
-
-        from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
-        from sglang.srt.layers.flashinfer_comm_fusion import (
-            pre_initialize_workspaces,
-        )
-
-        pre_initialize_workspaces(
-            max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
-            hidden_dim=model_config.hidden_size,
-            dtype=dtype,
-        )
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.model_config.use_ngram_embedding
