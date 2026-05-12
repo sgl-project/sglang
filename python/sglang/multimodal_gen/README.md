@@ -25,7 +25,7 @@ SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we u
 
 ### Moore Threads/MUSA Support
 
-SGLang Diffusion supports Moore Threads GPUs (MTGPU) through the MUSA software stack. On MUSA platforms, we use the Torch SDPA backend for attention. See the [installation guide](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/installation.md) for setup instructions.
+SGLang Diffusion supports Moore Threads GPUs (MTGPU) through the MUSA software stack. On MUSA platforms, we use FlashAttention (FA3) when available; also supports Sage Attention when installed; otherwise falls back to the Torch SDPA backend. See the [installation guide](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/installation.md) for setup instructions.
 
 ### Apple MPS Support
 
@@ -75,11 +75,6 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A curious raccoon" \
     --save-output
 ```
-
-For LTX-2 two-stage generation, use `--pipeline-class-name LTX2TwoStagePipeline`. The
-spatial upsampler and distilled LoRA are auto-resolved from the same model snapshot by
-default, and can still be overridden with `--spatial-upsampler-path` and
-`--distilled-lora-path` when needed.
 
 ### LoRA support
 

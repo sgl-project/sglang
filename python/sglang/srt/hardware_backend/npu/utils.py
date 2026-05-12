@@ -154,7 +154,7 @@ def npu_format_cast(
         logger.warning_once(
             "Warning: The conversion from 'ND' to 'NZ' does not work on the CPU. "
             "Please disable offloading, otherwise the performance will be "
-            "significantly reduced."
+            "significantly reduced. --dit-cpu-offload false"
         )
         return tensor
 
@@ -168,6 +168,10 @@ def npu_format_cast(
             n,
             tensor.dtype,
         )
+        return tensor
+
+    # Skip format cast for meta tensors (used in offloader)
+    if tensor.device.type == "meta":
         return tensor
 
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
