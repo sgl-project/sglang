@@ -1,10 +1,8 @@
-import asyncio
 import json
 import os
-import time
 from argparse import Namespace
 from dataclasses import dataclass
-from typing import AsyncGenerator, Dict, List
+from typing import Dict, List
 
 from transformers import PreTrainedTokenizerBase
 
@@ -21,6 +19,8 @@ class MooncakeDataset(BaseDataset):
     dataset_path: str
     mooncake_workload: str
     num_requests: int
+    num_rounds: int
+    block_size: int
 
     @classmethod
     def from_args(cls, args: Namespace) -> "MooncakeDataset":
@@ -28,9 +28,14 @@ class MooncakeDataset(BaseDataset):
             dataset_path=args.dataset_path,
             mooncake_workload=args.mooncake_workload,
             num_requests=args.num_prompts,
+            num_rounds=args.mooncake_num_rounds,
+            block_size=args.mooncake_block_size,
         )
 
-    def load(self, tokenizer=None, model_id=None) -> List[Dict]:
+    def load(self, tokenizer=None, model_id=None) -> List[DatasetRow]:
+        if tokenizer is None:
+            raise ValueError("MooncakeDataset requires a tokenizer to expand sessions.")
+
         if not self.dataset_path:
             local_path = os.path.join("/tmp", self.mooncake_workload + "_trace.jsonl")
         else:
@@ -44,80 +49,77 @@ class MooncakeDataset(BaseDataset):
         with open(local_path, "r") as f:
             all_requests_data = [json.loads(line) for line in f if line.strip()]
 
-        return all_requests_data[: self.num_requests]
+        return expand_mooncake_requests(
+            all_requests_data[: self.num_requests],
+            tokenizer,
+            num_rounds=self.num_rounds,
+            block_size=self.block_size,
+        )
 
 
-async def get_mooncake_request_over_time(
-    input_requests: List[Dict],
+def build_mooncake_session_requests(
+    record: Dict,
     tokenizer: PreTrainedTokenizerBase,
-    slowdown_factor: float,
     num_rounds: int,
-) -> AsyncGenerator[DatasetRow, None]:
-    """
-    An async generator that yields requests based on the timestamps in the Mooncake trace file,
-    with support for multi-round sessions.
-    """
-    if not input_requests:
-        return
+    block_size: int = 128,
+) -> List[DatasetRow]:
+    """Expand one Mooncake trace session into concrete benchmark requests."""
+    user_query_base = ""
+    hash_ids = record.get("hash_ids", [])
+    for hash_id in hash_ids:
+        user_query_base += f"{hash_id}" + " ".join(["hi"] * block_size)
+    user_query_base += "Tell me a story based on this context."
 
-    input_requests.sort(key=lambda r: r["timestamp"])
+    output_len_per_round = record.get("output_length", 256)
+    chat_history = []
+    requests = []
 
-    start_time = time.perf_counter()
-    trace_start_time_ms = input_requests[0]["timestamp"]
+    for i in range(num_rounds):
+        chat_history.append(
+            {"role": "user", "content": f"Round {i + 1}: {user_query_base}"}
+        )
 
-    for record in input_requests:
-        # Calculate when this entire session should start
-        relative_arrival_time_s = (record["timestamp"] - trace_start_time_ms) / 1000.0
-        target_arrival_time_s = relative_arrival_time_s * slowdown_factor
-
-        current_elapsed_time_s = time.perf_counter() - start_time
-        sleep_duration_s = target_arrival_time_s - current_elapsed_time_s
-        if sleep_duration_s > 0:
-            await asyncio.sleep(sleep_duration_s)
-
-        # Once the session starts, generate all rounds for it as a burst
-        # This simulates a user engaging in a multi-turn conversation
-
-        # Base user query constructed from hash_ids
-        user_query_base = ""
-        hash_ids = record.get("hash_ids", [])
-        for hash_id in hash_ids:
-            user_query_base += f"{hash_id}" + " ".join(
-                ["hi"] * 128
-            )  # Shorter for multi-round
-        user_query_base += "Tell me a story based on this context."
-
-        output_len_per_round = record.get("output_length", 256)
-        chat_history = []
-
-        for i in range(num_rounds):
-            # Add user query for the current round
-            chat_history.append(
-                {"role": "user", "content": f"Round {i + 1}: {user_query_base}"}
+        try:
+            full_prompt_text = tokenizer.apply_chat_template(
+                chat_history,
+                tokenize=False,
+                add_generation_prompt=True,
+                return_dict=False,
+            )
+        except Exception:
+            full_prompt_text = "\n".join(
+                [f"{msg['role']}: {msg['content']}" for msg in chat_history]
             )
 
-            # Form the full prompt from history
-            try:
-                full_prompt_text = tokenizer.apply_chat_template(
-                    chat_history,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    return_dict=False,
-                )
-            except Exception:
-                full_prompt_text = "\n".join(
-                    [f"{msg['role']}: {msg['content']}" for msg in chat_history]
-                )
-
-            prompt_len = len(tokenizer.encode(full_prompt_text))
-
-            yield DatasetRow(
+        prompt_len = len(tokenizer.encode(full_prompt_text))
+        requests.append(
+            DatasetRow(
                 prompt=full_prompt_text,
                 prompt_len=prompt_len,
                 output_len=output_len_per_round,
+                timestamp=record.get("timestamp") if i == 0 else None,
             )
+        )
 
-            # Add a placeholder assistant response for the next round's context
-            # We use a placeholder because we don't know the real response
-            placeholder_response = " ".join(["story"] * output_len_per_round)
-            chat_history.append({"role": "assistant", "content": placeholder_response})
+        placeholder_response = " ".join(["story"] * output_len_per_round)
+        chat_history.append({"role": "assistant", "content": placeholder_response})
+
+    return requests
+
+
+def expand_mooncake_requests(
+    records: List[Dict],
+    tokenizer: PreTrainedTokenizerBase,
+    num_rounds: int,
+    block_size: int = 128,
+) -> List[DatasetRow]:
+    return [
+        request
+        for record in records
+        for request in build_mooncake_session_requests(
+            record,
+            tokenizer,
+            num_rounds=num_rounds,
+            block_size=block_size,
+        )
+    ]
