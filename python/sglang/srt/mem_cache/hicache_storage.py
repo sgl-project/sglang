@@ -19,6 +19,8 @@ class HiCacheStorageConfig:
     tp_size: int
     pp_rank: int
     pp_size: int
+    attn_cp_rank: int
+    attn_cp_size: int
     is_mla_model: bool
     enable_storage_metrics: bool
     is_page_first_layout: bool
@@ -34,17 +36,31 @@ class HiCacheStorageExtraInfo:
     extra_info: Optional[dict] = None
 
 
+@dataclass(frozen=True)
+class PrefetchTimeoutConfig:
+    """Knobs for the linear prefetch-timeout policy used by HiCache."""
+
+    base: float = 2.0  # seconds, fixed overhead unrelated to token count
+    per_ki_token: float = 0.1  # seconds per 1024 tokens
+    max: float = 30.0  # seconds, upper bound for the linear timeout
+
+
 class PoolName(str, Enum):
     """Well-known pool names used as PoolTransfer/PoolEntry identifiers."""
 
     KV = "kv"
     MAMBA = "mamba"
+    SWA = "swa"
+    INDEXER = "indexer"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
-    ALL_PAGES      : every page in [0, kv_hit) must exist (default).
+    ALL_PAGES      : every page in [0, kv_hit) must exist (e.g. DSA).
     TRAILING_PAGES : only the last N pages must exist (e.g. Mamba/SWA states).
     """
 
@@ -58,6 +74,7 @@ class PoolTransfer:
 
     device<->host path : host_indices + device_indices
     host<->storage path: host_indices + keys
+    nodes_to_load      : evicted nodes this transfer covers
     """
 
     name: PoolName
@@ -65,6 +82,7 @@ class PoolTransfer:
     device_indices: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+    nodes_to_load: Optional[List[Any]] = None
 
 
 @dataclass

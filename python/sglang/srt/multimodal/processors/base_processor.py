@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image
-from transformers import BaseImageProcessorFast
+from transformers import BaseImageProcessor
 
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -184,6 +184,11 @@ class BaseMultimodalProcessor(ABC):
         self.server_args = server_args
         self.transport_mode = transport_mode
 
+        mm_process_config = self.server_args.mm_process_config
+        self.image_config = mm_process_config.get("image", {})
+        self.video_config = mm_process_config.get("video", {})
+        self.audio_config = mm_process_config.get("audio", {})
+
         # Resolve tokenizer: some processors (e.g. InternVL) pass a tokenizer
         # directly as _processor rather than a processor that wraps a tokenizer.
         if hasattr(self._processor, "tokenizer"):
@@ -249,8 +254,23 @@ class BaseMultimodalProcessor(ABC):
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
 
         if SGL_USE_CUDA_IPC and not skip_mm_pool:
+            # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
+            # tokenizer workers. Each worker gets an equal share so that adding
+            # workers doesn't multiply the GPU-side footprint.
+            worker_num = self.server_args.tokenizer_worker_num
+            per_worker_pool_size = max(
+                MM_FEATURE_CACHE_SIZE // worker_num,
+                128 * 1024 * 1024,
+            )
+            logger.info(
+                "MmItemMemoryPool size per tokenizer worker: %.0f MiB "
+                "(budget %.0f MiB / %d worker(s))",
+                per_worker_pool_size / (1024 * 1024),
+                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
+                worker_num,
+            )
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
-                MM_FEATURE_CACHE_SIZE,
+                per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
             )
 
@@ -381,8 +401,12 @@ class BaseMultimodalProcessor(ABC):
         """
         if images:
             kwargs["images"] = images
+            if self.image_config:
+                kwargs.setdefault("images_kwargs", {}).update(self.image_config)
         if videos:
             kwargs["videos"] = videos
+            if self.video_config:
+                kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
         if audios:
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
@@ -394,15 +418,17 @@ class BaseMultimodalProcessor(ABC):
             }:
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
                 kwargs["audio"] = audios
-                kwargs["audio_kwargs"] = {}
+                kwargs.setdefault("audio_kwargs", {})
                 kwargs["audio_kwargs"].setdefault("truncation", False)
             else:
                 kwargs["audios"] = audios
+            if self.audio_config:
+                kwargs.setdefault("audio_kwargs", {}).update(self.audio_config)
 
         processor = self._processor
         if (
             hasattr(processor, "image_processor")
-            and isinstance(processor.image_processor, BaseImageProcessorFast)
+            and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.server_args.disable_fast_image_processor
         ):
             if _is_cpu or get_global_server_args().rl_on_policy_target is not None:

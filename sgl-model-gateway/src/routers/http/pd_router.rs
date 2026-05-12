@@ -1241,7 +1241,7 @@ impl RouterTrait for PDRouter {
         let headers = header_utils::copy_request_headers(&req);
 
         // Proxy to first prefill worker
-        self.proxy_to_first_prefill_worker("get_model_info", Some(headers))
+        self.proxy_to_first_prefill_worker("model_info", Some(headers))
             .await
     }
 

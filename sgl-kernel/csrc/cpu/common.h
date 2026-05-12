@@ -2,7 +2,6 @@
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
-#include <ATen/record_function.h>
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -74,43 +73,94 @@ namespace {
     }                                                            \
   }()
 
+// Helper MICRO for CPU_DISPATCH_FLOATING_TYPES_EXT:
+//   TYPE1: the primary dtype (input, output, weight);
+//   TYPE2: defined as PARAM_T input
+#define CPU_DISPATCH_TYPE1_WITH_PARAM(TYPE1, PARAM_T, ...)   \
+  switch (TYPE1) {                                           \
+    case at::ScalarType::BFloat16: {                         \
+      using scalar_t = at::BFloat16;                         \
+      using param_t = PARAM_T;                               \
+      return __VA_ARGS__();                                  \
+    }                                                        \
+    case at::ScalarType::Half: {                             \
+      using scalar_t = at::Half;                             \
+      using param_t = PARAM_T;                               \
+      return __VA_ARGS__();                                  \
+    }                                                        \
+    case at::ScalarType::Float: {                            \
+      using scalar_t = float;                                \
+      using param_t = PARAM_T;                               \
+      return __VA_ARGS__();                                  \
+    }                                                        \
+    default:                                                 \
+      TORCH_CHECK(false, "Unsupported floating data type."); \
+  }
+
+// Helper MICRO for CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT:
+//   TYPE1: the primary dtype (input, output, weight);
+//   TYPE2: defined as PARAM_T input
+#define CPU_DISPATCH_TYPE1_WITH_PARAM_REDUCED(TYPE1, PARAM_T, ...) \
+  switch (TYPE1) {                                                 \
+    case at::ScalarType::BFloat16: {                               \
+      using scalar_t = at::BFloat16;                               \
+      using param_t = PARAM_T;                                     \
+      return __VA_ARGS__();                                        \
+    }                                                              \
+    case at::ScalarType::Half: {                                   \
+      using scalar_t = at::Half;                                   \
+      using param_t = PARAM_T;                                     \
+      return __VA_ARGS__();                                        \
+    }                                                              \
+    default:                                                       \
+      TORCH_CHECK(false, "Unsupported floating data type.");       \
+  }
+
+// Helper MICRO for CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT:
+//   TYPE1: the dtype both for scalar_t and param_t
+#define CPU_DISPATCH_TYPE1_WITH_SAME_PARAM_REDUCED(TYPE1, ...)       \
+  switch (TYPE1) {                                                   \
+    case at::ScalarType::BFloat16: {                                 \
+      using scalar_t = at::BFloat16;                                 \
+      using param_t = at::BFloat16;                                  \
+      return __VA_ARGS__();                                          \
+    }                                                                \
+    case at::ScalarType::Half: {                                     \
+      using scalar_t = at::Half;                                     \
+      using param_t = at::Half;                                      \
+      return __VA_ARGS__();                                          \
+    }                                                                \
+    default:                                                         \
+      TORCH_CHECK(false, "Unsupported reduced floating data type."); \
+  }
+
 // dispatch with mixed dtypes (TYPE1, TYPE2):
 //   TYPE1: the primary dtype (input, output, weight);
 //   TYPE2: the secondary dtype (bias, etc.).
-#define CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(TYPE1, TYPE2, ...) \
-  [&] {                                                            \
-    if (TYPE2 == at::kFloat) {                                     \
-      switch (TYPE1) {                                             \
-        case at::ScalarType::BFloat16: {                           \
-          using scalar_t = at::BFloat16;                           \
-          using param_t = float;                                   \
-          return __VA_ARGS__();                                    \
-        }                                                          \
-        case at::ScalarType::Half: {                               \
-          using scalar_t = at::Half;                               \
-          using param_t = float;                                   \
-          return __VA_ARGS__();                                    \
-        }                                                          \
-        default:                                                   \
-          TORCH_CHECK(false, "Unsupported floating data type.\n"); \
-      }                                                            \
-    } else {                                                       \
-      TORCH_CHECK(TYPE1 == TYPE2);                                 \
-      switch (TYPE1) {                                             \
-        case at::ScalarType::BFloat16: {                           \
-          using scalar_t = at::BFloat16;                           \
-          using param_t = at::BFloat16;                            \
-          return __VA_ARGS__();                                    \
-        }                                                          \
-        case at::ScalarType::Half: {                               \
-          using scalar_t = at::Half;                               \
-          using param_t = at::Half;                                \
-          return __VA_ARGS__();                                    \
-        }                                                          \
-        default:                                                   \
-          TORCH_CHECK(false, "Unsupported floating data type.\n"); \
-      }                                                            \
-    }                                                              \
+#define CPU_DISPATCH_FLOATING_TYPES_EXT(TYPE1, TYPE2, ...)            \
+  [&] {                                                               \
+    if (TYPE2 == at::kFloat) {                                        \
+      CPU_DISPATCH_TYPE1_WITH_PARAM(TYPE1, float, __VA_ARGS__)        \
+    } else if (TYPE2 == at::ScalarType::BFloat16) {                   \
+      CPU_DISPATCH_TYPE1_WITH_PARAM(TYPE1, at::BFloat16, __VA_ARGS__) \
+    } else if (TYPE2 == at::ScalarType::Half) {                       \
+      CPU_DISPATCH_TYPE1_WITH_PARAM(TYPE1, at::Half, __VA_ARGS__)     \
+    } else {                                                          \
+      TORCH_CHECK(false, "Unsupported floating data type.");          \
+    }                                                                 \
+  }()
+
+// dispatch with mixed dtypes (reduced one, no float for TYPE1) (TYPE1, TYPE2):
+//   TYPE1: the primary dtype (input, output, weight);
+//   TYPE2: the secondary dtype (bias, etc.).
+#define CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(TYPE1, TYPE2, ...)     \
+  [&] {                                                                \
+    if (TYPE2 == at::kFloat) {                                         \
+      CPU_DISPATCH_TYPE1_WITH_PARAM_REDUCED(TYPE1, float, __VA_ARGS__) \
+    } else {                                                           \
+      TORCH_CHECK(TYPE1 == TYPE2);                                     \
+      CPU_DISPATCH_TYPE1_WITH_SAME_PARAM_REDUCED(TYPE1, __VA_ARGS__)   \
+    }                                                                  \
   }()
 
 #define UNUSED(x) (void)(x)
