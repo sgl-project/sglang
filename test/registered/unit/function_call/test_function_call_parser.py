@@ -5107,6 +5107,15 @@ class TestGemma4Detector(unittest.TestCase):
         self.assertEqual(result.calls[1].name, "get_time")
         self.assertEqual(result.normal_text, "Some text ")
 
+    def test_detect_and_parse_repeated_calls_use_call_indices(self):
+        text = (
+            '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>'
+            '<|tool_call>call:get_weather{location:<|"|>Paris<|"|>}<tool_call|>'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual([call.tool_index for call in result.calls], [0, 1])
+        self.assertEqual([call.name for call in result.calls], ["get_weather"] * 2)
+
     def test_parse_gemma4_args_empty(self):
         self.assertEqual(_parse_gemma4_args(""), {})
         self.assertEqual(_parse_gemma4_args("   "), {})
@@ -5216,6 +5225,23 @@ class TestGemma4Detector(unittest.TestCase):
         params1 = json.loads(tool_calls_by_index[1]["parameters"])
         self.assertEqual(params0["location"], "Tokyo")
         self.assertEqual(params1["timezone"], "UTC")
+
+    def test_streaming_repeated_tool_calls_use_call_indices(self):
+        chunks = [
+            '<|tool_call>call:get_weather{location:<|"|>',
+            'Tokyo<|"|>}<tool_call|>',
+            '<|tool_call>call:get_weather{location:<|"|>',
+            'Paris<|"|>}<tool_call|>',
+        ]
+
+        normal_text, tool_calls = self._collect_streaming(chunks)
+
+        self.assertEqual(normal_text, "")
+        self.assertEqual(sorted(tool_calls), [0, 1])
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[1]["name"], "get_weather")
+        self.assertEqual(json.loads(tool_calls[0]["parameters"])["location"], "Tokyo")
+        self.assertEqual(json.loads(tool_calls[1]["parameters"])["location"], "Paris")
 
     def test_streaming_very_small_chunks(self):
         """Test streaming with character-by-character chunks."""
