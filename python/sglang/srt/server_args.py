@@ -487,6 +487,9 @@ class ServerArgs:
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
+    enable_forward_pass_metrics: bool = False
+    forward_pass_metrics_worker_id: str = ""
+    forward_pass_metrics_ipc_name: Optional[str] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
 
@@ -5237,6 +5240,25 @@ class ServerArgs:
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
         )
         parser.add_argument(
+            "--enable-forward-pass-metrics",
+            action="store_true",
+            help="Enable per-iteration forward pass metrics via ZMQ IPC. "
+            "External consumers (e.g. Dynamo planner) subscribe to the IPC "
+            "endpoint exposed in server_args.forward_pass_metrics_ipc_name.",
+        )
+        parser.add_argument(
+            "--forward-pass-metrics-worker-id",
+            type=str,
+            default="",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--forward-pass-metrics-ipc-name",
+            type=str,
+            default=None,
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
             "--enable-trace",
             action="store_true",
             help="Enable opentelemetry trace",
@@ -7065,6 +7087,14 @@ class ServerArgs:
         ), (
             "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
             f"Got: {self.pp_max_micro_batch_size}"
+        )
+
+        assert not (self.disable_cuda_graph_padding and self.enable_torch_compile), (
+            "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
+            "With padding disabled, every distinct batch size gets its own torch.compile + "
+            "Triton autotune cycle (O(max_batch_size) compilations) instead of the small fixed "
+            "set of padded bucket sizes, causing engine initialisation to stall for many minutes. "
+            "Remove --disable-cuda-graph-padding or --enable-torch-compile."
         )
 
         if self.pp_size > 1:
