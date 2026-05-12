@@ -7067,6 +7067,14 @@ class ServerArgs:
             f"Got: {self.pp_max_micro_batch_size}"
         )
 
+        assert not (self.disable_cuda_graph_padding and self.enable_torch_compile), (
+            "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
+            "With padding disabled, every distinct batch size gets its own torch.compile + "
+            "Triton autotune cycle (O(max_batch_size) compilations) instead of the small fixed "
+            "set of padded bucket sizes, causing engine initialisation to stall for many minutes. "
+            "Remove --disable-cuda-graph-padding or --enable-torch-compile."
+        )
+
         if self.pp_size > 1:
             assert (
                 self.disable_overlap_schedule and self.speculative_algorithm is None
