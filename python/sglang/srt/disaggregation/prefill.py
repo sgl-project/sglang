@@ -409,7 +409,7 @@ class SchedulerDisaggregationPrefillMixin:
                     .cpu()
                     .numpy()
                 ]
-            elif isinstance(kvcache, SWAKVPool):
+            elif isinstance(kvcache, BaseSWAKVPool):
                 seq_len = len(req.fill_ids)
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)
