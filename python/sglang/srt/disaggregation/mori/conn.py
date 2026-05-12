@@ -1556,5 +1556,6 @@ class MoriKVReceiver(CommonKVReceiver):
         super().abort()
         self.clear()
 
+
 class MoriKVBootstrapServer(CommonKVBootstrapServer):
     pass
