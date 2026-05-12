@@ -651,7 +651,9 @@ class SchedulerMetricsMixin:
 
             # Streaming session metrics
             self.stats.num_streaming_sessions = self._streaming_session_count()
-            self.stats.streaming_session_held_tokens = self._session_held_tokens()
+            self.stats.streaming_session_held_tokens = (
+                self.tree_cache.session_held_tokens(self._active_pool_idxs())
+            )
 
             # Routing key metrics
             # (to reduce the overhead, we only compute this when all requests have routing_key)
