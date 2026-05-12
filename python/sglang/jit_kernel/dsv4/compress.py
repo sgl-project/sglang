@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal, NamedTuple, Optional, Union
+from typing import Literal, NamedTuple, Optional, Union, cast
 
 import torch
 from tvm_ffi.module import Module
@@ -11,6 +11,7 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 from .utils import make_name
 
@@ -346,4 +347,77 @@ def compress_norm_rope_store(
         kvcache,
         plan.is_decode,
         plan.compress_ratio,
+    )
+
+
+def _compress_forward_fake(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    plan_a: torch.Tensor,
+    plan_b: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+    compress_ratio: int,
+    is_online: bool,
+) -> torch.Tensor:
+    return kv_score_input.new_empty((plan_a.shape[0], head_dim))
+
+
+@register_custom_op(fake_impl=_compress_forward_fake)
+def compress_forward_pcg_op(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    plan_a: torch.Tensor,
+    plan_b: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+    compress_ratio: int,
+    is_online: bool,
+) -> torch.Tensor:
+    out = kv_score_input.new_empty((plan_a.shape[0], head_dim))
+    if is_online:
+        assert compress_ratio == 128 and head_dim == 512
+        module = _jit_compress_128_online_module(512)
+    else:
+        dtype_in, dtype_out = kv_score_input.dtype, out.dtype
+        module = _jit_compress_module(
+            head_dim, dtype_in, dtype_out, cast(Literal[4, 128], compress_ratio)
+        )
+    if plan_b is None:
+        module.decode(kv_score_buffer, kv_score_input, out, ape, plan_a)
+    else:
+        module.prefill(kv_score_buffer, kv_score_input, out, ape, plan_a, plan_b)
+    return out
+
+
+@register_custom_op(mutates_args=["kvcache"])
+def compress_norm_rope_store_pcg_op(
+    kv: torch.Tensor,
+    plan_tensor: torch.Tensor,
+    *,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    freq_cis: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+    is_decode: bool,
+    compress_ratio: int,
+) -> None:
+    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    module = _jit_compress_norm_rope_module(
+        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
+    )
+    module.forward(
+        kv,
+        plan_tensor,
+        norm_weight,
+        norm_eps,
+        freq_cis,
+        out_loc,
+        kvcache,
+        is_decode,
+        compress_ratio,
     )

@@ -7,8 +7,8 @@ import torch
 from sglang.jit_kernel.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
-    compress_forward,
-    compress_norm_rope_store,
+    compress_forward_pcg_op,
+    compress_norm_rope_store_pcg_op,
 )
 from sglang.srt.environ import envs
 
@@ -70,25 +70,37 @@ class CompressorBackend:
             last_dim = 2 * head_dim * coff
             assert kv_score_buffer.shape[-1] == last_dim
             kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
-        kv_compressed = compress_forward(
+        if isinstance(plan, CompressorDecodePlan):
+            plan_a = plan.plan_d
+            plan_b = None
+            is_decode = True
+        else:
+            plan_a = plan.plan_c
+            plan_b = plan.plan_w
+            is_decode = False
+
+        kv_compressed = compress_forward_pcg_op(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score_input,
             ape=ape.view(-1, head_dim),
-            plan=plan,
+            plan_a=plan_a,
+            plan_b=plan_b,
             compress_ratio=compress_ratio,
             head_dim=head_dim,
             is_online=is_online,
         )
         # NOTE: we use some hack here...
-        compress_norm_rope_store(
+        compress_norm_rope_store_pcg_op(
             kv_compressed,
-            plan,
+            plan_a,
             norm_weight=norm.weight,
             norm_eps=norm.eps,
             freq_cis=freqs_cis_cache,
             out_loc=self._get_out_loc(compress_ratio),
             kvcache=kv_cache,
             page_size=page_size,
+            is_decode=is_decode,
+            compress_ratio=compress_ratio,
         )
 
     def forward_unified(
