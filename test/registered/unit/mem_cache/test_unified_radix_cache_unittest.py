@@ -1808,6 +1808,99 @@ class UnifiedRadixCacheSuite:
             n_swa,
         )
 
+    def test_hicache_swa_temp_lock_does_not_release_restored_tombstone(self):
+        """A temporary scheduler lock that skipped a SWA tombstone must not
+        release later load-back/request locks after the tombstone is restored.
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+
+        tree, allocator, _, chain, _ = self._swa_finalize_setup()
+        leaf = chain[-1]
+        tombstone = leaf
+        cd = tombstone.component_data[ComponentType.SWA]
+        old_swa = cd.value
+        self.assertIsNotNone(old_swa)
+
+        cd.value = None
+        tree.lru_lists[ComponentType.SWA].remove_node(tombstone)
+        tree.host_lru_lists[ComponentType.SWA].insert_mru(tombstone)
+        tree.component_evictable_size_[ComponentType.SWA] -= len(old_swa)
+
+        temp_lock = tree.inc_lock_ref(leaf)
+        self.assertEqual(cd.lock_ref, 0)
+
+        xfer = tree.components[ComponentType.SWA].build_hicache_transfers(
+            leaf, CacheTransferPhase.LOAD_BACK
+        )[0]
+        new_swa = allocator.swa_attn_allocator.alloc(int(xfer.host_indices.numel()))
+        self.assertIsNotNone(new_swa)
+        xfer.device_indices = new_swa
+        tree.components[ComponentType.SWA].commit_hicache_transfer(
+            leaf, CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+        )
+
+        load_back_lock = tree.inc_lock_ref(leaf)
+        request_lock = tree.inc_lock_ref(leaf)
+        self.assertEqual(cd.lock_ref, 2)
+
+        tree.dec_lock_ref(leaf, temp_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 2)
+
+        tree.dec_lock_ref(leaf, load_back_lock.to_dec_params())
+        tree.dec_lock_ref(leaf, request_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 0)
+
+    def test_hicache_mamba_temp_lock_does_not_release_restored_tombstone(self):
+        """A temporary scheduler lock that skipped a Mamba tombstone must not
+        release later load-back/request locks after the tombstone is restored.
+        """
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba component")
+        if self.cfg.has_swa:
+            self.skipTest("Mamba-only path keeps the chain construction simple")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        node = m.last_device_node
+        cd = node.component_data[ComponentType.MAMBA]
+        old_mamba = cd.value
+        self.assertIsNotNone(old_mamba)
+        self._simulate_backup(tree, node)
+
+        cd.value = None
+        tree.lru_lists[ComponentType.MAMBA].remove_node(node)
+        tree.host_lru_lists[ComponentType.MAMBA].insert_mru(node)
+        tree.component_evictable_size_[ComponentType.MAMBA] -= len(old_mamba)
+
+        temp_lock = tree.inc_lock_ref(node)
+        self.assertEqual(cd.lock_ref, 0)
+
+        xfer = tree.components[ComponentType.MAMBA].build_hicache_transfers(
+            node, CacheTransferPhase.LOAD_BACK
+        )[0]
+        new_mamba = req_to_token_pool.mamba_pool.alloc(1)
+        self.assertIsNotNone(new_mamba)
+        xfer.device_indices = new_mamba
+        tree.components[ComponentType.MAMBA].commit_hicache_transfer(
+            node, CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+        )
+
+        load_back_lock = tree.inc_lock_ref(node)
+        request_lock = tree.inc_lock_ref(node)
+        self.assertEqual(cd.lock_ref, 2)
+
+        tree.dec_lock_ref(node, temp_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 2)
+
+        tree.dec_lock_ref(node, load_back_lock.to_dec_params())
+        tree.dec_lock_ref(node, request_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 0)
+
     def test_hicache_mixed_backup_evict_insert(self):
         """Complex scenario: backup some, evict, insert new, verify invariants."""
         if self._skip_unsupported_hicache_test():
