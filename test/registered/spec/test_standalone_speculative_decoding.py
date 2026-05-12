@@ -122,10 +122,6 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, self.spec_decode_threshold)
 
-    def test_radix_attention(self):
-        run_radix_attention_test(self.base_url)
-        assert self.process.poll() is None
-
 
 class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
 
@@ -186,10 +182,6 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, self.spec_decode_threshold)
 
-    def test_radix_attention(self):
-        run_radix_attention_test(self.base_url)
-        assert self.process.poll() is None
-
 
 class TestStandaloneSpeculativeDecodingTriton(TestStandaloneSpeculativeDecodingBase):
 
@@ -213,6 +205,10 @@ class TestStandaloneV2SpeculativeDecodingTriton(
     @classmethod
     def get_server_args(cls):
         return DEFAULT_SERVER_ARGS_V2 + ["--attention-backend", "triton"]
+
+    def test_radix_attention(self):
+        run_radix_attention_test(self.base_url)
+        assert self.process.poll() is None
 
 
 class TestStandaloneV2SpeculativeDecodingFlashinfer(
