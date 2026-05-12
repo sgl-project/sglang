@@ -1,92 +1,112 @@
 """
-Regression test for issue #15686: Request.is_disconnected() broken by metrics middleware.
+Regression test for issue #15686: Request.is_disconnected() broken by the
+metrics middleware.
 
-Tests that Request.is_disconnected() works correctly when --enable-metrics is enabled.
+The metrics middleware added by `add_prometheus_track_response_middleware`
+is a pure ASGI middleware. It must pass the ASGI `receive` callable through
+to the downstream app untouched, so that a route handler calling
+`await request.is_disconnected()` can still detect when the client has
+dropped the connection.
+
+This is a sibling of test/registered/scheduler/test_abort_with_metrics.py,
+which covers _PureASGIDispatch. This test exercises the higher-level
+MetricsMiddleware that wraps the FastAPI app once metrics are enabled.
 """
 
 import asyncio
-import os
-import sys
-import time
 import unittest
-from typing import Optional
+from typing import List
 
-import aiohttp
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-
-# Add parent directory to path to import sglang modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../python"))
-
-from sglang.srt.managers.detokenizer_manager import DetokenizerManager
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.server_args import ServerArgs
-from test.lang.test_serve import create_test_serve, register_cpu_ci
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
-class TestPrometheusDisconnect(unittest.TestCase):
-    """Test that metrics middleware doesn't break is_disconnected()"""
+_HTTP_SCOPE = {
+    "type": "http",
+    "asgi": {"version": "3.0"},
+    "http_version": "1.1",
+    "method": "GET",
+    "path": "/probe",
+    "raw_path": b"/probe",
+    "query_string": b"",
+    "root_path": "",
+    "scheme": "http",
+    "server": ("127.0.0.1", 0),
+    "client": ("127.0.0.1", 0),
+    "headers": [],
+}
+
+
+def _build_app_with_metrics_middleware():
+    """Build a minimal FastAPI app and wire up the metrics middleware.
+
+    The handler stashes the result of `await request.is_disconnected()` in a
+    mutable cell so the test can inspect it after driving the ASGI app.
+    """
+    from fastapi import FastAPI, Request
+
+    from sglang.srt.utils.common import add_prometheus_track_response_middleware
+
+    app = FastAPI()
+    cell: dict = {}
+
+    @app.get("/probe")
+    async def probe(request: Request):
+        cell["disconnected"] = await request.is_disconnected()
+        return {"ok": True}
+
+    add_prometheus_track_response_middleware(app)
+    return app, cell
+
+
+async def _drive_once(app, scope, receive_msgs: List[dict]):
+    """Drive an ASGI app exactly once and return the list of sent messages."""
+    idx = 0
+    sent: List[dict] = []
+
+    async def receive():
+        nonlocal idx
+        if idx < len(receive_msgs):
+            msg = receive_msgs[idx]
+            idx += 1
+            return msg
+        return {"type": "http.disconnect"}
+
+    async def send(msg):
+        sent.append(msg)
+
+    await app(scope, receive, send)
+    return sent
+
+
+class TestMetricsMiddlewareReceivePassthrough(CustomTestCase):
+    """The metrics middleware must not break request.is_disconnected()."""
 
     @classmethod
     def setUpClass(cls):
-        cls.test_name = "prometheus_disconnect"
+        cls.app, cls.cell = _build_app_with_metrics_middleware()
 
-    def test_is_disconnected_with_metrics_enabled(self):
-        """
-        Test that Request.is_disconnected() works correctly when metrics are enabled.
-        
-        This is a regression test for issue #15686 where BaseHTTPMiddleware
-        was breaking request.is_disconnected() functionality, causing the engine
-        to continue processing after client disconnection.
-        """
-        server = create_test_serve(
-            model_path="meta-llama/Llama-2-7b-hf",
-            test_name=self.test_name,
-            enable_metrics=True,  # This is the key: enable metrics to trigger the bug
-            num_shards=1,
+    def setUp(self):
+        self.cell.clear()
+
+    def test_is_disconnected_when_client_drops(self):
+        """receive() returning http.disconnect must propagate to the handler."""
+        asyncio.run(_drive_once(self.app, _HTTP_SCOPE, [{"type": "http.disconnect"}]))
+        self.assertEqual(self.cell.get("disconnected"), True)
+
+    def test_not_disconnected_on_normal_request(self):
+        """receive() returning http.request must not flip is_disconnected()."""
+        asyncio.run(
+            _drive_once(
+                self.app,
+                _HTTP_SCOPE,
+                [{"type": "http.request", "body": b"", "more_body": False}],
+            )
         )
-
-        try:
-            base_url = f"http://127.0.0.1:{server.port}"
-            
-            # Test 1: Verify metrics endpoint is working
-            response = server.send_request(
-                "GET",
-                f"{base_url}/metrics",
-            )
-            self.assertEqual(response.status_code, 200)
-            self.assertIn("sglang:http_requests_total", response.text)
-            
-            # Test 2: Make a regular non-streaming request and verify it works
-            # This ensures the middleware isn't breaking normal requests
-            response = server.send_request(
-                "POST",
-                f"{base_url}/v1/completions",
-                {
-                    "model": "meta-llama/Llama-2-7b-hf",
-                    "prompt": "Hello",
-                    "max_tokens": 10,
-                    "temperature": 0.0,
-                },
-            )
-            self.assertEqual(response.status_code, 200)
-            
-            # Test 3: Verify metrics were recorded for the request
-            response = server.send_request(
-                "GET",
-                f"{base_url}/metrics",
-            )
-            self.assertEqual(response.status_code, 200)
-            # Should have recorded at least one response
-            self.assertIn("sglang:http_responses_total", response.text)
-            
-            print("✓ All tests passed: is_disconnected() works with metrics enabled")
-            
-        finally:
-            server.shutdown()
+        self.assertEqual(self.cell.get("disconnected"), False)
 
 
-# Register the test for CI
 if __name__ == "__main__":
-    register_cpu_ci(test_class=TestPrometheusDisconnect, est_time=30, suite="default", nightly=True)
     unittest.main()
