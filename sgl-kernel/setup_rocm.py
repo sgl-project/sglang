@@ -34,11 +34,35 @@ def _get_version():
 
 
 operator_namespace = "sgl_kernel"
+def _get_aiter_sampling_include():
+    """Find aiter's sampling header directory for speculative sampling kernel."""
+    try:
+        import aiter
+        aiter_root = Path(aiter.__file__).parent.parent
+        sampling_dir = aiter_root / "csrc" / "cpp_itfs" / "sampling"
+        if sampling_dir.exists():
+            return str(sampling_dir)
+    except ImportError:
+        pass
+    # Fallback: check common install locations
+    for p in [
+        Path("/sgl-workspace/aiter/csrc/cpp_itfs/sampling"),
+        Path(os.environ.get("AITER_ROOT", "")) / "csrc" / "cpp_itfs" / "sampling",
+    ]:
+        if p.exists():
+            return str(p)
+    return None
+
+
+_aiter_sampling_inc = _get_aiter_sampling_include()
+
 include_dirs = [
     root / "include",
     root / "include" / "impl",
     root / "csrc",
 ]
+if _aiter_sampling_inc:
+    include_dirs.append(_aiter_sampling_inc)
 
 sources = [
     "csrc/allreduce/custom_all_reduce.hip",
@@ -52,6 +76,7 @@ sources = [
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/moe/moe_topk_sigmoid_kernels.cu",
     "csrc/speculative/eagle_utils.cu",
+    "csrc/speculative/speculative_sampling.hip",
     "csrc/kvcacheio/transfer.cu",
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/elementwise/pos_enc.cu",
