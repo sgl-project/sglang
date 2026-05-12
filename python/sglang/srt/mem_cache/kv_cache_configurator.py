@@ -84,6 +84,174 @@ class KVCacheConfigurator:
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         raise NotImplementedError("populated in kvc-migrate-method-bodies")
 
+    def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
+        post_model_load_memory = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
+        )
+
+        rest_memory = post_model_load_memory - pre_model_load_memory * (
+            1 - self.server_args.mem_fraction_static
+        )
+        if self.mambaish_config is not None:
+            rest_memory = self._handle_max_mamba_cache(rest_memory)
+
+        return int(rest_memory * (1 << 30))  # return in bytes
+
+    def _calculate_mamba_ratio(self) -> int:
+        if self.server_args.disable_radix_cache:
+            return 1
+
+        additional_ratio = 0
+        if self.server_args.enable_mamba_extra_buffer():
+            # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
+            if not self.server_args.disable_overlap_schedule:
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
+            else:
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+
+        return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+
+    def _apply_token_constraints(self, token_capacity: int) -> int:
+        """Apply external constraints to token capacity: user cap, PP sync.
+
+        Page alignment is handled by the configurator, not here.
+        If constraints change the value, the configurator re-runs and re-aligns.
+        """
+        user_limit = self.server_args.max_total_tokens
+
+        # Apply user-specified upper bound
+        if user_limit is not None:
+            if user_limit > token_capacity:
+                logging.warning(
+                    f"max_total_tokens={user_limit} is larger than the profiled value "
+                    f"{token_capacity}. Use the profiled value instead."
+                )
+            token_capacity = min(token_capacity, user_limit)
+
+        # Sync across PP ranks (each may have different layer counts)
+        if self.server_args.pp_size > 1:
+            tensor = torch.tensor(token_capacity, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_world_group().cpu_group,
+            )
+            token_capacity = tensor.item()
+
+        return token_capacity
+
+    def _resolve_max_num_reqs(self, token_capacity: int) -> int:
+        """Compute max concurrent requests (per dp worker) from the finalized
+        token capacity."""
+        # Estimate pool size (used as upper bound when user specifies max_running_requests)
+        estimated = int(token_capacity / self.model_config.context_len * 512)
+        estimated = max(min(estimated, 4096), 2048)
+
+        max_num_reqs = self.server_args.max_running_requests
+        if max_num_reqs is not None:
+            max_num_reqs = min(max_num_reqs // self.server_args.dp_size, estimated)
+        else:
+            max_num_reqs = min(estimated, token_capacity // 2)
+
+        if self.mambaish_config is not None:
+            ratio = self._calculate_mamba_ratio()
+            max_num_reqs = min(
+                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+            )
+
+        return max_num_reqs
+
+    def _resolve_memory_pool_config(
+        self, pre_model_load_memory: int
+    ) -> MemoryPoolConfig:
+        """Profile GPU memory and resolve all pool parameters into a config."""
+        from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        page_size = self.server_args.page_size
+
+        configurator = create_memory_pool_configurator(self)
+        config = configurator.calculate_pool_sizes(available_bytes, page_size)
+
+        # Apply external constraints (user cap, page alignment, PP sync)
+        constrained = self._apply_token_constraints(config.max_total_num_tokens)
+        if constrained != config.max_total_num_tokens:
+            config = configurator.calculate_pool_sizes_from_max_tokens(
+                constrained, page_size
+            )
+
+        config.max_running_requests = self._resolve_max_num_reqs(
+            config.max_total_num_tokens
+        )
+        config.mem_fraction_static = self.server_args.mem_fraction_static
+        return config
+
+    def _handle_max_mamba_cache(self, total_rest_memory):
+        config = self.mambaish_config
+        server_args = self.server_args
+        assert config is not None
+
+        # reserve the memory for the intermediate mamba states used for spec dec
+        if not self.spec_algorithm.is_none():
+            assert server_args.speculative_num_draft_tokens is not None
+            assert server_args.max_running_requests is not None
+
+            max_running_requests = server_args.max_running_requests // (
+                self.server_args.dp_size if server_args.enable_dp_attention else 1
+            )
+            mamba_state_intermediate_size = (
+                config.mamba2_cache_params.mamba_cache_per_req
+                * max_running_requests
+                * server_args.speculative_num_draft_tokens
+            )
+            total_rest_memory = total_rest_memory - (
+                mamba_state_intermediate_size / (1 << 30)
+            )
+
+        if server_args.max_mamba_cache_size is not None:
+            # Use explicitly set max_mamba_cache_size
+            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
+                server_args.dp_size if server_args.enable_dp_attention else 1
+            )
+        elif (
+            server_args.disable_radix_cache
+            and server_args.max_running_requests is not None
+        ):
+            # Use explicitly set max_running_requests when radix cache is disabled
+            server_args.max_mamba_cache_size = server_args.max_running_requests // (
+                server_args.dp_size if server_args.enable_dp_attention else 1
+            )
+        else:
+            # Use ratio-based calculation to auto-fit available memory
+            assert config.mamba2_cache_params.mamba_cache_per_req > 0
+
+            # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
+            # solve the equations:
+            # 1. mamba_state_memory + full_kv_cache_memory == total_rest_memory
+            # 2. mamba_state_memory / full_kv_cache_memory == server_args.mamba_full_memory_ratio
+            mamba_state_memory_raw = (
+                total_rest_memory
+                * server_args.mamba_full_memory_ratio
+                / (1 + server_args.mamba_full_memory_ratio)
+            )
+            # calculate the max_mamba_cache_size based on the given total mamba memory
+            server_args.max_mamba_cache_size = int(
+                (mamba_state_memory_raw * (1 << 30))
+                // config.mamba2_cache_params.mamba_cache_per_req
+            )
+
+        mamba_state_memory = (
+            server_args.max_mamba_cache_size
+            * config.mamba2_cache_params.mamba_cache_per_req
+            / (1 << 30)
+        )
+        return total_rest_memory - mamba_state_memory
+
 
 def calculate_mla_kv_cache_dim(
     *,
