@@ -510,8 +510,15 @@ def hash_topk(
     )
 
 
-def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor):
-    return _jit_mask_topk_module().run(topk_ids, num_token_non_padded)
+def _mask_topk_ids_impl(
+    topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor
+) -> None:
+    _jit_mask_topk_module().run(topk_ids, num_token_non_padded)
+
+
+@register_custom_op(mutates_args=["topk_ids"])
+def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor) -> None:
+    _mask_topk_ids_impl(topk_ids, num_token_non_padded)
 
 
 class CompressorPrefillPlan(NamedTuple):
