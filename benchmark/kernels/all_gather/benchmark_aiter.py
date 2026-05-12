@@ -1,429 +1,306 @@
 """
-Benchmark baseline NCCL all-gather vs Aiter custom all-gather across message sizes.
+Benchmark SGLang logical TP all-gather against Aiter custom all-gather.
 
-Aiter exposes ``CustomAllreduce.custom_all_gather(inp, dim=0)`` (see
-``aiter/aiter/dist/device_communicators/custom_all_reduce.py``), which dispatches
-to ``all_gather_reg`` / ``all_gather_unreg`` based on whether the current stream
-is capturing. This script measures per-rank time vs. the default
-``torch.distributed.all_gather_into_tensor`` (RCCL) path for apples-to-apples
-comparison, mirroring the structure of the all-reduce benchmark.
+This benchmark is intended for captured logits all-gather shapes such as
+``1,32320;2,32320;4,32320``. It compares the current RCCL
+``dist.all_gather_into_tensor`` route with Aiter's custom all-gather, validates
+candidate correctness before timing, and reports per-rank average latency.
 
 Usage:
-    torchrun --nproc_per_node=2 benchmark_aiter.py
-    torchrun --nproc_per_node=4 benchmark_aiter.py
-    torchrun --nproc_per_node=8 benchmark_aiter.py
+    torchrun --nproc_per_node=4 benchmark/kernels/all_gather/benchmark_aiter.py \
+      --dtype bfloat16 --shapes "1,32320;2,32320;4,32320"
 """
 
+from __future__ import annotations
+
 import argparse
-import os
-import sys
-import time
-from typing import List, Optional, Tuple
+import statistics
 
 import torch
 import torch.distributed as dist
 
+Shape = tuple[int, ...]
 
-def parse_args():
+
+def parse_shape_list(value: str) -> list[Shape]:
+    shapes: list[Shape] = []
+    for item in value.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        shape = tuple(int(dim.strip()) for dim in item.split(",") if dim.strip())
+        if not shape or any(dim <= 0 for dim in shape):
+            raise argparse.ArgumentTypeError(f"invalid shape: {item!r}")
+        shapes.append(shape)
+    if not shapes:
+        raise argparse.ArgumentTypeError("at least one shape is required")
+    return shapes
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark NCCL vs Aiter custom all-gather across message sizes."
+        description="Benchmark RCCL vs Aiter custom all-gather for explicit shapes."
     )
     parser.add_argument(
         "--backend",
-        type=str,
         default="cpu:gloo,cuda:nccl",
-        help=(
-            "Process group backend. Default routes CPU collectives through gloo "
-            "and CUDA collectives through NCCL (RCCL on ROCm), giving a real "
-            "RCCL baseline for all-gather while still letting Aiter's "
-            "CustomAllreduce use the gloo sub-PG it requires."
-        ),
+        help="Process group backend for torch.distributed.",
     )
     parser.add_argument(
-        "--warmup",
-        type=int,
-        default=5,
-        help="Warmup iterations per size per implementation.",
-    )
-    parser.add_argument(
-        "--iters-small",
-        type=int,
-        default=50,
-        help="Benchmark iterations for sizes <= 1MB (per-rank input bytes).",
-    )
-    parser.add_argument(
-        "--iters-large",
-        type=int,
-        default=20,
-        help="Benchmark iterations for sizes > 1MB (per-rank input bytes).",
+        "--shapes",
+        type=parse_shape_list,
+        default=parse_shape_list("1,32320;2,32320;4,32320"),
+        help='Semicolon-separated input shapes, e.g. "1,32320;2,32320;4,32320".',
     )
     parser.add_argument(
         "--dtype",
-        type=str,
-        default="float16",
         choices=["float16", "bfloat16"],
-        help="Element dtype (2 bytes).",
+        default="bfloat16",
+        help="Input dtype.",
+    )
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--max-size-bytes",
+        type=int,
+        default=64 * 1024 * 1024,
+        help="Aiter CustomAllreduce IPC pool size.",
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Print per-iteration timings on rank 0 for debugging.",
+        help="Print per-rank diagnostic details.",
     )
     return parser.parse_args()
 
 
-def get_env_rank_world() -> Tuple[int, int, int]:
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    return rank, world_size, local_rank
+def dtype_from_name(name: str) -> torch.dtype:
+    return torch.bfloat16 if name == "bfloat16" else torch.float16
 
 
-def init_dist(backend: str):
-    rank, world_size, _ = get_env_rank_world()
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend=backend,
-            init_method="env://",
-            rank=rank,
-            world_size=world_size,
-        )
+def logical_output_shape(input_shape: Shape, world_size: int, dim: int) -> Shape:
+    if dim < 0:
+        dim += len(input_shape)
+    return input_shape[:dim] + (input_shape[dim] * world_size,) + input_shape[dim + 1 :]
 
 
-def get_device(local_rank: int) -> torch.device:
-    torch.cuda.set_device(local_rank)
-    return torch.device(f"cuda:{local_rank}")
+def raw_allgather_shape(input_shape: Shape, world_size: int) -> Shape:
+    return (input_shape[0] * world_size,) + input_shape[1:]
 
 
-def human_size(num_bytes: int) -> str:
-    units = [("B", 1), ("K", 1024), ("M", 1024 * 1024), ("G", 1024 * 1024 * 1024)]
-    for suf, base in reversed(units):
-        if num_bytes % base == 0 and num_bytes >= base:
-            val = num_bytes // base
-            return f"{val}{suf}"
-    return f"{num_bytes}B"
-
-
-def get_message_sizes() -> List[int]:
-    """Per-rank input sizes in bytes.
-
-    For all-gather, total on-the-wire traffic per step is roughly
-    ``world_size * size`` bytes (each rank receives world_size-1 shards).
-    """
-    return [
-        32 * 1024,
-        64 * 1024,
-        128 * 1024,
-        256 * 1024,
-        512 * 1024,
-        1 * 1024 * 1024,
-        2 * 1024 * 1024,
-        4 * 1024 * 1024,
-        8 * 1024 * 1024,
-        16 * 1024 * 1024,
-        32 * 1024 * 1024,
-        64 * 1024 * 1024,
-    ]
-
-
-@torch.inference_mode()
-def nccl_all_gather(
-    inp: torch.Tensor, out: torch.Tensor, group: Optional[dist.ProcessGroup]
-) -> torch.Tensor:
-    dist.all_gather_into_tensor(out, inp, group=group)
-    return out
-
-
-@torch.inference_mode()
-def aiter_all_gather(comm, inp: torch.Tensor) -> Optional[torch.Tensor]:
-    """Call Aiter's custom all-gather along dim=0 (out is allocated internally)."""
-    if hasattr(comm, "custom_all_gather"):
-        return comm.custom_all_gather(inp, dim=0)
-    raise RuntimeError("Aiter communicator does not expose custom_all_gather.")
-
-
-def _should_custom_ag(comm, inp: torch.Tensor) -> bool:
-    """Replicate Aiter's ``should_custom_ag`` gate without importing the
-    private attribute if missing; fall back to ``True`` and let the kernel
-    raise (we still skip if the comm is disabled)."""
-    if comm is None or getattr(comm, "disabled", True):
-        return False
-    fn = getattr(comm, "should_custom_ag", None)
-    if fn is None:
-        return True
-    return bool(fn(inp))
-
-
-@torch.inference_mode()
-def bench_nccl(
-    sizes: List[int],
-    device: torch.device,
-    dtype: torch.dtype,
-    warmup: int,
-    iters_small: int,
-    iters_large: int,
-    verbose: bool,
-    pg: Optional[dist.ProcessGroup] = None,
-) -> List[Tuple[int, Optional[float]]]:
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    results: List[Tuple[int, Optional[float]]] = []
-
-    for size_bytes in sizes:
-        elems = size_bytes // torch.tensor([], dtype=dtype).element_size()
-        inp = torch.empty(elems, dtype=dtype, device=device)
-        inp.uniform_(0, 1) if dtype != torch.bfloat16 else inp.fill_(1.0)
-        out = torch.empty(elems * world_size, dtype=dtype, device=device)
-
-        dist.barrier(group=pg)
-        for _ in range(warmup):
-            nccl_all_gather(inp, out, pg)
-        torch.cuda.synchronize()
-        dist.barrier(group=pg)
-
-        num_iters = iters_small if size_bytes <= (1 * 1024 * 1024) else iters_large
-        times_ms: List[float] = []
-        for it in range(num_iters):
-            dist.barrier(group=pg)
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            nccl_all_gather(inp, out, pg)
-            torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            dist.barrier(group=pg)
-            dt_ms = (t1 - t0) * 1000.0
-            times_ms.append(dt_ms)
-            if verbose and rank == 0:
-                print(
-                    f"[NCCL] size={human_size(size_bytes)} iter={it} time={dt_ms:.3f} ms"
-                )
-
-        avg_ms_local = sum(times_ms) / len(times_ms)
-        avg_tensor = torch.tensor([avg_ms_local], dtype=torch.float64, device=device)
-        gather_list = [torch.zeros_like(avg_tensor) for _ in range(world_size)]
-        dist.all_gather(gather_list, avg_tensor, group=pg)
-        if rank == 0:
-            avg_ms = float(torch.stack(gather_list).mean().item())
-            print(f"[NCCL] {human_size(size_bytes)}: {avg_ms:.3f} ms (avg across ranks)")
-            results.append((size_bytes, avg_ms))
-        else:
-            results.append((size_bytes, None))
-
-    return results
-
-
-@torch.inference_mode()
-def bench_aiter(
-    comm,
-    sizes: List[int],
-    device: torch.device,
-    dtype: torch.dtype,
-    warmup: int,
-    iters_small: int,
-    iters_large: int,
-    verbose: bool,
-    pg: Optional[dist.ProcessGroup] = None,
-) -> List[Tuple[int, Optional[float]]]:
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    results: List[Tuple[int, Optional[float]]] = []
-
-    for size_bytes in sizes:
-        elems = size_bytes // torch.tensor([], dtype=dtype).element_size()
-        inp = torch.empty(elems, dtype=dtype, device=device)
-        inp.uniform_(0, 1) if dtype != torch.bfloat16 else inp.fill_(1.0)
-
-        # Aiter's custom all-gather requires 16B alignment of the per-rank
-        # byte size AND the per-rank input to fit in max_size / (world_size*2).
-        if not _should_custom_ag(comm, inp):
-            if rank == 0:
-                print(f"[Aiter] {human_size(size_bytes)}: skipped (should_custom_ag=False)")
-            results.append((size_bytes, None))
-            continue
-
-        disabled = False
-        dist.barrier(group=pg)
-        for _ in range(warmup):
-            torch.cuda.synchronize()
-            out = aiter_all_gather(comm, inp)
-            torch.cuda.synchronize()
-            if out is None:
-                disabled = True
-                break
-        dist.barrier(group=pg)
-
-        if disabled:
-            if rank == 0:
-                print(f"[Aiter] {human_size(size_bytes)}: custom AG disabled (skipped)")
-            results.append((size_bytes, None))
-            continue
-
-        # One-shot correctness check vs. NCCL reference on this size.
-        ref = torch.empty(elems * world_size, dtype=dtype, device=device)
-        dist.all_gather_into_tensor(ref, inp, group=pg)
-        aiter_out = aiter_all_gather(comm, inp)
-        if aiter_out is None or aiter_out.shape != ref.shape:
-            if rank == 0:
-                print(
-                    f"[Aiter] {human_size(size_bytes)}: correctness skipped "
-                    f"(out={None if aiter_out is None else tuple(aiter_out.shape)} "
-                    f"ref={tuple(ref.shape)})"
-                )
-        else:
-            mismatch = not torch.equal(aiter_out, ref)
-            if mismatch and rank == 0:
-                print(
-                    f"[Aiter] {human_size(size_bytes)}: WARNING output differs from NCCL reference"
-                )
-
-        num_iters = iters_small if size_bytes <= (1 * 1024 * 1024) else iters_large
-        times_ms: List[float] = []
-        for it in range(num_iters):
-            dist.barrier(group=pg)
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            out = aiter_all_gather(comm, inp)
-            torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            dist.barrier(group=pg)
-            if out is None:
-                disabled = True
-                break
-            dt_ms = (t1 - t0) * 1000.0
-            times_ms.append(dt_ms)
-            if verbose and rank == 0:
-                print(
-                    f"[Aiter] size={human_size(size_bytes)} iter={it} time={dt_ms:.3f} ms"
-                )
-
-        if disabled or not times_ms:
-            if rank == 0:
-                print(f"[Aiter] {human_size(size_bytes)}: custom AG disabled (no timings)")
-            results.append((size_bytes, None))
-            continue
-
-        avg_ms_local = sum(times_ms) / len(times_ms)
-        avg_tensor = torch.tensor([avg_ms_local], dtype=torch.float64, device=device)
-        gather_list = [torch.zeros_like(avg_tensor) for _ in range(world_size)]
-        dist.all_gather(gather_list, avg_tensor, group=pg)
-        if rank == 0:
-            avg_ms = float(torch.stack(gather_list).mean().item())
-            print(f"[Aiter] {human_size(size_bytes)}: {avg_ms:.3f} ms (avg across ranks)")
-            results.append((size_bytes, avg_ms))
-        else:
-            results.append((size_bytes, None))
-
-    return results
-
-
-def main():
-    args = parse_args()
-    rank, world_size, local_rank = get_env_rank_world()
-
-    if world_size not in (2, 4, 6, 8):
-        print(
-            f"[rank {rank}] WARNING: world_size={world_size} not in supported set (2,4,6,8). "
-            "Aiter custom AG may disable itself.",
-            file=sys.stderr,
-        )
-
-    init_dist(args.backend)
-    device = get_device(local_rank)
-    dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
-
-    aiter_comm = None
-    HAVE_AITER = False
-    try:
-        from aiter.dist.device_communicators.custom_all_reduce import (
-            CustomAllreduce as AiterCustomAllreduce,
-        )
-
-        HAVE_AITER = True
-    except Exception as e:
-        if rank == 0:
-            print(f"Aiter CustomAllreduce import failed: {e}", file=sys.stderr)
-
-    if rank == 0:
-        print(f"Initialized PG backend={args.backend} world_size={world_size}")
-        print(f"Device: {device.type}:{device.index} dtype={dtype}")
-        print(f"Aiter available: {HAVE_AITER}")
-
-    pg = dist.group.WORLD
-    sizes = get_message_sizes()
-    max_size = max(sizes) if sizes else (64 * 1024 * 1024)
-
-    # Aiter's CustomAllreduce refuses an NCCL-backed PG (it needs a pure TCP
-    # store for IPC handle exchange). SGLang creates a separate gloo group for
-    # the same reason; replicate that here.
-    ranks = list(range(world_size))
-    gloo_group = dist.new_group(ranks=ranks, backend="gloo")
-
-    if HAVE_AITER:
-        try:
-            aiter_comm = AiterCustomAllreduce(
-                group=gloo_group, device=device, max_size=max_size
-            )
-        except Exception as e:
-            if rank == 0:
-                print(f"Failed to construct Aiter CustomAllreduce: {e}", file=sys.stderr)
-            aiter_comm = None
-
-    nccl_results = bench_nccl(
-        sizes=sizes,
-        device=device,
-        dtype=dtype,
-        warmup=args.warmup,
-        iters_small=args.iters_small,
-        iters_large=args.iters_large,
-        verbose=args.verbose,
-        pg=pg,
+def reshape_logical(raw: torch.Tensor, input_shape: Shape, world_size: int, dim: int):
+    if dim < 0:
+        dim += len(input_shape)
+    return (
+        raw.reshape((world_size,) + input_shape)
+        .movedim(0, dim)
+        .reshape(logical_output_shape(input_shape, world_size, dim))
     )
 
-    aiter_results: List[Tuple[int, Optional[float]]] = []
-    if aiter_comm is not None:
-        aiter_results = bench_aiter(
-            comm=aiter_comm,
-            sizes=sizes,
-            device=device,
-            dtype=dtype,
-            warmup=args.warmup,
-            iters_small=args.iters_small,
-            iters_large=args.iters_large,
-            verbose=args.verbose,
-            pg=pg,
+
+def make_input(shape: Shape, dtype: torch.dtype, device: torch.device, rank: int):
+    # Distinct per-rank values make rank-order errors visible in correctness.
+    x = torch.arange(
+        rank * 1000,
+        rank * 1000 + int(torch.tensor(shape).prod().item()),
+        device=device,
+        dtype=torch.float32,
+    )
+    return x.reshape(shape).to(dtype)
+
+
+@torch.inference_mode()
+def rccl_logical_all_gather(
+    inp: torch.Tensor,
+    raw_out: torch.Tensor,
+    pg: dist.ProcessGroup,
+    dim: int = -1,
+):
+    dist.all_gather_into_tensor(raw_out, inp, group=pg)
+    return reshape_logical(raw_out, tuple(inp.shape), dist.get_world_size(pg), dim)
+
+
+@torch.inference_mode()
+def aiter_logical_all_gather(
+    comm,
+    inp: torch.Tensor,
+    raw_out: torch.Tensor,
+    dim: int = -1,
+):
+    # SGLang's patched path writes Aiter output into the same preallocated raw
+    # buffer used by all_gather_into_tensor, then applies the standard reshape.
+    comm.all_gather_unreg(inp, out=raw_out, dim=0)
+    return reshape_logical(raw_out, tuple(inp.shape), comm.world_size, dim)
+
+
+def sync_avg(value: float, device: torch.device, pg: dist.ProcessGroup) -> float:
+    tensor = torch.tensor([value], dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.AVG, group=pg)
+    return float(tensor.item())
+
+
+def sync_max(value: float, device: torch.device, pg: dist.ProcessGroup) -> float:
+    tensor = torch.tensor([value], dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX, group=pg)
+    return float(tensor.item())
+
+
+def fmt_optional_us(value: object) -> str:
+    if value is None:
+        return "None"
+    return f"{float(value):.2f}"
+
+
+def time_us(fn, warmup: int, iters: int) -> tuple[float, float]:
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    times: list[float] = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    for _ in range(iters):
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end) * 1000.0)
+    return statistics.median(times), statistics.mean(times)
+
+
+def check_correctness(
+    comm,
+    inp: torch.Tensor,
+    rccl_raw: torch.Tensor,
+    aiter_raw: torch.Tensor,
+    pg: dist.ProcessGroup,
+):
+    ref = rccl_logical_all_gather(inp, rccl_raw, pg)
+    out = aiter_logical_all_gather(comm, inp, aiter_raw)
+    if ref.shape != out.shape:
+        raise AssertionError(
+            f"shape mismatch: ref={tuple(ref.shape)} out={tuple(out.shape)}"
         )
+    if not torch.equal(ref, out):
+        max_abs = (ref.float() - out.float()).abs().max().item()
+        raise AssertionError(f"Aiter output mismatch, max_abs={max_abs}")
 
-    if aiter_comm is not None and hasattr(aiter_comm, "close"):
-        try:
-            aiter_comm.close()
-        except Exception:
-            pass
 
-    if dist.get_rank() == 0:
-        print("\nResults (avg ms across ranks; None = disabled/unavailable):")
-        header = f"{'Size':>8}  {'NCCL(ms)':>11}  {'Aiter(ms)':>11}  {'Speedup':>8}"
+def main() -> None:
+    args = parse_args()
+    dist.init_process_group(backend=args.backend, init_method="env://")
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(torch.cuda.device_count() > 0 and rank % torch.cuda.device_count())
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    dtype = dtype_from_name(args.dtype)
+    pg = dist.group.WORLD
+
+    from aiter.dist.device_communicators.custom_all_reduce import (
+        CustomAllreduce as AiterCustomAllreduce,
+    )
+
+    gloo_group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+    max_input_bytes = max(
+        int(torch.tensor(shape).prod().item())
+        * torch.tensor([], dtype=dtype).element_size()
+        for shape in args.shapes
+    )
+    pool_size = max(args.max_size_bytes, max_input_bytes * world_size * 2)
+    comm = AiterCustomAllreduce(group=gloo_group, device=device, max_size=pool_size)
+
+    rows: list[dict[str, object]] = []
+    for shape in args.shapes:
+        inp = make_input(shape, dtype, device, rank).contiguous()
+        input_bytes = inp.numel() * inp.element_size()
+        raw_shape = raw_allgather_shape(shape, world_size)
+        rccl_raw = torch.empty(raw_shape, dtype=dtype, device=device)
+        aiter_raw = torch.empty_like(rccl_raw)
+
+        can_aiter = bool(comm.should_custom_ag(inp))
+        if not can_aiter:
+            if rank == 0:
+                print(f"SKIP shape={shape}: Aiter should_custom_ag=False")
+            rows.append(
+                {
+                    "shape": shape,
+                    "input_bytes": input_bytes,
+                    "correct": False,
+                    "rccl_us": None,
+                    "aiter_us": None,
+                    "speedup": None,
+                }
+            )
+            continue
+
+        check_correctness(comm, inp, rccl_raw, aiter_raw, pg)
+        correct_flag = sync_max(0.0, device, pg) == 0.0
+
+        dist.barrier(group=pg)
+        rccl_median_us, rccl_mean_us = time_us(
+            lambda: rccl_logical_all_gather(inp, rccl_raw, pg),
+            args.warmup,
+            args.iters,
+        )
+        dist.barrier(group=pg)
+        aiter_median_us, aiter_mean_us = time_us(
+            lambda: aiter_logical_all_gather(comm, inp, aiter_raw),
+            args.warmup,
+            args.iters,
+        )
+        dist.barrier(group=pg)
+
+        rccl_median_us = sync_avg(rccl_median_us, device, pg)
+        rccl_mean_us = sync_avg(rccl_mean_us, device, pg)
+        aiter_median_us = sync_avg(aiter_median_us, device, pg)
+        aiter_mean_us = sync_avg(aiter_mean_us, device, pg)
+        speedup = rccl_median_us / aiter_median_us if aiter_median_us > 0 else 0.0
+
+        rows.append(
+            {
+                "shape": shape,
+                "input_bytes": input_bytes,
+                "correct": correct_flag,
+                "rccl_us": rccl_median_us,
+                "aiter_us": aiter_median_us,
+                "rccl_mean_us": rccl_mean_us,
+                "aiter_mean_us": aiter_mean_us,
+                "speedup": speedup,
+            }
+        )
+        if args.verbose:
+            print(
+                f"[rank {rank}] shape={shape} rccl_median_us={rccl_median_us:.2f} "
+                f"aiter_median_us={aiter_median_us:.2f}"
+            )
+
+    if hasattr(comm, "close"):
+        comm.close()
+
+    if rank == 0:
+        print("\nResults (logical dim=-1 all-gather, avg median us across ranks)")
+        header = (
+            f"{'Shape':>14}  {'Input Bytes':>12}  {'Correct':>7}  "
+            f"{'RCCL us':>10}  {'Aiter us':>10}  {'Speedup':>8}"
+        )
         print(header)
         print("-" * len(header))
-
-        nccl_map = {s: v for s, v in nccl_results if v is not None}
-        aiter_map = {s: v for s, v in aiter_results if v is not None}
-
-        for s in sizes:
-            nccl_ms = nccl_map.get(s, None)
-            aiter_ms = aiter_map.get(s, None)
-            speedup = (
-                f"{nccl_ms / aiter_ms:.2f}x"
-                if (nccl_ms is not None and aiter_ms is not None and aiter_ms > 0)
-                else "-"
-            )
+        for row in rows:
+            rccl = row["rccl_us"]
+            aiter = row["aiter_us"]
+            speedup = row["speedup"]
             print(
-                f"{human_size(s):>8}  "
-                f"{('%.3f' % nccl_ms) if nccl_ms is not None else 'None':>11}  "
-                f"{('%.3f' % aiter_ms) if aiter_ms is not None else 'None':>11}  "
-                f"{speedup:>8}"
+                f"{str(row['shape']):>14}  "
+                f"{row['input_bytes']:>12}  "
+                f"{str(row['correct']):>7}  "
+                f"{fmt_optional_us(rccl):>10}  "
+                f"{fmt_optional_us(aiter):>10}  "
+                f"{speedup if speedup is not None else 0.0:>7.2f}x"
             )
 
-    dist.barrier()
+    dist.barrier(group=pg)
     dist.destroy_process_group()
 
 
