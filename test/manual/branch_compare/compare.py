@@ -215,10 +215,12 @@ def _bar(fraction: float, width: int) -> str:
     return out.ljust(width)
 
 
-def _fmt(v: float) -> str:
-    """Format a float for the bin-edge label column."""
+def _fmt(v: float, *, integer: bool = False) -> str:
+    """Format a value for the bin-edge label column."""
     if not np.isfinite(v):
         return "nan"
+    if integer:
+        return str(int(round(v)))
     av = abs(v)
     if av == 0.0:
         return "0"
@@ -246,9 +248,24 @@ def _ascii_histogram(
 
     lo = float(clean.min())
     hi = float(clean.max())
-    if lo == hi:
-        # Degenerate: every value identical. Print one row.
-        lines.append(f"  {_fmt(lo):>12s}  {_bar(1.0, width)} {clean.size}")
+    is_int = bool(np.all(clean == np.floor(clean)))
+
+    if lo == hi or _fmt(lo, integer=is_int) == _fmt(hi, integer=is_int):
+        # Range is zero, or so small that every bin edge renders to the
+        # same label at display precision. Collapse to one row.
+        lines.append(
+            f"  {_fmt(lo, integer=is_int):>12s}  {_bar(1.0, width)} {clean.size}"
+        )
+    elif is_int and (int(hi) - int(lo)) < n_bins:
+        # One bin per distinct integer value — no fractional edges.
+        ints = np.arange(int(lo), int(hi) + 1, dtype=np.int64)
+        counts = np.array([int((clean == v).sum()) for v in ints])
+        max_count = int(counts.max()) if counts.size else 0
+        for v, c in zip(ints, counts):
+            frac = (c / max_count) if max_count else 0.0
+            lines.append(
+                f"  {_fmt(int(v), integer=True):>12s}  {_bar(frac, width)} {int(c)}"
+            )
     else:
         edges = np.linspace(lo, hi, n_bins + 1)
         counts, _ = np.histogram(clean, bins=edges)
@@ -256,14 +273,16 @@ def _ascii_histogram(
         for i, c in enumerate(counts):
             edge_left = edges[i]
             frac = (c / max_count) if max_count else 0.0
-            lines.append(f"  {_fmt(edge_left):>12s}  {_bar(frac, width)} {int(c)}")
-        lines.append(f"  {_fmt(edges[-1]):>12s}  (upper edge)")
+            lines.append(
+                f"  {_fmt(edge_left, integer=is_int):>12s}  {_bar(frac, width)} {int(c)}"
+            )
+        lines.append(f"  {_fmt(edges[-1], integer=is_int):>12s}  (upper edge)")
 
     s = aggregates
     lines.append(
         f"  mean={_fmt(s['mean'])}  p50={_fmt(s['p50'])}  "
         f"p90={_fmt(s['p90'])}  p99={_fmt(s['p99'])}  "
-        f"min={_fmt(s['min'])}  max={_fmt(s['max'])}"
+        f"min={_fmt(s['min'], integer=is_int)}  max={_fmt(s['max'], integer=is_int)}"
     )
     return "\n".join(lines)
 
