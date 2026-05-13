@@ -12,7 +12,7 @@ export const InternS2PreviewDeployment = () => {
       title: 'Reasoning Parser',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
-        { id: 'enabled', label: 'Enabled', default: true, subtitle: 'qwen3' },
+        { id: 'enabled', label: 'Enabled', default: true },
       ],
     },
     toolcall: {
@@ -20,7 +20,7 @@ export const InternS2PreviewDeployment = () => {
       title: 'Tool Call Parser',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
-        { id: 'enabled', label: 'Enabled', default: true, subtitle: 'qwen3_coder' },
+        { id: 'enabled', label: 'Enabled', default: true },
       ],
     },
     mtp: {
@@ -28,7 +28,7 @@ export const InternS2PreviewDeployment = () => {
       title: 'Multi-Token Prediction',
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
-        { id: 'enabled', label: 'Enabled', default: false, subtitle: 'NEXTN' },
+        { id: 'enabled', label: 'Enabled', default: false },
       ],
     },
   };
