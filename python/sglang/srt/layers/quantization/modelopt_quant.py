@@ -1361,13 +1361,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
-        # Keep per-shard scales intact for hot reload; derive scalar params below.
         copy_or_rebind_param(
             layer, "alpha", (input_scale_2 * weight_scale_2).to(torch.float32)
         )
         copy_or_rebind_param(
             layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
         )
+        del layer.input_scale, layer.weight_scale_2
 
         # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
@@ -1421,6 +1421,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             copy_or_rebind_param(layer, "weight_scale_interleaved", scale)
             copy_or_rebind_param(layer, "weight", weight)
             layer.weights_padding_cols = weights_padding_cols
+            del layer.weight_scale
             return
 
         # Pad weights for CUTLASS/FlashInfer kernel alignment (K and N divisible by 32)
@@ -1451,6 +1452,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             else padded_scales.reshape(B, M_padded, K_padded)
         )
         copy_or_rebind_param(layer, "weight_scale_interleaved", padded_scales)
+        del layer.weight_scale
 
     def apply(
         self,
@@ -1773,6 +1775,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
+        del layer.w13_input_scale, layer.w2_input_scale
+        # TODO: w13_weight_scale_2 / w2_weight_scale_2 are also unused by apply()
+        # after this point. flashinfer_cutedsl reads them via hasattr() but has a
+        # mathematically-equivalent fallback through w13_input_scale_quant and
+        # g1_alphas. Kept for now to avoid a silent code-path switch and possible
+        # sub-ULP precision drift; revisit once the fallback is validated.
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         layer.dispatcher.set_quant_config(
@@ -1825,6 +1833,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # FlashInfer TRTLLM processing - handles both w13 and w2
             align_fp4_moe_weights_for_flashinfer_trtllm(layer)
+            del layer.w13_blockscale_swizzled, layer.w2_blockscale_swizzled
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
@@ -1958,6 +1967,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     intermediate_size_per_partition=inter_size,  # n
                     hidden_size=hidden_size,
                 )  # k
+            del layer.w13_weight_scale, layer.w2_weight_scale
 
     @property
     def load_up_proj_weight_first(self) -> bool:
