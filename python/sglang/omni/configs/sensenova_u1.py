@@ -14,8 +14,8 @@ from sglang.omni.backends.ar.srt import SRTARBackend
 from sglang.omni.backends.mm_gen.pipeline_forward_backend import (
     DirectPipelineForwardBackend,
 )
-from sglang.omni.coordinator import OmniCoordinator
-from sglang.omni.protocol import MultimodalGenerationBackend, OmniRequest
+from sglang.omni.core.coordinator import OmniCoordinator
+from sglang.omni.core.protocol import MultimodalGenerationBackend, OmniRequest
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
         ServerArgs as DiffusionServerArgs,
     )
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.omni_session.bridge import SRTBackedOmniSessionBridge
+    from sglang.srt.omni_session.session_adapter import SRTBackedOmniSessionAdapter
     from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
     from sglang.srt.server_args import ServerArgs as SRTServerArgs
 
@@ -92,7 +92,7 @@ class SenseNovaU1OmniPlugin:
 
 def build_sensenova_u1_orchestrator(
     *,
-    srt_bridge: "SRTBackedOmniSessionBridge",
+    srt_session_adapter: "SRTBackedOmniSessionAdapter",
     generation_backend: MultimodalGenerationBackend | None = None,
     server_args: "SRTServerArgs | None" = None,
 ) -> OmniCoordinator:
@@ -100,7 +100,7 @@ def build_sensenova_u1_orchestrator(
         generation_backend = _build_default_generation_backend(server_args)
     plugin = SenseNovaU1OmniPlugin()
     coordinator = OmniCoordinator(
-        ar_backend=SRTARBackend(srt_bridge),
+        ar_backend=SRTARBackend(srt_session_adapter),
         mm_generation_backend=generation_backend,
         request_adapter=plugin.normalize_request,
         metadata={"model": plugin.model_name},
@@ -119,10 +119,12 @@ def build_sensenova_u1_orchestrator_from_scheduler(
     generation_backend: MultimodalGenerationBackend | None = None,
     server_args: "SRTServerArgs | None" = None,
 ) -> OmniCoordinator:
-    from sglang.omni.bridges.sensenova_u1.bridge import build_sensenova_u1_srt_bridge
+    from sglang.omni.model_adapters.sensenova_u1.session_adapter import (
+        build_sensenova_u1_srt_session_adapter,
+    )
 
     return build_sensenova_u1_orchestrator(
-        srt_bridge=build_sensenova_u1_srt_bridge(
+        srt_session_adapter=build_sensenova_u1_srt_session_adapter(
             scheduler=scheduler,
             srt_request_executor=srt_request_executor,
             srt_ar_decode_max_new_tokens=srt_ar_decode_max_new_tokens,

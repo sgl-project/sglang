@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from threading import BoundedSemaphore
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
-from sglang.omni.protocol import (
+from sglang.omni.core.interleaved import STREAMED_TEXT_METADATA_KEY
+from sglang.omni.core.protocol import (
     ARBackend,
     ContextOps,
     GeneratedSegment,
@@ -22,12 +23,14 @@ from sglang.omni.protocol import (
     OmniRequest,
     OmniResponse,
 )
-from sglang.omni.streaming import STREAMED_TEXT_METADATA_KEY, OmniStreamSink
+
+if TYPE_CHECKING:
+    from sglang.omni.entrypoints.streaming import OmniStreamSink
 
 
 @dataclass(slots=True)
 class OmniCoordinator:
-    """Top-level coordinator for omni generation, coordinate AR and multimodal_generation backends without owning model internals."""
+    """Coordinate AR and multimodal-generation backends without owning model internals."""
 
     ar_backend: ARBackend
     mm_generation_backend: MultimodalGenerationBackend
@@ -62,7 +65,7 @@ class OmniCoordinator:
         stop_after_generation_limit: bool = False,
         stream_sink: OmniStreamSink | None = None,
     ) -> tuple[OmniResponse, OmniContextBundle]:
-        """Generate a response for an omni request"""
+        """Main entrypoint, generate a response for an omni request"""
         if self.request_adapter is not None:
             request = self.request_adapter(request)
 

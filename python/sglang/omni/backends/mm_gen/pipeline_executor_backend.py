@@ -15,7 +15,7 @@ from sglang.omni.backends.mm_gen.pipeline_forward_backend import (
     build_pipeline_req,
     require_generated_segment,
 )
-from sglang.omni.protocol import (
+from sglang.omni.core.protocol import (
     ContextOps,
     GeneratedSegment,
     MultimodalGenerationBackend,

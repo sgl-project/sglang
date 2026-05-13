@@ -6,7 +6,7 @@ import base64
 from io import BytesIO
 from typing import Any
 
-from sglang.omni.protocol import OmniResponse
+from sglang.omni.core.protocol import OmniResponse
 
 
 def serialize_response(response: OmniResponse) -> dict[str, Any]:

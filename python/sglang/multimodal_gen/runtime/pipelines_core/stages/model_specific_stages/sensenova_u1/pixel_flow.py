@@ -23,7 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.omni.protocol import ContextOps, GeneratedSegment, TemporaryForwardPrepared
+from sglang.omni.core.protocol import ContextOps, GeneratedSegment, TemporaryForwardPrepared
 
 _U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
 _U1_INTERLEAVE_TEXT_UNCONDITION_ROLE = "u1_interleave_text_uncondition"

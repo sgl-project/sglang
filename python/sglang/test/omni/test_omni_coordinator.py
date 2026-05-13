@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
 
-from sglang.omni.coordinator import OmniCoordinator
-from sglang.omni.protocol import (
+from sglang.omni.core.coordinator import OmniCoordinator
+from sglang.omni.core.protocol import (
     GeneratedSegment,
     OmniBoundary,
     OmniContextBundle,

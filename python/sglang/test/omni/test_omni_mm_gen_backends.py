@@ -13,7 +13,7 @@ from sglang.omni.backends.mm_gen.pipeline_forward_backend import (
     DirectPipelineForwardBackend,
     require_generated_segment,
 )
-from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
+from sglang.omni.core.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
 
 
 class TestOmniMMGenBackends(unittest.TestCase):

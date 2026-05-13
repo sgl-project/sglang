@@ -8,7 +8,15 @@ from types import SimpleNamespace
 from PIL import Image
 
 from sglang.omni.backends.ar.srt import SRTARBackend
-from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
+from sglang.omni.core.interleaved import (
+    INTERLEAVED_BOUNDARY_MODALITY_KEY,
+    INTERLEAVED_BOUNDARY_POSITION_ID_KEY,
+    INTERLEAVED_BOUNDARY_TOKEN_ID_KEY,
+    INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
+    INTERLEAVED_GENERATION_TOKEN_COUNT_KEY,
+    INTERLEAVED_GENERATION_TOKEN_COUNT_SOURCE_KEY,
+)
+from sglang.omni.core.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
 from sglang.srt.omni_session.runtime_types import (
     OmniContextBundle as SRTOmniContextBundle,
     OmniContextHandle,
@@ -18,7 +26,7 @@ from sglang.srt.omni_session.runtime_types import (
 
 class TestOmniSRTBackend(unittest.TestCase):
     def test_interleave_exposes_text_boundary_and_commits_generated_image(self):
-        bridge = _FakeBridge(
+        session_adapter = _FakeSessionAdapter(
             pre_image_segments=[
                 {
                     "type": "text",
@@ -32,7 +40,7 @@ class TestOmniSRTBackend(unittest.TestCase):
                 },
             ]
         )
-        backend = SRTARBackend(bridge)
+        backend = SRTARBackend(session_adapter)
         request = OmniRequest(
             messages=(OmniInputSegment(type="text", text="draw"),),
             mode="interleave",
@@ -54,10 +62,40 @@ class TestOmniSRTBackend(unittest.TestCase):
         )
         self.assertEqual("image", second.type)
         self.assertEqual("done", third.type)
-        self.assertEqual(1, bridge.commit_count)
+        self.assertEqual(1, session_adapter.commit_count)
+
+    def test_image_boundary_metadata_reaches_generation_context_ops(self):
+        boundary_metadata = {
+            INTERLEAVED_BOUNDARY_TOKEN_ID_KEY: 123,
+            INTERLEAVED_BOUNDARY_POSITION_ID_KEY: 226,
+            INTERLEAVED_GENERATION_TOKEN_COUNT_KEY: 256,
+            INTERLEAVED_GENERATION_TOKEN_COUNT_SOURCE_KEY: "ar",
+        }
+        session_adapter = _FakeSessionAdapter(
+            pre_image_segments=[],
+            pre_image_boundary_metadata=boundary_metadata,
+        )
+        backend = SRTARBackend(session_adapter)
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="draw"),),
+            mode="interleave",
+        )
+
+        context = backend.begin_request_context(request)
+        boundary = backend.decode_until_boundary(context, request=request)
+        context_ops = backend.get_context_ops(context)
+
+        self.assertEqual("image", boundary.type)
+        self.assertEqual(
+            {
+                **boundary_metadata,
+                INTERLEAVED_BOUNDARY_MODALITY_KEY: "image",
+            },
+            context_ops.metadata[INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY],
+        )
 
     def test_interleave_can_finish_before_image_marker(self):
-        bridge = _FakeBridge(
+        session_adapter = _FakeSessionAdapter(
             pre_image_segments=[
                 {
                     "type": "text",
@@ -67,7 +105,7 @@ class TestOmniSRTBackend(unittest.TestCase):
             ],
             reached_image_marker=False,
         )
-        backend = SRTARBackend(bridge)
+        backend = SRTARBackend(session_adapter)
         request = OmniRequest(
             messages=(OmniInputSegment(type="text", text="hi"),),
             mode="interleave",
@@ -79,11 +117,11 @@ class TestOmniSRTBackend(unittest.TestCase):
 
         self.assertEqual(("text", "hello"), (first.type, first.text))
         self.assertEqual("done", second.type)
-        self.assertEqual(0, bridge.commit_count)
+        self.assertEqual(0, session_adapter.commit_count)
 
     def test_image_payload_accepts_b64_json(self):
-        bridge = _ImageCaptureBridge()
-        backend = SRTARBackend(bridge)
+        session_adapter = _ImageCaptureSessionAdapter()
+        backend = SRTARBackend(session_adapter)
         request = OmniRequest(
             messages=(
                 OmniInputSegment(type="text", text="describe"),
@@ -97,12 +135,12 @@ class TestOmniSRTBackend(unittest.TestCase):
 
         backend.begin_request_context(request)
 
-        self.assertEqual((2, 2), bridge.images[0].size)
-        self.assertEqual("RGB", bridge.images[0].mode)
+        self.assertEqual((2, 2), session_adapter.images[0].size)
+        self.assertEqual("RGB", session_adapter.images[0].mode)
 
     def test_vlm_mode_returns_text_and_releases_session(self):
-        bridge = _FakeVLMBridge()
-        backend = SRTARBackend(bridge)
+        session_adapter = _FakeVLMSessionAdapter()
+        backend = SRTARBackend(session_adapter)
         request = OmniRequest(
             messages=(OmniInputSegment(type="text", text="what is this"),),
             mode="vlm",
@@ -118,13 +156,15 @@ class TestOmniSRTBackend(unittest.TestCase):
         self.assertEqual("answer", first.text)
         self.assertEqual((3, 4), first.token_ids)
         self.assertEqual("done", second.type)
-        self.assertEqual(4, bridge.max_new_tokens)
-        self.assertEqual(["s1"], bridge.runtime.closed_sessions)
+        self.assertEqual(4, session_adapter.max_new_tokens)
+        self.assertEqual(["s1"], session_adapter.runtime.closed_sessions)
 
     def test_context_ops_resolves_condition_path_role_map(self):
-        bridge = _FakeBridge(pre_image_segments=[])
-        bridge.condition_path_roles["edit_img_condition"] = "u1_edit_img_condition"
-        backend = SRTARBackend(bridge)
+        session_adapter = _FakeSessionAdapter(pre_image_segments=[])
+        session_adapter.condition_path_roles["edit_img_condition"] = (
+            "u1_edit_img_condition"
+        )
+        backend = SRTARBackend(session_adapter)
         context = backend.begin_request_context(
             OmniRequest(
                 messages=(OmniInputSegment(type="text", text="edit"),),
@@ -140,10 +180,15 @@ class TestOmniSRTBackend(unittest.TestCase):
         )
 
 
-class _FakeBridge:
+class _FakeSessionAdapter:
     generation_kind = "pixel_flow"
 
-    def __init__(self, pre_image_segments=None, reached_image_marker=True):
+    def __init__(
+        self,
+        pre_image_segments=None,
+        reached_image_marker=True,
+        pre_image_boundary_metadata=None,
+    ):
         self.condition_path_roles = {}
         self.pre_image_segments = (
             [
@@ -157,6 +202,7 @@ class _FakeBridge:
             else pre_image_segments
         )
         self.reached_image_marker = reached_image_marker
+        self.pre_image_boundary_metadata = dict(pre_image_boundary_metadata or {})
         self.commit_count = 0
         self.session_ids = []
 
@@ -175,6 +221,7 @@ class _FakeBridge:
             metadata={
                 "pre_image_segments": self.pre_image_segments,
                 "pre_image_reached_image_marker": self.reached_image_marker,
+                "pre_image_boundary_metadata": self.pre_image_boundary_metadata,
             },
         )
         text_cfg = OmniContextHandle(
@@ -211,7 +258,7 @@ class _FakeRuntime:
         self.closed_sessions.append(session.session_id)
 
 
-class _FakeVLMBridge:
+class _FakeVLMSessionAdapter:
     def __init__(self):
         self.runtime = _FakeRuntime()
         self.max_new_tokens = None
@@ -233,7 +280,7 @@ class _FakeVLMBridge:
         )
 
 
-class _ImageCaptureBridge(_FakeBridge):
+class _ImageCaptureSessionAdapter(_FakeSessionAdapter):
     def __init__(self):
         super().__init__(pre_image_segments=[])
         self.images = []

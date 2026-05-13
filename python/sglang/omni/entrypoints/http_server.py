@@ -16,10 +16,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.omni.backends import UnsupportedARBackend, UnsupportedGenerationBackend
-from sglang.omni.coordinator import OmniCoordinator
-from sglang.omni.protocol import OmniRequest
-from sglang.omni.serialization import serialize_response
-from sglang.omni.streaming import OmniStreamSink
+from sglang.omni.core.coordinator import OmniCoordinator
+from sglang.omni.core.protocol import OmniRequest
+from sglang.omni.entrypoints.serialization import serialize_response
+from sglang.omni.entrypoints.streaming import OmniStreamSink
 from sglang.version import __version__
 
 if TYPE_CHECKING:

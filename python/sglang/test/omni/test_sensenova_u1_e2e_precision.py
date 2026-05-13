@@ -238,6 +238,120 @@ class TestSenseNovaU1E2EBehavior(unittest.TestCase):
             stats,
         )
 
+    def test_t2i_think_medium_generates_clean_reasoning_and_image(self):
+        base_url = os.getenv("SGLANG_OMNI_U1_BASE_URL", "http://127.0.0.1:30000")
+        model = os.getenv("SGLANG_OMNI_U1_MODEL", "sensenova-u1")
+        sampling_params = {
+            "width": _env_int("SGLANG_OMNI_U1_T2I_THINK_WIDTH", 512),
+            "height": _env_int("SGLANG_OMNI_U1_T2I_THINK_HEIGHT", 512),
+            "num_steps": _env_int("SGLANG_OMNI_U1_T2I_THINK_STEPS", 24),
+            "seed": _env_int("SGLANG_OMNI_U1_T2I_THINK_SEED", 223),
+            "cfg_text_scale": _env_float("SGLANG_OMNI_U1_T2I_THINK_CFG_TEXT_SCALE", 1.0),
+            "cfg_img_scale": _env_float("SGLANG_OMNI_U1_T2I_THINK_CFG_IMG_SCALE", 1.0),
+            "cfg_interval": [0.0, 1.0],
+            "cfg_renorm_type": "none",
+            "t_eps": _env_float("SGLANG_OMNI_U1_T2I_THINK_T_EPS", 0.02),
+        }
+
+        response = _run_turn(
+            base_url,
+            model=model,
+            task="t2i",
+            text=THREE_TURN_PROMPTS[0],
+            sampling_params=sampling_params,
+            think=True,
+            max_images=1,
+        )
+        text = "\n".join(
+            segment.get("text", "")
+            for segment in response.get("segments", [])
+            if segment.get("type") == "text"
+        )
+        image = _last_image(response)
+        _save_output_image(response, "SGLANG_OMNI_U1_T2I_THINK_OUTPUT_IMAGE")
+        stats = _image_stats(image)
+
+        self.assertNotIn("<think>\n<think>", text)
+        self.assertLessEqual(text.count("<think>"), 1, text[:512])
+        self.assertLessEqual(text.count("</think>"), 1, text[:512])
+        self.assertGreaterEqual(
+            stats["std"],
+            _env_float("SGLANG_OMNI_U1_T2I_THINK_MIN_IMAGE_STD", 3.0),
+            stats,
+        )
+        self.assertLessEqual(
+            stats["edge_mean"],
+            _env_float("SGLANG_OMNI_U1_T2I_THINK_MAX_EDGE_MEAN", 70.0),
+            stats,
+        )
+
+    def test_edit_think_medium_generates_clean_reasoning_and_image(self):
+        base_url = os.getenv("SGLANG_OMNI_U1_BASE_URL", "http://127.0.0.1:30000")
+        model = os.getenv("SGLANG_OMNI_U1_MODEL", "sensenova-u1")
+        sampling_params = {
+            "width": _env_int("SGLANG_OMNI_U1_EDIT_THINK_WIDTH", 512),
+            "height": _env_int("SGLANG_OMNI_U1_EDIT_THINK_HEIGHT", 512),
+            "num_steps": _env_int("SGLANG_OMNI_U1_EDIT_THINK_STEPS", 24),
+            "seed": _env_int("SGLANG_OMNI_U1_EDIT_THINK_SEED", 223),
+            "cfg_text_scale": _env_float(
+                "SGLANG_OMNI_U1_EDIT_THINK_CFG_TEXT_SCALE", 1.0
+            ),
+            "cfg_img_scale": _env_float("SGLANG_OMNI_U1_EDIT_THINK_CFG_IMG_SCALE", 1.0),
+            "cfg_interval": [0.0, 1.0],
+            "cfg_renorm_type": "none",
+            "t_eps": _env_float("SGLANG_OMNI_U1_EDIT_THINK_T_EPS", 0.02),
+        }
+
+        first = _run_turn(
+            base_url,
+            model=model,
+            task="t2i",
+            text=THREE_TURN_PROMPTS[0],
+            sampling_params={
+                **sampling_params,
+                "seed": _env_int("SGLANG_OMNI_U1_EDIT_THINK_FIRST_SEED", 223),
+            },
+            think=False,
+            max_images=1,
+        )
+        edit = _run_turn(
+            base_url,
+            model=model,
+            task="edit",
+            text=THREE_TURN_PROMPTS[1],
+            messages=[
+                _image_segment_from_payload(first),
+                {"type": "text", "text": THREE_TURN_PROMPTS[1]},
+            ],
+            sampling_params={
+                **sampling_params,
+                "seed": _env_int("SGLANG_OMNI_U1_EDIT_THINK_EDIT_SEED", 224),
+            },
+            think=True,
+            max_images=1,
+        )
+        text = "\n".join(
+            segment.get("text", "")
+            for segment in edit.get("segments", [])
+            if segment.get("type") == "text"
+        )
+        image = _last_image(edit)
+        _save_output_image(edit, "SGLANG_OMNI_U1_EDIT_THINK_OUTPUT_IMAGE")
+        stats = _image_stats(image)
+
+        self.assertLessEqual(_max_repeated_token_run(text, "1"), 8, text[:512])
+        self.assertLessEqual(_max_repeated_char_run(text, "1"), 8, text[:512])
+        self.assertGreaterEqual(
+            stats["std"],
+            _env_float("SGLANG_OMNI_U1_EDIT_THINK_MIN_IMAGE_STD", 3.0),
+            stats,
+        )
+        self.assertLessEqual(
+            stats["edge_mean"],
+            _env_float("SGLANG_OMNI_U1_EDIT_THINK_MAX_EDGE_MEAN", 70.0),
+            stats,
+        )
+
     def test_interleave_long_pre_image_text_generates_image(self):
         base_url = os.getenv("SGLANG_OMNI_U1_BASE_URL", "http://127.0.0.1:30000")
         model = os.getenv("SGLANG_OMNI_U1_MODEL", "sensenova-u1")
@@ -485,6 +599,38 @@ def _image_segment_from_path(path: str) -> dict:
         "type": "image",
         "image": {"b64_json": image_b64},
     }
+
+
+def _image_segment_from_payload(payload: dict) -> dict:
+    for segment in reversed(payload.get("segments", [])):
+        if segment.get("type") == "image":
+            return {"type": "image", "image": segment.get("image")}
+    raise AssertionError(f"omni response did not contain an image: {payload}")
+
+
+def _max_repeated_token_run(text: str, token: str) -> int:
+    max_run = 0
+    current = 0
+    for piece in text.split():
+        normalized = piece.strip(".,;:!?()[]{}\"'")
+        if normalized == token:
+            current += 1
+            max_run = max(max_run, current)
+        else:
+            current = 0
+    return max_run
+
+
+def _max_repeated_char_run(text: str, char: str) -> int:
+    max_run = 0
+    current = 0
+    for value in text:
+        if value == char:
+            current += 1
+            max_run = max(max_run, current)
+        else:
+            current = 0
+    return max_run
 
 
 def _require_env(name: str) -> str:

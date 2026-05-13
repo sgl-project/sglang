@@ -28,7 +28,7 @@ class TestOmniSessionImportBoundaries(unittest.TestCase):
             PYTHON_ROOT / "sglang" / "srt",
             forbidden_prefixes=(
                 "sglang.srt.omni_session.coordinator",
-                "sglang.omni.bridges.sensenova_u1.bridge",
+                "sglang.omni.model_adapters.sensenova_u1.session_adapter",
             ),
             skip_dirs={PYTHON_ROOT / "sglang" / "srt" / "omni_session"},
         )
@@ -69,9 +69,9 @@ class TestOmniSessionImportBoundaries(unittest.TestCase):
             root / "sensenova_u1" / "pixel_flow.py",
         ]
         forbidden_patterns = (
-            "bridge.runtime",
+            "session_adapter.runtime",
             "srt_request_executor",
-            "sensenova_u1_bridge",
+            "sensenova_u1_session_adapter",
             "sensenova_u1_contexts",
             "OmniSessionRuntime",
             "forward_vlm",

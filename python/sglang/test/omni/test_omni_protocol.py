@@ -4,7 +4,7 @@ import dataclasses
 import unittest
 from typing import Any
 
-from sglang.omni.protocol import (
+from sglang.omni.core.protocol import (
     GeneratedSegment,
     OmniContextRef,
     OmniInputSegment,

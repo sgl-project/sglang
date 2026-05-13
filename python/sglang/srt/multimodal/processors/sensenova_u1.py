@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from sglang.omni.bridges.sensenova_u1.context import (
+from sglang.omni.model_adapters.sensenova_u1.context import (
     U1_IMAGE_PLACEHOLDER,
     U1_IMG_CONTEXT_TOKEN,
     U1_IMG_END_TOKEN,

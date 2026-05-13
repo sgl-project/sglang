@@ -5,9 +5,9 @@ import unittest
 
 from fastapi.testclient import TestClient
 
-from sglang.omni.coordinator import OmniCoordinator
+from sglang.omni.core.coordinator import OmniCoordinator
 from sglang.omni.entrypoints.http_server import create_app
-from sglang.omni.protocol import (
+from sglang.omni.core.protocol import (
     GeneratedSegment,
     OmniBoundary,
     OmniContextBundle,

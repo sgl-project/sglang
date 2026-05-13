@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 if TYPE_CHECKING:
-    from sglang.omni.streaming import OmniStreamSink
+    from sglang.omni.entrypoints.streaming import OmniStreamSink
 
 InputSegmentType = Literal["text", "image", "audio", "video"]
 OutputSegmentType = Literal["text", "image", "audio", "video"]
@@ -134,6 +134,8 @@ class OmniBoundary:
     'Boundary' is a common and crucial concept in interleaved (ar + multimodal_gen) generation.
      Conceptually, it marks the boundary of continuous token of different modalities, usually decided by the AR backend
 
+    Media boundary metadata may carry the AR-emitted marker token and optional
+    generation token budget for models where AR decides image/audio/video length.
     """
 
     type: BoundaryType

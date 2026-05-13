@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Middle bridge between generic omni orchestration and SRT session execution."""
+"""SRT session adapter for generic omni orchestration."""
 
-from typing import Any
+from __future__ import annotations
 
-from sglang.omni.protocol import GeneratedSegment
+from typing import TYPE_CHECKING, Any
+
+from sglang.omni.core.protocol import GeneratedSegment
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniInterleavedMessage,
@@ -16,11 +18,14 @@ from sglang.srt.omni_session.runtime_types import (
     OmniSessionHandle,
 )
 
+if TYPE_CHECKING:
+    from sglang.omni.entrypoints.streaming import OmniStreamSink
+
 DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS = 128
 
 
-class SRTBackedOmniSessionBridge:
-    """Concrete bridge from generic omni AR semantics to SRT session operations.
+class SRTBackedOmniSessionAdapter:
+    """Concrete adapter from generic omni AR semantics to SRT session operations.
 
     It keeps SRT as the session/KV owner and asks the runtime to
     prefill/decode/commit AR-side chunks. For interleaved generation this path is:
@@ -54,12 +59,13 @@ class SRTBackedOmniSessionBridge:
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
         session_id: str | None = None,
-        stream_sink: Any | None = None,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniContextBundle:
         messages = normalize_omni_interleaved_messages(messages)
         session = self.runtime.prefill_interleaved(messages, session_id=session_id)
         pre_image_segments: list[dict[str, Any]] = []
         reached_image_marker = False
+        image_boundary_metadata: dict[str, Any] = {}
         try:
             if think:
                 thinking = self._decode_thinking_text(
@@ -90,6 +96,7 @@ class SRTBackedOmniSessionBridge:
                 )
                 if segment.type == "image_marker":
                     reached_image_marker = True
+                    image_boundary_metadata = dict(segment.metadata)
                     break
                 if segment.type == "text":
                     metadata = dict(segment.metadata)
@@ -107,7 +114,7 @@ class SRTBackedOmniSessionBridge:
                 if segment.type == "done":
                     break
                 raise ValueError(
-                    "omni middle bridge expected AR decode to request an image segment, "
+                    "omni session adapter expected AR decode to request an image segment, "
                     f"got {segment.type}"
                 )
             else:
@@ -118,7 +125,7 @@ class SRTBackedOmniSessionBridge:
                 )
                 decoded_preview = decoded_preview[-240:]
                 raise ValueError(
-                    "omni middle bridge did not receive an image marker within "
+                    "omni session adapter did not receive an image marker within "
                     f"{self.max_pre_image_decode_steps} AR decode steps"
                     f"; decoded_text_preview={decoded_preview!r}"
                 )
@@ -140,6 +147,7 @@ class SRTBackedOmniSessionBridge:
                 metadata={
                     "pre_image_segments": pre_image_segments,
                     "pre_image_reached_image_marker": reached_image_marker,
+                    "pre_image_boundary_metadata": image_boundary_metadata,
                 },
             ),
             text_cfg=OmniContextHandle(
@@ -175,7 +183,7 @@ class SRTBackedOmniSessionBridge:
         self,
         *,
         contexts: OmniContextBundle,
-        stream_sink: Any | None = None,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniDecodeResult:
         """continue interleaved AR decode from an SRT-owned context bundle"""
         if contexts.full.session is None:

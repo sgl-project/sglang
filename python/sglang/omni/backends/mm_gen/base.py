@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fallback multimodal generation backend used by unsupported omni servers."""
 
-from sglang.omni.protocol import (
+from sglang.omni.core.protocol import (
     ContextOps,
     GeneratedSegment,
     MultimodalGenerationBackend,

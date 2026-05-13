@@ -26,7 +26,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
 
 if TYPE_CHECKING:
-    from sglang.omni.streaming import OmniStreamSink
+    from sglang.omni.entrypoints.streaming import OmniStreamSink
     from sglang.srt.omni_session.model_policy import (
         OmniModelPolicy,
         OmniModelSessionView,
@@ -379,6 +379,74 @@ class OmniSessionRuntime:
             record.omni_model_state
         )
         self._attach_srt_request_overrides(req, srt_request_metadata=policy_metadata)
+        self._execute_srt_req(record, req, state=OmniSegmentState.AR_DECODE)
+        record.srt_ar_decode_request_count += 1
+        record.srt_last_ar_decode_request_id = request_id
+        record.srt_last_ar_decode_origin_input_len = len(req.origin_input_ids)
+        record.srt_last_ar_decode_output_ids = []
+        record.srt_last_ar_decode_text = ""
+        record.context_length = len(req.origin_input_ids)
+        return record.handle()
+
+    def append_ar_input_tokens(
+        self,
+        handle: OmniSessionHandle,
+        *,
+        token_ids: list[int] | tuple[int, ...],
+        position_ids: list[int] | tuple[int, ...] | None = None,
+        model_state_updates: dict[str, Any] | None = None,
+    ) -> OmniSessionHandle:
+        record = self._record_for(handle)
+        if record.state != OmniSegmentState.AR_DECODE:
+            raise ValueError(
+                f"Cannot append AR input tokens from state {record.state} "
+                f"for omni session {handle.session_id}"
+            )
+        input_ids = [int(token_id) for token_id in token_ids]
+        if not input_ids:
+            return record.handle()
+        if position_ids is not None and len(position_ids) != len(input_ids):
+            raise ValueError(
+                "omni SRT AR append position_ids must match token_ids length: "
+                f"{len(position_ids)} != {len(input_ids)}"
+            )
+        request_id = f"{record.session_id}:d{record.srt_ar_decode_request_count + 1}"
+        req, _ = self._create_srt_session_req(
+            record,
+            request_id=request_id,
+            input_ids=input_ids,
+            input_text="",
+            mm_inputs=None,
+            max_new_tokens=0,
+            greedy=True,
+        )
+        if position_ids is not None:
+            prefix_len = len(req.origin_input_ids) - len(input_ids)
+            if prefix_len < 0:
+                raise RuntimeError(
+                    "omni SRT AR append input length is inconsistent with session request"
+                )
+            req.custom_position_ids = list(range(prefix_len)) + [
+                int(position) for position in position_ids
+            ]
+        self._record_srt_req(record, req, request_id=request_id)
+        policy_metadata = {
+            "omni_srt_added_token_count": len(input_ids),
+            "omni_srt_rope_delta": len(input_ids),
+            "omni_srt_position_count": (
+                max(int(position) for position in position_ids) + 1
+                if position_ids is not None
+                else len(req.origin_input_ids)
+            ),
+        }
+        if model_state_updates is not None:
+            policy_metadata["omni_model_state_updates"] = model_state_updates
+            self._merge_omni_model_state_updates(record, model_state_updates)
+        policy_metadata["omni_model_state"] = self._copy_omni_model_state(
+            record.omni_model_state
+        )
+        self._attach_srt_request_overrides(req, srt_request_metadata=policy_metadata)
+        # 1. keep previous decoded think tokens and append the explicit image marker
         self._execute_srt_req(record, req, state=OmniSegmentState.AR_DECODE)
         record.srt_ar_decode_request_count += 1
         record.srt_last_ar_decode_request_id = request_id

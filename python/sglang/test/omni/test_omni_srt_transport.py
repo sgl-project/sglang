@@ -7,14 +7,14 @@ from types import SimpleNamespace
 from PIL import Image
 
 from sglang.omni.entrypoints.http_api import create_srt_omni_router
-from sglang.omni.protocol import (
+from sglang.omni.core.protocol import (
     OmniContextBundle,
     OmniContextRef,
     OmniOutputSegment,
     OmniResponse,
 )
-from sglang.omni.scheduler_state import OmniSchedulerState
-from sglang.omni.srt_transport import handle_omni_generate_with_omni_coordinator
+from sglang.omni.runtime.srt_scheduler_state import OmniSchedulerState
+from sglang.omni.runtime.srt_transport import handle_omni_generate_with_omni_coordinator
 from sglang.srt.managers.io_struct import (
     OmniGenerateReqInput,
     OmniGenerateReqOutput,

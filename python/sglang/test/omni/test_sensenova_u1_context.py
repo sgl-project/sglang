@@ -7,15 +7,24 @@ from io import BytesIO
 import torch
 from PIL import Image
 
-from sglang.omni.bridges.sensenova_u1.bridge import U1OmniSessionModelPolicy
-from sglang.omni.bridges.sensenova_u1.context import (
+from sglang.omni.core.interleaved import (
+    INTERLEAVED_BOUNDARY_MODALITY_KEY,
+    INTERLEAVED_BOUNDARY_POSITION_ID_KEY,
+    INTERLEAVED_BOUNDARY_TOKEN_ID_KEY,
+    INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
+)
+from sglang.omni.model_adapters.sensenova_u1.session_adapter import U1OmniSessionModelPolicy
+from sglang.omni.model_adapters.sensenova_u1.context import (
     U1_SPECIAL_TOKENS,
     U1SpecialTokens,
     U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
-    build_u1_native_interleave_prepared_input,
     build_u1_interleave_prompt,
+    build_u1_native_edit_img_condition_prepared_input,
+    build_u1_native_edit_prepared_input,
     build_u1_native_generated_image_commit_prepared_input,
+    build_u1_native_interleave_prepared_input,
     build_u1_native_interleave_text_uncondition_marker_prepared_input,
+    build_u1_native_t2i_prepared_input,
     build_u1_t2i_plain_query,
     build_u1_t2i_prompt,
     build_u1_vlm_prompt,
@@ -68,6 +77,17 @@ class TestSenseNovaU1Context(unittest.TestCase):
 
         self.assertTrue(prompt.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"))
 
+    def test_t2i_think_mode_matches_official_open_think_prefix(self):
+        prompt = build_u1_t2i_prompt(prompt="draw a cube", think_mode=True)
+
+        self.assertTrue(prompt.endswith("<|im_start|>assistant\n<think>\n"))
+        self.assertNotIn("</think>\n\n<img>", prompt)
+
+    def test_t2i_non_think_mode_injects_official_empty_think_and_image_marker(self):
+        prompt = build_u1_t2i_prompt(prompt="draw a cube", think_mode=False)
+
+        self.assertTrue(prompt.endswith("<think>\n\n</think>\n\n<img>"))
+
     def test_native_interleave_prepared_input_respects_think_mode(self):
         messages = [OmniInterleavedMessage(type="text", content="hi")]
 
@@ -108,6 +128,122 @@ class TestSenseNovaU1Context(unittest.TestCase):
         self.assertIsNotNone(non_think_prepared)
         self.assertNotIn("<think>\n\n</think>\n\n", think_prepared[0].input_text)
         self.assertIn("<think>\n\n</think>\n\n", non_think_prepared[0].input_text)
+
+    def test_policy_t2i_think_flag_reaches_prepared_prompt(self):
+        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
+        policy.native_generation_mode = "t2i"
+        messages = [OmniInterleavedMessage(type="text", content="hi")]
+
+        policy.native_interleave_think_mode = True
+        think_prepared = policy.prepare_srt_ar_interleaved_inputs(
+            session=None,
+            messages=messages,
+            state=OmniSegmentState.AR_PREFILL,
+        )
+        policy.native_interleave_think_mode = False
+        non_think_prepared = policy.prepare_srt_ar_interleaved_inputs(
+            session=None,
+            messages=messages,
+            state=OmniSegmentState.AR_PREFILL,
+        )
+
+        self.assertIsNotNone(think_prepared)
+        self.assertIsNotNone(non_think_prepared)
+        self.assertTrue(think_prepared[-1].input_text.endswith("<think>\n"))
+        self.assertFalse(
+            think_prepared[-1].policy_metadata["omni_model_state_updates"]["u1"][
+                "open_image_marker"
+            ]
+        )
+        self.assertTrue(non_think_prepared[-1].input_text.endswith("</think>\n\n<img>"))
+
+    def test_t2i_prepared_input_records_think_mode(self):
+        prepared = build_u1_native_t2i_prepared_input(
+            tokenizer=_Tokenizer(),
+            messages=[OmniInterleavedMessage(type="text", content="hi")],
+            think_mode=True,
+        )
+
+        self.assertTrue(prepared.policy_metadata["u1"]["think_mode"])
+        self.assertTrue(
+            prepared.policy_metadata["omni_model_state_updates"]["u1"][
+                "t2i_think_mode"
+            ]
+        )
+
+    def test_edit_prepared_input_records_think_mode_without_open_image_marker(self):
+        prepared = build_u1_native_edit_prepared_input(
+            tokenizer=_Tokenizer(),
+            messages=[
+                OmniInterleavedMessage(
+                    type="image",
+                    content={
+                        "pixel_values": torch.zeros(4, 12),
+                        "grid_hw": torch.tensor([[4, 4]]),
+                    },
+                ),
+                OmniInterleavedMessage(type="text", content="make it red"),
+            ],
+            think_mode=True,
+        )
+        u1_updates = prepared.policy_metadata["omni_model_state_updates"]["u1"]
+
+        self.assertTrue(prepared.input_text.endswith("<think>\n"))
+        self.assertIsNotNone(prepared.position_ids)
+        self.assertEqual(len(prepared.input_ids), len(prepared.position_ids))
+        self.assertEqual(3, len(prepared.position_ids[0]))
+        self.assertEqual(
+            u1_updates["generation_position_start"],
+            max(position[0] for position in prepared.position_ids) + 1,
+        )
+        self.assertTrue(u1_updates["edit_think_mode"])
+        self.assertFalse(u1_updates["open_image_marker"])
+        self.assertGreater(u1_updates["generation_position_start"], 0)
+
+    def test_edit_image_condition_path_uses_vlm_position_ids(self):
+        prepared = build_u1_native_edit_img_condition_prepared_input(
+            tokenizer=_Tokenizer(),
+            messages=[
+                OmniInterleavedMessage(
+                    type="image",
+                    content={
+                        "pixel_values": torch.zeros(4, 12),
+                        "grid_hw": torch.tensor([[4, 4]]),
+                    },
+                )
+            ],
+        )
+        u1_metadata = prepared.policy_metadata["u1"]
+
+        self.assertIsNotNone(prepared.position_ids)
+        self.assertEqual(len(prepared.input_ids), len(prepared.position_ids))
+        self.assertEqual(3, len(prepared.position_ids[0]))
+        self.assertEqual(
+            u1_metadata["generation_position_start"],
+            max(position[0] for position in prepared.position_ids) + 1,
+        )
+
+    def test_t2i_think_decode_appends_image_marker_after_think(self):
+        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
+        runtime = _NativeThinkRuntime(output_ids=[42, 124])
+        session = OmniSessionHandle(
+            session_id="s0",
+            anchor_request_id="r0",
+            context_length=32,
+            context_version=1,
+        )
+
+        result = policy.decode_vlm_text(
+            runtime=runtime,
+            session=session,
+            max_new_tokens=8,
+        )
+
+        self.assertEqual((42, 124), result.next_token_ids)
+        self.assertEqual([10, 10, 123], runtime.appended_token_ids)
+        self.assertEqual([31, 32], runtime.decode_positions)
+        self.assertEqual([34, 35, 36], runtime.appended_position_ids)
+        self.assertTrue(runtime.model_state_updates[-1]["u1"]["open_image_marker"])
 
     def test_load_native_image_accepts_data_url(self):
         image = Image.new("RGB", (4, 4), (255, 0, 0))
@@ -152,6 +288,14 @@ class TestSenseNovaU1Context(unittest.TestCase):
         )
 
         self.assertEqual("image_marker", result.type)
+        self.assertEqual(
+            {
+                INTERLEAVED_BOUNDARY_MODALITY_KEY: "image",
+                INTERLEAVED_BOUNDARY_TOKEN_ID_KEY: 123,
+                INTERLEAVED_BOUNDARY_POSITION_ID_KEY: 225,
+            },
+            result.metadata,
+        )
         self.assertEqual([224], runtime.decode_positions)
         self.assertEqual((123, 225), runtime.committed_tokens[-1])
         self.assertEqual(
@@ -184,6 +328,16 @@ class TestSenseNovaU1Context(unittest.TestCase):
         self.assertEqual((123, 226), runtime.committed_tokens[-1])
         self.assertTrue(
             runtime.model_state_updates[-1]["u1"]["interleave_pending_image_marker"]
+        )
+        self.assertEqual(
+            {
+                INTERLEAVED_BOUNDARY_MODALITY_KEY: "image",
+                INTERLEAVED_BOUNDARY_TOKEN_ID_KEY: 123,
+                INTERLEAVED_BOUNDARY_POSITION_ID_KEY: 226,
+            },
+            runtime.model_state_updates[-1]["u1"][
+                INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY
+            ],
         )
         self.assertEqual(
             227,
@@ -238,11 +392,35 @@ class _Tokenizer:
 
     def __call__(self, prompt, **kwargs):
         self.last_prompt = prompt
-        return {"input_ids": torch.tensor([[ord(ch) for ch in prompt]])}
+        special_tokens = {
+            "<IMG_CONTEXT>": 125,
+            "<|im_end|>": 999,
+            "</think>": 124,
+            "</img>": 126,
+            "<img>": 123,
+        }
+        input_ids = []
+        index = 0
+        while index < len(prompt):
+            for token, token_id in special_tokens.items():
+                if prompt.startswith(token, index):
+                    input_ids.append(token_id)
+                    index += len(token)
+                    break
+            else:
+                input_ids.append(ord(prompt[index]))
+                index += 1
+        return {"input_ids": torch.tensor([input_ids])}
 
     def convert_tokens_to_ids(self, token):
         if token == "<img>":
             return 123
+        if token == "</think>":
+            return 124
+        if token == "<IMG_CONTEXT>":
+            return 125
+        if token == "</img>":
+            return 126
         if token == "<|im_end|>":
             return 999
         return 123
@@ -297,6 +475,45 @@ class _DecodeRuntime:
 
     def get_condition_path_model_state(self, session, role):
         return {}
+
+
+class _NativeThinkRuntime:
+    def __init__(self, output_ids):
+        self.output_ids = list(output_ids)
+        self.decode_positions = []
+        self.appended_token_ids = []
+        self.appended_position_ids = []
+        self.model_state_updates = []
+
+    def get_model_state(self, session, *, namespace):
+        return {"t2i_think_mode": True}
+
+    def decode_one_step(
+        self,
+        session,
+        *,
+        max_new_tokens,
+        decode_position_id,
+        greedy,
+        model_state_updates,
+    ):
+        self.decode_positions.append(decode_position_id)
+        token_id = self.output_ids.pop(0)
+        return OmniTextDecodeResult(
+            session=session,
+            input_ids=(),
+            output_ids=(token_id,),
+            position_ids=(),
+            text=str(token_id),
+        )
+
+    def append_ar_input_tokens(
+        self, session, *, token_ids, position_ids, model_state_updates
+    ):
+        self.appended_token_ids.extend(token_ids)
+        self.appended_position_ids.extend(position_ids)
+        self.model_state_updates.append(model_state_updates)
+        return session
 
 
 if __name__ == "__main__":

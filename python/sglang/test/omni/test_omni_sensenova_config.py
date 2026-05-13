@@ -3,16 +3,26 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.omni.configs.registry import resolve_omni_model_key
 from sglang.omni.configs.sensenova_u1 import (
     SenseNovaU1OmniPlugin,
     _build_diffusion_server_kwargs,
     _parse_diffusion_server_args,
     _resolve_omni_max_concurrent_generations,
 )
-from sglang.omni.protocol import OmniInputSegment, OmniRequest
+from sglang.omni.core.protocol import OmniInputSegment, OmniRequest
 
 
 class TestSenseNovaU1OmniConfig(unittest.TestCase):
+    def test_registry_resolves_sensenova_u1_aliases(self):
+        self.assertEqual("sensenova-u1", resolve_omni_model_key(None))
+        self.assertEqual(
+            "sensenova-u1",
+            resolve_omni_model_key("sensenova/SenseNova-U1-8B-MoT"),
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported omni model"):
+            resolve_omni_model_key("other-model")
+
     def test_sampling_payload_request_metadata_is_split_before_sampling_build(self):
         plugin = SenseNovaU1OmniPlugin()
         request = OmniRequest(

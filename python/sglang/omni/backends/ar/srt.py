@@ -2,7 +2,7 @@
 """SRT-backed AR backend for omni orchestration.
 
 The backend translates generic omni requests into the lower-level
-`srt.omni_session` bridge. SRT remains the owner of sessions, tokenizer state,
+`srt.omni_session` session adapter. SRT remains the owner of sessions, tokenizer state,
 and KV cache; omni only receives context references and a narrow ContextOps
 view for generation-side execution.
 """
@@ -12,9 +12,14 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
-from sglang.omni.protocol import (
+from sglang.omni.core.interleaved import (
+    INTERLEAVED_BOUNDARY_MODALITY_KEY,
+    INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
+    STREAMED_TEXT_METADATA_KEY,
+)
+from sglang.omni.core.protocol import (
     ARBackend,
     ContextOps,
     GeneratedSegment,
@@ -25,8 +30,7 @@ from sglang.omni.protocol import (
     OmniRequest,
     TemporaryForwardPrepared,
 )
-from sglang.omni.streaming import STREAMED_TEXT_METADATA_KEY, OmniStreamSink
-from sglang.srt.omni_session.bridge import SRTBackedOmniSessionBridge
+from sglang.srt.omni_session.session_adapter import SRTBackedOmniSessionAdapter
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniVLMTextGenerationResult,
@@ -35,6 +39,9 @@ from sglang.srt.omni_session.runtime_types import (
     OmniContextBundle as SRTOmniContextBundle,
     OmniContextHandle as SRTOmniContextHandle,
 )
+
+if TYPE_CHECKING:
+    from sglang.omni.entrypoints.streaming import OmniStreamSink
 
 
 @dataclass(slots=True)
@@ -46,7 +53,7 @@ class _VLMBackendContext:
 class SRTBackedContextOps(ContextOps):
     """Expose live SRT context operations to a colocated generation backend."""
 
-    bridge: SRTBackedOmniSessionBridge
+    session_adapter: SRTBackedOmniSessionAdapter
     context: OmniContextBundle
 
     @property
@@ -55,7 +62,7 @@ class SRTBackedContextOps(ContextOps):
 
     @property
     def generation_kind(self) -> str | None:
-        return self.bridge.generation_kind
+        return self.session_adapter.generation_kind
 
     @property
     def session_id(self) -> str:
@@ -65,10 +72,10 @@ class SRTBackedContextOps(ContextOps):
         return session.session_id
 
     def get_role(self, name: str, default: str) -> str:
-        return self.bridge.get_condition_path_role(name, default)
+        return self.session_adapter.get_condition_path_role(name, default)
 
     def get_model(self) -> Any:
-        return self.bridge.runtime.srt_request_executor.get_srt_model()
+        return self.session_adapter.runtime.srt_request_executor.get_srt_model()
 
     def get_position_count(
         self,
@@ -76,7 +83,7 @@ class SRTBackedContextOps(ContextOps):
         condition_path_role: str | None = None,
     ) -> int | None:
         return (
-            self.bridge.runtime.srt_request_executor.get_latest_session_position_count(
+            self.session_adapter.runtime.srt_request_executor.get_latest_session_position_count(
                 self.session_id,
                 condition_path_role=condition_path_role,
             )
@@ -88,17 +95,17 @@ class SRTBackedContextOps(ContextOps):
         prepared: TemporaryForwardPrepared,
         forward: Callable[[Any], Any],
     ) -> Any:
-        return self.bridge.runtime.srt_request_executor.run_temporary_context_forward(
+        return self.session_adapter.runtime.srt_request_executor.run_temporary_context_forward(
             prepared=prepared,
             forward=forward,
         )
 
 
 class SRTARBackend(ARBackend):
-    """AR backend in an omni pipeline, which delegates AR-side work to an SRT-owned middle bridge."""
+    """AR backend that delegates AR-side work to an SRT-owned session adapter."""
 
-    def __init__(self, bridge: SRTBackedOmniSessionBridge):
-        self.bridge = bridge
+    def __init__(self, session_adapter: SRTBackedOmniSessionAdapter):
+        self.session_adapter = session_adapter
 
     def begin_request_context(
         self,
@@ -148,7 +155,7 @@ class SRTARBackend(ARBackend):
         stream_sink: OmniStreamSink | None = None,
     ) -> OmniContextBundle:
         context = _srt_context_bundle_to_omni(
-            self.bridge.prefill_and_decode_to_image_boundary(
+            self.session_adapter.prefill_and_decode_to_image_boundary(
                 messages=[_to_legacy_message(message) for message in request.messages],
                 think=request.think,
                 think_max_new_tokens=request.think_max_new_tokens,
@@ -168,12 +175,15 @@ class SRTARBackend(ARBackend):
     ) -> OmniBoundary:
         pending_boundaries = context.metadata.get("pending_boundaries")
         if pending_boundaries:
-            return pending_boundaries.pop(0)
-        return _decode_result_to_boundary(
-            self.bridge.continue_ar_decode(
-                contexts=_srt_backend_context(context),
-                stream_sink=stream_sink,
-            )
+            return _record_generation_boundary(context, pending_boundaries.pop(0))
+        return _record_generation_boundary(
+            context,
+            _decode_result_to_boundary(
+                self.session_adapter.continue_ar_decode(
+                    contexts=_srt_backend_context(context),
+                    stream_sink=stream_sink,
+                )
+            ),
         )
 
     def append_generated_segment(
@@ -185,7 +195,7 @@ class SRTARBackend(ARBackend):
     ) -> OmniContextBundle:
         if request.mode != "interleave":
             return context
-        self.bridge.commit_generated_segment(
+        self.session_adapter.commit_generated_segment(
             contexts=_srt_backend_context(context),
             segment=segment,
         )
@@ -194,22 +204,22 @@ class SRTARBackend(ARBackend):
             and request.max_text_segments == 0
         ):
             # 1. only force-close when the caller explicitly disables post-image AR
-            self.bridge.finish_generated_segment_turn(
+            self.session_adapter.finish_generated_segment_turn(
                 contexts=_srt_backend_context(context)
             )
         return context
 
     def get_context_ops(self, context: OmniContextBundle) -> SRTBackedContextOps:
-        return SRTBackedContextOps(self.bridge, context)
+        return SRTBackedContextOps(self.session_adapter, context)
 
     def release(self, context: OmniContextBundle) -> None:
         if _is_vlm_backend_context(context):
-            _release_vlm_context(self.bridge, context)
+            _release_vlm_context(self.session_adapter, context)
             return
-        self.bridge.release(_srt_backend_context(context))
+        self.session_adapter.release(_srt_backend_context(context))
 
     def _prefill_and_decode_vlm_answer(self, request: OmniRequest) -> OmniContextBundle:
-        result = self.bridge.generate_vlm_answer(
+        result = self.session_adapter.generate_vlm_answer(
             messages=[_to_legacy_message(message) for message in request.messages],
             max_new_tokens=_resolve_vlm_max_new_tokens(request),
         )
@@ -277,6 +287,28 @@ def _decode_result_to_boundary(boundary: OmniDecodeResult) -> OmniBoundary:
     )
 
 
+def _record_generation_boundary(
+    context: OmniContextBundle,
+    boundary: OmniBoundary,
+) -> OmniBoundary:
+    if boundary.type not in {"image", "audio", "video"}:
+        return boundary
+    metadata = dict(boundary.metadata)
+    metadata.setdefault(INTERLEAVED_BOUNDARY_MODALITY_KEY, boundary.type)
+    context.metadata[INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY] = metadata
+    backend_context = context.backend_context
+    if isinstance(backend_context, SRTOmniContextBundle):
+        backend_context.full.metadata[
+            INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY
+        ] = metadata
+    return OmniBoundary(
+        type=boundary.type,
+        text=boundary.text,
+        token_ids=boundary.token_ids,
+        metadata=metadata,
+    )
+
+
 def _srt_context_bundle_to_omni(context: SRTOmniContextBundle) -> OmniContextBundle:
     return OmniContextBundle(
         full=_srt_context_handle_to_omni(context.full),
@@ -316,13 +348,13 @@ def _is_vlm_backend_context(context: OmniContextBundle) -> bool:
 
 
 def _release_vlm_context(
-    bridge: SRTBackedOmniSessionBridge,
+    session_adapter: SRTBackedOmniSessionAdapter,
     context: OmniContextBundle,
 ) -> None:
     backend_context = context.backend_context
     if not isinstance(backend_context, _VLMBackendContext):
         return
-    bridge.runtime.close_session(backend_context.result.session)
+    session_adapter.runtime.close_session(backend_context.result.session)
 
 
 def _resolve_vlm_max_new_tokens(request: OmniRequest) -> int:
@@ -365,7 +397,14 @@ def _initial_boundaries(
     if not context.full.metadata.get("pre_image_reached_image_marker", True):
         boundaries.append(OmniBoundary(type="done"))
         return boundaries
-    boundaries.append(OmniBoundary(type="image"))
+    boundaries.append(
+        OmniBoundary(
+            type="image",
+            metadata=dict(
+                context.full.metadata.get("pre_image_boundary_metadata") or {}
+            ),
+        )
+    )
     if mode != "interleave":
         boundaries.append(OmniBoundary(type="done"))
     return boundaries

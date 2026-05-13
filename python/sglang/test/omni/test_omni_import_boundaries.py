@@ -22,8 +22,8 @@ class TestOmniImportBoundaries(unittest.TestCase):
                 PYTHON_ROOT / "sglang" / "srt",
                 (
                     "sglang.omni.configs",
-                    "sglang.omni.coordinator",
-                    "sglang.omni.models",
+                    "sglang.omni.core.coordinator",
+                    "sglang.omni.model_adapters.sensenova_u1.session_adapter",
                 ),
             ),
         ]
@@ -36,6 +36,22 @@ class TestOmniImportBoundaries(unittest.TestCase):
                 )
 
                 self.assertEqual([], _format_violations(violations))
+
+    def test_omni_runtime_is_model_agnostic(self):
+        root = PYTHON_ROOT / "sglang" / "omni" / "runtime"
+        forbidden_patterns = ("sensenova", "SenseNova", "U1", "u1")
+        violations = []
+        for path in sorted(root.rglob("*.py")):
+            if _is_test_or_cache_path(path):
+                continue
+            text = path.read_text(encoding="utf-8-sig")
+            for pattern in forbidden_patterns:
+                if pattern in text:
+                    violations.append(
+                        f"{path.relative_to(REPO_ROOT)} contains {pattern}"
+                    )
+
+        self.assertEqual([], violations)
 
 
 def _find_imports(root: Path, *, forbidden_prefixes: tuple[str, ...]):

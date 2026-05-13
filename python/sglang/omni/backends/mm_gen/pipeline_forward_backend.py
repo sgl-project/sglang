@@ -15,7 +15,7 @@ from typing import Any
 
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.omni.protocol import (
+from sglang.omni.core.protocol import (
     ContextOps,
     GeneratedSegment,
     MultimodalGenerationBackend,
@@ -67,7 +67,7 @@ def require_generated_segment(segment: object) -> GeneratedSegment:
     if isinstance(segment, GeneratedSegment):
         return segment
     raise TypeError(
-        "Generation backend must return sglang.omni.protocol.GeneratedSegment"
+        "Generation backend must return sglang.omni.core.protocol.GeneratedSegment"
     )
 
 

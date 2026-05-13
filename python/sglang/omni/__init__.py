@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Public omni orchestration API."""
 
-from sglang.omni.coordinator import OmniCoordinator
-from sglang.omni.protocol import (
+from sglang.omni.core.coordinator import OmniCoordinator
+from sglang.omni.core.protocol import (
     GeneratedSegment,
     OmniBoundary,
     OmniContextBundle,

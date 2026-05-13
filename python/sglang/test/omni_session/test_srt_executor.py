@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.omni.protocol import TemporaryForwardPrepared
-from sglang.omni.scheduler_state import OmniSchedulerState
+from sglang.omni.core.protocol import TemporaryForwardPrepared
+from sglang.omni.runtime.srt_scheduler_state import OmniSchedulerState
 from sglang.srt.omni_session.srt_executor import (
     OmniSRTSchedulerExecutor,
     OmniSRTSchedulerExecutorError,

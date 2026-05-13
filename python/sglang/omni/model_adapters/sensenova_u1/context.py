@@ -3,8 +3,8 @@
 
 These helpers encode U1's model-specific token grammar: image markers,
 `<IMG_CONTEXT>` spans, multimodal offsets, and generated-image commits. They
-live in the omni bridge package because they are model-specific glue, while
-the returned prepared inputs remain SRT-owned runtime objects.
+live in the U1 model adapter because they are model-specific glue, while the
+returned prepared inputs remain SRT-owned runtime objects.
 """
 
 import math
@@ -402,9 +402,10 @@ def build_u1_native_t2i_prepared_input(
     tokenizer: Any,
     messages: list[OmniInterleavedMessage],
     session: Any | None = None,
+    think_mode: bool = False,
 ) -> OmniSRTPreparedInput:
     prompt_text = _u1_question_text(messages)
-    prompt = build_u1_t2i_prompt(prompt=prompt_text)
+    prompt = build_u1_t2i_prompt(prompt=prompt_text, think_mode=think_mode)
     input_ids = _u1_tokenize_to_ids(
         tokenizer,
         prompt,
@@ -413,7 +414,7 @@ def build_u1_native_t2i_prepared_input(
     if not input_ids:
         raise RuntimeError("U1 native T2I prompt produced no input ids")
     img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
-    if img_start_id not in input_ids:
+    if not think_mode and img_start_id not in input_ids:
         raise RuntimeError("U1 native T2I prompt did not contain <img> token")
     return OmniSRTPreparedInput(
         input_ids=input_ids,
@@ -425,6 +426,7 @@ def build_u1_native_t2i_prepared_input(
                     "segment_type": "t2i",
                     "source": "native_t2i_prompt",
                     "prompt_ends_with_image_marker": input_ids[-1] == img_start_id,
+                    "think_mode": bool(think_mode),
                 },
                 "omni_model_state_updates": {
                     "u1": {
@@ -432,6 +434,7 @@ def build_u1_native_t2i_prepared_input(
                         "last_source": "native_t2i_prompt",
                         "native_t2i_prompt": True,
                         "open_image_marker": input_ids[-1] == img_start_id,
+                        "t2i_think_mode": bool(think_mode),
                         "session_id": _u1_session_id(session),
                     }
                 },
@@ -445,6 +448,7 @@ def build_u1_native_edit_prepared_input(
     tokenizer: Any,
     messages: list[OmniInterleavedMessage],
     session: Any | None = None,
+    think_mode: bool = False,
 ) -> OmniSRTPreparedInput:
     image = _first_u1_image_content(messages)
     prompt_text = _u1_question_text(messages)
@@ -456,7 +460,7 @@ def build_u1_native_edit_prepared_input(
         max_pixels=2048 * 2048,
         upscale=False,
     )
-    prompt = build_u1_t2i_prompt(prompt=prompt_text)
+    prompt = build_u1_t2i_prompt(prompt=prompt_text, think_mode=think_mode)
     prompt = _replace_u1_image_placeholders(prompt, grid_hw)
     input_ids = _u1_tokenize_to_ids(
         tokenizer,
@@ -474,13 +478,15 @@ def build_u1_native_edit_prepared_input(
 
     from sglang.srt.models.sensenova_u1 import build_u1_vlm_thw_indexes
 
+    img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
     positions = build_u1_vlm_thw_indexes(
         input_ids,
         grid_hw=grid_hw,
-        img_start_token_id=tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN),
+        img_start_token_id=img_start_id,
         img_context_token_id=context_id,
     )
     generation_position_start = int(positions[0].max().item()) + 1
+    position_ids = positions.t().contiguous().tolist()
     image_offsets = [(selected[0], selected[-1])]
     mm_inputs = _u1_multimodal_inputs(
         pixel_values=pixel_values,
@@ -491,6 +497,7 @@ def build_u1_native_edit_prepared_input(
         input_ids=input_ids,
         input_text=prompt,
         messages=list(messages),
+        position_ids=position_ids,
         mm_inputs=mm_inputs,
         policy_metadata=_u1_policy_metadata(
             {
@@ -501,6 +508,7 @@ def build_u1_native_edit_prepared_input(
                     "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
                     "image_offsets": image_offsets,
                     "generation_position_start": generation_position_start,
+                    "think_mode": bool(think_mode),
                 },
                 "omni_model_state_updates": {
                     "u1": {
@@ -508,6 +516,9 @@ def build_u1_native_edit_prepared_input(
                         "last_source": "native_edit_prompt",
                         "native_edit_prompt": True,
                         "generation_position_start": generation_position_start,
+                        "edit_think_mode": bool(think_mode),
+                        "open_image_marker": (not think_mode)
+                        and input_ids[-1] == img_start_id,
                         "session_id": _u1_session_id(session),
                     }
                 },
@@ -599,6 +610,7 @@ def _build_u1_native_image_condition_path_prepared_input(
         img_context_token_id=context_id,
     )
     generation_position_start = int(positions[0].max().item()) + 1
+    position_ids = positions.t().contiguous().tolist()
     image_offsets = [(selected[0], selected[-1])]
     mm_inputs = _u1_multimodal_inputs(
         pixel_values=pixel_values,
@@ -609,6 +621,7 @@ def _build_u1_native_image_condition_path_prepared_input(
         input_ids=input_ids,
         input_text=prompt,
         messages=[OmniInterleavedMessage(type="image", content=image)],
+        position_ids=position_ids,
         mm_inputs=mm_inputs,
         condition_path_role=role,
         condition_path_session_id=_u1_condition_path_session_id(session, role),
@@ -795,13 +808,14 @@ def _build_u1_native_marker_condition_path_prepared_input(
     )
 
 
-def build_u1_t2i_prompt(*, prompt: str) -> str:
-    return (
+def build_u1_t2i_prompt(*, prompt: str, think_mode: bool = False) -> str:
+    query = (
         f"<|im_start|>system\n{U1_SYSTEM_MESSAGE_FOR_GEN}<|im_end|>\n"
         f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-        "<think>\n\n</think>\n\n"
-        f"{U1_IMG_START_TOKEN}"
     )
+    if think_mode:
+        return query + "<think>\n"
+    return query + "<think>\n\n</think>\n\n" + U1_IMG_START_TOKEN
 
 
 def build_u1_interleave_prompt(

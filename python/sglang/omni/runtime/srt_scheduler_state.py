@@ -1,4 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+"""SRT scheduler-side state for omni serve-time tasks.
+
+This module belongs to `sglang.omni.runtime`: it tracks request transport,
+conversation records, and scheduler-thread handoff. It intentionally does not
+own ModelRunner KV/session execution; that lower layer is
+`sglang.srt.omni_session.runtime`.
+"""
 
 from __future__ import annotations
 
@@ -9,10 +16,10 @@ from queue import Empty, Queue
 from threading import Condition, Event, RLock, Thread, get_ident
 from typing import TYPE_CHECKING, Any, Callable
 
-from sglang.omni.protocol import OmniContextBundle
+from sglang.omni.core.protocol import OmniContextBundle
 
 if TYPE_CHECKING:
-    from sglang.omni.coordinator import OmniCoordinator
+    from sglang.omni.core.coordinator import OmniCoordinator
     from sglang.srt.managers.io_struct import (
         OmniGenerateReqInput,
         OmniGenerateReqOutput,
@@ -39,6 +46,7 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class OmniSessionRecord:
     context: OmniContextBundle
+    orchestrator_key: str
     turns: int
     created_at: float
     updated_at: float
@@ -120,7 +128,7 @@ class OmniSchedulerExclusiveLease:
 
 @dataclass(slots=True)
 class OmniSchedulerState:
-    """Scheduler-local state for async omni tasks and native SRT req handoff."""
+    """Scheduler-local state for omni transport and native SRT req handoff."""
 
     orchestrators: dict[str, "OmniCoordinator"] = field(default_factory=dict)
     sessions: dict[str, OmniSessionRecord] = field(default_factory=dict)
@@ -361,10 +369,10 @@ class OmniSchedulerState:
     def _run_omni_generate_task(
         self, scheduler: "Scheduler", recv_req: "OmniGenerateReqInput"
     ) -> None:
-        from sglang.omni.srt_transport import (
+        from sglang.omni.runtime.srt_transport import (
             handle_omni_generate_with_omni_coordinator,
         )
-        from sglang.omni.streaming import OmniStreamSink
+        from sglang.omni.entrypoints.streaming import OmniStreamSink
         from sglang.srt.managers.io_struct import (
             OmniGenerateReqOutput,
             OmniGenerateStreamOutput,

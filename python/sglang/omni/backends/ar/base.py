@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fallback autoregressive backend used when no AR runtime is configured."""
 
-from sglang.omni.protocol import (
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from sglang.omni.core.protocol import (
     ARBackend,
     GeneratedSegment,
     OmniBoundary,
     OmniContextBundle,
     OmniRequest,
 )
-from sglang.omni.streaming import OmniStreamSink
+
+if TYPE_CHECKING:
+    from sglang.omni.entrypoints.streaming import OmniStreamSink
 
 
 class UnsupportedARBackend(ARBackend):

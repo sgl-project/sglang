@@ -11,11 +11,11 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
-from sglang.omni.protocol import TemporaryForwardPrepared
+from sglang.omni.core.protocol import TemporaryForwardPrepared
 from sglang.srt.omni_session.runtime_types import OmniSRTKVTokenBinding
 
 if TYPE_CHECKING:
-    from sglang.omni.scheduler_state import OmniSchedulerExclusiveLease
+    from sglang.omni.runtime.srt_scheduler_state import OmniSchedulerExclusiveLease
     from sglang.srt.managers.io_struct import OpenSessionReqInput, OpenSessionReqOutput
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
