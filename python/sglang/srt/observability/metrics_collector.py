@@ -589,10 +589,14 @@ class SchedulerMetricsCollector:
             documentation="Histogram of queueing time in seconds.",
             labelnames=labels.keys(),
             buckets=[
-                0.0,
-                0.1,
-                0.2,
-                0.5,
+                0.000,
+                0.001,
+                0.005,
+                0.010,
+                0.050,
+                0.100,
+                0.200,
+                0.500,
                 1,
                 2,
                 3,
@@ -1318,6 +1322,14 @@ class TokenizerMetricsCollector:
                 server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
             ),
         )
+        self.uncached_prompt_tokens_histogram = Histogram(
+            name="sglang:uncached_prompt_tokens_histogram",
+            documentation="Histogram of uncached (compute) prompt token length.",
+            labelnames=labels.keys(),
+            buckets=generate_buckets(
+                server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
+            ),
+        )
         self.generation_tokens_histogram = Histogram(
             name="sglang:generation_tokens_histogram",
             documentation="Histogram of generation token length.",
@@ -1491,6 +1503,9 @@ class TokenizerMetricsCollector:
             self.num_so_requests_total.labels(**labels).inc(1)
         self.histogram_e2e_request_latency.labels(**labels).observe(float(e2e_latency))
         self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
+        self.uncached_prompt_tokens_histogram.labels(**labels).observe(
+            float(prompt_tokens - cached_tokens)
+        )
         self.generation_tokens_histogram.labels(**labels).observe(
             float(generation_tokens)
         )
