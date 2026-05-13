@@ -220,14 +220,16 @@ class SchedulerOutputProcessorMixin:
                     )
                 if logits_output.next_token_top_logprobs_val:
                     logits_output.next_token_top_logprobs_val = [
-                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                        v.tolist() if isinstance(v, torch.Tensor) else v
+                        for v in logits_output.next_token_top_logprobs_val
                     ]
                     logits_output.next_token_top_logprobs_idx = [
-                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                        x.tolist() if isinstance(x, torch.Tensor) else x
+                        for x in logits_output.next_token_top_logprobs_idx
                     ]
                 if logits_output.next_token_token_ids_logprobs_val:
                     logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
+                        v.tolist() if isinstance(v, torch.Tensor) else v
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
 
@@ -497,15 +499,17 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
                 if logits_output.next_token_top_logprobs_val:
                     logits_output.next_token_top_logprobs_val = [
-                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                        v.tolist() if isinstance(v, torch.Tensor) else v
+                        for v in logits_output.next_token_top_logprobs_val
                     ]
                     logits_output.next_token_top_logprobs_idx = [
-                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                        x.tolist() if isinstance(x, torch.Tensor) else x
+                        for x in logits_output.next_token_top_logprobs_idx
                     ]
 
                 if logits_output.next_token_token_ids_logprobs_val:
                     logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
+                        v.tolist() if isinstance(v, torch.Tensor) else v
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
         # else: Spec V1 — output_ids, check_finished, grammar, and reasoning tokens
