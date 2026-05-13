@@ -1,3 +1,4 @@
+import heapq
 import logging
 from typing import Any, Dict, List, Optional, Union
 
@@ -593,11 +594,11 @@ class OpenAIServingRerank(OpenAIServingBase):
                     )
                 )
 
-        # Sort by score in descending order (highest relevance first)
+        # When top_n is set, nlargest avoids fully sorting the candidate list
+        # (O(N log top_n) vs O(N log N)) — meaningful for large rerank batches.
+        # Validator (V1RerankReqInput.validate_top_n) guarantees top_n >= 1.
+        if request.top_n is not None:
+            return heapq.nlargest(request.top_n, responses, key=lambda x: x.score)
+
         responses.sort(key=lambda x: x.score, reverse=True)
-
-        # Apply top_n limit if specified
-        if request.top_n is not None and request.top_n > 0:
-            responses = responses[: request.top_n]
-
         return responses
