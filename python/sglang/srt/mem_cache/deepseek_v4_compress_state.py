@@ -75,31 +75,6 @@ class KVAndScore:
         return KVAndScore(torch.cat([v.kv_score for v in tensors], dim=dim))
 
 
-class DeepSeekV4CompressState:
-    def __init__(
-        self,
-        max_num_reqs: int,
-        ratio: int,
-        overlap: bool,
-        head_dim: int,
-        device: str,
-        dtype: torch.dtype,
-    ):
-        self.max_num_reqs = max_num_reqs
-        self.ratio = ratio
-        self.overlap = overlap
-        self.head_dim = head_dim
-        self.device = device
-        self.dtype = dtype
-        coff = 1 + self.overlap
-
-        state_shape = (max_num_reqs + 1, ratio * coff, 2 * head_dim * coff)
-        self.kv_score_state = torch.zeros(state_shape, dtype=dtype, device=device)
-
-    def get_state(self) -> KVAndScore:
-        return KVAndScore(self.kv_score_state)
-
-
 class CompressStatePool:
     def __init__(
         self,

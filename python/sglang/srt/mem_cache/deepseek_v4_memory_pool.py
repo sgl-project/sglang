@@ -22,7 +22,9 @@ from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
 
-ONLINE_C128 = not is_hip() and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+_is_hip = is_hip()
+
+ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
 def get_compress_state_ring_size(
@@ -456,7 +458,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self.c4_indexer_kv_pool = DeepSeekV4IndexerPool(
-            c4_size,
+            self.c4_logical_size if not _is_hip else c4_size,
             c4_page_size,
             dtype,
             indexer_head_dim,
@@ -467,7 +469,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_compressed_layer_mapping()
 
-        if is_hip():
+        if _is_hip:
             self._init_paged_compress_states(False)
         else:
             self._init_paged_compress_states(enable_memory_saver)
