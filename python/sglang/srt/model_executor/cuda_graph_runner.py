@@ -1425,7 +1425,10 @@ class CudaGraphRunner:
 
                 capture_mode = (
                     CaptureHiddenMode.NULL
-                    if self.model_runner.spec_algorithm.is_standalone()
+                    if (
+                        self.model_runner.spec_algorithm.is_standalone()
+                        or self.model_runner.spec_algorithm.is_decoupled_verify()
+                    )
                     else CaptureHiddenMode.FULL
                 )
                 spec_info = EagleVerifyInput(

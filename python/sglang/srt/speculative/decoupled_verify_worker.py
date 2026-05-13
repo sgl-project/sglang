@@ -351,7 +351,7 @@ class VerifyWorker:
             spec_steps=spec_steps,
             topk=1,
             draft_token_num=draft_token_num,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
             seq_lens_sum=seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
         )
@@ -421,7 +421,9 @@ class VerifyWorker:
         )
 
         start_ns = self._trace_timestamp_ns()
-        spec_info.hidden_states = logits_output.hidden_states
+        # Decoupled verify has no local draft-extend consumer for target hidden
+        # states, but EagleVerifyInput.verify expects this attribute to exist.
+        spec_info.hidden_states = None
         verify_output: EagleVerifyOutput = spec_info.verify(
             batch,
             logits_output,
