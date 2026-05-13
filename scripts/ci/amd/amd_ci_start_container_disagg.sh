@@ -334,3 +334,25 @@ docker run -dt --user root \
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
 # setuptools-scm / vcs_versioning can resolve the package version.
 docker exec ci_sglang git config --global --add safe.directory /sglang-checkout
+
+# Inspect /sgl-data from inside the container so the CI log shows where
+# the persistent cache actually lives. The host-side `[[ -d "$CACHE_HOST" ]]`
+# probe above only sees paths the runner pod itself can stat; it cannot
+# detect cache that arrives via k8s pod-level hostPath, docker daemon
+# defaults, or an image layer. This block is the source of truth.
+docker exec ci_sglang sh -c '
+  echo "=== /sgl-data inspection (inside container) ==="
+  if mountpoint -q /sgl-data 2>/dev/null; then
+    echo "  Status: BIND MOUNT (persistent across job runs)"
+    findmnt -T /sgl-data 2>/dev/null || true
+  elif [ -d /sgl-data ]; then
+    echo "  Status: directory exists but NOT a mount point"
+    echo "         (image layer or external mount applied without our -v)"
+  else
+    echo "  Status: /sgl-data does NOT exist (HF cache will be ephemeral)"
+  fi
+  if [ -d /sgl-data/hf-cache/hub ]; then
+    n=$(ls /sgl-data/hf-cache/hub 2>/dev/null | grep -c "^models--" || true)
+    echo "  hf-cache/hub: ${n} cached model dir(s)"
+  fi
+'
