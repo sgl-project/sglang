@@ -467,6 +467,7 @@ jobs:
       job_display_name: Build Wheel
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   sgl-kernel-build-wheels-arm:
@@ -492,6 +493,7 @@ jobs:
       arch_suffix: '-aarch64'
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   call-sgl-kernel-tests:

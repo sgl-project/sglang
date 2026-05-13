@@ -27,6 +27,25 @@ on:
       git_ref:
         type: string
         default: ''
+      skip_stage_health_check:
+        description: 'Forwarded from the caller workflow input of the same name. Not consumed inside this reusable workflow today, but mirrored so the resulting env context matches the inline-job baseline.'
+        type: boolean
+        default: false
+
+# Mirror the caller workflow's top-level env block. GitHub Actions does NOT
+# automatically inherit workflow-level env vars across the workflow_call
+# boundary, so anything pr-test.yml defines must be redeclared here for the
+# reusable jobs to see the same context. Most of these are not read by the
+# wheel-build path, but PR_TEST_BYPASS_MAINTENANCE_ON_MAIN is consumed by the
+# check-maintenance composite action and would otherwise be unset.
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check && 'true' || 'false' }}
+  FORCE_REBUILD_DEEPEP: '1'
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  USE_VENV: false
 
 jobs:
   build:
