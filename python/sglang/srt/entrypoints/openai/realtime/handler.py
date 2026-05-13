@@ -9,20 +9,16 @@ import asyncio
 import logging
 
 from fastapi import WebSocket, WebSocketDisconnect
+from openai.types.realtime import RealtimeErrorEvent
+from openai.types.realtime.realtime_error import RealtimeError
 
-from sglang.srt.entrypoints.openai.realtime.protocol import (
-    CODE_INFERENCE_FAILED,
-    CODE_NOT_SUPPORTED,
-    ERROR_TYPE_INVALID_REQUEST,
-    ERROR_TYPE_SERVER,
-    format_error_envelope,
-)
 from sglang.srt.entrypoints.openai.realtime.session import RealtimeConnection
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import random_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +44,7 @@ async def _reject_before_session(
     code: str,
     message: str,
     *,
-    error_type: str = ERROR_TYPE_INVALID_REQUEST,
+    error_type: str = "invalid_request_error",
 ) -> None:
     """Accept, send a wire error envelope, close. Each step is best-effort."""
     try:
@@ -57,10 +53,12 @@ async def _reject_before_session(
         logger.debug("[realtime] reject: accept failed: %s", e)
         return
     logger.info("[realtime] rejected (%s)", code)
-    await _safe_send(
-        websocket,
-        format_error_envelope(code, message, error_type=error_type),
+    envelope = RealtimeErrorEvent(
+        event_id=f"event_{random_uuid()}",
+        type="error",
+        error=RealtimeError(type=error_type, code=code, message=message),
     )
+    await _safe_send(websocket, envelope.model_dump_json())
     await _safe_close(websocket)
 
 
@@ -83,7 +81,7 @@ async def handle_realtime_transcription(
     if not adapter.supports_chunked_streaming:
         await _reject_before_session(
             websocket,
-            CODE_NOT_SUPPORTED,
+            "not_supported",
             "Model does not support streaming ASR",
         )
         return
@@ -101,29 +99,30 @@ async def handle_realtime_transcription(
         )
         return
 
-    await session_semaphore.acquire()
-    try:
+    async with session_semaphore:
         try:
-            await websocket.accept()
-        except (WebSocketDisconnect, RuntimeError) as e:
-            logger.debug("[realtime] accept failed: %s", e)
-            return
-        connection = RealtimeConnection(
-            websocket, tokenizer_manager, adapter, server_args
-        )
-        await connection.run()
-    except WebSocketDisconnect:
-        logger.info("[realtime] client disconnected (normal)")
-    except Exception:
-        logger.exception("[realtime] unexpected error in session")
-        await _safe_send(
-            websocket,
-            format_error_envelope(
-                CODE_INFERENCE_FAILED,
-                "Internal server error",
-                error_type=ERROR_TYPE_SERVER,
-            ),
-        )
-    finally:
-        session_semaphore.release()
-        await _safe_close(websocket)
+            try:
+                await websocket.accept()
+            except (WebSocketDisconnect, RuntimeError) as e:
+                logger.debug("[realtime] accept failed: %s", e)
+                return
+            connection = RealtimeConnection(
+                websocket, tokenizer_manager, adapter, server_args
+            )
+            await connection.run()
+        except WebSocketDisconnect:
+            logger.info("[realtime] client disconnected (normal)")
+        except Exception:
+            logger.exception("[realtime] unexpected error in session")
+            envelope = RealtimeErrorEvent(
+                event_id=f"event_{random_uuid()}",
+                type="error",
+                error=RealtimeError(
+                    type="server_error",
+                    code="inference_failed",
+                    message="Internal server error",
+                ),
+            )
+            await _safe_send(websocket, envelope.model_dump_json())
+        finally:
+            await _safe_close(websocket)
