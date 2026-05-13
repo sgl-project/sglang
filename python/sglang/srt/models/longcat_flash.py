@@ -271,37 +271,45 @@ class LongcatFlashMoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.router(hidden_states)
-        topk_weights, topk_idx, _ = self.topk(
-            hidden_states,
-            router_logits,
-        )
-        if self.zero_expert_type is not None:
-            if not _is_npu:
-                zero_expert_result = zero_experts_compute_triton(
-                    expert_indices=topk_idx,
-                    expert_scales=topk_weights,
-                    num_experts=self.num_experts,
-                    zero_expert_type=self.zero_expert_type,
-                    hidden_states=hidden_states,
-                )
-            else:
-                identity_mask_value = -1 if get_moe_a2a_backend().is_deepep() else 0
-                zero_expert_result = zero_experts_compute_identity_triton(
-                    expert_indices=topk_idx,
-                    expert_scales=topk_weights,
-                    num_experts=self.num_experts,
-                    zero_expert_type=self.zero_expert_type,
-                    hidden_states=hidden_states,
-                    identity_mask_value=identity_mask_value,
-                )
-        topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
+        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.router(hidden_states)
+            topk_weights, topk_idx, _ = self.topk(
+                hidden_states,
+                router_logits,
+            )
+            if self.zero_expert_type is not None:
+                if not _is_npu:
+                    zero_expert_result = zero_experts_compute_triton(
+                        expert_indices=topk_idx,
+                        expert_scales=topk_weights,
+                        num_experts=self.num_experts,
+                        zero_expert_type=self.zero_expert_type,
+                        hidden_states=hidden_states,
+                    )
+                else:
+                    identity_mask_value = -1 if get_moe_a2a_backend().is_deepep() else 0
+                    zero_expert_result = zero_experts_compute_identity_triton(
+                        expert_indices=topk_idx,
+                        expert_scales=topk_weights,
+                        num_experts=self.num_experts,
+                        zero_expert_type=self.zero_expert_type,
+                        hidden_states=hidden_states,
+                        identity_mask_value=identity_mask_value,
+                    )
+            topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
         final_hidden_states *= self.routed_scaling_factor
 
-        if self.tp_size > 1 and get_moe_a2a_backend().is_deepep():
+        if (
+            self.tp_size > 1
+            and get_moe_a2a_backend().is_deepep()
+            and self.zero_expert_type is not None
+            and hidden_states.shape[0] > 0
+        ):
             zero_expert_result *= self.tp_size
 
         if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
