@@ -437,6 +437,7 @@ class ServerArgs:
     prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
     prefill_delayer_queue_min_ratio: Optional[float] = None
     prefill_delayer_max_delay_ms: Optional[float] = None
+    prefill_delayer_check_interval: int = 1
 
     # Runtime options
     device: Optional[str] = None
@@ -4901,6 +4902,17 @@ class ServerArgs:
                 "is force-released to bound worst-case TTFT. Only consulted when "
                 "--prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ 5000; defaults to "
                 "5000 if unset."
+            ),
+        )
+        parser.add_argument(
+            "--prefill-delayer-check-interval",
+            type=int,
+            default=ServerArgs.prefill_delayer_check_interval,
+            help=(
+                "Run the cross-rank prefill-delayer negotiation (an all-gather) once every N "
+                "scheduler steps; on intervening steps prefill is delayed without a collective. "
+                "Default 1 preserves per-step behavior; increase to reduce gloo/NCCL overhead at "
+                "the cost of up to N-1 extra forward passes of TTFT latency."
             ),
         )
 

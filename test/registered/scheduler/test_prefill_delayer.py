@@ -65,6 +65,11 @@ class NegotiateTestCase:
     # to exercise the legacy slot-only code paths.
     queue_min_ratio: Optional[float] = None
     max_delay_ms: Optional[float] = None
+    check_interval: int = 1
+    # Optional per-call expectations; when set, each entry is checked against
+    # the corresponding call. The trailing call must still match
+    # expected_allow / expected_reason.
+    expected_per_call: Optional[List[tuple]] = None
 
 
 def _run_negotiate_test(rank, test_cases):
@@ -82,12 +87,13 @@ def _run_negotiate_test(rank, test_cases):
                 disable_overlap_schedule=False,
                 prefill_delayer_queue_min_ratio=case.queue_min_ratio,
                 prefill_delayer_max_delay_ms=case.max_delay_ms,
+                prefill_delayer_check_interval=case.check_interval,
             ),
             max_delay_passes=case.max_delay_passes,
             token_usage_low_watermark=case.token_usage_low_watermark,
         )
 
-        for call in case.calls:
+        for call_idx, call in enumerate(case.calls):
             if call.sleep_before_s > 0:
                 time.sleep(call.sleep_before_s)
 
@@ -106,6 +112,13 @@ def _run_negotiate_test(rank, test_cases):
                 token_usage=call.token_usage[rank],
                 **extra_kwargs,
             )
+
+            if case.expected_per_call is not None:
+                expected = case.expected_per_call[call_idx]
+                assert (result.output_allow, result.output_reason) == expected, (
+                    f"Case {case.name} rank {rank} call {call_idx}: "
+                    f"got ({result.output_allow}, {result.output_reason}), expected {expected}"
+                )
 
         assert (result.output_allow, result.output_reason) == (
             case.expected_allow,
@@ -299,6 +312,69 @@ _NEGOTIATE_TEST_CASES = [
                 waiting_queue_len=[1, 1, 1, 1],
                 max_running_requests=1024,
             )
+        ],
+        expected_allow=True,
+        expected_reason="no_wait",
+    ),
+    # check_interval > 1: only the 1st and (1+N)th calls run the cross-rank
+    # all-gather. Intervening calls short-circuit to delay/skipped_check
+    # without touching the collective. With check_interval=3, an all-
+    # prefillable workload sees: call0=allow, call1=skip, call2=skip,
+    # call3=allow.
+    NegotiateTestCase(
+        name="check_interval_skips_between_real_checks",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        check_interval=3,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            ),
+        ],
+        expected_per_call=[
+            (True, "no_wait"),
+            (False, "skipped_check"),
+            (False, "skipped_check"),
+            # Real check sees the prev_state left over from the skipped
+            # delays and reports a successful wait.
+            (True, "wait_success"),
+        ],
+        expected_allow=True,
+        expected_reason="wait_success",
+    ),
+    # check_interval=1 is identical to legacy behavior: every call runs the
+    # gather and there are no skipped_check outputs.
+    NegotiateTestCase(
+        name="check_interval_one_is_legacy",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        check_interval=1,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            ),
+        ],
+        expected_per_call=[
+            (True, "no_wait"),
+            (True, "no_wait"),
         ],
         expected_allow=True,
         expected_reason="no_wait",
