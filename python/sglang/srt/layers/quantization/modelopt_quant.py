@@ -39,11 +39,6 @@ from sglang.srt.layers.quantization.fp4_utils import (
     fp4_quantize,
     get_fp4_gemm_runner_backend,
 )
-from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-    apply_fp4_marlin_linear,
-    prepare_fp4_layer_for_marlin,
-    prepare_moe_nvfp4_layer_for_marlin,
-)
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -51,6 +46,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    apply_fp4_marlin_linear,
+    prepare_fp4_layer_for_marlin,
+    prepare_moe_nvfp4_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -2033,7 +2033,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.MARLIN
             else:
                 # TRTLLM is currently the most performant and tested FP4 MoE
-                # backend on Blackwell, so use it as the default there.
+                # backend, so use it as the default.
                 moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
 
         self._moe_runner_backend = moe_runner_backend

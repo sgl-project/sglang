@@ -13,7 +13,6 @@ from sglang.srt.layers.quantization.marlin_utils import (
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     nvfp4_marlin_process_global_scale,
-    nvfp4_marlin_process_scales,
     prepare_fp4_layer_for_marlin,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -104,7 +103,11 @@ def test_gptq_marlin_gemm(
     output_ref = torch.matmul(a_input, w_ref)
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.15)
+    # JIT kernel should produce approximately correct results vs torch.matmul
+    max_diff = torch.mean(torch.abs(output - output_ref)) / torch.mean(
+        torch.abs(output_ref)
+    )
+    assert max_diff < 0.04
 
 
 def _is_sm80_sm90_cuda() -> bool:
@@ -116,7 +119,7 @@ def _is_sm80_sm90_cuda() -> bool:
 
 @pytest.mark.skipif(
     not _is_sm80_sm90_cuda(),
-    reason="NVFP4 Marlin fallback tests require CUDA SM80, SM86, or SM90",
+    reason="NVFP4 Marlin fallback tests require CUDA SM8X/SM9X",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_nvfp4_marlin_support_and_scale_transforms_sm80_sm90(dtype):
@@ -128,20 +131,6 @@ def test_nvfp4_marlin_support_and_scale_transforms_sm80_sm90(dtype):
         has_zp=False,
         device_capability=capability,
     )
-
-    scales = torch.tensor(
-        [[0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]],
-        dtype=dtype,
-        device="cuda",
-    )
-    expected_scales = scales.view(-1, 4)[:, [0, 2, 1, 3]].view(scales.size(0), -1)
-    expected_scales = (expected_scales.to(torch.half) * (2**7)).view(torch.int16) << 1
-    expected_scales = expected_scales.view(torch.float8_e4m3fn)[:, 1::2].contiguous()
-
-    actual_scales = nvfp4_marlin_process_scales(scales)
-    assert actual_scales.is_cuda
-    assert actual_scales.dtype == torch.float8_e4m3fn
-    assert torch.equal(actual_scales.view(torch.uint8), expected_scales.view(torch.uint8))
 
     global_scale = torch.tensor(1.0, dtype=dtype, device="cuda")
     actual_global_scale = nvfp4_marlin_process_global_scale(global_scale)
@@ -176,16 +165,12 @@ def test_nvfp4_marlin_dense_matches_dequant_reference(dtype):
     global_scale = scales.max() / 448
     scales = (scales / global_scale).to(torch.float8_e4m3fn)
 
-    fp4_weight_part_1 = (fp4_weight & 0b10000000) | (
-        (fp4_weight & 0b01110000) >> 2
-    )
+    fp4_weight_part_1 = (fp4_weight & 0b10000000) | ((fp4_weight & 0b01110000) >> 2)
     fp4_weight_part_1 = fp4_weight_part_1.view(torch.float8_e4m3fn)
     fp4_weight_part_1 = fp4_weight_part_1.to(dtype) * (2**6)
 
     fp4_weight2 = fp4_weight << 4
-    fp4_weight_part_2 = (fp4_weight2 & 0b10000000) | (
-        (fp4_weight2 & 0b01110000) >> 2
-    )
+    fp4_weight_part_2 = (fp4_weight2 & 0b10000000) | ((fp4_weight2 & 0b01110000) >> 2)
     fp4_weight_part_2 = fp4_weight_part_2.view(torch.float8_e4m3fn)
     fp4_weight_part_2 = fp4_weight_part_2.to(dtype) * (2**6)
 

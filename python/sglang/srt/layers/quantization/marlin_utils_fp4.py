@@ -405,7 +405,9 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             tensor_list.append(marlin_permute_bias(bias[i].to(param_dtype)))
         return torch.stack(tensor_list)
 
-    layer.w13_weight = torch.nn.Parameter(_repack_weight(w13, True), requires_grad=False)
+    layer.w13_weight = torch.nn.Parameter(
+        _repack_weight(w13, True), requires_grad=False
+    )
     layer.w2_weight = torch.nn.Parameter(_repack_weight(w2, False), requires_grad=False)
     layer.w13_weight_scale = torch.nn.Parameter(
         _permute_scales(w13_scale, True), requires_grad=False

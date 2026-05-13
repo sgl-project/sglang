@@ -1,5 +1,6 @@
 import itertools
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,6 +9,9 @@ from sgl_kernel.scalar_type import scalar_types
 from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    prepare_moe_nvfp4_layer_for_marlin,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
 
@@ -349,7 +353,7 @@ def test_moe_wna16_marlin_gemm(
 
 @pytest.mark.skipif(
     not _is_sm80_sm90_cuda(),
-    reason="Non-gated NVFP4 Marlin fallback test requires CUDA SM80, SM86, or SM90",
+    reason="Non-gated NVFP4 Marlin fallback test requires CUDA SM8X/SM9X",
 )
 def test_fused_marlin_moe_non_gated_relu2():
     torch.manual_seed(0)
@@ -412,15 +416,9 @@ def test_fused_marlin_moe_non_gated_relu2():
 
 @pytest.mark.skipif(
     not _is_sm80_sm90_cuda(),
-    reason="NVFP4 Marlin MoE padding test requires CUDA SM80, SM86, or SM90",
+    reason="NVFP4 Marlin MoE padding test requires CUDA SM8X/SM9X",
 )
 def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
-    from types import SimpleNamespace
-
-    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-        prepare_moe_nvfp4_layer_for_marlin,
-    )
-
     torch.manual_seed(0)
 
     m = 17
@@ -517,12 +515,6 @@ def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
     reason="NVFP4 Marlin MoE numeric test requires CUDA SM80, SM86, or SM90",
 )
 def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
-    from types import SimpleNamespace
-
-    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-        prepare_moe_nvfp4_layer_for_marlin,
-    )
-
     torch.manual_seed(0)
 
     m = 17
@@ -543,9 +535,7 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
         global_scale = scales.max() / 448
         scales = (scales / global_scale).to(torch.float8_e4m3fn)
 
-        fp4_weight_part_1 = (fp4_weight & 0b10000000) | (
-            (fp4_weight & 0b01110000) >> 2
-        )
+        fp4_weight_part_1 = (fp4_weight & 0b10000000) | ((fp4_weight & 0b01110000) >> 2)
         fp4_weight_part_1 = fp4_weight_part_1.view(torch.float8_e4m3fn)
         fp4_weight_part_1 = fp4_weight_part_1.to(dtype) * (2**6)
 
@@ -569,17 +559,13 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     w13_packed_l, w13_scales_l, w13_gscale_l, w13_ref_l = [], [], [], []
     w2_packed_l, w2_scales_l, w2_gscale_l, w2_ref_l = [], [], [], []
     for _ in range(e):
-        packed, scales, gscale, ref = make_nvfp4_weight(
-            intermediate_size, hidden_size
-        )
+        packed, scales, gscale, ref = make_nvfp4_weight(intermediate_size, hidden_size)
         w13_packed_l.append(packed)
         w13_scales_l.append(scales)
         w13_gscale_l.append(gscale)
         w13_ref_l.append(ref)
 
-        packed, scales, gscale, ref = make_nvfp4_weight(
-            hidden_size, intermediate_size
-        )
+        packed, scales, gscale, ref = make_nvfp4_weight(hidden_size, intermediate_size)
         w2_packed_l.append(packed)
         w2_scales_l.append(scales)
         w2_gscale_l.append(gscale)
@@ -590,7 +576,9 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     layer.moe_runner_config = SimpleNamespace(is_gated=False)
     layer.params_dtype = dtype
     layer.intermediate_size_per_partition = intermediate_size
-    layer.w13_weight = torch.nn.Parameter(torch.stack(w13_packed_l), requires_grad=False)
+    layer.w13_weight = torch.nn.Parameter(
+        torch.stack(w13_packed_l), requires_grad=False
+    )
     layer.w2_weight = torch.nn.Parameter(torch.stack(w2_packed_l), requires_grad=False)
     layer.w13_weight_scale = torch.nn.Parameter(
         torch.stack(w13_scales_l), requires_grad=False
