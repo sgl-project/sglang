@@ -35,6 +35,7 @@ class TestSRTBackend(CustomTestCase):
             mem_fraction_static=0.7,
             incremental_streaming_output=True,
             log_level="info",
+            enable_metrics=True,
         )
         sgl.set_default_backend(cls.backend)
 
