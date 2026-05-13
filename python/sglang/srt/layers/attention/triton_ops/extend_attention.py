@@ -368,7 +368,9 @@ def _fwd_kernel(
                 final_mask &= window_mask
 
             SKIP_TILE = False
-            if (USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK) or SLIDING_WINDOW_SIZE > 0:
+            if (
+                USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK
+            ) or SLIDING_WINDOW_SIZE > 0:
                 SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
             if not SKIP_TILE:
@@ -493,13 +495,16 @@ def _fwd_kernel(
                     + offs_d[:, None]
                 )
                 k = tl.load(
-                    K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+                    K_Extend + offs_k,
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
+                    other=0.0,
                 )
 
                 qk = tl.dot(q, k, out_dtype=tl.float32)
                 if BLOCK_DPE > 0:
                     offs_kpe = (
-                        (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+                        (cur_seq_extend_start_idx + start_n + offs_n[None, :])
+                        * stride_kbs
                         + cur_kv_head * stride_kh
                         + offs_dpe[:, None]
                     )
@@ -534,7 +539,9 @@ def _fwd_kernel(
                     + offs_dv[None, :]
                 )
                 v = tl.load(
-                    V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+                    V_Extend + offs_v,
+                    mask=mask_n[:, None] & mask_dv[None, :],
+                    other=0.0,
                 )
                 p = p.to(v.dtype)
                 acc = acc * re_scale[:, None] + tl.dot(p, v)
@@ -547,10 +554,8 @@ def _fwd_kernel(
 
     if STORE_LSE:
         offs_lse = (
-            (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m)
-            * stride_lse_bs
-            + cur_head * stride_lse_h
-        )
+            cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m
+        ) * stride_lse_bs + cur_head * stride_lse_h
         lse = tl.log(deno) + e_max
         tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
 

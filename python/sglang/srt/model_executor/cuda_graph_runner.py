@@ -233,7 +233,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
 
             dcp_kv_mask = (
-                torch.zeros((max_num_token,), dtype=torch.bool) if dcp_size > 1 else None
+                torch.zeros((max_num_token,), dtype=torch.bool)
+                if dcp_size > 1
+                else None
             )
 
             ngram_embedding_info = (

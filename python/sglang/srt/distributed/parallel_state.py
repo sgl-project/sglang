@@ -1907,7 +1907,9 @@ def initialize_model_parallel(
     dcp_group_ranks = []
     for tp_group in group_ranks:
         for start in range(0, len(tp_group), decode_context_parallel_size):
-            dcp_group_ranks.append(tp_group[start : start + decode_context_parallel_size])
+            dcp_group_ranks.append(
+                tp_group[start : start + decode_context_parallel_size]
+            )
     _DCP = init_model_parallel_group(
         dcp_group_ranks,
         get_world_group().local_rank,

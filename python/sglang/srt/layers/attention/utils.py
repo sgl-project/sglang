@@ -89,7 +89,9 @@ def create_triton_kv_indices_for_dcp_triton(
             req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + abs_pos,
             mask=mask,
         )
-        tl.store(kv_indices_ptr + kv_indices_offset + offset, data // dcp_size, mask=mask)
+        tl.store(
+            kv_indices_ptr + kv_indices_offset + offset, data // dcp_size, mask=mask
+        )
 
 
 def get_num_page_per_block_flashmla(page_size: int = 64) -> int:

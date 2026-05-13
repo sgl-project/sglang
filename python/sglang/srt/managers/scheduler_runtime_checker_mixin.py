@@ -342,7 +342,11 @@ class SchedulerRuntimeCheckerMixin:
             total,
             uncached,
         )
-        if leak and getattr(self.server_args, "dcp_size", 1) > 1 and allocator.page_size > 1:
+        if (
+            leak
+            and getattr(self.server_args, "dcp_size", 1) > 1
+            and allocator.page_size > 1
+        ):
             # Radix/Mamba cache accounting is logical-token based while DCP full
             # KV allocation is physical-page based. Partial physical pages can
             # leave a small page-level slack even when all pages are owned by

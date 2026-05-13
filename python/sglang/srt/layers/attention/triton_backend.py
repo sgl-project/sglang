@@ -15,8 +15,8 @@ from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
     cp_lse_ag_out_rs,
-    create_triton_kv_indices_for_dcp_triton,
     create_flashinfer_kv_indices_triton,
+    create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -386,7 +386,9 @@ class TritonAttnBackend(AttentionBackend):
                     kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                     kv_indptr = kv_indptr[: bs + 1]
                     kv_indices = torch.empty(
-                        forward_batch.seq_lens_sum, dtype=torch.int64, device=self.device
+                        forward_batch.seq_lens_sum,
+                        dtype=torch.int64,
+                        device=self.device,
                     )
                     create_flashinfer_kv_indices_triton[(bs,)](
                         self.req_to_token,
@@ -443,9 +445,11 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
             self.get_num_kv_splits(
                 num_kv_splits,
-                self._dcp_lens(forward_batch.seq_lens).clamp_min(1)
-                if self.dcp_size > 1
-                else forward_batch.seq_lens,
+                (
+                    self._dcp_lens(forward_batch.seq_lens).clamp_min(1)
+                    if self.dcp_size > 1
+                    else forward_batch.seq_lens
+                ),
             )
 
             qo_indptr = None
@@ -911,7 +915,11 @@ class TritonAttnBackend(AttentionBackend):
                 assert False, "Multi-step cuda graph init is not done here."
             self.get_num_kv_splits(
                 num_kv_splits[:num_token],
-                dcp_seq_lens[:bs].clamp_min(1) if self.dcp_size > 1 else dcp_seq_lens[:bs],
+                (
+                    dcp_seq_lens[:bs].clamp_min(1)
+                    if self.dcp_size > 1
+                    else dcp_seq_lens[:bs]
+                ),
             )
 
         elif forward_mode.is_target_verify():
@@ -1077,7 +1085,11 @@ class TritonAttnBackend(AttentionBackend):
                 elif self.use_mla:
                     k_scaled = k.clone().div_(layer.k_scale)
                     self._set_kv_buffer(
-                        forward_batch, layer, self._kv_cache_loc(forward_batch), k_scaled, v
+                        forward_batch,
+                        layer,
+                        self._kv_cache_loc(forward_batch),
+                        k_scaled,
+                        v,
                     )
                 elif self.use_mla:
                     # For MLA, scale K manually before storing since MLATokenToKVPool
@@ -1187,7 +1199,9 @@ class TritonAttnBackend(AttentionBackend):
         if self.forward_metadata.custom_mask is not None:
             raise NotImplementedError("DCP Triton extend does not support custom masks")
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-            raise NotImplementedError("DCP Triton extend does not support sliding window")
+            raise NotImplementedError(
+                "DCP Triton extend does not support sliding window"
+            )
 
         group = get_dcp_group()
         q_local = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
@@ -1298,9 +1312,7 @@ class TritonAttnBackend(AttentionBackend):
         prefix_scale = torch.exp(prefix_lse - final_lse).unsqueeze(-1)
         current_scale = torch.exp(current_lse - final_lse).unsqueeze(-1)
         prefix_scale = torch.nan_to_num(prefix_scale, nan=0.0, posinf=0.0, neginf=0.0)
-        current_scale = torch.nan_to_num(
-            current_scale, nan=0.0, posinf=0.0, neginf=0.0
-        )
+        current_scale = torch.nan_to_num(current_scale, nan=0.0, posinf=0.0, neginf=0.0)
         out = prefix_out * prefix_scale + current_out * current_scale
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
