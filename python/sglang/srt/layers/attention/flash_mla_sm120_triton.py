@@ -222,10 +222,14 @@ def _run_triton_sparse_decode(
     flat_indices = indices.reshape(B, -1).contiguous()
     topk = flat_indices.shape[1]
 
-    # Create three typed views of the flat cache memory
+    # Create three typed views of the flat cache memory.
+    # The KV cache may arrive as uint8 or float8_e4m3fn depending on the
+    # sglang version.  Ensure each view has the correct dtype so Triton
+    # interprets the loaded values correctly (FP8 dequant vs raw integer).
     total_elems = num_pages * page_bytes
-    raw_fp8 = k_cache.as_strided((total_elems,), (1,))
-    raw_uint8 = raw_fp8.view(torch.uint8)
+    raw_flat = k_cache.as_strided((total_elems,), (1,))
+    raw_uint8 = raw_flat.view(torch.uint8)
+    raw_fp8 = raw_uint8.view(torch.float8_e4m3fn)
     raw_bf16 = raw_uint8.view(torch.bfloat16)
 
     # Squeeze Q: [B, H, D]

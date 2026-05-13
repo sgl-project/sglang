@@ -9,7 +9,7 @@ from torch.nn import Module
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import log_info_on_rank0, set_weight_attrs
-from sglang.srt.utils.common import get_device_sm, is_sm90_supported
+from sglang.srt.utils.common import is_sm120_supported, is_sm90_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -108,15 +108,14 @@ class Mxfp4MarlinMoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        _sm = get_device_sm()
-        if not is_sm90_supported() and _sm // 10 != 12:
+        if not is_sm90_supported() and not is_sm120_supported():
             raise RuntimeError(
                 "DeepSeekV4 MXFP4 Marlin fallback requires Hopper/SM90 or above."
             )
 
         # SM120: Skip Marlin repacking, keep original weight format
-        # for PyTorch dequant fallback (Marlin kernel produces NaN on SM120)
-        if _sm // 10 == 12:
+        # for Triton dequant kernel (Marlin kernel produces NaN on SM120)
+        if is_sm120_supported():
             from torch.nn import Parameter
 
             log_info_on_rank0(
@@ -142,7 +141,7 @@ class Mxfp4MarlinMoEMethod:
                     requires_grad=False,
                 )
             # else: float32 scales are already usable directly
-            layer._dsv4_mxfp4_backend = "sm120_fallback"
+            layer._dsv4_mxfp4_backend = "sm120_triton"
             return
 
         if not check_moe_marlin_supports_layer(layer, 32):
@@ -177,10 +176,10 @@ class Mxfp4MarlinMoEMethod:
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
 
-        # SM120 fallback: use Triton fused dequant+GEMM (or PyTorch fallback)
-        if getattr(layer, "_dsv4_mxfp4_backend", None) == "sm120_fallback":
+        # SM120: use Triton fused dequant+GEMM (Marlin kernel produces NaN on SM120)
+        if getattr(layer, "_dsv4_mxfp4_backend", None) == "sm120_triton":
             from sglang.srt.layers.moe.fused_moe_triton.mxfp4_moe_sm120_triton import (
-                mxfp4_moe_forward_triton as mxfp4_moe_forward_fallback,
+                mxfp4_moe_forward_triton,
             )
 
             hidden_states = dispatch_output.hidden_states
@@ -191,7 +190,7 @@ class Mxfp4MarlinMoEMethod:
             intermediate_size = w13.shape[1] // 2
             hidden_size = w13.shape[2] * 2
 
-            output = mxfp4_moe_forward_fallback(
+            output = mxfp4_moe_forward_triton(
                 hidden_states=hidden_states,
                 w13_packed=w13,
                 w2_packed=w2,

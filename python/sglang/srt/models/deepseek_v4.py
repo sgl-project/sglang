@@ -94,6 +94,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.common import is_sm120_supported
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
@@ -726,7 +727,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() and not is_sm120_supported():
             from sglang.srt.layers.mhc import mhc_pre
 
             norm_kwargs = {}
@@ -764,7 +765,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, False
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get() and not is_sm120_supported():
             import deep_gemm
 
             x_flat = x.flatten(1).bfloat16()

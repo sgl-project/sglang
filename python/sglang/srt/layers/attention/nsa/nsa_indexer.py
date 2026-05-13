@@ -29,19 +29,19 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
-    get_device_sm,
     is_cuda,
     is_gfx95_supported,
     is_hip,
     is_npu,
 )
+from sglang.srt.utils.common import is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
 global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_sm120 = _is_cuda and get_device_sm() // 10 == 12  # SM120/SM121
+_is_sm120 = _is_cuda and is_sm120_supported()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -916,6 +916,11 @@ class Indexer(MultiPlatformOp):
         actual_seq_q: int,
         cp_index: List[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
+        if _is_sm120:
+            raise NotImplementedError(
+                "Ragged CP path requires DeepGEMM fp8_mqa_logits which is not "
+                "supported on SM120. Use paged topk_transform instead."
+            )
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 

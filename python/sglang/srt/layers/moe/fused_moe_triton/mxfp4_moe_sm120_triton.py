@@ -356,7 +356,11 @@ def mxfp4_moe_forward_triton(
     # ── Graph-safe routing: flatten topk assignments ──
     # token_ids[slot] = which row of A (original token index)
     # expert_ids[slot] = which expert's weights to use
-    flat_expert_ids = topk_ids.reshape(-1).contiguous()  # [M*topk]
+    # topk_ids may contain -1 for padded/filtered tokens; clamp to 0 for safe
+    # Triton loads, then zero out invalid slots' output after GEMM.
+    flat_expert_ids_raw = topk_ids.reshape(-1).contiguous()  # [M*topk]
+    invalid_slot_mask = flat_expert_ids_raw < 0  # [M*topk]
+    flat_expert_ids = flat_expert_ids_raw.clamp(min=0)  # safe for indexing
     token_ids = (
         torch.arange(M, device=device, dtype=torch.int32)
         .unsqueeze(1)
@@ -433,6 +437,12 @@ def mxfp4_moe_forward_triton(
         w2_scale.stride(0),
         down.stride(0),
     )
+
+    # ── Zero out invalid slots (padded/filtered tokens with topk_ids == -1) ──
+    # Use multiplication instead of boolean indexing to stay CUDA-graph-safe
+    # (no GPU→CPU sync). valid_mask is 1.0 for valid slots, 0.0 for invalid.
+    valid_mask = (~invalid_slot_mask).unsqueeze(1).to(dtype)  # [M*topk, 1]
+    down = down * valid_mask
 
     # ── Weighted sum across topk slots (graph-safe) ──
     flat_weights = topk_weights.reshape(-1).unsqueeze(1).to(dtype)  # [M*topk, 1]

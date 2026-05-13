@@ -61,8 +61,8 @@ def fp8_paged_mqa_logits_torch(
     block_size = kvcache_fp8.shape[1]
     device = q_fp8.device
 
-    assert head_dim == 128, "TODO"
-    assert block_size == 64, "TODO"
+    assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
+    assert block_size == 64, "Vectorized torch impl hardcodes block_size=64 cache layout"
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)

@@ -1054,8 +1054,7 @@ class DeepseekV4AttnBackend(
                 extra_topk_length=extra_topk_lengths,
             )
 
-            backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
-            o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
+            o = flash_mla_with_kvcache_entrypoint(**input_dict, backend="kernel")[0]
 
             o = o.squeeze(1)
             return o

@@ -7,6 +7,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_musa,
 )
+from sglang.srt.utils.common import is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -19,15 +20,14 @@ def _compute_enable_deep_gemm():
     if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
         return False
     # DeepGEMM requires TMEM/tcgen05 (SM100+datacenter), not available on SM120
-    if sm_version // 10 == 12:
+    if is_sm120_supported():
         return False
     if not (_is_cuda or _is_musa):
         return False
 
     try:
         import deep_gemm  # noqa: F401
-    except (ImportError, AssertionError):
-        # AssertionError: deep_gemm init may fail on unsupported architectures
+    except ImportError:
         return False
 
     return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()
