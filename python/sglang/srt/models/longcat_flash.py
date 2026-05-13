@@ -48,8 +48,10 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
+    dp_scatter,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_local_dp_buffer,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -487,6 +489,12 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         # second_attn
+        if is_dp_attention_enabled():
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(),
+                hidden_states,
+            )
+            dp_scatter(hidden_states, global_hidden_states, forward_batch)
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_attn(
             hidden_states, residual, forward_batch
         )
