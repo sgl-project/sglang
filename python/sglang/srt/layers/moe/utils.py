@@ -208,8 +208,8 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
         if dispatcher_output_dtype is not None:
             return DeepEPOutputDtype(dispatcher_output_dtype)
 
-    # 4. flashinfer_cutedsl expects BF16 dispatch
-    if get_moe_runner_backend().is_flashinfer_cutedsl():
+    # 4. flashinfer_cutedsl and is_cutlass expects BF16 dispatch
+    if get_moe_runner_backend().is_flashinfer_cutedsl() or get_moe_runner_backend().is_cutlass():
         return DeepEPOutputDtype.BF16
 
     # 5. Default on NPU → BF16
