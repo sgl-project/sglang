@@ -1058,27 +1058,43 @@ def _get_valid_draft_acceptance_stats(
 def _get_decoupled_verify_acceptance_stats(
     meta_info: dict[str, Any],
 ) -> tuple[float | None, float | None, int, int, int]:
+    """Return (accept_length, accept_rate, accepted, proposed_drafts, verify_ct).
+
+    `accept_rate` uses the fixed verify-tree capacity as denominator
+    (`spec_num_proposed_drafts` = verify_ct * (speculative_num_draft_tokens-1))
+    so it is comparable to non-decoupled `spec_accept_rate`. The per-request
+    `spec_valid_accept_rate` (computed separately via
+    `_get_valid_draft_acceptance_stats`) uses the drafter-side denominator.
+    Their ratio is the drafter fill rate; they coincide only when the drafter
+    keeps up with every verify round.
+    """
     verify_ct = meta_info.get("spec_verify_ct")
-    valid_draft_tokens = meta_info.get("spec_valid_draft_token_num")
     valid_accepted_tokens = meta_info.get("spec_valid_accept_token_num")
-    if verify_ct is None or valid_draft_tokens is None or valid_accepted_tokens is None:
+    num_proposed_drafts = meta_info.get("spec_num_proposed_drafts")
+    if (
+        verify_ct is None
+        or valid_accepted_tokens is None
+        or num_proposed_drafts is None
+    ):
         return None, None, 0, 0, 0
 
     verify_ct = int(verify_ct)
-    valid_draft_tokens = int(valid_draft_tokens)
     valid_accepted_tokens = int(valid_accepted_tokens)
+    num_proposed_drafts = int(num_proposed_drafts)
     if verify_ct <= 0:
-        return None, None, 0, valid_draft_tokens, 0
+        return None, None, 0, num_proposed_drafts, 0
 
     accept_length = valid_accepted_tokens / verify_ct
     accept_rate = (
-        valid_accepted_tokens / valid_draft_tokens if valid_draft_tokens > 0 else None
+        valid_accepted_tokens / num_proposed_drafts
+        if num_proposed_drafts > 0
+        else None
     )
     return (
         accept_length,
         accept_rate,
         valid_accepted_tokens,
-        valid_draft_tokens,
+        num_proposed_drafts,
         verify_ct,
     )
 
