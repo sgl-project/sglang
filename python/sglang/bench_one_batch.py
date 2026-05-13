@@ -619,6 +619,17 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
+    initialize_moe_config(server_args)
+    initialize_mamba_selective_state_update_backend(server_args)
+    initialize_fp8_gemm_config(server_args)
+    initialize_fp4_gemm_config(server_args)
+
+    # Set CPU affinity
+    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+        set_gpu_proc_affinity(
+            server_args.pp_size, server_args.tp_size, server_args.nnodes, tp_rank
+        )
+
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
