@@ -1422,8 +1422,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
         elif disable_reason is None and get_moe_a2a_backend().is_deepep():
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
-        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
-            disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
+        elif self.quant_config and (
+            self.quant_config.get_name() == "w4afp8"
+            or getattr(self.quant_config, "is_w4afp8_config", lambda: False)()
+            or getattr(self.quant_config, "is_w4a16_config", lambda: False)()
+        ):
+            disable_reason = "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
         elif (
             envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
         ):
@@ -1653,7 +1657,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
 
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+        if self.quant_config and (
+            self.quant_config.get_name() == "w4afp8"
+            or getattr(self.quant_config, "is_w4afp8_config", lambda: False)()
+        ):
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
@@ -1777,6 +1784,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         loaded_params.add(name)
                         break
                     else:
+                        skip_unmaterialized_expert_param = False
                         for mapping in expert_params_mapping:
                             if MOE_BIT_WISE_EQUAL_MODE:
                                 continue
@@ -1785,10 +1793,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 continue
                             if _is_npu:
                                 name = name.replace("weight_packed", "weight")
-                            name = name.replace(weight_name, param_name)
-                            if name not in params_dict:
+                            resolved_name = name.replace(weight_name, param_name)
+                            if resolved_name not in params_dict:
+                                skip_unmaterialized_expert_param = True
                                 continue
-                            param = params_dict[name]
+                            param = params_dict[resolved_name]
                             weight_loader = param.weight_loader
                             maybe_executor_submit(
                                 executor=executor,
@@ -1798,16 +1807,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 func_args=(
                                     param,
                                     loaded_weight,
-                                    name,
+                                    resolved_name,
                                 ),
                                 func_kwargs={
                                     "shard_id": shard_id,
                                     "expert_id": expert_id,
                                 },
                             )
-                            loaded_params.add(name)
+                            loaded_params.add(resolved_name)
                             break
                         else:
+                            if skip_unmaterialized_expert_param:
+                                continue
                             if name.endswith(".bias") and name not in params_dict:
                                 continue
                             if (
@@ -1919,6 +1930,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
+        # compressed-tensors W4A16 MoE checkpoints do not contain g_idx tensors
+        # when actorder is disabled; they are materialized in
+        # process_weights_after_loading().
+        qc = self.quant_config
+        if (
+            qc is not None
+            and qc.get_name() == "compressed_tensors"
+            and getattr(qc, "is_w4a16_config", lambda: False)()
+        ):
+            weight_quant = qc.target_scheme_map.get("Linear", {}).get("weights")
+            if getattr(weight_quant, "actorder", None) != "group":
+                skipped_checking_patterns.extend(
+                    [
+                        "mlp.experts.w13_weight_g_idx",
+                        "mlp.experts.w2_weight_g_idx",
+                        "mlp.experts.w13_g_idx_sort_indices",
+                        "mlp.experts.w2_g_idx_sort_indices",
+                    ]
+                )
         if is_nextn:
             skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
         unloaded_params = {

@@ -125,6 +125,38 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_name(self) -> str:
         return "compressed_tensors"
 
+    def is_w4afp8_config(self) -> bool:
+        linear_scheme = self.target_scheme_map.get("Linear", {})
+        weight_quant = linear_scheme.get("weights")
+        input_quant = linear_scheme.get("input_activations")
+        if weight_quant is None or input_quant is None:
+            return False
+
+        weight_type = getattr(weight_quant.type, "value", weight_quant.type)
+        input_type = getattr(input_quant.type, "value", input_quant.type)
+        return (
+            self.quant_format == CompressionFormat.pack_quantized.value
+            and weight_quant.num_bits == 4
+            and weight_type == "int"
+            and input_quant.num_bits == 8
+            and input_type == "float"
+            and input_quant.dynamic
+        )
+
+    def is_w4a16_config(self) -> bool:
+        linear_scheme = self.target_scheme_map.get("Linear", {})
+        weight_quant = linear_scheme.get("weights")
+        input_quant = linear_scheme.get("input_activations")
+        if weight_quant is None or input_quant is not None:
+            return False
+
+        weight_type = getattr(weight_quant.type, "value", weight_quant.type)
+        return (
+            self.quant_format == CompressionFormat.pack_quantized.value
+            and weight_quant.num_bits == 4
+            and weight_type == "int"
+        )
+
     def get_scaled_act_names(self) -> List[str]:
         return []
 
