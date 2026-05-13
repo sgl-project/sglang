@@ -1361,17 +1361,14 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
-        alias_or_bind_derived_param(
-            layer,
-            "weight_scale_2",
-            "alpha",
-            (input_scale_2 * weight_scale_2).to(torch.float32),
+        # alpha / input_scale_inv stay as scalar Parameters. Aliasing them into
+        # the [N_partitions] source slot breaks fused-QKV linears whose
+        # downstream kernels assume scalar input scale.
+        copy_or_rebind_param(
+            layer, "alpha", (input_scale_2 * weight_scale_2).to(torch.float32)
         )
-        alias_or_bind_derived_param(
-            layer,
-            "input_scale",
-            "input_scale_inv",
-            (1 / input_scale_2).to(torch.float32),
+        copy_or_rebind_param(
+            layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
         )
 
         # Store original output size before any padding
@@ -1761,27 +1758,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_input_scale = layer.w2_input_scale
 
         # Create shared parameters
-        alias_or_bind_derived_param(
+        copy_or_rebind_param(
             layer,
-            "w13_weight_scale_2",
             "g1_alphas",
             (w13_input_scale * w13_weight_scale_2).to(torch.float32),
         )
-        alias_or_bind_derived_param(
+        copy_or_rebind_param(
             layer,
-            "w2_weight_scale_2",
             "g2_alphas",
             (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
         )
-        alias_or_bind_derived_param(
+        copy_or_rebind_param(
             layer,
-            "w13_input_scale",
             "w13_input_scale_quant",
             (1 / w13_input_scale).to(torch.float32),
         )
-        alias_or_bind_derived_param(
+        copy_or_rebind_param(
             layer,
-            "w2_input_scale",
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
