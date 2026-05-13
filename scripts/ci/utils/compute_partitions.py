@@ -84,8 +84,12 @@ def compute_max_parallel(size: int) -> int:
     return max(size // 4, 1)
 
 
-def compute_partitions(tests):
-    """Group per-commit tests by suite and emit partition metadata."""
+def compute_partitions(tests, full_parallel=False):
+    """Group per-commit tests by suite and emit partition metadata.
+
+    When `full_parallel` is True (scheduled cron or `high priority` PR label),
+    every suite's max_parallel = size, i.e. matrix fanout is unthrottled.
+    """
     suite_tests = defaultdict(list)
     for t in tests:
         if t.backend not in _TARGET_BACKENDS:
@@ -102,7 +106,7 @@ def compute_partitions(tests):
             max_parallel = size
         else:
             size = max(1, math.ceil(total * LPT_SLOP / TARGET_SECONDS))
-            max_parallel = compute_max_parallel(size)
+            max_parallel = size if full_parallel else compute_max_parallel(size)
         # Coarse upper bound: assuming perfect LPT balance gives total/size
         # seconds per partition. Real LPT can be up to ~4/3 of that, but the
         # ceil + LPT_SLOP padding above already absorbs the slack, so the
@@ -135,6 +139,14 @@ def main():
         default="gha",
         help="`gha` emits `partitions=<json>` for $GITHUB_OUTPUT; `json` emits raw JSON",
     )
+    parser.add_argument(
+        "--full-parallel",
+        choices=("true", "false"),
+        default="false",
+        help="If true, max_parallel = size for every suite (no matrix throttle). "
+        "Set by the check-changes step when github.event_name == 'schedule' or "
+        "the PR carries the 'high priority' label.",
+    )
     args = parser.parse_args()
 
     files = discover_files(args.repo_root)
@@ -143,7 +155,7 @@ def main():
     # to catch this at test-execution time; the CI dispatch should keep going.
     all_tests = collect_tests(files, sanity_check=False)
 
-    result = compute_partitions(all_tests)
+    result = compute_partitions(all_tests, full_parallel=(args.full_parallel == "true"))
     payload = json.dumps(result, separators=(",", ":"), sort_keys=True)
     if args.output_format == "gha":
         print(f"partitions={payload}")

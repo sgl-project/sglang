@@ -192,14 +192,58 @@ jobs:
             echo "multimodal_gen=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Determine full-parallel mode
+        id: parallel-mode
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # `full=true` lifts the matrix-fanout throttle so each suite's
+          # max_parallel = size. Conditions (matching the prior set-parallel
+          # step exactly):
+          #   1. Scheduled cron run.
+          #   2. pull_request event with the `high priority` label.
+          #   3. workflow_dispatch with target_stage set (i.e. /rerun-stage)
+          #      whose underlying PR carries `high priority`. The labels
+          #      aren't on the dispatch payload, so look them up via API:
+          #      try SHA -> /pulls (works for fork PRs), fall back to
+          #      branch name -> gh pr list (works for non-fork PRs).
+          FULL=false
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            FULL=true
+            echo "Scheduled run -> full parallelism"
+          elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
+            FULL=true
+            echo "high priority PR -> full parallelism"
+          elif [[ -n "${{ inputs.target_stage }}" ]]; then
+            LABELS=""
+            PR_HEAD_SHA="${{ inputs.pr_head_sha }}"
+            if [[ -n "$PR_HEAD_SHA" ]]; then
+              LABELS=$(gh api "repos/${{ github.repository }}/commits/${PR_HEAD_SHA}/pulls" \
+                --jq '.[0].labels[].name' 2>/dev/null || true)
+            fi
+            if [[ -z "$LABELS" ]]; then
+              LABELS=$(gh pr list --head "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+                --json labels --jq '.[0].labels[].name' 2>/dev/null || true)
+            fi
+            echo "PR labels (via API): ${LABELS:-"(none)"}"
+            if echo "$LABELS" | grep -Fxq "high priority"; then
+              FULL=true
+              echo "high priority PR (via API) -> full parallelism"
+            fi
+          fi
+          echo "full=$FULL" >> "$GITHUB_OUTPUT"
+
       - name: Compute partitions
         id: partitions
         run: |
           # Emit a single JSON output `partitions` keyed by suite name with
           # {size, arr, max_parallel} fields per suite. Replaces the prior
-          # `high priority` label-driven full/low max-parallel presets.
+          # full/low max-parallel presets; `--full-parallel` keeps the
+          # `high priority` PR / scheduled cron escape hatch.
           # See scripts/ci/utils/compute_partitions.py.
-          python3 scripts/ci/utils/compute_partitions.py >> "$GITHUB_OUTPUT"
+          python3 scripts/ci/utils/compute_partitions.py \
+            --full-parallel ${{ steps.parallel-mode.outputs.full }} \
+            >> "$GITHUB_OUTPUT"
 
       - name: Set B200 runner tag
         id: set-runner
