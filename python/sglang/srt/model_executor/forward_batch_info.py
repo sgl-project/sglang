@@ -56,12 +56,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    is_cuda,
-    is_hip,
-    is_npu,
-    support_triton,
-)
+from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -392,6 +387,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_extend_in_batch: bool = False
     all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
+    can_run_dp_piecewise_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
     # Whether this batch is prefill-only (no token generation needed)
@@ -470,6 +466,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_extend_in_batch=batch.is_extend_in_batch,
             all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
+            can_run_dp_piecewise_cuda_graph=batch.can_run_dp_piecewise_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             multi_item_delimiter_indices=batch.multi_item_delimiter_indices,

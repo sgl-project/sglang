@@ -703,6 +703,7 @@ class TboForwardBatchPreparer:
             "req_to_token_pool",
             "token_to_kv_pool",
             "can_run_dp_cuda_graph",
+            "can_run_dp_piecewise_cuda_graph",
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
