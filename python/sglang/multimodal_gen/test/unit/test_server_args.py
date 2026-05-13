@@ -302,6 +302,23 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
 
+    def test_auto_ltx_snapshot_keeps_dit_offload_with_headroom(self):
+        args = self._from_dict_with_pipeline_config(
+            LTX2PipelineConfig(),
+            available_memory_gb=76,
+            kwargs={
+                "model_path": "Lightricks/LTX-2.3",
+                "pipeline_class_name": "LTX2TwoStageHQPipeline",
+                "ltx2_two_stage_device_mode": "snapshot",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertEqual(args.ltx2_two_stage_device_mode, "snapshot")
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.image_encoder_cpu_offload)
+
     def test_auto_wan_layerwise_offload_is_enabled_without_fsdp(self):
         args = self._from_dict_with_pipeline_config(
             WanT2V480PConfig(),

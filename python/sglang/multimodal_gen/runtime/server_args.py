@@ -321,9 +321,10 @@ class ServerArgs(DisaggArgsMixin):
         if auto_tuner.could_override_server_args():
             self._adjust_offload()
             auto_tuner.maybe_adjust_auto_dit_layerwise_offload()
+        self._adjust_ltx2_two_stage_device_mode()
+        if auto_tuner.could_override_server_args():
             auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
-        self._adjust_ltx2_two_stage_device_mode()
         self._adjust_path()
         self._adjust_quant_config()
         self._adjust_warmup()
@@ -478,6 +479,12 @@ class ServerArgs(DisaggArgsMixin):
         return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
             self._is_ltx23_model_path(self.model_path)
             or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
+        )
+
+    def _uses_ltx23_snapshot_two_stage_residency(self) -> bool:
+        return (
+            self.ltx2_two_stage_device_mode == "snapshot"
+            and self._is_ltx23_two_stage_pipeline()
         )
 
     def _adjust_attention_backend(self):
