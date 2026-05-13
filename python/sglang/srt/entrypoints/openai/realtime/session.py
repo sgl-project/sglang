@@ -290,6 +290,34 @@ class RealtimeConnection:
         ) or TranscriptionSessionAudioInput()
         transcription = audio.transcription
 
+        # Validation pass. Reject unsupported features first (fail-fast on
+        # things sglang never implements regardless of state), then validate
+        # format-dependent fields, computing the candidate rate without
+        # mutating self. Reaching the end means the whole update is accepted.
+        if audio.turn_detection is not None:
+            await self._send_error(
+                "not_supported",
+                "Server-side VAD is not implemented; "
+                "set audio.input.turn_detection: null and commit explicitly.",
+                param="session.audio.input.turn_detection",
+            )
+            return
+        if audio.noise_reduction is not None:
+            await self._send_error(
+                "not_supported",
+                "audio.input.noise_reduction is not supported; set to null.",
+                param="session.audio.input.noise_reduction",
+            )
+            return
+        if transcription is not None and transcription.prompt is not None:
+            await self._send_error(
+                "not_supported",
+                "audio.input.transcription.prompt is not supported.",
+                param="session.audio.input.transcription.prompt",
+            )
+            return
+
+        new_rate = self.input_sample_rate  # default: keep current
         fmt = audio.format
         if fmt is not None:
             if not isinstance(fmt, AudioPCM):
@@ -321,47 +349,24 @@ class RealtimeConnection:
                     param="session.audio.input.format.rate",
                 )
                 return
-            self.input_sample_rate = new_rate
 
-        if audio.turn_detection is not None:
-            await self._send_error(
-                "not_supported",
-                "Server-side VAD is not implemented; "
-                "set audio.input.turn_detection: null and commit explicitly.",
-                param="session.audio.input.turn_detection",
-            )
-            return
-        if audio.noise_reduction is not None:
-            await self._send_error(
-                "not_supported",
-                "audio.input.noise_reduction is not supported; set to null.",
-                param="session.audio.input.noise_reduction",
-            )
-            return
-        if transcription is not None and transcription.prompt is not None:
-            await self._send_error(
-                "not_supported",
-                "audio.input.transcription.prompt is not supported.",
-                param="session.audio.input.transcription.prompt",
-            )
-            return
+        # Mutation pass — no early returns past this point.
+        self.input_sample_rate = new_rate
+        if transcription is not None:
+            self.client_model = transcription.model
+            self.language = transcription.language
+        self.sampling_params = self.adapter.build_sampling_params(
+            TranscriptionRequest(language=self.language)
+        )
+        self.session_configured = True
 
+        # Side effects: log + ack.
         if cfg.include:
             logger.info(
                 "[realtime] %s: include[] received but not implemented; ignoring: %s",
                 self.session_id,
                 cfg.include,
             )
-
-        if transcription is not None:
-            self.client_model = transcription.model
-            self.language = transcription.language
-
-        self.sampling_params = self.adapter.build_sampling_params(
-            TranscriptionRequest(language=self.language)
-        )
-
-        self.session_configured = True
         if self.input_sample_rate != self.model_sample_rate:
             logger.info(
                 "[realtime] %s configured: resample %d→%d (ratio %.2f), language=%s",
