@@ -7,13 +7,13 @@ metatags:
 
 ### Installation
 
-The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the quay.io platform. You can directly pull it.
+The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the online platform. You can directly pull it.
 
 ```bash Command
 #Atlas 800 A3
-docker pull quay.io/ascend/sglang:main-cann8.5.0-a3
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-a3
 #Atlas 800 A2
-docker pull quay.io/ascend/sglang:main-cann8.5.0-910b
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-910b
 
 #start container
 docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
@@ -42,7 +42,7 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:${tag}
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${tag}
 ```
 
 ## Deployment
