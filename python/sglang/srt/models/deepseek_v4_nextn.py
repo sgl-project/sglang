@@ -10,6 +10,7 @@ from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_round_robin_split,
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -243,6 +244,18 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
+                if is_nsa_prefill_cp_round_robin_split():
+                    metadata = forward_batch.attn_backend.forward_metadata
+                    core_meta = metadata.core_attn_metadata
+                    core_meta.apply_cp_reindex()
+                    core_meta.init_flashmla_related()
+                    if metadata.indexer_metadata is not None:
+                        metadata.indexer_metadata = (
+                            forward_batch.attn_backend.init_forward_metadata_indexer(
+                                core_meta
+                            )
+                        )
+
         hidden_states, pre_hc_head = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids,
