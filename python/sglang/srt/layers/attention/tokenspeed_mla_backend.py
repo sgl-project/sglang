@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.jit_kernel.fp8_quantize import fp8_quantize
+from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
@@ -42,6 +43,11 @@ if is_tokenspeed_mla_available():
     from tokenspeed_mla.mla_kv_pack_quantize_fp8 import (
         mla_kv_pack_quantize_fp8 as _ts_mla_kv_pack_quantize_fp8,
     )
+
+# Crossover point measured on GB300: at bs <= this, the upstream Triton kernel
+# is ~0.1us faster than the JIT version (launch-overhead-bound regime); above
+# this, the JIT version is 2-5x faster (compute regime) or ties (HBM regime).
+_JIT_PACK_MIN_TOKENS = 32
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -267,9 +273,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         """Pack strided ``k_nope``+``k_pe`` into contig FP8 K and quantize
         strided ``v`` into contig FP8 V in a single kernel.
         """
-        return _ts_mla_kv_pack_quantize_fp8(
-            k_nope, k_pe, v, enable_pdl=is_arch_support_pdl()
+        impl = (
+            mla_kv_pack_quantize_fp8
+            if k_nope.shape[0] >= _JIT_PACK_MIN_TOKENS
+            else _ts_mla_kv_pack_quantize_fp8
         )
+        return impl(k_nope, k_pe, v, enable_pdl=is_arch_support_pdl())
 
     def _run_decode_kernel(
         self,
