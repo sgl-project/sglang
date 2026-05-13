@@ -26,7 +26,6 @@ import os
 import pickle
 import sys
 import threading
-from functools import partialmethod
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
@@ -129,11 +128,11 @@ def _handle_output_by_index(output, i):
         new_output = BatchTokenIDOutput(
             rids=[output.rids[i]],
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_accepted_drafts=_extract_field_by_index(
-                output, "spec_accepted_drafts", i
+            spec_num_correct_drafts=_extract_field_by_index(
+                output, "spec_num_correct_drafts", i
             ),
-            spec_acceptance_histogram=_extract_field_by_index(
-                output, "spec_acceptance_histogram", i
+            spec_correct_drafts_histogram=_extract_field_by_index(
+                output, "spec_correct_drafts_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
@@ -217,11 +216,11 @@ def _handle_output_by_index(output, i):
         new_output = BatchStrOutput(
             rids=[output.rids[i]],
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_accepted_drafts=_extract_field_by_index(
-                output, "spec_accepted_drafts", i
+            spec_num_correct_drafts=_extract_field_by_index(
+                output, "spec_num_correct_drafts", i
             ),
-            spec_acceptance_histogram=_extract_field_by_index(
-                output, "spec_acceptance_histogram", i
+            spec_correct_drafts_histogram=_extract_field_by_index(
+                output, "spec_correct_drafts_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
@@ -589,20 +588,6 @@ def write_data_for_multi_tokenizer(
     args_shm.close()
 
     return args_shm
-
-
-def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
-    """Monkey patch uvicorn multiprocessing is_alive timeout"""
-    # from default 5s -> 10s
-    try:
-        from uvicorn.supervisors.multiprocess import Process
-
-        Process.is_alive = partialmethod(Process.is_alive, timeout=timeout)
-
-    except ImportError:
-        logger.warning(
-            "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
-        )
 
 
 class SenderWrapper:
