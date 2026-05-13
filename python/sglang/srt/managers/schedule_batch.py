@@ -1379,12 +1379,16 @@ class Req(ReqDllmMixin):
         )
 
 
-def set_mamba_track_indices_from_reqs(batch):
+def set_mamba_track_indices_from_reqs(batch, req_to_token_pool=None):
     """Build mamba_track_indices from req objects (authoritative source).
 
     Works on both ScheduleBatch and ModelWorkerBatch.
     """
-    all_buffers = torch.stack([req.mamba_ping_pong_track_buffer for req in batch.reqs])
+    if req_to_token_pool is None:
+        req_to_token_pool = batch.req_to_token_pool
+    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+        batch.req_pool_indices
+    ]  # (bs, ping_pong_size), int64, on device
     idx = (
         torch.tensor(
             [req.mamba_next_track_idx for req in batch.reqs],

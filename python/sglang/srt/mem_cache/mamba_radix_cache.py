@@ -655,6 +655,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep] = (
                 new_slot[0]
             )
+            self.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                req.req_pool_idx
+            ] = req.mamba_ping_pong_track_buffer
         else:
             mamba_value_donated = req.mamba_pool_idx.unsqueeze(-1).clone()
             req.mamba_pool_idx = self._alloc_mamba_slot()[0]
