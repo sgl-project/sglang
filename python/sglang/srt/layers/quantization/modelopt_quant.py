@@ -1361,6 +1361,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_weights_postprocessed", False):
             return
+        layer._weights_postprocessed = True
 
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
@@ -1426,7 +1427,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             copy_or_rebind_param(layer, "weight", weight)
             layer.weights_padding_cols = weights_padding_cols
             del layer.weight_scale
-            layer._weights_postprocessed = True
             return
 
         # Pad weights for CUTLASS/FlashInfer kernel alignment (K and N divisible by 32)
@@ -1458,7 +1458,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
         copy_or_rebind_param(layer, "weight_scale_interleaved", padded_scales)
         del layer.weight_scale
-        layer._weights_postprocessed = True
 
     def apply(
         self,
@@ -1711,6 +1710,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         """
         if getattr(layer, "_weights_postprocessed", False):
             return
+        layer._weights_postprocessed = True
 
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
@@ -1977,8 +1977,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     hidden_size=hidden_size,
                 )  # k
             del layer.w13_weight_scale, layer.w2_weight_scale
-
-        layer._weights_postprocessed = True
 
     @property
     def load_up_proj_weight_first(self) -> bool:
