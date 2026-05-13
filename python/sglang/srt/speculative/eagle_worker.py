@@ -893,7 +893,6 @@ class EAGLEWorker(TpModelWorker):
             ):
                 out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
@@ -913,6 +912,7 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+            forward_batch.positions.add_(1)
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
@@ -1161,8 +1161,11 @@ class EAGLEWorker(TpModelWorker):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
-        if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
-            # All reqs finished this verify; swap to an idle ExtendInput.
+        if draft_extend_input.input_ids.shape[0] == 0:
+            # Single source for hidden_size via hidden_size_for(self) (incl.
+            # EAGLE-3 aux widening). Two stub origins from verify(): fully-idle
+            # batch (DP attn rank w/o reqs) and active batch with all reqs
+            # finished. prepare_for_idle() is idempotent on already-idle.
             batch = batch.copy()
             batch.prepare_for_idle()
             draft_extend_input = EagleDraftExtendInput.create_idle_input(

@@ -252,10 +252,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accepted token logits.
         """
         if batch.forward_mode.is_idle():
+            # hidden_size=None: worker fixup in forward_draft_extend_after_decode
+            # rebuilds via EagleDraftExtendInput.hidden_size_for(worker)
+            # (single source incl. EAGLE-3 aux widening).
             draft_extend_input = EagleDraftExtendInput.create_idle_input(
                 device=batch.device,
-                hidden_size=batch.model_config.spec_hidden_size,
-                dtype=batch.model_config.dtype,
+                hidden_size=None,
+                dtype=None,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             return EagleVerifyOutput.create_idle(
@@ -645,10 +648,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     req_pool_indices=batch.req_pool_indices[unfinished_index_device],
                 )
             else:
+                # hidden_size=None: worker fixup rebuilds via
+                # EagleDraftExtendInput.hidden_size_for(worker) (single source).
                 draft_extend_input = EagleDraftExtendInput.create_idle_input(
                     device=batch.device,
-                    hidden_size=batch.model_config.spec_hidden_size,
-                    dtype=batch.model_config.dtype,
+                    hidden_size=None,
+                    dtype=None,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
 
