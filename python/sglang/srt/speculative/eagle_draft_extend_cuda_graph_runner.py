@@ -407,7 +407,16 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
-            probs = torch.softmax(ret.next_token_logits, dim=-1)
+            if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
+                select_index = (
+                    torch.arange(bs, device=self.model_runner.device)
+                    * self.num_tokens_per_bs
+                    + num_accepted_tokens
+                    - 1
+                )
+                probs = torch.softmax(ret.next_token_logits[select_index], dim=-1)
+            else:
+                probs = torch.softmax(ret.next_token_logits, dim=-1)
             ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
@@ -536,6 +545,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             # DRAFT_EXTEND_V2: all tokens calculations whether accepted or not.
             unpadding_bs = num_tokens
+            topk_unpadding_bs = raw_bs
         elif bs != raw_bs:
             forward_batch.spec_info.num_accepted_drafts = buffers.num_accepted_drafts[
                 :raw_bs
@@ -544,8 +554,10 @@ class EAGLEDraftExtendCudaGraphRunner:
                 :raw_bs
             ]
             unpadding_bs = raw_bs
+            topk_unpadding_bs = raw_bs
         else:
             unpadding_bs = None
+            topk_unpadding_bs = None
 
         if unpadding_bs is not None:
             out_copy = out
@@ -553,6 +565,6 @@ class EAGLEDraftExtendCudaGraphRunner:
                 next_token_logits=out.next_token_logits[:unpadding_bs],
                 hidden_states=out.hidden_states[:unpadding_bs],
             )
-            out.topk_p = out_copy.topk_p[:unpadding_bs]
-            out.topk_index = out_copy.topk_index[:unpadding_bs]
+            out.topk_p = out_copy.topk_p[:topk_unpadding_bs]
+            out.topk_index = out_copy.topk_index[:topk_unpadding_bs]
         return out
