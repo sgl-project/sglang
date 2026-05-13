@@ -301,7 +301,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
         self.config = config
         self.quant_config = (
             None
-            if "mtp" in getattr(config, "disable_quant_module", [])
+            if "mtp" in getattr(config, "disable_quant_module", []) or (_is_npu and getattr(config, "quantize", "") == "w8a8_dynamic")
             else quant_config
         )
         self.model = LongcatFlashModelNextN(config, self.quant_config)

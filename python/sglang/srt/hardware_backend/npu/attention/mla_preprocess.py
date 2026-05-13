@@ -97,7 +97,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.v_head_dim = v_head_dim
         self.q_b_proj_weight_scale = self.q_b_proj.weight_scale.view(1, -1).to(
             torch.float
-        )
+        ) if hasattr(self.q_b_proj, 'weight_scale') else None
 
     def preprocess_weights(self, hidden_states):
         self.dummy = torch.zeros(
