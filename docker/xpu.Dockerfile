@@ -52,4 +52,4 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     pip install --no-deps xgrammar==0.1.33 && \
     pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore
 
-CMD ["/bin/bash"]
+CMD ["bash", "-c", "source /opt/intel/oneapi/setvars.sh && exec bash"]
