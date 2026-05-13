@@ -63,6 +63,8 @@ class TestDSV4FlashFP8H200(ServerSanityMixin, CustomTestCase):
                 "128",
                 "--deepep-config",
                 DEEPEP_CONFIG,
+                "--watchdog-timeout",
+                "900",
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
