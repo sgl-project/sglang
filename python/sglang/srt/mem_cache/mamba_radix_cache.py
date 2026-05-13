@@ -599,17 +599,20 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
+        # Bound row read by kv_committed_len; see radix_cache.py for rationale.
+        assert req.kv_committed_len >= req.cache_protected_len
+        read_len = req.kv_committed_len
 
         def _skip_cache_unfinished_req(req: Req) -> None:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
+                req.req_pool_idx, :read_len
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
-        token_ids = req.fill_ids
+        token_ids = req.fill_ids[:read_len]
         cache_len = (
             req.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer
@@ -619,7 +622,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :read_len
         ]
         # kv_indices is the kv indices to be cached
         kv_indices = kv_indices_orig[:cache_len]

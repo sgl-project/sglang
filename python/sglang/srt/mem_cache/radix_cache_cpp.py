@@ -209,8 +209,10 @@ class RadixCacheCpp(BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         assert req.req_pool_idx is not None
-        token_ids = req.fill_ids
-        prefill_len = len(token_ids)  # prefill only (maybe chunked)
+        # Bound row read by kv_committed_len; see radix_cache.py for rationale.
+        assert req.kv_committed_len >= req.cache_protected_len
+        prefill_len = req.kv_committed_len
+        token_ids = req.fill_ids[:prefill_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefill_len
         ].to(dtype=torch.int64, copy=True)
