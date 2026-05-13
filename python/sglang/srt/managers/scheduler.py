@@ -3580,9 +3580,24 @@ class Scheduler(
         # waiting_queue removal for those — let the to_finish path below handle
         # them, otherwise we send_output / release_kv_cache twice.
         if self.cur_batch is self.running_batch or self.cur_batch is None:
-            batch_reqs = self.running_batch.reqs
+            batch_reqs = list(self.running_batch.reqs)
         else:
-            batch_reqs = self.running_batch.reqs + self.cur_batch.reqs
+            batch_reqs = list(self.running_batch.reqs) + list(self.cur_batch.reqs)
+        # PP: rids from every in-flight microbatch must also be treated as
+        # 'in batch'. Each mb's forward was launched against the req's
+        # req_pool_idx + KV slots; the output processor on a different mb
+        # iteration consumes the result later. Without this, a chunked-resume
+        # req with pending_middle_outputs > 0 sitting in waiting_queue would
+        # fall into the waiting-only abort path, release_kv_cache would free
+        # the row + KV underneath the still-launched forward, and the delayed
+        # output processor would crash on a None req_pool_idx (or, with
+        # pending_middle_outputs cleared to 0, mistake the middle-chunk
+        # result for a full output and append garbage tokens).
+        if self.pp_size > 1 and hasattr(self, "mbs"):
+            for mb_list in (self.mbs, self.last_mbs, self.running_mbs):
+                for mb in mb_list:
+                    if mb is not None and not mb.is_empty():
+                        batch_reqs.extend(mb.reqs)
         batch_rids = {r.rid for r in batch_reqs}
 
         # Delete requests in the waiting queue
