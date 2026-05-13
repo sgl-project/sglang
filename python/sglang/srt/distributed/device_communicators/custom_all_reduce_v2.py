@@ -93,24 +93,26 @@ class CustomAllReduceV2:
 
     @contextmanager
     def capture(self):
+        if self.disabled:
+            yield
+            return
         try:
             self.obj.set_cuda_graph_capture(True)
             yield
         finally:
             self.obj.set_cuda_graph_capture(False)
-        if not self.disabled:
-            # cannot call when graph is capturing
-            assert (
-                torch.cuda.is_current_stream_capturing() == False
-            ), "Cannot register graph inputs while capturing CUDA graph"
-            pairs = self.obj.share_graph_inputs()
-            handles = [handle for _, handle in pairs]
-            offsets = [offset for offset, _ in pairs]
-            handles_all = self._share_list(handles)
-            offsets_all = self._share_list(offsets)
-            result = [list(zip(o, h)) for o, h in zip(offsets_all, handles_all)]
-            self.obj.register_inputs(result)
-            log_info_on_rank0(logger, f"Registering {len(pairs)} cuda graph addresses")
+        # cannot call when graph is capturing
+        assert (
+            torch.cuda.is_current_stream_capturing() == False
+        ), "Cannot register graph inputs while capturing CUDA graph"
+        pairs = self.obj.share_graph_inputs()
+        handles = [handle for _, handle in pairs]
+        offsets = [offset for offset, _ in pairs]
+        handles_all = self._share_list(handles)
+        offsets_all = self._share_list(offsets)
+        result = [list(zip(o, h)) for o, h in zip(offsets_all, handles_all)]
+        self.obj.register_inputs(result)
+        log_info_on_rank0(logger, f"Registering {len(pairs)} cuda graph addresses")
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         """Check if the input tensor is suitable for custom all-reduce."""

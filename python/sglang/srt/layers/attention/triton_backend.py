@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel.utils import is_arch_support_pdl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -20,8 +19,14 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
     get_int_env_var,
+    is_cuda,
     next_power_of_2,
 )
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel.utils import is_arch_support_pdl
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -148,7 +153,10 @@ class TritonAttnBackend(AttentionBackend):
                 self.device_core_count,
                 self.max_context_len,
             )
-        self.use_pdl = is_arch_support_pdl()
+        if _is_cuda:
+            self.use_pdl = is_arch_support_pdl()
+        else:
+            self.use_pdl = False
 
         self.allow_bidirectional_attention_in_extend = (
             model_runner.server_args.disable_cuda_graph
@@ -416,9 +424,9 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = kv_indices.to(torch.int64)
             mask_indptr = None
             # TODO(FIXME): This will trigger an invalid Eagle tree when using
-            # `max(spec_info.num_accepted_tokens_cpu)`.
+            # `max(spec_info.num_accept_tokens_cpu)`.
             # It might have been forgotten to update somewhere.
-            max_extend_len = torch.max(spec_info.num_accepted_tokens).item()
+            max_extend_len = torch.max(spec_info.num_accept_tokens).item()
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
