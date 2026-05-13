@@ -237,6 +237,20 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
 
+        total_pool_size = size + pre_alloc_size
+        if len(self.req_index_to_mamba_index_mapping) < total_pool_size:
+            self.req_index_to_mamba_index_mapping = torch.zeros(
+                total_pool_size,
+                dtype=self.req_index_to_mamba_index_mapping.dtype,
+                device=self.req_index_to_mamba_index_mapping.device,
+            )
+            if self.enable_mamba_extra_buffer:
+                self.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.zeros(
+                    (total_pool_size, self.mamba_ping_pong_track_buffer_size),
+                    dtype=self.req_index_to_mamba_ping_pong_track_buffer_mapping.dtype,
+                    device=self.req_index_to_mamba_ping_pong_track_buffer_mapping.device,
+                )
+
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.mamba_pool.clear()
