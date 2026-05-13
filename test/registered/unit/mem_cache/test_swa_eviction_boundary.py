@@ -110,6 +110,7 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
         extra_key=None,
         last_node=tree.root_node,
         swa_uuid_for_lock=None,
+        swa_prefix_lock_released=False,
         prefix_indices=torch.tensor([], dtype=torch.int64, device=tree.device),
         _kv_committed_len=len(token_ids),
     )
