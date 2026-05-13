@@ -401,6 +401,7 @@ class MoEGate(nn.Module):
                 and _device_sm >= 90
             ):
                 if _device_sm in [100, 103] and self.weight.shape[0] == 256:
+                    # TODO: will check the dtype to be bf16
                     # router gemm output float32
                     logits = torch.empty(
                         hidden_states.shape[0],
