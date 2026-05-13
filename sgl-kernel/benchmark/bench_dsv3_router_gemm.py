@@ -4,12 +4,15 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.testing
-from sgl_kernel import dsv3_router_gemm
-
-from sglang.utils import is_in_ci
+from sglang.utils import is_in_ci  # pyright: ignore[reportMissingImports]
 
 IS_CI = is_in_ci()
 
+try:
+    from sgl_kernel import dsv3_router_gemm  # pyright: ignore[reportMissingImports]
+    AOT_AVAILABLE = True
+except ImportError:
+    AOT_AVAILABLE = False
 # CI environment uses simplified parameters
 if IS_CI:
     num_tokens_vals = [1]  # Only test 1 value in CI
@@ -47,6 +50,9 @@ else:
     )
 )
 def benchmark_bf16_output(num_tokens, impl):
+    if impl.startswith("sgl-kernel") and not AOT_AVAILABLE:
+        raise RuntimeError("sgl_kernel AOT dsv3_router_gemm is not available")
+
     # M: num_tokens, K: hidden_dim, N: num_experts
     M, K = num_tokens, 7168
 
@@ -109,6 +115,9 @@ def benchmark_bf16_output(num_tokens, impl):
     )
 )
 def benchmark_float_output(num_tokens, impl):
+    if impl.startswith("sgl-kernel") and not AOT_AVAILABLE:
+        raise RuntimeError("sgl_kernel AOT dsv3_router_gemm is not available")
+
     # M: num_tokens, K: hidden_dim, N: num_experts
     M, K = num_tokens, 7168
 
