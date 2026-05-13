@@ -34,13 +34,13 @@ try:
         enable_pdl: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return _flashinfer_fp4_quantize(
-            input,
-            global_scale,
-            sf_vec_size,
-            sf_use_ue8m0,
-            is_sf_swizzled_layout,
-            is_sf_8x4_layout,
-            enable_pdl,
+            input=input,
+            global_scale=global_scale,
+            sf_vec_size=sf_vec_size,
+            sf_use_ue8m0=sf_use_ue8m0,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            is_sf_8x4_layout=is_sf_8x4_layout,
+            enable_pdl=enable_pdl,
             backend=_flashinfer_fp4_quantize_backend,
         )
 
