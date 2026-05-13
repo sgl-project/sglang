@@ -70,19 +70,19 @@ def npu_wrapper_preprocess(func):
     def _preprocess(
         self,
         images: list["torch.Tensor"],
-        do_resize: bool,
-        size: SizeDict,
-        interpolation: Optional["tvF.InterpolationMode"],
-        do_rescale: bool,
-        rescale_factor: float,
-        do_normalize: bool,
-        image_mean: float | list[float] | None,
-        image_std: float | list[float] | None,
-        patch_size: int,
-        temporal_patch_size: int,
-        merge_size: int,
-        disable_grouping: bool | None,
-        return_tensors: str | TensorType | None,
+        do_resize: bool = True,
+        size: SizeDict = None,
+        interpolation: Optional["tvF.InterpolationMode"] = None,
+        do_rescale: bool = True,
+        rescale_factor: float = 1 / 255.0,
+        do_normalize: bool = True,
+        image_mean: float | list[float] | None = None,
+        image_std: float | list[float] | None = None,
+        patch_size: int = 14,
+        temporal_patch_size: int = 2,
+        merge_size: int = 2,
+        disable_grouping: bool | None = None,
+        return_tensors: str | TensorType | None = None,
         **kwargs,
     ):
         # Group images by size for batched resizing
@@ -103,7 +103,11 @@ def npu_wrapper_preprocess(func):
                 stacked_images = self.resize(
                     image=stacked_images,
                     size=SizeDict(height=resized_height, width=resized_width),
-                    interpolation=interpolation,
+                    interpolation=(
+                        interpolation
+                        if interpolation is not None
+                        else tvF.InterpolationMode.BICUBIC
+                    ),
                 )
             resized_images_grouped[shape] = stacked_images
         resized_images = reorder_images(resized_images_grouped, grouped_images_index)
