@@ -3597,12 +3597,19 @@ class Scheduler(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
 
-            # For mamba radix cache
+            # For mamba radix cache, or for chunked-resume reqs whose prior
+            # admissions already allocated a row + KV + radix lock_ref. Without
+            # this branch, aborting a chunked-resume req that is currently only
+            # in waiting_queue (not in any batch's reqs) leaks all three.
             if (
                 req.mamba_pool_idx is not None
-                and self.disaggregation_mode != DisaggregationMode.DECODE
-            ):
+                or (req.has_pending_chunk and req.req_pool_idx is not None)
+            ) and self.disaggregation_mode != DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache, is_insert=False)
+                # Defensive: clear pending-chunk flags on the orphaned req so a
+                # stale reference can't trigger Stage A re-stash of the freed row.
+                req.has_pending_chunk = False
+                req.pending_middle_outputs = 0
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
