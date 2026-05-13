@@ -722,7 +722,6 @@ class Compressor(nn.Module):
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
-            # HIP-only: share the per-step freqs_cis gather across layers.
             freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
