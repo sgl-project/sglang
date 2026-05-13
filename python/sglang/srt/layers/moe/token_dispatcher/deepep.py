@@ -377,46 +377,74 @@ class _DeepEPDispatcherImplBase:
 
     def set_deepep_dispatcher_dtype(self) -> None:
         self.deepep_output_dtype = get_deepep_output_dtype(self)
-        if self.deepep_output_dtype == DeepEPOutputDtype.BF16:
-            self.params_bytes = 2
-            self.use_nvfp4 = self.use_fp8 = False
-            if _is_npu:
-                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
-        elif self.deepep_output_dtype == DeepEPOutputDtype.FP8:
-            self.params_bytes = 1
-            self.use_nvfp4 = False
-            self.use_fp8 = True
-            if _is_npu:
-                # Ascend A2/A3 NPU supports only int8 quantization (but uses fp8 flag).
-                # Leaving a message for the user.
+        
+        # Configuration mapping for each dtype
+        config_map = {
+            DeepEPOutputDtype.BF16: {
+                "params_bytes": 2,
+                "use_fp8": False,
+                "use_nvfp4": False,
+            },
+            DeepEPOutputDtype.FP8: {
+                "params_bytes": 1,
+                "use_fp8": True,
+                "use_nvfp4": False,
+            },
+            # Needed for Ascend A2/A3 NPU case, 
+            # despite the use_fp8 flag,
+            # quantization will be performed in int8
+            DeepEPOutputDtype.INT8: {
+                "params_bytes": 1,
+                "use_fp8": True,
+                "use_nvfp4": False,
+            },
+            DeepEPOutputDtype.NVFP4: {
+                "params_bytes": 1,
+                "use_fp8": False,
+                "use_nvfp4": True,
+            },
+        }
+        
+        # Validate and apply hardware-specific adjustments
+        self._validate_and_adjust_dtype()
+        
+        # Apply configuration
+        config = config_map[self.deepep_output_dtype]
+        self.params_bytes = config["params_bytes"]
+        self.use_fp8 = config["use_fp8"]
+        self.use_nvfp4 = config["use_nvfp4"]
+        
+        # Handle environment variables
+        self._update_int8_quant_env()
+    
+    def _validate_and_adjust_dtype(self) -> None:
+        """Validate dtype against hardware and adjust if necessary."""
+        if _is_npu:
+            if self.deepep_output_dtype == DeepEPOutputDtype.FP8:
                 logger.warning_once(
-                    "Warning: Ascend A2/A3 NPU does not support fp8 "
-                    "deepep_dispatcher_output_dtype, switching to int8... "
+                    "Ascend A2/A3 NPU does not support fp8 "
+                    "deepep_dispatcher_output_dtype, switching to int8..."
                 )
                 self.deepep_output_dtype = DeepEPOutputDtype.INT8
-                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
-        elif self.deepep_output_dtype == DeepEPOutputDtype.INT8:
-            if not _is_npu:
-                # GPU supports only fp8 quantization.
-                # Leaving a message for the user.
-                logger.warning_once(
-                    "Warning: GPU does not support int8 "
-                    "deepep_dispatcher_output_dtype, switching to fp8... "
-                )
-                self.deepep_output_dtype = DeepEPOutputDtype.FP8
-            self.params_bytes = 1
-            self.use_nvfp4 = False
-            self.use_fp8 = True
-            if _is_npu:
-                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
-        elif self.deepep_output_dtype == DeepEPOutputDtype.NVFP4:
-            self.params_bytes = 1
-            self.use_nvfp4 = True
-            self.use_fp8 = False
-            if _is_npu:
+            elif self.deepep_output_dtype == DeepEPOutputDtype.NVFP4:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
+        else:
+            if self.deepep_output_dtype == DeepEPOutputDtype.INT8:
+                logger.warning_once(
+                    "GPU does not support int8 "
+                    "deepep_dispatcher_output_dtype, switching to fp8..."
+                )
+                self.deepep_output_dtype = DeepEPOutputDtype.FP8
+            # NVFP4 is supported on GPU, no adjustment needed
+    
+    def _update_int8_quant_env(self) -> None:
+        """Update the DEEP_NORMAL_MODE_USE_INT8_QUANT environment variable."""
+        if self.use_fp8:
+            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
+        else:
+            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
