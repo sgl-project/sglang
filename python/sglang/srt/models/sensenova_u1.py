@@ -631,28 +631,27 @@ class NEOQwen3Attention(Qwen3Attention):
         k = k.view(extend_num_tokens, self.num_kv_heads, self.head_dim)
         v = v.view(extend_num_tokens, self.num_kv_heads, self.head_dim)
 
-        # 1. write current image-query KV into the same temporary slots used by SRT
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn,
-            forward_batch.out_cache_loc,
-            k,
-            v,
-            self.attn.k_scale,
-            self.attn.v_scale,
-        )
-
         req_to_token = forward_batch.req_to_token_pool.req_to_token
-        token_indices = req_to_token[req_pool_idx, :seq_len].to(
-            device=q.device,
-            dtype=torch.long,
-            non_blocking=True,
-        )
-        key_states = forward_batch.token_to_kv_pool.get_key_buffer(
-            self.attn.layer_id
-        ).index_select(0, token_indices)
-        value_states = forward_batch.token_to_kv_pool.get_value_buffer(
-            self.attn.layer_id
-        ).index_select(0, token_indices)
+        prefix_len = int(metadata["prefix_len"])
+        if prefix_len > 0:
+            # 1. read committed text/image prefix KV owned by the SRT session
+            prefix_indices = req_to_token[req_pool_idx, :prefix_len].to(
+                device=q.device,
+                dtype=torch.long,
+                non_blocking=True,
+            )
+            key_prefix = forward_batch.token_to_kv_pool.get_key_buffer(
+                self.attn.layer_id
+            ).index_select(0, prefix_indices)
+            value_prefix = forward_batch.token_to_kv_pool.get_value_buffer(
+                self.attn.layer_id
+            ).index_select(0, prefix_indices)
+            # 2. keep current denoise query KV local, matching official update_cache=False
+            key_states = torch.cat([key_prefix, k], dim=0)
+            value_states = torch.cat([value_prefix, v], dim=0)
+        else:
+            key_states = k
+            value_states = v
 
         attn_mask = None
         custom_mask = forward_batch.cross_attention_custom_mask
@@ -665,8 +664,34 @@ class NEOQwen3Attention(Qwen3Attention):
             ).masked_fill_(~custom_mask, float("-inf"))
             attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
 
-        # 2. materialize prefix+query K/V so full-query semantics match official U1
-        if sgl_flash_attn_varlen_func is not None and attn_mask is None:
+        # 3. materialize prefix+query K/V so full-query semantics match official U1
+        if forward_batch.use_reference_eager_attention():
+            if self.num_heads != self.num_kv_heads:
+                kv_groups = self.num_heads // self.num_kv_heads
+                key_states = key_states.repeat_interleave(kv_groups, dim=1)
+                value_states = value_states.repeat_interleave(kv_groups, dim=1)
+            if not (q.dtype == key_states.dtype == value_states.dtype):
+                key_states = key_states.to(q.dtype)
+                value_states = value_states.to(q.dtype)
+            attn_output = self._temporary_eager_attention(
+                q=q.transpose(0, 1),
+                key=key_states.transpose(0, 1),
+                value=value_states.transpose(0, 1),
+                additive_mask=(
+                    None if attn_mask is None else attn_mask.squeeze(0).squeeze(0)
+                ),
+                scaling=self.scaling,
+            )
+            return attn_output.transpose(0, 1).reshape(
+                extend_num_tokens,
+                self.q_size,
+            )
+
+        if (
+            sgl_flash_attn_varlen_func is not None
+            and attn_mask is None
+            and get_global_server_args().attention_backend != "torch_native"
+        ):
             attn_output = sgl_flash_attn_varlen_func(
                 q.contiguous(),
                 key_states.contiguous().to(q.dtype),
@@ -701,6 +726,25 @@ class NEOQwen3Attention(Qwen3Attention):
             extend_num_tokens,
             self.q_size,
         )
+
+    @staticmethod
+    def _temporary_eager_attention(
+        *,
+        q: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        additive_mask: torch.Tensor | None,
+        scaling: float,
+    ) -> torch.Tensor:
+        attn_weights = torch.matmul(q, key.transpose(1, 2)) * scaling
+        if additive_mask is not None:
+            attn_weights = attn_weights + additive_mask
+        attn_weights = torch.nn.functional.softmax(
+            attn_weights,
+            dim=-1,
+            dtype=torch.float32,
+        ).to(q.dtype)
+        return torch.matmul(attn_weights, value)
 
     def _apply_rotary(
         self,
@@ -832,7 +876,7 @@ class NEOQwen3Model(Qwen2Model):
         if not self.pp_group.is_first_rank or not self.pp_group.is_last_rank:
             raise NotImplementedError(
                 "SenseNova U1 pixel-flow G forward is currently single-stage PP only"
-            )
+        )
 
         hidden_states = input_embeds
         residual = None
@@ -1194,6 +1238,8 @@ class NEOChatModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
+        if forward_batch.use_temporary_full_query_attention():
+            return
         if getattr(forward_batch, "cross_attention_custom_mask", None) is not None:
             return
         if getattr(forward_batch, "extend_seq_lens_cpu", None) is None:

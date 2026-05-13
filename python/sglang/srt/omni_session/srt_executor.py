@@ -12,10 +12,11 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 
 from sglang.omni.protocol import TemporaryForwardPrepared
-from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.omni_session.runtime_protocol import OmniSRTKVTokenBinding
+from sglang.srt.omni_session.runtime_types import OmniSRTKVTokenBinding
 
 if TYPE_CHECKING:
+    from sglang.omni.scheduler_state import OmniSchedulerExclusiveLease
+    from sglang.srt.managers.io_struct import OpenSessionReqInput, OpenSessionReqOutput
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.omni_session.runtime import OmniSessionRecord
+    from sglang.srt.session.session_controller import SessionController
     from sglang.srt.session.streaming_session import SessionSlot
 
 
@@ -54,7 +56,8 @@ class OmniSRTTemporaryForwardBatch:
     temp_req: OmniSRTTemporaryReqSlot
     out_cache_loc: torch.Tensor
     owned_cache_loc: torch.Tensor | None = None
-    scheduler_exclusive_lease: Any | None = None
+    synchronize_before_release: bool = False
+    scheduler_exclusive_lease: "OmniSchedulerExclusiveLease | None" = None
     released: bool = False
 
     def release(self) -> None:
@@ -66,6 +69,9 @@ class OmniSRTTemporaryForwardBatch:
         self.released = True
         try:
             # 4. release temporary query KV after the denoise forward
+            if self.synchronize_before_release and self.out_cache_loc.is_cuda:
+                # 1. wait for kernels that may still read temporary KV slots
+                torch.cuda.current_stream(self.out_cache_loc.device).synchronize()
             if self.owned_cache_loc is not None:
                 self.token_to_kv_pool_allocator.free(self.owned_cache_loc)
         finally:
@@ -120,13 +126,15 @@ class OmniSRTSchedulerExecutor:
         self.temporary_context_allocated_token_count = 0
 
     @property
-    def session_controller(self):
+    def session_controller(self) -> "SessionController":
         return self.scheduler.session_controller
 
-    def open_session_on_scheduler_thread(self, recv_req: Any) -> Any:
+    def open_session_on_scheduler_thread(
+        self, recv_req: "OpenSessionReqInput"
+    ) -> "OpenSessionReqOutput":
         """open an SRT session on the scheduler thread when omni is async"""
 
-        def open_session() -> Any:
+        def open_session() -> "OpenSessionReqOutput":
             return self.session_controller.open(recv_req)
 
         return self._run_scheduler_thread_call(
@@ -290,6 +298,10 @@ class OmniSRTSchedulerExecutor:
         cross_attention_custom_mask = generation_input.get(
             "cross_attention_custom_mask"
         )
+        attention_math_mode = generation_input.get("attention_math_mode")
+        synchronize_before_release = bool(
+            generation_input.get("synchronize_before_release", False)
+        )
         if packed_seqlens is None or packed_position_ids is None:
             raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward requires packed_seqlens and packed_position_ids"
@@ -340,9 +352,6 @@ class OmniSRTSchedulerExecutor:
             temp_req = self._alloc_temp_req_slot(req_to_token_pool)
             out_cache_loc, owned_cache_loc = self._alloc_temporary_context_cache(
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-                prefix_indices=prefix_indices,
-                prefix_len=prefix_len,
-                seq_len=seq_len,
                 extend_num_tokens=extend_num_tokens,
                 device=device,
             )
@@ -367,6 +376,7 @@ class OmniSRTSchedulerExecutor:
                 extend_num_tokens=extend_num_tokens,
                 binding=binding,
                 cross_attention_custom_mask=cross_attention_custom_mask,
+                attention_math_mode=attention_math_mode,
                 device=device,
             )
             context = OmniSRTTemporaryForwardBatch(
@@ -376,6 +386,7 @@ class OmniSRTSchedulerExecutor:
                 temp_req=temp_req,
                 out_cache_loc=out_cache_loc,
                 owned_cache_loc=owned_cache_loc,
+                synchronize_before_release=synchronize_before_release,
                 scheduler_exclusive_lease=scheduler_exclusive_lease,
             )
             scheduler_exclusive_lease = None
@@ -399,6 +410,38 @@ class OmniSRTSchedulerExecutor:
                 if scheduler_exclusive_lease is not None:
                     scheduler_exclusive_lease.release()
             raise
+
+    def run_temporary_context_forward(
+        self,
+        *,
+        prepared: TemporaryForwardPrepared,
+        forward: Callable[[Any], Any],
+    ) -> Any:
+        """run a temporary context forward inside the SRT scheduler boundary"""
+        scheduler_exclusive_lease = self._enter_temporary_context_region()
+
+        def run_forward() -> Any:
+            temporary_batch = self.build_temporary_context_forward_batch(
+                prepared=prepared
+            )
+            try:
+                # 1. run U1 denoise attention where srt model runner owns streams/KV
+                return forward(temporary_batch.forward_batch)
+            finally:
+                # 2. release temporary query KV before scheduler accepts more AR work
+                temporary_batch.release()
+
+        try:
+            return self._run_scheduler_thread_call(
+                callback=run_forward,
+                description=(
+                    "run temporary omni context forward "
+                    f"{prepared.srt_session_id}"
+                ),
+            )
+        finally:
+            if scheduler_exclusive_lease is not None:
+                scheduler_exclusive_lease.release()
 
     def capture_batch_token_bindings_before_process(
         self, batch: "ScheduleBatch"
@@ -439,7 +482,7 @@ class OmniSRTSchedulerExecutor:
         pending.wait()
         return True
 
-    def _enter_temporary_context_region(self) -> Any | None:
+    def _enter_temporary_context_region(self) -> "OmniSchedulerExclusiveLease | None":
         scheduler_state = self.scheduler.omni_scheduler_state
         if (
             scheduler_state is None
@@ -521,6 +564,11 @@ class OmniSRTSchedulerExecutor:
         for _ in range(self.max_sync_steps):
             if self._scheduler_fully_idle():
                 return
+            if self._scheduler_has_waiting_requests():
+                # 1. drain already-admitted SRT work before borrowing KV slots
+                if self._run_scheduler_step() is None:
+                    return
+                continue
             if self._scheduler_has_pending_requests():
                 return
             if not self._scheduler_has_active_batches():
@@ -549,9 +597,12 @@ class OmniSRTSchedulerExecutor:
         return self.scheduler.is_fully_idle()
 
     def _scheduler_has_pending_requests(self) -> bool:
-        if len(self.scheduler.waiting_queue) > 0:
+        if self._scheduler_has_waiting_requests():
             return True
         return len(self.scheduler.grammar_manager.grammar_queue) > 0
+
+    def _scheduler_has_waiting_requests(self) -> bool:
+        return len(self.scheduler.waiting_queue) > 0
 
     def _scheduler_has_active_batches(self) -> bool:
         for batch in (
@@ -733,34 +784,28 @@ class OmniSRTSchedulerExecutor:
         self,
         *,
         token_to_kv_pool_allocator: "BaseTokenToKVPoolAllocator",
-        prefix_indices: torch.Tensor,
-        prefix_len: int,
-        seq_len: int,
         extend_num_tokens: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Allocate the temporary kv tokens in the kv-cache
-        extend_num_tokens: number of KV token required by the denoise query
+        """allocate scratch KV for a temporary denoise query
 
-        Returns a tuple of: tokens actually needed, and tokens allocated
+        temporary context forward reads committed session KV through the same
+        req_to_token row, so this path must not evict tree cache on its own.
+        if scratch KV is unavailable, admission/backpressure should handle it
+        above this model-runner boundary.
         """
         tree_cache = self.scheduler.tree_cache
         page_size = int(tree_cache.page_size)
 
-        # number of tokens after aligned with page size
+        # 1. reserve only scratch KV; committed prefix KV remains session-owned
         owned_num_tokens = self._ceil_to_page(extend_num_tokens, page_size)
-
-        # evict cache to make enough headroom for temporary query
-        self._evict_for_temporary_context(
-            tree_cache,
-            extend_num_tokens=owned_num_tokens,
-            page_size=page_size,
-        )
         owned_cache_loc = token_to_kv_pool_allocator.alloc(owned_num_tokens)
         if owned_cache_loc is None:
+            available_size = int(token_to_kv_pool_allocator.available_size())
             raise OmniSRTSchedulerExecutorError(
-                "Temporary context forward could not allocate KV cache slots"
+                "Temporary context forward could not allocate scratch KV slots "
+                "without evicting committed SRT context: "
+                f"need={owned_num_tokens}, available={available_size}"
             )
         owned_cache_loc = owned_cache_loc.to(
             device=device,
@@ -775,18 +820,6 @@ class OmniSRTSchedulerExecutor:
         if page_size <= 1:
             return num_tokens
         return ((num_tokens + page_size - 1) // page_size) * page_size
-
-    @staticmethod
-    def _evict_for_temporary_context(
-        tree_cache: "BasePrefixCache",
-        *,
-        extend_num_tokens: int,
-        page_size: int,
-    ) -> None:
-        evict_from_tree_cache(
-            tree_cache,
-            extend_num_tokens + max(1, page_size),
-        )
 
     @staticmethod
     def _write_temp_req_token_mapping(
@@ -832,6 +865,7 @@ class OmniSRTSchedulerExecutor:
         extend_num_tokens: int,
         binding: OmniSRTKVTokenBinding,
         cross_attention_custom_mask: torch.Tensor | None,
+        attention_math_mode: str | None,
         device: torch.device,
     ) -> "ForwardBatch":
         """adapt a diffusion denoise query into an SRT ForwardBatch"""
@@ -901,6 +935,7 @@ class OmniSRTSchedulerExecutor:
             rids=[f"{binding.session_id}:temporary_context"],
             # U1 pixel-flow query tokens are bidirectional while prefix KV stays read-only
             temporary_context_attention_mode="full_query",
+            attention_math_mode=attention_math_mode,
         )
         forward_batch.temporary_context_cu_seqlens_q = torch.tensor(
             [0, extend_num_tokens],
@@ -1043,14 +1078,14 @@ class OmniSRTSchedulerExecutor:
 
     @staticmethod
     def _request_position_count(req: "Req") -> int | None:
+        if req.omni_srt_position_count is not None:
+            return int(req.omni_srt_position_count)
+
         position_count = OmniSRTSchedulerExecutor._position_count_from_position_ids(
             req.custom_position_ids
         )
         if position_count is not None:
             return position_count
-
-        if req.omni_srt_position_count is not None:
-            return int(req.omni_srt_position_count)
 
         if req.custom_decode_position_id is not None:
             return int(req.custom_decode_position_id) + 1
@@ -1073,13 +1108,6 @@ class OmniSRTSchedulerExecutor:
 
     @staticmethod
     def _streaming_session_slot(
-        tree_cache: object, session_id: str
+        tree_cache: "BasePrefixCache", session_id: str
     ) -> "SessionSlot | None":
-        slots = getattr(tree_cache, "slots", None)
-        if isinstance(slots, dict) and session_id in slots:
-            return slots[session_id]
-        streaming_session = getattr(tree_cache, "session", None)
-        slots = getattr(streaming_session, "slots", None)
-        if isinstance(slots, dict):
-            return slots.get(session_id)
-        return None
+        return tree_cache.get_session_slot(session_id)

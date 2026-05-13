@@ -45,6 +45,7 @@ def handle_omni_generate_with_omni_coordinator(
     sessions = _scheduler_sessions(scheduler)
     session_id = _resolve_session_id(payload)
     keep_session = bool(payload.get("keep_session", False) or session_id)
+    request.metadata["finish_turn_after_generation"] = keep_session
     session_record = None
     if session_id is not None:
         session_record = sessions.get(session_id)

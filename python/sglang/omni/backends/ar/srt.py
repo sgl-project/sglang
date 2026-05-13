@@ -12,7 +12,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from sglang.omni.protocol import (
     ARBackend,
@@ -31,10 +31,8 @@ from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniVLMTextGenerationResult,
 )
-from sglang.srt.omni_session.runtime_protocol import (
+from sglang.srt.omni_session.runtime_types import (
     OmniContextBundle as SRTOmniContextBundle,
-)
-from sglang.srt.omni_session.runtime_protocol import (
     OmniContextHandle as SRTOmniContextHandle,
 )
 
@@ -67,8 +65,7 @@ class SRTBackedContextOps(ContextOps):
         return session.session_id
 
     def get_role(self, name: str, default: str) -> str:
-        attr_name = name if name.endswith("_role") else f"{name}_role"
-        return str(getattr(self.bridge, attr_name, default))
+        return self.bridge.get_condition_path_role(name, default)
 
     def get_model(self) -> Any:
         return self.bridge.runtime.srt_request_executor.get_srt_model()
@@ -85,15 +82,15 @@ class SRTBackedContextOps(ContextOps):
             )
         )
 
-    def build_temporary_forward_batch(
+    def run_temporary_forward(
         self,
         *,
         prepared: TemporaryForwardPrepared,
-        generation_query_embeds: Any,
-        timestep: Any,
+        forward: Callable[[Any], Any],
     ) -> Any:
-        return self.bridge.runtime.srt_request_executor.build_temporary_context_forward_batch(
-            prepared=prepared
+        return self.bridge.runtime.srt_request_executor.run_temporary_context_forward(
+            prepared=prepared,
+            forward=forward,
         )
 
 
@@ -192,6 +189,14 @@ class SRTARBackend(ARBackend):
             contexts=_srt_backend_context(context),
             segment=segment,
         )
+        if (
+            request.metadata.get("finish_turn_after_generation")
+            and request.max_text_segments == 0
+        ):
+            # 1. only force-close when the caller explicitly disables post-image AR
+            self.bridge.finish_generated_segment_turn(
+                contexts=_srt_backend_context(context)
+            )
         return context
 
     def get_context_ops(self, context: OmniContextBundle) -> SRTBackedContextOps:
@@ -357,6 +362,9 @@ def _initial_boundaries(
     boundaries = _pre_image_segments_to_boundaries(
         context.full.metadata.get("pre_image_segments", [])
     )
+    if not context.full.metadata.get("pre_image_reached_image_marker", True):
+        boundaries.append(OmniBoundary(type="done"))
+        return boundaries
     boundaries.append(OmniBoundary(type="image"))
     if mode != "interleave":
         boundaries.append(OmniBoundary(type="done"))

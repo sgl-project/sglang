@@ -13,9 +13,10 @@ from typing import TYPE_CHECKING, Any
 from sglang.omni.bridges.sensenova_u1.context import (
     U1_EDIT_IMG_CONDITION_ROLE,
     U1_EDIT_UNCONDITION_ROLE,
-    U1_IMG_START_TOKEN,
+    U1_SPECIAL_TOKENS,
     U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
     U1_T2I_CFG_UNCONDITION_ROLE,
+    U1SpecialTokens,
     _u1_decode_token_ids,
     _u1_eos_token_ids,
     _u1_needs_any_cfg,
@@ -48,14 +49,20 @@ from sglang.srt.omni_session.runtime import (
     OmniSRTPreparedInput,
     OmniVLMTextGenerationResult,
 )
-from sglang.srt.omni_session.runtime_protocol import (
+from sglang.srt.omni_session.runtime_types import (
     OmniContextBundle,
     OmniSessionHandle,
 )
 from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
 
 if TYPE_CHECKING:
+    from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+        SenseNovaU1SamplingParams,
+    )
     from sglang.srt.managers.scheduler import Scheduler
+
+
+DEFAULT_U1_INTERLEAVE_DECODE_MAX_NEW_TOKENS = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +74,7 @@ class _U1ConditionPathSessionView:
 def build_sensenova_u1_srt_bridge(
     *,
     scheduler: "Scheduler",
-    srt_request_executor: Any | None = None,
+    srt_request_executor: OmniSRTSchedulerExecutor | None = None,
     srt_ar_decode_max_new_tokens: int | None = None,
 ) -> "U1SRTBackedOmniSessionBridge":
     """Build the SRT-owned middle bridge for SenseNova U1.
@@ -83,7 +90,7 @@ def build_sensenova_u1_srt_bridge(
             )
         srt_request_executor = OmniSRTSchedulerExecutor(scheduler)
     if srt_ar_decode_max_new_tokens is None:
-        srt_ar_decode_max_new_tokens = 0
+        srt_ar_decode_max_new_tokens = DEFAULT_U1_INTERLEAVE_DECODE_MAX_NEW_TOKENS
     session_controller = srt_request_executor.session_controller
     model_config = getattr(scheduler, "model_config", None)
     runtime = OmniSessionRuntime(
@@ -120,6 +127,17 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
         self.include_edit_uncondition = False
         self.native_generation_mode: str | None = None
         self.native_interleave_think_mode = False
+        self.special_tokens: U1SpecialTokens = U1_SPECIAL_TOKENS
+
+    def is_image_generation_boundary_token(self, token_id: int) -> bool:
+        """translate U1 token grammar into a generic omni image boundary"""
+
+        return token_id == self._image_start_token_id()
+
+    def _image_start_token_id(self) -> int:
+        if self.native_tokenizer is None:
+            raise RuntimeError("SenseNova U1 image boundary requires a tokenizer")
+        return _u1_token_id(self.native_tokenizer, self.special_tokens.img_start)
 
     def prepare_srt_ar_interleaved_inputs(
         self,
@@ -305,7 +323,6 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
         if runtime.srt_request_executor is None:
             return OmniDecodeResult(type="done")
 
-        img_start_id = _u1_token_id(self.native_tokenizer, U1_IMG_START_TOKEN)
         eos_token_ids = _u1_eos_token_ids(self.native_tokenizer)
         max_new_tokens = max(
             1,
@@ -313,27 +330,30 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
         )
         generated_text_ids: list[int] = []
         streamed_text = ""
-        current_position = int(
+        # 1. official U1 stores generation_position_start as the next output position
+        next_output_position = int(
             u1_state.get(
                 "generation_position_start",
                 session.context_length,
             )
             or 0
         )
+        # 2. SRT decode replays the previous token, so its position is one step behind
+        decode_input_position = max(0, next_output_position - 1)
 
         # iteratively decode
         for _ in range(max_new_tokens):
             decoded = runtime.decode_one_step(
                 session,
                 max_new_tokens=1,
-                decode_position_id=current_position,
+                decode_position_id=decode_input_position,
                 greedy=True,
                 model_state_updates={
                     "u1": {
                         "last_segment_type": "interleave",
                         "last_source": "native_interleave_decode",
                         "native_interleave_prompt": True,
-                        "generation_position_start": current_position,
+                        "generation_position_start": decode_input_position + 1,
                     }
                 },
             )
@@ -341,12 +361,13 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                 self._merge_runtime_u1_state(
                     runtime,
                     session,
-                    {"generation_position_start": current_position},
+                    {"generation_position_start": decode_input_position + 1},
                 )
                 break
             token_id = int(decoded.output_ids[-1])
-            current_position += 1
-            if token_id == img_start_id:
+            # 3. the sampled token is committed later at the next logical position
+            output_position = decode_input_position + 1
+            if self.is_image_generation_boundary_token(token_id):
                 # switch to image-generation, return a new segment
                 state_updates = {
                     "last_segment_type": "interleave",
@@ -354,12 +375,12 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                     "native_interleave_prompt": True,
                     "open_image_marker": True,
                     "interleave_pending_image_marker": bool(generated_text_ids),
-                    "generation_position_start": current_position,
+                    "generation_position_start": output_position + 1,
                 }
                 session = runtime.commit_ar_decode_input_token(
                     session,
                     token_id=token_id,
-                    position_id=current_position - 1,
+                    position_id=output_position,
                     model_state_updates={"u1": state_updates},
                 )
                 self._append_interleave_text_uncondition_marker(
@@ -389,7 +410,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                         "last_segment_type": "interleave",
                         "last_source": "native_interleave_eos",
                         "native_interleave_prompt": True,
-                        "generation_position_start": current_position,
+                        "generation_position_start": output_position + 1,
                     },
                 )
                 if generated_text_ids:
@@ -408,6 +429,8 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                     )
                 return OmniDecodeResult(type="done")
             generated_text_ids.append(token_id)
+            # 1. the generated token becomes the next decode input position
+            decode_input_position = output_position
             if stream_sink is not None:
                 current_text = _u1_decode_token_ids(
                     self.native_tokenizer,
@@ -428,7 +451,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                 "last_segment_type": "interleave",
                 "last_source": "native_interleave_decode",
                 "native_interleave_prompt": True,
-                "generation_position_start": current_position,
+                "generation_position_start": decode_input_position + 1,
             },
         )
         if generated_text_ids:
@@ -549,16 +572,18 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
     """Pixel-flow U1 bridge shell backed by the common SRT omni session runtime."""
 
     generation_kind: str = "pixel_flow"
-    t2i_cfg_uncondition_role = U1_T2I_CFG_UNCONDITION_ROLE
-    interleave_text_uncondition_role = U1_INTERLEAVE_TEXT_UNCONDITION_ROLE
-    edit_img_condition_role = U1_EDIT_IMG_CONDITION_ROLE
-    edit_uncondition_role = U1_EDIT_UNCONDITION_ROLE
+    condition_path_roles = {
+        "t2i_cfg_uncondition": U1_T2I_CFG_UNCONDITION_ROLE,
+        "interleave_text_uncondition": U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
+        "edit_img_condition": U1_EDIT_IMG_CONDITION_ROLE,
+        "edit_uncondition": U1_EDIT_UNCONDITION_ROLE,
+    }
 
     def __init__(
         self,
         runtime: OmniSessionRuntime,
         *,
-        max_pre_image_decode_steps: int = 128,
+        max_pre_image_decode_steps: int = 8192,
     ) -> None:
         self.runtime = runtime
         self._bridge = SRTBackedOmniSessionBridge(
@@ -578,15 +603,15 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         messages: list[OmniInterleavedMessage | dict[str, Any]],
         think: bool = False,
         think_max_new_tokens: int | None = None,
-        sampling_params: Any | None = None,
+        sampling_params: "SenseNovaU1SamplingParams | None" = None,
         session_id: str | None = None,
         stream_sink: Any | None = None,
     ) -> OmniContextBundle:
         with self._temporary_generation_settings(sampling_params, think=think):
             bridge_think = (
                 False
-                if getattr(sampling_params, "omni_generation_mode", None)
-                == "interleave"
+                if sampling_params is not None
+                and sampling_params.omni_generation_mode == "interleave"
                 else think
             )
             contexts = self._bridge.prefill_and_decode_to_image_boundary(
@@ -602,12 +627,12 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
     @contextmanager
     def _temporary_generation_settings(
         self,
-        sampling_params: Any | None,
+        sampling_params: "SenseNovaU1SamplingParams | None",
         *,
         think: bool,
     ):
         policy = self._u1_policy()
-        mode = getattr(sampling_params, "omni_generation_mode", None)
+        mode = None if sampling_params is None else sampling_params.omni_generation_mode
         if policy is not None:
             old_cfg = policy.include_t2i_cfg_uncondition
             old_interleave_text_uncondition = policy.include_interleave_text_uncondition
@@ -616,8 +641,16 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
             old_mode = policy.native_generation_mode
             old_interleave_think_mode = policy.native_interleave_think_mode
             needs_cfg = _u1_needs_any_cfg(sampling_params)
-            cfg_text_scale = float(getattr(sampling_params, "cfg_text_scale", 1.0))
-            cfg_img_scale = float(getattr(sampling_params, "cfg_img_scale", 1.0))
+            cfg_text_scale = (
+                1.0
+                if sampling_params is None
+                else float(sampling_params.cfg_text_scale)
+            )
+            cfg_img_scale = (
+                1.0
+                if sampling_params is None
+                else float(sampling_params.cfg_img_scale)
+            )
             policy.include_t2i_cfg_uncondition = (
                 _u1_needs_text_cfg(sampling_params)
                 and mode not in {"edit", "interleave"}
@@ -659,6 +692,50 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
             contexts=contexts,
             segment=segment,
         )
+
+    def finish_generated_segment_turn(
+        self,
+        *,
+        contexts: OmniContextBundle,
+    ) -> None:
+        """close a persistent U1 assistant turn after generated image commit"""
+        policy = self._u1_policy()
+        tokenizer = None if policy is None else policy.native_tokenizer
+        if tokenizer is None or contexts.full.session is None:
+            return
+        u1_state = self.runtime.get_model_state(
+            contexts.full.session,
+            namespace="u1",
+        )
+        position_id = int(
+            u1_state.get(
+                "generation_position_start",
+                contexts.full.session.context_length,
+            )
+        )
+        token_id = _u1_token_id(tokenizer, "<|im_end|>")
+        # 1. append <|im_end|> at the U1 logical position after generated </img>
+        session = self.runtime.commit_ar_decode_input_token(
+            contexts.full.session,
+            token_id=token_id,
+            position_id=position_id,
+            model_state_updates={
+                "u1": {
+                    "last_segment_type": "interleave",
+                    "last_source": "native_interleave_turn_end",
+                    "native_interleave_prompt": True,
+                    "open_image_marker": False,
+                    "interleave_pending_image_marker": False,
+                    "generation_position_start": position_id + 1,
+                }
+            },
+        )
+        # 2. keep all context paths attached to the closed full session
+        contexts.full.request_id = session.anchor_request_id
+        contexts.full.token_count = session.context_length
+        contexts.full.session = session
+        contexts.text_cfg.session = session
+        contexts.image_cfg.session = session
 
     def release(self, contexts: OmniContextBundle) -> None:
         self._bridge.release(contexts)

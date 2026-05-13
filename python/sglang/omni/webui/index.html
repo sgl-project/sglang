@@ -195,6 +195,30 @@
       accent-color: var(--accent-2);
     }
 
+    .segmented {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 4px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #edf4f1;
+      padding: 4px;
+    }
+
+    button.segment-button {
+      border-color: transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 8px 12px;
+      box-shadow: none;
+    }
+
+    button.segment-button.active {
+      border-color: var(--ink);
+      background: var(--ink);
+      color: var(--paper);
+    }
+
     .actions {
       display: flex;
       flex-wrap: wrap;
@@ -206,6 +230,10 @@
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 10px;
+    }
+
+    .render-actions {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
     }
 
     .side-actions .warn {
@@ -521,6 +549,14 @@
             <option value="vlm">vlm</option>
           </select>
         </div>
+        <div class="control">
+          <label>Think Mode</label>
+          <div class="segmented" role="group" aria-label="Think mode">
+            <button class="segment-button" id="thinkOff" type="button">Off</button>
+            <button class="segment-button active" id="thinkOn" type="button">On</button>
+          </div>
+          <input id="thinkMode" type="checkbox" checked hidden>
+        </div>
       </div>
 
       <div class="control-group">
@@ -533,6 +569,12 @@
 
       <div class="control-group">
         <h3>Generation</h3>
+        <div class="preset-actions render-actions">
+          <button class="secondary" id="draftPreset">Draft</button>
+          <button class="secondary" id="mediumPreset">Medium</button>
+          <button class="secondary" id="qualityPreset">Quality</button>
+        </div>
+
         <div class="row">
           <div class="control">
             <label for="width">Width</label>
@@ -570,8 +612,12 @@
       <div class="control-group">
         <h3>Session</h3>
         <div class="checkline">
-          <input id="keepSession" type="checkbox" checked>
-          <span>Keep omni session across turns</span>
+          <input id="usePreviousImage" type="checkbox">
+          <span>Use previous image as input</span>
+        </div>
+        <div class="checkline">
+          <input id="keepSession" type="checkbox">
+          <span>Keep interleave session across turns</span>
         </div>
         <div class="side-actions">
           <button class="secondary" id="newChat">New chat</button>
@@ -611,10 +657,17 @@
     let requestModel = "sensenova-u1";
     let sessionId = "";
     let turnIndex = 0;
+    let lastImagePayload = null;
 
     const prompts = {
       turn1: "Create one clean studio image of a matte cobalt-blue cube centered on a white tabletop, with a plain light-gray background. After the image, describe the cube color and table in one short sentence.",
       turn2: "Continue from the previous generated image. Edit it so the cube becomes bright red and add one glossy green sphere on its right. Keep the same tabletop, camera angle, and background, then explain exactly what changed."
+    };
+
+    const renderPresets = {
+      draft: {width: "512", height: "512", steps: "12", cfgText: "1.0", cfgImage: "1.0"},
+      medium: {width: "512", height: "512", steps: "24", cfgText: "1.0", cfgImage: "1.0"},
+      quality: {width: "1024", height: "1024", steps: "50", cfgText: "4.0", cfgImage: "1.0"}
     };
 
     $("prompt").value = prompts.turn1;
@@ -636,6 +689,21 @@
     function setSession(id) {
       sessionId = id || "";
       renderSessionView();
+    }
+
+    function applyRenderPreset(name) {
+      const preset = renderPresets[name];
+      $("width").value = preset.width;
+      $("height").value = preset.height;
+      $("steps").value = preset.steps;
+      $("cfgText").value = preset.cfgText;
+      $("cfgImage").value = preset.cfgImage;
+    }
+
+    function setThinkMode(enabled) {
+      $("thinkMode").checked = Boolean(enabled);
+      $("thinkOff").classList.toggle("active", !enabled);
+      $("thinkOn").classList.toggle("active", Boolean(enabled));
     }
 
     function setStatus(ok, text) {
@@ -694,7 +762,7 @@
       const meta = makeEl(
         "div",
         "turn-meta",
-        `turn ${turnIndex}\n${payload.task || "request"}`
+        `turn ${turnIndex}\n${payload.task || "request"}\nthink ${payload.think ? "on" : "off"}`
       );
       const body = makeEl("div", "turn-body");
       body.appendChild(makeEl("div", "prompt", prompt));
@@ -763,11 +831,31 @@
       if (segment.type === "text") {
         wrap.appendChild(makeEl("div", "text", segment.text || ""));
       } else if (segment.type === "image") {
+        rememberGeneratedImage(segment.image || {});
         wrap.appendChild(renderImage(segment.image || {}));
       } else {
         wrap.appendChild(makeEl("pre", "raw", JSON.stringify(segment, null, 2)));
       }
       return wrap;
+    }
+
+    function rememberGeneratedImage(image) {
+      const b64Json = image?.b64_json || image?.base64 || "";
+      if (!b64Json) {
+        return;
+      }
+      lastImagePayload = {
+        b64_json: b64Json,
+        mime_type: image.mime_type || "image/png"
+      };
+    }
+
+    function previousImageSegment() {
+      if (!lastImagePayload) return null;
+      return {
+        type: "image",
+        image: {...lastImagePayload}
+      };
     }
 
     function renderImage(image) {
@@ -840,6 +928,7 @@
         setPendingStatus(pending, "Generating image");
       } else if (event.type === "image") {
         const entry = getLiveSegment(pending, event.segment_id || "seg-image", "image");
+        rememberGeneratedImage(event.image || {});
         entry.content.replaceWith(renderImage(event.image || {}));
         entry.content = entry.wrap.querySelector(".image");
         setPendingStatus(pending, "Finishing");
@@ -880,14 +969,24 @@
       if (!prompt) {
         throw new Error("Message is required");
       }
-      const imageSegment = await fileAsImageSegment($("imageInput").files[0]);
+      const task = $("task").value;
+      const uploadedImageSegment = await fileAsImageSegment($("imageInput").files[0]);
+      const imageSegment =
+        uploadedImageSegment ||
+        (task !== "t2i" && $("usePreviousImage").checked
+          ? previousImageSegment()
+          : null);
+      if (task === "edit" && !imageSegment) {
+        throw new Error("Edit requires an uploaded image or a previous generated image");
+      }
       const messages = [];
       if (imageSegment) messages.push(imageSegment);
       messages.push({type: "text", text: prompt});
 
       const payload = {
         model: requestModel,
-        task: $("task").value,
+        task,
+        think: $("thinkMode").checked,
         stream: true,
         messages,
         sampling_params: {
@@ -906,9 +1005,9 @@
         max_text_segments: 3
       };
 
-      if (sessionId) {
+      if (task === "interleave" && sessionId) {
         payload.session_id = sessionId;
-      } else if ($("keepSession").checked) {
+      } else if (task === "interleave" && $("keepSession").checked) {
         payload.keep_session = true;
       }
       return {payload, prompt};
@@ -1029,6 +1128,7 @@
         await closeCurrentSession();
         setSession("");
         turnIndex = 0;
+        lastImagePayload = null;
         renderSessionView();
         $("prompt").value = "";
         $("imageInput").value = "";
@@ -1039,20 +1139,32 @@
     }
 
     $("send").addEventListener("click", send);
+    $("draftPreset").addEventListener("click", () => applyRenderPreset("draft"));
+    $("mediumPreset").addEventListener("click", () => applyRenderPreset("medium"));
+    $("qualityPreset").addEventListener("click", () => applyRenderPreset("quality"));
+    $("thinkOff").addEventListener("click", () => setThinkMode(false));
+    $("thinkOn").addEventListener("click", () => setThinkMode(true));
     $("newChat").addEventListener("click", newChat);
     $("closeSession").addEventListener("click", closeSession);
     $("reset").addEventListener("click", () => {
       turnIndex = 0;
+      lastImagePayload = null;
       renderSessionView();
       feed.innerHTML = '<div class="empty">Timeline cleared.</div>';
     });
     $("turn1").addEventListener("click", () => {
-      $("task").value = "interleave";
+      $("task").value = "t2i";
+      setThinkMode(false);
+      $("usePreviousImage").checked = false;
+      $("keepSession").checked = false;
       $("prompt").value = prompts.turn1;
       $("seed").value = "223";
     });
     $("turn2").addEventListener("click", () => {
-      $("task").value = "interleave";
+      $("task").value = "edit";
+      setThinkMode(false);
+      $("usePreviousImage").checked = true;
+      $("keepSession").checked = false;
       $("prompt").value = prompts.turn2;
       $("seed").value = "224";
     });
@@ -1064,6 +1176,7 @@
     });
 
     renderSessionView();
+    setThinkMode($("thinkMode").checked);
     loadConfig();
     checkHealth();
     setInterval(checkHealth, 10000);

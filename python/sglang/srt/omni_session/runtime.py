@@ -18,7 +18,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, MultimodalInputs, Req
-from sglang.srt.omni_session.runtime_protocol import (
+from sglang.srt.omni_session.runtime_types import (
     OmniSessionHandle,
 )
 from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
@@ -371,6 +371,7 @@ class OmniSessionRuntime:
         }
         if position_id is not None:
             policy_metadata["omni_srt_decode_position_id"] = int(position_id)
+            policy_metadata["omni_srt_position_count"] = int(position_id) + 1
         if model_state_updates is not None:
             policy_metadata["omni_model_state_updates"] = model_state_updates
             self._merge_omni_model_state_updates(record, model_state_updates)
@@ -525,6 +526,16 @@ class OmniSessionRuntime:
 
         record = self._record_for(handle_or_session_id)
         self._merge_omni_model_state_updates(record, {namespace: dict(updates)})
+
+    def get_model_state(
+        self,
+        handle_or_session_id: OmniSessionHandle | str,
+        *,
+        namespace: str,
+    ) -> dict[str, Any]:
+        record = self._record_for(handle_or_session_id)
+        state = record.omni_model_state.get(str(namespace)) or {}
+        return self._copy_omni_model_state(state)
 
     def _record_for(
         self,
@@ -909,6 +920,7 @@ class OmniSessionRuntime:
             policy_metadata["omni_srt_rope_delta"] = len(input_ids)
         if decode_position_id is not None:
             policy_metadata["omni_srt_decode_position_id"] = int(decode_position_id)
+            policy_metadata["omni_srt_position_count"] = int(decode_position_id) + 1
         if model_state_updates is not None:
             policy_metadata["omni_model_state_updates"] = model_state_updates
             self._merge_omni_model_state_updates(record, model_state_updates)
@@ -1101,7 +1113,7 @@ class OmniSessionRuntime:
         recv_req = OpenSessionReqInput(
             session_id=session_id,
             capacity_of_str_len=self.capacity_of_str_len,
-            # ug contexts must retain KV across AR/generation phases for generation-side reads
+            # omni sessions retain KV across AR/generation phases for generation-side reads
             streaming=True,
         )
         if self.srt_request_executor is None:

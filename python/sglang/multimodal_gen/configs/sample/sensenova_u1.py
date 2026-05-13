@@ -17,6 +17,8 @@ class SenseNovaU1SamplingParams(SamplingParams):
     height: int | None = 1024
     width: int | None = 1024
     num_inference_steps: int | None = 50
+    omni_generation_mode: str = "interleave"
+    think_mode: bool = False
 
     cfg_text_scale: float = 4.0
     cfg_img_scale: float = 1.0
@@ -87,12 +89,12 @@ class SenseNovaU1PixelFlowCFG:
 
 
 def resolve_sensenova_u1_pixel_flow_cfg(
-    params: Any,
+    params: SenseNovaU1SamplingParams,
 ) -> SenseNovaU1PixelFlowCFG:
-    text_scale = float(getattr(params, "cfg_text_scale", 4.0))
-    img_scale = float(getattr(params, "cfg_img_scale", 1.0))
+    text_scale = float(params.cfg_text_scale)
+    img_scale = float(params.cfg_img_scale)
     needs_cfg = not (text_scale == 1.0 and img_scale == 1.0)
-    cfg_interval = list(getattr(params, "cfg_interval", [0.0, 1.0]))
+    cfg_interval = list(params.cfg_interval)
     if len(cfg_interval) != 2:
         raise ValueError("SenseNova U1 cfg_interval must contain [start, end]")
     return SenseNovaU1PixelFlowCFG(
@@ -103,8 +105,8 @@ def resolve_sensenova_u1_pixel_flow_cfg(
         needs_uncondition=needs_cfg and img_scale != 1.0,
         start=float(cfg_interval[0]),
         end=float(cfg_interval[1]),
-        renorm_min=float(getattr(params, "cfg_renorm_min", 0.0)),
-        renorm_type=str(getattr(params, "cfg_renorm_type", "none")),
+        renorm_min=float(params.cfg_renorm_min),
+        renorm_type=str(params.cfg_renorm_type),
     )
 
 

@@ -13,8 +13,25 @@ from sglang.omni.protocol import OmniContextBundle
 
 if TYPE_CHECKING:
     from sglang.omni.coordinator import OmniCoordinator
+    from sglang.srt.managers.io_struct import (
+        OmniGenerateReqInput,
+        OmniGenerateReqOutput,
+        OmniGenerateStreamOutput,
+    )
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.omni_session.runtime import (
+        OmniSessionRecord as SRTOmniSessionRecord,
+    )
+    from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
+
+    OmniTaskOutput = tuple[
+        OmniGenerateReqOutput | OmniGenerateStreamOutput,
+        OmniGenerateReqInput,
+    ]
+else:
+    OmniTaskOutput = tuple[Any, Any]
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +48,9 @@ class OmniSessionRecord:
 class OmniSRTExecutionRequest:
     """A native SRT request submitted by an omni task and completed by scheduler."""
 
-    executor: Any
-    record: Any
-    req: Any
+    executor: "OmniSRTSchedulerExecutor"
+    record: "SRTOmniSessionRecord"
+    req: "Req"
     state: object | None
     done: Event = field(default_factory=Event)
     error: BaseException | None = None
@@ -56,7 +73,9 @@ class OmniSRTBatchObservation:
     """Scheduler-owned observation needed to finalize native omni SRT reqs."""
 
     requests: list[OmniSRTExecutionRequest]
-    executor_sessions: list[tuple[Any, Any]]
+    executor_sessions: list[
+        tuple["OmniSRTSchedulerExecutor", list[tuple[str, str, int | None]]]
+    ]
 
 
 @dataclass(slots=True)
@@ -115,7 +134,7 @@ class OmniSchedulerState:
     pending_scheduler_thread_calls: Queue[OmniSchedulerThreadCall] = field(
         default_factory=Queue
     )
-    completed_task_outputs: Queue[tuple[Any, Any]] = field(default_factory=Queue)
+    completed_task_outputs: Queue[OmniTaskOutput] = field(default_factory=Queue)
     orchestrator_lock: RLock = field(default_factory=RLock)
     scheduler_thread_id: int | None = None
     scheduler_condition: Condition = field(default_factory=Condition)
@@ -132,9 +151,9 @@ class OmniSchedulerState:
     def submit_srt_request(
         self,
         *,
-        executor: Any,
-        record: Any,
-        req: Any,
+        executor: "OmniSRTSchedulerExecutor",
+        record: "SRTOmniSessionRecord",
+        req: "Req",
         state: object | None,
     ) -> OmniSRTExecutionRequest:
         pending = OmniSRTExecutionRequest(
@@ -176,7 +195,9 @@ class OmniSchedulerState:
         if not pending_requests:
             return None
 
-        executor_sessions: list[tuple[Any, Any]] = []
+        executor_sessions: list[
+            tuple["OmniSRTSchedulerExecutor", list[tuple[str, str, int | None]]]
+        ] = []
         seen_executors: set[int] = set()
         for pending in pending_requests:
             executor = pending.executor
@@ -230,7 +251,7 @@ class OmniSchedulerState:
         self,
         *,
         scheduler: "Scheduler",
-        recv_req: Any,
+        recv_req: "OmniGenerateReqInput",
     ) -> None:
         with self.scheduler_condition:
             self.active_task_count += 1
@@ -238,12 +259,12 @@ class OmniSchedulerState:
             target=self._run_omni_generate_task,
             args=(scheduler, recv_req),
             daemon=True,
-            name=f"omni-generate-{getattr(recv_req, 'rid', 'unknown')}",
+            name=f"omni-generate-{recv_req.rid}",
         )
         thread.start()
 
-    def pop_completed_task_outputs(self) -> list[tuple[Any, Any]]:
-        outputs: list[tuple[Any, Any]] = []
+    def pop_completed_task_outputs(self) -> list[OmniTaskOutput]:
+        outputs: list[OmniTaskOutput] = []
         while True:
             try:
                 outputs.append(self.completed_task_outputs.get_nowait())
@@ -315,7 +336,7 @@ class OmniSchedulerState:
         with self.scheduler_condition:
             self.scheduler_condition.notify_all()
 
-    def _scheduler_still_owns_req(self, scheduler: "Scheduler", req: Any) -> bool:
+    def _scheduler_still_owns_req(self, scheduler: "Scheduler", req: "Req") -> bool:
         if req in scheduler.waiting_queue:
             return True
         for batch in (
@@ -337,7 +358,9 @@ class OmniSchedulerState:
                     return True
         return False
 
-    def _run_omni_generate_task(self, scheduler: "Scheduler", recv_req: Any) -> None:
+    def _run_omni_generate_task(
+        self, scheduler: "Scheduler", recv_req: "OmniGenerateReqInput"
+    ) -> None:
         from sglang.omni.srt_transport import (
             handle_omni_generate_with_omni_coordinator,
         )

@@ -174,6 +174,9 @@ class StreamingSession(BasePrefixCache):
     def has_slot(self, session_id: str) -> bool:
         return session_id in self.slots
 
+    def get_session_slot(self, session_id: str) -> SessionSlot | None:
+        return self.slots.get(session_id)
+
     def any_holding_kv(self) -> bool:
         return any(s.is_holding_kv for s in self.slots.values())
 

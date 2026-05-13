@@ -11,6 +11,7 @@ from sglang.omni.backends.mm_gen.pipeline_executor_backend import (
 )
 from sglang.omni.backends.mm_gen.pipeline_forward_backend import (
     DirectPipelineForwardBackend,
+    require_generated_segment,
 )
 from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
 
@@ -78,6 +79,10 @@ class TestOmniMMGenBackends(unittest.TestCase):
         self.assertEqual(stages, executor.stages)
         self.assertEqual(server_args, executor.server_args)
         self.assertIs(context_ops, executor.batch.omni_context_ops)
+
+    def test_pipeline_backend_requires_generated_segment_contract(self):
+        with self.assertRaisesRegex(TypeError, "GeneratedSegment"):
+            require_generated_segment(SimpleNamespace(type="image", image="legacy"))
 
 
 class _FakePipeline:

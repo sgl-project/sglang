@@ -9,10 +9,8 @@ from PIL import Image
 
 from sglang.omni.backends.ar.srt import SRTARBackend
 from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
-from sglang.srt.omni_session.runtime_protocol import (
+from sglang.srt.omni_session.runtime_types import (
     OmniContextBundle as SRTOmniContextBundle,
-)
-from sglang.srt.omni_session.runtime_protocol import (
     OmniContextHandle,
     OmniSessionHandle,
 )
@@ -58,6 +56,31 @@ class TestOmniSRTBackend(unittest.TestCase):
         self.assertEqual("done", third.type)
         self.assertEqual(1, bridge.commit_count)
 
+    def test_interleave_can_finish_before_image_marker(self):
+        bridge = _FakeBridge(
+            pre_image_segments=[
+                {
+                    "type": "text",
+                    "text": "hello",
+                    "metadata": {"token_ids": [1]},
+                },
+            ],
+            reached_image_marker=False,
+        )
+        backend = SRTARBackend(bridge)
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="hi"),),
+            mode="interleave",
+        )
+
+        context = backend.begin_request_context(request)
+        first = backend.decode_until_boundary(context, request=request)
+        second = backend.decode_until_boundary(context, request=request)
+
+        self.assertEqual(("text", "hello"), (first.type, first.text))
+        self.assertEqual("done", second.type)
+        self.assertEqual(0, bridge.commit_count)
+
     def test_image_payload_accepts_b64_json(self):
         bridge = _ImageCaptureBridge()
         backend = SRTARBackend(bridge)
@@ -98,9 +121,30 @@ class TestOmniSRTBackend(unittest.TestCase):
         self.assertEqual(4, bridge.max_new_tokens)
         self.assertEqual(["s1"], bridge.runtime.closed_sessions)
 
+    def test_context_ops_resolves_condition_path_role_map(self):
+        bridge = _FakeBridge(pre_image_segments=[])
+        bridge.condition_path_roles["edit_img_condition"] = "u1_edit_img_condition"
+        backend = SRTARBackend(bridge)
+        context = backend.begin_request_context(
+            OmniRequest(
+                messages=(OmniInputSegment(type="text", text="edit"),),
+                mode="edit",
+            )
+        )
+
+        context_ops = backend.get_context_ops(context)
+
+        self.assertEqual(
+            "u1_edit_img_condition",
+            context_ops.get_role("edit_img_condition_role", "fallback"),
+        )
+
 
 class _FakeBridge:
-    def __init__(self, pre_image_segments=None):
+    generation_kind = "pixel_flow"
+
+    def __init__(self, pre_image_segments=None, reached_image_marker=True):
+        self.condition_path_roles = {}
         self.pre_image_segments = (
             [
                 {
@@ -112,6 +156,7 @@ class _FakeBridge:
             if pre_image_segments is None
             else pre_image_segments
         )
+        self.reached_image_marker = reached_image_marker
         self.commit_count = 0
         self.session_ids = []
 
@@ -127,7 +172,10 @@ class _FakeBridge:
             request_id="r0",
             token_count=4,
             session=session,
-            metadata={"pre_image_segments": self.pre_image_segments},
+            metadata={
+                "pre_image_segments": self.pre_image_segments,
+                "pre_image_reached_image_marker": self.reached_image_marker,
+            },
         )
         text_cfg = OmniContextHandle(
             request_id="r0:text_cfg",
@@ -145,10 +193,14 @@ class _FakeBridge:
         self.commit_count += 1
 
     def continue_ar_decode(self, **kwargs):
-        return SimpleNamespace(type="done", text=None, token_ids=())
+        return SimpleNamespace(type="done", text=None, token_ids=(), metadata={})
 
     def release(self, contexts):
         return None
+
+    def get_condition_path_role(self, name, default):
+        key = name[:-5] if name.endswith("_role") else name
+        return self.condition_path_roles.get(key, default)
 
 
 class _FakeRuntime:

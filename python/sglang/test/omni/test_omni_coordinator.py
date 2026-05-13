@@ -34,9 +34,7 @@ class _InMemoryContextOps:
     def get_position_count(self, *, condition_path_role: str | None = None):
         return 0
 
-    def build_temporary_forward_batch(
-        self, *, prepared, generation_query_embeds, timestep
-    ):
+    def run_temporary_forward(self, *, prepared, forward):
         raise RuntimeError("no temporary forward backend")
 
 
@@ -175,12 +173,23 @@ class TestOmniCoordinator(unittest.TestCase):
         self.assertEqual(1, gen_backend.calls)
         self.assertEqual(1, len(ar_backend.appended_segments))
         self.assertEqual(1, len(ar_backend.released_contexts))
+        self.assertEqual(
+            {
+                "num_segments": 3,
+                "num_text_segments": 2,
+                "num_image_segments": 1,
+                "num_audio_segments": 0,
+                "num_video_segments": 0,
+            },
+            response.stats,
+        )
 
-    def test_session_turn_keeps_context_and_stops_after_image(self):
+    def test_session_turn_keeps_context_and_continues_text_after_image(self):
         ar_backend = _ScriptedARBackend(
             [
                 OmniBoundary(type="image"),
                 OmniBoundary(type="text", text="after"),
+                OmniBoundary(type="image"),
             ]
         )
         gen_backend = _ImageBackend()
@@ -196,7 +205,7 @@ class TestOmniCoordinator(unittest.TestCase):
             stop_after_generation_limit=True,
         )
 
-        self.assertEqual(["image"], [s.type for s in response.segments])
+        self.assertEqual(["image", "text"], [s.type for s in response.segments])
         self.assertEqual(1, gen_backend.calls)
         self.assertEqual(0, len(ar_backend.released_contexts))
 

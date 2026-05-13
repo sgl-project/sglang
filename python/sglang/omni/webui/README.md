@@ -4,11 +4,10 @@ This is a small local WebUI for testing interleaved omni models through
 SGLang's `/v1/omni/generate` API. It is intentionally a thin browser UI plus
 HTTP proxy: model serving still happens in `sglang serve --model-type omni`.
 
-The first target model is SenseNova U1. The UI supports a free-form chat loop
-for repeated refinements, and also keeps a two-turn preset for quickly checking
-that a later turn can edit a previously generated image. Requests use
-`stream: true`, so text appears incrementally and image generation shows a
-placeholder until the final image event arrives.
+The first target model is SenseNova U1. The UI supports fresh text-to-image
+requests, explicit image editing, VLM checks, and advanced interleave sessions.
+Requests use `stream: true`, so text appears incrementally and image generation
+shows a placeholder until the final image event arrives.
 
 ## Start An Omni Server
 
@@ -54,26 +53,34 @@ http://127.0.0.1:7860
 ```
 
 The UI displays the served model from `--served-model`, while requests use
-`--request-model` for the API payload. It defaults to `1024x1024`, matching
-U1's image sampling defaults. Custom width and height values should be multiples
-of 32.
+`--request-model` for the API payload. It defaults to U1's quality image
+configuration: `1024x1024`, 50 steps, text CFG `4.0`, and image CFG `1.0`.
+Use the Draft or Medium presets only when you explicitly want a faster
+interactive check. Custom width and height values should be multiples of 32.
 
-## Multi-Turn Flow
+## Recommended Flow
 
-Use the `Message` composer for normal multi-turn refinement. Keep `Keep omni
-session across turns` enabled, then click `Send` for each user turn. `New chat`
-closes the current server session and clears the thread.
+For unrelated new images, use `t2i` and start a fresh request. This matches the
+official U1 usage pattern: a new topic should not inherit the previous SRT KV
+session.
 
-For the preset flow:
+For image editing, use `edit` and provide an input image. The WebUI can reuse
+the last generated image when `Use previous image as input` is enabled, or you
+can upload a file through `Optional input image`.
 
 1. Click `Preset: first image`.
 2. Click `Send`.
-3. Keep the returned session alive.
+3. Wait for the image to appear.
 4. Click `Preset: edit previous`.
 5. Click `Send` again.
 
-Turn 2 reuses the session returned by turn 1, so the model can refer to the
-previous generated image and edit it.
+Turn 2 sends the first generated image as an explicit input image. It does not
+reuse the previous KV session.
+
+`Keep interleave session across turns` is an advanced option for interleaved
+text-image protocol experiments. It is useful when the model is expected to keep
+one protocol-level conversation, but it should not be used for independent image
+topics.
 
 ## API Proxy
 

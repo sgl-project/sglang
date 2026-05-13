@@ -32,6 +32,8 @@ class TestSenseNovaU1OmniConfig(unittest.TestCase):
         self.assertEqual(4, normalized.metadata["max_new_tokens"])
         self.assertEqual(2, normalized.max_images)
         self.assertTrue(normalized.think)
+        self.assertEqual("vlm", normalized.sampling_params.omni_generation_mode)
+        self.assertTrue(normalized.sampling_params.think_mode)
         self.assertEqual(3, normalized.sampling_params.num_inference_steps)
 
     def test_sampling_defaults_follow_u1_official_image_generation(self):
@@ -50,6 +52,16 @@ class TestSenseNovaU1OmniConfig(unittest.TestCase):
         self.assertEqual([0.0, 1.0], params.cfg_interval)
         self.assertEqual("none", params.cfg_renorm_type)
         self.assertEqual(0.02, params.t_eps)
+
+    def test_sampling_params_must_be_object(self):
+        plugin = SenseNovaU1OmniPlugin()
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="draw"),),
+            sampling_params="bad",
+        )
+
+        with self.assertRaisesRegex(ValueError, "sampling_params must be an object"):
+            plugin.normalize_request(request)
 
     def test_diffusion_source_engine_args_accept_json_and_cli_string(self):
         cases = [

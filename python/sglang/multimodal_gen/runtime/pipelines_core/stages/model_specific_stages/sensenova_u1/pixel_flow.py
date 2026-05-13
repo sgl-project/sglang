@@ -2,7 +2,7 @@
 """Run SenseNova U1 pixel-flow against live SRT context state."""
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -23,7 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.omni.protocol import ContextOps, TemporaryForwardPrepared
+from sglang.omni.protocol import ContextOps, GeneratedSegment, TemporaryForwardPrepared
 
 _U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
 _U1_INTERLEAVE_TEXT_UNCONDITION_ROLE = "u1_interleave_text_uncondition"
@@ -72,14 +72,6 @@ class SenseNovaU1PixelFlowDenoiseOutput:
 
 
 @dataclass(frozen=True, slots=True)
-class SenseNovaU1GeneratedSegment:
-    type: str
-    image: Any
-    metadata: dict[str, Any] = field(default_factory=dict)
-    commit_image: Any | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class _SenseNovaU1GenerationContext:
     session_id: str
     position_count: int
@@ -111,7 +103,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         """
         context_ops = _require_context_ops(batch)
         model = _require_model(context_ops)
-        forward_batch_provider = _require_forward_batch_provider(context_ops)
+        temporary_forward_runner = _require_temporary_forward_runner(context_ops)
         (
             u1_context,
             cfg_img_condition_u1_context,
@@ -127,7 +119,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         )
         image_prediction = self._denoise(
             model=model,
-            forward_batch_provider=forward_batch_provider,
+            temporary_forward_runner=temporary_forward_runner,
             prepared=prepared,
         )
         batch.sensenova_u1_pixel_flow = SenseNovaU1PixelFlowDenoiseOutput(
@@ -181,23 +173,17 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         token_w = width // divisor
         grid_h = height // patch_size
         grid_w = width // patch_size
-        steps = int(getattr(sampling_params, "num_inference_steps", None) or 0)
+        steps = int(sampling_params.num_inference_steps or 0)
         if steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {steps}")
         t_eps = float(sampling_params.t_eps)
-        commit_generated_image = (
-            getattr(sampling_params, "omni_generation_mode", None) == "interleave"
-        )
+        commit_generated_image = sampling_params.omni_generation_mode == "interleave"
 
         device = _model_device(model)
-        dtype = _model_dtype(model)
         seed = _batch_seed(batch)
-        generator = _session_torch_generator(
-            context_metadata,
-            seed=seed,
-            device=device,
-        )
+        generator = _new_torch_generator(seed=seed, device=device)
         noise_scale = float(_noise_scale_for_image(model, grid_h=grid_h, grid_w=grid_w))
+        dtype = _model_dtype(model)
         image_prediction = noise_scale * torch.randn(
             (1, 3, height, width),
             device=device,
@@ -206,7 +192,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         )
         # keep shape metadata on cpu so vision embedding loop bounds do not sync per step
         gen_grid_hw = torch.tensor([[grid_h, grid_w]], dtype=torch.long)
-        timestep_shift = float(getattr(sampling_params, "timestep_shift", 3.0))
+        timestep_shift = float(sampling_params.timestep_shift)
         timesteps = torch.linspace(0.0, 1.0, steps + 1, device=device)
         timesteps = _apply_time_schedule(
             model,
@@ -229,6 +215,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
             token_h=token_h,
             token_w=token_w,
             packed_seqlens=packed_seqlens,
+            attention_math_mode=context_metadata.get("attention_math_mode"),
             device=device,
         )
         img_condition = None
@@ -238,6 +225,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
                 token_h=token_h,
                 token_w=token_w,
                 packed_seqlens=packed_seqlens,
+                attention_math_mode=context_metadata.get("attention_math_mode"),
                 device=device,
             )
         uncondition = None
@@ -247,6 +235,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
                 token_h=token_h,
                 token_w=token_w,
                 packed_seqlens=packed_seqlens,
+                attention_math_mode=context_metadata.get("attention_math_mode"),
                 device=device,
             )
 
@@ -278,7 +267,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         self,
         *,
         model: Any,
-        forward_batch_provider: Any,
+        temporary_forward_runner: Any,
         prepared: SenseNovaU1PixelFlowPrepared,
     ) -> Any:
 
@@ -317,7 +306,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
 
             v_condition = self._predict_v(
                 model=model,
-                forward_batch_provider=forward_batch_provider,
+                temporary_forward_runner=temporary_forward_runner,
                 forward_context=prepared.condition,
                 image_embeds=image_embeds,
                 timestep=timestep,
@@ -327,7 +316,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
             use_cfg = prepared.cfg_step_mask[step_i]
             v_pred = self._combine_cfg_velocity(
                 model=model,
-                forward_batch_provider=forward_batch_provider,
+                temporary_forward_runner=temporary_forward_runner,
                 prepared=prepared,
                 image_embeds=image_embeds,
                 timestep=timestep,
@@ -355,7 +344,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         self,
         *,
         model: Any,
-        forward_batch_provider: Any,
+        temporary_forward_runner: Any,
         prepared: SenseNovaU1PixelFlowPrepared,
         image_embeds: Any,
         timestep: Any,
@@ -369,7 +358,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         if cfg.img_scale == 1.0:
             v_img_condition = self._predict_v(
                 model=model,
-                forward_batch_provider=forward_batch_provider,
+                temporary_forward_runner=temporary_forward_runner,
                 forward_context=_require_forward_context(prepared.img_condition),
                 image_embeds=image_embeds,
                 timestep=timestep,
@@ -380,7 +369,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         if cfg.text_scale == cfg.img_scale:
             v_uncondition = self._predict_v(
                 model=model,
-                forward_batch_provider=forward_batch_provider,
+                temporary_forward_runner=temporary_forward_runner,
                 forward_context=_require_forward_context(prepared.uncondition),
                 image_embeds=image_embeds,
                 timestep=timestep,
@@ -391,7 +380,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
 
         v_img_condition = self._predict_v(
             model=model,
-            forward_batch_provider=forward_batch_provider,
+            temporary_forward_runner=temporary_forward_runner,
             forward_context=_require_forward_context(prepared.img_condition),
             image_embeds=image_embeds,
             timestep=timestep,
@@ -400,7 +389,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         )
         v_uncondition = self._predict_v(
             model=model,
-            forward_batch_provider=forward_batch_provider,
+            temporary_forward_runner=temporary_forward_runner,
             forward_context=_require_forward_context(prepared.uncondition),
             image_embeds=image_embeds,
             timestep=timestep,
@@ -417,25 +406,15 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         self,
         *,
         model: Any,
-        forward_batch_provider: Any,
+        temporary_forward_runner: Any,
         forward_context: SenseNovaU1PixelFlowForwardContext,
         image_embeds: Any,
         timestep: Any,
         z: Any,
         t_eps: float,
     ) -> Any:
-        forward_batch_context = forward_batch_provider(
-            prepared=forward_context.prepared,
-            generation_query_embeds=image_embeds,
-            timestep=timestep,
-        )
-        forward_batch = getattr(
-            forward_batch_context,
-            "forward_batch",
-            forward_batch_context,
-        )
-        try:
-            # important: after each noise step, calls the forward of the **AR** model
+        def run_forward(forward_batch: Any) -> Any:
+            # 1. each noise step calls the AR model with temporary SRT KV
             return _predict_pixel_flow_from_srt(
                 model,
                 image_embeds=image_embeds,
@@ -445,11 +424,12 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
                 z=z,
                 t_eps=t_eps,
             )
-        finally:
-            # release the temporarilly allocated kv tokens from kv cache
-            release = getattr(forward_batch_context, "release", None)
-            if callable(release):
-                release()
+
+        # 2. srt owns build/forward/release so forward batch does not cross threads
+        return temporary_forward_runner(
+            prepared=forward_context.prepared,
+            forward=run_forward,
+        )
 
     @staticmethod
     def _apply_cfg_renorm(
@@ -512,7 +492,7 @@ class SenseNovaU1PixelFlowDecodeStage(PipelineStage):
         model: Any,
         prepared: SenseNovaU1PixelFlowPrepared,
         image_prediction: Any,
-    ) -> SenseNovaU1GeneratedSegment:
+    ) -> GeneratedSegment:
         array = (
             (image_prediction[0].float() * 0.5 + 0.5)
             .clamp(0, 1)
@@ -535,7 +515,7 @@ class SenseNovaU1PixelFlowDecodeStage(PipelineStage):
                 "pad_hash": id(image_prediction),
             }
         cfg = prepared.cfg
-        return SenseNovaU1GeneratedSegment(
+        return GeneratedSegment(
             type="image",
             image=image,
             metadata={
@@ -561,7 +541,7 @@ class SenseNovaU1PixelFlowDecodeStage(PipelineStage):
                 "cfg_img_scale": cfg.img_scale,
                 "cfg_renorm_type": cfg.renorm_type if cfg.needs_cfg else "none",
             },
-            commit_image=commit_image,
+            commit_payload=commit_image,
         )
 
 
@@ -585,7 +565,7 @@ def _resolve_u1_contexts(
     cfg_img_condition_context = None
     cfg_uncondition_context = None
     sampling_params = batch.sampling_params
-    mode = getattr(sampling_params, "omni_generation_mode", None)
+    mode = sampling_params.omni_generation_mode
     cfg = resolve_sensenova_u1_pixel_flow_cfg(sampling_params)
 
     t2i_uncondition_role = context_ops.get_role(
@@ -681,6 +661,7 @@ def _build_forward_context(
     token_h: int,
     token_w: int,
     packed_seqlens: Any,
+    attention_math_mode: str | None,
     device: Any,
 ) -> SenseNovaU1PixelFlowForwardContext:
     position_count = int(context.position_count)
@@ -696,6 +677,8 @@ def _build_forward_context(
             "packed_seqlens": packed_seqlens,
             "packed_position_ids": indexes_image,
             "extend_num_tokens": token_h * token_w,
+            "attention_math_mode": attention_math_mode,
+            "synchronize_before_release": True,
         },
         srt_session_id=context.session_id,
         condition_path_role=context.condition_path_role,
@@ -825,31 +808,10 @@ def _calculate_dynamic_mu(model: Any, image_seq_len: int) -> float:
     return float(image_seq_len) * slope + bias
 
 
-def _session_torch_generator(
-    metadata: dict[str, Any],
-    *,
-    seed: int,
-    device: Any,
-) -> Any:
+def _new_torch_generator(*, seed: int, device: Any) -> Any:
     import torch
 
-    key = "_u1_pixel_flow_generator"
-    device_str = str(device)
-    state = metadata.get(key)
-    if (
-        isinstance(state, dict)
-        and state.get("seed") == int(seed)
-        and state.get("device") == device_str
-        and isinstance(state.get("generator"), torch.Generator)
-    ):
-        return state["generator"]
-    generator = torch.Generator(device=device).manual_seed(int(seed))
-    metadata[key] = {
-        "seed": int(seed),
-        "device": device_str,
-        "generator": generator,
-    }
-    return generator
+    return torch.Generator(device=device).manual_seed(int(seed))
 
 
 def _batch_seed(batch: Any) -> int:
@@ -893,8 +855,8 @@ def _require_model(context_ops: ContextOps) -> Any:
     return context_ops.get_model()
 
 
-def _require_forward_batch_provider(context_ops: ContextOps) -> Any:
-    return context_ops.build_temporary_forward_batch
+def _require_temporary_forward_runner(context_ops: ContextOps) -> Any:
+    return context_ops.run_temporary_forward
 
 
 def _should_apply_cfg_value(cfg: SenseNovaU1PixelFlowCFG, timestep_value: float) -> bool:
@@ -964,7 +926,7 @@ def _predict_pixel_flow_from_srt(
         -1,
     )
 
-    t = timestep.to(device=z.device, dtype=z.dtype)
+    t = timestep.to(device=z.device)
     return (x_pred - z) / (1 - t).clamp_min(float(t_eps))
 
 

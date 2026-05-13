@@ -40,7 +40,7 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
 
         prepared = stage._prepare(
             model=_FakeModel(),
-            context_metadata={},
+            context_metadata={"attention_math_mode": "reference_eager"},
             batch=batch,
             u1_context=SimpleNamespace(
                 session_id="s0",
@@ -65,6 +65,10 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
         self.assertNotIn(
             "cross_attention_custom_mask",
             prepared.condition.prepared.generation_input,
+        )
+        self.assertEqual(
+            "reference_eager",
+            prepared.condition.prepared.generation_input["attention_math_mode"],
         )
 
     def test_pixel_flow_stage_uses_denoising_stage_contract(self):

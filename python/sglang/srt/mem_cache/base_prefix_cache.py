@@ -22,6 +22,7 @@ from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollecto
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.session.streaming_session import SessionSlot
 
 
 @runtime_checkable
@@ -264,6 +265,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_streaming_session(self) -> bool:
         return False
+
+    def get_session_slot(self, session_id: str) -> SessionSlot | None:
+        return None
 
     def release_session(self, session_id: str) -> None:
         pass

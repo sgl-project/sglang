@@ -15,10 +15,19 @@ from sglang.omni.backends.mm_gen.pipeline_forward_backend import (
     DirectPipelineForwardBackend,
 )
 from sglang.omni.coordinator import OmniCoordinator
-from sglang.omni.protocol import OmniRequest
+from sglang.omni.protocol import MultimodalGenerationBackend, OmniRequest
 
 if TYPE_CHECKING:
+    from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+        SenseNovaU1SamplingParams,
+    )
+    from sglang.multimodal_gen.runtime.server_args import (
+        ServerArgs as DiffusionServerArgs,
+    )
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.omni_session.bridge import SRTBackedOmniSessionBridge
+    from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
+    from sglang.srt.server_args import ServerArgs as SRTServerArgs
 
 _MODE_ALIASES = {
     "text_to_image": "t2i",
@@ -75,7 +84,7 @@ class SenseNovaU1OmniPlugin:
             sampling_params=sampling_params,
             max_images=max_images,
             max_text_segments=max_text_segments,
-            think=bool(getattr(sampling_params, "think_mode", request.think)),
+            think=sampling_params.think_mode,
             think_max_new_tokens=think_max_new_tokens,
             metadata=metadata,
         )
@@ -83,9 +92,9 @@ class SenseNovaU1OmniPlugin:
 
 def build_sensenova_u1_orchestrator(
     *,
-    srt_bridge: Any,
-    generation_backend: Any | None = None,
-    server_args: Any | None = None,
+    srt_bridge: "SRTBackedOmniSessionBridge",
+    generation_backend: MultimodalGenerationBackend | None = None,
+    server_args: "SRTServerArgs | None" = None,
 ) -> OmniCoordinator:
     if generation_backend is None:
         generation_backend = _build_default_generation_backend(server_args)
@@ -105,10 +114,10 @@ def build_sensenova_u1_orchestrator(
 def build_sensenova_u1_orchestrator_from_scheduler(
     *,
     scheduler: "Scheduler",
-    srt_request_executor: Any | None = None,
+    srt_request_executor: "OmniSRTSchedulerExecutor | None" = None,
     srt_ar_decode_max_new_tokens: int | None = None,
-    generation_backend: Any | None = None,
-    server_args: Any | None = None,
+    generation_backend: MultimodalGenerationBackend | None = None,
+    server_args: "SRTServerArgs | None" = None,
 ) -> OmniCoordinator:
     from sglang.omni.bridges.sensenova_u1.bridge import build_sensenova_u1_srt_bridge
 
@@ -137,26 +146,30 @@ def normalize_mode(mode: Any | None) -> str:
 
 
 def build_sampling_params(
-    payload: Any | None,
+    payload: dict[str, Any] | None,
     *,
     mode: str,
     think: bool,
-) -> Any:
+) -> "SenseNovaU1SamplingParams":
     if payload is None:
         sampling_params = _build_sensenova_sampling_dataclass({})
-    elif not isinstance(payload, dict):
-        sampling_params = payload
     else:
         sampling_params = _build_sensenova_sampling_dataclass(payload)
 
-    setattr(sampling_params, "omni_generation_mode", mode)
-    setattr(sampling_params, "think_mode", bool(think))
+    sampling_params.omni_generation_mode = mode
+    sampling_params.think_mode = bool(think)
     return sampling_params
 
 
-def split_request_metadata(payload: Any | None) -> tuple[Any | None, dict[str, Any]]:
+def split_request_metadata(
+    payload: Any | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if payload is None:
+        return None, {}
     if not isinstance(payload, dict):
-        return payload, {}
+        raise ValueError(
+            f"SenseNova U1 sampling_params must be an object, got {payload!r}"
+        )
     sampling_payload = dict(payload)
     metadata = {}
     for key in tuple(sampling_payload):
@@ -177,7 +190,9 @@ def _resolve_bool(value: Any, *, name: str) -> bool:
     raise ValueError(f"{name} must be a bool, got {value!r}")
 
 
-def _build_sensenova_sampling_dataclass(payload: dict[str, Any]) -> Any:
+def _build_sensenova_sampling_dataclass(
+    payload: dict[str, Any],
+) -> "SenseNovaU1SamplingParams":
     from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
         build_sensenova_u1_sampling_params,
     )
@@ -194,7 +209,9 @@ def _build_sensenova_sampling_dataclass(payload: dict[str, Any]) -> Any:
     return build_sensenova_u1_sampling_params(values)
 
 
-def _build_default_generation_backend(srt_server_args: Any | None) -> Any:
+def _build_default_generation_backend(
+    srt_server_args: "SRTServerArgs | None",
+) -> DirectPipelineForwardBackend:
     from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import (
         SenseNovaU1Pipeline,
     )
@@ -224,7 +241,9 @@ def _build_default_generation_backend(srt_server_args: Any | None) -> Any:
     )
 
 
-def _resolve_omni_max_concurrent_generations(srt_server_args: Any | None) -> int:
+def _resolve_omni_max_concurrent_generations(
+    srt_server_args: "SRTServerArgs | None",
+) -> int:
     value = getattr(srt_server_args, "omni_max_concurrent_generations", 1)
     if value is None:
         value = 1
@@ -237,7 +256,9 @@ def _resolve_omni_max_concurrent_generations(srt_server_args: Any | None) -> int
     return value
 
 
-def _build_diffusion_server_kwargs(srt_server_args: Any | None) -> dict[str, Any]:
+def _build_diffusion_server_kwargs(
+    srt_server_args: "SRTServerArgs | None",
+) -> dict[str, Any]:
     kwargs = _parse_diffusion_server_args(
         getattr(srt_server_args, "diffusion_server_args", None)
     )
@@ -333,7 +354,7 @@ def _load_diffusion_server_args_file(path: str) -> dict[str, Any]:
     return payload
 
 
-def _validate_diffusion_server_args(server_args: Any) -> None:
+def _validate_diffusion_server_args(server_args: "DiffusionServerArgs") -> None:
     validate_runtime = getattr(server_args.pipeline_config, "validate_runtime", None)
     if not callable(validate_runtime):
         return
@@ -352,7 +373,7 @@ def _validate_diffusion_server_args(server_args: Any) -> None:
         )
 
 
-def _resolve_model_path(server_args: Any | None) -> str:
+def _resolve_model_path(server_args: "SRTServerArgs | None") -> str:
     if server_args is not None:
         model_path = getattr(server_args, "model_path", None)
         if model_path:

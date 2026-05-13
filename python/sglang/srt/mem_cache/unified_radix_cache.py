@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.session.streaming_session import SessionSlot
 
 
 class UnifiedTreeNode:
@@ -1416,6 +1417,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def release_session(self, session_id: str) -> None:
         self.session.release_session(session_id)
+
+    def get_session_slot(self, session_id: str) -> "SessionSlot | None":
+        return self.session.get_session_slot(session_id)
 
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         return self.session.session_held_tokens(active_pool_idxs)

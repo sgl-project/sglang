@@ -12,7 +12,7 @@ from sglang.srt.omni_session.runtime import (
     OmniSRTPreparedInput,
     OmniVLMTextGenerationResult,
 )
-from sglang.srt.omni_session.runtime_protocol import OmniSessionHandle
+from sglang.srt.omni_session.runtime_types import OmniSessionHandle
 
 
 @dataclass(frozen=True, slots=True)

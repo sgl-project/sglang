@@ -41,7 +41,7 @@ class DirectPipelineForwardBackend(MultimodalGenerationBackend):
         if segment is None:
             raise ValueError("Direct pipeline forward did not set generated_segment")
 
-        return coerce_generated_segment(segment)
+        return require_generated_segment(segment)
 
 
 def build_pipeline_req(
@@ -63,25 +63,11 @@ def build_pipeline_req(
     )
 
 
-def coerce_generated_segment(segment: Any) -> GeneratedSegment:
+def require_generated_segment(segment: object) -> GeneratedSegment:
     if isinstance(segment, GeneratedSegment):
         return segment
-    segment_type = getattr(segment, "type", None)
-    if segment_type is None and getattr(segment, "image", None) is not None:
-        segment_type = "image"
-    if segment_type is None:
-        raise ValueError("Generation backend returned a segment without type")
-    commit_payload = getattr(segment, "commit_payload", None)
-    if commit_payload is None:
-        commit_payload = getattr(segment, "commit_image", None)
-    return GeneratedSegment(
-        type=segment_type,
-        text=getattr(segment, "text", None),
-        image=getattr(segment, "image", None),
-        audio=getattr(segment, "audio", None),
-        video=getattr(segment, "video", None),
-        commit_payload=commit_payload,
-        metadata=dict(getattr(segment, "metadata", {}) or {}),
+    raise TypeError(
+        "Generation backend must return sglang.omni.protocol.GeneratedSegment"
     )
 
 

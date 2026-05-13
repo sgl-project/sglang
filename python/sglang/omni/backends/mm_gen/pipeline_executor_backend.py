@@ -10,9 +10,10 @@ from typing import Any
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.omni.backends.mm_gen.pipeline_forward_backend import (
     build_pipeline_req,
-    coerce_generated_segment,
+    require_generated_segment,
 )
 from sglang.omni.protocol import (
     ContextOps,
@@ -32,7 +33,7 @@ class PipelineExecutorBackend(MultimodalGenerationBackend):
     """
 
     executor: PipelineExecutor
-    stages: Sequence[Any]
+    stages: Sequence[PipelineStage]
     server_args: Any
 
     def generate_segment(
@@ -49,4 +50,4 @@ class PipelineExecutorBackend(MultimodalGenerationBackend):
         segment = batch.generated_segment
         if segment is None:
             raise ValueError("Pipeline executor did not set generated_segment")
-        return coerce_generated_segment(segment)
+        return require_generated_segment(segment)

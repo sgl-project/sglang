@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 if TYPE_CHECKING:
     from sglang.omni.streaming import OmniStreamSink
@@ -263,20 +263,13 @@ class ContextOps(ABC):
     ) -> int | None: ...
 
     @abstractmethod
-    def build_temporary_forward_batch(
+    def run_temporary_forward(
         self,
         *,
         prepared: TemporaryForwardPrepared,
-        generation_query_embeds: Any,
-        timestep: Any,
+        forward: Callable[[Any], Any],
     ) -> Any:
-        """
-        Build a temporary forward batch for the forward-process using language model in image generation process
-
-        For some models (U1), the image generation process includes calling forward of the language (AR) model.
-
-        Since the kv tokens of the image tokens are useless once after denoising, it is temporary and should be released.
-        """
+        """run a short-lived generation forward while the backend owns KV lifetime"""
 
         ...
 

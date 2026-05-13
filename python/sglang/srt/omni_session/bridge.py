@@ -9,7 +9,7 @@ from sglang.srt.omni_session.runtime import (
     OmniSessionRuntime,
     OmniVLMTextGenerationResult,
 )
-from sglang.srt.omni_session.runtime_protocol import (
+from sglang.srt.omni_session.runtime_types import (
     OmniContextBundle,
     OmniContextHandle,
     OmniSessionHandle,
@@ -29,6 +29,7 @@ class SRTBackedOmniSessionBridge:
     """
 
     generation_kind: str = "generic"
+    condition_path_roles: dict[str, str] = {}
 
     def __init__(
         self,
@@ -57,6 +58,7 @@ class SRTBackedOmniSessionBridge:
         messages = normalize_omni_interleaved_messages(messages)
         session = self.runtime.prefill_interleaved(messages, session_id=session_id)
         pre_image_segments: list[dict[str, Any]] = []
+        reached_image_marker = False
         try:
             if think:
                 thinking = self._decode_thinking_text(
@@ -86,6 +88,7 @@ class SRTBackedOmniSessionBridge:
                     stream_sink=stream_sink,
                 )
                 if segment.type == "image_marker":
+                    reached_image_marker = True
                     break
                 if segment.type == "text":
                     metadata = dict(segment.metadata)
@@ -100,6 +103,8 @@ class SRTBackedOmniSessionBridge:
                         }
                     )
                     continue
+                if segment.type == "done":
+                    break
                 raise ValueError(
                     "omni middle bridge expected AR decode to request an image segment, "
                     f"got {segment.type}"
@@ -131,7 +136,10 @@ class SRTBackedOmniSessionBridge:
                 session.anchor_request_id,
                 session.context_length,
                 session=session,
-                metadata={"pre_image_segments": pre_image_segments},
+                metadata={
+                    "pre_image_segments": pre_image_segments,
+                    "pre_image_reached_image_marker": reached_image_marker,
+                },
             ),
             text_cfg=OmniContextHandle(
                 f"{session.anchor_request_id}:text_cfg",
@@ -155,6 +163,9 @@ class SRTBackedOmniSessionBridge:
             image_for_commit = segment.image
         self._commit_generated_image(contexts=contexts, image=image_for_commit)
 
+    def finish_generated_segment_turn(self, *, contexts: OmniContextBundle) -> None:
+        return None
+
     def release(self, contexts: OmniContextBundle) -> None:
         if contexts.full.session is not None:
             self.runtime.close_session(contexts.full.session)
@@ -172,6 +183,10 @@ class SRTBackedOmniSessionBridge:
             contexts.full.session,
             stream_sink=stream_sink,
         )
+
+    def get_condition_path_role(self, name: str, default: str) -> str:
+        key = name[:-5] if name.endswith("_role") else name
+        return self.condition_path_roles.get(key, default)
 
     def _decode_thinking_text(
         self,

@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from sglang.omni.protocol import (
     ARBackend,
+    ContextOps,
     GeneratedSegment,
     MultimodalGenerationBackend,
     OmniContextBundle,
@@ -56,11 +57,11 @@ class OmniCoordinator:
         self,
         request: OmniRequest,
         *,
-        context: Any | None = None,
+        context: OmniContextBundle | None = None,
         release_context: bool = True,
         stop_after_generation_limit: bool = False,
         stream_sink: OmniStreamSink | None = None,
-    ) -> tuple[OmniResponse, Any]:
+    ) -> tuple[OmniResponse, OmniContextBundle]:
         """Generate a response for an omni request"""
         if self.request_adapter is not None:
             request = self.request_adapter(request)
@@ -89,7 +90,9 @@ class OmniCoordinator:
 
         segments: list[OmniOutputSegment] = []
         num_text_segments = 0
-        num_multimodal_generated_segments = 0
+        num_image_segments = 0
+        num_audio_segments = 0
+        num_video_segments = 0
 
         try:
             # the main loop: orchestrator owns modality handoff; backends own token and pixel internals
@@ -119,6 +122,12 @@ class OmniCoordinator:
                     output_segment.metadata.pop(STREAMED_TEXT_METADATA_KEY, None)
                     segments.append(output_segment)
                     num_text_segments += 1
+                    if (
+                        stop_after_generation_limit
+                        and num_image_segments >= request.max_images
+                    ):
+                        # 1. stop before probing another image marker
+                        break
                     continue
 
                 if boundary.type not in {"image", "audio", "video"}:
@@ -126,14 +135,14 @@ class OmniCoordinator:
 
                 if (
                     boundary.type == "image"
-                    and num_multimodal_generated_segments >= request.max_images
+                    and num_image_segments >= request.max_images
                 ):
                     break
 
-                stream_segment_id = (
-                    None if stream_sink is None else stream_sink.begin_image()
-                )
-                # 2. image boundary: switch to multimodal gen and generate a image segment
+                stream_segment_id = None
+                if stream_sink is not None and boundary.type == "image":
+                    stream_segment_id = stream_sink.begin_image()
+                # 2. media boundary: switch to multimodal gen and generate one segment
                 generated_segment = self._generate_segment(
                     request,
                     self.ar_backend.get_context_ops(context),
@@ -144,9 +153,14 @@ class OmniCoordinator:
                         f"expected {boundary.type!r}, got {generated_segment.type!r}"
                     )
 
-                # 3. build and append the OmniOutputSegment to result list
+                # 3. count the generated segment by output modality
                 segments.append(OmniOutputSegment.from_generated(generated_segment))
-                num_multimodal_generated_segments += 1
+                if generated_segment.type == "image":
+                    num_image_segments += 1
+                elif generated_segment.type == "audio":
+                    num_audio_segments += 1
+                elif generated_segment.type == "video":
+                    num_video_segments += 1
                 if stream_sink is not None and stream_segment_id is not None:
                     stream_sink.image(
                         segment_id=stream_segment_id,
@@ -161,12 +175,6 @@ class OmniCoordinator:
                     request=request,
                 )
 
-                if (
-                    stop_after_generation_limit
-                    and boundary.type == "image"
-                    and num_multimodal_generated_segments >= request.max_images
-                ):
-                    break
         finally:
             if release_context:
                 self.ar_backend.release(context)
@@ -174,7 +182,9 @@ class OmniCoordinator:
         stats = {
             "num_segments": len(segments),
             "num_text_segments": num_text_segments,
-            "num_generated_segments": num_multimodal_generated_segments,
+            "num_image_segments": num_image_segments,
+            "num_audio_segments": num_audio_segments,
+            "num_video_segments": num_video_segments,
         }
         response = OmniResponse(
             segments=tuple(segments),
@@ -185,7 +195,7 @@ class OmniCoordinator:
         return response, context
 
     def _generate_segment(
-        self, request: OmniRequest, context_ops: Any
+        self, request: OmniRequest, context_ops: ContextOps
     ) -> GeneratedSegment:
         if self._generation_slots is None:
             return self.mm_generation_backend.generate_segment(request, context_ops)

@@ -9,27 +9,46 @@ the returned prepared inputs remain SRT-owned runtime objects.
 
 import math
 import uuid
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from sglang.srt.omni_session.runtime import (
     OmniInterleavedMessage,
     OmniSRTPreparedInput,
 )
-from sglang.srt.omni_session.runtime_protocol import OmniSessionHandle
+from sglang.srt.omni_session.runtime_types import OmniSessionHandle
 
-U1_IMG_START_TOKEN = "<img>"
-U1_IMG_END_TOKEN = "</img>"
-U1_IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
-U1_IMAGE_PLACEHOLDER = "<image>"
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+        SenseNovaU1SamplingParams,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class U1SpecialTokens:
+    """model-local token grammar that decides U1 modality boundaries"""
+
+    img_start: str = "<img>"
+    img_end: str = "</img>"
+    img_context: str = "<IMG_CONTEXT>"
+    image_placeholder: str = "<image>"
+
+
+U1_SPECIAL_TOKENS = U1SpecialTokens()
+U1_IMG_START_TOKEN = U1_SPECIAL_TOKENS.img_start
+U1_IMG_END_TOKEN = U1_SPECIAL_TOKENS.img_end
+U1_IMG_CONTEXT_TOKEN = U1_SPECIAL_TOKENS.img_context
+U1_IMAGE_PLACEHOLDER = U1_SPECIAL_TOKENS.image_placeholder
 U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
 U1_INTERLEAVE_TEXT_UNCONDITION_ROLE = "u1_interleave_text_uncondition"
 U1_EDIT_IMG_CONDITION_ROLE = "u1_edit_img_condition"
 U1_EDIT_UNCONDITION_ROLE = "u1_edit_uncondition"
-_U1_ATTENTION_MATH_MODE = "reference_eager"
+_U1_ATTENTION_MATH_MODE: str | None = None
 
 
 def _u1_policy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    metadata.setdefault("attention_math_mode", _U1_ATTENTION_MATH_MODE)
+    if _U1_ATTENTION_MATH_MODE is not None:
+        metadata.setdefault("attention_math_mode", _U1_ATTENTION_MATH_MODE)
     return metadata
 
 
@@ -285,6 +304,9 @@ def _build_u1_native_interleave_like_prepared_input(
     mm_inputs = None
     image_offsets: list[tuple[int, int]] = []
     generation_position_start = None
+    position_ids = None
+    # generated image commits advance U1 logical m-rope positions outside raw SRT token count
+    position_base = _u1_session_logical_position(session)
     if images:
         import torch
 
@@ -328,14 +350,24 @@ def _build_u1_native_interleave_like_prepared_input(
             img_start_token_id=tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN),
             img_context_token_id=context_id,
         )
+        if position_base is not None:
+            positions = positions.clone()
+            positions[0] += int(position_base)
         generation_position_start = int(positions[0].max().item()) + 1
+        position_ids = positions.t().contiguous().tolist()
         mm_inputs = _u1_multimodal_inputs(
             pixel_values=pixel_values,
             grid_hw=grid_hw,
             offsets=image_offsets,
         )
     else:
-        generation_position_start = len(input_ids)
+        if position_base is None:
+            generation_position_start = len(input_ids)
+        else:
+            position_ids = list(
+                range(int(position_base), int(position_base) + len(input_ids))
+            )
+            generation_position_start = int(position_base) + len(input_ids)
 
     session_id = _u1_session_id(session)
     u1_metadata = {
@@ -357,6 +389,7 @@ def _build_u1_native_interleave_like_prepared_input(
         input_ids=input_ids,
         input_text=prompt,
         messages=messages,
+        position_ids=position_ids,
         mm_inputs=mm_inputs,
         condition_path_role=role,
         condition_path_session_id=_u1_condition_path_session_id(session, role),
@@ -943,18 +976,18 @@ def _u1_decode_token_ids(tokenizer: Any, token_ids: list[int]) -> str:
         return str(decode(token_ids))
 
 
-def _u1_needs_text_cfg(sampling_params: Any | None) -> bool:
+def _u1_needs_text_cfg(sampling_params: "SenseNovaU1SamplingParams | None") -> bool:
     if sampling_params is None:
         return False
-    return float(getattr(sampling_params, "cfg_text_scale", 1.0)) > 1.0
+    return float(sampling_params.cfg_text_scale) > 1.0
 
 
-def _u1_needs_any_cfg(sampling_params: Any | None) -> bool:
+def _u1_needs_any_cfg(sampling_params: "SenseNovaU1SamplingParams | None") -> bool:
     if sampling_params is None:
         return False
     return not (
-        float(getattr(sampling_params, "cfg_text_scale", 1.0)) == 1.0
-        and float(getattr(sampling_params, "cfg_img_scale", 1.0)) == 1.0
+        float(sampling_params.cfg_text_scale) == 1.0
+        and float(sampling_params.cfg_img_scale) == 1.0
     )
 
 
@@ -982,8 +1015,7 @@ def load_u1_native_image(
     import torch
     from PIL import Image
 
-    if not isinstance(image, Image.Image):
-        image = Image.open(image)
+    image = _load_u1_pil_image(image)
     if image.mode == "RGBA":
         background = Image.new("RGB", image.size, (255, 255, 255))
         background.paste(image, mask=image.split()[3])
@@ -1003,6 +1035,26 @@ def load_u1_native_image(
     array = np.asarray(resized, dtype=np.float32) / 255.0
     pixel_values = torch.from_numpy(array).permute(2, 0, 1)
     return _u1_normalize_and_patchify(pixel_values, patch_size=patch_size)
+
+
+def _load_u1_pil_image(image: Any):
+    from io import BytesIO
+    import base64
+
+    from PIL import Image
+
+    if isinstance(image, Image.Image):
+        return image
+    if isinstance(image, dict):
+        b64_json = image.get("b64_json") or image.get("base64")
+        if b64_json is not None:
+            if isinstance(b64_json, str) and "," in b64_json:
+                b64_json = b64_json.split(",", 1)[1]
+            return Image.open(BytesIO(base64.b64decode(b64_json)))
+        image = image.get("image", image)
+    if isinstance(image, str) and image.startswith("data:"):
+        return Image.open(BytesIO(base64.b64decode(image.split(",", 1)[1])))
+    return Image.open(image)
 
 
 def load_u1_generated_image_for_commit(
