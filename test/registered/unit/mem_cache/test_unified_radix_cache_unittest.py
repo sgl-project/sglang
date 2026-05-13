@@ -944,6 +944,62 @@ class UnifiedRadixCacheSuite:
     # Evict chain tests covering demotion, cascade, and tombstone cleanup.
     # ================================================================
 
+    def test_aux_evict_full_locked_leaf_tombstones_aux_only(self):
+        aux_types = [
+            ct
+            for ct in (ComponentType.SWA, ComponentType.MAMBA)
+            if ct in self.cfg.components
+        ]
+        if not aux_types:
+            self.skipTest("requires an auxiliary component")
+        if len(aux_types) > 1:
+            self.skipTest("single-aux case keeps cascade expectations precise")
+        aux = aux_types[0]
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        node = match.last_device_node
+        full_cd = node.component_data[ComponentType.FULL]
+        aux_cd = node.component_data[aux]
+        self.assertEqual(len(node.children), 0)
+        self.assertIsNotNone(full_cd.value)
+        self.assertIsNotNone(aux_cd.value)
+
+        lock_result = tree.inc_lock_ref(node)
+        self.assertGreater(full_cd.lock_ref, 0)
+        self.assertGreater(aux_cd.lock_ref, 0)
+
+        aux_len = len(aux_cd.value)
+        tree.component_protected_size_[aux] -= aux_len
+        tree.component_evictable_size_[aux] += aux_len
+        aux_cd.lock_ref = 0
+        self.assertNotIn(node, tree.evictable_device_leaves)
+
+        evict_params = EvictParams(num_tokens=0)
+        if aux == ComponentType.SWA:
+            evict_params.swa_num_tokens = aux_len
+        else:
+            evict_params.mamba_num = aux_len
+        result = tree.evict(evict_params)
+
+        self.assertEqual(result.num_tokens_evicted, 0)
+        if aux == ComponentType.SWA:
+            self.assertEqual(result.swa_num_tokens_evicted, aux_len)
+        else:
+            self.assertEqual(result.mamba_num_evicted, aux_len)
+        self.assertIsNotNone(full_cd.value)
+        self.assertIsNone(aux_cd.value)
+        self.assertFalse(tree.lru_lists[aux].in_list(node))
+
+        tree.dec_lock_ref(
+            node,
+            DecLockRefParams(swa_uuid_for_lock=lock_result.swa_uuid_for_lock),
+        )
+        tree.sanity_check()
+
     def test_evict_leaf_frees_all_components(self):
         """Evicting a device leaf frees Full and all aux components atomically."""
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
