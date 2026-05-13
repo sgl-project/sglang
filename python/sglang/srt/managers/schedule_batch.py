@@ -2403,6 +2403,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
+        # Invariant: reqs still doing prefill (chunked-resume or DLLM staging)
+        # must never be merged into running_batch via this filter — running_batch
+        # runs decode forward, and admitting a mid-prefill req there causes
+        # shape mismatch + double KV accounting. Today the invariant is enforced
+        # by callers passing chunked_req_to_exclude; the stateless-scheduler v2
+        # refactor will move this to a per-req predicate.
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
