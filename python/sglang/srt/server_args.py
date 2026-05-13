@@ -913,6 +913,9 @@ class ServerArgs:
 
         # Set kernel backends.
         self._handle_sampling_backend()
+        # Must run before _handle_attention_backend_compatibility so the
+        # deterministic backend is set before auto-detection fills it in.
+        self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
         self._handle_linear_attn_backend()
@@ -969,9 +972,6 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
-
-        # Handle deterministic inference.
-        self._handle_deterministic_inference()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -1836,15 +1836,8 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    if is_hip():
-                        self.page_size = 1
-                        logger.warning(
-                            "Setting page size to 1 for DeepSeek DSA on ROCm."
-                        )
-                    else:
-                        # For CUDA GPU
-                        self.page_size = 64
-                        logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                    self.page_size = 64
+                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     import torch
 
@@ -3989,11 +3982,11 @@ class ServerArgs:
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
                 envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-                and self.disaggregation_transfer_backend != "mooncake"
+                and self.disaggregation_transfer_backend not in ("mooncake", "nixl")
             ):
                 raise ValueError(
                     f"SGLANG_DISAGG_STAGING_BUFFER requires "
-                    f"disaggregation_transfer_backend='mooncake', "
+                    f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                     f"got '{self.disaggregation_transfer_backend}'."
                 )
 
