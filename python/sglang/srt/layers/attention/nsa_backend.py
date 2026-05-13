@@ -2151,10 +2151,18 @@ class NativeSparseAttnBackend(
         """
         Decide all attention prefill dispatch strategies for this batch.
         """
+        from sglang.srt.compilation.piecewise_context_manager import (
+            is_in_piecewise_cuda_graph,
+        )
         from sglang.srt.utils import get_device_sm, is_blackwell
 
         # Decide MHA vs MLA
-        if forward_batch and forward_batch.forward_mode.is_extend_without_speculative():
+        if is_in_piecewise_cuda_graph():
+            # Can't branch on seq_lens_cpu in PCG, force mha off to guarantee correctness.
+            self.use_mha = False
+        elif (
+            forward_batch and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
             # Check if sequence meets criteria for MHA_ONE_SHOT
             assert forward_batch.seq_lens_cpu is not None
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
