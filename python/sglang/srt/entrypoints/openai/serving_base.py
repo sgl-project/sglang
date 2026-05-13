@@ -148,18 +148,25 @@ class OpenAIServingBase(ABC):
 
         return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
 
+    def _get_string_request_key(
+        self, request: OpenAIServingRequest, key: str
+    ) -> Optional[str]:
+        value = getattr(request, key, None)
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str):
+            raise TypeError(
+                f"Value of {key} must be a string, but got {type(value).__name__}"
+            )
+        return value
+
     def _compute_extra_key(self, request: OpenAIServingRequest) -> Optional[str]:
-        """Compute the final extra_key by concatenating cache_salt and extra_key if both are provided."""
-        parts = []
-        for key in ["cache_salt", "extra_key"]:
-            value = getattr(request, key, None)
-            if value:
-                if not isinstance(value, str):
-                    raise TypeError(
-                        f"Value of {key} must be a string, but got {type(value).__name__}"
-                    )
-                parts.append(value)
-        return "".join(parts) if parts else None
+        """Return the user-provided extra_key without composing it with cache_salt."""
+        return self._get_string_request_key(request, "extra_key")
+
+    def _compute_cache_salt(self, request: OpenAIServingRequest) -> Optional[str]:
+        """Return the user-provided cache_salt as a separate namespace part."""
+        return self._get_string_request_key(request, "cache_salt")
 
     @abstractmethod
     def _convert_to_internal_request(
