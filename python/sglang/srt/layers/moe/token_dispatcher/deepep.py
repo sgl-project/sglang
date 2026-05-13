@@ -388,7 +388,7 @@ class _DeepEPDispatcherImplBase:
                 # Leaving a message for the user.
                 logger.warning_once(
                     "Warning: Ascend A2/A3 NPU does not support fp8 "
-                    "deepep_output_dtype, switching to int8... "
+                    "deepep_dispatcher_output_dtype, switching to int8... "
                 )
                 os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
         elif self.deepep_output_dtype == DeepEPOutputDtype.INT8:
@@ -397,7 +397,7 @@ class _DeepEPDispatcherImplBase:
                 # Leaving a message for the user.
                 logger.warning_once(
                     "Warning: GPU does not support int8 "
-                    "deepep_output_dtype, switching to fp8... "
+                    "deepep_dispatcher_output_dtype, switching to fp8... "
                 )
             os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
             self.params_bytes = 1
@@ -410,13 +410,7 @@ class _DeepEPDispatcherImplBase:
             self.use_nvfp4 = True
             self.use_fp8 = False
             if _is_npu:
-                # Ascend A2/A3 NPU supports only int8 quantization (but uses fp8 flag).
-                # Leaving a message for the user.
-                logger.warning_once(
-                    "Warning: Ascend A2/A3 NPU does not support nvfp4 "
-                    "deepep_output_dtype. "
-                )
-                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
+                raise RuntimeError("Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype.")
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
