@@ -610,6 +610,7 @@ def fused_topk_cpu(
     correction_bias: torch.Tensor = None,
     scoring_func: str = "softmax",
 ):
+    # TODO: add c++ kernel for cpu
     # The topk_softmax_cpu kernel only handles vanilla softmax scoring with no
     # correction bias. Fall back to the torch-native impl for the rest
     # (e.g. MiniMax sets both correction_bias and scoring_func).
