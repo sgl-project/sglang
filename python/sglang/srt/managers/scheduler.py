@@ -1851,14 +1851,25 @@ class Scheduler(
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
+    @property
+    def hisparse_max_req_len(self):
+        return min(
+            self.model_config.context_len - 1,
+            self.hisparse_coordinator.mem_pool_host.size - 1,
+        )
+
     def init_req_max_new_tokens(self, req):
+        if self.enable_hisparse and self.disaggregation_mode == DisaggregationMode.DECODE:
+            max_req_len = self.hisparse_max_req_len
+        else:
+            max_req_len = self.max_req_len
         req.sampling_params.max_new_tokens = min(
             (
                 req.sampling_params.max_new_tokens
                 if req.sampling_params.max_new_tokens is not None
                 else 1 << 30
             ),
-            self.max_req_len - len(req.origin_input_ids) - 1,
+            max_req_len - len(req.origin_input_ids) - 1,
         )
 
     def _process_and_broadcast_mm_inputs(
@@ -2122,12 +2133,13 @@ class Scheduler(
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
-        # Validate prompt length
-        error_msg = validate_input_length(
-            req,
-            self.max_req_input_len,
-            self.server_args.allow_auto_truncate,
+        max_input_len = (
+            self.hisparse_max_req_len - 5
+            if self.enable_hisparse and self.disaggregation_mode == DisaggregationMode.DECODE
+            else self.max_req_input_len
         )
+        # Validate prompt length
+        error_msg = validate_input_length(req, max_input_len, self.server_args.allow_auto_truncate)
         if error_msg:
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
@@ -2392,12 +2404,13 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # Validate prompts length
-        error_msg = validate_input_length(
-            req,
-            self.max_req_input_len,
-            self.server_args.allow_auto_truncate,
+        max_input_len = (
+            self.hisparse_max_req_len - 5
+            if self.enable_hisparse and self.disaggregation_mode == DisaggregationMode.DECODE
+            else self.max_req_input_len
         )
+        # Validate prompt length
+        error_msg = validate_input_length(req, max_input_len, self.server_args.allow_auto_truncate)
         if error_msg:
             self._add_request_to_queue(req)
             return
