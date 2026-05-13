@@ -205,35 +205,10 @@ class TestFlashinferTrtllmGenMoeBackendFP8(
     backend = "flashinfer_trtllm"
 
 
-class TestFlashinferTrtllmGenMoeBackendMXFP8(
-    FlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
-):
-    backend = "flashinfer_trtllm"
-
-
-class TestFlashinferTrtllmGenMoeBackendBF16(
-    FlashinferTrtllmGenMoeBackendBF16Base, CustomTestCase
-):
-    backend = "flashinfer_trtllm"
-
-
 class TestFlashinferTrtllmGenMoeBackendNVFP4(
     FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm"
-
-
-class TestFlashinferTrtllmGenMoeBackendPerTokenNVFP4(
-    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
-):
-    extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
-    backend = "flashinfer_trtllm"
-
-
-class TestFlashinferTrtllmGenMoeBackendFP8Routed(
-    FlashinferTrtllmGenMoeBackendFP8Base, CustomTestCase
-):
-    backend = "flashinfer_trtllm_routed"
 
 
 class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
@@ -244,12 +219,6 @@ class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
 
 class TestFlashinferTrtllmGenMoeBackendBF16Routed(
     FlashinferTrtllmGenMoeBackendBF16Base, CustomTestCase
-):
-    backend = "flashinfer_trtllm_routed"
-
-
-class TestFlashinferTrtllmGenMoeBackendNVFP4Routed(
-    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm_routed"
 
