@@ -37,7 +37,7 @@ SGL_DEVICE float fp8_e4m3_clip(float val) {
 
 // Pack two fp32 values into a single fp8x2_e4m3 with clamping.
 SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
-  return fp8x2_e4m3_t{fp32x2_t{fp8_e4m3_clip(x), fp8_e4m3_clip(y)}};
+  return fp8x2_e4m3_t{fp32x2_t{x, y}};
 }
 
 }  // namespace deepseek_v4::fp8
