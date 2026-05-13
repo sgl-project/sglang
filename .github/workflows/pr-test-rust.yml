@@ -349,8 +349,86 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  k8s-integration:
+    # Runs SMG against a kind cluster with fake worker pods to exercise the
+    # K8s service discovery / reconciliation path. No GPU required (workers
+    # are python:3.12-slim mocks); the h100 matrix runners are unsuitable
+    # because they're containers without a Docker daemon.
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install kind and kubectl
+        run: |
+          curl -fsSLo /tmp/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x /tmp/kind && sudo mv /tmp/kind /usr/local/bin/kind
+          KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x /tmp/kubectl && sudo mv /tmp/kubectl /usr/local/bin/kubectl
+          kind --version
+          kubectl version --client
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build smg-gateway:test image
+        uses: docker/build-push-action@v5
+        with:
+          context: sgl-model-gateway
+          file: sgl-model-gateway/e2e_test/k8s_integration/Dockerfile.gateway
+          tags: smg-gateway:test
+          load: true
+          cache-from: type=gha,scope=k8s-integration
+          cache-to: type=gha,scope=k8s-integration,mode=max
+
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pytest httpx
+
+      - name: Set up kind cluster and deploy
+        env:
+          SKIP_DOCKER_BUILD: "1"
+        run: |
+          cd sgl-model-gateway
+          bash e2e_test/k8s_integration/setup.sh
+
+      - name: Run K8s integration tests
+        run: |
+          cd sgl-model-gateway
+          # confcutdir avoids loading the parent e2e_test/conftest.py, which
+          # pulls in heavy infra deps (requests, sglang_router) that this job
+          # intentionally doesn't install.
+          pytest e2e_test/k8s_integration/ \
+            --confcutdir=e2e_test/k8s_integration \
+            -v -s -o log_cli=true --log-cli-level=INFO
+
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          kubectl --context kind-smg-test get all -A || true
+          kubectl --context kind-smg-test -n smg-test describe pods || true
+          kubectl --context kind-smg-test -n smg-test logs deploy/smg-gateway --tail=200 || true
+
+      - name: Tear down kind cluster
+        if: always()
+        run: |
+          cd sgl-model-gateway
+          bash e2e_test/k8s_integration/setup.sh teardown || true
+
   finish:
-    needs: [build-wheel, python-unit-tests, unit-tests, gateway-e2e, docker-build-test]
+    needs: [build-wheel, python-unit-tests, unit-tests, gateway-e2e, docker-build-test, k8s-integration]
     runs-on: ubuntu-latest
     steps:
       - name: Finish

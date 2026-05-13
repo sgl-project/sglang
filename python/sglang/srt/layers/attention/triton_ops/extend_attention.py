@@ -1017,7 +1017,6 @@ def _fwd_kernel_unified(
                 other=0.0,
             )
 
-            # Compute QK
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
