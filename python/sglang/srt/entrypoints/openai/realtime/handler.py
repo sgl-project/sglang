@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 
 async def _safe_send(websocket: WebSocket, text: str) -> None:
-    """Send text; debug-log if the peer is already gone."""
     try:
         await websocket.send_text(text)
     except (WebSocketDisconnect, RuntimeError) as e:
@@ -32,7 +31,6 @@ async def _safe_send(websocket: WebSocket, text: str) -> None:
 
 
 async def _safe_close(websocket: WebSocket) -> None:
-    """Close, ignoring already-closed errors (starlette raises RuntimeError)."""
     try:
         await websocket.close()
     except (WebSocketDisconnect, RuntimeError) as e:
@@ -46,7 +44,8 @@ async def _reject_before_session(
     *,
     error_type: str = "invalid_request_error",
 ) -> None:
-    """Accept, send a wire error envelope, close. Each step is best-effort."""
+    """Reject path that runs before acquiring the session semaphore, so
+    unsupported / over-capacity peers don't hold a session slot."""
     try:
         await websocket.accept()
     except (WebSocketDisconnect, RuntimeError) as e:
@@ -69,15 +68,10 @@ async def handle_realtime_transcription(
     server_args: ServerArgs,
     session_semaphore: asyncio.Semaphore,
 ) -> None:
-    """Accept the WS, run a RealtimeConnection, release the semaphore.
-
-    `finally` must release: leaked slots block new connections. Single-task,
-    so `ws.receive()` returning a disconnect is the only termination trigger.
-    """
-    # Pre-session rejects come before acquire: unsupported / over-capacity
-    # peers shouldn't hold slots.
-
-    # RealtimeConnection.__init__ crashes on a non-chunked adapter; reject early.
+    """WS endpoint for /v1/realtime. Pre-session validation runs before
+    the semaphore so rejects don't consume a session slot; the
+    ``async with`` then guarantees the slot is released even if
+    RealtimeConnection raises."""
     if not adapter.supports_chunked_streaming:
         await _reject_before_session(
             websocket,
@@ -86,9 +80,6 @@ async def handle_realtime_transcription(
         )
         return
 
-    # Atomic in asyncio: no `await` between `locked()` and `acquire()`'s
-    # fast path, so no other coroutine can slip in between the check and
-    # the decrement.
     if session_semaphore.locked():
         await _reject_before_session(
             websocket,

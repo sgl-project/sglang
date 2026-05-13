@@ -1,11 +1,4 @@
-"""sglang subclasses + wire-layer constants for Realtime WS where SDK
-types can't carry our wire (rate ∈ {16k,24k,48k}, standard discriminator
-on `type`). id/object on session info ride SDK's `extra='allow'`, so only
-the parse path needs a session-event subclass.
-
-All non-subclassed schemas are imported directly from openai.types.realtime
-at the use site, matching `serving_responses.py`'s convention.
-"""
+"""Wire schema for Realtime WS transcription sessions."""
 
 from __future__ import annotations
 

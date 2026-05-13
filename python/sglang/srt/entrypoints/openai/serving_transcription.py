@@ -48,6 +48,7 @@ from sglang.srt.entrypoints.openai.realtime import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
+    needs_space,
     process_asr_chunk,
     split_audio_chunks,
 )
@@ -199,7 +200,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
         # For fused auto-detect, parse_fused_output returns the scrubbed
         # user-visible text. On parse failure (FSM abort, truncation) it
-        # returns (None, None) and we fall back to a best-effort scrub —
+        # returns (None, None) and we fall back to strip_special_tokens —
         # the language stays unset rather than reporting a bogus detection.
         if getattr(request, "_fused_autodetect", False):
             lang, visible = self._adapter.parse_fused_output(
@@ -389,7 +390,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
         model = request.model
         state = StreamingASRState(**self._adapter.chunked_streaming_config)
-        first_word = True
+        # Track only the trailing char of the cumulative emit; `needs_space`
+        # uses prev[-1] / cur[0] so we don't need to keep the full buffer.
+        last_char = ""
 
         try:
             chunks = split_audio_chunks(request.audio_data, state.chunk_size_sec)
@@ -415,8 +418,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     for word in delta.split(" "):
                         if not word:
                             continue
-                        content = word if first_word else " " + word
-                        first_word = False
+                        content = f" {word}" if needs_space(last_char, word) else word
+                        last_char = content[-1]
                         chunk_resp = TranscriptionStreamResponse(
                             id=request_id,
                             created=created_time,

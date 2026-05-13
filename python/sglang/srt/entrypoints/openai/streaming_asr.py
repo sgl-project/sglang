@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 
 
 # Collapse whitespace before punctuation so batched-inference token
-# boundary jitter (" ," vs ",") doesn't leak into deltas.
-_PUNCT_WS_RE = re.compile(r"\s+([,.;:!?])")
+# boundary jitter (" ," vs ",") doesn't leak into deltas. Covers both
+# ASCII punctuation and the CJK / fullwidth equivalents.
+_PUNCT_WS_RE = re.compile(r"\s+([,.;:!?，。！？；：、])")
 
 
 @dataclass
@@ -124,6 +125,43 @@ def normalize_whitespace(text: str) -> str:
     return _PUNCT_WS_RE.sub(r"\1", text)
 
 
+_NO_SPACE_BEFORE = frozenset(".,!?;:%)]}，。！？；：、）】》」』")
+_NO_SPACE_AFTER = frozenset("([{（【《「『")
+
+
+def _is_cjk(c: str) -> bool:
+    """Whether char is a CJK-context glyph that doesn't take inter-word
+    spaces — ideographs, Japanese kana, CJK punctuation, fullwidth forms.
+    Excludes Hangul / Devanagari / Arabic etc., which are non-ASCII but
+    space-separated and need the normal boundary space."""
+    cp = ord(c)
+    return (
+        0x3000 <= cp <= 0x303F  # CJK Symbols and Punctuation (，。、《》「」…)
+        or 0x3040 <= cp <= 0x309F  # Hiragana
+        or 0x30A0 <= cp <= 0x30FF  # Katakana
+        or 0x3400 <= cp <= 0x4DBF  # CJK Unified Ideographs Ext A
+        or 0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+        or 0xFF00 <= cp <= 0xFFEF  # Halfwidth & Fullwidth Forms (fullwidth ASCII)
+    )
+
+
+def needs_space(prev: str, cur: str) -> bool:
+    """Return whether a boundary space is needed between emitted deltas.
+
+    Avoid spaces around punctuation and between adjacent CJK-context glyphs.
+    Shared by the realtime WS and HTTP SSE chunked streaming paths.
+    """
+    if not prev or not cur:
+        return False
+    if prev[-1].isspace() or cur[0].isspace():
+        return False
+    if cur[0] in _NO_SPACE_BEFORE or prev[-1] in _NO_SPACE_AFTER:
+        return False
+    if _is_cjk(prev[-1]) and _is_cjk(cur[0]):
+        return False
+    return True
+
+
 async def process_asr_chunk(
     tokenizer_manager: TokenizerManager,
     adapter: TranscriptionAdapter,
@@ -153,9 +191,11 @@ async def process_asr_chunk(
             break
     except asyncio.CancelledError:
         raise
-    except ValueError as e:
-        logger.warning("[streaming_asr] chunk %d failed: %s", state.chunk_index, e)
-        return ""
+    except ValueError:
+        logger.warning(
+            "[streaming_asr] chunk %d failed", state.chunk_index, exc_info=True
+        )
+        raise
 
     if ret is None:
         logger.warning("[streaming_asr] empty response for chunk %d", state.chunk_index)
