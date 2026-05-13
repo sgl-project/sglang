@@ -344,7 +344,7 @@ class Envs:
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
-    DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
+    DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
 
     # MTHREADS & MUSA

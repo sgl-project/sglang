@@ -622,7 +622,6 @@ do
         echo "${P_IP[$i]}"
         export SGLANG_USE_AG_AFTER_QLORA=1
         export HCCL_BUFFSIZE=800
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export SGLANG_NPU_FUSED_MOE_MODE=2
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=131072
@@ -743,7 +742,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1600
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export SGLANG_USE_AG_AFTER_QLORA=1
         export HCCL_SOCKET_IFNAME=lo
@@ -870,7 +868,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -996,7 +993,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
@@ -1185,7 +1181,6 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 
 MODEL_PATH=xxx
 
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -1276,7 +1271,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=2600
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -1383,7 +1377,6 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=56
 export HCCL_BUFFSIZE=1200
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -1476,7 +1469,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=3500
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -1594,7 +1586,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1200
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
@@ -1761,7 +1752,6 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
         export STREAMS_PER_DEVICE=32
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
         # P节点
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill \
@@ -2697,7 +2687,6 @@ do
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill \
         --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
@@ -2794,7 +2783,6 @@ source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env
 export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
 MODEL_PATH=xxx
@@ -3458,7 +3446,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0  \
-    --attention-backend ascend --device npu  --quantization modelslim  \
+    --attention-backend ascend --device npu \
     --max-running-requests 78 \
     --disable-radix-cache --speculative-draft-model-quantization unquant \
     --chunked-prefill-size -1 --max-prefill-tokens 65536  \
@@ -3527,7 +3515,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0  \
-    --attention-backend ascend --device npu  --quantization modelslim  \
+    --attention-backend ascend --device npu \
     --max-running-requests 120 \
     --disable-radix-cache \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
@@ -3590,7 +3578,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7339 --trust-remote-code --nnodes 1 --node-rank 0  \
-    --attention-backend ascend --device npu --quantization modelslim \
+    --attention-backend ascend --device npu \
     --max-running-requests 16 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
@@ -3654,7 +3642,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7339 --trust-remote-code --nnodes 1 --node-rank 0  \
-    --attention-backend ascend --device npu --quantization modelslim \
+    --attention-backend ascend --device npu \
     --max-running-requests 8 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
@@ -3708,7 +3696,6 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=5
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3000
@@ -3755,7 +3742,6 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
     --mamba-ssm-dtype bfloat16 \
     --base-gpu-id 0 \
     --speculative-draft-model-path /home/weights/Qwen3-Next-80B-A3B-Instruct \
-    --quantization modelslim \
     --moe-a2a-backend deepep --deepep-mode auto \
 ```
 
@@ -3803,7 +3789,6 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=5
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3000
@@ -3850,7 +3835,6 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
     --mamba-ssm-dtype bfloat16 \
     --base-gpu-id 0 \
     --speculative-draft-model-path /home/weights/Qwen3-Next-80B-A3B-Instruct \
-    --quantization modelslim \
     --moe-a2a-backend deepep --deepep-mode auto \
 ```
 
@@ -3915,7 +3899,7 @@ echo "${LOCAL_HOST2}"
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0 \
-    --attention-backend ascend --device npu --quantization modelslim \
+    --attention-backend ascend --device npu \
     --disable-radix-cache --mem-fraction-static 0.8 \
     --tp-size 1 --dp-size 1 \
     --sampling-backend ascend --max-running-requests 8 \
@@ -3992,7 +3976,7 @@ echo "${LOCAL_HOST2}"
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0 \
-    --attention-backend ascend --device npu --quantization modelslim \
+    --attention-backend ascend --device npu \
     --disable-radix-cache --mem-fraction-static 0.89 \
     --tp-size 1 --dp-size 2 \
     --sampling-backend ascend --max-running-requests 144 \
@@ -4068,7 +4052,7 @@ echo "${LOCAL_HOST2}"
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0 \
-    --attention-backend ascend --device npu --quantization modelslim \
+    --attention-backend ascend --device npu \
     --disable-radix-cache --mem-fraction-static 0.9 \
     --tp-size 1 \
     --max-running-requests 70 \
@@ -4141,7 +4125,7 @@ echo "${LOCAL_HOST2}"
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0 \
-    --attention-backend ascend --device npu --quantization modelslim \
+    --attention-backend ascend --device npu \
     --disable-radix-cache --mem-fraction-static 0.894 \
     --tp-size 2 \
     --max-running-requests 1 \
@@ -4198,7 +4182,6 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=400
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
@@ -4235,7 +4218,6 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
-    --quantization modelslim \
     --watchdog-timeout 9000 \
     --host 127.0.0.1 --port 6699 \
     --mem-fraction-static 0.85 \

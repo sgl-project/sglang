@@ -143,7 +143,6 @@ python3 -m sglang.launch_server \
 **Decode node:**
 
 ```shell
-export SGLANG_DEEPEP_BF16_DISPATCH=0
 export HCCL_BUFFSIZE=4000
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
