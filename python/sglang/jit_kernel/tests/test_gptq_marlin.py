@@ -104,18 +104,14 @@ def test_gptq_marlin_gemm(
     output_ref = torch.matmul(a_input, w_ref)
     torch.cuda.synchronize()
 
-    # JIT kernel should produce approximately correct results vs torch.matmul
-    max_diff = torch.mean(torch.abs(output - output_ref)) / torch.mean(
-        torch.abs(output_ref)
-    )
-    assert max_diff < 0.04
+    torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.15)
 
 
 def _is_sm80_sm90_cuda() -> bool:
     if not torch.cuda.is_available():
         return False
     major, minor = torch.cuda.get_device_capability()
-    return major * 10 + minor in (80, 86, 90)
+    return 80 <= major * 10 + minor < 100
 
 
 @pytest.mark.skipif(
@@ -228,10 +224,7 @@ def test_nvfp4_marlin_dense_matches_dequant_reference(dtype):
     output_ref = torch.matmul(a_input, weight_ref.T)
     torch.cuda.synchronize()
 
-    rel_diff = torch.mean(torch.abs(output - output_ref)) / torch.mean(
-        torch.abs(output_ref)
-    )
-    assert rel_diff < 0.04
+    torch.testing.assert_close(output, output_ref, rtol=0.04, atol=0.04)
 
 
 if __name__ == "__main__":
