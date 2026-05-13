@@ -788,23 +788,13 @@ class DecodePreallocQueue:
             decode_req.req.cache_protected_len = prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
-            if self.scheduler.enable_hisparse:
-                # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
-                kv_indices = (
-                    dst_kv_indices[: origin_input_len - prefix_len]
-                    .cpu()
-                    .numpy()
-                    .astype(np.int32)
-                )
-            else:
-                # Only send delta indices (beyond prefix) to prefill.
-                kv_indices = (
-                    self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                        prefix_len:origin_input_len
-                    ]
-                    .cpu()
-                    .numpy()
-                )
+            # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
+            kv_indices = (
+                dst_kv_indices[: origin_input_len - prefix_len]
+                .cpu()
+                .numpy()
+                .astype(np.int32)
+            )
 
             seq_len = len(decode_req.req.origin_input_ids)
 
