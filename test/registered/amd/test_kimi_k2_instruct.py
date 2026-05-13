@@ -59,11 +59,16 @@ class TestKimiK2Instruct0905(CustomTestCase):
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         requests.get(self.base_url + "/flush_cache")
 
+        # parallel reduced from 1319 to 512 to fit MI300X (192 GB HBM) post-#20479
+        # memory budget: after weight load (121 GB) + KV cache (35 GB) + CUDA graph
+        # buffers, ~18 GB free/rank, which OOMs at ~1180 concurrent prefills. All
+        # 1319 questions are still evaluated; accuracy is per-question independent
+        # so the >0.94 assertion is unaffected.
         args = SimpleNamespace(
             num_shots=8,
             data_path=None,
             num_questions=1319,
-            parallel=1319,
+            parallel=512,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
