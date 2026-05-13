@@ -2,13 +2,20 @@
 title: Intern-S2-Preview
 metatags:
     description: "Deploy Intern-S2-Preview with SGLang"
+tag: NEW
 ---
 
-## 1. Model introduction
+## 1. Model Introduction
 
-[Intern-S2-Preview](https://huggingface.co/internLM/Intern-S2-Preview) is an efficient 35B scientific multimodal foundation model. Beyond conventional parameter and data scaling, Intern-S2-Preview explores task scaling: increasing the difficulty, diversity, and coverage of scientific tasks to further unlock model capabilities.
+**Intern-S2-Preview** is an efficient 35B scientific multimodal foundation model. Beyond conventional parameter and data scaling, Intern-S2-Preview explores task scaling: increasing the difficulty, diversity, and coverage of scientific tasks to further unlock model capabilities.
 
-## 2. SGLang installation
+**Resources:**
+
+- HuggingFace: [internLM/Intern-S2-Preview](https://huggingface.co/internLM/Intern-S2-Preview)
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
 Install SGLang from source or use an NVIDIA Docker image:
 
@@ -19,63 +26,48 @@ uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=pytho
 # Or use Docker for NVIDIA GPUs
 docker pull lmsysorg/sglang:latest
 ```
+For how to actually launch a docker image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the inner `sglang serve ...` with whatever the [command generator](#3-model-deployment) below produces):
 
-For full installation details, see the [SGLang installation guide](/docs/get-started/install).
-
-## 3. Model deployment
-
-
-**NVIDIA:**
-
-Deploy internLM/Intern-S2-Preview with the following commands:
-
-### Standard Version
-
-```shell Command
-sglang serve \
-  --model-path internLM/Intern-S2-Preview \
-  --tp 8 \
-  --reasoning-parser qwen3 \
-  --tool-call-parser qwen3_coder \
-  --mem-fraction-static 0.8 \
-  --host 0.0.0.0 \
-  --port 30000
+```bash Command
+docker run --gpus all \
+    --shm-size 32g \
+    -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=<your-hf-token>" \
+    --ipc=host \
+    lmsysorg/sglang:latest \
+    sglang serve <use args below>
 ```
 
-### Multi-Token Prediction (MTP)
+## 3. Model Deployment
 
-```shell Command
-SGLANG_ENABLE_SPEC_V2=1 \
-sglang serve \
-  --model-path internLM/Intern-S2-Preview \
-  --tp 8 \
-  --reasoning-parser qwen3 \
-  --tool-call-parser qwen3_coder \
-  --mamba-scheduler-strategy extra_buffer \
-  --speculative-algo 'NEXTN' \
-  --speculative-eagle-topk 1 \
-  --speculative-num-steps 3 \
-  --speculative-num-draft-tokens 4 \
-  --mem-fraction-static 0.8 \
-  --host 0.0.0.0 \
-  --port 30000
-```
+### 3.1 Basic Configuration
 
-### Configuration tips
+**Interactive Command Generator**: Use the selector below to generate the deployment command for your hardware and parser configuration.
+
+import { InternS2PreviewDeployment } from "/src/snippets/autoregressive/intern-s2-preview-deployment.jsx";
+
+<InternS2PreviewDeployment />
+
+### 3.2 Configuration Tips
 
 - Use `tp>=2` for the NVIDIA deployment commands.
 - Use `--reasoning-parser qwen3` to separate reasoning content from final content in streaming responses.
 - Use `--tool-call-parser qwen3_coder` when serving tool-calling workloads.
-- Add `--mamba-scheduler-strategy extra_buffer with `--speculative-algo 'NEXTN'` to enable MTP.
-- If weight loading is slow, add `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'`.
+- Add `--mamba-scheduler-strategy extra_buffer` with `--speculative-algo 'NEXTN'` to enable MTP.
+- If weight loading is slow, add `--model-loader-extra-config='{"enable_multithread_load": "true", "num_threads": 64}'`.
 
-## 4. Model invocation
+## 4. Model Invocation
 
-### 4.1 Basic usage
+### 4.1 Basic Usage
 
-For basic API usage and request examples, see the [SGLang basic usage guide](/docs/basic_usage/send_request).
+For basic API usage and request examples, see:
 
-### 4.2 Vision input
+- [Basic API Usage](../../../docs/basic_usage/send_request)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Vision Input
 
 Intern-S2-Preview supports image inputs. Here is an example with an image:
 
@@ -134,7 +126,7 @@ for chunk in response:
 print()
 ```
 
-### 4.3 Reasoning parser
+#### 4.2.2 Reasoning Parser
 
 Enable streaming to read reasoning content separately from the final answer:
 
@@ -179,7 +171,7 @@ for chunk in response:
 print()
 ```
 
-### 4.4 Tool calling
+#### 4.2.3 Tool Calling
 
 Serve with `--tool-call-parser qwen3_coder` enabled, then send OpenAI-compatible tool requests:
 

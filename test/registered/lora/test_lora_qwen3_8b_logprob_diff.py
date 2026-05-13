@@ -113,11 +113,15 @@ class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
         of internal param names that would break LoRA auto-detection."""
         model = _build_qwen3_mock()
 
-        with patch("sglang.srt.layers.linear.LinearBase", _MockLinearBase), patch(
-            "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", _MockFusedMoE
-        ), patch(
-            "sglang.srt.layers.vocab_parallel_embedding.ParallelLMHead",
-            _MockParallelLMHead,
+        with (
+            patch("sglang.srt.layers.linear.LinearBase", _MockLinearBase),
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", _MockFusedMoE
+            ),
+            patch(
+                "sglang.srt.layers.vocab_parallel_embedding.ParallelLMHead",
+                _MockParallelLMHead,
+            ),
         ):
             detected = auto_detect_lora_target_modules(model)
 
