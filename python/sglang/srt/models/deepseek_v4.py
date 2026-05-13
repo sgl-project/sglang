@@ -77,6 +77,96 @@ logger = logging.getLogger(__name__)
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
+def _v4_rope_inplace_npu(
+    q_rope: torch.Tensor,
+    kv_rope: Optional[torch.Tensor],
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    inverse: bool = False,
+) -> None:
+    """In-place interleaved RoPE for V4 — torch fallback used on NPU.
+
+    Mirrors main's CUDA `fused_rope` kernel: consecutive (even, odd) pairs
+    of x form complex pairs, with `freqs_cis` a complex tensor where
+    `freqs_cis.real[t, k]` = cos(theta_{t,k}), `freqs_cis.imag` = sin(...)
+    indexed by frequency pair k in [0, rope_dim/2).
+
+    NOTE on V4-Flash YARN `mscale`: when the model was trained with the
+    YARN magnitude-scale `mscale` ≠ 1.0, the cos/sin values stored in
+    `freqs_cis` MUST already be pre-multiplied by `mscale` at precompute
+    time — see `deepseek_v4_rope.precompute_freqs_cis`. This function
+    just reads what's stored; it does NOT apply mscale here.
+
+    Prefer the NPU-native `torch.ops.custom.inplace_partial_rotary_mul`
+    (same kernel iforgetmyname/dsv4_release uses) — torch fallback differs
+    by ~1 ULP per element vs the kernel because torch does bf16*bf16 muls
+    with bf16 accumulation while the NPU kernel accumulates in fp32.
+    43 layers × (Q + K) = 86 rope calls compound the drift; with the torch
+    fallback some prompts (those with marginal argmax decisions) flip
+    tokens vs iforgetmyname.
+    """
+    if _is_npu and hasattr(torch.ops, "custom") and hasattr(
+        torch.ops.custom, "inplace_partial_rotary_mul"
+    ):
+        # Build cos/sin caches in the layout the kernel expects:
+        # (T, 1, 1, rope_dim) with each freq pair value repeated twice for
+        # the interleaved pairing convention.
+        cos_half = freqs_cis.real[positions]  # (T, rope_dim/2)
+        sin_half = freqs_cis.imag[positions]
+        if inverse:
+            sin_half = -sin_half
+        cos_full = cos_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
+        sin_full = sin_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
+        rope_dim = cos_full.shape[-1]
+        cos4 = cos_full.view(-1, 1, 1, rope_dim).contiguous()
+        sin4 = sin_full.view(-1, 1, 1, rope_dim).contiguous()
+        # q_rope: (T, n_heads, rope_dim) → (T, 1, n_heads, rope_dim) view
+        # kv_rope: (T, 1, rope_dim) → (T, 1, 1, rope_dim) view
+        q_view = q_rope.unsqueeze(1)
+        torch.ops.custom.inplace_partial_rotary_mul(
+            q_view, cos4, sin4,
+            rotary_mode="interleave",
+            partial_slice=[0, rope_dim],
+        )
+        if kv_rope is not None:
+            if kv_rope.dim() == 3:
+                kv_view = kv_rope.unsqueeze(1)
+            else:
+                kv_view = kv_rope.view(-1, 1, 1, rope_dim)
+            torch.ops.custom.inplace_partial_rotary_mul(
+                kv_view, cos4, sin4,
+                rotary_mode="interleave",
+                partial_slice=[0, rope_dim],
+            )
+        return
+
+    # Torch fallback (CUDA tests, or NPU images without the custom op).
+    cos_full = freqs_cis.real
+    sin_full = freqs_cis.imag
+    cos = cos_full[positions].to(q_rope.dtype)
+    sin = sin_full[positions].to(q_rope.dtype)
+
+    def _apply(x: torch.Tensor) -> None:
+        pair = x.view(*x.shape[:-1], -1, 2)
+        re = pair[..., 0].clone()
+        im = pair[..., 1].clone()
+        c = cos
+        s = sin
+        while c.ndim < pair.ndim - 1:
+            c = c.unsqueeze(-2)
+            s = s.unsqueeze(-2)
+        if inverse:
+            pair[..., 0] = re * c + im * s
+            pair[..., 1] = im * c - re * s
+        else:
+            pair[..., 0] = re * c - im * s
+            pair[..., 1] = re * s + im * c
+
+    _apply(q_rope)
+    if kv_rope is not None:
+        _apply(kv_rope)
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
@@ -177,8 +267,15 @@ class MQALayer(nn.Module):
             if compress_ratio_override is not None
             else config.compress_ratios[layer_id]
         )
-        assert compress_ratio in [0, 4, 128]
-        self.compress_ratio: Literal[0, 4, 128] = compress_ratio
+        # V4-Flash uses ratio=1 for the dense (uncompressed) edge layers
+        # (e.g. [1, 1, 4, 128, ..., 1] for the 43-layer Flash variant), in
+        # addition to the {0, 4, 128} the original V4 model ships. Treat 0
+        # and 1 the same throughout: neither has a Compressor/C4Indexer and
+        # neither uses the compress_rope_theta / yarn original_seq_len.
+        assert compress_ratio in (0, 1, 4, 128), (
+            f"V4 compress_ratio: expected one of (0, 1, 4, 128), got {compress_ratio}"
+        )
+        self.compress_ratio: Literal[0, 1, 4, 128] = compress_ratio
 
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
@@ -187,15 +284,25 @@ class MQALayer(nn.Module):
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
-        rope_base = config.compress_rope_theta if self.compress_ratio else rope_theta
+        rope_base = (
+            config.compress_rope_theta
+            if self.compress_ratio in (4, 128)
+            else rope_theta
+        )
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
-        assert self.compress_ratio in {0, 4, 128}
-        if self.compress_ratio:
-            original_seq_len = rope_scaling["original_max_position_embeddings"]
-        else:
-            original_seq_len = 0
+        # YARN correction applies to ALL layers regardless of compress_ratio.
+        # iforgetmyname/dsv4_release's get_rope_wrapper always passes
+        # `rope_scaling` to the rotary_emb constructor, so dense (ratio 0/1)
+        # layers get the same YARN-corrected inv_freq as compressed layers
+        # — only the rope base differs (rope_theta vs compress_rope_theta).
+        # Earlier this branched on compress_ratio and zeroed the YARN
+        # correction for dense layers; that left the 3 dense layers of
+        # V4-Flash (positions 0, 1, 43 in the 44-layer model) with raw
+        # extrapolation freqs while the model was trained with YARN —
+        # causing token-1+ divergence even after the mscale magnitude fix.
+        original_seq_len = rope_scaling["original_max_position_embeddings"]
 
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
@@ -205,6 +312,18 @@ class MQALayer(nn.Module):
             factor=rope_scaling["factor"],
             beta_fast=rope_scaling["beta_fast"],
             beta_slow=rope_scaling["beta_slow"],
+            # V4-Flash YARN magnitude-scale: V4-Flash config.json doesn't
+            # include mscale / mscale_all_dim fields, so iforgetmyname's
+            # DeepseekScalingRotaryEmbedding falls back to defaults
+            # (mscale=1, mscale_all_dim=0) which yield self.mscale ≈ 1.2773
+            # for factor=16. main's precompute_freqs_cis previously omitted
+            # this scale entirely, producing rope magnitudes ~22% smaller
+            # than what the model was trained for → semantically broken
+            # output (231 step 5+ test: tokens like `[19,16,19,16,343,...]`
+            # = "1.1. (C.dir," vs the correct `[54994,1060,...]` =
+            # "jumps over the lazy dog" for prompt "The quick brown fox").
+            mscale=float(rope_scaling.get("mscale", 1.0)),
+            mscale_all_dim=float(rope_scaling.get("mscale_all_dim", 0.0)),
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
@@ -222,7 +341,7 @@ class MQALayer(nn.Module):
 
         self.compressor = None
         self.indexer = None
-        if self.compress_ratio:
+        if self.compress_ratio in (4, 128):
             self.compressor = Compressor(
                 config,
                 layer_id=self.layer_id,
@@ -338,7 +457,17 @@ class MQALayer(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.use_jit_norm:
+        if _is_npu:
+            # iforgetmyname/dsv4_release uses torch_npu.npu_rms_norm with an
+            # all-ones dummy weight (q_b_norm_dummy_weight) for this second
+            # RMS post wq_b. Our triton rms_normalize_triton produces ULP-
+            # different bf16 results vs the NPU-native kernel; with 43
+            # layers of cascade, that 1-2% per-layer drift flips argmax in
+            # tokens 5+. Match exact iforgetmyname behavior here.
+            import torch_npu
+            _dummy = q.new_ones(q.shape[-1])
+            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+        elif self.use_jit_norm:
             q = rmsnorm_self(q, self.eps)
         else:
             q = rms_normalize_triton(q, self.eps)
@@ -463,19 +592,42 @@ class MQALayer(nn.Module):
         q_lora = q
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.use_jit_norm:
+        if _is_npu:
+            # iforgetmyname/dsv4_release uses torch_npu.npu_rms_norm with an
+            # all-ones dummy weight (q_b_norm_dummy_weight) for this second
+            # RMS post wq_b. Our triton rms_normalize_triton produces ULP-
+            # different bf16 results vs the NPU-native kernel; with 43
+            # layers of cascade, that 1-2% per-layer drift flips argmax in
+            # tokens 5+. Match exact iforgetmyname behavior here.
+            import torch_npu
+            _dummy = q.new_ones(q.shape[-1])
+            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+        elif self.use_jit_norm:
             q = rmsnorm_self(q, self.eps)
         else:
             q = rms_normalize_triton(q, self.eps)
 
         kv = self.kv_norm(kv)
 
-        fused_rope(
-            q[..., -self.qk_rope_head_dim :],
-            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-            self.freqs_cis,
-            positions=positions,
-        )
+        if _is_npu:
+            # `fused_rope` is a tvm_ffi-compiled CUDA kernel; NPU images don't
+            # ship tvm_ffi, so do the same operation (in-place rotary on the
+            # last qk_rope_head_dim of q and kv) with a torch fallback. The
+            # interleaved pair convention here matches fused_rope's CUDA
+            # source (consecutive even/odd indices form a complex pair).
+            _v4_rope_inplace_npu(
+                q[..., -self.qk_rope_head_dim :],
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                self.freqs_cis,
+                positions,
+            )
+        else:
+            fused_rope(
+                q[..., -self.qk_rope_head_dim :],
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                self.freqs_cis,
+                positions=positions,
+            )
 
         if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
             kv = cp_all_gather_rerange_output(
@@ -557,13 +709,22 @@ class MQALayer(nn.Module):
             save_kv_cache=not self.overlap_store_cache,
         )
         o = o[:, tp_slice, :]
-        fused_rope(
-            o[..., -self.qk_rope_head_dim :],
-            None,
-            self.freqs_cis,
-            positions=positions,
-            inverse=True,
-        )
+        if _is_npu:
+            _v4_rope_inplace_npu(
+                o[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions,
+                inverse=True,
+            )
+        else:
+            fused_rope(
+                o[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+                inverse=True,
+            )
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
@@ -677,6 +838,32 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
+        # NPU fast path: the cann8.5.0-a3 image ships a `custom_ops` wheel
+        # that registers torch.ops.custom.npu_hc_pre — a fused RMS-norm +
+        # linear projection + sinkhorn iteration kernel that returns the
+        # same (post, comb, y) triple the rest of this method computes via
+        # tilelang/deep_gemm/torch. Use it instead of mhc.py on Ascend (where
+        # tilelang isn't available and the torch fallback would be slow).
+        if _is_npu:
+            import custom_ops  # noqa: F401  registers torch.ops.custom.*
+
+            # Note the return order: (y, post, comb) — y is the (T, hidden)
+            # mixed activation, post / comb are the hc_post inputs. The
+            # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
+            # cast back to the input dtype before the downstream
+            # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
+            y, post, comb = torch.ops.custom.npu_hc_pre(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                hc_mult=self.hc_mult,
+                hc_sinkhorn_iters=self.hc_sinkhorn_iters,
+                norm_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+            )
+            return y.to(dtype), post, comb
+
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
 
@@ -741,6 +928,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             return torch.empty(
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
+
+        # NPU fast path mirroring hc_pre: torch.ops.custom.npu_hc_post is
+        # the fused output replication + mixing kernel shipped in the
+        # cann8.5.0-a3 image's custom_ops wheel.
+        if _is_npu:
+            import custom_ops  # noqa: F401
+
+            return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.srt.layers.mhc import mhc_post
@@ -1072,6 +1267,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
+
         return self.logits_processor(
             input_ids,
             hidden_states,
@@ -1109,7 +1305,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             return
         for layer in self.model.layers:
             self_attn = layer.self_attn
-            if self_attn.compress_ratio != 0 and not self_attn.compressor.ape_converted:
+            if (
+                self_attn.compress_ratio in (4, 128)
+                and not self_attn.compressor.ape_converted
+            ):
                 self_attn.compressor.apply_ape_hotfix()
             if (
                 self_attn.compress_ratio == 4
@@ -1119,8 +1318,18 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
-        name: str, is_nextn: bool = False, num_hidden_layers: Optional[int] = None
+        name: str,
+        is_nextn: bool = False,
+        num_hidden_layers: Optional[int] = None,
+        scale_suffix: str = "weight_scale_inv",
     ) -> str:
+        # ``scale_suffix`` controls how DeepSeek modelslim's ``.scale`` channel
+        # gets renamed to match the in-model parameter:
+        #  * "weight_scale_inv" — FP8 ckpts (deep_gemm convention, the default)
+        #  * "weight_scale"     — INT8 / W8A8 ckpts saved by compressed-tensors
+        # V4-Flash-W8A8 uses int-quantized + per-channel scale; without this
+        # parameterisation the loader looks up gate_up_proj.weight_scale_inv
+        # while the int8 quant scheme registers gate_up_proj.weight_scale.
         if name == "embed.weight":
             return "model.embed_tokens.weight"
         if name == "head.weight":
@@ -1153,9 +1362,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                     elif rest.startswith("head."):
                         rest = "shared_head.head.weight"
                     elif rest == "e_proj.scale":
-                        rest = "e_proj.weight_scale_inv"
+                        rest = "e_proj." + scale_suffix
                     elif rest == "h_proj.scale":
-                        rest = "h_proj.weight_scale_inv"
+                        rest = "h_proj." + scale_suffix
                 name = f"model.layers.{num_hidden_layers}." + rest
 
         if name.startswith("layers."):
@@ -1165,8 +1374,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
+        scale_target = "." + scale_suffix
         if "self_attn" in name:
-            name = name.replace(".scale", ".weight_scale_inv")
+            name = name.replace(".scale", scale_target)
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
@@ -1174,13 +1384,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
         if "mlp" in name:
-            name = name.replace(".scale", ".weight_scale_inv")
+            name = name.replace(".scale", scale_target)
 
         return name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+
+        # Compressed-tensors saves int-quantized W8A8 ckpts with parameter
+        # name `weight_scale` while FP8 ckpts save `weight_scale_inv`. The
+        # remap below has to match whichever the model created — sniff it
+        # off any existing scale parameter, falling back to the FP8 default.
+        scale_suffix = "weight_scale_inv"
+        for _name in params_dict:
+            if _name.endswith(".weight_scale"):
+                scale_suffix = "weight_scale"
+                break
+            if _name.endswith(".weight_scale_inv"):
+                break  # default already correct
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -1259,6 +1481,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         name,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
+                        scale_suffix=scale_suffix,
                     )
 
                     layer_id = get_layer_id(name)
@@ -1504,8 +1727,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # Hot weight reload (RL workflows). torch.cuda.{empty_cache,synchronize}
+        # raise on NPU (no CUDA device); gate so V4 stays usable on Ascend.
+        if _is_cuda or _is_hip:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

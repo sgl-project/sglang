@@ -78,6 +78,19 @@ def create_wave_backend(runner):
 
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
+    from sglang.srt.configs.model_config import is_deepseek_v4
+
+    if is_deepseek_v4(runner.model_config.hf_config):
+        # V4's model code calls compressor/indexer/store_cache methods that
+        # AscendAttnBackend doesn't expose. Route to a subclass that mixes
+        # those in, keeping all the NPU-side ascend metadata & forward
+        # plumbing intact.
+        from sglang.srt.hardware_backend.npu.attention.deepseek_v4_ascend_backend import (
+            DeepseekV4AscendAttnBackend,
+        )
+
+        return DeepseekV4AscendAttnBackend(runner)
+
     from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
         AscendAttnBackend,
     )

@@ -2,8 +2,6 @@ import functools
 import math
 from typing import Tuple
 
-import tilelang
-import tilelang.language as T
 import torch
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
@@ -11,12 +9,52 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
 
-tilelang.set_log_level("WARNING")
+# Tilelang isn't packaged on every platform (notably Ascend NPU images) but
+# this module is imported transitively from deepseek_v4.py — module-load
+# must succeed even when tilelang is missing. The kernels themselves still
+# require tilelang at runtime; we replace the package with a stub that lets
+# `@tilelang.jit` decorations and `tilelang.PassConfigKey.*` references parse
+# without ImportError, and any actual call into the kernels raises a clear
+# message at execution time instead of crashing on import.
+try:
+    import tilelang
+    import tilelang.language as T
 
-pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-}
+    tilelang.set_log_level("WARNING")
+
+    pass_configs = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
+except ImportError:
+
+    class _TilelangMissing:
+        """Stub so module-level @tilelang.jit and PassConfigKey accesses parse."""
+
+        def __getattr__(self, name):
+            if name == "jit":
+
+                def _jit(*_args, **_kwargs):
+                    def _wrap(fn):
+                        def _raise(*a, **k):
+                            raise RuntimeError(
+                                "tilelang is not installed; this kernel cannot run "
+                                "on the current platform"
+                            )
+
+                        return _raise
+
+                    return _wrap
+
+                return _jit
+            return _TilelangMissing()
+
+        def __call__(self, *_args, **_kwargs):
+            return _TilelangMissing()
+
+    tilelang = _TilelangMissing()
+    T = _TilelangMissing()
+    pass_configs = None
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
