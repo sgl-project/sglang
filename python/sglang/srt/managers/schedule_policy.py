@@ -283,11 +283,19 @@ class SchedulePolicy:
         waiting_queue: List[Req], temporary_deprioritized: Set[int]
     ) -> None:
         """Sorts the waiting queue based on the longest prefix match."""
+        # Chunked-resume reqs sort first: their prefix_indices length only
+        # reflects the chunks already prefilled (kv_committed_len), not the
+        # full prompt prefix they could have hit had they been fresh. Without
+        # this floor, a fresh req with a long cached prefix outranks them
+        # every iter, starving them under tight budget.
         waiting_queue.sort(
             key=lambda r: (
-                -len(r.prefix_indices)
-                if r.rid not in temporary_deprioritized
-                else float("inf")
+                0 if r.has_pending_chunk else 1,
+                (
+                    -len(r.prefix_indices)
+                    if r.rid not in temporary_deprioritized
+                    else float("inf")
+                ),
             )
         )
 
@@ -296,8 +304,15 @@ class SchedulePolicy:
         waiting_queue: List[Req], tree_cache: BasePrefixCache
     ) -> None:
         """Sorts the waiting queue based on a depth-first search weighting."""
+        # Pull chunked-resume reqs out before DFS — their last_node points at
+        # a mid-chunk stash node with weight 1 (no siblings share it), which
+        # otherwise drops them to a low DFS priority and starves them under
+        # tight budget. They go back to the front of the queue afterwards.
+        chunked_reqs = [req for req in waiting_queue if req.has_pending_chunk]
+        non_chunked_reqs = [req for req in waiting_queue if not req.has_pending_chunk]
+
         last_node_to_reqs = defaultdict(list)
-        for req in waiting_queue:
+        for req in non_chunked_reqs:
             last_node_to_reqs[req.last_node].append(req)
 
         node_to_weight = defaultdict(int)
@@ -306,6 +321,7 @@ class SchedulePolicy:
         SchedulePolicy._calc_weight(tree_cache.root_node, node_to_weight)
 
         waiting_queue.clear()
+        waiting_queue.extend(chunked_reqs)
         SchedulePolicy._get_dfs_priority(
             tree_cache.root_node,
             node_to_weight,
