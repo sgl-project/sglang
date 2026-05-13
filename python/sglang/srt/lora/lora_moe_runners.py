@@ -188,11 +188,9 @@ class LoRAInfo:
     hidden_size: int = 0
     lora_use_virtual_experts: bool = False
 
-    # CPU-side flag mirrored from ``LoRABatchInfo.has_active_lora``: True iff
-    # at least one request in the batch maps to a slot with rank > 0.
-    # ``build_lora_hooks`` reads this in eager mode to gate the fused_moe_lora
-    # kernel launch. The kernel correctly produces zero for no-active-LoRA
-    # batches, but launching it at all introduces bf16 round-trip noise.
+    # True iff at least one request in the batch maps to a slot with rank > 0.
+    # Mirrors ``LoRABatchInfo.has_active_lora`` set by ``LoRAManager``; read by
+    # ``build_lora_hooks`` to gate the eager-mode ``fused_moe_lora`` launch.
     has_active_lora: bool = True
 
 
@@ -534,20 +532,10 @@ def build_lora_hooks(
         if get_capture_lora_variant() == "nolora":
             return LoRAHooks()
     elif not lora_info.has_active_lora:
-        # Eager mode: mirror the graph-mode "nolora" gate above so the two
-        # paths behave identically for batches that hold no real adapter.
-        # ``has_active_lora`` is the CPU-side flag set in
-        # ``LoRAManager.prepare_lora_batch``; True iff at least one request
-        # in the batch maps to a slot with ``lora_ranks[slot] > 0``.
-        #
-        # Without this gate, the ``fused_moe_lora`` triton kernel still
-        # runs over the no-LoRA passthrough slot (``adapter_enabled[slot] = 1``
-        # for routing purposes, ``lora_ranks[slot] = 0``).  Its zero-initialised
-        # ``lora_a`` / ``lora_b`` buffers make the contribution mathematically
-        # zero, but launching the kernel introduces bf16 round-trip noise that
-        # compounds across layers into visibly different generations against
-        # the fused-wrapper base captures on the NVFP4 + LoRA path.  Skipping
-        # the launch matches what the graph-mode "nolora" variant already does.
+        # Eager-mode mirror of the graph-mode "nolora" gate above. The kernel
+        # is mathematically zero on the passthrough slot (``lora_a``/``lora_b``
+        # are zero-initialised), but its bf16 round-trip accumulates across
+        # layers into visible drift on the NVFP4 path.
         return LoRAHooks()
 
     # Compute alignment / mapping (once, shared by both hooks)

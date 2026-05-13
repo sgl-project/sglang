@@ -69,9 +69,8 @@ class MoeRunner:
 
                 self.runner_core = CutlassFp4LoraRunnerCore(config)
             else:
-                # Non-LoRA flashinfer_cutlass goes through ModelOpt quant's
-                # ``apply`` (which calls ``flashinfer_cutlass_fused_moe``), not
-                # through ``MoeRunner``.
+                # Non-LoRA flashinfer_cutlass bypasses MoeRunner: calls
+                # ``flashinfer_cutlass_fused_moe`` directly from quant ``apply``.
                 self.runner_core = None
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")

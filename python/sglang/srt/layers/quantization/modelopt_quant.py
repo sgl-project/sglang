@@ -1780,19 +1780,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32),
         )
 
-        # Per-expert ``[E]`` view of the input-scale-quant tensors.  Both
-        # ``CutlassFp4LoraRunnerCore`` and ``cutlass_moe_fp4`` consume per-expert
-        # fp32 scales of shape ``[E]``; the source ``w13_input_scale_quant`` /
-        # ``w2_input_scale_quant`` may be scalar (FlashInfer paths reduce all
-        # experts to a single max above) or already ``[E]``-shaped.  Pre-expand
-        # once at load time so the hot path never has to ``.expand(E).contiguous()``.
+        # ``[E]``-expanded fp32 view consumed by ``CutlassFp4LoraRunnerCore``.
+        # The source may be scalar (FlashInfer paths reduce all experts to a
+        # single max above) or already ``[E]``-shaped; expand once at load
+        # time so the hot path can hand it directly to the FP4 quant kernel.
         E = layer.num_local_experts
 
         def _to_per_expert(src: torch.Tensor) -> torch.Tensor:
             flat = src.view(-1).to(torch.float32)
-            if flat.shape[0] != E:
-                flat = flat.expand(E).contiguous()
-            return flat.contiguous()
+            if flat.shape[0] == E:
+                return flat.contiguous()
+            return flat.expand(E).contiguous()
 
         copy_or_rebind_param(
             layer,
@@ -2009,23 +2007,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
     def get_cutlass_fp4_quant_info(self, layer: torch.nn.Module):
-        """Build the LoRA-aware NVFP4 quant payload for ``CutlassFp4LoraRunnerCore``.
-
-        Per-expert ``[E]``-expanded input scales are precomputed in
-        ``process_weights_after_loading`` (see
-        ``w13_input_scale_quant_per_expert`` / ``w2_input_scale_quant_per_expert``),
-        so this just packages references into the dataclass — no per-forward
-        expansion work.
-        """
+        """Build the LoRA-aware NVFP4 quant payload for ``CutlassFp4LoraRunnerCore``."""
         from sglang.srt.lora.lora_moe_runner_cutlass_fp4 import (
             CutlassFp4MoeQuantInfo,
         )
-
-        E = layer.num_local_experts
-        w13_input_scale = layer.w13_input_scale_quant_per_expert
-        w2_input_scale = layer.w2_input_scale_quant_per_expert
-        assert w13_input_scale.shape == (E,), w13_input_scale.shape
-        assert w2_input_scale.shape == (E,), w2_input_scale.shape
 
         return CutlassFp4MoeQuantInfo(
             w13_weight=layer.w13_weight,
@@ -2034,10 +2019,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_blockscale_swizzled=layer.w2_blockscale_swizzled,
             g1_alphas=layer.g1_alphas,
             g2_alphas=layer.g2_alphas,
-            w13_input_scale_expanded=w13_input_scale,
-            w2_input_scale_expanded=w2_input_scale,
+            w13_input_scale_expanded=layer.w13_input_scale_quant_per_expert,
+            w2_input_scale_expanded=layer.w2_input_scale_quant_per_expert,
             cutlass_moe_params=layer.cutlass_moe_params,
-            num_local_experts=E,
+            num_local_experts=layer.num_local_experts,
             hidden_size=layer.hidden_size,
             intermediate_size_per_partition=layer.intermediate_size_per_partition,
             moe_ep_rank=layer.moe_ep_rank,
@@ -2223,8 +2208,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        # ``cutlass_moe_fp4`` already casts its output to ``a.dtype`` (== x.dtype)
-        # internally; no extra cast required.
         output = cutlass_moe_fp4(
             a=x,
             a1_gscale=layer.w13_input_scale_quant,
