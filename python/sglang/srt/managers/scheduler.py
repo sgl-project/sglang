@@ -1503,6 +1503,10 @@ class Scheduler(
         hf_cfg = self.model_config.hf_config
         pad_id = getattr(hf_cfg, "pad_token_id", None)
         bos_id = getattr(hf_cfg, "bos_token_id", None)
+        # `hf_eos_token_id` is annotated Optional[Set[int]] but the
+        # producer accepts int/list/None inputs; coerce defensively.
+        eos_ids = self.model_config.hf_eos_token_id
+        eos_token_ids = sorted([eos_ids] if isinstance(eos_ids, int) else eos_ids or [])
         result_dict = {
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
@@ -1510,7 +1514,7 @@ class Scheduler(
             "is_generation": self.is_generation,
             "supports_vision": self.model_config.is_multimodal,
             "vocab_size": self.model_config.vocab_size,
-            "eos_token_ids": sorted(self.model_config.hf_eos_token_id or []),
+            "eos_token_ids": eos_token_ids,
             # int32 proto field; coerce missing IDs to the smg-grpc-servicer
             # int defaults (0 for pad, 1 for bos) so encoding doesn't crash
             # on `None`.
