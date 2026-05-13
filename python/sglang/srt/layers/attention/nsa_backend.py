@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlia
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
-from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
@@ -35,7 +34,7 @@ from sglang.srt.layers.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     seqlens_expand_triton,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -262,20 +261,11 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
-
-        if (
-            attn_tp_size > 1
-            and attn_tp_rank != 0
-            and envs.SGLANG_DSA_TOPK_BROADCAST.get()
-        ):
-            result = logits.new_empty((logits.size(0), topk), dtype=torch.int32)
-        elif not envs.SGLANG_NSA_FUSE_TOPK.get() or self.force_unfused_topk:
-            result = fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
+        if not envs.SGLANG_NSA_FUSE_TOPK.get() or self.force_unfused_topk:
+            return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
             # NOTE(dark): if fused, we return a transformed page table directly
-            result = fast_topk_transform_fused(
+            return fast_topk_transform_fused(
                 score=logits,
                 lengths=seq_lens_topk,
                 page_table_size_1=page_table_size_1,
@@ -289,7 +279,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                     "RAGGED topk_transform requires topk_indices_offset; "
                     "expected extend-without-speculative metadata."
                 )
-            result = fast_topk_transform_ragged_fused(
+            return fast_topk_transform_ragged_fused(
                 score=logits,
                 lengths=seq_lens_topk,
                 topk_indices_offset=cu_topk_indices_offset,
@@ -298,14 +288,6 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             )
         else:
             assert False, f"Unsupported {self.topk_transform_method = }"
-
-        if attn_tp_size > 1 and envs.SGLANG_DSA_TOPK_BROADCAST.get():
-            group = get_attn_tp_group()
-            assert group.pynccl_comm is not None
-            with group.pynccl_comm.change_state(enable=True):
-                group.pynccl_comm.broadcast(result, src=0)
-
-        return result
 
 
 _NSA_IMPL_T: TypeAlias = Literal[
