@@ -154,6 +154,7 @@ class TestOmniSRTTransport(unittest.TestCase):
         tokenizer_manager = SimpleNamespace(
             auto_create_handle_loop=lambda: None,
             omni_futures={},
+            omni_stream_queues={},
             send_to_scheduler=sender,
         )
 
@@ -183,6 +184,7 @@ class TestOmniSRTTransport(unittest.TestCase):
         sender = FakeSender()
         tokenizer_manager = SimpleNamespace(
             auto_create_handle_loop=lambda: None,
+            omni_futures={},
             omni_stream_queues={},
             send_to_scheduler=sender,
         )
