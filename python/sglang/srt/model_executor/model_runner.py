@@ -215,6 +215,7 @@ from sglang.srt.utils.patch_torch import (
     monkey_patch_torch_reductions,
     register_sgl_tp_rank,
 )
+from sglang.srt.utils.profile_utils import profile_startup_region
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -2451,11 +2452,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             pre_initialize_workspaces,
         )
 
-        pre_initialize_workspaces(
-            max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
-            hidden_dim=self.model_config.hidden_size,
-            dtype=self.dtype,
-        )
+        with profile_startup_region(
+            label="flashinfer_allreduce_workspace",
+            snapshot_path="flashinfer_allreduce_workspace_memory_usage.pickle",
+            enabled=self.server_args.enable_profile_startup_workspaces,
+        ):
+            pre_initialize_workspaces(
+                max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+                hidden_dim=self.model_config.hidden_size,
+                dtype=self.dtype,
+            )
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
@@ -2504,13 +2510,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         cache_path = self._flashinfer_autotune_cache_path()
         logger.info("Running FlashInfer autotune with cache: %s", cache_path)
 
-        # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
-        # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
-        self.forward_stream.wait_stream(torch.cuda.current_stream())
-        with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune(True, cache=str(cache_path)):
-                self._dummy_run(batch_size=self.req_to_token_pool.size)
-        torch.cuda.current_stream().wait_stream(self.forward_stream)
+        with profile_startup_region(
+            label="flashinfer_autotune",
+            snapshot_path="flashinfer_autotune_memory_usage.pickle",
+            enabled=self.server_args.enable_profile_startup_workspaces,
+        ):
+            # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
+            # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
+            self.forward_stream.wait_stream(torch.cuda.current_stream())
+            with torch.get_device_module(self.device).stream(self.forward_stream):
+                with torch.inference_mode(), autotune(True, cache=str(cache_path)):
+                    self._dummy_run(batch_size=self.req_to_token_pool.size)
+            torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
 
     def _flashinfer_autotune_cache_path(self) -> Path:
@@ -3548,17 +3559,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             return
 
-        # Memory allocation is tied to a cuda stream, use the forward stream
-        with torch.get_device_module(self.device).stream(self.forward_stream):
-            logger.info(
-                f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
-            )
-            with use_symmetric_memory(get_tp_group()):
-                torch.empty(
-                    (envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024,),
-                    dtype=torch.uint8,
-                    device=self.device,
+        with profile_startup_region(
+            label="symm_mem_prealloc",
+            snapshot_path="symm_mem_prealloc_memory_usage.pickle",
+            enabled=self.server_args.enable_profile_startup_workspaces,
+        ):
+            # Memory allocation is tied to a cuda stream, use the forward stream
+            with torch.get_device_module(self.device).stream(self.forward_stream):
+                logger.info(
+                    f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
                 )
+                with use_symmetric_memory(get_tp_group()):
+                    torch.empty(
+                        (
+                            envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()
+                            * 1024
+                            * 1024
+                            * 1024,
+                        ),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
 
     def _maybe_rebalance_after_rank_fault(
         self,

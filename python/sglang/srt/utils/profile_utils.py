@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 import time
@@ -25,6 +26,61 @@ if _is_npu:
     torch_npu._apply_patches(patches)
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def profile_startup_region(label: str, snapshot_path: str, enabled: bool):
+    """Wrap a one-shot startup memory-allocation region with a torch profiler
+    trace and a CUDA memory history snapshot.
+
+    Mirrors :class:`CudaGraphRunner._init_profile_context_and_memory_record`
+    / ``_post_process_after_profile`` so that arbitrary startup workspaces
+    (CUDA graph capture, FlashInfer all-reduce fusion workspace, FlashInfer
+    autotune, symmetric memory pre-allocation, ...) can be inspected with the
+    same tooling.
+
+    When ``enabled`` is ``False`` this is a zero-overhead no-op.
+
+    The snapshot file can be opened at https://pytorch.org/memory_viz.
+
+    Args:
+        label: Short identifier used in the log header (e.g.
+            ``"flashinfer_autotune"``). Each region inside one process should
+            use a unique label.
+        snapshot_path: Path the CUDA memory snapshot pickle is dumped to. If
+            relative, it is resolved against the process cwd.
+        enabled: Master switch. When ``False`` the helper yields immediately
+            without touching the profiler or memory history APIs.
+    """
+    if not enabled:
+        yield
+        return
+
+    torch.cuda.memory._record_memory_history()
+    try:
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+        ) as prof:
+            yield
+        torch.cuda.memory._dump_snapshot(snapshot_path)
+        log_message = (
+            f"[{label}] Sorted by CUDA Time:\n"
+            + prof.key_averages(group_by_input_shape=True).table(
+                sort_by="cuda_time_total", row_limit=10
+            )
+            + f"\n\n[{label}] Sorted by CPU Time:\n"
+            + prof.key_averages(group_by_input_shape=True).table(
+                sort_by="cpu_time_total", row_limit=10
+            )
+            + f"\n\n[{label}] Memory snapshot saved to {snapshot_path}\n"
+        )
+        logger.info(log_message)
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 
 class ProfileManager:

@@ -698,6 +698,7 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     enable_breakable_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
+    enable_profile_startup_workspaces: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
     enable_layerwise_nvtx_marker: bool = False
@@ -6332,6 +6333,18 @@ class ServerArgs:
             "--enable-profile-cuda-graph",
             action="store_true",
             help="Enable profiling of cuda graph capture.",
+        )
+        parser.add_argument(
+            "--enable-profile-startup-workspaces",
+            action="store_true",
+            help=(
+                "Enable torch profiler + CUDA memory snapshot capture around "
+                "startup workspace allocations: FlashInfer all-reduce fusion "
+                "workspace pre-init, FlashInfer autotune kernel warmup, and "
+                "symmetric-memory pool pre-allocation. Each region writes its "
+                "own *_memory_usage.pickle in the cwd and logs top ops sorted "
+                "by CUDA / CPU time."
+            ),
         )
         parser.add_argument(
             "--enable-cudagraph-gc",
