@@ -30,10 +30,10 @@ MAMBA_TRACK_INTERVAL = 128
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-GLM5_MODEL = "zai-org/GLM-5-FP8"
-GLM5_LAUNCH_TIMEOUT = 3600
+DSV32_MODEL = "deepseek-ai/DeepSeek-V3.2"
+DSV32_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-8-gpu-h200", nightly=True)
+register_cuda_ci(est_time=900, suite="nightly-8-gpu-h200", nightly=True)
 
 
 class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
@@ -158,13 +158,12 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
         kill_process_tree(cls.process.pid)
 
 
-class TestUnifiedGLM5HiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
-    """GLM-5 FP8 (DSA) + HiCache + UnifiedRadixCache."""
+class TestUnifiedDeepSeekV32HiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
+    """DeepSeek V3.2 (DSA) + HiCache + UnifiedRadixCache."""
 
     kl_threshold = 0.0035
     sampling_temperature = 0
-    decode_cache_assert = staticmethod(_assert_dsv4_decode_cached_tokens)
-    gsm8k_threshold = 0.90
+    gsm8k_threshold = 0.93
     num_gsm8k_questions = 100
 
     @unittest.skip("no stable.")
@@ -173,12 +172,12 @@ class TestUnifiedGLM5HiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = GLM5_MODEL
+        cls.model = DSV32_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=GLM5_LAUNCH_TIMEOUT,
+            timeout=DSV32_LAUNCH_TIMEOUT,
             other_args=[
                 "--trust-remote-code",
                 "--tp",
