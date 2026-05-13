@@ -1,5 +1,7 @@
 """Tests for JIT dsv3_router_gemm kernel."""
 
+import sys
+
 import pytest
 import torch
 
@@ -38,3 +40,7 @@ def test_dsv3_router_gemm(num_experts, num_tokens, out_dtype):
     assert out.shape == (num_tokens, num_experts)
     assert out.dtype == out_dtype
     torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=RTOL)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
