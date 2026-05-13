@@ -26,7 +26,6 @@ from sglang.srt.layers.moe.utils import (
     DeepEPOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
-    get_moe_runner_backend,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
