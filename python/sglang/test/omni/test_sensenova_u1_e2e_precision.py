@@ -21,6 +21,9 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 REFERENCE_ENV = "SGLANG_OMNI_U1_REFERENCE_IMAGE"
+T2I_REFERENCE_ENV = "SGLANG_OMNI_U1_T2I_REFERENCE_IMAGE"
+EDIT_INPUT_ENV = "SGLANG_OMNI_U1_EDIT_INPUT_IMAGE"
+EDIT_REFERENCE_ENV = "SGLANG_OMNI_U1_EDIT_REFERENCE_IMAGE"
 THREE_TURN_PROMPTS = (
     (
         "Create one clean studio image of a matte cobalt-blue cube centered on a "
@@ -34,9 +37,59 @@ THREE_TURN_PROMPTS = (
     ),
     "Continue from the previous generated image. Edit it so the cube becomes a capybara",
 )
+T2I_PRECISION_PROMPT = (
+    "Create one clean studio image of a matte cobalt-blue cube centered on a "
+    "white tabletop, plain light-gray background."
+)
+EDIT_PRECISION_PROMPT = (
+    "Edit the image so the cube becomes bright red and add one glossy green "
+    "sphere on its right. Keep the same tabletop, camera angle, and background."
+)
 
 
 class TestSenseNovaU1E2EPrecision(unittest.TestCase):
+    def test_t2i_matches_reference_image(self):
+        base_url = os.getenv("SGLANG_OMNI_U1_BASE_URL", "http://127.0.0.1:30000")
+        model = os.getenv("SGLANG_OMNI_U1_MODEL", "sensenova-u1")
+        response = _run_turn(
+            base_url,
+            model=model,
+            task="t2i",
+            text=T2I_PRECISION_PROMPT,
+            sampling_params=_precision_sampling_params("SGLANG_OMNI_U1_T2I"),
+            max_images=1,
+        )
+
+        _assert_reference_match(
+            response,
+            reference_env=T2I_REFERENCE_ENV,
+            output_env="SGLANG_OMNI_U1_T2I_OUTPUT_IMAGE",
+            metric_prefix="SGLANG_OMNI_U1_T2I",
+        )
+
+    def test_edit_matches_reference_image(self):
+        base_url = os.getenv("SGLANG_OMNI_U1_BASE_URL", "http://127.0.0.1:30000")
+        model = os.getenv("SGLANG_OMNI_U1_MODEL", "sensenova-u1")
+        response = _run_turn(
+            base_url,
+            model=model,
+            task="edit",
+            text=EDIT_PRECISION_PROMPT,
+            messages=[
+                _image_segment_from_path(_require_env(EDIT_INPUT_ENV)),
+                {"type": "text", "text": EDIT_PRECISION_PROMPT},
+            ],
+            sampling_params=_precision_sampling_params("SGLANG_OMNI_U1_EDIT"),
+            max_images=1,
+        )
+
+        _assert_reference_match(
+            response,
+            reference_env=EDIT_REFERENCE_ENV,
+            output_env="SGLANG_OMNI_U1_EDIT_OUTPUT_IMAGE",
+            metric_prefix="SGLANG_OMNI_U1_EDIT",
+        )
+
     def test_three_turn_interleave_edit_matches_reference_image(self):
         base_url = os.getenv("SGLANG_OMNI_U1_BASE_URL", "http://127.0.0.1:30000")
         model = os.getenv("SGLANG_OMNI_U1_MODEL", "sensenova-u1")
@@ -273,6 +326,8 @@ def _run_turn(
     model: str,
     text: str,
     sampling_params: dict,
+    task: str = "interleave",
+    messages: list[dict] | None = None,
     session_id: str | None = None,
     keep_session: bool = False,
     think: bool = False,
@@ -280,9 +335,9 @@ def _run_turn(
 ) -> dict:
     payload = {
         "model": model,
-        "task": "interleave",
+        "task": task,
         "think": think,
-        "messages": [{"type": "text", "text": text}],
+        "messages": messages or [{"type": "text", "text": text}],
         "sampling_params": sampling_params,
     }
     if max_images is not None:
@@ -343,6 +398,32 @@ def _save_output_image(payload: dict, env_name: str) -> None:
         _last_image(payload).save(output_path)
 
 
+def _assert_reference_match(
+    payload: dict,
+    *,
+    reference_env: str,
+    output_env: str,
+    metric_prefix: str,
+) -> None:
+    actual = _last_image(payload)
+    reference = Image.open(_require_env(reference_env)).convert("RGB")
+    metrics = _compare_images(actual, reference)
+
+    output_path = os.getenv(output_env)
+    if output_path:
+        actual.save(output_path)
+
+    min_psnr = _env_float(f"{metric_prefix}_MIN_PSNR", 22.0)
+    max_mae = _env_float(f"{metric_prefix}_MAX_MAE", 80.0)
+    min_cosine = _env_float(f"{metric_prefix}_MIN_COSINE", 0.95)
+    if metrics["psnr"] < min_psnr:
+        raise AssertionError(metrics)
+    if metrics["mae"] > max_mae:
+        raise AssertionError(metrics)
+    if metrics["cosine"] < min_cosine:
+        raise AssertionError(metrics)
+
+
 def _compare_images(actual: Image.Image, reference: Image.Image) -> dict[str, float]:
     if actual.size != reference.size:
         raise AssertionError(f"image size mismatch: {actual.size} != {reference.size}")
@@ -378,6 +459,32 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_float(name: str, default: float) -> float:
     return float(os.getenv(name, str(default)))
+
+
+def _precision_sampling_params(env_prefix: str) -> dict:
+    return {
+        "width": _env_int(f"{env_prefix}_WIDTH", 1024),
+        "height": _env_int(f"{env_prefix}_HEIGHT", 1024),
+        "num_steps": _env_int(f"{env_prefix}_STEPS", 50),
+        "seed": _env_int(f"{env_prefix}_SEED", 223),
+        "cfg_text_scale": _env_float(f"{env_prefix}_CFG_TEXT_SCALE", 4.0),
+        "cfg_img_scale": _env_float(f"{env_prefix}_CFG_IMG_SCALE", 1.0),
+        "cfg_interval": [
+            _env_float(f"{env_prefix}_CFG_START", 0.0),
+            _env_float(f"{env_prefix}_CFG_END", 1.0),
+        ],
+        "cfg_renorm_type": os.getenv(f"{env_prefix}_CFG_RENORM_TYPE", "none"),
+        "t_eps": _env_float(f"{env_prefix}_T_EPS", 0.02),
+    }
+
+
+def _image_segment_from_path(path: str) -> dict:
+    with open(path, "rb") as image_file:
+        image_b64 = base64.b64encode(image_file.read()).decode("ascii")
+    return {
+        "type": "image",
+        "image": {"b64_json": image_b64},
+    }
 
 
 def _require_env(name: str) -> str:
