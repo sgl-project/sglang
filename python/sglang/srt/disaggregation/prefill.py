@@ -181,6 +181,7 @@ class PrefillBootstrapQueue:
             kv_args,
             self.token_to_kv_pool,
             self.draft_token_to_kv_pool,
+            self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
         )
 

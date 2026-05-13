@@ -26,7 +26,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.spec_utils import maybe_detect_nan, maybe_detect_oob
+from sglang.srt.speculative.spec_utils import (
+    maybe_detect_nan,
+    maybe_detect_oob,
+)
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -50,7 +53,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     extend_seq_lens: torch.Tensor
     topk_p: torch.Tensor
     topk_index: torch.Tensor
-    hidden_states: torch.Tensor
+    hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
@@ -129,9 +132,14 @@ class EAGLEDraftCudaGraphRunner:
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
-            hidden_states = torch.zeros(
-                (self.max_bs, EagleDraftInput.hidden_size_for(self.eagle_worker)),
-                dtype=EagleDraftInput.dtype_for(self.eagle_worker),
+            _hidden_size = EagleDraftInput.hidden_size_for(self.eagle_worker)
+            hidden_states = (
+                torch.zeros(
+                    (self.max_bs, _hidden_size),
+                    dtype=EagleDraftInput.dtype_for(self.eagle_worker),
+                )
+                if _hidden_size is not None
+                else None
             )
 
             if self.require_gathered_buffer:
@@ -253,7 +261,11 @@ class EAGLEDraftCudaGraphRunner:
         out_cache_loc = buffers.out_cache_loc[: num_tokens * self.speculative_num_steps]
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        hidden_states = buffers.hidden_states[:num_seqs]
+        hidden_states = (
+            buffers.hidden_states[:num_seqs]
+            if buffers.hidden_states is not None
+            else None
+        )
         topk_p = buffers.topk_p[:num_seqs]
         topk_index = buffers.topk_index[:num_seqs]
 
@@ -298,11 +310,16 @@ class EAGLEDraftCudaGraphRunner:
             global_dp_buffer_len = None
             global_num_tokens_for_logprob = None
 
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.model_runner.spec_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
         spec_info = EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+            capture_hidden_mode=capture_mode,
         )
 
         # Forward batch
@@ -347,7 +364,7 @@ class EAGLEDraftCudaGraphRunner:
             )
             set_is_extend_in_batch(False)
 
-            # Backup two fields, which will be modified in-place in `draft_forward`.
+            # Backup fields that are modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
@@ -355,6 +372,7 @@ class EAGLEDraftCudaGraphRunner:
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -401,7 +419,8 @@ class EAGLEDraftCudaGraphRunner:
             buffers.positions.zero_()
             buffers.topk_p.zero_()
             buffers.topk_index.zero_()
-            buffers.hidden_states.zero_()
+            if buffers.hidden_states is not None:
+                buffers.hidden_states.zero_()
             buffers.req_pool_indices.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
@@ -425,7 +444,11 @@ class EAGLEDraftCudaGraphRunner:
         )
         buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
-        buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        if (
+            buffers.hidden_states is not None
+            and forward_batch.spec_info.hidden_states is not None
+        ):
+            buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         # TODO(ch-wan): support num_token_non_padded
