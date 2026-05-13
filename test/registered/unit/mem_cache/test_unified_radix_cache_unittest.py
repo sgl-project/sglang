@@ -1914,21 +1914,18 @@ class UnifiedRadixCacheSuite:
         return tokens
 
     def _swa_anchor_setup(self):
-        """Build chain[-3]=N, chain[-2]=Y, chain[-1]=X where the FULL-derived
-        `last_host_node` (Y) is strictly shallower than the validator-derived
-        `best_match_node` (X) — the structural condition under which the SWA
-        load_back assert used to fire.
+        """Chain layout (root-to-leaf):
 
-        Per-node state:
-            N: SWA fully tombstone, FULL device-on, FULL host removed
-            Y: SWA host-only, FULL host-only (evicted + backuped)
-            X: SWA on device, FULL device-on, FULL host removed
+            ... top padding ...
+            chain[-(window_pages + 1)] = N : SWA tombstone
+            chain[-(window_pages)]     = Y : SWA host-only, FULL host-backed
+            chain[-(window_pages - 1)..-2] : SWA device, FULL.host=None
+            chain[-1]                  = X : SWA device, FULL.host=None
 
-        match_prefix outcome:
-            last_device_node = X         (X not evicted)
-            last_host_node   = Y         (X not backuped -> walk up)
-            best_match_node  = X         (SWA validator state resets at N then
-                                          accumulates over Y and X)
+        Anchor=X has window_pages of device pages below N, so the SWA
+        load_back walker accumulates n_swa >= sliding_window_size and
+        exits before reaching N. Anchor=Y has only 1 page and walks into
+        N's tombstone.
         """
         if not self.cfg.has_swa:
             self.skipTest("requires SWA")
@@ -1936,6 +1933,8 @@ class UnifiedRadixCacheSuite:
             self.skipTest("SWA-only path keeps the chain construction simple")
         ps = self.cfg.page_size
         sw = self.cfg.sliding_window_size
+        if ps >= sw:
+            self.skipTest("test scenario requires ps < sw")
         window_pages = (sw + ps - 1) // ps
         chain_pages = window_pages + 3
         if chain_pages * ps > self.cfg.kv_size // 2:
@@ -1943,31 +1942,26 @@ class UnifiedRadixCacheSuite:
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         chain = self._build_chain_pages(tree, allocator, req_to_token_pool, chain_pages)
-        if len(chain) < 3:
-            self.skipTest("chain too short for N/Y/X")
+        if len(chain) < chain_pages:
+            self.skipTest("chain too short")
         self._simulate_backup_tree(tree)
 
         x = chain[-1]
-        y = chain[-2]
-        n = chain[-3]
+        y = chain[-window_pages]
+        n = chain[-(window_pages + 1)]
 
         n.component_data[ComponentType.SWA].value = None
         n.component_data[ComponentType.SWA].host_value = None
-        n.component_data[ComponentType.FULL].host_value = None
-
-        y.component_data[ComponentType.FULL].value = None
         y.component_data[ComponentType.SWA].value = None
-
-        x.component_data[ComponentType.FULL].host_value = None
-        x.component_data[ComponentType.SWA].host_value = None
+        # Strip FULL.host on X + intermediates so last_host_node walks past
+        # them to Y. Y.FULL untouched preserves the leaf-up evict invariant.
+        for node in chain[-(window_pages - 1) :]:
+            node.component_data[ComponentType.FULL].host_value = None
 
         tokens = self._swa_anchor_chain_tokens(len(chain))
         return tree, chain, n, y, x, tokens
 
     def test_hicache_swa_match_prefix_picks_best_match_node_above_last_host(self):
-        """match_prefix populates best_match_node = X strictly deeper than
-        last_host_node = Y. Pre-fix scheduler fed last_host_node into SWA
-        build_hicache_transfers and tripped the assert above N."""
         tree, _, _, y, x, tokens = self._swa_anchor_setup()
         result = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
         self.assertIs(result.best_match_node, x)
@@ -1975,38 +1969,22 @@ class UnifiedRadixCacheSuite:
         self.assertIs(result.last_host_node, y)
 
     def test_hicache_swa_load_back_anchored_on_best_match_node(self):
-        """SWA build_hicache_transfers(LOAD_BACK) anchored on best_match_node
-        (X) collects [Y] only and never touches the SWA-tombstoned N.
-        Feeding Y (last_host_node) instead would over-reach into N and assert.
-        """
         tree, _, _, y, x, _ = self._swa_anchor_setup()
         ps = self.cfg.page_size
-        sw = self.cfg.sliding_window_size
         swa_comp = tree.components[ComponentType.SWA]
 
         transfers = swa_comp.build_hicache_transfers(x, CacheTransferPhase.LOAD_BACK)
-        if ps >= sw:
-            self.assertIsNone(transfers)
-        else:
-            self.assertEqual(len(transfers), 1)
-            xfer = transfers[0]
-            self.assertEqual(xfer.name, PoolName.SWA)
-            self.assertEqual(xfer.nodes_to_load, [y])
-            self.assertEqual(int(xfer.host_indices.numel()), ps)
+        self.assertEqual(len(transfers), 1)
+        xfer = transfers[0]
+        self.assertEqual(xfer.name, PoolName.SWA)
+        self.assertEqual(xfer.nodes_to_load, [y])
+        self.assertEqual(int(xfer.host_indices.numel()), ps)
 
-        # Anchor on Y (the pre-fix scheduler input) and watch the assert fire.
-        # Only reproducible when the window does not fit within Y alone.
-        if ps < sw:
-            with self.assertRaises(AssertionError):
-                swa_comp.build_hicache_transfers(y, CacheTransferPhase.LOAD_BACK)
+        with self.assertRaises(AssertionError):
+            swa_comp.build_hicache_transfers(y, CacheTransferPhase.LOAD_BACK)
 
     def test_hicache_swa_finalize_anchored_on_best_match_node(self):
-        """SWA finalize_match_result scans from best_match_node so the
-        sentinel decision lines up with what build_hicache_transfers will
-        actually walk."""
         tree, _, _, y, x, _ = self._swa_anchor_setup()
-        ps = self.cfg.page_size
-        sw = self.cfg.sliding_window_size
         swa_comp = tree.components[ComponentType.SWA]
 
         base = MatchResult(
@@ -2022,10 +2000,7 @@ class UnifiedRadixCacheSuite:
             value_chunks=[],
             best_value_len=0,
         )
-        if ps >= sw:
-            self.assertEqual(result.host_hit_length, 0)
-        else:
-            self.assertEqual(result.host_hit_length, 1)
+        self.assertEqual(result.host_hit_length, 1)
 
     def test_hicache_swa_temp_lock_does_not_release_restored_tombstone(self):
         """A temporary scheduler lock that skipped a SWA tombstone must not
@@ -2072,14 +2047,15 @@ class UnifiedRadixCacheSuite:
         tree.dec_lock_ref(leaf, request_lock.to_dec_params())
         self.assertEqual(cd.lock_ref, 0)
 
-    def test_hicache_full_temp_lock_skips_evicted_ancestor_and_mirrors_on_release(
+    def test_hicache_full_temp_lock_skips_evicted_anchor_and_mirrors_on_release(
         self,
     ):
-        """A FULL load_back lock anchored on best_match_node walks past
-        evicted ancestors (e.g. Y = evicted+backuped) and locks only the
-        device-on nodes (X above Y, A below Y). Once Y is restored to device,
-        a second lock covers Y fully; releasing the first lock must mirror
-        its skip and not decrement Y's lock_ref."""
+        """Acquire records the evicted anchor in skip_lock_node_ids (phase 1)
+        and locks device-on ancestors only (phase 2). After load_back
+        restores the anchor, a second acquire covers it; releasing the
+        first must mirror the skip so the anchor's lock_ref is not
+        decremented twice.
+        """
         if self._skip_unsupported_hicache_test():
             return
         ps = self.cfg.page_size
@@ -2089,41 +2065,42 @@ class UnifiedRadixCacheSuite:
         chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
             self.skipTest("chain too short")
-        a, y, x = chain
+        a, y, anchor = chain
         self._simulate_backup_tree(tree)
 
-        # y goes FULL evicted+backuped while a / x stay device-on.
-        y.component_data[ComponentType.FULL].value = None
-
+        cd_anchor = anchor.component_data[ComponentType.FULL]
         cd_a = a.component_data[ComponentType.FULL]
         cd_y = y.component_data[ComponentType.FULL]
-        cd_x = x.component_data[ComponentType.FULL]
-        self.assertEqual(cd_a.lock_ref, 0)
-        self.assertEqual(cd_x.lock_ref, 0)
+        anchor_value = cd_anchor.value
+        cd_anchor.value = None
 
-        temp_lock = tree.inc_lock_ref(x)
-        self.assertEqual(cd_a.lock_ref, 1)
-        self.assertEqual(cd_x.lock_ref, 1)
-        self.assertIn(ComponentType.FULL, temp_lock.skip_lock_node_ids)
-        self.assertIn(y.id, temp_lock.skip_lock_node_ids[ComponentType.FULL])
-
-        # Simulate commit restoring y's device value.
-        cd_y.value = torch.empty((ps,), dtype=torch.int64, device=tree.device)
-
-        second_lock = tree.inc_lock_ref(x)
-        self.assertEqual(cd_y.lock_ref, 1)
-        self.assertEqual(cd_a.lock_ref, 2)
-        self.assertEqual(cd_x.lock_ref, 2)
-
-        tree.dec_lock_ref(x, temp_lock.to_dec_params())
-        self.assertEqual(cd_y.lock_ref, 1)
-        self.assertEqual(cd_a.lock_ref, 1)
-        self.assertEqual(cd_x.lock_ref, 1)
-
-        tree.dec_lock_ref(x, second_lock.to_dec_params())
+        self.assertEqual(cd_anchor.lock_ref, 0)
         self.assertEqual(cd_y.lock_ref, 0)
         self.assertEqual(cd_a.lock_ref, 0)
-        self.assertEqual(cd_x.lock_ref, 0)
+
+        temp_lock = tree.inc_lock_ref(anchor)
+        self.assertEqual(cd_anchor.lock_ref, 0)
+        self.assertEqual(cd_y.lock_ref, 1)
+        self.assertEqual(cd_a.lock_ref, 1)
+        self.assertIn(ComponentType.FULL, temp_lock.skip_lock_node_ids)
+        self.assertIn(anchor.id, temp_lock.skip_lock_node_ids[ComponentType.FULL])
+
+        cd_anchor.value = anchor_value
+
+        second_lock = tree.inc_lock_ref(anchor)
+        self.assertEqual(cd_anchor.lock_ref, 1)
+        self.assertEqual(cd_y.lock_ref, 2)
+        self.assertEqual(cd_a.lock_ref, 2)
+
+        tree.dec_lock_ref(anchor, temp_lock.to_dec_params())
+        self.assertEqual(cd_anchor.lock_ref, 1)
+        self.assertEqual(cd_y.lock_ref, 1)
+        self.assertEqual(cd_a.lock_ref, 1)
+
+        tree.dec_lock_ref(anchor, second_lock.to_dec_params())
+        self.assertEqual(cd_anchor.lock_ref, 0)
+        self.assertEqual(cd_y.lock_ref, 0)
+        self.assertEqual(cd_a.lock_ref, 0)
 
     def test_hicache_mamba_temp_lock_does_not_release_restored_tombstone(self):
         """A temporary scheduler lock that skipped a Mamba tombstone must not
