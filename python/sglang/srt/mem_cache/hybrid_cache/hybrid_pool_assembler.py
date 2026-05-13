@@ -101,8 +101,8 @@ def build_kv_only_stack(
     page_size: int,
     tp_group,
     load_cache_event,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
@@ -165,8 +165,8 @@ def build_hybrid_swa_stack(
     page_size: int,
     tp_group,
     load_cache_event,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
@@ -238,13 +238,7 @@ def build_hybrid_swa_stack(
     return host_pool_group, cache_controller
 
 
-def _v4_paged_item_bytes(device_buffers: list["torch.Tensor"]) -> int:
-    if not device_buffers:
-        return 0
-    return device_buffers[0].shape[1] * device_buffers[0].element_size()
-
-
-def _v4_num_host_pages(
+def _deepseek_v4_num_host_pages(
     *,
     params: CacheInitParams,
     server_args: ServerArgs,
@@ -258,6 +252,11 @@ def _v4_num_host_pages(
 
     device_swa_pages = (kvcache.swa_size + swa_page_size - 1) // swa_page_size
 
+    if server_args.hicache_size > 0:
+        raise ValueError(
+            "DeepSeek V4 HiCache currently does not support --hicache-size; "
+            "use --hicache-ratio instead."
+        )
     ratio = server_args.hicache_ratio
     full_host_pages = max(int(device_full_pages * ratio), device_full_pages + 1)
     swa_host_pages = max(int(device_swa_pages * ratio), device_swa_pages + 1)
@@ -272,6 +271,8 @@ def build_deepseek_v4_hicache_stack(
     page_size: int,
     tp_group,
     load_cache_event,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
     storage_backend: Optional[str],
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
@@ -306,7 +307,7 @@ def build_deepseek_v4_hicache_stack(
     c128_state_mapping = {
         layer_id: local_id for local_id, layer_id in enumerate(c128_state_global_layers)
     }
-    num_host_pages, swa_num_host_pages = _v4_num_host_pages(
+    num_host_pages, swa_num_host_pages = _deepseek_v4_num_host_pages(
         params=params,
         server_args=server_args,
         kvcache=kvcache,
@@ -358,8 +359,9 @@ def build_deepseek_v4_hicache_stack(
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
             device_buffers=kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer,
-            item_bytes=_v4_paged_item_bytes(
-                kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer
+            item_bytes=(
+                kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[0].shape[1]
+                * kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[0].element_size()
             ),
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
@@ -376,7 +378,7 @@ def build_deepseek_v4_hicache_stack(
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
-            pool_name=str(PoolName.DEEPSEEK_V4_INDEXER_STATE),
+            pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
             state_pools=[
                 kvcache.indexer_compress_state_pools[layer_id]
                 for layer_id in c4_state_global_layers
@@ -409,7 +411,7 @@ def build_deepseek_v4_hicache_stack(
                     transfer_layer_num=transfer_layer_num,
                 ),
                 build_pool_entry(
-                    name=PoolName.DEEPSEEK_V4_INDEXER_STATE,
+                    name=PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
                     host_pool=c4_indexer_state_host_pool,
                     device_pool=None,
                     layer_mapping=c4_state_mapping,
@@ -463,6 +465,8 @@ def build_deepseek_v4_hicache_stack(
         page_size,
         tp_group,
         load_cache_event=load_cache_event,
+        attn_cp_group=attn_cp_group,
+        attn_tp_group=attn_tp_group,
         write_policy=server_args.hicache_write_policy,
         io_backend=server_args.hicache_io_backend,
         storage_backend=storage_backend,
@@ -488,8 +492,8 @@ def build_hybrid_mamba_stack(
     page_size: int,
     tp_group,
     load_cache_event,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     host_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
@@ -567,8 +571,8 @@ def build_anchor_sidecar_stack(
     page_size: int,
     tp_group,
     load_cache_event,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
@@ -635,8 +639,8 @@ def attach_hybrid_pool_to_unified_cache(
     server_args: ServerArgs,
     *,
     load_cache_event,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -691,6 +695,8 @@ def attach_hybrid_pool_to_unified_cache(
                 page_size=cache.page_size,
                 tp_group=params.tp_cache_group,
                 load_cache_event=load_cache_event,
+                attn_cp_group=attn_cp_group,
+                attn_tp_group=attn_tp_group,
                 storage_backend=None,
                 host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
                 device_swa_evict_fn=lambda n: cache.evict(
@@ -714,7 +720,7 @@ def attach_hybrid_pool_to_unified_cache(
                 (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C128, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA),
-                (PoolName.DEEPSEEK_V4_INDEXER_STATE, PoolName.SWA),
+                (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, PoolName.SWA),
                 (PoolName.DEEPSEEK_V4_C128_STATE, PoolName.SWA),
             ):
                 if pool_name in host_pool_group.entry_map:
@@ -904,8 +910,8 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
     prefetch_threshold: int,
     enable_storage_metrics: bool,
     load_cache_event,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
 
@@ -963,8 +969,8 @@ def attach_hybrid_pool_to_mamba_cache(
     prefetch_threshold: int,
     load_cache_event,
     enable_storage_metrics: bool = False,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """Attach HostPoolGroup (KV + Mamba) + HybridCacheController for HiMambaRadixCache.
 

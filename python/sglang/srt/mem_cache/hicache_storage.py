@@ -56,12 +56,13 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
     SWA = "swa"
     INDEXER = "indexer"
+    # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
+    # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
     DEEPSEEK_V4_C4 = "deepseek_v4_c4"
     DEEPSEEK_V4_C4_INDEXER = "deepseek_v4_c4_indexer"
-    DEEPSEEK_V4_INDEXER = "deepseek_v4_c4_indexer"
     DEEPSEEK_V4_C128 = "deepseek_v4_c128"
     DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
-    DEEPSEEK_V4_INDEXER_STATE = "deepseek_v4_indexer_state"
+    DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
 
     def __str__(self) -> str:
