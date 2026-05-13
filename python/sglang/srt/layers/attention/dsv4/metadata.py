@@ -107,9 +107,8 @@ class PagedIndexerMetadata:
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or (
-            is_cpu() and cpu_has_amx_support()
-        ) or _is_sm120:
+        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TRITON.get() or (
+            is_cpu() and cpu_has_amx_support()) or _is_sm120:
             # SM120: DeepGEMM get_paged_mqa_logits_metadata asserts
             # "Unsupported architecture" on SM120. Use None (torch fallback path).
             self.deep_gemm_metadata = None
