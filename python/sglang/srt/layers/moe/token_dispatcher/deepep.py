@@ -386,7 +386,7 @@ class _DeepEPDispatcherImplBase:
             if _is_npu:
                 # Ascend A2/A3 NPU supports only int8 quantization (but uses fp8 flag).
                 # Leaving a message for the user.
-                logger.warning_once(ß
+                logger.warning_once(
                     "Warning: Ascend A2/A3 NPU does not support fp8 "
                     "deepep_output_dtype, switching to int8... "
                 )
