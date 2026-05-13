@@ -32,22 +32,39 @@ jobs:
           pip install requests
 
       - name: Run Failure Analysis
+        # Prefer the maintained PAT (lets the script reuse the same
+        # higher-rate-limit token used by other CI workflows), but fall
+        # back to the workflow's built-in GITHUB_TOKEN if the PAT secret
+        # is empty. The built-in token has the actions:read scope already
+        # declared above and is sufficient for every read-only API call
+        # this script makes against the public sgl-project/sglang repo
+        # (admin runner-list calls go through GH_PAT_FOR_RUNNER_ADMIN
+        # separately). The script also fails loudly on 401/403, so a
+        # broken/expired PAT will turn this job red instead of silently
+        # producing an empty report.
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
           GH_PAT_FOR_RUNNER_ADMIN: ${{ secrets.GH_PAT_FOR_RUNNER_ADMIN }}
           PYTHONUNBUFFERED: 1
           PYTHONIOENCODING: utf-8
         run: |
           cd scripts/ci_monitor
           python ci_failures_analysis.py \
-            --token $GITHUB_TOKEN \
+            --token "$GITHUB_TOKEN" \
             --limit 100 \
             --output ci_failure_analysis_$(date +%Y%m%d_%H%M%S).json
 
       - name: Upload Analysis Results
+        # The Run Failure Analysis step now exits non-zero when no runs
+        # were collected (e.g. token broken across the board), so this
+        # upload is naturally skipped on those failures. Keep
+        # if-no-files-found as 'warn' for the rare case where the script
+        # exits 0 but produced no JSON.
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ci-failure-analysis-${{ github.run_number }}
           path: |
             scripts/ci_monitor/ci_failure_analysis_*.json
           retention-days: 7
+          if-no-files-found: warn
