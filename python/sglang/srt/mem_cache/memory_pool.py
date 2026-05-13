@@ -624,6 +624,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
 
+    def get_state_buf_infos(self):
+        return self.mamba_pool.get_contiguous_buf_infos()
+
+    def get_state_dim_per_tensor(self):
+        return self.mamba_pool.get_state_dim_per_tensor()
+
     def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
         if self.mamba_ping_pong_track_buffer_size == 2:
             return 1 - mamba_next_track_idx
@@ -2017,7 +2023,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
         assert index_head_dim == 128
 
         if _is_hip:
-            assert self.page_size == 1
+            assert (
+                self.page_size % 16 == 0
+            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
         else:
             assert self.page_size == 64
         with (

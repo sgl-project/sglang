@@ -526,6 +526,11 @@ class FlashInferWorkspaceManager:
                 dtype=dtype or torch.bfloat16,
                 gpus_per_node=gpus_per_node,
                 comm_backend=comm_backend,
+                # Pin the symmetric-memory rendezvous to the actual
+                # subgroup. Without this, flashinfer >=0.6.10 falls back
+                # to WORLD and TP/EP/CP subgroup peers get addressed
+                # incorrectly (kernel hangs in cuda-graph warmup).
+                group=device_group,
             )
             if use_oneshot is not None:
                 create_kw["force_oneshot_support"] = bool(use_oneshot)
@@ -669,8 +674,6 @@ def ensure_workspace_initialized(
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
 
-    tp_coordinator = get_tp_group()
-
     if use_attn_tp_group:
         world_size = get_attn_tensor_model_parallel_world_size()
         rank = get_attn_tensor_model_parallel_rank()
@@ -685,18 +688,12 @@ def ensure_workspace_initialized(
             rank = get_moe_tensor_parallel_rank()
             coordinator = get_moe_tp_group()
 
-    # When the sub-group IS the full TP group, pass None so the workspace
-    # uses the default process group directly (no TorchDistBackend needed).
-    # For true sub-groups, use NCCL device_group for GPU/device mapping and
-    # GLOO cpu_group for metadata broadcasts (avoids NCCL collectives that
-    # interfere with CUDA graph capture).
-    if coordinator.device_group is tp_coordinator.device_group:
-        device_group = None
-        cpu_group = None
-    else:
-        device_group = coordinator.device_group
-        cpu_group = coordinator.cpu_group
-    comm_group = coordinator.cpu_group
+    # Always pass the coordinator's groups: flashinfer >=0.6.10 reads the
+    # rendezvous group from `group=...` (falling back to WORLD when None),
+    # so leaving it None silently rendezvouses on WORLD and the kernel ends
+    # up addressing the wrong peers in TP/EP/CP subgroup setups.
+    device_group = coordinator.device_group
+    cpu_group = coordinator.cpu_group
 
     if world_size <= 1:
         return False
@@ -727,7 +724,7 @@ def ensure_workspace_initialized(
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
             backend=backend,
-            group=comm_group,
+            group=cpu_group,
             use_fp32_lamport=use_fp32_lamport,
             dtype=dtype,
             use_oneshot=use_oneshot,

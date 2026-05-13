@@ -319,6 +319,8 @@ class UnifiedRadixCache(BasePrefixCache):
             params,
             server_args,
             load_cache_event=self.load_cache_event,
+            attn_cp_group=params.attn_cp_cache_group,
+            attn_tp_group=params.attn_tp_cache_group,
         )
 
         # State initialization
@@ -657,10 +659,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
-                if child.evicted:
-                    break
                 node = self._split_node(child.key, child, prefix_len)
-                value.append(node.component_data[BASE_COMPONENT_TYPE].value)
+                if not node.evicted:
+                    value.append(node.component_data[BASE_COMPONENT_TYPE].value)
                 _update_best_if_valid(node)
                 break
 
@@ -896,7 +897,13 @@ class UnifiedRadixCache(BasePrefixCache):
         target: EvictLayer = EvictLayer.DEVICE,
     ):
         """Cascade eviction from trigger to lower-or-equal priority components."""
-        is_leaf = len(node.children) == 0
+
+        is_leaf = False
+        if target == EvictLayer.DEVICE:
+            is_leaf = node in self.evictable_device_leaves
+        elif target == EvictLayer.HOST:
+            is_leaf = node in self.evictable_host_leaves
+
         trigger_priority = trigger.eviction_priority(is_leaf)
 
         for comp in self._components_tuple:
