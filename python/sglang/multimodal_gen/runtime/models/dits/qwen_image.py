@@ -14,10 +14,6 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
-from sglang.jit_kernel.diffusion.triton.scale_shift import (
-    fuse_layernorm_scale_shift_gate_select01_kernel,
-    fuse_residual_layernorm_scale_shift_gate_select01_kernel,
-)
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -25,6 +21,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
+from sglang.multimodal_gen.runtime.layers.fused_scale_shift_gate import (
+    FusedLayerNormScaleShiftGateSelect01,
+    FusedResidualLayerNormScaleShiftGateSelect01,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
@@ -47,14 +47,10 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
 )
 from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import (
-    AttentionBackendEnum,
-    current_platform,
-)
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
-
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
@@ -879,6 +875,10 @@ class QwenImageTransformerBlock(nn.Module):
         )
         # Utils
         self.fuse_mul_add = MulAdd()
+        self.fused_ln_ss_gate_select01 = FusedLayerNormScaleShiftGateSelect01()
+        self.fused_res_ln_ss_gate_select01 = (
+            FusedResidualLayerNormScaleShiftGateSelect01()
+        )
 
         nunchaku_enabled = (
             quant_config is not None
@@ -941,86 +941,51 @@ class QwenImageTransformerBlock(nn.Module):
 
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
-            # ROCm currently fails to compile the select01 Triton kernel, so
-            # keep using the torch.where fallback there.
-            if x.is_cuda and not current_platform.is_hip():
-                actual_batch = x.shape[0]
-                shift0, shift1 = (
-                    shift[:actual_batch],
-                    shift[actual_batch : 2 * actual_batch],
+            actual_batch = x.shape[0]
+            shift0, shift1 = (
+                shift[:actual_batch],
+                shift[actual_batch : 2 * actual_batch],
+            )
+            scale0, scale1 = (
+                scale[:actual_batch],
+                scale[actual_batch : 2 * actual_batch],
+            )
+            gate0, gate1 = (
+                gate[:actual_batch],
+                gate[actual_batch : 2 * actual_batch],
+            )
+            if is_scale_residual:
+                x, residual_out, gate_result = self.fused_res_ln_ss_gate_select01(
+                    x,
+                    residual_x,
+                    gate_x,
+                    getattr(norm_module.norm, "weight", None),
+                    getattr(norm_module.norm, "bias", None),
+                    scale0,
+                    shift0,
+                    gate0,
+                    scale1,
+                    shift1,
+                    gate1,
+                    index,
+                    norm_module.eps,
                 )
-                scale0, scale1 = (
-                    scale[:actual_batch],
-                    scale[actual_batch : 2 * actual_batch],
-                )
-                gate0, gate1 = (
-                    gate[:actual_batch],
-                    gate[actual_batch : 2 * actual_batch],
-                )
-                if not x.is_contiguous():
-                    x = x.contiguous()
-                if not index.is_contiguous():
-                    index = index.contiguous()
-                if is_scale_residual:
-                    if not residual_x.is_contiguous():
-                        residual_x = residual_x.contiguous()
-                    if not gate_x.is_contiguous():
-                        gate_x = gate_x.contiguous()
-                    x, residual_out, gate_result = (
-                        fuse_residual_layernorm_scale_shift_gate_select01_kernel(
-                            x,
-                            residual=residual_x,
-                            residual_gate=gate_x,
-                            weight=getattr(norm_module.norm, "weight", None),
-                            bias=getattr(norm_module.norm, "bias", None),
-                            scale0=scale0.contiguous(),
-                            shift0=shift0.contiguous(),
-                            gate0=gate0.contiguous(),
-                            scale1=scale1.contiguous(),
-                            shift1=shift1.contiguous(),
-                            gate1=gate1.contiguous(),
-                            index=index,
-                            eps=norm_module.eps,
-                        )
-                    )
-                    return x, residual_out, gate_result
-                else:
-                    x, gate_result = fuse_layernorm_scale_shift_gate_select01_kernel(
-                        x,
-                        weight=getattr(norm_module.norm, "weight", None),
-                        bias=getattr(norm_module.norm, "bias", None),
-                        scale0=scale0.contiguous(),
-                        shift0=shift0.contiguous(),
-                        gate0=gate0.contiguous(),
-                        scale1=scale1.contiguous(),
-                        shift1=shift1.contiguous(),
-                        gate1=gate1.contiguous(),
-                        index=index,
-                        eps=norm_module.eps,
-                    )
-                    return x, gate_result
+                return x, residual_out, gate_result
             else:
-                actual_batch = x.shape[0]
-                shift0, shift1 = (
-                    shift[:actual_batch],
-                    shift[actual_batch : 2 * actual_batch],
+                x, gate_result = self.fused_ln_ss_gate_select01(
+                    x,
+                    getattr(norm_module.norm, "weight", None),
+                    getattr(norm_module.norm, "bias", None),
+                    scale0,
+                    shift0,
+                    gate0,
+                    scale1,
+                    shift1,
+                    gate1,
+                    index,
+                    norm_module.eps,
                 )
-                scale0, scale1 = (
-                    scale[:actual_batch],
-                    scale[actual_batch : 2 * actual_batch],
-                )
-                gate0, gate1 = (
-                    gate[:actual_batch],
-                    gate[actual_batch : 2 * actual_batch],
-                )
-                index = index.to(dtype=torch.bool).unsqueeze(-1)
-                shift_result = torch.where(
-                    index, shift1.unsqueeze(1), shift0.unsqueeze(1)
-                )
-                scale_result = torch.where(
-                    index, scale1.unsqueeze(1), scale0.unsqueeze(1)
-                )
-                gate_result = torch.where(index, gate1.unsqueeze(1), gate0.unsqueeze(1))
+                return x, gate_result
         else:
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
@@ -1165,6 +1130,7 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
     param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
+    _fsdp_shard_conditions = QwenImageDitConfig().arch_config._fsdp_shard_conditions
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
