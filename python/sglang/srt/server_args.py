@@ -7214,15 +7214,18 @@ class ServerArgs:
                 "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
             )
 
-        # Check two batch overlap
+        # Check two/single batch overlap
         if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
 
-        if self.enable_two_batch_overlap and self.enforce_shared_experts_fusion:
+        if (
+            self.enable_two_batch_overlap or self.enable_single_batch_overlap
+        ) and self.enforce_shared_experts_fusion:
             raise ValueError(
-                "--enable-two-batch-overlap and --enforce-shared-experts-fusion cannot be used together."
+                "--enable-two-batch-overlap/--enable-single-batch-overlap and "
+                "--enforce-shared-experts-fusion cannot be used together."
             )
 
         # Check communications compression

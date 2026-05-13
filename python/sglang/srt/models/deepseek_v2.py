@@ -2410,14 +2410,17 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             return
 
         # DeepEP + enforce: the only path that enables fusion under DeepEP.
+        # SBO/TBO must still be excluded even in this path — their overlap
+        # kernel execution is incompatible with fused shared experts.
         if is_deepep_class_backend() and server_args.enforce_shared_experts_fusion:
-            log_info_on_rank0(
-                logger,
-                "DeepEP shared expert fusion: fusing shared expert into MoE kernel "
-                "at home EP rank local slot (--enforce-shared-experts-fusion).",
-            )
-            self.num_fused_shared_experts = self.config.n_shared_experts
-            return
+            if not (is_sbo_enabled() or is_tbo_enabled()):
+                log_info_on_rank0(
+                    logger,
+                    "DeepEP shared expert fusion: fusing shared expert into MoE kernel "
+                    "at home EP rank local slot (--enforce-shared-experts-fusion).",
+                )
+                self.num_fused_shared_experts = self.config.n_shared_experts
+                return
 
         # Check all conditions that disable fusion.
         disable_reason = None
