@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -41,6 +42,7 @@ def _build_swa_tree(
     kv_size: int = 64,
     kv_size_swa: int = 32,
     sliding_window_size: int = 4,
+    enable_kv_cache_events: bool = False,
 ):
     head_num = 8
     head_dim = 128
@@ -89,6 +91,7 @@ def _build_swa_tree(
             disable=False,
             is_eagle=is_eagle,
             sliding_window_size=sliding_window_size,
+            enable_kv_cache_events=enable_kv_cache_events,
         ),
     )
     return tree, allocator, req_to_token_pool
@@ -132,6 +135,66 @@ class TestSWA(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pass
+
+    def test_swa_radix_cache_kv_events(self):
+        tree, allocator, _ = _build_swa_tree(
+            is_eagle=False, enable_kv_cache_events=True
+        )
+        tree.take_events()  # Clear the reset event.
+
+        _insert(tree, allocator, [1, 2, 3, 4])
+        first_insert_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        self.assertEqual(len(first_insert_events), 4)
+        self.assertEqual([e.token_ids[0] for e in first_insert_events], [1, 2, 3, 4])
+
+        _insert(tree, allocator, [1, 2, 3, 4, 5, 6])
+        second_insert_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        self.assertEqual(len(second_insert_events), 2)
+        self.assertEqual([e.token_ids[0] for e in second_insert_events], [5, 6])
+
+        stored_hashes = [
+            e.block_hashes[0] for e in first_insert_events + second_insert_events
+        ]
+
+        # Evicting only SWA tokens tombstones nodes but keeps full KV blocks.
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        self.assertEqual(result.num_tokens_evicted, 0)
+        self.assertGreaterEqual(result.swa_num_tokens_evicted, 1)
+        self.assertEqual(
+            [e for e in tree.take_events() if isinstance(e, BlockRemoved)], []
+        )
+
+        result = tree.evict(EvictParams(num_tokens=1, swa_num_tokens=0))
+        self.assertGreaterEqual(result.num_tokens_evicted, 1)
+        removed_hashes = [
+            e.block_hashes[0] for e in tree.take_events() if isinstance(e, BlockRemoved)
+        ]
+        self.assertCountEqual(removed_hashes, stored_hashes)
+
+    def test_swa_radix_cache_kv_events_split_hash(self):
+        tree, allocator, _ = _build_swa_tree(
+            is_eagle=False, enable_kv_cache_events=True
+        )
+        tree.take_events()  # Clear the reset event.
+
+        _insert(tree, allocator, [1, 2, 3, 4])
+        first_insert_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        self.assertEqual(len(first_insert_events), 4)
+        split_parent_hash = first_insert_events[1].block_hashes[0]
+
+        _insert(tree, allocator, [1, 2, 5, 6])
+        second_insert_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        self.assertEqual(len(second_insert_events), 2)
+        self.assertEqual(second_insert_events[0].token_ids, [5])
+        self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
     def test_swa_memory_pool(self):
         size = 16

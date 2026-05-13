@@ -23,7 +23,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PrefetchTimeoutConfig,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
@@ -125,8 +130,7 @@ class HiMambaRadixCache(MambaRadixCache):
         (
             extra_config,
             prefetch_threshold,
-            prefetch_timeout_base,
-            prefetch_timeout_per_ki_token,
+            prefetch_timeout_config,
             hicache_storage_pass_prefix_keys,
         ) = self._parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
@@ -149,8 +153,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,
-            prefetch_timeout_base=prefetch_timeout_base,
-            prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
+            prefetch_timeout_config=prefetch_timeout_config,
             hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
             enable_storage=self.enable_storage,
             enable_storage_metrics=self.enable_storage_metrics,
@@ -1233,17 +1236,12 @@ class HiMambaRadixCache(MambaRadixCache):
         *,
         storage_backend: Optional[str],
         prefetch_threshold: int,
-        prefetch_timeout_base: float,
-        prefetch_timeout_per_ki_token: float,
+        prefetch_timeout_config: PrefetchTimeoutConfig,
         hicache_storage_pass_prefix_keys: bool,
         enable_storage: bool,
         enable_storage_metrics: bool,
         extra_metric_labels: Optional[Dict[str, str]],
     ) -> None:
-        prefetch_timeout_per_page = (
-            self.page_size / 1024 * prefetch_timeout_per_ki_token
-        )
-
         storage_metrics_collector = None
         if enable_storage_metrics:
             labels = {
@@ -1259,8 +1257,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self.enable_storage = enable_storage
         self.prefetch_threshold = prefetch_threshold
-        self.prefetch_timeout_base = prefetch_timeout_base
-        self.prefetch_timeout_per_page = prefetch_timeout_per_page
+        self.prefetch_timeout_config = prefetch_timeout_config
         self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
         self.enable_storage_metrics = enable_storage_metrics
         if self.enable_storage_metrics:
@@ -1327,8 +1324,7 @@ class HiMambaRadixCache(MambaRadixCache):
             (
                 extra_config,
                 prefetch_threshold,
-                prefetch_timeout_base,
-                prefetch_timeout_per_ki_token,
+                prefetch_timeout_config,
                 hicache_storage_pass_prefix_keys,
             ) = self._parse_storage_backend_extra_config(
                 storage_backend_extra_config_json
@@ -1358,8 +1354,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self._apply_storage_runtime_config(
             storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
-            prefetch_timeout_base=prefetch_timeout_base,
-            prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
+            prefetch_timeout_config=prefetch_timeout_config,
             hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
             enable_storage=True,
             enable_storage_metrics=self._enable_metrics_flag,
@@ -1536,11 +1531,13 @@ class HiMambaRadixCache(MambaRadixCache):
                 logger.error(f"Invalid backend extra config JSON: {e}")
                 raise e
 
+        defaults = PrefetchTimeoutConfig()
         prefetch_threshold = extra_config.pop("prefetch_threshold", 256)
-        prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)
+        prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", defaults.base)
         prefetch_timeout_per_ki_token = extra_config.pop(
-            "prefetch_timeout_per_ki_token", 0.25
+            "prefetch_timeout_per_ki_token", defaults.per_ki_token
         )
+        prefetch_timeout_max = extra_config.pop("prefetch_timeout_max", defaults.max)
         hicache_storage_pass_prefix_keys = extra_config.pop(
             "hicache_storage_pass_prefix_keys", False
         )
@@ -1558,17 +1555,27 @@ class HiMambaRadixCache(MambaRadixCache):
                 f"prefetch_timeout_per_ki_token must be number, got "
                 f"{type(prefetch_timeout_per_ki_token).__name__}"
             )
+        if not isinstance(prefetch_timeout_max, (int, float)):
+            raise ValueError(
+                f"prefetch_timeout_max must be number, got "
+                f"{type(prefetch_timeout_max).__name__}"
+            )
         if not isinstance(hicache_storage_pass_prefix_keys, bool):
             raise ValueError(
                 "hicache_storage_pass_prefix_keys must be bool, got "
                 f"{type(hicache_storage_pass_prefix_keys).__name__}"
             )
 
+        prefetch_timeout_config = PrefetchTimeoutConfig(
+            base=float(prefetch_timeout_base),
+            per_ki_token=float(prefetch_timeout_per_ki_token),
+            max=float(prefetch_timeout_max),
+        )
+
         return (
             extra_config,
             prefetch_threshold,
-            float(prefetch_timeout_base),
-            float(prefetch_timeout_per_ki_token),
+            prefetch_timeout_config,
             hicache_storage_pass_prefix_keys,
         )
 
@@ -1620,11 +1627,10 @@ class HiMambaRadixCache(MambaRadixCache):
         )
 
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation):
-        return (
-            time.monotonic() - operation.start_time
-            > self.prefetch_timeout_base
-            + len(operation.hash_value) * self.prefetch_timeout_per_page
-        )
+        cfg = self.prefetch_timeout_config
+        num_tokens = len(operation.hash_value) * self.page_size
+        timeout = min(cfg.max, cfg.base + cfg.per_ki_token * num_tokens / 1024)
+        return time.monotonic() - operation.start_time > timeout
 
     def can_terminate_prefetch(self, operation: PrefetchOperation):
         can_terminate = True
