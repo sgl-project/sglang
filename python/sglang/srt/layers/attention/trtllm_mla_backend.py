@@ -1143,7 +1143,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert k_rope is None
             chunk_idx = forward_batch.prefix_chunk_idx
 
-            out = torch.zeros(
+            out = torch.empty(
                 q.shape[0],
                 layer.tp_q_head_num,
                 layer.v_head_dim,
@@ -1186,7 +1186,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             return result
         else:
-            out = torch.zeros(
+            out = torch.empty(
                 q.shape[0],
                 q.shape[1],
                 v.shape[2],
