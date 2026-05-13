@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.hunyuan3d_shape import 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageEncodingStage,
     ImageVAEEncodingStage,
+    LTX2ImageEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
@@ -91,6 +92,7 @@ __all__ = [
     "LTX2AVDecodingStage",
     "ImageEncodingStage",
     "ImageVAEEncodingStage",
+    "LTX2ImageEncodingStage",
     "TextEncodingStage",
     "LTX2TextConnectorStage",
     # Hunyuan3D shape stages

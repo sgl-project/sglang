@@ -102,6 +102,7 @@ def get_param_names_mapping(
 def hf_to_custom_state_dict(
     hf_param_sd: dict[str, torch.Tensor] | Iterator[tuple[str, torch.Tensor]],
     param_names_mapping: Callable[[str], tuple[str, Any, Any]],
+    valid_target_names: set[str] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, tuple[str, Any, Any]]]:
     """
     Converts a Hugging Face parameter state dictionary to a custom parameter state dictionary.
@@ -123,6 +124,15 @@ def hf_to_custom_state_dict(
         target_param_name, merge_index, num_params_to_merge = param_names_mapping(
             source_param_name
         )
+        if (
+            valid_target_names is not None
+            and target_param_name != source_param_name
+            and source_param_name in valid_target_names
+            and target_param_name not in valid_target_names
+        ):
+            target_param_name = source_param_name
+            merge_index = None
+            num_params_to_merge = None
         if target_param_name == "" or target_param_name is None:  # type: ignore[comparison-overlap]
             continue
         reverse_param_names_mapping[target_param_name] = (
@@ -196,9 +206,76 @@ def _clean_hf_config_inplace(model_config: dict) -> None:
         model_config.pop(key, None)
 
 
+def _try_redownload_missing_shards(model_path: str, missing: list[str]) -> bool:
+    """Try to re-download missing safetensors shards from HuggingFace Hub.
+
+    Parses the repo_id and revision from the HF cache path structure
+    (models--{org}--{repo}/snapshots/{revision}) and calls hf_hub_download
+    for each missing shard. Returns True if all shards were recovered.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+
+        match = re.search(
+            r"models--([^/\\]+)--([^/\\]+)[/\\]snapshots[/\\]([^/\\]+)", model_path
+        )
+        if not match:
+            return False
+
+        repo_id = f"{match.group(1)}/{match.group(2)}"
+        revision = match.group(3)
+        logger.warning(
+            "Incomplete checkpoint for %s (revision %.8s) — missing shards: %s. "
+            "Attempting auto-repair via HuggingFace Hub...",
+            repo_id,
+            revision,
+            missing,
+        )
+        for shard in missing:
+            hf_hub_download(repo_id=repo_id, filename=shard, revision=revision)
+        logger.info("Auto-repair succeeded for %s.", repo_id)
+        return True
+    except Exception as e:
+        logger.warning("Auto-repair failed: %s", e)
+        return False
+
+
 def _list_safetensors_files(model_path: str) -> list[str]:
-    """List all .safetensors files under a directory."""
-    return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
+    """List all .safetensors files under a directory.
+
+    If a safetensors index file is present, verifies that every shard listed
+    in the index actually exists on disk. Missing shards are first repaired
+    automatically via HuggingFace Hub (if the path is an HF cache entry);
+    if repair fails a clear RuntimeError is raised.
+    """
+    found = sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
+
+    index_path = os.path.join(
+        str(model_path), "diffusion_pytorch_model.safetensors.index.json"
+    )
+    if os.path.exists(index_path):
+        import json
+
+        with open(index_path) as f:
+            index = json.load(f)
+        expected_shards = sorted(set(index.get("weight_map", {}).values()))
+        found_basenames = {os.path.basename(p) for p in found}
+        missing = [s for s in expected_shards if s not in found_basenames]
+        if missing:
+            repaired = _try_redownload_missing_shards(model_path, missing)
+            if repaired:
+                found = sorted(
+                    glob.glob(os.path.join(str(model_path), "*.safetensors"))
+                )
+            else:
+                raise RuntimeError(
+                    f"Checkpoint at '{model_path}' is incomplete — the following "
+                    f"shard(s) listed in the index are missing from disk: "
+                    f"{missing}. Re-download the checkpoint (e.g. "
+                    f"`huggingface-cli download {os.path.basename(model_path)}`)."
+                )
+
+    return found
 
 
 BYTES_PER_GB = 1024**3

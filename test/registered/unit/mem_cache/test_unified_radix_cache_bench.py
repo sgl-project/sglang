@@ -38,7 +38,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=25, suite="stage-b-test-1-gpu-small")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -335,7 +335,8 @@ def _insert_seq(env, seq):
     if env.has_mamba:
         req = env.make_req()
         mamba_val = req.mamba_pool_idx.unsqueeze(0)
-    env.tree.insert(InsertParams(key=RadixKey(seq), value=v, mamba_value=mamba_val))
+    key = RadixKey(seq)
+    env.tree.insert(InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val))
     return True
 
 
@@ -356,7 +357,10 @@ def _fill_no_evict(env):
         if env.has_mamba:
             req = env.make_req()
             mamba_val = req.mamba_pool_idx.unsqueeze(0)
-        env.tree.insert(InsertParams(key=RadixKey(seq), value=v, mamba_value=mamba_val))
+        key = RadixKey(seq)
+        env.tree.insert(
+            InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val)
+        )
         inserted += 1
     return inserted
 
@@ -501,8 +505,9 @@ def bench_match_prefix(
             queries.append([rng.randint(1, 32000)] * rng.randint(50, 300))
 
     def verify_fn(q):
-        r1 = env.tree.match_prefix(MatchPrefixParams(key=RadixKey(q)))
-        r2 = env.tree.match_prefix(MatchPrefixParams(key=RadixKey(q)))
+        k = RadixKey(q)
+        r1 = env.tree.match_prefix(MatchPrefixParams(key=k))
+        r2 = env.tree.match_prefix(MatchPrefixParams(key=k))
         assert len(r1.device_indices) == len(r2.device_indices), "match not idempotent"
 
     warmup = min(20, len(queries) // 10)

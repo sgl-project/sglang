@@ -19,7 +19,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=11, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 # Note: PYTHONPATH=python should be set when running tests
@@ -321,11 +321,10 @@ class TestModelOptExportIntegration(unittest.TestCase):
 
         model_config = ModelConfig(
             model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-            modelopt_quant="fp8",
-            modelopt_export_path=self.export_dir,
+            quantization="modelopt_fp8",
         )
 
-        load_config = LoadConfig()
+        load_config = LoadConfig(modelopt_export_path=self.export_dir)
         device_config = DeviceConfig()
 
         # Mock the quantization and export process

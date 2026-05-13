@@ -10,13 +10,14 @@ from sglang.test.test_utils import (
     CustomTestCase,
     auto_config_device,
     get_benchmark_args,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     run_benchmark,
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=204, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=211, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=345, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -70,7 +71,8 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
-            self.assertLess(res["median_ttft_ms"], 86)
+            # relax for mi300x
+            self.assertLess(res["median_ttft_ms"], 130 if is_in_amd_ci() else 86)
             self.assertLess(res["median_itl_ms"], 10)
 
 

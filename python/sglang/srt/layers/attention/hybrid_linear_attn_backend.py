@@ -187,8 +187,10 @@ class MambaAttnBackendBase(AttentionBackend):
                 )
 
                 if self.topk > 1:
-                    retrieve_next_token = forward_batch.spec_info.retrive_next_token
-                    retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
+                    retrieve_next_token = forward_batch.spec_info.retrieve_next_token
+                    retrieve_next_sibling = (
+                        forward_batch.spec_info.retrieve_next_sibling
+                    )
                     # retrieve_next_token is None during dummy run so skip tensor creation
                     if retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
@@ -485,8 +487,8 @@ class MambaAttnBackendBase(AttentionBackend):
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and self.topk > 1:
             # They are None during cuda graph capture so skip the copy_...
-            # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrive_next_token)
-            # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrive_next_sibling)
+            # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrieve_next_token)
+            # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrieve_next_sibling)
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
@@ -545,12 +547,12 @@ class MambaAttnBackendBase(AttentionBackend):
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and self.topk > 1:
-            bs_without_pad = spec_info.retrive_next_token.shape[0]
+            bs_without_pad = spec_info.retrieve_next_token.shape[0]
             self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
-                spec_info.retrive_next_token
+                spec_info.retrieve_next_token
             )
             self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
-                spec_info.retrive_next_sibling
+                spec_info.retrieve_next_sibling
             )
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
@@ -934,7 +936,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def update_mamba_state_after_mtp_verify(
         self,
-        accepted_steps: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
@@ -948,7 +950,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        request_number = accepted_steps.shape[0]
+        request_number = last_correct_step_indices.shape[0]
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
@@ -971,13 +973,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             ssm_states,
             intermediate_state_cache,
             state_indices_tensor,
-            accepted_steps,
+            last_correct_step_indices,
         )
         fused_mamba_state_scatter_with_mask(
             conv_states,
             intermediate_conv_window_cache,
             state_indices_tensor,
-            accepted_steps,
+            last_correct_step_indices,
         )
 
         # Track indices used for tracking mamba states for prefix cache

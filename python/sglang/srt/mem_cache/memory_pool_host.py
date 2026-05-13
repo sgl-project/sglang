@@ -147,6 +147,7 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     lambda: alloc_with_host_register,
     {
         "npu": alloc_with_pin_memory,
+        "musa": alloc_with_pin_memory,
     },
 )
 
@@ -1670,6 +1671,13 @@ class PoolEntry:
     # device_evict_fn(n): evict n slots from the device pool (used by load()).
     host_evict_fn: Optional[Callable] = None
     device_evict_fn: Optional[Callable] = None
+    # Optional alloc/free overrides for the device side, used by
+    # _resolve_pool_transfers_allocation. Set when entry.device_pool is the
+    # raw KV pool (layout) rather than an allocator (e.g. SWA, where alloc
+    # lives on a separate sub-allocator inside SWATokenToKVPoolAllocator).
+    # When None, fall back to entry.device_pool.alloc/free.
+    device_alloc_fn: Optional[Callable] = None
+    device_free_fn: Optional[Callable] = None
 
 
 class HostPoolGroup:
@@ -1714,6 +1722,9 @@ class HostPoolGroup:
 
     def get_ksize_per_token(self):
         return self.anchor_entry.host_pool.get_ksize_per_token()
+
+    def get_pool(self, name: PoolName):
+        return self.entry_map[name].host_pool
 
     def get_page_buffer_meta(self, indices):
         return self.anchor_entry.host_pool.get_page_buffer_meta(indices)

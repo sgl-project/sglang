@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=115, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=109, suite="stage-b-test-1-gpu-small")
 
 MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 

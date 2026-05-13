@@ -6,8 +6,8 @@ SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are 
 
 # Fetch tags from origin to ensure we have the latest
 if git fetch --tags origin; then
-  # Get the latest version tag sorted by version number (e.g., v0.5.7)
-  VERSION_FROM_TAG=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
+  # Use the shared helper so stable/post releases sort above rc tags.
+  VERSION_FROM_TAG=$(python3 python/tools/get_version_tag.py --tag-only || true)
   if [ -n "$VERSION_FROM_TAG" ]; then
     SGLANG_VERSION="$VERSION_FROM_TAG"
     echo "Using SGLang version from git tags: $SGLANG_VERSION"
@@ -23,6 +23,7 @@ fi
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
+LOCAL_DOCKER_REGISTRY="10.245.143.50:5000"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -96,11 +97,45 @@ else
   DEVICE_FLAG="--device /dev/dri"
 fi
 
+# Retry a command with exponential backoff. Usage: retry_with_backoff <max_attempts> <cmd...>
+retry_with_backoff() {
+  local max_attempts=$1; shift
+  local attempt=1
+  local wait_secs=30
+  # Add jitter (0-30s) so concurrent jobs don't all retry at the same instant
+  local jitter=$(( RANDOM % 30 ))
+  while true; do
+    if "$@"; then
+      return 0
+    fi
+    if (( attempt >= max_attempts )); then
+      echo "Error: '$*' failed after ${max_attempts} attempts" >&2
+      return 1
+    fi
+    local sleep_time=$(( wait_secs + jitter ))
+    echo "Attempt ${attempt}/${max_attempts} failed. Retrying in ${sleep_time}s…" >&2
+    sleep "${sleep_time}"
+    (( attempt++ ))
+    (( wait_secs = wait_secs * 2 > 300 ? 300 : wait_secs * 2 ))
+    jitter=$(( RANDOM % 30 ))
+  done
+}
+
+# Authenticate to Docker Hub to avoid anonymous pull rate limits.
+# Credentials are optional; when absent we fall back to unauthenticated pulls.
+if [[ -n "${DOCKERHUB_AMD_USERNAME:-}" && -n "${DOCKERHUB_AMD_TOKEN:-}" ]]; then
+  echo "Logging in to Docker Hub…"
+  if retry_with_backoff 6 sh -c 'echo "${DOCKERHUB_AMD_TOKEN}" | docker login -u "${DOCKERHUB_AMD_USERNAME}" --password-stdin >/dev/null 2>&1'; then
+    echo "Docker Hub login successful"
+  else
+    echo "Warning: Docker Hub login failed after retries; continuing with unauthenticated pulls" >&2
+  fi
+fi
 
 # Find the latest image
 find_latest_image() {
   local gpu_arch=$1
-  local base_tag days_back image_tag
+  local base_tag days_back image_tag image_id remote_tags
 
   case "${gpu_arch}" in
       mi30x) base_tag="${MI30X_BASE_TAG}" ;;
@@ -108,19 +143,26 @@ find_latest_image() {
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
 
-  # First, check local cache
+  # First, check local cache on the runner.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
-    local local_image="rocm/sgl-dev:${image_tag}"
-    image_id=$(docker images -q "${local_image}")
+    image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
     if [[ -n "$image_id" ]]; then
-        echo "Found cached image locally: ${local_image}" >&2
-        echo "${local_image}"
-        return 0
+      echo "Found cached image locally: rocm/sgl-dev:${image_tag}" >&2
+      echo "rocm/sgl-dev:${image_tag}"
+      return 0
     fi
   done
 
-  # If not found locally, fall back to pulling from public registry
+  # If not found locally, fall back to pulling from public registry.
+  # We intentionally do not probe ${LOCAL_DOCKER_REGISTRY} here with
+  # `docker manifest inspect --insecure` because that command runs in the
+  # runner pod's network namespace, which on every observed AMD scale set
+  # cannot reach 10.245.143.50:5000 (every probe either fast-fails with TLS
+  # reject or hits a 30s TCP timeout, multiplied across 7 daily candidates).
+  # The actual local-registry pull still happens in the call site below via
+  # `docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"`, which goes through the
+  # docker daemon on the host and inherits its insecure-registries config.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
@@ -135,7 +177,7 @@ find_latest_image() {
   echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch} image…" >&2
   for days_back in {0..6}; do
     local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
-    local remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1)
+    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1 || true)
     if [[ -n "$remote_tags" ]]; then
       echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
       echo "rocm/sgl-dev:${remote_tags}"
@@ -181,7 +223,11 @@ if [[ -n "${CUSTOM_IMAGE}" ]]; then
   # Use explicitly provided custom image
   IMAGE="${CUSTOM_IMAGE}"
   echo "Using custom image: ${IMAGE}"
-  docker pull "${IMAGE}"
+  if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
+    docker pull "${IMAGE}"
+  else
+    retry_with_backoff 6 docker pull "${IMAGE}"
+  fi
 elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
   # Build image from Dockerfile
   if [[ -z "${GPU_ARCH_BUILD}" ]]; then
@@ -211,11 +257,23 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
 else
   # Find the latest pre-built image
   IMAGE=$(find_latest_image "${GPU_ARCH}")
-  echo "Pulling Docker image: ${IMAGE}"
-  docker pull "${IMAGE}"
+  # Try the local docker registry first (avoids Docker Hub rate limits and is
+  # faster on the LAN); if that fails for any reason, fall back to the
+  # public registry with exponential-backoff retries. Capture stderr so the
+  # real failure reason (TLS handshake, 404, connection refused, etc.) is
+  # visible in the job log instead of being silently swallowed.
+  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+  else
+    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
+    retry_with_backoff 6 docker pull "${IMAGE}"
+  fi
 fi
 
-CACHE_HOST=/home/runner/sgl-data
+# CACHE_HOST=/home/runner/sgl-data
+CACHE_HOST=/home/runner/sglang-data
 if [[ -d "$CACHE_HOST" ]]; then
     CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
 else

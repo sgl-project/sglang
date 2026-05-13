@@ -46,7 +46,7 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
-  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == 'true' }}
 
 jobs:
@@ -117,7 +117,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -129,6 +129,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
           PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
+          SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
@@ -145,6 +146,15 @@ jobs:
           name: diffusion-report-1gpu-${{ matrix.part }}
           path: python/sglang/multimodal_gen/test/execution_report_*.json
           retention-days: 1
+
+      - name: Upload diffusion failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-failures-1gpu-${{ matrix.part }}-${{ github.run_attempt }}
+          path: diffusion-failures/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -186,7 +196,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -199,6 +209,7 @@ jobs:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
           PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
+          SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
@@ -215,6 +226,15 @@ jobs:
           name: diffusion-report-2gpu-${{ matrix.part }}
           path: python/sglang/multimodal_gen/test/execution_report_*.json
           retention-days: 1
+
+      - name: Upload diffusion failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-failures-2gpu-${{ matrix.part }}-${{ github.run_attempt }}
+          path: diffusion-failures/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -251,7 +271,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -300,7 +320,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -312,11 +332,20 @@ jobs:
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-gpu-b200 \
             $CONTINUE_ON_ERROR_FLAG
+
+      - name: Upload diffusion failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-failures-${{ github.job }}-${{ github.run_attempt }}
+          path: diffusion-failures/
+          if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -347,7 +376,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
