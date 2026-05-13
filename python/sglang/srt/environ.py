@@ -406,6 +406,7 @@ class Envs:
 
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
+    SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
 
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
@@ -519,6 +520,9 @@ class Envs:
 
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
+    # too short when many workers cold-start and load tokenizers in parallel.
+    SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
 
     # HTTP/2 Server
     SGLANG_GRANIAN_PARENT_PID = EnvInt(None)
@@ -611,7 +615,7 @@ class Envs:
 
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
-
+    SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)

@@ -6,6 +6,7 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_STANDALONE,
@@ -204,6 +205,10 @@ class TestStandaloneV2SpeculativeDecodingTriton(
     @classmethod
     def get_server_args(cls):
         return DEFAULT_SERVER_ARGS_V2 + ["--attention-backend", "triton"]
+
+    def test_radix_attention(self):
+        run_radix_attention_test(self.base_url)
+        assert self.process.poll() is None
 
 
 class TestStandaloneV2SpeculativeDecodingFlashinfer(
