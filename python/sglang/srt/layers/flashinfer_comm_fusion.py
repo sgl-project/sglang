@@ -26,6 +26,7 @@ from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
     is_flashinfer_available,
+    is_sm100_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -41,30 +42,14 @@ _posix_transport_override_logged = False
 _mnnvl_non_blackwell_fallback_logged = False
 
 
-def _is_blackwell_system() -> bool:
-    """Return True on Blackwell GPUs (SM10x).
-
-    MNNVL allreduce fusion is only validated on Blackwell; on every other
-    platform we fall back to the TRT-LLM backend.
-    """
-    if not torch.cuda.is_available():
-        return False
-    try:
-        major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-    except Exception as e:
-        logger.debug("Failed to get CUDA device capability: %s", e)
-        return False
-    return major == 10
-
-
 def _resolve_backend(backend: str) -> str:
-    """Force any auto/mnnvl selection back to trtllm when not on a Blackwell system.
+    """Force any auto/mnnvl selection back to trtllm when not on SM100.
 
-    MNNVL is only enabled on Blackwell GPUs where it has been validated;
+    MNNVL is only enabled on Blackwell GPUs (SM10x) where it has been validated;
     elsewhere we use TRT-LLM unconditionally.
     """
     global _mnnvl_non_blackwell_fallback_logged
-    if backend in ("auto", "mnnvl") and not _is_blackwell_system():
+    if backend in ("auto", "mnnvl") and not is_sm100_supported():
         if not _mnnvl_non_blackwell_fallback_logged:
             logger.info(
                 "FlashInfer allreduce fusion: forcing trtllm backend "
@@ -87,7 +72,7 @@ def flashinfer_mnnvl_allreduce_fusion_enabled(server_args) -> bool:
     if backend is None:
         return False
     return _resolve_backend(backend) == "mnnvl" or (
-        backend == "auto" and _is_blackwell_system()
+        backend == "auto" and is_sm100_supported()
     )
 
 
