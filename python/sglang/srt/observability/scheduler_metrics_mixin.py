@@ -105,11 +105,11 @@ class SchedulerMetricsMixin:
         }.get(getattr(self, "device", ""), "cuda graph")
 
         # Cumulative spec-decoding counters (reset every decode_log_interval).
-        # Each update adds (num_accepted_drafts + bs, bs).
-        # `*_accepted_tokens` = drafts + bonus; `*_accepted_drafts` = drafts-only.
-        self.spec_num_accepted_tokens = 0  # per-log-interval
+        # Each update adds (num_correct_drafts + bs, bs).
+        # `*_accept_tokens` = drafts + bonus; `*_correct_drafts` = drafts-only.
+        self.spec_num_accept_tokens = 0  # per-log-interval
         self.spec_num_forward_ct = 0
-        self.spec_total_num_accepted_tokens = 0  # lifetime
+        self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
 
         # For PD disaggregation
@@ -157,11 +157,12 @@ class SchedulerMetricsMixin:
                 self._mfu_log_read_bytes = 0.0
                 self._mfu_log_write_bytes = 0.0
 
+        self.fwd_occupancy = float("nan")
+
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self._device_timer_window_gpu_time = 0.0
             self._device_timer_window_start = None
-            self.fwd_occupancy = float("nan")
 
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
@@ -178,6 +179,19 @@ class SchedulerMetricsMixin:
             enable_metrics=self.enable_metrics
         )
 
+    def install_device_timer_on_runners(self: Scheduler):
+        if not hasattr(self, "forward_pass_device_timer"):
+            return
+        timer = self.forward_pass_device_timer
+        self.tp_worker.model_runner.device_timer = timer
+        if self.draft_worker is not None:
+            dw = getattr(self.draft_worker, "draft_worker", None)
+            if dw is not None:
+                if hasattr(dw, "draft_runner"):
+                    dw.draft_runner.device_timer = timer
+                for r in getattr(dw, "draft_runner_list", []):
+                    r.device_timer = timer
+
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         self.enable_kv_cache_events = bool(
             kv_events_config and self.attn_tp_rank == 0 and self.attn_cp_rank == 0
@@ -188,12 +202,12 @@ class SchedulerMetricsMixin:
                 kv_events_config, self.attn_dp_rank
             )
 
-    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_drafts: int):
-        self.spec_num_accepted_tokens += num_accepted_drafts + bs
+    def update_spec_metrics(self: Scheduler, bs: int, num_correct_drafts: int):
+        self.spec_num_accept_tokens += num_correct_drafts + bs
         self.spec_num_forward_ct += bs
 
         # Bonus tokens updated elsewhere
-        self.num_generated_tokens += num_accepted_drafts
+        self.num_generated_tokens += num_correct_drafts
 
     def _init_estimated_perf_constants(self: Scheduler) -> None:
         model_config = self.model_config
@@ -331,13 +345,14 @@ class SchedulerMetricsMixin:
     def reset_metrics(self: Scheduler):
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
-        self.spec_num_accepted_tokens = 0
+        self.spec_num_accept_tokens = 0
         self.spec_num_forward_ct = 0
-        self.spec_total_num_accepted_tokens = 0
+        self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
 
     def report_prefill_stats(
         self: Scheduler,
+        batch: Optional[ScheduleBatch],
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
@@ -359,7 +374,12 @@ class SchedulerMetricsMixin:
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
-        iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
+        batch_iter = (
+            batch.forward_iter
+            if batch is not None and batch.forward_iter is not None
+            else self.forward_ct
+        )
+        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
         msg = (
             f"Prefill batch{iter_msg}, "
@@ -373,7 +393,7 @@ class SchedulerMetricsMixin:
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
+            msg += f"#bootstrap-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             msg += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
 
         if (
@@ -438,7 +458,7 @@ class SchedulerMetricsMixin:
 
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+                self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                     self.disagg_prefill_bootstrap_queue.queue, priority_enabled
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
@@ -456,6 +476,7 @@ class SchedulerMetricsMixin:
 
             # Utilization / LoRA / HiCache
             self.calculate_utilization()
+            self.stats.fwd_occupancy = self.fwd_occupancy
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
@@ -466,13 +487,13 @@ class SchedulerMetricsMixin:
         self: Scheduler,
         can_run_cuda_graph: bool,
         running_batch: ScheduleBatch = None,
-        num_accepted_drafts: int = 0,
+        num_correct_drafts: int = 0,
     ):
         batch = running_batch or self.running_batch
 
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
-            decode_tokens = batch.batch_size() + num_accepted_drafts
+            decode_tokens = batch.batch_size() + num_correct_drafts
             self.metrics_collector.increment_realtime_tokens(
                 # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
                 decode_tokens=decode_tokens,
@@ -518,32 +539,31 @@ class SchedulerMetricsMixin:
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
+        batch_iter = (
+            batch.forward_iter
+            if batch is not None and batch.forward_iter is not None
+            else self.forward_ct
+        )
+        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
             spec_accept_rate = 0
         else:
-            spec_accept_length = (
-                self.spec_num_accepted_tokens / self.spec_num_forward_ct
-            )
-            num_accepted_drafts = (
-                self.spec_num_accepted_tokens - self.spec_num_forward_ct
-            )
+            spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
+            num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
             if self.server_args.speculative_num_draft_tokens:
                 draft_per_round = self.server_args.speculative_num_draft_tokens - 1
             else:
                 draft_per_round = self.server_args.speculative_num_steps or 0
             total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             spec_accept_rate = (
-                num_accepted_drafts / total_draft_tokens
-                if total_draft_tokens > 0
-                else 0
+                num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
             )
-            self.spec_total_num_accepted_tokens += self.spec_num_accepted_tokens
+            self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
-            self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
+            self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
         cache_hit_rate = 0.0
 
@@ -615,7 +635,7 @@ class SchedulerMetricsMixin:
 
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+                self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                     self.disagg_prefill_bootstrap_queue.queue, priority_enabled
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
@@ -648,6 +668,7 @@ class SchedulerMetricsMixin:
 
             # Utilization / LoRA / HiCache
             self.calculate_utilization()
+            self.stats.fwd_occupancy = self.fwd_occupancy
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
@@ -843,7 +864,7 @@ class SchedulerMetricsMixin:
             if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
                 speculative = SpeculativeMetrics(
                     accept_length=(
-                        self.spec_total_num_accepted_tokens
+                        self.spec_total_num_accept_tokens
                         / self.spec_total_num_forward_ct
                     ),
                     accept_rate=self.stats.spec_accept_rate,
@@ -861,7 +882,7 @@ class SchedulerMetricsMixin:
         disaggregation = None
         if include_all or "disagg" in include:
             mode_str = "null"
-            prefill_prealloc = 0
+            prefill_bootstrap = 0
             prefill_inflight = 0
             decode_prealloc = 0
             decode_transfer = 0
@@ -869,7 +890,7 @@ class SchedulerMetricsMixin:
 
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 mode_str = "prefill"
-                prefill_prealloc = len(self.disagg_prefill_bootstrap_queue.queue)
+                prefill_bootstrap = len(self.disagg_prefill_bootstrap_queue.queue)
                 prefill_inflight = len(self.disagg_prefill_inflight_queue)
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 mode_str = "decode"
@@ -881,7 +902,7 @@ class SchedulerMetricsMixin:
 
             disaggregation = DisaggregationMetrics(
                 mode=mode_str,
-                prefill_prealloc_queue_reqs=prefill_prealloc,
+                prefill_bootstrap_queue_reqs=prefill_bootstrap,
                 prefill_inflight_queue_reqs=prefill_inflight,
                 decode_prealloc_queue_reqs=decode_prealloc,
                 decode_transfer_queue_reqs=decode_transfer,
@@ -946,3 +967,4 @@ class SchedulerMetricsMixin:
     def reset_device_timer_window(self: Scheduler):
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
+            self.fwd_occupancy = float("nan")

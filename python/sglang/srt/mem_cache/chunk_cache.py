@@ -19,6 +19,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hisparse_memory_pool import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 
 if TYPE_CHECKING:
@@ -110,7 +113,14 @@ class SWAChunkCache(ChunkCache):
     """ChunkCache with support for sliding window attention."""
 
     def __init__(self, params: CacheInitParams):
-        assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+        # DeepSeek V4 HiSparse wraps SWATokenToKVPoolAllocator and exposes the same API.
+        assert isinstance(
+            params.token_to_kv_pool_allocator,
+            (
+                SWATokenToKVPoolAllocator,
+                DeepSeekV4HiSparseTokenToKVPoolAllocator,
+            ),
+        )
         super().__init__(params)
 
         self.sliding_window_size = params.sliding_window_size

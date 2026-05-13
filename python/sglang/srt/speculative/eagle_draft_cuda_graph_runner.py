@@ -130,8 +130,8 @@ class EAGLEDraftCudaGraphRunner:
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             hidden_states = torch.zeros(
-                (self.max_bs, self.model_runner.model_config.spec_hidden_size),
-                dtype=self.model_runner.dtype,
+                (self.max_bs, EagleDraftInput.hidden_size_for(self.eagle_worker)),
+                dtype=EagleDraftInput.dtype_for(self.eagle_worker),
             )
 
             if self.require_gathered_buffer:
@@ -211,6 +211,13 @@ class EAGLEDraftCudaGraphRunner:
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
             run_once_fn()
+            hook = getattr(
+                self.model_runner.draft_attn_backend,
+                "on_after_cuda_graph_warmup",
+                None,
+            )
+            if hook is not None:
+                hook()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         with torch.cuda.graph(graph, pool=pool, stream=stream):
