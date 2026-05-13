@@ -263,12 +263,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
+        skip_init_workspace_buffer: bool = False,
     ):
         super().__init__(
             model_runner,
             skip_prefill,
             kv_indptr_buf,
             q_indptr_decode_buf,
+            skip_init_workspace_buffer=skip_init_workspace_buffer,
         )
 
         config = model_runner.model_config
@@ -294,14 +296,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        global global_zero_init_workspace_buffer
-        if global_zero_init_workspace_buffer is None:
-            global_zero_init_workspace_buffer = torch.zeros(
-                self.workspace_size,
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
-        self.workspace_buffer = global_zero_init_workspace_buffer
+        if skip_init_workspace_buffer:
+            self.workspace_buffer = None
+        else:
+            global global_zero_init_workspace_buffer
+            if global_zero_init_workspace_buffer is None:
+                global_zero_init_workspace_buffer = torch.zeros(
+                    self.workspace_size,
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+            self.workspace_buffer = global_zero_init_workspace_buffer
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
