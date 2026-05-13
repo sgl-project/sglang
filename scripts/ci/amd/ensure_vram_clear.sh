@@ -160,9 +160,49 @@ ensure_vram_clear() {
     local max_retries=3
     local retry_count=0
 
-    # Log host information for debugging
+    # Log host information for debugging.
+    #
+    # `hostname` inside a K8s-managed runner pod returns the *pod* name (e.g.
+    # linux-mi325-4gpu-sglang-gn9lt-runner-h78qs), which is ephemeral and
+    # changes every run, so it can't be used to identify the underlying
+    # physical machine when triaging flaky/bad nodes. The real host is the
+    # K8s node the pod was scheduled onto (pod.spec.nodeName).
+    #
+    # Resolution order:
+    #   1. $NODE_NAME / $KUBE_NODE_NAME — set if the runner pod template
+    #      injects spec.nodeName via the Downward API (preferred long-term).
+    #   2. Self-lookup against the in-pod K8s API using the mounted
+    #      ServiceAccount token. Works without any pod-spec changes as long
+    #      as the SA has `get` on pods in its own namespace.
+    # Both are best-effort; if neither works we just print "<unknown>".
+    local k8s_node="${NODE_NAME:-${KUBE_NODE_NAME:-}}"
+    if [ -z "$k8s_node" ] && [ -r /var/run/secrets/kubernetes.io/serviceaccount/token ] \
+       && command -v curl >/dev/null 2>&1; then
+        local sa_dir=/var/run/secrets/kubernetes.io/serviceaccount
+        local kube_ns kube_host kube_port pod_name api_resp
+        kube_ns=$(cat "$sa_dir/namespace" 2>/dev/null || echo "")
+        kube_host="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+        kube_port="${KUBERNETES_SERVICE_PORT:-443}"
+        pod_name=$(hostname)
+        if [ -n "$kube_ns" ] && [ -n "$pod_name" ]; then
+            api_resp=$(curl -sS --max-time 5 \
+                --cacert "$sa_dir/ca.crt" \
+                -H "Authorization: Bearer $(cat "$sa_dir/token")" \
+                "https://${kube_host}:${kube_port}/api/v1/namespaces/${kube_ns}/pods/${pod_name}" \
+                2>/dev/null || true)
+            # Extract spec.nodeName without depending on jq/python being on
+            # the host. The first nodeName field in the pod object is the
+            # one we want.
+            k8s_node=$(echo "$api_resp" \
+                | grep -oE '"nodeName"[[:space:]]*:[[:space:]]*"[^"]+"' \
+                | head -n1 \
+                | sed -E 's/.*"nodeName"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+        fi
+    fi
+
     echo "=== Host Information ==="
-    echo "Hostname: $(hostname)"
+    echo "Pod hostname (ephemeral): $(hostname)"
+    echo "K8s node (real host): ${k8s_node:-<unknown>}"
     echo "Host IP: $(hostname -I 2>/dev/null || echo 'N/A')"
     echo "Date: $(date)"
     echo "Mode: rocm"
