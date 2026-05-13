@@ -757,6 +757,14 @@ class Req(ReqDllmMixin):
         # processed.
         self.is_chunked = 0
 
+        # Persistent (cross-iter) flag set by admission when this req's
+        # current admission was truncated (more chunks remain). Cleared
+        # when last chunk is admitted (truncated=False) or on retract.
+        # Used by Stage A stash detection, filter_batch exclusion, and
+        # add_one_req's reuse-vs-fresh branch. Independent of is_chunked
+        # counter (transient) and kv_committed_len (derived).
+        self.has_pending_chunk = False
+
         # For retraction
         self.is_retracted = False
         # Indicates if the req has ever been retracted.
@@ -1258,6 +1266,7 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
+        self.has_pending_chunk = False
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -1835,6 +1844,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.cached_tokens_host = host_portion
                     req.cached_tokens_storage = storage_portion
                     req._cache_breakdown_computed = True
+                    # Reset host_hit_length after metric is computed so that
+                    # subsequent chunks' admission paths see host_hit_length == 0
+                    # and naturally skip init_load_back (host KV already loaded).
+                    req.host_hit_length = 0
 
                 req.already_computed = seq_len
             req.is_retracted = False

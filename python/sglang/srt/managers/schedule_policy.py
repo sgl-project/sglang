@@ -441,7 +441,6 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
-        self.new_chunked_req = None
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
@@ -663,41 +662,6 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
-        if self.dllm_config is not None:
-            _rem_tokens = self._get_dllm_remain_tokens()
-        else:
-            _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-            if self.is_hybrid_swa:
-                # alloc_extend needs extend_num_tokens + page_size per request,
-                # so reserve one page here to avoid OOM
-                _rem_tokens = min(
-                    _rem_tokens, int(self.rem_swa_tokens) - self.page_size
-                )
-            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
-            # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
-            if _rem_tokens <= 0:
-                if self.is_hybrid_swa:
-                    return req
-                _rem_tokens = self.rem_chunk_tokens
-
-        truncated = req.extend_input_len > _rem_tokens
-        req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
-        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
-        self.can_run_list.append(req)
-        self._update_prefill_budget(
-            0,
-            req.extend_input_len,
-            (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if not truncated
-                else 0
-            ),
-        )
-
-        # Return if chunked prefill not finished
-        return req if truncated else None
-
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
         dec_lock_params = None
@@ -784,6 +748,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             self._add_dllm_req(req, 0)
+            truncated = False
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
@@ -795,6 +760,7 @@ class PrefillAdder:
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
+            truncated = False
         else:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
@@ -805,14 +771,24 @@ class PrefillAdder:
             req.set_extend_input_len(trunc_len)
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
-            self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0)
+            truncated = True
+
+        if not req.is_dllm():
+            req.has_pending_chunk = truncated
 
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self, req: Req, truncation_align_size: Optional[int]
     ):
+        # Reuse path: this req was admitted in a previous iter, has a row
+        # with committed KV (kv_committed_len > 0), and is mid-prefill. Skip
+        # fresh-req setup (lock_ref already held by previous stash;
+        # init_load_back already ran on first admission; prefix already
+        # counted in tree). DLLM has its own path and never takes reuse here.
+        is_resume = req.kv_committed_len > 0 and not req.is_dllm()
+
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
@@ -874,6 +850,10 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
+            # Fresh-only init_load_back. For reuse, host_hit_length was set
+            # on first admission and reset by prepare_for_extend after the
+            # cache-breakdown metric was computed, so the predicate naturally
+            # short-circuits here for reuse.
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
@@ -892,6 +872,10 @@ class PrefillAdder:
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
+            # Budget prefix_len: 0 for reuse (already counted by previous
+            # admission's stash into tree); actual prefix_len for fresh.
+            budget_prefix = 0 if is_resume else prefix_len
+
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
@@ -902,20 +886,24 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
+                truncated = False
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill
+                # Non-chunked prefill (or last chunk of a chunked-resume req).
                 self.can_run_list.append(req)
 
-                self._req_inc_lock_ref(req)
+                if not is_resume:
+                    self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
-                    prefix_len,
+                    budget_prefix,
                     input_tokens,
                     min(
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
                     ),
                 )
+                truncated = False
             else:
+                # Chunked prefill: this admission doesn't complete the prefill.
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
@@ -940,15 +928,20 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
-                # Chunked prefill
                 req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
 
-                self._req_inc_lock_ref(req)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
+                if not is_resume:
+                    self._req_inc_lock_ref(req)
+                self._update_prefill_budget(budget_prefix, trunc_len, 0)
+                truncated = True
+
+        # has_pending_chunk: persistent flag carrying chunked-resume state
+        # across iters. DLLM uses its own staging_queue + is_chunked counter.
+        if not req.is_dllm():
+            req.has_pending_chunk = truncated
 
         return self.budget_state()
 

@@ -2698,12 +2698,23 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
+        # Re-admit the in-flight chunked req via the unified add_one_req
+        # entry. add_one_req's reuse branch (gated on kv_committed_len > 0)
+        # mirrors the old add_chunked_req's behavior: skip lock_ref inc,
+        # init_load_back, and prefix budget. Sets req.has_pending_chunk to
+        # truncated.
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
-            self._chunked_req_scheduled_last_iter = (
-                self.chunked_req in adder.can_run_list
+            adder.add_one_req(
+                self.chunked_req,
+                truncation_align_size=self.truncation_align_size,
             )
+            # After admit, has_pending_chunk reflects whether more chunks
+            # remain. Mirror it into self.chunked_req for the existing
+            # Stage A stash path (deleted in a later commit).
+            if not self.chunked_req.has_pending_chunk:
+                self.chunked_req = None
+            self._chunked_req_scheduled_last_iter = self.chunked_req is not None
         else:
             self._chunked_req_scheduled_last_iter = False
 
@@ -2750,7 +2761,6 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
 
@@ -2793,12 +2803,20 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        if adder.new_chunked_req is not None:
-            # Update chunked prefill
+        # Identify newly-truncated chunked-resume reqs admitted this iter via
+        # add_one_req's reuse/chunked branch. has_pending_chunk is set by
+        # add_one_req when truncated=True. The "newly chunked" set excludes
+        # self.chunked_req which was already tracked from previous iter.
+        new_chunked = [
+            r for r in can_run_list if r.has_pending_chunk and r is not self.chunked_req
+        ]
+        assert (
+            len(new_chunked) <= 1
+        ), "single-flight invariant: at most one new chunked req per iter"
+        if new_chunked:
             assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
-            # new_chunked_req is added to can_run_list by add_one_req,
-            # so it will be scheduled this iter -> stash is needed next iter.
+            self.chunked_req = new_chunked[0]
+            # The chunked req is scheduled this iter -> stash needed next iter.
             self._chunked_req_scheduled_last_iter = True
 
         if self.chunked_req is not None:
