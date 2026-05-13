@@ -73,6 +73,7 @@ class HiSparseCoordinator:
                 self.mem_pool_host.kv_cache_total_dim
                 * self.mem_pool_host.dtype.itemsize
             )
+            self.page_size = self.mem_pool_host.page_size
         else:
             assert isinstance(
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
@@ -84,11 +85,12 @@ class HiSparseCoordinator:
                 device_pool=self.mem_pool_device,
                 host_to_device_ratio=host_to_device_ratio,
                 host_size=0,
-                page_size=1,
+                page_size=self.mem_pool_device.page_size,
                 layout="layer_first",
                 override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
+            self.page_size = self.mem_pool_host.page_size
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -110,7 +112,7 @@ class HiSparseCoordinator:
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
         self.req_to_host_pool = torch.full(
-            (max_num_req_slots, max_compressed_context_len),
+            (max_num_req_slots, max_compressed_context_len + self.page_size),
             -1,
             dtype=torch.int64,
             device=device,
@@ -167,6 +169,72 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
 
+    def _round_up_to_host_page(self, size: int) -> int:
+        return (size + self.page_size - 1) // self.page_size * self.page_size
+
+    def ensure_host_slots(
+        self,
+        req_pool_idx: int,
+        start_pos: int,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Ensure token-position host slots, backed by page-granular allocation."""
+        if num_tokens <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        page_start = (start_pos // self.page_size) * self.page_size
+        page_end = self._round_up_to_host_page(start_pos + num_tokens)
+
+        page_starts = torch.arange(
+            page_start,
+            page_end,
+            self.page_size,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        page_is_missing = self.req_to_host_pool[req_pool_idx, page_starts] < 0
+        num_missing_pages = int(page_is_missing.sum().item())
+
+        if num_missing_pages > 0:
+            host_locs = self.mem_pool_host.alloc(num_missing_pages * self.page_size)
+            if host_locs is None:
+                logger.error(
+                    "HiSparse: host mem pool alloc failed for %d host pages "
+                    "(req_pool_idx=%d, start_pos=%d, num_tokens=%d)",
+                    num_missing_pages,
+                    req_pool_idx,
+                    start_pos,
+                    num_tokens,
+                )
+                raise RuntimeError(
+                    f"HiSparse host mem pool alloc failed for {num_missing_pages} pages"
+                )
+            host_locs = host_locs.to(device=self.device)
+            if num_missing_pages == page_starts.numel():
+                self.req_to_host_pool[req_pool_idx, page_start:page_end] = host_locs
+            else:
+                missing_page_starts = page_starts[page_is_missing]
+                offsets = torch.arange(
+                    self.page_size, dtype=torch.int64, device=self.device
+                )
+                missing_indices = (
+                    missing_page_starts[:, None] + offsets[None, :]
+                ).reshape(-1)
+                self.req_to_host_pool[req_pool_idx, missing_indices] = host_locs
+
+        return self.req_to_host_pool[req_pool_idx, start_pos : start_pos + num_tokens]
+
+    def _allocated_host_indices(self, req: Req) -> torch.Tensor:
+        allocated_len = req.kv_allocated_len
+        if self.is_dsv4_hisparse:
+            allocated_len = allocated_len // self.compress_ratio
+        host_len = min(
+            self._round_up_to_host_page(allocated_len),
+            self.req_to_host_pool.shape[1],
+        )
+        host_indices = self.req_to_host_pool[req.req_pool_idx, :host_len]
+        return host_indices[host_indices >= 0]
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
@@ -200,18 +268,7 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
-        host_indices = self.mem_pool_host.alloc(prefill_len)
-        if host_indices is None:
-            logger.error(
-                "HiSparse: host mem pool alloc failed for %d tokens (req %s)",
-                prefill_len,
-                req.rid,
-            )
-            raise RuntimeError(
-                f"HiSparse host mem pool alloc failed for {prefill_len} tokens"
-            )
-        host_indices = host_indices.to(device=self.device)
-        self.req_to_host_pool[req.req_pool_idx, :prefill_len] = host_indices
+        host_indices = self.ensure_host_slots(req.req_pool_idx, 0, prefill_len)
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -549,17 +606,16 @@ class HiSparseCoordinator:
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
-        host_locs = self.mem_pool_host.alloc(len(device_locs))
-        if host_locs is None:
-            logger.error(
-                "HiSparse: host mem pool alloc failed for %d decode backup tokens",
-                len(device_locs),
-            )
-            raise RuntimeError(
-                f"HiSparse host mem pool alloc failed for {len(device_locs)} decode backup tokens"
-            )
-        host_locs = host_locs.to(device=self.device)
-        self.req_to_host_pool[backup_req_indices, actual_compressed_pos] = host_locs
+        host_locs = torch.cat(
+            [
+                self.ensure_host_slots(
+                    int(req_pool_indices_cpu[i]),
+                    int(actual_compressed_pos[j].item()),
+                    1,
+                )
+                for j, i in enumerate(backup_indices)
+            ]
+        )
 
         self.wait_for_pending_backup()
         schedule_stream = device_module.current_stream()
@@ -702,9 +758,7 @@ class HiSparseCoordinator:
         self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
         # Free host memory that was allocated during admit_request_into_staging
-        compressed_len = prefill_len // self.compress_ratio
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :compressed_len]
-        host_indices = host_indices[host_indices >= 0]
+        host_indices = self._allocated_host_indices(req)
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
@@ -748,8 +802,7 @@ class HiSparseCoordinator:
         )
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
 
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :compressed_len]
-        host_indices = host_indices[host_indices >= 0]
+        host_indices = self._allocated_host_indices(req)
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
 
