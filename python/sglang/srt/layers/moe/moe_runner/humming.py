@@ -369,14 +369,11 @@ class HummingRunnerCore(MoeRunnerCore):
         return buffers
 
     def apply_activation(self, inputs: torch.Tensor, outputs: torch.Tensor):
+        if self.swiglu_limit is not None:
+            half = inputs.shape[-1] // 2
+            inputs[:, :half].clamp_(max=self.swiglu_limit)
+            inputs[:, half:].clamp_(min=-self.swiglu_limit, max=self.swiglu_limit)
         if self.activation == "silu":
-            if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-                from sglang.srt.layers.moe.moe_runner.deep_gemm import (
-                    _apply_swiglu_limit,
-                )
-
-                inputs = _apply_swiglu_limit(inputs, swiglu_limit=self.swiglu_limit)
-                deepseek_v4_moe_code_path_checker.observed += 1
             from sgl_kernel import silu_and_mul
 
             silu_and_mul(inputs, outputs)
