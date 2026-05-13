@@ -44,6 +44,16 @@ on:
         required: false
         type: string
         default: "false"
+      reply_comment_id:
+        description: "Reply comment ID to write back result to"
+        required: false
+        type: string
+        default: ""
+      reply_marker:
+        description: "Per-batch marker for locating the line in reply comment"
+        required: false
+        type: string
+        default: ""
 
 env:
   SGLANG_IS_IN_CI: true
@@ -62,6 +72,9 @@ jobs:
     if: inputs.is_cpu != 'true'
     runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
     env:
       RUNNER_LABELS: ${{ inputs.runner_label }}
       SGLANG_CI_RDMA_ALL_DEVICES: ${{ inputs.runner_label == '8-gpu-h20' && 'mlx5_1,mlx5_2,mlx5_3,mlx5_4' || '' }}
@@ -70,6 +83,21 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ inputs.runner_label }}" == "1-gpu-5090" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
+          python3 scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
 
       - uses: ./.github/actions/check-maintenance
 
@@ -133,6 +161,9 @@ jobs:
     if: inputs.is_cpu == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
     steps:
       - name: Free disk space
         run: |
@@ -143,6 +174,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
 
       - uses: ./.github/actions/check-maintenance
 
@@ -196,3 +239,37 @@ jobs:
           done
           total_elapsed=$(( SECONDS - suite_start ))
           echo "All $total test(s) passed in ${total_elapsed}s"
+
+  write-back-result:
+    needs: [rerun-test-cuda, rerun-test-cpu]
+    if: always() && inputs.reply_comment_id != '' && inputs.reply_marker != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    concurrency:
+      group: rerun-test-writeback-${{ inputs.reply_comment_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Write back result to reply comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ needs.rerun-test-cuda.result }}" == "success" || "${{ needs.rerun-test-cpu.result }}" == "success" ]]; then
+            STATUS=success
+          else
+            STATUS=failure
+          fi
+          python3 scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status "$STATUS" \
+            --repo "${{ github.repository }}"
