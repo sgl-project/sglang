@@ -140,6 +140,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
@@ -153,6 +154,8 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
+        if not forward_batch.forward_mode.is_extend() or self.is_draft_worker:
+            return
         if (
             forward_batch.mamba_clear_indices is not None
             and len(forward_batch.mamba_clear_indices) > 0

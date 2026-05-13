@@ -745,8 +745,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 model_worker_batch
             )
 
-            model_worker_batch.clear_deferred_mamba_ops()
-
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
             with self.draft_worker.draft_tp_context(

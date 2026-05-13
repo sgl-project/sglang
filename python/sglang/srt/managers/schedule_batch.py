@@ -1384,9 +1384,7 @@ def set_mamba_track_indices_from_reqs(batch):
 
     Works on both ScheduleBatch and ModelWorkerBatch.
     """
-    all_buffers = torch.stack(
-        [req.mamba_ping_pong_track_buffer for req in batch.reqs]
-    )
+    all_buffers = torch.stack([req.mamba_ping_pong_track_buffer for req in batch.reqs])
     idx = (
         torch.tensor(
             [req.mamba_next_track_idx for req in batch.reqs],
@@ -1450,12 +1448,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
     mamba_clear_indices: torch.Tensor = None
-
-    def clear_deferred_mamba_ops(self):
-        """Null out deferred mamba COW/clear indices after they have been consumed."""
-        self.mamba_clear_indices = None
-        self.mamba_cow_src_indices = None
-        self.mamba_cow_dst_indices = None
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -2920,9 +2912,3 @@ class ModelWorkerBatch:
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
-
-    def clear_deferred_mamba_ops(self):
-        """Null out deferred mamba COW/clear indices after they have been consumed."""
-        self.mamba_clear_indices = None
-        self.mamba_cow_src_indices = None
-        self.mamba_cow_dst_indices = None

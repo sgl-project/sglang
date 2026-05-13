@@ -179,18 +179,10 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
         # ScheduleBatch.prepare_for_decode returns early for spec v2,
-        # skipping the normal mamba tracking setup. Set them here so
-        # batch.copy() preserves them for _mamba_prefix_cache_update.
+        # skipping the normal mamba tracking setup. Set mamba_track_indices
+        # here so batch.copy() preserves them for _mamba_prefix_cache_update.
         if get_global_server_args().enable_mamba_extra_buffer():
             set_mamba_track_indices_from_reqs(batch)
-            batch.mamba_track_mask = (
-                (
-                    batch.seq_lens_cpu % get_global_server_args().mamba_track_interval
-                    == 0
-                )
-                .pin_memory()
-                .to(device=batch.device, non_blocking=True)
-            )
 
     def prepare_for_v2_draft(
         self: EagleDraftInput,
