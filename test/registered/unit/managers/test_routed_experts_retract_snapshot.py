@@ -1,0 +1,110 @@
+import unittest
+from unittest.mock import MagicMock, patch
+
+import torch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
+
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+
+
+def _make_req(
+    prefix=None,
+    snap_seqlen=0,
+    seqlen=None,
+    req_pool_idx=0,
+    start_len=0,
+):
+    req = MagicMock()
+    req._retract_routed_experts_prefix = prefix
+    req._retract_snapshot_seqlen = snap_seqlen
+    req.req_pool_idx = req_pool_idx
+    req.return_routed_experts = True
+    req.routed_experts_start_len = start_len
+    req.rid = "test-rid"
+    req.seqlen = seqlen if seqlen is not None else snap_seqlen
+    # batch_result_processor computes seqlen as
+    # len(origin_input_ids) + len(output_ids_through_stop)
+    req.origin_input_ids = [0] * (seqlen if seqlen is not None else snap_seqlen)
+    req.output_ids_through_stop = []
+    return req
+
+
+class TestMaybeCollectRoutedExpertsWithRetract(unittest.TestCase):
+    def _call(self, req, suffix):
+        processor = MagicMock(spec=SchedulerBatchResultProcessor)
+        processor.req_to_token_pool = MagicMock()
+        capturer = MagicMock()
+        capturer.get_topk.return_value = suffix
+        with patch(
+            "sglang.srt.managers.scheduler_components.batch_result_processor."
+            "get_global_experts_capturer",
+            return_value=capturer,
+        ):
+            SchedulerBatchResultProcessor._maybe_collect_routed_experts(processor, req)
+        return req.routed_experts
+
+    def test_no_prefix_returns_suffix(self):
+        suffix = torch.arange(12).reshape(4, 3)
+        req = _make_req(prefix=None, snap_seqlen=0, seqlen=5)
+        result = self._call(req, suffix)
+        self.assertTrue(torch.equal(result, suffix))
+
+    def test_prefix_only_when_suffix_none(self):
+        prefix = torch.arange(6).reshape(2, 3)
+        req = _make_req(prefix=prefix, snap_seqlen=3, seqlen=3)
+        result = self._call(req, None)
+        self.assertTrue(torch.equal(result, prefix))
+
+    def test_stitches_prefix_and_sliced_suffix(self):
+        prefix = torch.tensor([[0, 0, 0], [1, 1, 1]])
+        suffix = torch.tensor(
+            [
+                [0, 0, 0],
+                [1, 1, 1],
+                [2, 2, 2],
+                [3, 3, 3],
+                [4, 4, 4],
+            ]
+        )
+        # snapshot was taken at seqlen=3, so snap = 3 - 1 = 2 and tail = suffix[2:]
+        req = _make_req(prefix=prefix, snap_seqlen=3, seqlen=6)
+        result = self._call(req, suffix)
+        expected = torch.tensor(
+            [
+                [0, 0, 0],
+                [1, 1, 1],
+                [2, 2, 2],
+                [3, 3, 3],
+                [4, 4, 4],
+            ]
+        )
+        self.assertTrue(torch.equal(result, expected))
+
+    def test_snap_beyond_suffix_drops_tail(self):
+        prefix = torch.tensor([[7, 7, 7], [8, 8, 8]])
+        suffix = torch.tensor([[1, 1, 1]])
+        # snap_seqlen - 1 = 4 >= suffix.shape[0], so tail must be empty
+        req = _make_req(prefix=prefix, snap_seqlen=5, seqlen=6)
+        result = self._call(req, suffix)
+        self.assertTrue(torch.equal(result, prefix))
+
+    def test_snap_zero_keeps_full_suffix(self):
+        prefix = torch.tensor([[9, 9, 9]])
+        suffix = torch.tensor([[1, 1, 1], [2, 2, 2]])
+        # snap = max(0, 0 - 1) = 0, so tail = suffix[0:] which is the full suffix
+        req = _make_req(prefix=prefix, snap_seqlen=0, seqlen=3)
+        result = self._call(req, suffix)
+        expected = torch.cat([prefix, suffix], dim=0)
+        self.assertTrue(torch.equal(result, expected))
+
+
+if __name__ == "__main__":
+    unittest.main()
