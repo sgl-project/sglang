@@ -127,7 +127,7 @@ The following system-level tuning steps reduce OS interference and improve CPU s
     </tr>
     <tr>
       <td>`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`</td>
-      <td>Sets the maximum number of tokens that a single rank can dispatch in one DeepEP operation (hard upper limit: `1024`). Larger values accommodate more tokens per dispatch but increase buffer allocation overhead. For prefill, use a large value or unbounded (`0`) since many tokens are processed. For decode, set to match your expected tokens per iteration. Must satisfy: `max-running-requests * (1 + draft_tokens) &lt;= this value`.</td>
+      <td>Sets the maximum number of tokens that a single rank can dispatch in one DeepEP operation (hard upper limit: `1024`). Larger values accommodate more tokens per dispatch but increase buffer allocation overhead. For prefill, use a large value or unbounded (`0`) since many tokens are processed. For decode, set to match your expected tokens per iteration. Must satisfy: `max-running-requests * (1 + draft_tokens) <= this value`.</td>
       <td>Prefill: `0` (unbounded), Decode: `8`</td>
     </tr>
     <tr>
