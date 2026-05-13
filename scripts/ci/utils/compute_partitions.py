@@ -145,6 +145,19 @@ def main():
     else:
         print(payload)
 
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a") as f:
+            f.write("## Partitions\n\n")
+            f.write(
+                f"`full_parallel={args.full_parallel}` "
+                f"(`size//4` throttle is lifted when true)\n\n"
+            )
+            f.write("| Suite | size | max_parallel |\n")
+            f.write("|---|---:|---:|\n")
+            for suite, info in sorted(result.items()):
+                f.write(f"| `{suite}` | {info['size']} | {info['max_parallel']} |\n")
+
 
 if __name__ == "__main__":
     main()
