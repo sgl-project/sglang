@@ -2279,6 +2279,12 @@ class SafeUnpickler(pickle.Unpickler):
         "sglang.srt.model_executor.model_runner.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
+        "sglang.srt.observability.trace.",
+        # --- SGLang diffusion request types ---
+        "sglang.multimodal_gen.configs.sample.",
+        "sglang.multimodal_gen.configs.post_training.",
+        "sglang.multimodal_gen.runtime.entrypoints.utils.",
+        "sglang.multimodal_gen.runtime.pipelines_core.schedule_batch.",
         "torch_npu.",
     }
 

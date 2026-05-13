@@ -192,9 +192,9 @@ Role instances derive their result endpoint automatically from `--disagg-server-
 
 ## Transfer Mechanism
 
-Tensor data between roles (encoder→denoiser, denoiser→decoder) is transferred via a P2P transfer engine. The DiffusionServer only routes lightweight control messages (alloc/push/ready); actual tensor data flows directly between instances.
+Tensor data between roles (encoder→denoiser, denoiser→decoder) is transferred via a P2P transfer engine. The DiffusionServer only routes lightweight control messages; actual tensor data flows directly between instances.
 
-**mooncake-transfer-engine** is required for disaggregated diffusion. It provides RDMA for direct GPU-to-GPU data movement.
+For production cross-host deployment, install **mooncake-transfer-engine** and configure an RDMA-reachable hostname plus IB device. Same-host development and unit tests can use the local fallback path, but it is not intended to replace Mooncake/RDMA for cross-host serving.
 
 ```bash
 pip install mooncake-transfer-engine
@@ -206,7 +206,7 @@ pip install mooncake-transfer-engine
 2. **Sender** sends `transfer_staged` control message to DiffusionServer (metadata only, no tensor data).
 3. **DiffusionServer** sends `transfer_alloc` to receiver → receiver allocates buffer slot → replies `transfer_allocated`.
 4. **DiffusionServer** sends `transfer_push` to receiver with sender's address info.
-5. **Receiver** pulls data via transfer engine (Mooncake RDMA or mock), sends `transfer_ready`.
+5. **Receiver** pulls data via Mooncake/RDMA or uses the same-host local-copy fallback, then sends `transfer_ready`.
 6. **Receiver** loads tensors async on a dedicated transfer stream, overlapped with the previous request's compute.
 
 Decoder results (final output) flow back through DiffusionServer as raw ZMQ frames to the HTTP client.

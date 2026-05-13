@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Transfer engine abstraction for tensor transfer between role instances."""
 
+import ipaddress
 import logging
+import threading
 from abc import ABC, abstractmethod
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,41 @@ def _check_mooncake() -> bool:
         except ImportError:
             _MOONCAKE_AVAILABLE = False
     return _MOONCAKE_AVAILABLE
+
+
+def is_mooncake_available() -> bool:
+    return _check_mooncake()
+
+
+def _is_loopback_hostname(hostname: str) -> bool:
+    normalized = (hostname or "").strip().lower()
+    if normalized in {"", "127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}:
+        return True
+
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def resolve_transfer_backend(
+    configured_backend: Literal["auto", "mock", "mooncake"] = "auto",
+    *,
+    hostname: str = "127.0.0.1",
+    ib_device: str | None = None,
+) -> Literal["mock", "mooncake"]:
+    if configured_backend == "mock":
+        return "mock"
+    if configured_backend == "mooncake":
+        return "mooncake"
+    if ib_device:
+        return "mooncake"
+    if _is_loopback_hostname(hostname):
+        return "mock"
+    return "mooncake"
 
 
 class BaseTransferEngine(ABC):
@@ -110,17 +148,101 @@ class MooncakeDiffusionEngine(BaseTransferEngine):
         )
 
 
+class MockTransferEngine(BaseTransferEngine):
+    """Local/test fallback that simulates transfer with ctypes memmove.
+
+    Production cross-host deployments should use Mooncake/RDMA. The mock
+    backend keeps unit tests and same-host development usable when Mooncake is
+    not installed.
+    """
+
+    # Shared registry so mock instances can "see" each other's buffers
+    _registry: dict[str, dict[int, tuple[object, int]]] = {}
+    _lock = threading.Lock()
+    _counter = 0
+
+    def __init__(self, session_id: str | None = None):
+        with MockTransferEngine._lock:
+            if session_id is None:
+                MockTransferEngine._counter += 1
+                session_id = f"mock-session-{MockTransferEngine._counter}"
+            self._session_id = session_id
+            MockTransferEngine._registry[session_id] = {}
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    def register_buffer(self, ptr: int, length: int) -> None:
+        with MockTransferEngine._lock:
+            self._registry[self._session_id][ptr] = (None, length)
+
+    def deregister_buffer(self, ptr: int) -> None:
+        with MockTransferEngine._lock:
+            self._registry[self._session_id].pop(ptr, None)
+
+    def transfer_sync(
+        self, dst_session_id: str, src_addr: int, dst_addr: int, length: int
+    ) -> int:
+        import ctypes
+
+        try:
+            ctypes.memmove(dst_addr, src_addr, length)
+            return 0
+        except Exception as e:
+            logger.error("MockTransferEngine transfer failed: %s", e)
+            return -1
+
+    def batch_transfer_sync(
+        self,
+        dst_session_id: str,
+        src_addrs: list[int],
+        dst_addrs: list[int],
+        lengths: list[int],
+    ) -> int:
+        for src, dst, length in zip(src_addrs, dst_addrs, lengths):
+            ret = self.transfer_sync(dst_session_id, src, dst, length)
+            if ret != 0:
+                return ret
+        return 0
+
+    @classmethod
+    def reset(cls):
+        """Reset global registry (for test cleanup)."""
+        with cls._lock:
+            cls._registry.clear()
+            cls._counter = 0
+
+
 def create_transfer_engine(
     hostname: str = "127.0.0.1",
     gpu_id: int = 0,
     ib_device: str | None = None,
+    backend: Literal["auto", "mock", "mooncake"] = "auto",
+    force_mock: bool = False,
 ) -> BaseTransferEngine:
-    """Factory: returns MooncakeDiffusionEngine if mooncake is available."""
-    if not _check_mooncake():
-        raise RuntimeError(
-            "Mooncake transfer engine is required for disaggregated diffusion "
-            "but is not installed. Please install mooncake first."
+    """Factory: returns MooncakeDiffusionEngine if available, else MockTransferEngine."""
+    resolved_backend = (
+        "mock"
+        if force_mock
+        else resolve_transfer_backend(
+            backend,
+            hostname=hostname,
+            ib_device=ib_device,
         )
-    return MooncakeDiffusionEngine(
-        hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
     )
+    if resolved_backend == "mooncake":
+        if not _check_mooncake():
+            raise RuntimeError(
+                "Mooncake transfer backend was requested but mooncake-transfer-engine "
+                "is not available in this environment."
+            )
+        return MooncakeDiffusionEngine(
+            hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
+        )
+    logger.info(
+        "Using MockTransferEngine (backend=%s, force_mock=%s)",
+        resolved_backend,
+        force_mock,
+    )
+    return MockTransferEngine()

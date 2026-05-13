@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
+    SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
@@ -238,6 +239,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(
         "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
     ),
+    # Internal per-worker platform override used by disaggregated role launch.
+    # Empty means normal platform auto-detection.
+    "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
+        "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
+    ),
     # Enables torch profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.
     "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
@@ -250,6 +256,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # Optional override for diffusion disaggregation outbound send queue count.
+    # When unset, the runtime keeps the existing single-queue behavior.
+    "SGLANG_DIFFUSION_DISAGG_SEND_QUEUE_SIZE": _lazy_int(
+        "SGLANG_DIFFUSION_DISAGG_SEND_QUEUE_SIZE"
+    ),
+    # Optional override for diffusion disaggregation outbound transfer worker
+    # threads. When unset, the runtime falls back to the existing
+    # send_concurrency-derived worker count.
+    "SGLANG_DIFFUSION_DISAGG_SEND_THREAD_POOL_SIZE": _lazy_int(
+        "SGLANG_DIFFUSION_DISAGG_SEND_THREAD_POOL_SIZE"
+    ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_bool(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "true"
     ),

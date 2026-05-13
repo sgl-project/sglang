@@ -5,7 +5,7 @@ import asyncio
 import dataclasses
 import os
 import pickle
-import tempfile
+import shutil
 import time
 from collections import deque
 from contextlib import contextmanager
@@ -59,6 +59,7 @@ from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
+from sglang.multimodal_gen.runtime.warmup_utils import get_or_create_input_dir
 
 logger = init_logger(__name__)
 
@@ -156,14 +157,18 @@ class Scheduler(SchedulerDisaggMixin):
         # warmup progress tracking
         self._warmup_total = 0
         self._warmup_processed = 0
-
-        self.prepare_server_warmup_reqs()
+        self._warmup_temp_dirs: list[str] = []
 
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
         self._consecutive_error_count = 0
 
         self._init_disagg_state(server_args, local_rank)
+        if self._disagg_role != RoleType.MONOLITHIC:
+            self._run_disagg_startup_warmup(self.build_server_warmup_reqs())
+            self.warmed_up = True
+        else:
+            self.prepare_server_warmup_reqs()
 
         if self._batch_metrics_enabled:
             logger.info(
@@ -905,46 +910,55 @@ class Scheduler(SchedulerDisaggMixin):
         )
         return batch_items
 
-    def prepare_server_warmup_reqs(self):
+    def build_server_warmup_reqs(self) -> list[Req]:
         if (
-            self.server_args.warmup
-            and not self.warmed_up
-            and self.server_args.warmup_resolutions is not None
+            not self.server_args.warmup
+            or self.warmed_up
+            or self.server_args.warmup_resolutions is None
         ):
-            # insert warmup reqs constructed with each warmup-resolution
-            self._warmup_total = len(self.server_args.warmup_resolutions)
-            self._warmup_processed = 0
-            task_type = self.server_args.pipeline_config.task_type
+            return []
 
-            requires_warmup_image = task_type.accepts_image_input()
-            warmup_input_path = None
+        self._warmup_total = len(self.server_args.warmup_resolutions)
+        self._warmup_processed = 0
+        task_type = self.server_args.pipeline_config.task_type
+
+        requires_warmup_image = task_type.accepts_image_input()
+        warmup_input_path = None
+        if requires_warmup_image:
+            warmup_input_path = self._prepare_shared_warmup_image_path()
+
+        warmup_reqs: list[Req] = []
+        for resolution in self.server_args.warmup_resolutions:
+            width, height = _parse_size(resolution)
+
+            # CFG-parallel splits cond/uncond across ranks, so rank 1
+            # needs a real uncond pass. Force do_classifier_free_guidance
+            # + non-empty negative_prompt when cfg-parallel is on, so the
+            # synthesized warmup Req exercises both ranks' denoising paths.
+            # When cfg-parallel is off, the Req construction is
+            # byte-identical to the pre-fix behavior.
+            req_kwargs = dict(
+                data_type=task_type.data_type(),
+                width=width,
+                height=height,
+                prompt="",
+            )
             if requires_warmup_image:
-                warmup_input_path = self._prepare_shared_warmup_image_path()
+                req_kwargs["negative_prompt"] = ""
+                req_kwargs["image_path"] = [warmup_input_path]
+            if self.server_args.enable_cfg_parallel:
+                req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
+                req_kwargs["do_classifier_free_guidance"] = True
+            req = Req(**req_kwargs)
+            req.set_as_warmup(self.server_args.warmup_steps)
+            warmup_reqs.append(req)
+        return warmup_reqs
 
-            for resolution in self.server_args.warmup_resolutions:
-                width, height = _parse_size(resolution)
-
-                # CFG-parallel splits cond/uncond across ranks, so rank 1
-                # needs a real uncond pass. Force do_classifier_free_guidance
-                # + non-empty negative_prompt when cfg-parallel is on, so the
-                # synthesized warmup Req exercises both ranks' denoising paths.
-                # When cfg-parallel is off, the Req construction is
-                # byte-identical to the pre-fix behavior.
-                req_kwargs = dict(
-                    data_type=task_type.data_type(),
-                    width=width,
-                    height=height,
-                    prompt="",
-                )
-                if requires_warmup_image:
-                    req_kwargs["negative_prompt"] = ""
-                    req_kwargs["image_path"] = [warmup_input_path]
-                if self.server_args.enable_cfg_parallel:
-                    req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
-                    req_kwargs["do_classifier_free_guidance"] = True
-                req = Req(**req_kwargs)
-                req.set_as_warmup(self.server_args.warmup_steps)
-                self.waiting_queue.append((None, req, time.monotonic()))
+    def prepare_server_warmup_reqs(self):
+        warmup_reqs = self.build_server_warmup_reqs()
+        for req in warmup_reqs:
+            self.waiting_queue.append((None, req, time.monotonic()))
+        if warmup_reqs:
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
 
@@ -955,11 +969,9 @@ class Scheduler(SchedulerDisaggMixin):
         warmup_sync: dict[str, str | None]
         if world_group.rank == src_rank:
             try:
-                if self.server_args.input_save_path is not None:
-                    uploads_dir = self.server_args.input_save_path
-                    os.makedirs(uploads_dir, exist_ok=True)
-                else:
-                    uploads_dir = tempfile.mkdtemp(prefix="sglang_input_")
+                uploads_dir = get_or_create_input_dir(
+                    self.server_args, self._warmup_temp_dirs
+                )
                 warmup_image_base = os.path.join(uploads_dir, "warmup_image")
                 input_path = asyncio.run(
                     save_image_to_path(
@@ -994,6 +1006,11 @@ class Scheduler(SchedulerDisaggMixin):
             raise RuntimeError("Warmup image preparation returned empty input path")
 
         return input_path
+
+    def _cleanup_warmup_temp_dirs(self) -> None:
+        for temp_dir in self._warmup_temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        self._warmup_temp_dirs = []
 
     def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: List[tuple[bytes, Any]]
@@ -1203,6 +1220,7 @@ class Scheduler(SchedulerDisaggMixin):
 
         if self.receiver is not None:
             self.receiver.close()
+        self._cleanup_warmup_temp_dirs()
         self._cleanup_disagg()
         self.context.destroy(linger=0)
 

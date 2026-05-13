@@ -1104,6 +1104,7 @@
                 "group": "Diffusion Models",
                 "pages": [
                   "cookbook/diffusion/intro",
+                  "cookbook/diffusion/disaggregation",
                   {
                     "group": "FLUX",
                     "pages": [
