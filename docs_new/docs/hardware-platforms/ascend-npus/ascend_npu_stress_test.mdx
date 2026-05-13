@@ -6,6 +6,8 @@ metatags:
 
 This page walks through stress testing your SGLang deployment on Ascend NPUs. We cover three model types — text generation (`Qwen/Qwen2.5-7B-Instruct`), multimodal vision (`Qwen/Qwen2.5-VL-7B-Instruct`), and embedding (`Qwen/Qwen3-Embedding-8B`) — in both online and offline serving modes. You can use [Evalscope](https://evalscope.readthedocs.io/en/latest/), [AISBench](https://ais-bench-benchmark.readthedocs.io/en/latest/), or SGLang's built-in benchmarking tools.
 
+<Note>The benchmark output examples in this guide are for illustration only. Actual performance depends on your hardware (e.g., Atlas 800I A2 vs A3), model version, SGLang version, and deployment configuration. Always run benchmarks on your own hardware to obtain accurate performance data.</Note>
+
 ## 1. Prepare
 
 ### 1.1 Start SGLang server
@@ -111,7 +113,7 @@ evalscope perf \
 
 <Tip>If the model has already been downloaded, you can point `--tokenizer-path` to the local model path instead of the model id.</Tip>
 
-After several minutes, you will see results like:
+Example output (for illustration only — actual results depend on your hardware and configuration):
 
 ```text
 Benchmarking summary:
@@ -231,7 +233,7 @@ Run with a synthetic dataset:
 ais_bench --models vllm_api_stream_chat --datasets synthetic_gen_string -m perf
 ```
 
-After several minutes, you will see results like:
+Example output (for illustration only — actual results depend on your hardware and configuration):
 
 ```text
 ╒══════════════════════════╤═════════╤═════════════════╤═════════════════╤═════════════════╤═════════════════╤═════════════════╤═════════════════╤═════════════════╤═════╕
@@ -307,7 +309,7 @@ python -m sglang.bench_serving \
 
 <Tip>Set `--random-range-ratio 1` for fixed input/output lengths (recommended for consistent comparisons) or `0` (default) for uniform distribution. Add `--request-rate` to control the request rate. For all backends, datasets, and advanced options, see the full [Bench Serving Guide](/docs/developer_guide/bench_serving).</Tip>
 
-After several minutes, you will see results like:
+Example output (for illustration only — actual results depend on your hardware and configuration):
 
 ```text
 ============ Serving Benchmark Result ============
@@ -441,7 +443,7 @@ Run the stress test:
 ais_bench --models vllm_api_stream_chat --datasets mmstar_gen -m perf
 ```
 
-After several minutes, you will see results like:
+Example output (for illustration only — actual results depend on your hardware and configuration):
 
 ```text
 ╒══════════════════════════╤═════════╤═════════════════╤════════════════╤═════════════════╤═════════════════╤═════════════════╤═════════════════╤═════════════════╤══════╕
@@ -513,7 +515,7 @@ python -m sglang.bench_serving \
   --image-resolution 720p
 ```
 
-After several minutes, you will see results like:
+Example output (for illustration only — actual results depend on your hardware and configuration):
 
 ```text
 ============ Serving Benchmark Result ============
@@ -583,7 +585,7 @@ evalscope perf \
 
 <Tip>If the model has already been downloaded, you can point `--tokenizer-path` to the local model path instead of the model id.</Tip>
 
-<Note>Evalscope's embedding stress test support may vary by version. If the `perf` command does not accept the embeddings endpoint, use [`bench_serving` with `--backend sglang-embedding`](#4-2-using-bench-serving-embedding-backend) as the primary option.</Note>
+<Note>Evalscope's embedding stress test support may vary by version. If the `perf` command does not accept the embeddings endpoint, use [`bench_serving` with `--backend sglang-embedding`](#4-2-using-bench_serving-embedding-backend) as the primary option.</Note>
 
 ### 4.2 Using bench_serving (embedding backend)
 
@@ -604,7 +606,7 @@ python -m sglang.bench_serving \
 
 <Note>`--dataset-name random` samples token IDs from the ShareGPT dataset; the first run downloads ShareGPT from Hugging Face automatically. Set `export HF_ENDPOINT=https://hf-mirror.com` if network is not available. Set `--random-output-len 0` for embedding benchmarks — no output tokens are generated.</Note>
 
-After several minutes, you will see results like:
+Example output (for illustration only — actual results depend on your hardware and configuration):
 
 ```text
 ============ Serving Benchmark Result ============
