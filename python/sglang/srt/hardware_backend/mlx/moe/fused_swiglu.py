@@ -1,0 +1,457 @@
+"""Path B fusion for SwitchGLU: gate gather_qmv with silu(gate) * x_up epilogue.
+
+Why this exists
+---------------
+The existing `FusedSwitchUpGate` (fused_switch_glu.py) concatenates up_proj
+and gate_proj weights along the output dim and runs one gather_qmm. That saves
+one kernel launch per layer but doubles the matmul's output dim, which pushes
+MLX's quantized GEMV into a worse tile/occupancy config. At bs >= 4 on
+Qwen3-30B-A3B-4bit this is a net regression (~2% slower at bs=32).
+
+Path B keeps up_proj and gate_proj separate (matmul kernels see their natural
+N — no tile regression) and instead fuses the *activation* into the gate
+matmul. Concretely:
+
+    Baseline (3 kernels per MoE layer in the swiglu front-half):
+        x_up   = gather_qmm(x, W_up)
+        x_gate = gather_qmm(x, W_gate)
+        out    = silu(x_gate) * x_up         # 1 compiled kernel via mlx_lm.swiglu
+
+    Path B (2 kernels):
+        x_up = gather_qmm(x, W_up)
+        out  = fused_gate_qmv_silu_mul(x, W_gate, ..., x_up)
+                                              # one custom Metal kernel
+
+Saves one kernel launch per MoE layer with no change in matmul kernel shapes,
+so it shouldn't regress at any batch size.
+
+Scope of v1
+-----------
+Targets the configuration shared by Qwen3-30B-A3B-4bit and Qwen1.5-MoE-A2.7B-4bit:
+- bits=4, mode='affine', group_size=64
+- K (input_dim) divisible by 512  (Qwen3: 2048, Qwen1.5: 2048)
+- N (output_dim) divisible by 8   (Qwen3: 768, Qwen1.5: 1408)
+- Scales/biases dtype matches the input dtype (bf16 or fp16)
+
+Anything outside that falls back to the unfused mlx_lm path.
+
+When the fast `gather_qmv` from #22283 lands, the qmv inner loop here can be
+replaced by a call into it; the epilogue (silu * x_up) doesn't change.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import mlx.core as mx
+import mlx.nn as nn
+
+logger = logging.getLogger(__name__)
+
+# Constants matching MLX's affine_qmv_fast for bits=4, group_size=64.
+# Lifted directly from mlx/include/mlx/backend/metal/kernels/quantized.h
+# (qmv_fast_impl), so the inner-loop layout is bit-for-bit compatible with
+# MLX's own gather_qmm in that regime.
+_BITS = 4
+_GROUP_SIZE = 64
+_SIMD_SIZE = 32
+_PACK_FACTOR = 8  # 32 / bits
+_BYTES_PER_PACK = 4  # sizeof(uint32_t)
+_PACKS_PER_THREAD = 2
+_NUM_SIMDGROUPS = 2
+_RESULTS_PER_SIMDGROUP = 4
+_VALUES_PER_THREAD = _PACK_FACTOR * _PACKS_PER_THREAD  # 16
+_BLOCK_SIZE = _VALUES_PER_THREAD * _SIMD_SIZE  # 512
+_ROWS_PER_TG = _NUM_SIMDGROUPS * _RESULTS_PER_SIMDGROUP  # 8
+
+
+# Metal source for the fused kernel.
+# Body only — mx.fast.metal_kernel auto-generates the kernel signature
+# based on input_names / output_names and the template params below.
+_KERNEL_SOURCE = r"""
+    // Mirrors qmv_fast_impl<T, group_size=64, bits=4> from MLX's quantized.h
+    // with a silu(result) * x_up write epilogue.
+    //
+    // Inputs:
+    //   x       [M_tok, K]                — pre-gather activations (T)
+    //   w       [E, N, K * 4 / 32]        — packed 4-bit weights (uint32)
+    //   s       [E, N, K / GROUP_SIZE]    — affine scales (T)
+    //   b       [E, N, K / GROUP_SIZE]    — affine biases (T)
+    //   idx     [M_tok * TOPK]            — expert per (token, topk) pair (uint32)
+    //   x_up    [M_tok * TOPK, N]         — precomputed up output (T)
+    // Output:
+    //   y       [M_tok * TOPK, N]         — silu(gate_qmv(x)) * x_up
+
+    constexpr int BITS = 4;
+    constexpr int GROUP_SIZE = 64;
+    constexpr int SIMD_SIZE = 32;
+    constexpr int PACK_FACTOR = 8;
+    constexpr int BYTES_PER_PACK = 4;
+    constexpr int PACKS_PER_THREAD = 2;
+    constexpr int NUM_SIMDGROUPS = 2;
+    constexpr int RESULTS_PER_SIMDGROUP = 4;
+    constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;   // 16
+    constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;            // 512
+    constexpr int SCALE_STEP_PER_THREAD = GROUP_SIZE / VALUES_PER_THREAD; // 4
+
+    // Compile-time problem dims (template params)
+    constexpr int K = IN_VEC_SIZE;
+    constexpr int N = OUT_VEC_SIZE;
+    constexpr int TOPK = TOP_K;
+
+    constexpr int in_vec_size_w = K * BYTES_PER_PACK / PACK_FACTOR;    // K/2 bytes per row
+    constexpr int in_vec_size_g = K / GROUP_SIZE;                       // groups per row
+
+    // tid.x = (token, topk) pair index in M_tok*TOPK
+    // tid.y = output row block index (each block writes 8 rows)
+    uint mt = threadgroup_position_in_grid.x;
+    uint out_row_block = threadgroup_position_in_grid.y;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    uint m = mt / TOPK;                      // index into pre-gather x
+    uint e = idx[mt];                        // expert id
+
+    // Base pointers for this (expert) row block.
+    // Weights / scales / biases live in [E, N, ...] tensors.
+    const device uint8_t* ws = (const device uint8_t*)(w
+        + uint64_t(e) * uint64_t(N) * uint64_t(in_vec_size_w / BYTES_PER_PACK));
+    const device T* scales_p = s
+        + uint64_t(e) * uint64_t(N) * uint64_t(in_vec_size_g);
+    const device T* biases_p = b
+        + uint64_t(e) * uint64_t(N) * uint64_t(in_vec_size_g);
+
+    // out_row indexes the first of RESULTS_PER_SIMDGROUP rows this simdgroup handles.
+    int out_row = out_row_block * NUM_SIMDGROUPS * RESULTS_PER_SIMDGROUP
+                + simd_gid * RESULTS_PER_SIMDGROUP;
+
+    ws += out_row * in_vec_size_w + simd_lid * PACKS_PER_THREAD * BYTES_PER_PACK;
+    scales_p += out_row * in_vec_size_g + simd_lid / SCALE_STEP_PER_THREAD;
+    biases_p += out_row * in_vec_size_g + simd_lid / SCALE_STEP_PER_THREAD;
+
+    // Pre-gather x: shape [M_tok, K]
+    const device T* x_p = x + uint64_t(m) * uint64_t(K)
+                            + uint64_t(simd_lid) * uint64_t(VALUES_PER_THREAD);
+
+    float result[RESULTS_PER_SIMDGROUP] = {0, 0, 0, 0};
+    thread float x_thread[VALUES_PER_THREAD];
+
+    // Outer loop over K in BLOCK_SIZE-wide chunks.
+    // K % BLOCK_SIZE == 0 is required (checked in Python wrapper).
+    for (int k = 0; k < K; k += BLOCK_SIZE) {
+        // --- load_vector for bits=4 ---
+        float sum = 0;
+        for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
+            float a0 = float(x_p[i]);
+            float a1 = float(x_p[i + 1]);
+            float a2 = float(x_p[i + 2]);
+            float a3 = float(x_p[i + 3]);
+            sum += a0 + a1 + a2 + a3;
+            x_thread[i]     = a0;
+            x_thread[i + 1] = a1 / 16.0f;
+            x_thread[i + 2] = a2 / 256.0f;
+            x_thread[i + 3] = a3 / 4096.0f;
+        }
+
+        // For each of the 4 output rows this simdgroup is responsible for...
+        for (int row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
+            const device uint16_t* ws_u16 =
+                (const device uint16_t*)(ws + row * in_vec_size_w);
+            float scale_v = float(scales_p[row * in_vec_size_g]);
+            float bias_v  = float(biases_p[row * in_vec_size_g]);
+
+            // --- qdot for bits=4, values_per_thread=16 ---
+            float accum = 0;
+            for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+                uint16_t packed = ws_u16[i];
+                accum += (x_thread[4 * i]     * float(packed & 0x000f) +
+                          x_thread[4 * i + 1] * float(packed & 0x00f0) +
+                          x_thread[4 * i + 2] * float(packed & 0x0f00) +
+                          x_thread[4 * i + 3] * float(packed & 0xf000));
+            }
+            result[row] += scale_v * accum + sum * bias_v;
+        }
+
+        ws        += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;  // += 256 bytes
+        scales_p  += BLOCK_SIZE / GROUP_SIZE;                    // += 8 groups
+        biases_p  += BLOCK_SIZE / GROUP_SIZE;
+        x_p       += BLOCK_SIZE;
+    }
+
+    // Write epilogue: simd-sum across lanes, then silu(gate) * x_up.
+    device T* y_p = y + uint64_t(mt) * uint64_t(N) + uint64_t(out_row);
+    const device T* x_up_p = x_up + uint64_t(mt) * uint64_t(N) + uint64_t(out_row);
+
+    for (int row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
+        float gate_v = simd_sum(result[row]);
+        if (simd_lid == 0) {
+            // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+            float silu_v = gate_v / (1.0f + metal::precise::exp(-gate_v));
+            y_p[row] = T(silu_v * float(x_up_p[row]));
+        }
+    }
+"""
+
+
+# Build kernel lazily so import-time on non-MLX systems doesn't fail.
+_kernel_cache: dict = {}
+
+
+def _get_kernel(dtype: mx.Dtype):
+    """Return a compiled mx.fast.metal_kernel for the given input dtype.
+
+    Kept per-dtype because mx.fast.metal_kernel specializes on template args
+    at first call, and we want clean separation between fp16 / bf16 variants.
+    """
+    if dtype not in _kernel_cache:
+        # Strip the `mlx.core.` prefix and any dots from the dtype repr so the
+        # kernel name is a valid C identifier (Metal's host_name attribute and
+        # function-name slot don't accept '.').
+        dtype_tag = str(dtype).replace("mlx.core.", "").replace(".", "_")
+        _kernel_cache[dtype] = mx.fast.metal_kernel(
+            name=f"affine_gather_qmv_silu_mul_4bit_gs64_{dtype_tag}",
+            input_names=["x", "w", "s", "b", "idx", "x_up"],
+            output_names=["y"],
+            source=_KERNEL_SOURCE,
+        )
+    return _kernel_cache[dtype]
+
+
+def fused_gate_qmv_silu_mul(
+    x: mx.array,
+    gate_w: mx.array,
+    gate_s: mx.array,
+    gate_b: mx.array,
+    indices: mx.array,
+    x_up: mx.array,
+) -> mx.array:
+    """Compute ``silu(gather_qmm(x, W_gate)) * x_up`` in one kernel.
+
+    Shapes:
+        x       : (..., 1, 1, K)               input activations (pre-gather)
+        gate_w  : (E, N, K // PACK_FACTOR)     packed 4-bit weights
+        gate_s  : (E, N, K // GROUP_SIZE)      affine scales
+        gate_b  : (E, N, K // GROUP_SIZE)      affine biases
+        indices : (..., T)                     expert per (token, topk) pair
+        x_up    : (..., T, 1, N)               pre-computed up output
+        y       : (..., T, 1, N)               returned
+
+    Numerical contract: bit-for-bit equivalent to::
+
+        x_gate = mx.gather_qmm(x, gate_w, gate_s, gate_b, rhs_indices=indices,
+                               transpose=True, group_size=GROUP_SIZE, bits=BITS,
+                               mode='affine')
+        y = nn.silu(x_gate) * x_up
+
+    up to floating-point ordering of accumulations (which matches MLX's own
+    qmv_fast_impl exactly).
+    """
+    # Validate the regime this kernel supports. Outside it, the caller should
+    # fall back to the unfused MLX path.
+    K = gate_s.shape[-1] * _GROUP_SIZE
+    N = gate_w.shape[-2]
+    if K % _BLOCK_SIZE != 0:
+        raise ValueError(
+            f"fused_gate_qmv_silu_mul: K={K} not divisible by {_BLOCK_SIZE}. "
+            f"Use the unfused path."
+        )
+    if N % _ROWS_PER_TG != 0:
+        raise ValueError(
+            f"fused_gate_qmv_silu_mul: N={N} not divisible by {_ROWS_PER_TG}."
+        )
+    # Sanity: scales/biases dtype must match x dtype for in-kernel float() conversion.
+    if gate_s.dtype != x.dtype or gate_b.dtype != x.dtype:
+        raise ValueError(
+            f"fused_gate_qmv_silu_mul: dtype mismatch x={x.dtype} "
+            f"s={gate_s.dtype} b={gate_b.dtype}"
+        )
+
+    # Shape handling: x always has K as its last axis. M_tok is the number of
+    # distinct pre-gather tokens (= x.size // K). T is the top_k axis carried
+    # by `indices`. In the unsorted SwitchGLU path x has shape (B, 1, 1, K) and
+    # indices is (B, T); in the sorted path x has shape (B*T, 1, K) and
+    # indices is (B*T, 1) after our reshape. Either way: M_tok * T == idx.size
+    # and M_tok * K == x.size.
+    assert x.shape[-1] == K, f"x last dim {x.shape[-1]} != K={K}"
+    M_tok = x.size // K
+    T = indices.shape[-1]
+    assert (
+        M_tok * T == indices.size
+    ), f"M_tok({M_tok}) * T({T}) != indices.size({indices.size})"
+    x_flat = x.reshape(M_tok, K)
+    idx_flat = indices.reshape(M_tok * T)
+    if idx_flat.dtype != mx.uint32:
+        idx_flat = idx_flat.astype(mx.uint32)
+
+    # x_up has N as its last axis and total size M_tok * T * N. The singleton
+    # rank dims (1 or 2 of them) get folded away by reshape.
+    assert (
+        x_up.shape[-1] == N and x_up.size == M_tok * T * N
+    ), f"x_up shape {x_up.shape} does not match M_tok({M_tok})*T({T})*N({N})"
+    x_up_flat = x_up.reshape(M_tok * T, N)
+
+    kernel = _get_kernel(x.dtype)
+    (y_flat,) = kernel(
+        inputs=[x_flat, gate_w, gate_s, gate_b, idx_flat, x_up_flat],
+        template=[
+            ("T", x.dtype),
+            ("IN_VEC_SIZE", K),
+            ("OUT_VEC_SIZE", N),
+            ("TOP_K", T),
+        ],
+        # grid is in *threads*, not threadgroups: total threads = product of
+        # (grid_x, grid_y, grid_z). One threadgroup processes one (mt, row_block).
+        # Threadgroup is 64 = 2 simdgroups × 32 lanes.
+        grid=(M_tok * T * 64, N // _ROWS_PER_TG, 1),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(M_tok * T, N)],
+        output_dtypes=[x.dtype],
+    )
+
+    # Reshape to x_up's shape, which is exactly what self.activation(x_up,
+    # x_gate) would have returned (silu*mul is shape-preserving).
+    return y_flat.reshape(x_up.shape)
+
+
+def can_fuse(switch_mlp) -> bool:
+    """Cheap structural check: does this SwitchGLU match the Path B v1 regime?"""
+    try:
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+    except ImportError:
+        return False
+    up = switch_mlp.up_proj
+    gate = switch_mlp.gate_proj
+    if not isinstance(up, QuantizedSwitchLinear) or not isinstance(
+        gate, QuantizedSwitchLinear
+    ):
+        return False
+    if up.bits != 4 or up.group_size != 64 or up.mode != "affine":
+        return False
+    if gate.bits != 4 or gate.group_size != 64 or gate.mode != "affine":
+        return False
+    if up.biases is None or gate.biases is None:
+        return False
+    K = up.scales.shape[-1] * _GROUP_SIZE
+    N = up.weight.shape[-2]
+    if K % _BLOCK_SIZE != 0 or N % _ROWS_PER_TG != 0:
+        return False
+    return True
+
+
+class FusedSwitchSwiGLU(nn.Module):
+    """SwitchGLU forward with Path B fusion installed.
+
+    Wraps an existing SwitchGLU instance. Reads up_proj / gate_proj weights
+    directly (no concatenation), runs up_proj as usual, then calls the fused
+    kernel for ``silu(gate_qmv(x)) * x_up`` in one shot.
+
+    Replaces ``switch_mlp.__call__`` via patch_switch_glu_with_fused_swiglu;
+    SwitchGLU.up_proj / gate_proj / activation are *not* replaced and remain
+    available for fallback paths (e.g. sorted-indices large-batch case).
+    """
+
+    def __init__(self, switch_mlp):
+        super().__init__()
+        self._switch_mlp = switch_mlp  # weak association — we read its modules
+
+    def fused_forward(self, x, indices):
+        """Same contract as SwitchGLU.__call__ but with fused activation."""
+        from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
+
+        sw = self._switch_mlp
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+
+        # Up projection: unchanged.
+        x_up = sw.up_proj(x, idx, sorted_indices=do_sort)
+
+        # Gate projection + silu + multiply: fused.
+        # Note: after _gather_sort, x has shape (M_tok, 1, 1, K) (no batch dim
+        # interleaved with topk), and idx is 1-D (M_tok,). x_up has shape
+        # (M_tok, 1, 1, N) in the sorted case — top_k axis is folded into M_tok.
+        if do_sort:
+            # In sorted mode, each row in x is already a (token, expert) pair
+            # so there's no extra TOPK fan-out. Treat as TOPK=1.
+            x_gate_in = x  # (M_tok, 1, 1, K)
+            idx_in = idx.reshape(-1, 1)  # (M_tok, 1)
+            x_up_in = x_up  # (M_tok, 1, 1, N)
+            swiglu = fused_gate_qmv_silu_mul(
+                x_gate_in,
+                sw.gate_proj["weight"],
+                sw.gate_proj["scales"],
+                sw.gate_proj.get("biases"),
+                idx_in,
+                x_up_in,
+            )
+            # swiglu shape: (M_tok, 1, 1, N). Down expects same.
+        else:
+            # Unsorted: x has shape (..., 1, 1, K), idx has shape (..., TOPK).
+            swiglu = fused_gate_qmv_silu_mul(
+                x,
+                sw.gate_proj["weight"],
+                sw.gate_proj["scales"],
+                sw.gate_proj.get("biases"),
+                idx,
+                x_up,
+            )
+
+        out = sw.down_proj(swiglu, idx, sorted_indices=do_sort)
+
+        if do_sort:
+            out = _scatter_unsort(out, inv_order, indices.shape)
+        return out.squeeze(-2)
+
+
+def patch_switch_glu_with_fused_swiglu(model) -> int:
+    """Install Path B on every eligible SwitchGLU in the model.
+
+    Replaces ``switch_mlp.__call__`` with FusedSwitchSwiGLU.fused_forward.
+    Leaves ``up_proj``, ``gate_proj``, ``activation`` in place so the original
+    code path is still reachable for sorted-large-batch (handled internally) and
+    for any callers that bypass the patched __call__.
+
+    Returns number of layers patched.
+    """
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    patched = 0
+    for layer in model.model.layers:
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            continue
+        sw = getattr(mlp, "switch_mlp", None)
+        if not isinstance(sw, SwitchGLU):
+            continue
+        if not can_fuse(sw):
+            continue
+        # Idempotent: skip if already patched.
+        if getattr(sw, "_path_b_installed", False):
+            continue
+        # Per-instance override of __call__ via a one-off subclass. Python
+        # looks up __call__ on the type, so attribute assignment on the
+        # instance won't take effect — we swap sw.__class__ to a subclass
+        # whose __call__ dispatches to the bound wrapper. The subclass is
+        # cached on the parent type so we only build it once per model.
+        sw._path_b_call = FusedSwitchSwiGLU(sw).fused_forward
+        cls = type(sw)
+        if not hasattr(cls, "_PathBSubclass"):
+            cls._PathBSubclass = type(
+                f"{cls.__name__}_PathB",
+                (cls,),
+                {"__call__": lambda self, *a, **kw: self._path_b_call(*a, **kw)},
+            )
+        sw.__class__ = cls._PathBSubclass
+        sw._path_b_installed = True
+        patched += 1
+
+    if patched == 0:
+        logger.warning(
+            "patch_switch_glu_with_fused_swiglu: no eligible SwitchGLU found"
+        )
+    else:
+        logger.info(f"patch_switch_glu_with_fused_swiglu: patched {patched} layers")
+    return patched

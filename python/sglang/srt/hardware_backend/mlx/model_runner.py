@@ -15,6 +15,7 @@ state.
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 
@@ -264,6 +265,21 @@ class MlxModelRunner:
 
         load_time = time.time() - start_time
         logger.info(f"MLX model loaded in {load_time:.2f}s")
+
+        # Optional: Path B fusion — keep up_proj/gate_proj weights separate
+        # (no matmul-kernel tile regression) but fuse the swiglu activation
+        # into the gate matmul via a custom Metal kernel. Activated by
+        # SGLANG_MLX_FUSE_SWIGLU=1. Mutually exclusive with FUSE_SWITCHGLU.
+        # See: python/sglang/srt/hardware_backend/mlx/moe/fused_swiglu.py
+        if os.environ.get("SGLANG_MLX_FUSE_SWIGLU", "0") == "1":
+            from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
+                patch_switch_glu_with_fused_swiglu,
+            )
+
+            n_patched = patch_switch_glu_with_fused_swiglu(self.model)
+            logger.info(
+                f"MLX SwiGLU activation fusion enabled: patched {n_patched} blocks"
+            )
 
     def _get_attn_config(self) -> tuple[int, int, mx.Dtype]:
         """Return (n_kv_heads, head_dim, dtype) from the model."""
