@@ -209,6 +209,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "mori",
     "ascend_fuseep",
     "flashinfer",
+    "megamoe",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -609,7 +610,14 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
-        "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
+        "none",
+        "deepep",
+        "mooncake",
+        "nixl",
+        "mori",
+        "ascend_fuseep",
+        "flashinfer",
+        "megamoe",
     ] = "none"
     moe_runner_backend: str = "auto"
     record_nolora_graph: bool = True
@@ -3184,12 +3192,12 @@ class ServerArgs:
             )
             self.moe_a2a_backend = "deepep"
 
-        if (
-            envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
-            and self.moe_a2a_backend == "none"
-            and self.ep_size == 1
-        ):
+        if self.moe_a2a_backend == "megamoe":
             self.ep_size = self.tp_size
+            if not envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.is_set():
+                envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.set(True)
+            if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
+                envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
             logger.info(
                 f"Mega MoE is enabled. The expert parallel size is adjusted "
                 f"to be the same as the tensor parallel size[{self.tp_size}]."
@@ -3276,17 +3284,6 @@ class ServerArgs:
                 assert (
                     self.chunked_prefill_size
                 ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
-
-        if (
-            envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
-            and self.ep_size > 1
-            and not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set()
-        ):
-            envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
-            logger.info(
-                "Mega MoE with EP enabled: auto-setting "
-                "SGLANG_OPT_FIX_MEGA_MOE_MEMORY=True to share weights."
-            )
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
