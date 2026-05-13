@@ -217,11 +217,17 @@ class FlashAttentionBackend(AttentionBackend):
         # In embedding mode with no chunked prefill and radix cache disabled,
         # skip KV cache write and use flash_attn_varlen_func with raw K/V
         # instead of flash_attn_with_kvcache, bypassing paged KV cache entirely.
+        # Restricted to non-MLA backends: the read-skip elif lives inside the
+        # `if not self.use_mla:` branch in forward_extend, while the write-skip
+        # guard wraps both set_kv_buffer and set_mla_kv_buffer. Without this
+        # gate, MLA + is_embedding would skip the write but still read stale
+        # cache via get_key_buffer in the absorbed-MLA path.
         server_args = model_runner.server_args
         self.fa_skip_kv_cache = (
             server_args.is_embedding
             and server_args.chunked_prefill_size == -1
             and server_args.disable_radix_cache
+            and not self.use_mla
         )
 
         # Skip the FA3 scheduler_metadata precompute (PR #21104) under DP
@@ -2156,9 +2162,9 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            extend_lens = spec_info.num_accepted_tokens[:bs]
-            if spec_info.num_accepted_tokens_cpu:
-                metadata.max_seq_len_q = max(spec_info.num_accepted_tokens_cpu)
+            extend_lens = spec_info.num_accept_tokens[:bs]
+            if spec_info.num_accept_tokens_cpu:
+                metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
             else:
                 metadata.max_seq_len_q = 1
 
@@ -2477,10 +2483,20 @@ class FlashAttentionBackend(AttentionBackend):
             else metadata_swa.page_table
         )
 
+        page_table_a = metadata.page_table
+        page_table_b = metadata_expand.page_table
+        if self.use_sliding_window_kv_pool:
+            page_table_a = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                page_table_a
+            )
+            page_table_b = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                page_table_b
+            )
+
         prepare_swa_spec_page_table_triton(
             page_table,
-            metadata.page_table,
-            metadata_expand.page_table,
+            page_table_a,
+            page_table_b,
             metadata.cache_seqlens_int32,
             metadata_expand.cache_seqlens_int32,
             self.speculative_num_draft_tokens,

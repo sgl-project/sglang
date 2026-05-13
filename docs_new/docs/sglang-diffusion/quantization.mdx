@@ -102,7 +102,7 @@ backend.
       <td><code>--model-path</code></td>
       <td>Wan2.2 family</td>
       <td>None</td>
-      <td>Currently only compatible with the Ascend NPU family and supports both <code>w8a8</code> and <code>w4a4</code></td>
+      <td>Currently only compatible with the Ascend NPU family and supports <code>mxfp8</code>, <code>w8a8</code>, and <code>w4a4</code></td>
     </tr>
   </tbody>
 </table>
@@ -572,16 +572,19 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
 
     For msmodelslim checkpoints, it's enough to specify only ```--model-path```, the detection of quantization occurs automatically for each layer using parsing of      `quant_model_description.json` config.
 
-    In the case of `Wan2.2` only `Diffusers` weights storage format are supported, whereas modelslim saves the quantized model in the original `Wan2.2` format,
-    for conversion in use `python/sglang/multimodal_gen/tools/wan_repack.py` script:
+    In the case of `Wan2.2` only `Diffusers` weights storage format are supported, whereas modelslim saves the quantized model in the original `Wan2.2` format.
+    For conversion, use the one-step `wan_repack.py` script:
 
     ```bash
     python wan_repack.py \
-      --input-path {path_to_quantized_model} \
+      --model-type Wan2.2-TI2V-5B \
+      --original-model-path {path_to_original_diffusers_model} \
+      --quant-path {path_to_quantized_model} \
       --output-path {path_to_converted_model}
     ```
 
-    After that, please copy all files from original `Diffusers` checkpoint (instead of `transformer`/`tranfsormer_2` folders)
+    Supported `--model-type` values: `Wan2.2-TI2V-5B` (single-transformer), `Wan2.2-T2V-A14B` and `Wan2.2-I2V-A14B` (Cascade dual-transformer).
+    The script automatically handles: copying the base model, converting quantized weights to Diffusers format, and restoring `config.json`.
 
 - **Usage Example**
 
@@ -598,4 +601,34 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     - [x]  ```W4A4_DYNAMIC``` linear with online quantization of activations
     - [x]  ```W8A8``` linear with offline quantization of activations
     - [x]  ```W8A8_DYNAMIC``` linear with online quantization of activations
-    - [ ]  ```mxfp8``` linear in progress
+    - [x]  ```W8A8_MXFP8``` linear with offline quantization (msmodelslim pre-quantized weights)
+    - [x]  ```mxfp8``` linear with online quantization (`--quantization mxfp8`)
+
+## MXFP8 Online Quantization
+
+For online MXFP8 quantization, load the original FP16/BF16 model and add `--quantization mxfp8`.
+Weights are quantized at load time via `npu_dynamic_mx_quant`, and activations are quantized per-token
+during inference with `npu_quant_matmul` (block_size=32).
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp8 \
+  --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+> **Hardware requirement:** Ascend A5 series or newer. `npu_dynamic_mx_quant` is not available on A2/A3.
+
+## MXFP8 Offline Quantization (msmodelslim)
+
+Pre-quantized MXFP8 weights exported by msmodelslim are auto-detected via `quant_model_description.json`
+(`W8A8_MXFP8` scheme). Use `wan_repack.py` to convert the quantized weights to Diffusers format,
+then load the converted model with `--model-path`:
+
+```bash
+sglang generate \
+  --model-path Eco-Tech/Wan2.2-T2V-A14B-Diffusers-mxfp8 \
+  --prompt "a beautiful sunset" \
+  --save-output
+```

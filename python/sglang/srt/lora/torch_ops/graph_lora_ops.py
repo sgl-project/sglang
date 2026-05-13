@@ -65,7 +65,7 @@ def sgemm_lora_a_graph_fwd(
         x_seq = torch.where(batch_token_mask, inputs, 0)
         w_seq = weights[lora_idx]
 
-        output.add_(scaling_tensor[lora_idx] * torch.mm(x_seq, w_seq.t(), 0))
+        output.add_(scaling_tensor[lora_idx] * torch.mm(x_seq, w_seq.t()))
 
     return output
 
