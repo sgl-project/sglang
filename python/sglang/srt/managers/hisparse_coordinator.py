@@ -99,9 +99,7 @@ class HiSparseCoordinator:
         ) // self.compress_ratio
 
         # to have an extra page for new tokens
-        self.padded_buffer_size = (
-            self.device_buffer_size + self.mem_pool_device.page_size
-        )
+        self.padded_buffer_size = self.device_buffer_size + self.page_size
 
         self.req_to_device_buffer = torch.zeros(
             (max_num_req_slots, self.padded_buffer_size),
