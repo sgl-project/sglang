@@ -3982,11 +3982,11 @@ class ServerArgs:
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
                 envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-                and self.disaggregation_transfer_backend != "mooncake"
+                and self.disaggregation_transfer_backend not in ("mooncake", "nixl")
             ):
                 raise ValueError(
                     f"SGLANG_DISAGG_STAGING_BUFFER requires "
-                    f"disaggregation_transfer_backend='mooncake', "
+                    f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                     f"got '{self.disaggregation_transfer_backend}'."
                 )
 

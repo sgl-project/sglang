@@ -218,9 +218,11 @@ class EAGLEWorker(TpModelWorker):
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
             if self.adaptive_controller is not None:
@@ -459,9 +461,11 @@ class EAGLEWorker(TpModelWorker):
                 seq_lens_cpu,
                 can_run_cuda_graph,
             ) = self.forward_target_extend(batch)
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 self.forward_draft_extend(
                     batch,
                     logits_output.hidden_states,
@@ -478,9 +482,11 @@ class EAGLEWorker(TpModelWorker):
         else:
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 verify_input = self.draft(batch)
 
             set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
@@ -502,9 +508,11 @@ class EAGLEWorker(TpModelWorker):
                 batch.reqs, "set_spec_draft_extend_start_time", trace_only=True
             )
 
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 draft_extend_input = verify_output.draft_extend_input
