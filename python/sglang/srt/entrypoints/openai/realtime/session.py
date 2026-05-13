@@ -555,20 +555,42 @@ class RealtimeConnection:
             )
         except Exception as e:
             logger.exception("[realtime] inference failed: %s", self.session_id)
-            await self._send(
-                ConversationItemInputAudioTranscriptionFailedEvent(
-                    event_id=f"event_{random_uuid()}",
-                    type="conversation.item.input_audio_transcription.failed",
-                    item_id=self.current_item_id,
-                    content_index=0,
-                    error=TranscriptionFailedError(
-                        type="server_error",
-                        code="inference_failed",
-                        message=str(e),
-                    ),
+            if is_last:
+                # Commit-time failure: committed + created already emitted,
+                # so the item exists client-side and transcription.failed
+                # can reference it.
+                await self._send(
+                    ConversationItemInputAudioTranscriptionFailedEvent(
+                        event_id=f"event_{random_uuid()}",
+                        type="conversation.item.input_audio_transcription.failed",
+                        item_id=self.current_item_id,
+                        content_index=0,
+                        error=TranscriptionFailedError(
+                            type="server_error",
+                            code="inference_failed",
+                            message=str(e),
+                        ),
+                    )
                 )
-            )
-            self._start_next_item()
+                self._start_next_item()
+            else:
+                # Append-time failure: committed / created run inside the
+                # commit handler, so the item is not yet visible to the
+                # client. transcription.failed would reference a ghost
+                # item_id; emit a generic error envelope and close the WS
+                # instead so the client reconnects.
+                await self._send_error(
+                    "inference_failed",
+                    str(e),
+                    error_type="server_error",
+                )
+                try:
+                    await self.websocket.close(code=1011)
+                except (WebSocketDisconnect, RuntimeError) as ce:
+                    logger.debug(
+                        "[realtime] close after append-time inference failure: %s",
+                        ce,
+                    )
             return False
 
         self.last_inference_offset = len(self.pcm_buffer)
