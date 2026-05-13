@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-8-gpu-h200")
+register_cuda_ci(est_time=250, suite="stage-c-test-dsv4-8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 
@@ -133,7 +133,7 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
         metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["score"], 0.92)
+        self.assertGreater(metrics["score"], 0.95)
 
 
 if __name__ == "__main__":
