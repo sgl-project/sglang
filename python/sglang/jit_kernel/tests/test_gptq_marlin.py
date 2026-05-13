@@ -16,7 +16,11 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_fp4_layer_for_marlin,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
+from sglang.test.test_marlin_utils import (
+    awq_marlin_quantize,
+    make_nvfp4_weight_and_ref,
+    marlin_quantize,
+)
 
 register_cuda_ci(est_time=13, suite="stage-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
@@ -157,30 +161,8 @@ def test_nvfp4_marlin_dense_matches_dequant_reference(dtype):
     group_size = 16
 
     a_input = torch.randn((size_m, size_k), dtype=dtype, device="cuda") / 10
-    fp4_weight = torch.randint(
-        0, 256, (size_n, size_k // 2), dtype=torch.uint8, device="cuda"
-    )
-    scale_source = torch.randn((size_n, size_k), dtype=dtype, device="cuda")
-    scales = scale_source.view(size_n, -1, group_size).abs().max(-1)[0] / 6
-    global_scale = scales.max() / 448
-    scales = (scales / global_scale).to(torch.float8_e4m3fn)
-
-    fp4_weight_part_1 = (fp4_weight & 0b10000000) | ((fp4_weight & 0b01110000) >> 2)
-    fp4_weight_part_1 = fp4_weight_part_1.view(torch.float8_e4m3fn)
-    fp4_weight_part_1 = fp4_weight_part_1.to(dtype) * (2**6)
-
-    fp4_weight2 = fp4_weight << 4
-    fp4_weight_part_2 = (fp4_weight2 & 0b10000000) | ((fp4_weight2 & 0b01110000) >> 2)
-    fp4_weight_part_2 = fp4_weight_part_2.view(torch.float8_e4m3fn)
-    fp4_weight_part_2 = fp4_weight_part_2.to(dtype) * (2**6)
-
-    weight_ref = torch.cat(
-        [fp4_weight_part_2.unsqueeze(2), fp4_weight_part_1.unsqueeze(2)], 2
-    ).view(size_n, size_k)
-    weight_ref = (
-        weight_ref
-        * global_scale.to(dtype)
-        * scales.repeat_interleave(group_size, 1).to(dtype)
+    fp4_weight, scales, global_scale, weight_ref = make_nvfp4_weight_and_ref(
+        size_n, size_k, dtype, group_size=group_size
     )
 
     layer = torch.nn.Module()
