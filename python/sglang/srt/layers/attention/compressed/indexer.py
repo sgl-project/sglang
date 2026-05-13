@@ -12,12 +12,13 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.compressed.metadata import (
     PagedCoreMetadata,
     PagedIndexerMetadata,
+    _is_sm120,
 )
 from sglang.srt.layers.attention.indexer_topk_capturer import (
     get_global_indexer_capturer,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.compressor import CompressorBackend
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v4 import C4Indexer
 
+__is_xpu = is_xpu()
 
 if is_hip():
     FP8_DTYPE = torch.float8_e4m3fnuz
@@ -33,6 +35,14 @@ if is_hip():
 else:
     FP8_DTYPE = torch.float8_e4m3fn
     FP8_MAX = torch.finfo(FP8_DTYPE).max
+
+
+# Bound peak memory of the vectorized fallback.  For each row we materialize
+#   chunk_size * page_table.shape[1] * block_size * head_dim bytes of fp32 KV
+# plus the gathered raw bytes, plus chunk_size * padded_seq_len * num_heads
+# fp32 scores.  256 MiB is plenty for typical (B, P) shapes while keeping
+# launch overhead low on XPU.
+_FP8_PAGED_MQA_LOGITS_CHUNK_BYTES = 256 * 1024 * 1024
 
 
 def fp8_paged_mqa_logits_torch(
@@ -45,6 +55,21 @@ def fp8_paged_mqa_logits_torch(
     max_seq_len: int,
     clean_logits: bool = True,
 ) -> torch.Tensor:
+    """Vectorized pure-PyTorch fallback for fp8_paged_mqa_logits.
+
+    The original reference implementation looped in Python over ``batch_size``
+    and called ``int(seq_lens[i].item())`` per iteration, forcing a device
+    sync per query token per layer.  For prefill on DeepSeek V4 this is the
+    dominant cost on XPU since ``batch_size == num_prefill_tokens`` and the
+    indexer runs once per layer (e.g. 768 tokens * 43 layers = 33k host
+    syncs and 33k tiny F.linear launches).
+
+    This rewrite gathers the full KV slab once per chunk, computes scores in
+    a single batched matmul, and masks invalid positions with the device-side
+    ``seq_lens`` so no host sync is needed.  Out-of-range page-table entries
+    are clamped to a valid index so the gather can never read past the pool;
+    the corresponding scores are zeroed out by the position mask.
+    """
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
@@ -54,37 +79,108 @@ def fp8_paged_mqa_logits_torch(
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
+    if seq_lens.dim() > 1:
+        seq_lens = seq_lens.squeeze(-1)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
 
+    device = q_fp8.device
+    head_dim_with_sf = head_dim + 4
+    SCALE_OFFSET = block_size * head_dim
+
+    # Cap pages used per row to what fits into ``max_seq_len``; this is also
+    # the largest valid index any row will ever access.
+    max_pages_eff = (max_seq_len + block_size - 1) // block_size
+    P = min(page_table.shape[1], max_pages_eff)
+    padded_seq_len = P * block_size
+    # Pad result to ``max_seq_len`` so callers see the documented shape.
     logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
-    for i in range(batch_size):
-        q = q_fp8[i, 0]
-        q = q.to(torch.float32)
-        q_scale = weight[i]
-        seq_len = int(seq_lens[i].item())
-        assert seq_len <= max_seq_len
-        num_pages = (seq_len + block_size - 1) // block_size
-        padded_seq_len = num_pages * block_size
-        pages = page_table[i, :num_pages]
-        kvcache_fp8 = kvcache_fp8.view(-1, block_size * (head_dim + 4))
-        kvcache = kvcache_fp8[pages]
-        SCALE_OFFSET = block_size * head_dim
-        kvcache_value = kvcache[..., :SCALE_OFFSET].view(dtype=FP8_DTYPE)
-        kvcache_scale = kvcache[..., SCALE_OFFSET:].view(dtype=torch.float32)
-        kvcache_value = kvcache_value.to(torch.float32)
-        kvcache_scale = kvcache_scale.contiguous()
-        kvcache_value = kvcache_value.view(padded_seq_len, head_dim)
-        kvcache_scale = kvcache_scale.view(padded_seq_len)
-        score = F.linear(kvcache_value, q)
-        score = F.relu(score)
-        score *= q_scale[None, :]
-        score = score.sum(dim=1)
-        score *= kvcache_scale
-        logits[i, :seq_len] = score[:seq_len]
+
+    # Flatten the paged byte slab once: (num_pages_total, block_size*hd_with_sf)
+    kv_flat = kvcache_fp8.reshape(-1, block_size * head_dim_with_sf)
+    num_pages_total = kv_flat.shape[0]
+
+    # Per-row valid mask is computed against absolute token positions.
+    pos = torch.arange(padded_seq_len, device=device)
+
+    # Pick a per-chunk batch size that keeps the gathered fp32 KV slab within
+    # the configured byte budget.  4 bytes/elem * P * block_size * head_dim.
+    bytes_per_row = max(1, P * block_size * head_dim * 4)
+    chunk_size = max(1, _FP8_PAGED_MQA_LOGITS_CHUNK_BYTES // bytes_per_row)
+
+    # Pre-clamp page table so the gather is always in-bounds.  Out-of-range
+    # entries (rows past their seq_len, or padding) are mapped to page 0; the
+    # corresponding score positions are zeroed by the seq-len mask below.
+    pt = page_table[:, :P]
+    if num_pages_total > 0:
+        pt = pt.clamp_(min=0, max=num_pages_total - 1)
+
+    for s in range(0, batch_size, chunk_size):
+        e = min(s + chunk_size, batch_size)
+        cb = e - s
+
+        # (cb, P, block_size*hd_with_sf) bytes
+        kv = kv_flat[pt[s:e]]
+        # Split off value/scale halves and make them contiguous so view-as-dtype
+        # is legal after slicing the trailing dim.
+        kv_value_b = kv[..., :SCALE_OFFSET].contiguous()
+        kv_scale_b = kv[..., SCALE_OFFSET:].contiguous()
+
+        # bytes -> fp8 -> fp32, shape (cb, padded_seq_len, head_dim)
+        kv_value = (
+            kv_value_b.view(dtype=FP8_DTYPE)
+            .view(cb, padded_seq_len, head_dim)
+            .to(torch.float32)
+        )
+        # bytes -> fp32 scale per token, shape (cb, padded_seq_len)
+        kv_scale = kv_scale_b.view(dtype=torch.float32).view(cb, padded_seq_len)
+
+        # q: (cb, num_heads, head_dim) fp32
+        q = q_fp8[s:e, 0].to(torch.float32)
+
+        # score: (cb, padded_seq_len, num_heads)
+        score = torch.einsum("bsd,bhd->bsh", kv_value, q)
+        score = torch.relu(score)
+        score = score * weight[s:e].unsqueeze(1)
+        score = score.sum(dim=2)
+        score = score * kv_scale
+
+        # Mask positions outside [0, seq_len_i) to 0.
+        valid = pos.unsqueeze(0) < seq_lens[s:e].unsqueeze(1)
+        score = torch.where(valid, score, score.new_zeros(()))
+
+        # Write back; truncate or pad to max_seq_len.
+        write_len = min(padded_seq_len, max_seq_len)
+        logits[s:e, :write_len] = score[:, :write_len]
+        if write_len < max_seq_len:
+            logits[s:e, write_len:] = 0
 
     return logits
+
+
+_NEG_INF_I32_CACHE: dict = {}
+_NEG_ONE_I32_CACHE: dict = {}
+
+
+def _neg_inf_scalar(device: torch.device) -> torch.Tensor:
+    """Cached scalar -inf fp32 tensor per device."""
+    key = str(device)
+    t = _NEG_INF_I32_CACHE.get(key)
+    if t is None:
+        t = torch.tensor(float("-inf"), device=device, dtype=torch.float32)
+        _NEG_INF_I32_CACHE[key] = t
+    return t
+
+
+def _neg_one_i32_scalar(device: torch.device) -> torch.Tensor:
+    """Cached scalar -1 int32 tensor per device."""
+    key = str(device)
+    t = _NEG_ONE_I32_CACHE.get(key)
+    if t is None:
+        t = torch.tensor(-1, device=device, dtype=torch.int32)
+        _NEG_ONE_I32_CACHE[key] = t
+    return t
 
 
 def topk_transform_512_pytorch_vectorized(
@@ -104,13 +200,18 @@ def topk_transform_512_pytorch_vectorized(
     page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
     page_mask = page_size - 1
 
-    positions = (
-        torch.arange(max_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    )
-    valid_mask = positions < seq_lens.unsqueeze(1)
+    # Per-device cached scalar constants — constructing torch.tensor(...) on
+    # the device path here would otherwise force an H2D copy + sync per call
+    # (this function runs per-layer per prefill chunk).
+    neg_inf = _neg_inf_scalar(device)
+    neg_one_i32 = _neg_one_i32_scalar(device)
 
-    masked_scores = scores.clone()
-    masked_scores[~valid_mask] = float("-inf")
+    positions = torch.arange(max_seq_len, device=device).unsqueeze(0)  # (1, S)
+    valid_mask = positions < seq_lens.unsqueeze(1)                     # (B, S)
+
+    # NOTE: avoid `masked_scores[~valid_mask] = float("-inf")` — boolean-
+    # indexed scatter writes are a known L0 sync hot spot on Intel XPU.
+    masked_scores = torch.where(valid_mask, scores, neg_inf)
 
     actual_k = min(TOPK, max_seq_len)
     _, raw_indices = torch.topk(
@@ -124,39 +225,35 @@ def topk_transform_512_pytorch_vectorized(
         )
         raw_indices = torch.cat([raw_indices, padding], dim=1)
 
-    batch_indices = (
-        torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, TOPK)
-    )
-    gathered_scores = scores[
-        batch_indices.flatten(), raw_indices.clamp(min=0).flatten()
-    ].view(batch_size, TOPK)
+    # Gather along dim=1 with a single int64 gather kernel — significantly
+    # cheaper than the 2-D advanced index `scores[batch_idx.flatten(),
+    # raw.flatten()].view(...)` pattern, which materializes a flat int64
+    # index tensor of size B*TOPK for every call.
+    gather_idx = raw_indices.clamp(min=0).to(torch.long)
+    gathered_scores = torch.gather(scores, dim=1, index=gather_idx)
 
     valid_topk = gathered_scores != float("-inf")
     if actual_k < TOPK:
         pad_mask = torch.arange(TOPK, device=device).unsqueeze(0) >= actual_k
         valid_topk = valid_topk & ~pad_mask
 
-    needs_sequential = seq_lens <= TOPK
-    if needs_sequential.any():
-        sequential_indices = (
-            torch.arange(TOPK, device=device, dtype=torch.int32)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
+    # Always run the sequential override (cheap when no row hits it).
+    # Previously this was guarded by `if needs_sequential.any():` which
+    # forced a D2H sync per call on XPU.
+    needs_sequential = (seq_lens <= TOPK).unsqueeze(1)  # (B, 1) bool
+    sequential_indices = torch.arange(
+        TOPK, device=device, dtype=torch.int32
+    ).unsqueeze(0)                                       # (1, TOPK)
+    sequential_valid = sequential_indices < seq_lens.unsqueeze(1).to(
+        sequential_indices.dtype
+    )                                                    # (B, TOPK)
 
-        raw_indices = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK),
-            torch.where(
-                sequential_valid,
-                sequential_indices,
-                torch.tensor(-1, device=device, dtype=torch.int32),
-            ),
-            raw_indices,
-        )
-        valid_topk = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK), sequential_valid, valid_topk
-        )
+    raw_indices = torch.where(
+        needs_sequential,
+        torch.where(sequential_valid, sequential_indices, neg_one_i32),
+        raw_indices,
+    )
+    valid_topk = torch.where(needs_sequential, sequential_valid, valid_topk)
 
     page_idx = raw_indices >> page_bits
     offset_in_page = raw_indices & page_mask
@@ -167,16 +264,12 @@ def topk_transform_512_pytorch_vectorized(
     page_indices = (physical_pages << page_bits) | offset_in_page
     page_indices = page_indices.to(torch.int32)
 
-    page_indices = torch.where(
-        valid_topk, page_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-    )
+    page_indices = torch.where(valid_topk, page_indices, neg_one_i32)
 
     out_page_indices.copy_(page_indices)
 
     if out_raw_indices is not None:
-        raw_indices = torch.where(
-            valid_topk, raw_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-        )
+        raw_indices = torch.where(valid_topk, raw_indices, neg_one_i32)
         out_raw_indices.copy_(raw_indices)
 
 
@@ -376,7 +469,7 @@ class C4IndexerBackend:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_sm120 or _is_xpu:
             fn = fp8_paged_mqa_logits_torch
         else:
             if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:

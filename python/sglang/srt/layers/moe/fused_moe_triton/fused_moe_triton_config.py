@@ -10,10 +10,11 @@ import torch
 import triton
 
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_device_name, is_hip
+from sglang.srt.utils import get_device_name, is_hip, is_xpu
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 
 def get_config_file_name(
@@ -182,6 +183,31 @@ def get_default_config(
                 "num_warps": 4,
                 "num_stages": 2 if _is_hip else 3,
             }
+        if _is_xpu:
+            # Intel Arc / Xe-HPG GPUs have ~64 KiB of SLM per work-group.
+            # The CUDA defaults above (large BLOCK_SIZE_N and num_stages>=3)
+            # exceed that budget and trigger
+            # UR_RESULT_ERROR_OUT_OF_RESOURCES at kernel launch. Use a
+            # conservative tile that fits, while still respecting the
+            # block_shape divisibility constraints when present.
+            if block_shape is None:
+                config = {
+                    "BLOCK_SIZE_M": 32,
+                    "BLOCK_SIZE_N": 64,
+                    "BLOCK_SIZE_K": 64,
+                    "GROUP_SIZE_M": 8,
+                    "num_warps": 4,
+                    "num_stages": 2,
+                }
+            else:
+                config = {
+                    "BLOCK_SIZE_M": 32,
+                    "BLOCK_SIZE_N": block_shape[0],
+                    "BLOCK_SIZE_K": block_shape[1],
+                    "GROUP_SIZE_M": 8,
+                    "num_warps": 4,
+                    "num_stages": 2,
+                }
     else:
         config = {
             "BLOCK_SIZE_M": 64,

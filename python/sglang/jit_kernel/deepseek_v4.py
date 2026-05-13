@@ -16,10 +16,17 @@ from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_cuda, is_xpu
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+
+# JIT-compiled CUDA kernels in this module require tvm_ffi and a working CUDA
+# toolchain. On non-CUDA backends (e.g. XPU) those entrypoints fall back to
+# triton/torch implementations.
+_is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 def make_name(name: str) -> str:
     return f"dpsk_v4_{name}"
@@ -474,17 +481,30 @@ class CompressorPrefillPlan(NamedTuple):
             device=seq_lens.device,
             pin_memory=seq_lens.is_cpu,
         )
-        module = _jit_common_module()
         is_overlap = compress_ratio == 4
-        plan_lens = module.plan_compress_prefill(
-            extend_lens,
-            seq_lens,
-            plan_tensor[0],
-            plan_tensor[1],
-            compress_ratio,
-            is_overlap,
-            use_cuda_graph,
-        )
+        if _is_cuda:
+            module = _jit_common_module()
+            plan_lens = module.plan_compress_prefill(
+                extend_lens,
+                seq_lens,
+                plan_tensor[0],
+                plan_tensor[1],
+                compress_ratio,
+                is_overlap,
+                use_cuda_graph,
+            )
+        else:
+            # Pure-torch fallback on non-CUDA backends (e.g. XPU). Mirrors
+            # plan_prefill_host in jit_kernel/csrc/deepseek_v4/common.cuh.
+            plan_lens = _torch_plan_compress_prefill(
+                extend_lens,
+                seq_lens,
+                plan_tensor[0],
+                plan_tensor[1],
+                compress_ratio,
+                is_overlap,
+                use_cuda_graph,
+            )
         return CompressorPrefillPlan(
             compress_ratio,
             plan_tensor[0, : plan_lens[0]].to(device, non_blocking=True),
@@ -526,6 +546,773 @@ class CompressorPrefillPlan(NamedTuple):
     @property
     def is_decode(self) -> bool:
         return False
+
+
+def _torch_plan_compress_prefill(
+    extend_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    compress_plan: torch.Tensor,
+    write_plan: torch.Tensor,
+    compress_ratio: int,
+    is_overlap: bool,
+    use_cuda_graph: bool,
+) -> Tuple[int, int]:
+    """Pure-torch fallback for ``plan_compress_prefill``.
+
+    Mirrors ``host::compress::plan_prefill_host`` in
+    ``jit_kernel/csrc/deepseek_v4/common.cuh``. Each plan slot is
+    ``PrefillPlan{ragged_id, batch_id, position, window_len}`` packed as
+    4 little-endian uint32 (16 bytes).
+    """
+    import struct
+
+    assert compress_plan.dtype == torch.uint8
+    assert write_plan.dtype == torch.uint8
+    num_tokens = compress_plan.shape[0]
+    assert write_plan.shape[0] == num_tokens
+    assert compress_plan.shape[1] == 16 and write_plan.shape[1] == 16
+
+    extend_lens_cpu = extend_lens.detach().to("cpu", dtype=torch.int64).tolist()
+    seq_lens_cpu = seq_lens.detach().to("cpu", dtype=torch.int64).tolist()
+    batch_size = len(extend_lens_cpu)
+    assert len(seq_lens_cpu) == batch_size
+
+    ratio = compress_ratio * (2 if is_overlap else 1)
+    counter = 0
+    compress_entries: list = []
+    write_entries: list = []
+
+    for i in range(batch_size):
+        seq_len = int(seq_lens_cpu[i])
+        extend_len = int(extend_lens_cpu[i])
+        assert 0 < extend_len <= seq_len
+        prefix_len = seq_len - extend_len
+        pos = (seq_len // compress_ratio) * compress_ratio
+        if is_overlap:
+            start_write_pos = pos - compress_ratio if pos >= compress_ratio else 0
+        else:
+            start_write_pos = pos
+        for j in range(extend_len):
+            position = prefix_len + j
+            window_len = ratio - min(j + 1, ratio)
+            plan = (counter + j, i, position, window_len)
+            if (position + 1) % compress_ratio == 0:
+                compress_entries.append(plan)
+            if position >= start_write_pos:
+                write_entries.append(plan)
+        counter += extend_len
+    assert (
+        counter == num_tokens
+    ), f"input size {counter} != num_q_tokens {num_tokens}"
+
+    kInvalid = 0xFFFFFFFF
+    invalid_row = struct.pack("<IIII", kInvalid, kInvalid, kInvalid, kInvalid)
+
+    def _fill(buf: torch.Tensor, entries: list) -> int:
+        n_entries = len(entries)
+        n_rows = num_tokens if use_cuda_graph else n_entries
+        if n_rows == 0:
+            return num_tokens if use_cuda_graph else 0
+        valid_bytes = b"".join(struct.pack("<IIII", *e) for e in entries)
+        if use_cuda_graph and n_entries < num_tokens:
+            payload = valid_bytes + invalid_row * (num_tokens - n_entries)
+        else:
+            payload = valid_bytes
+        cpu_view = torch.frombuffer(bytearray(payload), dtype=torch.uint8).view(
+            n_rows, 16
+        )
+        buf[:n_rows].copy_(cpu_view)
+        return num_tokens if use_cuda_graph else n_entries
+
+    compress_count = _fill(compress_plan, compress_entries)
+    write_count = _fill(write_plan, write_entries)
+    return compress_count, write_count
+
+
+def _decode_prefill_plan(plan_bytes: torch.Tensor) -> torch.Tensor:
+    """Decode packed PrefillPlan tensor ([N, 16] uint8) into [N, 4] int64.
+
+    Each plan slot is 4 little-endian uint32:
+    (ragged_id, batch_id, position, window_len). Invalid entries use
+    ``0xFFFFFFFF`` for every field.
+
+    On-device bitcast: avoids a D->H sync that drains the L0 queue every
+    layer on XPU. uint8 [N, 16] is reinterpreted as int32 [N, 4] (LE on
+    XPU/x86), promoted to int64, then masked to keep the unsigned value
+    so that the kInvalid sentinel 0xFFFFFFFF (which would bitcast to -1
+    in int32) compares correctly.
+    """
+    t = plan_bytes.detach().contiguous()
+    as_i32 = t.view(torch.int32).reshape(-1, 4)
+    return as_i32.to(torch.int64) & 0xFFFFFFFF
+
+
+# ---------------------------------------------------------------------------
+# Triton fallbacks for non-CUDA backends (XPU/AMD).
+#
+# These kernels mirror the CUDA c{4,128} kernels exactly. Each program
+# fuses gather + softmax + weighted-sum for one (work_item, head_dim_split)
+# tile, avoiding the intermediate [B, 128, HD] / [N, 128, HD] allocations
+# a torch implementation would need.
+#
+# Layout reminders (matching the C++ kernels):
+#   c4 buffer:  [N_idx, page_size, 4*HD]  | kv_overlap | kv | score_ovr | score |
+#               page_size = 4 (paged) or 8 (ring)
+#   c4 input:   [N_q,                4*HD] same chunk layout
+#   c128 buffer:[N_idx, 128,         2*HD] | kv | score |
+#   c128 input: [N_q,                2*HD] same chunk layout
+#   ape:        [SEQ, HD]   SEQ = 8 for c4, 128 for c128
+#
+# Plan tensor on entry is [N_plan, 16] uint8; we view it as int32 [N_plan, 4]:
+#   (ragged_id, batch_id, position, window_len), with 0xFFFFFFFF (== -1 as
+#   int32) as the invalid sentinel.
+# ---------------------------------------------------------------------------
+
+
+def _pick_block_hd(head_dim: int) -> int:
+    # Triton tiles need power-of-two; HD is always a multiple of 128 here.
+    return head_dim if head_dim <= 128 else 128
+
+
+# --- c128 decode -----------------------------------------------------------
+
+
+@triton.jit
+def _triton_c128_decode_kernel(
+    buf_ptr,            # [N_idx, 128, 2*HD]
+    inp_ptr,            # [B, 2*HD]
+    out_ptr,            # [B, HD]
+    ape_ptr,            # [128, HD]
+    indices_ptr,        # [B] int32
+    seq_lens_ptr,       # [B] int32
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+):
+    SEQ: tl.constexpr = 128
+    pid_b = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    index = tl.load(indices_ptr + pid_b).to(tl.int64)
+    seq_len = tl.load(seq_lens_ptr + pid_b).to(tl.int64)
+
+    offs_hd = pid_s * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    hd_mask = offs_hd < HD
+
+    # Load the current step's kv + score (input chunks 0 and 1).
+    inp_base = inp_ptr + pid_b * (2 * HD)
+    inp_kv = tl.load(inp_base + offs_hd, mask=hd_mask)
+    inp_score = tl.load(inp_base + HD + offs_hd, mask=hd_mask)
+
+    do_fwd = (seq_len % SEQ) == 0
+
+    if do_fwd:
+        # When seq_len % 128 == 0, write_pos == 127. Read positions 0..126
+        # from the buffer; supply position 127 from `inp_kv`/`inp_score`
+        # directly to avoid depending on store-then-load coherence inside
+        # the same program.
+        offs_s = tl.arange(0, SEQ)
+        is_last = (offs_s == (SEQ - 1))[:, None]
+
+        slot_off_2d = (
+            index * (SEQ * 2 * HD)
+            + offs_s[:, None].to(tl.int64) * (2 * HD)
+            + offs_hd[None, :].to(tl.int64)
+        )
+        load_mask = (~is_last) & hd_mask[None, :]
+        buf_kv = tl.load(buf_ptr + slot_off_2d, mask=load_mask, other=0.0).to(tl.float32)
+        buf_score = tl.load(buf_ptr + slot_off_2d + HD, mask=load_mask, other=0.0).to(tl.float32)
+
+        kv_t = tl.where(is_last, inp_kv[None, :].to(tl.float32), buf_kv)
+        score_t = tl.where(is_last, inp_score[None, :].to(tl.float32), buf_score)
+
+        bias = tl.load(
+            ape_ptr + offs_s[:, None] * HD + offs_hd[None, :],
+            mask=hd_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        s = score_t + bias
+        m = tl.max(s, axis=0)
+        w = tl.exp(s - m[None, :])
+        num = tl.sum(kv_t * w, axis=0)
+        den = tl.sum(w, axis=0)
+        result = num / den
+
+        tl.store(out_ptr + pid_b * HD + offs_hd, result, mask=hd_mask)
+
+    # Always commit the current step into the buffer at write_pos. Done last
+    # so the conditional forward above never reads our own pending store.
+    write_pos = (seq_len + (SEQ - 1)) % SEQ
+    write_base = buf_ptr + index * (SEQ * 2 * HD) + write_pos * (2 * HD)
+    tl.store(write_base + offs_hd, inp_kv, mask=hd_mask)
+    tl.store(write_base + HD + offs_hd, inp_score, mask=hd_mask)
+
+
+# --- c128 prefill ----------------------------------------------------------
+
+
+@triton.jit
+def _triton_c128_prefill_compress_kernel(
+    buf_ptr,
+    inp_ptr,
+    out_ptr,
+    ape_ptr,
+    plan_ptr,           # [N_plan, 4] int32 (ragged_id, batch_id, position, window_len)
+    load_indices_ptr,   # [B] int32  (== `indices` when no extra is provided)
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+):
+    SEQ: tl.constexpr = 128
+    pid_p = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    plan_base = plan_ptr + pid_p * 4
+    ragged_id = tl.load(plan_base + 0)
+    batch_id = tl.load(plan_base + 1)
+    window_len = tl.load(plan_base + 3)
+
+    if ragged_id == -1:
+        return
+
+    index = tl.load(load_indices_ptr + batch_id.to(tl.int64)).to(tl.int64)
+
+    offs_hd = pid_s * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    hd_mask = offs_hd < HD
+
+    offs_s = tl.arange(0, SEQ)
+    use_buf = (offs_s < window_len)[:, None]
+
+    # Buffer source (j < window_len).
+    buf_off_2d = (
+        index * (SEQ * 2 * HD)
+        + offs_s[:, None].to(tl.int64) * (2 * HD)
+        + offs_hd[None, :].to(tl.int64)
+    )
+    buf_load_mask = use_buf & hd_mask[None, :]
+    buf_kv = tl.load(buf_ptr + buf_off_2d, mask=buf_load_mask, other=0.0).to(tl.float32)
+    buf_score = tl.load(buf_ptr + buf_off_2d + HD, mask=buf_load_mask, other=0.0).to(tl.float32)
+
+    # Ragged tail source: rag_off = max(ragged_id + j - 127, 0).
+    rag_off = tl.maximum(
+        ragged_id.to(tl.int64) + offs_s.to(tl.int64) - (SEQ - 1), 0
+    )
+    rag_off_2d = rag_off[:, None] * (2 * HD) + offs_hd[None, :].to(tl.int64)
+    rag_load_mask = (~use_buf) & hd_mask[None, :]
+    rag_kv = tl.load(inp_ptr + rag_off_2d, mask=rag_load_mask, other=0.0).to(tl.float32)
+    rag_score = tl.load(inp_ptr + rag_off_2d + HD, mask=rag_load_mask, other=0.0).to(tl.float32)
+
+    kv_t = tl.where(use_buf, buf_kv, rag_kv)
+    score_t = tl.where(use_buf, buf_score, rag_score)
+
+    bias = tl.load(
+        ape_ptr + offs_s[:, None] * HD + offs_hd[None, :],
+        mask=hd_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    s = score_t + bias
+    m = tl.max(s, axis=0)
+    w = tl.exp(s - m[None, :])
+    num = tl.sum(kv_t * w, axis=0)
+    den = tl.sum(w, axis=0)
+    result = num / den
+
+    tl.store(out_ptr + ragged_id.to(tl.int64) * HD + offs_hd, result, mask=hd_mask)
+
+
+@triton.jit
+def _triton_c128_prefill_write_kernel(
+    buf_ptr,
+    inp_ptr,
+    plan_ptr,
+    indices_ptr,
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+):
+    SEQ: tl.constexpr = 128
+    pid_p = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    plan_base = plan_ptr + pid_p * 4
+    ragged_id = tl.load(plan_base + 0)
+    batch_id = tl.load(plan_base + 1)
+    position = tl.load(plan_base + 2)
+
+    if ragged_id == -1:
+        return
+
+    index = tl.load(indices_ptr + batch_id.to(tl.int64)).to(tl.int64)
+
+    offs_hd = pid_s * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    hd_mask = offs_hd < HD
+
+    pos = (position % SEQ).to(tl.int64)
+    src_base = inp_ptr + ragged_id.to(tl.int64) * (2 * HD)
+    tgt_base = buf_ptr + index * (SEQ * 2 * HD) + pos * (2 * HD)
+
+    src_kv = tl.load(src_base + offs_hd, mask=hd_mask)
+    src_score = tl.load(src_base + HD + offs_hd, mask=hd_mask)
+    tl.store(tgt_base + offs_hd, src_kv, mask=hd_mask)
+    tl.store(tgt_base + HD + offs_hd, src_score, mask=hd_mask)
+
+
+# --- c4 decode -------------------------------------------------------------
+
+
+@triton.jit
+def _triton_c4_decode_kernel(
+    buf_ptr,
+    inp_ptr,
+    out_ptr,
+    ape_ptr,
+    indices_ptr,
+    seq_lens_ptr,
+    extra_ptr,            # [B] int32 (index_prev) for paged; ignored for ring
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,    # 4 (paged) or 8 (ring)
+):
+    SEQ: tl.constexpr = 8
+    NUM_CHUNKS: tl.constexpr = 4
+    PAGED: tl.constexpr = (PAGE_SIZE == 4)
+    STRIDE_IDX: tl.constexpr = PAGE_SIZE * NUM_CHUNKS * HD
+    STRIDE_POS: tl.constexpr = NUM_CHUNKS * HD
+
+    pid_b = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    index = tl.load(indices_ptr + pid_b).to(tl.int64)
+    seq_len = tl.load(seq_lens_ptr + pid_b).to(tl.int64)
+
+    offs_hd = pid_s * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    hd_mask = offs_hd < HD
+
+    # Input chunks (0=kv_ovr, 1=kv, 2=score_ovr, 3=score).
+    inp_base = inp_ptr + pid_b * (NUM_CHUNKS * HD)
+    inp_kv_ovr = tl.load(inp_base + 0 * HD + offs_hd, mask=hd_mask)
+    inp_kv = tl.load(inp_base + 1 * HD + offs_hd, mask=hd_mask)
+    inp_score_ovr = tl.load(inp_base + 2 * HD + offs_hd, mask=hd_mask)
+    inp_score = tl.load(inp_base + 3 * HD + offs_hd, mask=hd_mask)
+
+    do_fwd = (seq_len % 4) == 0
+
+    if do_fwd:
+        offs_s = tl.arange(0, SEQ)
+        chunk_kv_off = tl.where(offs_s < 4, 0, HD).to(tl.int64)
+        chunk_score_off = chunk_kv_off + 2 * HD
+
+        if PAGED:
+            index_prev = tl.load(extra_ptr + pid_b).to(tl.int64)
+            page_idx = tl.where(offs_s < 4, index_prev, index)
+            slot_pos = (offs_s % 4).to(tl.int64)
+            slot_base_2d = page_idx[:, None] * STRIDE_IDX + slot_pos[:, None] * STRIDE_POS
+        else:
+            slot_pos = (seq_len + offs_s.to(tl.int64)) % 8
+            slot_base_2d = index * STRIDE_IDX + slot_pos[:, None] * STRIDE_POS
+
+        kv_off_2d = slot_base_2d + chunk_kv_off[:, None] + offs_hd[None, :].to(tl.int64)
+        score_off_2d = slot_base_2d + chunk_score_off[:, None] + offs_hd[None, :].to(tl.int64)
+
+        # i == 7 (newest entry) is supplied by the input directly to avoid
+        # depending on store-then-load coherence (we may not have written it
+        # yet; even if we had, the buffer write happens at the end).
+        is_i7 = (offs_s == 7)[:, None]
+        load_mask = (~is_i7) & hd_mask[None, :]
+        buf_kv = tl.load(buf_ptr + kv_off_2d, mask=load_mask, other=0.0).to(tl.float32)
+        buf_score = tl.load(buf_ptr + score_off_2d, mask=load_mask, other=0.0).to(tl.float32)
+
+        kv_t = tl.where(is_i7, inp_kv[None, :].to(tl.float32), buf_kv)
+        score_t = tl.where(is_i7, inp_score[None, :].to(tl.float32), buf_score)
+
+        # seq_len == 4 special case: zero overlap kv, -inf overlap score.
+        sl4_active = ((seq_len == 4) & (offs_s < 4))[:, None]
+        kv_t = tl.where(sl4_active, tl.zeros([SEQ, BLOCK_HD], tl.float32), kv_t)
+        score_t = tl.where(
+            sl4_active, tl.full([SEQ, BLOCK_HD], -1e9, tl.float32), score_t
+        )
+
+        bias = tl.load(
+            ape_ptr + offs_s[:, None] * HD + offs_hd[None, :],
+            mask=hd_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        s = score_t + bias
+        m = tl.max(s, axis=0)
+        w = tl.exp(s - m[None, :])
+        num = tl.sum(kv_t * w, axis=0)
+        den = tl.sum(w, axis=0)
+        result = num / den
+
+        tl.store(out_ptr + pid_b * HD + offs_hd, result, mask=hd_mask)
+
+    # Always commit the current step (4 chunks) at write_pos.
+    write_pos = (seq_len + PAGE_SIZE - 1) % PAGE_SIZE
+    write_base = buf_ptr + index * STRIDE_IDX + write_pos * STRIDE_POS
+    tl.store(write_base + 0 * HD + offs_hd, inp_kv_ovr, mask=hd_mask)
+    tl.store(write_base + 1 * HD + offs_hd, inp_kv, mask=hd_mask)
+    tl.store(write_base + 2 * HD + offs_hd, inp_score_ovr, mask=hd_mask)
+    tl.store(write_base + 3 * HD + offs_hd, inp_score, mask=hd_mask)
+
+
+# --- c4 prefill ------------------------------------------------------------
+
+
+@triton.jit
+def _triton_c4_prefill_compress_kernel(
+    buf_ptr,
+    inp_ptr,
+    out_ptr,
+    ape_ptr,
+    plan_ptr,
+    indices_ptr,
+    extra_ptr,            # [B, 4] int32 for paged; ignored for ring
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+):
+    SEQ: tl.constexpr = 8
+    NUM_CHUNKS: tl.constexpr = 4
+    PAGED: tl.constexpr = (PAGE_SIZE == 4)
+    STRIDE_IDX: tl.constexpr = PAGE_SIZE * NUM_CHUNKS * HD
+    STRIDE_POS: tl.constexpr = NUM_CHUNKS * HD
+
+    pid_p = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    plan_base = plan_ptr + pid_p * 4
+    ragged_id = tl.load(plan_base + 0)
+    batch_id = tl.load(plan_base + 1)
+    position = tl.load(plan_base + 2)
+    window_len = tl.load(plan_base + 3)
+
+    if ragged_id == -1:
+        return
+
+    seq_len = position + 1
+
+    offs_hd = pid_s * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    hd_mask = offs_hd < HD
+
+    offs_s = tl.arange(0, SEQ)
+    use_buf = (offs_s < window_len)[:, None]
+    chunk_kv_off = tl.where(offs_s < 4, 0, HD).to(tl.int64)
+    chunk_score_off = chunk_kv_off + 2 * HD
+
+    # ---- Buffer offsets ----
+    if PAGED:
+        ex_base = extra_ptr + batch_id.to(tl.int64) * 4
+        load_first_page = tl.load(ex_base + 0).to(tl.int64)
+        load_second_page = tl.load(ex_base + 1).to(tl.int64)
+        # When window_len <= 4 the overlap half is unused, so reuse load_second
+        # to keep loads in-bounds (matches the CUDA kernel's selection).
+        page_idx_overlap = tl.where(window_len <= 4, load_second_page, load_first_page)
+        page_idx = tl.where(offs_s < 4, page_idx_overlap, load_second_page)
+        slot_pos = (offs_s % 4).to(tl.int64)
+        slot_base_2d = page_idx[:, None] * STRIDE_IDX + slot_pos[:, None] * STRIDE_POS
+    else:
+        page_idx_scalar = tl.load(indices_ptr + batch_id.to(tl.int64)).to(tl.int64)
+        slot_pos = (seq_len.to(tl.int64) + offs_s.to(tl.int64)) % 8
+        slot_base_2d = page_idx_scalar * STRIDE_IDX + slot_pos[:, None] * STRIDE_POS
+
+    kv_off_2d = slot_base_2d + chunk_kv_off[:, None] + offs_hd[None, :].to(tl.int64)
+    score_off_2d = slot_base_2d + chunk_score_off[:, None] + offs_hd[None, :].to(tl.int64)
+    buf_load_mask = use_buf & hd_mask[None, :]
+    buf_kv = tl.load(buf_ptr + kv_off_2d, mask=buf_load_mask, other=0.0).to(tl.float32)
+    buf_score = tl.load(buf_ptr + score_off_2d, mask=buf_load_mask, other=0.0).to(tl.float32)
+
+    # ---- Ragged tail offsets: rag_off = max(ragged_id + i - 7, 0) ----
+    rag_off = tl.maximum(ragged_id.to(tl.int64) + offs_s.to(tl.int64) - 7, 0)
+    rag_base_2d = rag_off[:, None] * (NUM_CHUNKS * HD)
+    rag_kv_off_2d = rag_base_2d + chunk_kv_off[:, None] + offs_hd[None, :].to(tl.int64)
+    rag_score_off_2d = rag_base_2d + chunk_score_off[:, None] + offs_hd[None, :].to(tl.int64)
+    rag_load_mask = (~use_buf) & hd_mask[None, :]
+    rag_kv = tl.load(inp_ptr + rag_kv_off_2d, mask=rag_load_mask, other=0.0).to(tl.float32)
+    rag_score = tl.load(inp_ptr + rag_score_off_2d, mask=rag_load_mask, other=0.0).to(tl.float32)
+
+    kv_t = tl.where(use_buf, buf_kv, rag_kv)
+    score_t = tl.where(use_buf, buf_score, rag_score)
+
+    sl4_active = ((seq_len == 4) & (offs_s < 4))[:, None]
+    kv_t = tl.where(sl4_active, tl.zeros([SEQ, BLOCK_HD], tl.float32), kv_t)
+    score_t = tl.where(
+        sl4_active, tl.full([SEQ, BLOCK_HD], -1e9, tl.float32), score_t
+    )
+
+    bias = tl.load(
+        ape_ptr + offs_s[:, None] * HD + offs_hd[None, :],
+        mask=hd_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    s = score_t + bias
+    m = tl.max(s, axis=0)
+    w = tl.exp(s - m[None, :])
+    num = tl.sum(kv_t * w, axis=0)
+    den = tl.sum(w, axis=0)
+    result = num / den
+
+    tl.store(out_ptr + ragged_id.to(tl.int64) * HD + offs_hd, result, mask=hd_mask)
+
+
+@triton.jit
+def _triton_c4_prefill_write_kernel(
+    buf_ptr,
+    inp_ptr,
+    plan_ptr,
+    indices_ptr,
+    extra_ptr,
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+):
+    NUM_CHUNKS: tl.constexpr = 4
+    PAGED: tl.constexpr = (PAGE_SIZE == 4)
+    STRIDE_IDX: tl.constexpr = PAGE_SIZE * NUM_CHUNKS * HD
+    STRIDE_POS: tl.constexpr = NUM_CHUNKS * HD
+
+    pid_p = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    plan_base = plan_ptr + pid_p * 4
+    ragged_id = tl.load(plan_base + 0)
+    batch_id = tl.load(plan_base + 1)
+    position = tl.load(plan_base + 2)
+
+    if ragged_id == -1:
+        return
+
+    offs_hd = pid_s * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    hd_mask = offs_hd < HD
+
+    if PAGED:
+        ex_base = extra_ptr + batch_id.to(tl.int64) * 4
+        write_first_page = tl.load(ex_base + 2).to(tl.int64)
+        last_pos = tl.load(ex_base + 3)
+        write_second_page = tl.load(indices_ptr + batch_id.to(tl.int64)).to(tl.int64)
+        tgt_index = tl.where(position < last_pos, write_first_page, write_second_page)
+        tgt_pos = (position % 4).to(tl.int64)
+    else:
+        tgt_index = tl.load(indices_ptr + batch_id.to(tl.int64)).to(tl.int64)
+        tgt_pos = (position % 8).to(tl.int64)
+
+    src_base = inp_ptr + ragged_id.to(tl.int64) * (NUM_CHUNKS * HD)
+    tgt_base = buf_ptr + tgt_index * STRIDE_IDX + tgt_pos * STRIDE_POS
+
+    for c in tl.static_range(NUM_CHUNKS):
+        v = tl.load(src_base + c * HD + offs_hd, mask=hd_mask)
+        tl.store(tgt_base + c * HD + offs_hd, v, mask=hd_mask)
+
+
+# --- Triton wrapper functions ----------------------------------------------
+
+
+def _triton_c128_decode(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    head_dim: int,
+) -> None:
+    B = indices.shape[0]
+    if B == 0:
+        return
+    BLOCK_HD = _pick_block_hd(head_dim)
+    grid = (B, triton.cdiv(head_dim, BLOCK_HD))
+    _triton_c128_decode_kernel[grid](
+        kv_score_buffer,
+        kv_score_input,
+        out,
+        ape,
+        indices,
+        seq_lens,
+        HD=head_dim,
+        BLOCK_HD=BLOCK_HD,
+    )
+
+
+def _triton_c128_prefill(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    compress_plan_bytes: torch.Tensor,
+    write_plan_bytes: torch.Tensor,
+    extra: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+) -> None:
+    cplan = compress_plan_bytes.view(torch.int32).reshape(-1, 4)
+    wplan = write_plan_bytes.view(torch.int32).reshape(-1, 4)
+    load_indices = extra if extra is not None else indices
+    BLOCK_HD = _pick_block_hd(head_dim)
+    if cplan.shape[0] > 0:
+        grid = (cplan.shape[0], triton.cdiv(head_dim, BLOCK_HD))
+        _triton_c128_prefill_compress_kernel[grid](
+            kv_score_buffer,
+            kv_score_input,
+            out,
+            ape,
+            cplan,
+            load_indices,
+            HD=head_dim,
+            BLOCK_HD=BLOCK_HD,
+        )
+    if wplan.shape[0] > 0:
+        grid = (wplan.shape[0], triton.cdiv(head_dim, BLOCK_HD))
+        _triton_c128_prefill_write_kernel[grid](
+            kv_score_buffer,
+            kv_score_input,
+            wplan,
+            indices,
+            HD=head_dim,
+            BLOCK_HD=BLOCK_HD,
+        )
+
+
+def _triton_c4_decode(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extra: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+) -> None:
+    B = indices.shape[0]
+    if B == 0:
+        return
+    page_size = kv_score_buffer.shape[1]
+    assert page_size in (4, 8)
+    BLOCK_HD = _pick_block_hd(head_dim)
+    grid = (B, triton.cdiv(head_dim, BLOCK_HD))
+    extra_arg = extra if extra is not None else indices  # dummy ptr for ring
+    _triton_c4_decode_kernel[grid](
+        kv_score_buffer,
+        kv_score_input,
+        out,
+        ape,
+        indices,
+        seq_lens,
+        extra_arg,
+        HD=head_dim,
+        BLOCK_HD=BLOCK_HD,
+        PAGE_SIZE=page_size,
+    )
+
+
+def _triton_c4_prefill(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    compress_plan_bytes: torch.Tensor,
+    write_plan_bytes: torch.Tensor,
+    extra: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+) -> None:
+    page_size = kv_score_buffer.shape[1]
+    assert page_size in (4, 8)
+    BLOCK_HD = _pick_block_hd(head_dim)
+    cplan = compress_plan_bytes.view(torch.int32).reshape(-1, 4)
+    wplan = write_plan_bytes.view(torch.int32).reshape(-1, 4)
+    extra_arg = extra if extra is not None else indices  # dummy ptr for ring
+    if cplan.shape[0] > 0:
+        grid = (cplan.shape[0], triton.cdiv(head_dim, BLOCK_HD))
+        _triton_c4_prefill_compress_kernel[grid](
+            kv_score_buffer,
+            kv_score_input,
+            out,
+            ape,
+            cplan,
+            indices,
+            extra_arg,
+            HD=head_dim,
+            BLOCK_HD=BLOCK_HD,
+            PAGE_SIZE=page_size,
+        )
+    if wplan.shape[0] > 0:
+        grid = (wplan.shape[0], triton.cdiv(head_dim, BLOCK_HD))
+        _triton_c4_prefill_write_kernel[grid](
+            kv_score_buffer,
+            kv_score_input,
+            wplan,
+            indices,
+            extra_arg,
+            HD=head_dim,
+            BLOCK_HD=BLOCK_HD,
+            PAGE_SIZE=page_size,
+        )
+
+
+def _triton_compress_forward(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    extra_data: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+    compress_ratio: Literal[4, 128],
+) -> None:
+    if compress_ratio == 4:
+        if plan.is_decode:
+            _triton_c4_decode(
+                kv_score_buffer,
+                kv_score_input,
+                out,
+                ape,
+                indices,
+                plan.seq_lens,
+                extra_data,
+                head_dim=head_dim,
+            )
+        else:
+            _triton_c4_prefill(
+                kv_score_buffer,
+                kv_score_input,
+                out,
+                ape,
+                indices,
+                plan.compress_plan,
+                plan.write_plan,
+                extra_data,
+                head_dim=head_dim,
+            )
+    else:
+        assert compress_ratio == 128
+        if plan.is_decode:
+            _triton_c128_decode(
+                kv_score_buffer,
+                kv_score_input,
+                out,
+                ape,
+                indices,
+                plan.seq_lens,
+                head_dim=head_dim,
+            )
+        else:
+            _triton_c128_prefill(
+                kv_score_buffer,
+                kv_score_input,
+                out,
+                ape,
+                indices,
+                plan.compress_plan,
+                plan.write_plan,
+                extra_data,
+                head_dim=head_dim,
+            )
 
 
 class CompressorDecodePlan(NamedTuple):
@@ -596,6 +1383,21 @@ def compress_forward(
         F = online_module.decode if plan.is_decode else online_module.prefill
         F(kv_score_buffer, kv_score_input, out, ape, indices, *plan[1:], extra_data)
         return out
+    if _is_xpu:
+        # Triton fallback for non-CUDA backends. Mirrors
+        # FlashCompress{4,128}Kernel in jit_kernel/csrc/deepseek_v4/c{4,128}.cuh.
+        _triton_compress_forward(
+            kv_score_buffer,
+            kv_score_input,
+            out,
+            ape,
+            indices,
+            plan,
+            extra_data,
+            head_dim=head_dim,
+            compress_ratio=compress_ratio,
+        )
+        return out
     module = _jit_compress_module(
         head_dim,
         kv_score_input.dtype,
@@ -630,13 +1432,25 @@ def compress_fused_norm_rope_inplace(
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    mode = 1 if plan.is_decode else 0
+    if _is_xpu:
+        _torch_fused_norm_rope(
+            kv,
+            weight,
+            plan[1],
+            freq_cis,
+            mode,
+            eps,
+            plan.compress_ratio,
+        )
+        return
     module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
     module.forward(
         kv,
         weight,
         plan[1],
         freq_cis,
-        int(plan.is_decode),
+        mode,
         eps,
         plan.compress_ratio,
     )
@@ -650,6 +1464,17 @@ def fused_norm_rope_inplace(
     positions: torch.Tensor,
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    if _is_xpu:
+        _torch_fused_norm_rope(
+            kv,
+            weight,
+            positions,
+            freq_cis,
+            2,
+            eps,
+            0,
+        )
+        return
     module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
     module.forward(
         kv,
@@ -662,6 +1487,88 @@ def fused_norm_rope_inplace(
     )
 
 
+def _torch_fused_norm_rope(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    handle: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    mode: int,
+    eps: float,
+    compress_ratio: int,
+) -> None:
+    """Pure-torch fallback for ``FusedNormRopeKernel::forward``.
+
+    Mirrors ``fused_norm_rope`` in
+    ``jit_kernel/csrc/deepseek_v4/fused_norm_rope.cuh``: per-row RMSNorm
+    in-place, then RoPE on the trailing ``rope_dim`` of each selected row.
+
+    ``mode``:
+      0 = CompressExtend  (handle = packed PrefillPlan, [N, 16] uint8)
+      1 = CompressDecode  (handle = seq_lens, [N])
+      2 = DefaultForward  (handle = positions, [N])
+    """
+    head_dim = input_tensor.shape[-1]
+    rope_dim = freqs_cis.shape[-1]
+    device = input_tensor.device
+    in_dtype = input_tensor.dtype
+
+    if mode == 0:
+        # Prefill plan is already pre-sliced to its exact valid length on
+        # the host (no cuda-graph padding on the prefill path), so all rows
+        # are valid. Avoid the per-layer ``bool((plan != INVALID).any())``
+        # / boolean-mask gather host-syncs that drain the L0 queue.
+        plan = _decode_prefill_plan(handle)
+        if plan.shape[0] == 0:
+            return
+        rows = plan[:, 0]
+        positions = plan[:, 2] + 1 - compress_ratio
+        row_mask = None  # writeback unconditional via index
+    elif mode == 1:
+        # Decode: avoid host syncs (``bool(valid.any())`` /
+        # ``valid.nonzero()``) that drain the L0 queue every layer.
+        # Compute over all rows and mask the writeback with torch.where.
+        seq_lens = handle.to(torch.int64)
+        valid = (seq_lens % compress_ratio) == 0  # [B] bool
+        num_works = seq_lens.shape[0]
+        rows = torch.arange(num_works, device=device, dtype=torch.int64)
+        # For invalid rows, ``positions`` would be negative; clamp to 0
+        # so freqs_cis[positions] is always in-bounds. Result is masked
+        # out below before writeback.
+        positions = (seq_lens - compress_ratio).clamp_min(0)
+        row_mask = valid
+    elif mode == 2:
+        num_works = handle.shape[0]
+        positions = handle.to(torch.int64)
+        rows = torch.arange(num_works, device=device, dtype=torch.int64)
+        row_mask = None
+    else:
+        raise ValueError(f"unsupported fused_norm_rope mode: {mode}")
+
+    # RMSNorm in-place on selected rows.
+    x = input_tensor[rows].float()  # [N, head_dim]
+    var = (x * x).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(var + eps) * weight.float()
+
+    # RoPE on the trailing rope_dim, viewed as (real, imag) interleaved pairs.
+    n = x.shape[0]
+    rope = x[..., -rope_dim:].view(n, rope_dim // 2, 2)
+    freq = freqs_cis.float()[positions].view(n, rope_dim // 2, 2)
+    xr, xi = rope[..., 0], rope[..., 1]
+    fr, fi = freq[..., 0], freq[..., 1]
+    out_r = xr * fr - xi * fi
+    out_i = xr * fi + xi * fr
+    rope_out = torch.stack([out_r, out_i], dim=-1).reshape(n, rope_dim)
+    x[..., -rope_dim:] = rope_out
+    if row_mask is None:
+        input_tensor[rows] = x.to(in_dtype)
+    else:
+        # Only update rows where ``valid`` is true; preserve others.
+        mask = row_mask.view(-1, *([1] * (x.ndim - 1)))
+        input_tensor[rows] = torch.where(
+            mask, x.to(in_dtype), input_tensor[rows]
+        )
+
+
 def fused_rope(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -669,9 +1576,21 @@ def fused_rope(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
-    module = _jit_fused_rope_module()
-    module.forward(q, k, freqs_real, positions, inverse)
+    if _is_cuda:
+        freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+        module = _jit_fused_rope_module()
+        module.forward(q, k, freqs_real, positions, inverse)
+    else:
+        # Triton fallback for non-CUDA backends (e.g. XPU). Mirrors
+        # FusedQKRopeKernel: apply rotary embedding in-place to q and
+        # (when provided) k.
+        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+
+        apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
+        if k is not None:
+            apply_rotary_emb_triton(
+                k, freqs_cis, positions=positions, inverse=inverse
+            )
 
 
 @cache_once

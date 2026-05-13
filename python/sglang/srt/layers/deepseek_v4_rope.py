@@ -2,19 +2,22 @@ import math
 from functools import lru_cache
 from typing import Optional
 
-import tilelang
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.utils.common import maybe_torch_compile
 
-tilelang.set_log_level("WARNING")
+try:
+    import tilelang
 
-pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-}
+    tilelang.set_log_level("WARNING")
+    pass_configs = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
+except ImportError:
+    pass
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"

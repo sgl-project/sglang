@@ -32,7 +32,10 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import get_device_sm, is_cuda, is_hip, is_xpu
+
+# _is_sm120 = is_cuda() and get_device_sm() // 10 == 12
+_is_sm120 = True
 
 # from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
@@ -43,6 +46,7 @@ if TYPE_CHECKING:
 
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 if _is_hip:
     try:
@@ -592,7 +596,7 @@ class NativeSparseAttnBackend(
         paged_mqa_schedule_metadata = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
         # Compute it once per forward batch and reuse it across layers.
-        if is_cuda() and (
+        if is_cuda() and not (_is_sm120 or _is_xpu) and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
@@ -875,7 +879,7 @@ class NativeSparseAttnBackend(
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
-        if is_cuda() and (
+        if is_cuda() and not (_is_sm120 or _is_xpu) and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend()
@@ -1044,7 +1048,8 @@ class NativeSparseAttnBackend(
             )
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
+        # SM120: skip DeepGEMM metadata — the SM120 fallback handles scheduling internally.
+        if is_cuda() and not (_is_sm120 or _is_xpu) and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend()

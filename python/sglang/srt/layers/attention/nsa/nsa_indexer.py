@@ -17,19 +17,32 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
 )
 
 global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_sm103 = _is_cuda and get_device_sm() == 103
+# _is_sm120 = _is_cuda and get_device_sm() // 10 == 12  # SM120/SM121 (RTX 5090, RTX PRO 6000, DGX Spark)
+_is_sm120 = True
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_xpu = is_xpu()
+
 if _is_cuda:
     try:
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
+
+if _is_sm120 or _is_xpu:
+    from sglang.srt.layers.attention.nsa.sm120_mqa_fallback import (
+        compute_paged_mqa_schedule_metadata as _sm120_compute_paged_mqa_schedule_metadata,
+        sm120_fp8_paged_mqa_logits as _sm120_fp8_paged_mqa_logits,
+        sm120_fp8_mqa_logits as _sm120_fp8_mqa_logits,
+    )
 
 if _is_npu:
     import custom_ops  # noqa: F401
@@ -122,9 +135,31 @@ class BaseIndexerMetadata(ABC):
         """
 
 
+def _torch_hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Pure-torch FWHT fallback for backends without a fused kernel.
+
+    Iterative Cooley-Tukey-style Walsh-Hadamard transform along the last
+    dim. Hidden size must be a power of two; same contract as the fused
+    ``hadamard_transform`` op.
+    """
+    n = x.size(-1)
+    leading = x.shape[:-1]
+    out = x.reshape(-1, n).clone()
+    h = 1
+    while h < n:
+        out = out.view(-1, n // (2 * h), 2, h)
+        a = out[:, :, 0, :]
+        b = out[:, :, 1, :]
+        out = torch.stack((a + b, a - b), dim=2).view(-1, n)
+        h *= 2
+    return out.view(*leading, n) * scale
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip or _is_sm103:
         from fast_hadamard_transform import hadamard_transform
+    elif _is_xpu:
+        hadamard_transform = _torch_hadamard_transform
     else:
         try:
             from sgl_kernel import hadamard_transform
@@ -174,7 +209,12 @@ class Indexer(MultiPlatformOp):
             self.cp_size = None
             self.cp_rank = None
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            if _is_sm120:
+                # SM120: deep_gemm.get_num_sms() crashes; use torch native API
+                props = torch.cuda.get_device_properties(torch.cuda.current_device())
+                self.sm_count = props.multi_processor_count
+            else:
+                self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_global_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
@@ -223,7 +263,7 @@ class Indexer(MultiPlatformOp):
         # request to receive the PP proxy tensor or output from the previous stage, occupying one SM resource.
         # Model execution runs in parallel with the recv operation, so the SMs available to the indexer must be reduced
         # by 1. Currently, the last rank starts the send result + recv request only after waiting for execution results.
-        if self.logits_with_pp_recv:
+        if self.logits_with_pp_recv and not _is_sm120:
             pp_recv_sm_count = 1
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                 self.sm_count - pp_recv_sm_count
@@ -382,11 +422,18 @@ class Indexer(MultiPlatformOp):
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32.unsqueeze(-1) if seqlens_32.dim() == 1 else seqlens_32,
-                    blocksize,
-                    self.sm_count,
-                )
+                if _is_sm120 or _is_xpu:
+                    schedule_metadata = _sm120_compute_paged_mqa_schedule_metadata(
+                        seqlens_32.unsqueeze(-1) if seqlens_32.dim() == 1 else seqlens_32,
+                        blocksize,
+                        self.sm_count,
+                    )
+                else:
+                    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                        seqlens_32.unsqueeze(-1) if seqlens_32.dim() == 1 else seqlens_32,
+                        blocksize,
+                        self.sm_count,
+                    )
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
@@ -428,6 +475,17 @@ class Indexer(MultiPlatformOp):
                 ChunkK=128,
                 TotalCuCount=256,
                 WavePerEU=5,
+            )
+        elif _is_sm120 or _is_xpu:
+            logits = _sm120_fp8_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                seqlens_32.unsqueeze(-1) if seqlens_32.dim() == 1 else seqlens_32,
+                block_tables,
+                schedule_metadata,
+                max_seq_len,
+                clean_logits=False,
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
@@ -545,6 +603,15 @@ class Indexer(MultiPlatformOp):
                     logits = fp8_mqa_logits(
                         q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
                     )
+                elif _is_sm120 or _is_xpu:
+                    logits = _sm120_fp8_mqa_logits(
+                        q_fp8[:q_offset],
+                        kv_fp8,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
                 else:
                     logits = deep_gemm.fp8_mqa_logits(
                         q_fp8[:q_offset],
@@ -594,6 +661,15 @@ class Indexer(MultiPlatformOp):
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
+                    )
+                elif _is_sm120 or _is_xpu:
+                    logits_chunk = _sm120_fp8_mqa_logits(
+                        q_fp8[start:end],
+                        kv_fp8,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        clean_logits=False,
                     )
                 else:
                     logits_chunk = deep_gemm.fp8_mqa_logits(

@@ -6,7 +6,13 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_xpu
+from sglang.srt.utils.common import get_device_sm
+
+_is_cuda = torch.cuda.is_available() and not is_hip()
+# _is_sm120 = _is_cuda and get_device_sm() // 10 == 12
+_is_sm120 = True
+_is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
@@ -122,7 +128,9 @@ class PagedIndexerMetadata(IndexerMetadata):
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or _is_sm120 or _is_xpu:
+            # SM120: DeepGEMM get_paged_mqa_logits_metadata asserts
+            # "Unsupported architecture" on SM120. Use None (torch fallback path).
             self.deep_gemm_metadata = None
         else:
             import deep_gemm

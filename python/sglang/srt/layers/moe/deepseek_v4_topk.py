@@ -20,6 +20,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
@@ -155,7 +157,7 @@ class HashTopK(nn.Module):
         return topk_output
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=(_is_npu or _is_xpu or True))
 def biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -179,6 +181,8 @@ def biased_topk_impl(
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
 
+    if correction_bias.device != scores.device:
+        correction_bias = correction_bias.to(scores.device)
     scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
     _, topk_ids = torch.topk(
         scores_for_choice,
