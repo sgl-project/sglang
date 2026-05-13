@@ -427,12 +427,13 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
-        top_k = self.topk_config.top_k
-        num_experts = router_logits.shape[1]
         self.topk_config.torch_native = True
-        # XPU kernels for 'topk_softmax' and 'topk_sigmoid' support up to 8 topk and 256 experts.
-        if top_k <= 8 and num_experts <= 256:
-            self.topk_config.torch_native = False
+        # [NOTE] XPU device support for topk kernels
+        #   - support 'topk_softmax' and 'topk_sigmoid'
+        #   - support up to 8 top-k and 256 experts
+        self.topk_config.torch_native = not (
+            self.topk_config.top_k <= 8 and router_logits.shape[1] <= 256
+        )
 
         return select_experts(
             hidden_states=hidden_states,
