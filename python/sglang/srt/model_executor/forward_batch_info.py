@@ -1217,9 +1217,10 @@ def _clamp_position_native(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 
-if is_cuda() or is_hip():
+if is_cuda():
     from sglang.jit_kernel.clamp_position import clamp_position_cuda
 
     clamp_position = clamp_position_cuda
 else:
+    # HIP / CPU: tvm_ffi JIT path needs CUDA_HOME (not set on ROCm); use native.
     clamp_position = _clamp_position_native
