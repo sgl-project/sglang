@@ -406,7 +406,7 @@ class SchedulerOutputProcessorMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
-    def _resolve_spec_overlap_token_ids(
+    def _resolve_spec_overlap_tokens(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
         """Resolve the padding next token ids for speculative decoding with overlap."""
@@ -415,13 +415,13 @@ class SchedulerOutputProcessorMixin:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_accepted_drafts = sum(accept_lens) - len(batch.reqs)
-        result.num_accepted_drafts_per_req_cpu = [x - 1 for x in accept_lens]
+        result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
+        result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(result.num_accepted_drafts_per_req_cpu)
+        self.model_worker.on_verify_complete_cpu(result.num_correct_drafts_per_req_cpu)
 
         predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this
@@ -447,9 +447,9 @@ class SchedulerOutputProcessorMixin:
             req.kv_committed_len += accept_lens[i] - 1
             req.spec_verify_ct += 1
 
-            accepted_draft_tokens = result.num_accepted_drafts_per_req_cpu[i]
-            req.spec_accepted_drafts += accepted_draft_tokens
-            req.update_spec_acceptance_histogram(accepted_draft_tokens)
+            num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
+            req.spec_num_correct_drafts += num_correct_drafts
+            req.update_spec_correct_drafts_histogram(num_correct_drafts)
 
         return predict_tokens
 
@@ -487,7 +487,7 @@ class SchedulerOutputProcessorMixin:
 
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
-                next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+                next_token_ids = self._resolve_spec_overlap_tokens(result, batch)
             elif isinstance(next_token_ids, list):
                 pass  # MLX path: already a list[int], skip torch round-trip
             else:
@@ -513,7 +513,7 @@ class SchedulerOutputProcessorMixin:
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
-            self.update_spec_metrics(batch.batch_size(), result.num_accepted_drafts)
+            self.update_spec_metrics(batch.batch_size(), result.num_correct_drafts)
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph
@@ -628,7 +628,7 @@ class SchedulerOutputProcessorMixin:
         self.report_decode_stats(
             can_run_cuda_graph,
             running_batch=batch,
-            num_accepted_drafts=result.num_accepted_drafts,
+            num_correct_drafts=result.num_correct_drafts,
         )
 
     def _handle_finished_req(
@@ -687,13 +687,13 @@ class SchedulerOutputProcessorMixin:
                 req.mamba_last_track_seqlen = seq_len
             elif (
                 not batch.spec_algorithm.is_none()
-                and result.num_accepted_drafts_per_req_cpu is not None
+                and result.num_correct_drafts_per_req_cpu is not None
             ):
                 # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
                 actual_seq_len = req.seqlen - 1
                 if (
                     actual_seq_len // mamba_track_interval
-                    != (actual_seq_len - result.num_accepted_drafts_per_req_cpu[i] - 1)
+                    != (actual_seq_len - result.num_correct_drafts_per_req_cpu[i] - 1)
                     // mamba_track_interval
                 ):
                     req.mamba_next_track_idx = (
@@ -1046,8 +1046,8 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
-        spec_accepted_drafts = []
-        spec_acceptance_histogram = []
+        spec_num_correct_drafts = []
+        spec_correct_drafts_histogram = []
         retraction_counts = []
         output_hidden_states = None
         load = self.get_loads(GetLoadsReqInput(include=["core"]))
@@ -1156,8 +1156,10 @@ class SchedulerOutputProcessorMixin:
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
-                    spec_accepted_drafts.append(req.spec_accepted_drafts)
-                    spec_acceptance_histogram.append(req.spec_acceptance_histogram)
+                    spec_num_correct_drafts.append(req.spec_num_correct_drafts)
+                    spec_correct_drafts_histogram.append(
+                        req.spec_correct_drafts_histogram
+                    )
 
                 if return_logprob:
                     if (
@@ -1265,8 +1267,8 @@ class SchedulerOutputProcessorMixin:
                     rids=rids,
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
-                    spec_accepted_drafts=spec_accepted_drafts,
-                    spec_acceptance_histogram=spec_acceptance_histogram,
+                    spec_num_correct_drafts=spec_num_correct_drafts,
+                    spec_correct_drafts_histogram=spec_correct_drafts_histogram,
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,
