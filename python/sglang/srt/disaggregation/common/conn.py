@@ -96,7 +96,7 @@ class CommonKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.kv_item_lens_sum = sum(args.kv_item_lens)
-        self.state_item_lens_sum = sum(args.state_item_lens)
+        self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
@@ -512,16 +512,18 @@ class CommonKVSender(BaseKVSender):
     def _record_transfer_indices(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]],
+        state_indices: Optional[List],
     ):
         self._transfer_num_kv_indices += len(kv_indices)
-        if state_indices is not None:
-            self._transfer_num_state_indices += len(state_indices)
+        if state_indices:
+            for component_indices in state_indices:
+                if component_indices is not None:
+                    self._transfer_num_state_indices += len(component_indices)
 
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         pass
 
@@ -600,6 +602,8 @@ class CommonKVReceiver(BaseKVReceiver):
 
         self.prefill_dp_rank = prefill_dp_rank
         self._setup_bootstrap_infos()
+        if self.conclude_state == KVPoll.Failed:
+            return
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def _setup_bootstrap_infos(self):
@@ -642,6 +646,7 @@ class CommonKVReceiver(BaseKVReceiver):
                             self.kv_mgr.update_status(
                                 self.bootstrap_room, KVPoll.Failed
                             )
+                            self.bootstrap_infos = None
                             return
 
                 self.bootstrap_infos = bootstrap_infos

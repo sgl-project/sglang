@@ -145,6 +145,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-prefill-delayer` | Enable prefill delayer for DP attention to reduce idle time. | `False` | bool flag (set to enable) |
 | `--prefill-delayer-max-delay-passes` | Maximum forward passes to delay prefill. | `30` | Type: int |
 | `--prefill-delayer-token-usage-low-watermark` | Token usage low watermark for prefill delayer. | `None` | Type: float |
+| `--prefill-delayer-queue-min-ratio` | Opt-in to the adaptive queue-based delay trigger (independent of the slot-based one). Defers prefill until the waiting queue reaches `min(running_req * ratio, max_prefill_bs)` so small fragments batch into a larger prefill. Unset keeps the original slot-only behavior. Typical: `0.1`–`0.5`. | `None` | Type: float |
+| `--prefill-delayer-max-delay-ms` | Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, prefill is force-released to bound worst-case TTFT. Only consulted when `--prefill-delayer-queue-min-ratio` is set. Typical: `1000`–`5000`. | `5000` | Type: float |
 | `--prefill-delayer-forward-passes-buckets` | Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added. | `None` | List[float] |
 | `--prefill-delayer-wait-seconds-buckets` | Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added. | `None` | List[float] |
 

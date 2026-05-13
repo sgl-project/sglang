@@ -418,6 +418,9 @@ def prepare_request(
         VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
     )
     sampling_params.apply_request_extra(req)
+    diffusers_kwargs = getattr(sampling_params, "diffusers_kwargs", None)
+    if diffusers_kwargs and "max_sequence_length" in diffusers_kwargs:
+        req.max_sequence_length = diffusers_kwargs["max_sequence_length"]
 
     req.adjust_size(server_args)
 

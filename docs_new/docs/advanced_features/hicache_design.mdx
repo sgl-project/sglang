@@ -56,15 +56,19 @@ After local matching, for the parts not found in L1 or L2, the system queries L3
 
 After prefetching stops, the data already fetched is used together with the local data for the prefill computation.
 
-For **timeout** strategy, HiCache introduces two configuration parameters to support fine-grained control over prefetch timeout conditions:
+For **timeout** strategy, HiCache introduces three configuration parameters to support fine-grained control over prefetch timeout conditions:
 
-* `prefetch_timeout_base`: the base timeout, representing overhead unrelated to the number of tokens (e.g., scheduling and synchronization).
-* `prefetch_timeout_per_ki_token`: the incremental timeout per thousand tokens.
+* `prefetch_timeout_base`: the base timeout, representing overhead unrelated to the number of tokens (e.g., scheduling and synchronization). Default: `2` seconds.
+* `prefetch_timeout_per_ki_token`: the incremental timeout per thousand tokens. Default: `0.1` seconds per 1024 tokens.
+* `prefetch_timeout_max`: the upper bound applied to the linear timeout, preventing very long prompts from waiting unboundedly. Default: `30` seconds.
 
 The timeout is computed as:
 
 ```python Example
-timeout = prefetch_timeout_base + prefetch_timeout_per_ki_token * num_token_to_fetch / 1024
+timeout = min(
+    prefetch_timeout_max,
+    prefetch_timeout_base + prefetch_timeout_per_ki_token * num_token_to_fetch / 1024,
+)
 ```
 
 ### Data Write-back
