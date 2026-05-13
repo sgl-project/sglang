@@ -831,13 +831,9 @@ def quantize_hidden_states_fp4(
     if use_per_token_nvfp4:
         from flashinfer import SfLayout, nvfp4_quantize
 
-        _NVFP4_PER_TOKEN_GLOBAL_SCALE_INV = 1.0 / (
-            (256.0 if envs.FLASHINFER_NVFP4_4OVER6.get() else 448.0) * 6.0
-        )
-
         hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
             hidden_states,
-            _NVFP4_PER_TOKEN_GLOBAL_SCALE_INV,
+            1.0 / (448.0 * 6.0),
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
         )
