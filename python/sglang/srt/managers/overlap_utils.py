@@ -26,13 +26,17 @@ def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
     )
 
 
-if _is_cuda or _is_hip:
+if _is_cuda:
+    # CUDA: use JIT-compiled kernel (requires CUDA_HOME).
     from sglang.jit_kernel.resolve_future_token_ids import (
         resolve_future_token_ids_cuda,
     )
 
     _resolve_future_token_ids = resolve_future_token_ids_cuda
 else:
+    # HIP / CPU: tvm_ffi.load_jit currently looks for CUDA_HOME, which is not
+    # set in our ROCm container.  Fall back to the torch-native implementation;
+    # the resulting overhead is negligible for the dummy-forward benchmark.
     _resolve_future_token_ids = _resolve_future_token_ids_native
 
 
