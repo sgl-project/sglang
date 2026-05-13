@@ -44,12 +44,6 @@ if current_platform.is_npu():
     )
 else:
     from sglang.multimodal_gen.test.server.gpu_cases import (  # noqa: F401 It is used by ci scripts
-        ONE_GPU_CASES,
-    )
-    from sglang.multimodal_gen.test.server.gpu_cases import (  # noqa: F401 It is used by ci scripts
-        TWO_GPU_CASES,
-    )
-    from sglang.multimodal_gen.test.server.gpu_cases import (
         _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE,
         _UPDATE_WEIGHTS_MODEL_PAIR_ENV,
         _UPDATE_WEIGHTS_MODEL_PAIR_IDS,
@@ -58,12 +52,14 @@ else:
         DEFAULT_EST_TIME_SECONDS,
         DEFAULT_STANDALONE_EST_TIME_SECONDS,
         FILE_SUITES,
+        ONE_GPU_CASES,
         PARAMETRIZED_CASE_GROUPS,
         STANDALONE_FILE_EST_TIMES,
         STANDALONE_FILES,
         STARTUP_OVERHEAD_SECONDS,
         STRICT_SUITES,
         SUITES,
+        TWO_GPU_CASES,
     )
 
 
