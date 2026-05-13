@@ -533,55 +533,45 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch.seq_lens_cpu = original_seq_lens_cpu
 
     def draft_forward_for_prepare(self, spec_info):
-        topk_p, topk_index, hidden_states = (
-            spec_info.topk_p,
-            spec_info.topk_index,
-            spec_info.hidden_states,
-        )
+        topk_p = spec_info.topk_p
+        topk_index = spec_info.topk_index
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
 
-        # Forward multiple steps
-        input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-            0, topk_p, topk_index, hidden_states, None, self.topk
+        # In the zero_bubble path, topk_p already contains the concatenated
+        # per-step scores (shape: [b, topk + (num_steps-1) * topk^2]).
+        # There is no need to slice-and-reassemble via select_top_k_tokens +
+        # a Python loop — the roundtrip is a no-op.  We use topk_p / topk_index
+        # directly and only build the parents_list, which is the sole piece of
+        # new information produced by the original loop.
+        b = topk_p.shape[0]
+        K = self.topk
+        N = self.speculative_num_steps
+
+        # Step-0 parents: arange(-1, K).expand(b, -1)  ->  (b, K+1)
+        step0_parents = torch.arange(-1, K, dtype=torch.long, device=self.device)
+        step0_parents = step0_parents.expand(b, -1)
+
+        if N > 1:
+            # Steps 1 .. N-1: each is full((b, K), i).  Build them in one shot
+            # and drop the last step (parents_list[:-1] semantics).
+            other = torch.arange(1, N, dtype=torch.long, device=self.device)
+            other = other.view(1, -1, 1).expand(b, -1, K).reshape(b, -1)
+            # keep only steps 1 .. N-2
+            parent_list = torch.cat([step0_parents, other[:, : (N - 2) * K]], dim=1)
+        else:
+            parent_list = torch.empty(b, 0, dtype=torch.long, device=self.device)
+
+        # topk over the (already concatenated) scores, gather from tokens
+        top_scores = torch.topk(topk_p, self.speculative_num_draft_tokens - 1, dim=-1)
+        top_scores_index = torch.sort(top_scores.indices).values
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            topk_index.shape[1],
+            "draft_forward: top_scores_index OOB for gather on ss_token_list",
         )
-
-        score_list = []
-        token_list = []
-        parents_list = []
-        offset = 0
-        for i in range(self.speculative_num_steps):
-            if i == 0:
-                group_size = 1
-            else:
-                group_size = self.topk
-            step_size = group_size * self.topk
-
-            scores = tree_info[0][:, :, offset : offset + step_size].reshape(
-                -1, group_size, self.topk
-            )
-            tokens = tree_info[1][:, offset : offset + step_size]
-
-            score_list.append(scores)
-            token_list.append(tokens)
-
-            if i == 0:
-                parents_list.append(tree_info[2])
-            else:
-                parents_list.append(
-                    torch.full(
-                        (tree_info[2].size(0), self.topk),
-                        i,
-                        dtype=torch.long,
-                        device=self.device,
-                    )
-                )
-            offset += step_size
-
-        # Organize the results
-        parent_list, top_scores_index, draft_tokens = self._organize_draft_results(
-            score_list, token_list, parents_list
-        )
+        draft_tokens = torch.gather(topk_index, index=top_scores_index, dim=1)
 
         return parent_list, top_scores_index, draft_tokens
 
