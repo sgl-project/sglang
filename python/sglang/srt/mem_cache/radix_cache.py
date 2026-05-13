@@ -495,9 +495,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         assert req.kv_committed_len >= req.cache_protected_len
         read_len = req.kv_committed_len
         token_ids = req.fill_ids[:read_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :read_len
-        ]
+        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :read_len]
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle

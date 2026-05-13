@@ -801,9 +801,7 @@ class PrefillAdder:
 
         return self.budget_state()
 
-    def add_one_req(
-        self, req: Req, truncation_align_size: Optional[int]
-    ):
+    def add_one_req(self, req: Req, truncation_align_size: Optional[int]):
         # Reuse path: this req's previous chunk left lock_ref held, prefix
         # already in tree, and init_load_back already consumed host KV. We
         # must skip fresh-req setup. Gate on `has_pending_chunk` (the

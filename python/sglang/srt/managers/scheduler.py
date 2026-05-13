@@ -2818,9 +2818,7 @@ class Scheduler(
         # naturally by budget + priority.
         can_run_set = set(can_run_list)
         self.waiting_queue = [
-            x
-            for x in self.waiting_queue
-            if x not in can_run_set or x.has_pending_chunk
+            x for x in self.waiting_queue if x not in can_run_set or x.has_pending_chunk
         ]
         if adder.preempt_list:
             for req in adder.preempt_list:
@@ -2870,9 +2868,7 @@ class Scheduler(
             adder,
             self.running_batch.reqs,
             self.enable_priority_scheduling,
-            num_pending_tokens=self._get_num_pending_tokens(
-                chunk_deduct=chunk_deduct
-            ),
+            num_pending_tokens=self._get_num_pending_tokens(chunk_deduct=chunk_deduct),
         )
 
         # Mixed-style chunked prefill
