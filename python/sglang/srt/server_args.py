@@ -3921,9 +3921,7 @@ class ServerArgs:
 
         if os.path.isdir(self.model_path):
             return _check_format(
-                has_params=os.path.exists(
-                    os.path.join(self.model_path, "params.json")
-                ),
+                has_params=os.path.exists(os.path.join(self.model_path, "params.json")),
                 has_consolidated=bool(
                     glob.glob(
                         os.path.join(self.model_path, "consolidated*.safetensors")
@@ -3945,8 +3943,7 @@ class ServerArgs:
                     for f in files
                 ),
                 has_hf_weights=any(
-                    f.startswith("model-") and f.endswith(".safetensors")
-                    for f in files
+                    f.startswith("model-") and f.endswith(".safetensors") for f in files
                 ),
             )
         except Exception:

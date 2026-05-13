@@ -38,9 +38,7 @@ def register_model_config_parser(name: str):
 
     def _wrapper(cls):
         if not issubclass(cls, ModelConfigParserBase):
-            raise ValueError(
-                "Model-config parser must subclass ModelConfigParserBase."
-            )
+            raise ValueError("Model-config parser must subclass ModelConfigParserBase.")
         if name in _MODEL_CONFIG_PARSER_REGISTRY:
             logger.warning(
                 "Model-config parser %r already registered; overwriting with %s",
