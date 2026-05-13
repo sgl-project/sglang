@@ -6,6 +6,9 @@ import unittest
 import torch
 import torch.multiprocessing as mp
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    set_graph_pool_id,
+)
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -14,12 +17,8 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    set_graph_pool_id,
-)
 from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
 from sglang.test.test_utils import CustomTestCase
-
 
 DCP_SIZE = 2
 WORLD_SIZE = 8
@@ -103,9 +102,7 @@ def _fill_lse_merge_inputs(
     heads = out.shape[1]
     head_dim = out.shape[2]
     h = torch.arange(heads, device=out.device, dtype=out.dtype).view(1, heads)
-    d = torch.arange(head_dim, device=out.device, dtype=out.dtype).view(
-        1, 1, head_dim
-    )
+    d = torch.arange(head_dim, device=out.device, dtype=out.dtype).view(1, 1, head_dim)
     lse.copy_(0.13 * step + 0.37 * dcp_rank + 0.01 * h)
     out.copy_(0.07 * step + 0.11 * dcp_rank + 0.001 * d)
 
@@ -135,14 +132,22 @@ def _dcp_attention_worker(rank: int, world_size: int, port: int) -> None:
         gen = torch.Generator(device="cuda")
         gen.manual_seed(1000 + group_base_rank)
         k_full = torch.randn(
-            (batch, seq_len, head_dim), generator=gen, device="cuda", dtype=torch.float32
+            (batch, seq_len, head_dim),
+            generator=gen,
+            device="cuda",
+            dtype=torch.float32,
         )
         gen.manual_seed(2000 + group_base_rank)
         v_full = torch.randn(
-            (batch, seq_len, head_dim), generator=gen, device="cuda", dtype=torch.float32
+            (batch, seq_len, head_dim),
+            generator=gen,
+            device="cuda",
+            dtype=torch.float32,
         )
 
-        owner_mask = torch.arange(seq_len, device="cuda") % DCP_SIZE == group.rank_in_group
+        owner_mask = (
+            torch.arange(seq_len, device="cuda") % DCP_SIZE == group.rank_in_group
+        )
         k_local = k_full[:, owner_mask, :].contiguous()
         v_local = v_full[:, owner_mask, :].contiguous()
 
@@ -187,11 +192,15 @@ def _dcp_attention_worker(rank: int, world_size: int, port: int) -> None:
         set_graph_pool_id(pool)
         _fill_lse_merge_inputs(cp_out, cp_lse, step=10, dcp_rank=group.rank_in_group)
         with graph_capture() as graph_capture_context:
-            with torch.cuda.graph(graph, pool=pool, stream=graph_capture_context.stream):
+            with torch.cuda.graph(
+                graph, pool=pool, stream=graph_capture_context.stream
+            ):
                 graph_out = cp_lse_ag_out_rs(cp_out, cp_lse, group)
 
         for step in range(11, 14):
-            _fill_lse_merge_inputs(cp_out, cp_lse, step=step, dcp_rank=group.rank_in_group)
+            _fill_lse_merge_inputs(
+                cp_out, cp_lse, step=step, dcp_rank=group.rank_in_group
+            )
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(

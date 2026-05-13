@@ -42,7 +42,9 @@ class TestTritonDCPUtils(CustomTestCase):
             self.skipTest("Triton DCP KV-index test requires CUDA")
 
         dcp_size = 2
-        req_to_token = torch.arange(2 * 16, device="cuda", dtype=torch.int64).view(2, 16)
+        req_to_token = torch.arange(2 * 16, device="cuda", dtype=torch.int64).view(
+            2, 16
+        )
         req_pool_indices = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
         lens = torch.tensor([7, 6], device="cuda", dtype=torch.int32)
         start = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
