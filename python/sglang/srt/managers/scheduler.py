@@ -99,8 +99,11 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DisableEICReqInput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EICSwitchOutput,
+    EnableEICReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -186,6 +189,11 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.eic_hiradix_cache import (
+    EICHiRadixCache,
+    EICHiRadixCacheBuilder,
+    EICPagedHiRadixCache,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -394,6 +402,9 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.enable_eic_cache = (
+            server_args.enable_eic_cache if self.enable_hierarchical_cache else False
+        )
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -867,7 +878,22 @@ class Scheduler(
         )
 
         if effective_chunked_prefill_size is not None and self.disable_radix_cache:
-            if not self.is_hybrid_swa:
+            if self.enable_eic_cache:
+                from sglang.srt.mem_cache.eic_chunk_cache import (
+                    EICChunkCache,
+                    EICSWAChunkCache,
+                )
+
+                logger.info(f"use EICChunkCache for decode save")
+                if self.is_hybrid_swa:
+                    ChunkCacheClass = EICSWAChunkCache
+                else:
+                    ChunkCacheClass = EICChunkCache
+                self.tree_cache = ChunkCacheClass(
+                    params=params,
+                    server_args=server_args,
+                )
+            elif not self.is_hybrid_swa:
                 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
                 self.tree_cache = ChunkCache(params)
@@ -890,6 +916,15 @@ class Scheduler(
 
                     self.tree_cache = HiMambaRadixCache(
                         params=params, server_args=server_args
+                    )
+                elif self.enable_eic_cache:
+                    # EIC has native hierarchical integration; route through its
+                    # builder so prefetch results land in the radix tree (otherwise
+                    # HiRadix + EICStorage fetches from remote but never registers
+                    # the prefix as a hit).
+                    self.tree_cache = EICHiRadixCacheBuilder.build(
+                        params=params,
+                        server_args=server_args,
                     )
                 else:
                     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -915,6 +950,20 @@ class Scheduler(
                     )
                 params.tree_components = tuple(tree_components)
                 self.tree_cache = UnifiedRadixCache(params)
+                if self.enable_eic_cache:
+                    self.tree_cache = EICHiRadixCacheBuilder.build(
+                        params=params,
+                        server_args=server_args,
+                    )
+                else:
+                    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+                    self.tree_cache = HiRadixCache(
+                        params=params, server_args=server_args
+                    )
+                    self.tp_worker.register_hicache_layer_transfer_counter(
+                        self.tree_cache.cache_controller.layer_done_counter
+                    )
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -1453,6 +1502,8 @@ class Scheduler(
                     ListExternalCorporaReqInput,
                     self.list_external_corpora,
                 ),
+                (EnableEICReqInput, self.enable_eic_cache_wrapped),
+                (DisableEICReqInput, self.disable_eic_cache_wrapped),
             ]
         )
 
@@ -2630,6 +2681,7 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            enable_eic_cache=self.enable_eic_cache,
         )
 
         if self.chunked_req is not None:
@@ -2638,6 +2690,10 @@ class Scheduler(
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
+
+        if isinstance(self.tree_cache, EICPagedHiRadixCache):
+            # for batch exists from EIC cache
+            self.tree_cache.match_from_remote(self.waiting_queue)
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -3651,6 +3707,74 @@ class Scheduler(
         """Send the seed instance weights to the destination instance."""
         success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
         return SendWeightsToRemoteInstanceReqOutput(success, message)
+
+    def enable_eic_cache_wrapped(self, recv_req: EnableEICReqInput) -> EICSwitchOutput:
+        if not isinstance(self.tree_cache, EICHiRadixCache):
+            success = self.flush_cache()
+            if not success:
+                # If there are pending requests, we cannot enable EIC cache.
+                return EICSwitchOutput(
+                    success=False,
+                    message="Cannot enable EIC cache while there are pending requests. Please flush the cache first.'",
+                )
+
+            self.enable_eic_cache = True
+            self.enable_hierarchical_cache = True
+            self.server_args.enable_hierarchical_cache = True
+            self.server_args.enable_eic_cache = True
+            self.init_cache_with_memory_pool()
+
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+                self.enable_priority_scheduling,
+                self.schedule_low_priority_values_first,
+            )
+            message = "EIC cache enabled successfully."
+        else:
+            message = "EIC cache is already enabled."
+
+        logger.info(message)
+        return EICSwitchOutput(
+            success=True,
+            message=message,
+        )
+
+    def disable_eic_cache_wrapped(
+        self, recv_req: DisableEICReqInput
+    ) -> EICSwitchOutput:
+        if isinstance(self.tree_cache, EICHiRadixCache):
+            success = self.flush_cache()
+            if not success:
+                # If there are pending requests, we cannot disable EIC cache.
+                return EICSwitchOutput(
+                    success=False,
+                    message="Cannot disable EIC cache while there are pending requests. Please flush the cache first.'",
+                )
+
+            self.enable_eic_cache = False
+            self.enable_hierarchical_cache = False
+            self.server_args.enable_hierarchical_cache = False
+            self.server_args.enable_eic_cache = False
+            self.init_cache_with_memory_pool()
+
+            self.policy = SchedulePolicy(
+                self.schedule_policy,
+                self.tree_cache,
+                self.enable_hierarchical_cache,
+                self.enable_priority_scheduling,
+                self.schedule_low_priority_values_first,
+            )
+            message = "EIC cache disabled successfully."
+        else:
+            message = "EIC cache is already enabled."
+
+        logger.info(message)
+        return EICSwitchOutput(
+            success=True,
+            message=message,
+        )
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time

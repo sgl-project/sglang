@@ -24,8 +24,10 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 """Request scheduler policy"""
 
+import logging
 import os
 import random
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -49,6 +51,7 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+logger = logging.getLogger(__name__)
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
 # This can prevent the server from being too conservative.
@@ -409,6 +412,7 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
+        enable_eic_cache: bool = False,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -433,7 +437,10 @@ class PrefillAdder:
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
+        self.log_hit_gpu_tokens = 0
+        self.log_hit_eic_tokens = 0
         self.log_input_tokens = 0
+        self.enable_eic_cache = enable_eic_cache
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
@@ -563,7 +570,11 @@ class PrefillAdder:
         return AddReqResult.CONTINUE
 
     def _update_prefill_budget(
-        self, prefix_len: int, extend_input_len: int, max_new_tokens: int
+        self,
+        prefix_len: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        eic_prefix_len: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -583,6 +594,8 @@ class PrefillAdder:
             self.rem_chunk_tokens -= extend_input_len
 
         self.log_hit_tokens += prefix_len
+        self.log_hit_gpu_tokens += prefix_len - eic_prefix_len
+        self.log_hit_eic_tokens += eic_prefix_len
         self.log_input_tokens += extend_input_len
 
     def _get_dllm_remain_tokens(self) -> int:
@@ -847,6 +860,7 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
+            eic_prefix_len = 0
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
@@ -855,10 +869,46 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                logger.debug(
+                    f"req {req.rid} init load back, last node:{req.last_node.id}, prefix len:{len(req.prefix_indices)}"
+                )
+                if self.enable_eic_cache:
+                    loading_check_start_ts = time.perf_counter()
+                    while not self.tree_cache.loading_complete(req.last_node):
+                        time.sleep(0.01)
+                    load_sucess = req.last_node.value is not None
+                    complete_token_num = len(new_indices)
+                    if not load_sucess:
+                        last_gpu_node = req.last_node
+                        while last_gpu_node.evicted:
+                            complete_token_num -= len(last_gpu_node.key)
+                            last_gpu_node = last_gpu_node.parent
+                        assert complete_token_num >= 0
+                        req.last_node = last_gpu_node
+                        logger.error(
+                            f"req {req.rid} after load back failed, last node:{last_gpu_node.id}, complete_token_num:{complete_token_num}"
+                        )
+                        if complete_token_num > 0:
+                            new_indices = new_indices[:complete_token_num]
+                        else:
+                            new_indices = torch.empty(
+                                (0,),
+                                dtype=torch.int64,
+                                device=req.prefix_indices.device,
+                            )
+                    loading_check_end_ts = time.perf_counter()
+                    logger.debug(
+                        f"batch_prefill loading check time {loading_check_end_ts - loading_check_start_ts}"
+                    )
+                logger.debug(
+                    f"after eic sync, req {req.rid} last node:{req.last_node.id}, prefix len:{len(req.prefix_indices)}"
+                )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+                req.last_matched_prefix_len = prefix_len
+                eic_prefix_len = len(new_indices)
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
@@ -887,6 +937,7 @@ class PrefillAdder:
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
                     ),
+                    eic_prefix_len,
                 )
             else:
                 # Make sure at least one page is available

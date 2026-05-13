@@ -48,6 +48,8 @@ class PrefillStats:
 
     log_input_tokens: int
     log_hit_tokens: int
+    log_hit_gpu_tokens: int
+    log_hit_eic_tokens: int
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
@@ -64,6 +66,8 @@ class PrefillStats:
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
+            log_hit_gpu_tokens=adder.log_hit_gpu_tokens,
+            log_hit_eic_tokens=adder.log_hit_eic_tokens,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -372,6 +376,24 @@ class SchedulerMetricsMixin:
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
 
+        if self.enable_hierarchical_cache and self.enable_eic_cache:
+            num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
+            num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
+            if num_write_queue_size:
+                msg += f"#write-queue: {num_write_queue_size}, "
+            if num_load_queue_size:
+                msg += f"#load-queue: {num_load_queue_size}, "
+
+            denom = prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
+            if denom > 0:
+                total_hit_rate = prefill_stats.log_hit_tokens / denom
+                eic_hit_rate = prefill_stats.log_hit_eic_tokens / denom
+                gpu_hit_rate = total_hit_rate - eic_hit_rate
+                msg += (
+                    f"#hit_rate(total/gpu/eic): "
+                    f"{total_hit_rate:.2f}/{gpu_hit_rate:.2f}/{eic_hit_rate:.2f}, "
+                )
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             msg += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
@@ -419,6 +441,11 @@ class SchedulerMetricsMixin:
             cache_hit_rate = (
                 prefill_stats.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
+            eic_cache_hit_rate = (
+                prefill_stats.log_hit_eic_tokens / total_tokens
+                if total_tokens > 0
+                else 0.0
+            )
 
             # Basics
             self.stats.num_running_reqs = prefill_stats.num_running_reqs
@@ -427,6 +454,7 @@ class SchedulerMetricsMixin:
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.eic_cache_hit_rate = eic_cache_hit_rate
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)

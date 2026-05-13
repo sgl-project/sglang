@@ -683,6 +683,13 @@ class ServerArgs:
     enable_draft_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
+    enable_hierarchical_cache: bool = False
+    enable_eic_cache: bool = False
+    disable_eic_shared: bool = False
+    hicache_ratio: float = 2.0
+    hicache_size: int = 0
+    hicache_write_policy: str = "write_through"
+    hicache_io_backend: str = ""
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     enforce_shared_experts_fusion: bool = False
@@ -3957,6 +3964,11 @@ class ServerArgs:
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
+        if self.custom_weight_loader is None:
+            self.custom_weight_loader = []
+
+        if self.enable_eic_cache and not self.enable_hierarchical_cache:
+            self.enable_hierarchical_cache = True
 
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
@@ -6420,6 +6432,18 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
+        )
+
+        parser.add_argument(
+            "--enable-eic-cache",
+            action="store_true",
+            help="Enable EIC cache",
+        )
+
+        parser.add_argument(
+            "--disable-eic-shared",
+            action="store_true",
+            help="Disable EIC shared cache, which is used to share the cache between multiple servers.",
         )
 
         # PD disaggregation

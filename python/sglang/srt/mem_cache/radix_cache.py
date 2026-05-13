@@ -231,6 +231,9 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        self.backuped_storage = False
+        # for block-wise cache
+        self.content_hash = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1

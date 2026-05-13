@@ -563,7 +563,17 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+def release_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    is_insert: bool = True,
+    is_decode: bool = False,
+):
+    from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCache
+
+    if isinstance(tree_cache, EICHiRadixCache) and is_decode:
+        is_insert = is_insert and tree_cache.save_decode_cache
+
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         assert (
