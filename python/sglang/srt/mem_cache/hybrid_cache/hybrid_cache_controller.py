@@ -164,8 +164,6 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
-        attn_cp_rank: int = 0,
-        attn_cp_size: int = 1,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
     ):
