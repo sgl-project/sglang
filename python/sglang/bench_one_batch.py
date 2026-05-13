@@ -66,6 +66,9 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
+from sglang.srt.layers.attention.mamba.ops import (
+    initialize_mamba_selective_state_update_backend,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -817,6 +820,7 @@ def latency_test(
     tp_rank,
 ):
     initialize_moe_config(server_args)
+    initialize_mamba_selective_state_update_backend(server_args)
     initialize_fp8_gemm_config(server_args)
     initialize_fp4_gemm_config(server_args)
 
