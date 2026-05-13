@@ -28,6 +28,7 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -115,6 +116,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--ack-large-artifacts",
         action="store_true",
         help="Required when projected artifact size exceeds 5 GB.",
+    )
+    g.add_argument(
+        "--num-threads",
+        type=int,
+        default=16,
+        help="Concurrent in-flight requests to the server. The server's "
+        "scheduler batches them internally, so higher values overlap "
+        "prompts and dramatically reduce wall time on multi-prompt runs.",
     )
 
     # Server pass-through. Last so server's own --help text reads naturally.
@@ -288,8 +297,8 @@ def cmd_record(args: argparse.Namespace, base_url: str) -> None:
     timestamp = datetime.datetime.utcnow().isoformat() + "Z"
     server_args_list = _server_args_passthrough(args)
 
-    prompt_records: List[Dict[str, Any]] = []
-    for i, p in enumerate(prompts_list):
+    def _record_one(i_p: Tuple[int, Any]) -> Dict[str, Any]:
+        i, p = i_p
         sp = _build_sampling_params(args, args.max_new_tokens)
         t0 = time.time()
         resp = _request(base_url, p.text, sp, args.topk_logprobs)
@@ -302,16 +311,17 @@ def cmd_record(args: argparse.Namespace, base_url: str) -> None:
             f"  [{i+1}/{n}] {len(out_ids)} steps, finish={finish}, {dt:.1f}s",
             flush=True,
         )
-        prompt_records.append(
-            {
-                "idx": i,
-                "prompt": p.text,
-                "messages": p.messages,
-                "logprobs_file": artifacts.prompt_filename(i),
-                "n_steps": len(out_ids),
-                "stop_reason": finish,
-            }
-        )
+        return {
+            "idx": i,
+            "prompt": p.text,
+            "messages": p.messages,
+            "logprobs_file": artifacts.prompt_filename(i),
+            "n_steps": len(out_ids),
+            "stop_reason": finish,
+        }
+
+    with ThreadPoolExecutor(max_workers=args.num_threads) as ex:
+        prompt_records = list(ex.map(_record_one, enumerate(prompts_list)))
 
     meta = {
         "phase": "record",
@@ -365,9 +375,9 @@ def cmd_verify(args: argparse.Namespace, base_url: str) -> None:
     timestamp = datetime.datetime.utcnow().isoformat() + "Z"
     server_args_list = _server_args_passthrough(args)
 
-    prompt_records: List[Dict[str, Any]] = []
-    failed_steps: List[Dict[str, Any]] = []
-    for entry in record_meta["prompts"]:
+    def _verify_one(
+        entry: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         idx = entry["idx"]
         text = entry["prompt"]
         n_steps_record = entry["n_steps"]
@@ -386,14 +396,13 @@ def cmd_verify(args: argparse.Namespace, base_url: str) -> None:
         # Sanity: forcing must actually have taken.
         record_artifact = artifacts.read_prompt_artifact(record_dir_abs, idx)
         record_out_ids = record_artifact["output_ids"].tolist()
+        mismatch: Optional[Dict[str, Any]] = None
         if out_ids != record_out_ids:
             mismatch_step = next(
                 (k for k, (a, b) in enumerate(zip(out_ids, record_out_ids)) if a != b),
                 min(len(out_ids), len(record_out_ids)),
             )
-            failed_steps.append(
-                {"prompt_idx": idx, "first_mismatch_step": mismatch_step}
-            )
+            mismatch = {"prompt_idx": idx, "first_mismatch_step": mismatch_step}
             print(
                 f"  [{idx+1}/{n}] FORCED-TOKEN MISMATCH at step "
                 f"{mismatch_step}: forcing did not take.",
@@ -406,16 +415,20 @@ def cmd_verify(args: argparse.Namespace, base_url: str) -> None:
                 flush=True,
             )
 
-        prompt_records.append(
-            {
-                "idx": idx,
-                "prompt": text,
-                "messages": entry.get("messages"),
-                "logprobs_file": artifacts.prompt_filename(idx),
-                "n_steps": len(out_ids),
-                "stop_reason": finish,
-            }
-        )
+        record = {
+            "idx": idx,
+            "prompt": text,
+            "messages": entry.get("messages"),
+            "logprobs_file": artifacts.prompt_filename(idx),
+            "n_steps": len(out_ids),
+            "stop_reason": finish,
+        }
+        return record, mismatch
+
+    with ThreadPoolExecutor(max_workers=args.num_threads) as ex:
+        results = list(ex.map(_verify_one, record_meta["prompts"]))
+    prompt_records = [r for r, _ in results]
+    failed_steps = [m for _, m in results if m is not None]
 
     meta = {
         "phase": "verify",
