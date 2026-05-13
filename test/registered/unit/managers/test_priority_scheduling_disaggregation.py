@@ -124,6 +124,8 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
         queue.token_to_kv_pool_allocator = MagicMock()
         queue.token_to_kv_pool_allocator.page_size = 1
+        queue.token_to_kv_pool_allocator.available_size.return_value = 1000
+        queue.token_to_kv_pool = MagicMock()
         queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
         queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
         queue.tree_cache = MagicMock()
@@ -148,7 +150,8 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         ]
         queue = self._new_queue(reqs)
 
-        preallocated, failed = queue.pop_preallocated()
+        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
+            preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(
             [decode_req.req.rid for decode_req in preallocated],
@@ -168,7 +171,8 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         ]
         queue = self._new_queue(reqs, low_priority_values_first=True)
 
-        preallocated, failed = queue.pop_preallocated()
+        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
+            preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(
             [decode_req.req.rid for decode_req in preallocated],
@@ -185,7 +189,8 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         healthy_high = self._new_decode_req("healthy-high", 10)
         queue = self._new_queue([failed_low, healthy_high])
 
-        preallocated, failed = queue.pop_preallocated()
+        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
+            preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(
             [decode_req.req.rid for decode_req in preallocated], ["healthy-high"]
