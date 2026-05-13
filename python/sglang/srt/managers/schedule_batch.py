@@ -2366,10 +2366,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     (0,), dtype=torch.int64, device=self.device
                 )
             else:
-                # already on device
-                all_buffers = torch.stack(
-                    [req.mamba_ping_pong_track_buffer for req in self.reqs]
-                )
+                all_buffers = self.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                    self.req_pool_indices
+                ]  # (bs, ping_pong_size), int32, on device
                 idx = (
                     torch.tensor(
                         [req.mamba_next_track_idx for req in self.reqs],
