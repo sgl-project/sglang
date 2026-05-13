@@ -299,24 +299,29 @@ mkdir aime/ && cd aime/
 wget http://opencompass.oss-cn-shanghai.aliyuncs.com/datasets/data/aime.zip
 unzip aime.zip && rm aime.zip
 cd ../../..
-```
+
 # MMStar
 cd ais_bench/datasets
 mkdir mmstar
 cd mmstar
 wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
+cd ../..
 
 # MMMU
 cd ais_bench/datasets
 git lfs install
 git clone https://www.modelscope.cn/datasets/AI-ModelScope/MMMU.git mmmu
+cd ../..
+```
 
 ### Online Text Model Testing
 
 #### Start SGLang Server
 
 ```shell Command
-sglang serve --model-path /home/weights/Qwen2.5-7B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000 &
+sglang serve --model-path /home/weights/Qwen2.5-7B-Instruct \
+    --attention-backend ascend \
+    --host 0.0.0.0 --port 30000 &
 ```
 
 #### Execute Accuracy Evaluation
@@ -402,7 +407,6 @@ sglang serve --model-path Qwen/Qwen2.5-VL-7B-Instruct \
     --mm-attention-backend ascend_attn \
     --host 0.0.0.0 --port 30000 &
 
-# TextVQA evaluation
 # Run MMStar dataset
 ais_bench --models vllm_api_stream_chat_mutiturn --datasets mmstar_gen --mode all --dump-eval-details --merge-ds
 
