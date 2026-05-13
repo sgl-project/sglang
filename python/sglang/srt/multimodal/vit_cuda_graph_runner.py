@@ -170,8 +170,10 @@ class ViTCudaGraphRunner:
                 elif override_backend in ("fa3", "fa4"):
                     cu_seq_len_ws = [cu_seqlens_now, max_len]
                 else:
-                    raise RuntimeError(f"Not supported ViT attention backend, \
-                                       we only support triton_attn/fa3/fa4 for now, but got {override_backend}.")
+                    raise RuntimeError(
+                        f"Not supported ViT attention backend, \
+                                       we only support triton_attn/fa3/fa4 for now, but got {override_backend}."
+                    )
 
                 if position_embeddings is not None:
                     if layer_num == 0:

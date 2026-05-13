@@ -7,7 +7,7 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cpu, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
