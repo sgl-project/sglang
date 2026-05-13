@@ -2787,29 +2787,14 @@ class Scheduler(
             return None
 
         can_run_set = set(can_run_list)
-        # PP only: drop everything that just got admitted (including still-
-        # chunked reqs — they're re-added to waiting_queue by
-        # process_batch_result_prefill once their forward + OP completes).
-        # This keeps PP correct: while a chunk is mid-flight in one
-        # microbatch, the req is OUT of waiting_queue, so the next
-        # microbatch in the same outer iter can't also admit it and
-        # re-prefill the same KV range concurrently.
-        #
-        # Non-PP: keep chunked reqs in waiting_queue across iters (the
-        # original behaviour). Dropping them outside PP regresses
-        # event_loop_normal / event_loop_overlap paths (VLM bench, EAGLE
-        # specdec) — the OP re-add interacts badly with overlap-mode
-        # delayed OP / spec v2 OP, producing CUDA-side aborts and
-        # full-pool leaks. Multi-microbatch double-admit only exists when
-        # ``pp_size > 1``, so the PP-only carve-out is safe.
-        if self.pp_size > 1:
-            self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
-        else:
-            self.waiting_queue = [
-                x
-                for x in self.waiting_queue
-                if x not in can_run_set or _is_unfinished_chunked(x)
-            ]
+        # Keep chunked reqs in waiting_queue (they will be re-admitted as
+        # chunked-resume next iter). _is_unfinished_chunked is safe to call
+        # here because PrefillAdder truncated fill_ids for the admitted chunk.
+        self.waiting_queue = [
+            x
+            for x in self.waiting_queue
+            if x not in can_run_set or _is_unfinished_chunked(x)
+        ]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)

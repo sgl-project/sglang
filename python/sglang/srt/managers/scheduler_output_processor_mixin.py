@@ -18,7 +18,6 @@ from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
     ScheduleBatch,
-    _is_unfinished_chunked,
 )
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
@@ -320,21 +319,6 @@ class SchedulerOutputProcessorMixin:
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
                     skip_stream_req = req
-
-                    # Re-add to waiting_queue so the next scheduler iter can
-                    # admit the next chunk. The admission path drops chunked-
-                    # resume reqs from waiting_queue when it admits them (to
-                    # keep PP correct: another microbatch in the same outer
-                    # iter must not also admit the same req and re-prefill
-                    # the in-flight KV range). PP can hold multiple
-                    # microbatches' OPs in flight for the same req, so guard
-                    # against duplicate re-adds with req.is_chunked still > 0.
-                    if (
-                        req.is_chunked == 0
-                        and _is_unfinished_chunked(req)
-                        and req not in self.waiting_queue
-                    ):
-                        self.waiting_queue.append(req)
 
                     # Incrementally update input logprobs.
                     if batch.return_logprob:
