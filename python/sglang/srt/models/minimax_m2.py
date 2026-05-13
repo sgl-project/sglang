@@ -316,6 +316,7 @@ class MiniMaxM2RMSNormTP(nn.Module):
         shard_size = param.data.shape[0]
 
         if _is_cpu:
+            # Handle uneven TP sharding on CPU
             param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 param.data,
                 loaded_weight,
@@ -398,9 +399,7 @@ class MiniMaxM2QKRMSNorm:
         use_fused_norm = get_bool_env_var("SGLANG_USE_FUSED_PARALLEL_QKNORM")
 
         self._forward_impl = self._forward_naive
-        if _is_cpu:
-            self._forward_impl = self._forward_cpu
-        elif self._world_size > 1 and _is_cuda and use_fused_norm:
+        if self._world_size > 1 and _is_cuda and use_fused_norm:
             occupancy = get_fused_parallel_qknorm_max_occupancy(
                 q_norm.weight.dtype,
                 self._world_size,
@@ -412,6 +411,8 @@ class MiniMaxM2QKRMSNorm:
             if counter is not None:
                 self._counter = counter
                 self._forward_impl = self._forward_fused
+        elif _is_cpu:
+            self._forward_impl = self._forward_cpu
 
     @lru_cache
     @staticmethod
