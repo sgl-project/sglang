@@ -36,11 +36,21 @@ class HiCacheStorageExtraInfo:
     extra_info: Optional[dict] = None
 
 
+@dataclass(frozen=True)
+class PrefetchTimeoutConfig:
+    """Knobs for the linear prefetch-timeout policy used by HiCache."""
+
+    base: float = 2.0  # seconds, fixed overhead unrelated to token count
+    per_ki_token: float = 0.1  # seconds per 1024 tokens
+    max: float = 30.0  # seconds, upper bound for the linear timeout
+
+
 class PoolName(str, Enum):
     """Well-known pool names used as PoolTransfer/PoolEntry identifiers."""
 
     KV = "kv"
     MAMBA = "mamba"
+    SWA = "swa"
     INDEXER = "indexer"
 
     def __str__(self) -> str:
@@ -64,6 +74,7 @@ class PoolTransfer:
 
     device<->host path : host_indices + device_indices
     host<->storage path: host_indices + keys
+    nodes_to_load      : evicted nodes this transfer covers
     """
 
     name: PoolName
@@ -71,6 +82,7 @@ class PoolTransfer:
     device_indices: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+    nodes_to_load: Optional[List[Any]] = None
 
 
 @dataclass

@@ -7,13 +7,11 @@ import json
 import os
 import re
 import urllib.request
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INDEX_PATH = ROOT / "index.mdx"
-OUTPUT_JSON_PATH = ROOT / "src" / "generated" / "lmsys_sglang_blogs.json"
 
 START_MARKER = "{/* BEGIN_LMSYS_SGLANG_BLOG_CARDS */}"
 END_MARKER = "{/* END_LMSYS_SGLANG_BLOG_CARDS */}"
@@ -256,20 +254,6 @@ def replace_generated_block(index_text: str, generated_cards: str) -> str:
     return updated_text
 
 
-def write_metadata(posts: list[BlogPost], total_blog_files: int) -> None:
-    OUTPUT_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "sourceRepo": "https://github.com/lm-sys/lm-sys.github.io/tree/main/blog",
-        "keywords": KEYWORDS,
-        "maxCards": MAX_CARDS,
-        "totalBlogFilesScanned": total_blog_files,
-        "cardsPublished": len(posts),
-        "posts": [asdict(post) for post in posts],
-    }
-    OUTPUT_JSON_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-
-
 def main() -> None:
     sources = download_blog_sources()
     relevant_posts: list[BlogPost] = []
@@ -291,7 +275,6 @@ def main() -> None:
     if updated_index != current_index:
         INDEX_PATH.write_text(updated_index, encoding="utf-8")
 
-    write_metadata(posts=selected_posts, total_blog_files=len(sources))
     print(
         "Scanned "
         f"{len(sources)} blog files, matched {len(relevant_posts)} posts, "

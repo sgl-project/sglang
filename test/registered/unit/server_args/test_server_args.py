@@ -47,6 +47,44 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
+    def test_pd_decode_radix_cache_rejects_hisparse(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="decode",
+                disaggregation_decode_enable_radix_cache=True,
+                disaggregation_transfer_backend="nixl",
+                enable_hisparse=True,
+            )
+
+        self.assertIn(
+            "--disaggregation-decode-enable-radix-cache is incompatible with "
+            "--enable-hisparse",
+            str(context.exception),
+        )
+
+    def test_pd_decode_radix_cache_allows_mooncake(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_cache_rejects_unknown_backend(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="decode",
+                disaggregation_decode_enable_radix_cache=True,
+                disaggregation_transfer_backend="fake",
+            )
+
+        self.assertIn("('nixl', 'mooncake')", str(context.exception))
+        self.assertIn("'fake'", str(context.exception))
+
 
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
@@ -475,6 +513,64 @@ class TestNgramExternalSamArgs(CustomTestCase):
                 speculative_ngram_external_corpus_max_tokens=0,
             )._handle_speculative_decoding()
         self.assertIn("external-corpus-max-tokens", str(context.exception))
+
+
+class TestPrefillOnlyDisableKvCache(unittest.TestCase):
+    """Validation for --prefill-only-disable-kv-cache.
+
+    The flag wires NoOpMHATokenToKVPool, which is only safe when:
+      - the engine is in embedding mode (fa_skip_kv_cache active in FA backend),
+      - chunked_prefill_size == -1 (no inter-chunk K/V reuse),
+      - disable_radix_cache (radix cache otherwise indexes empty pool slots),
+      - no context-parallel attention (CP writes to the pool via set_kv_buffer),
+      - no HiSparse (uses a different pool family),
+      - kv_cache_dtype != fp4_e2m1 (FP4 pool is a separate allocation path).
+    All other configurations must be rejected at __post_init__ time so users
+    get a clear error before model load.
+    """
+
+    def _base_kwargs(self, **overrides):
+        kwargs = dict(
+            model_path="dummy",
+            is_embedding=True,
+            chunked_prefill_size=-1,
+            disable_radix_cache=True,
+            prefill_only_disable_kv_cache=True,
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_valid_minimal_config_constructs(self):
+        sa = ServerArgs(**self._base_kwargs())
+        self.assertTrue(sa.prefill_only_disable_kv_cache)
+
+    def test_rejects_when_not_embedding(self):
+        with self.assertRaisesRegex(ValueError, "requires --is-embedding"):
+            ServerArgs(**self._base_kwargs(is_embedding=False))
+
+    def test_rejects_when_chunked_prefill_size_not_minus_one(self):
+        with self.assertRaisesRegex(ValueError, "--chunked-prefill-size=-1"):
+            ServerArgs(**self._base_kwargs(chunked_prefill_size=8192))
+
+    def test_rejects_when_radix_cache_enabled(self):
+        with self.assertRaisesRegex(ValueError, "--disable-radix-cache"):
+            ServerArgs(**self._base_kwargs(disable_radix_cache=False))
+
+    def test_rejects_attn_cp_size_greater_than_one(self):
+        with self.assertRaisesRegex(ValueError, "--attn-cp-size"):
+            ServerArgs(**self._base_kwargs(attn_cp_size=2, tp_size=2))
+
+    def test_rejects_prefill_context_parallel(self):
+        with self.assertRaisesRegex(ValueError, "--enable-prefill-context-parallel"):
+            ServerArgs(**self._base_kwargs(enable_prefill_context_parallel=True))
+
+    def test_rejects_hisparse(self):
+        with self.assertRaisesRegex(ValueError, "--enable-hisparse"):
+            ServerArgs(**self._base_kwargs(enable_hisparse=True))
+
+    def test_rejects_fp4_kv_cache(self):
+        with self.assertRaisesRegex(ValueError, "fp4_e2m1"):
+            ServerArgs(**self._base_kwargs(kv_cache_dtype="fp4_e2m1"))
 
 
 if __name__ == "__main__":
