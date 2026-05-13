@@ -2413,14 +2413,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         keep_indices: Optional[List[int]] = None,
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
+        exclude_chunked_req: bool = False,
     ):
-        # Invariant: reqs still doing prefill (chunked-resume or DLLM-managed)
-        # must never be merged into running_batch via this filter — running_batch
-        # runs decode forward, and admitting a mid-prefill req there causes
-        # shape mismatch + double KV accounting. Enforced per-req:
-        #   - has_pending_chunk: chunked-resume scheduled to continue
-        #   - pending_middle_outputs > 0: PP in-flight middle chunk for this req
-        #   - is_dllm(): DllmManager-managed (separate staging queue)
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
@@ -2430,9 +2424,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and not self.reqs[i].has_pending_chunk
-                and not self.reqs[i].pending_middle_outputs > 0
-                and not self.reqs[i].is_dllm()
+                and not (
+                    exclude_chunked_req
+                    and (
+                        self.reqs[i].has_pending_chunk
+                        or self.reqs[i].pending_middle_outputs > 0
+                        or self.reqs[i].is_dllm()
+                    )
+                )
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -2503,11 +2502,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # future. Synchronize here to avoid a cross-stream data race.
         self.maybe_wait_verify_done()
 
-        # Invariant: chunked-resume / mid-prefill reqs must never reach
-        # running_batch via merge — running_batch runs decode forward and
-        # admitting a prefill-in-progress req there breaks shape + KV accounting.
-        # filter_batch's predicate is responsible for excluding these from
-        # last_batch before this merge call.
+        # Caller must filter_batch(exclude_chunked_req=True) on the other batch
+        # before merging — running_batch runs decode forward and admitting a
+        # prefill-in-progress req there breaks shape + KV accounting.
         assert not any(r.has_pending_chunk for r in other.reqs)
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because

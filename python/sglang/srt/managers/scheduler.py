@@ -2512,10 +2512,8 @@ class Scheduler(
             and self.last_batch
             and self.last_batch.forward_mode.is_extend()
         ):
-            # filter_batch's internal predicate excludes still-prefilling reqs
-            # (has_pending_chunk / pending_middle_outputs > 0 / is_dllm) from merge.
             last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch()
+            self.last_batch.filter_batch(exclude_chunked_req=True)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -2533,7 +2531,7 @@ class Scheduler(
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
-            self.running_batch.filter_batch()
+            self.running_batch.filter_batch(exclude_chunked_req=True)
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
@@ -2846,7 +2844,9 @@ class Scheduler(
             and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            self.running_batch.filter_batch(v1_spec_info_filtered=True)
+            self.running_batch.filter_batch(
+                v1_spec_info_filtered=True, exclude_chunked_req=True
+            )
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
@@ -3668,9 +3668,7 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            # filter_batch's internal predicate excludes still-prefilling reqs
-            # (has_pending_chunk / pending_middle_outputs > 0 / is_dllm).
-            self.last_batch.filter_batch()
+            self.last_batch.filter_batch(exclude_chunked_req=True)
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never

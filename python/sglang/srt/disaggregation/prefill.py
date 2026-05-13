@@ -732,9 +732,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.running_batch.batch_is_full = False
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            # filter_batch's internal predicate excludes still-prefilling reqs.
             last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch()
+            self.last_batch.filter_batch(exclude_chunked_req=True)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
