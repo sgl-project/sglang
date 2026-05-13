@@ -37,7 +37,10 @@ from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.iquest_q1_detector import IQuestQ1Detector
 from sglang.srt.function_call.k2_v3_detector import K2V3Detector
-from sglang.srt.function_call.kimik2_detector import KimiK2Detector
+from sglang.srt.function_call.kimik2_detector import (
+    KimiK2Detector,
+    KimiK2RawIdDetector,
+)
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.ling3_detector import Ling3Detector
@@ -88,6 +91,7 @@ class FunctionCallParser:
         "k2_horizon": K2V3Detector,
         "kimi_k2": KimiK2Detector,
         "kimi_k3": KimiK3Detector,
+        "kimi_k2_raw_id": KimiK2RawIdDetector,
         "lfm2": Lfm2Detector,
         "ling3": Ling3Detector,
         "llama3": Llama32Detector,
