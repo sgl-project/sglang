@@ -2118,6 +2118,41 @@ def maybe_stub_sgl_kernel():
     sys.meta_path.insert(0, _SglKernelFinder())
 
 
+def download_audio_bytes(url, local_path=None):
+    """Download audio file and return raw bytes.
+
+    If *local_path* is given the file is cached on disk so repeated calls
+    within the same CI job avoid re-downloading.
+    """
+    if local_path and os.path.exists(local_path):
+        with open(local_path, "rb") as f:
+            return f.read()
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    if local_path:
+        with open(local_path, "wb") as f:
+            f.write(resp.content)
+    return resp.content
+
+
+def parse_sse_stream(response):
+    """Parse an SSE stream into a list of JSON event dicts and assembled text."""
+    events = []
+    text_parts = []
+    for line in response.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        payload = line[len("data: ") :]
+        if payload == "[DONE]":
+            break
+        event = json.loads(payload)
+        events.append(event)
+        content = event.get("choices", [{}])[0].get("delta", {}).get("content")
+        if content:
+            text_parts.append(content)
+    return events, "".join(text_parts)
+
+
 class CustomTestCase(unittest.TestCase):
 
     def __init_subclass__(cls, **kwargs):
