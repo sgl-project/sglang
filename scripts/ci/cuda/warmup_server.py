@@ -11,8 +11,7 @@ invalidated when Python, Triton, or PyTorch versions change.
 
 Usage:
     python3 scripts/ci/cuda/warmup_server.py \
-        deepseek-ai/DeepSeek-V3-0324:8 \
-        inclusionAI/Ring-2.5-1T:8
+        deepseek-ai/DeepSeek-V3-0324:8
 """
 
 import hashlib

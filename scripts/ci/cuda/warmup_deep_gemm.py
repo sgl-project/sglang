@@ -11,7 +11,7 @@ for unsupported architectures.
 Usage:
     python3 scripts/ci/cuda/warmup_deep_gemm.py \
         deepseek-ai/DeepSeek-V3-0324:8 \
-        deepseek-ai/DeepSeek-V3.2-Exp:8
+        deepseek-ai/DeepSeek-V3.2:8
 """
 
 import json

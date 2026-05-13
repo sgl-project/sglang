@@ -1358,7 +1358,7 @@ jobs:
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
-            deepseek-ai/DeepSeek-V3.2-Exp:8
+            deepseek-ai/DeepSeek-V3.2:8
 
       - name: Warmup Server CUDA Graphs
         timeout-minutes: 25
