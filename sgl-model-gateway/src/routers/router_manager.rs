@@ -35,17 +35,22 @@ use crate::{
 };
 
 /// Read the `model` field out of a parsed body for IGW dispatch.
-/// Distinguishes three input shapes that previously all collapsed
+/// Distinguishes four input shapes that previously all collapsed
 /// to "no model":
-/// - `Some(Ok(Some(s)))` — explicit string model id;
-/// - `Some(Ok(None))` — field absent, or present as JSON `null`;
-/// - `Some(Err(_))` — field present but not a string, e.g. `model: 42`;
-///   surface a structured 400 instead of silently routing to the
-///   single-model implicit default.
+/// - `Ok(Some(s))` — explicit non-empty string model id;
+/// - `Ok(None)` — field absent, or present as JSON `null`;
+/// - `Err(_)` for `model: ""` — empty string is rejected explicitly
+///   so we fail fast with a structured 400 instead of routing to a
+///   model id no worker can match;
+/// - `Err(_)` for non-string types like `model: 42` — same reasoning.
 fn extract_body_model(value: &Value) -> Result<Option<&str>, Response> {
     match value.get("model") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(Value::String(s)) if !s.is_empty() => Ok(Some(s.as_str())),
+        Some(Value::String(_)) => Err(error::bad_request(
+            "json_parse_error",
+            "Field `model` must be a non-empty string",
+        )),
         Some(_) => Err(error::bad_request(
             "json_parse_error",
             "Field `model` must be a string",
@@ -828,6 +833,38 @@ mod tests {
         fn router_type(&self) -> &'static str {
             "capture-mock"
         }
+    }
+
+    #[test]
+    fn extract_body_model_empty_string_is_400() {
+        let body = serde_json::json!({"model": ""});
+        let err = extract_body_model(&body).unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        // Lock the structured-error contract: clients (and our own
+        // metrics labels) classify on the `X-SMG-Error-Code` header,
+        // so a refactor that drops the code must not slip through.
+        assert_eq!(
+            error::extract_error_code_from_response(&err),
+            "json_parse_error"
+        );
+    }
+
+    #[test]
+    fn extract_body_model_accepts_missing_and_null() {
+        assert!(matches!(
+            extract_body_model(&serde_json::json!({})),
+            Ok(None)
+        ));
+        assert!(matches!(
+            extract_body_model(&serde_json::json!({"model": null})),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn extract_body_model_accepts_nonempty_string() {
+        let body = serde_json::json!({"model": "m1"});
+        assert_eq!(extract_body_model(&body).unwrap(), Some("m1"));
     }
 
     /// IGW (k8s-mode) implicit-default-model contract: when service

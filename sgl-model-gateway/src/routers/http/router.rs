@@ -38,7 +38,10 @@ use crate::{
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
-        http::routing_view::{view_parse_error, ChatRoutingView, GenerateRoutingView},
+        http::{
+            pd_router::extract_chat_request_text,
+            routing_view::{view_parse_error, ChatRoutingView, GenerateRoutingView},
+        },
         RouterTrait,
     },
 };
@@ -1047,16 +1050,45 @@ impl RouterTrait for Router {
             Ok(v) => v,
             Err(e) => return view_parse_error::<ChatRoutingView>(body, e),
         };
+        let effective_model = model_id.or(Some(view.model.as_str()));
+
+        // Cache-aware (and any future policy that reports
+        // `needs_request_text() == true`) hashes on the conversation
+        // text to keep multi-turn chats on the same worker for KV-cache
+        // reuse. Skip the second parse when no policy needs it so the
+        // non-cache-aware deployment stays at one `from_slice`.
+        //
+        // TODO: this lookup is redundant — `route_bytes_request` →
+        // `route_bytes_once` resolves the same policy from
+        // `effective_model` again for its load-guard branch. Fold both
+        // into one resolved `Arc<dyn LoadBalancingPolicy>` threaded
+        // through the call so we don't double-look-up per request.
+        let policy = match effective_model {
+            Some(m) => self.policy_registry.get_policy_or_default(m),
+            None => self.policy_registry.get_default_policy(),
+        };
+        // TODO: this is a second `from_slice` on the same body — the
+        // typed `ChatRoutingView` above already paid one parse. If
+        // cache-aware becomes the dominant deployment, plumb the raw
+        // `messages` array out of the routing view (or parse to
+        // `Value` once and reuse) so the cache-aware path stays at a
+        // single parse instead of two.
+        let request_text_owned = if policy.needs_request_text() {
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(v) => extract_chat_request_text(&v),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         self.route_bytes_request(
             headers,
             body,
             "/v1/chat/completions",
-            model_id.or(Some(view.model.as_str())),
+            effective_model,
             view.stream,
-            // Cache-aware text extraction for chat would walk the
-            // messages array. The unified router doesn't currently
-            // use it; PD does (in pd_router.rs).
-            None,
+            request_text_owned.as_deref(),
         )
         .await
     }

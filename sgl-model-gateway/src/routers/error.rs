@@ -61,9 +61,14 @@ pub fn create_error(
     let message_str = message.into();
 
     let mut headers = HeaderMap::with_capacity(1);
+    // `code_str` is developer-controlled today, but unwrap would panic if a
+    // future caller smuggled in a byte that's invalid inside an HTTP header
+    // value (CTL chars like `\n`, or non-visible bytes). Fall back to a
+    // static sentinel so the response status/body still propagate.
     headers.insert(
         HEADER_X_SMG_ERROR_CODE,
-        HeaderValue::from_str(&code_str).unwrap(),
+        HeaderValue::from_str(&code_str)
+            .unwrap_or_else(|_| HeaderValue::from_static("unknown_error")),
     );
 
     (
@@ -103,4 +108,34 @@ pub fn extract_error_code_from_response<B>(response: &Response<B>) -> &str {
         .get(HEADER_X_SMG_ERROR_CODE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `create_error` must not panic when a caller smuggles a byte that
+    /// is invalid in an HTTP header value (here `\n` — a CTL char, not
+    /// strictly non-ASCII). Without the `unwrap_or_else` fallback the
+    /// previous `unwrap()` would have taken down the request handler.
+    #[test]
+    fn invalid_header_byte_code_falls_back_to_sentinel_header() {
+        let response = create_error(StatusCode::BAD_REQUEST, "bad\ncode", "msg");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let header = response
+            .headers()
+            .get(HEADER_X_SMG_ERROR_CODE)
+            .expect("error code header must be present");
+        assert_eq!(header.to_str().unwrap(), "unknown_error");
+    }
+
+    #[test]
+    fn ascii_code_round_trips_in_header() {
+        let response = create_error(StatusCode::BAD_REQUEST, "json_parse_error", "msg");
+        let header = response
+            .headers()
+            .get(HEADER_X_SMG_ERROR_CODE)
+            .expect("error code header must be present");
+        assert_eq!(header.to_str().unwrap(), "json_parse_error");
+    }
 }
