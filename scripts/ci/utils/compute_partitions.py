@@ -39,8 +39,10 @@ _STAGE_A_OVERRIDES = {
     "stage-a-test-1-gpu-small": 1,
 }
 
-# Per-partition wall-clock budget. Single knob for the whole pipeline.
-TARGET_SECONDS = 17 * 60
+# Per-partition wall-clock target + ceiling. Single knob for the whole
+# pipeline. ~17 min avg under perfect LPT (TARGET / LPT_SLOP), ~22 min under
+# worst-case LPT 4/3 imbalance, fail-fast above 30 min.
+TARGET_SECONDS = 20 * 60
 
 # LPT (Longest Processing Time first) worst case is 4/3 * OPT; pad ~15% so a
 # slightly-unlucky LPT result still fits inside MAX_PARTITION_SECONDS.
@@ -48,7 +50,7 @@ LPT_SLOP = 1.15
 
 # Hard ceiling. Exceeded → raise, forcing the maintainer to split a slow file
 # or bump TARGET_SECONDS deliberately.
-MAX_PARTITION_SECONDS = 25 * 60
+MAX_PARTITION_SECONDS = 30 * 60
 
 
 def discover_files(repo_root: str) -> list[str]:
