@@ -913,9 +913,7 @@ class DeepseekV4Model(nn.Module):
             enable_tp=not is_dp_attention_enabled(),
         )
         self.rms_norm_eps = config.rms_norm_eps
-        self.alt_streams = (
-            [torch.cuda.Stream() for _ in range(5)] if (_is_cuda or _is_hip) else None
-        )
+        self.alt_streams = [torch.cuda.Stream() for _ in range(5)] if _is_cuda else None
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(
