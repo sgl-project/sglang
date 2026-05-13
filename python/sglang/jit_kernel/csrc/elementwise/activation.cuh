@@ -90,7 +90,7 @@ struct ActivationKernel {
   static constexpr auto activation_kernel = act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert>;
 
   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
-  
+
   using KernelFunc = void (*)(ActivationParams);
 
   template <bool kFilterExpert>

@@ -635,7 +635,10 @@ class CudaGraphRunner:
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.last_replay_timings: Optional[dict] = None
         self.num_tokens_per_bs = 1
-        if model_runner.spec_algorithm.is_speculative() and not model_runner.spec_algorithm.is_decoupled_draft():
+        if (
+            model_runner.spec_algorithm.is_speculative()
+            and not model_runner.spec_algorithm.is_decoupled_draft()
+        ):
             if self.model_runner.is_draft_worker:
                 # DFLASH draft workers reuse this runner for TARGET_VERIFY mode.
                 if not self.model_runner.spec_algorithm.is_dflash():
@@ -1467,9 +1470,7 @@ class CudaGraphRunner:
                 ),
             )
 
-        elif (
-            self.model_runner.spec_algorithm.is_ngram()
-        ):
+        elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
             spec_info = NgramVerifyInput(

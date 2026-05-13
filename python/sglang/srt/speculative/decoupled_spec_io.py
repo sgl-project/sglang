@@ -57,6 +57,7 @@ class VerifyCommit:
     Drafter relies on pre_verify_committed_len and bonus_token_pos to
     correctly push forward the verifier_committed_prefix_len.
     """
+
     request_id: str
     src_verifier_rank: int
     dst_drafter_rank: int
@@ -92,6 +93,7 @@ class DraftTailStreamOutput:
     """
     Drafter sends a stream output to verifier whenever it decodes a new token
     """
+
     src_drafter_rank: int
     dst_verifier_rank: int
     request_id: str

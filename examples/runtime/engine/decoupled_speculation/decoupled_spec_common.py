@@ -10,11 +10,12 @@ from dataclasses import dataclass
 from typing import Any
 
 import ray
-import sglang as sgl
 from ray.util.scheduling_strategies import (
     NodeAffinitySchedulingStrategy,
     PlacementGroupSchedulingStrategy,
 )
+
+import sglang as sgl
 from sglang.srt.utils.network import is_valid_ipv6_address
 
 DEFAULT_PROMPT_COLUMN_CANDIDATES = [
@@ -435,9 +436,8 @@ def create_remote_decoupled_spec_topology(
         verifier_pgs = [verifier_pgs]
     if not verifier_pgs:
         raise ValueError("at least one verifier placement group is required")
-    if (
-        preferred_result_ports is not None
-        and len(preferred_result_ports) != len(verifier_pgs)
+    if preferred_result_ports is not None and len(preferred_result_ports) != len(
+        verifier_pgs
     ):
         raise ValueError(
             f"preferred_result_ports has {len(preferred_result_ports)} entries, "
@@ -606,6 +606,7 @@ class TargetActor:
         """Shutdown the target engine owned by this actor."""
         self.engine.shutdown()
         return True
+
 
 def infer_prompt_column(
     available_columns: list[str],

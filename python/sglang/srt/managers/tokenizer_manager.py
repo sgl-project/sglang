@@ -2165,9 +2165,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         meta_info["spec_valid_draft_token_num"] = valid_draft_tokens
         meta_info["spec_valid_accept_token_num"] = valid_accepted_tokens
         valid_accept_rate = (
-            valid_accepted_tokens / valid_draft_tokens
-            if valid_draft_tokens > 0
-            else 0
+            valid_accepted_tokens / valid_draft_tokens if valid_draft_tokens > 0 else 0
         )
         meta_info["spec_valid_accept_rate"] = valid_accept_rate
 

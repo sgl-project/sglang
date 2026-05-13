@@ -79,8 +79,8 @@ def _ensure_runtime_imports() -> None:
         return
 
     import ray as ray_module
+    from ray.util.placement_group import placement_group as ray_placement_group
     from ray.util.placement_group import (
-        placement_group as ray_placement_group,
         remove_placement_group as ray_remove_placement_group,
     )
     from ray.util.scheduling_strategies import (
@@ -96,9 +96,7 @@ def _ensure_runtime_imports() -> None:
     placement_group = ray_placement_group
     remove_placement_group = ray_remove_placement_group
     PlacementGroupSchedulingStrategy = RayPlacementGroupSchedulingStrategy
-    create_remote_decoupled_spec_topology = (
-        common.create_remote_decoupled_spec_topology
-    )
+    create_remote_decoupled_spec_topology = common.create_remote_decoupled_spec_topology
     PortActor = common.PortActor
     TargetActor = common.TargetActor
     _build_chat_template_renderer = common._build_chat_template_renderer
@@ -108,9 +106,7 @@ def _ensure_runtime_imports() -> None:
     _normalize_prompt = common._normalize_prompt
     get_decoupled_spec_actor_env_vars = common.get_decoupled_spec_actor_env_vars
     infer_prompt_column = common.infer_prompt_column
-    resolve_dapo_math_17k_prompt_column = (
-        common.resolve_dapo_math_17k_prompt_column
-    )
+    resolve_dapo_math_17k_prompt_column = common.resolve_dapo_math_17k_prompt_column
     _RUNTIME_IMPORTS_READY = True
 
 
@@ -482,9 +478,7 @@ def _build_codeforces_raw_prompt(
     ]
     if input_mode:
         if input_mode == "stdio":
-            limit_parts.append(
-                "I/O mode: standard input and standard output"
-            )
+            limit_parts.append("I/O mode: standard input and standard output")
         else:
             limit_parts.append(f"I/O mode: {input_mode}")
 
@@ -539,7 +533,9 @@ def _build_codeforces_raw_prompt(
     return _messages_to_fallback_text(messages)
 
 
-def load_prompt_samples(args: argparse.Namespace) -> tuple[str, list[PromptSample], int]:
+def load_prompt_samples(
+    args: argparse.Namespace,
+) -> tuple[str, list[PromptSample], int]:
     if args.prompt is not None and args.dataset_path is not None:
         raise ValueError("--prompt and --dataset-path are mutually exclusive")
     if args.prompt is None and args.dataset_path is None:
@@ -568,7 +564,10 @@ def load_prompt_samples(args: argparse.Namespace) -> tuple[str, list[PromptSampl
         prompt_tokens = len(prompt_input_ids)
         if prompt_tokens == 0:
             raise ValueError("--prompt produced zero prompt tokens")
-        if args.max_prompt_length is not None and prompt_tokens > args.max_prompt_length:
+        if (
+            args.max_prompt_length is not None
+            and prompt_tokens > args.max_prompt_length
+        ):
             raise ValueError(
                 f"--prompt has {prompt_tokens} tokens, exceeding --max-prompt-length "
                 f"{args.max_prompt_length}"
@@ -879,10 +878,7 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
             f"({derived_num_draft_replicas}) when --draft-ngpus is set"
         )
     args.num_draft_replicas = derived_num_draft_replicas
-    if (
-        args.verify_ngpus is not None
-        and args.verify_ngpus % args.target_tp_size != 0
-    ):
+    if args.verify_ngpus is not None and args.verify_ngpus % args.target_tp_size != 0:
         raise ValueError(
             f"verify-ngpus ({args.verify_ngpus}) must be divisible by "
             f"target-tp-size ({args.target_tp_size})"
@@ -892,8 +888,8 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
         if args.nnodes != 1:
             raise ValueError("n-gpu-per-node is required when nnodes > 1")
         args.n_gpu_per_node = (
-            (args.verify_ngpus or args.target_tp_size) + args.draft_ngpus
-        )
+            args.verify_ngpus or args.target_tp_size
+        ) + args.draft_ngpus
     if args.n_gpu_per_node <= 0:
         raise ValueError("n-gpu-per-node must be positive")
 
@@ -949,10 +945,7 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
 
 
 def create_target_placement_group(target_nnodes: int, target_gpus_per_node: int):
-    bundles = [
-        {"CPU": 1, "GPU": target_gpus_per_node}
-        for _ in range(target_nnodes)
-    ]
+    bundles = [{"CPU": 1, "GPU": target_gpus_per_node} for _ in range(target_nnodes)]
     strategy = "PACK" if target_nnodes == 1 else "STRICT_SPREAD"
     pg = placement_group(bundles, strategy=strategy)
     ray.get(pg.ready())
@@ -1068,11 +1061,7 @@ def _get_decoupled_verify_acceptance_stats(
     verify_ct = meta_info.get("spec_verify_ct")
     valid_draft_tokens = meta_info.get("spec_valid_draft_token_num")
     valid_accepted_tokens = meta_info.get("spec_valid_accept_token_num")
-    if (
-        verify_ct is None
-        or valid_draft_tokens is None
-        or valid_accepted_tokens is None
-    ):
+    if verify_ct is None or valid_draft_tokens is None or valid_accepted_tokens is None:
         return None, None, 0, 0, 0
 
     verify_ct = int(verify_ct)
@@ -1083,9 +1072,7 @@ def _get_decoupled_verify_acceptance_stats(
 
     accept_length = valid_accepted_tokens / verify_ct
     accept_rate = (
-        valid_accepted_tokens / valid_draft_tokens
-        if valid_draft_tokens > 0
-        else None
+        valid_accepted_tokens / valid_draft_tokens if valid_draft_tokens > 0 else None
     )
     return (
         accept_length,
@@ -1174,8 +1161,12 @@ def collect_mode_metrics(
             "output_text_preview": (
                 output_text[:512] if isinstance(output_text, str) else None
             ),
-            "output_ids_head": output_ids[:32] if isinstance(output_ids, list) else None,
-            "output_ids_tail": output_ids[-32:] if isinstance(output_ids, list) else None,
+            "output_ids_head": (
+                output_ids[:32] if isinstance(output_ids, list) else None
+            ),
+            "output_ids_tail": (
+                output_ids[-32:] if isinstance(output_ids, list) else None
+            ),
         }
         if include_output_text:
             request_metrics["output_text"] = (
@@ -1190,9 +1181,7 @@ def collect_mode_metrics(
         total_generated_tokens / generation_time_s if generation_time_s > 0 else 0.0
     )
     avg_accept_length = (
-        total_accepted_tokens / total_verify_ct
-        if total_verify_ct > 0
-        else None
+        total_accepted_tokens / total_verify_ct if total_verify_ct > 0 else None
     )
     avg_accept_rate = (
         total_accepted_tokens / total_draft_tokens if total_draft_tokens > 0 else None
@@ -1396,7 +1385,9 @@ def build_result(
         "dataset": {
             "total_rows": total_rows,
             "loaded_rows": [sample.row_index for sample in prompt_samples],
-            "total_prompt_tokens": sum(sample.prompt_tokens for sample in prompt_samples),
+            "total_prompt_tokens": sum(
+                sample.prompt_tokens for sample in prompt_samples
+            ),
             "prompt_samples": [
                 {
                     "row_index": sample.row_index,
@@ -1464,9 +1455,7 @@ def _csv_output_record(mode_key: str, item: dict[str, Any]) -> dict[str, Any]:
                 "spec_accept_length": item["spec_accept_length"],
                 "spec_accept_rate": item["spec_accept_rate"],
                 "spec_valid_accept_rate": item["spec_valid_accept_rate"],
-                "spec_valid_accept_token_num": item[
-                    "spec_valid_accept_token_num"
-                ],
+                "spec_valid_accept_token_num": item["spec_valid_accept_token_num"],
                 "spec_valid_draft_token_num": item["spec_valid_draft_token_num"],
             }
         )
@@ -1499,9 +1488,7 @@ def write_output_files(result: dict[str, Any], output_dir: str) -> list[Path]:
                     {
                         "spec_accept_length": item["spec_accept_length"],
                         "spec_accept_rate": item["spec_accept_rate"],
-                        "spec_valid_accept_rate": item[
-                            "spec_valid_accept_rate"
-                        ],
+                        "spec_valid_accept_rate": item["spec_valid_accept_rate"],
                         "spec_valid_accept_token_num": item[
                             "spec_valid_accept_token_num"
                         ],
@@ -1601,8 +1588,14 @@ def print_summary(result: dict[str, Any]) -> None:
         )
     if result["config"].get("show_responses"):
         print("responses:")
-        decode_items = decode["per_request"] if decode is not None else [None] * len(spec["per_request"])
-        for spec_item, decode_item in zip(spec["per_request"], decode_items, strict=True):
+        decode_items = (
+            decode["per_request"]
+            if decode is not None
+            else [None] * len(spec["per_request"])
+        )
+        for spec_item, decode_item in zip(
+            spec["per_request"], decode_items, strict=True
+        ):
             print(
                 "  "
                 f"batch_index={spec_item['batch_index']}, "
@@ -1676,10 +1669,7 @@ def main() -> None:
                         for replica_index in range(num_verifiers)
                     )
         preferred_result_ports = (
-            [
-                args.dist_init_port + 2 * num_verifiers + i
-                for i in range(num_verifiers)
-            ]
+            [args.dist_init_port + 2 * num_verifiers + i for i in range(num_verifiers)]
             if args.dist_init_port is not None
             else None
         )

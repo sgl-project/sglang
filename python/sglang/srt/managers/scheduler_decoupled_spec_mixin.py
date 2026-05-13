@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class DraftReqState:
     key: DraftReqKey
@@ -43,11 +44,13 @@ class DraftReqState:
     pending_verify_commits: Deque[VerifyCommit] = field(default_factory=deque)
     pending_close: Optional[DraftClose] = None
 
+
 @dataclass
 class DraftCommitApplyResult:
     stream_output: Optional[Tuple[str, int, int, int, int]] = None
     applied_commits: list[VerifyCommit] = field(default_factory=list)
     deferred_commits: list[VerifyCommit] = field(default_factory=list)
+
 
 class SchedulerDecoupledSpecMixin:
     """Decoupled-spec scheduler hooks and request lifecycle helpers."""
@@ -58,12 +61,20 @@ class SchedulerDecoupledSpecMixin:
             raise RuntimeError("decoupled_spec_rank is required for decoupled spec")
         return int(rank)
 
-    def is_draft_worker_batch(self: Scheduler, batch: Optional[ScheduleBatch] = None) -> bool:
-        spec_algorithm = batch.spec_algorithm if batch is not None else self.spec_algorithm
+    def is_draft_worker_batch(
+        self: Scheduler, batch: Optional[ScheduleBatch] = None
+    ) -> bool:
+        spec_algorithm = (
+            batch.spec_algorithm if batch is not None else self.spec_algorithm
+        )
         return bool(spec_algorithm.is_decoupled_draft())
 
-    def is_verify_worker_batch(self: Scheduler, batch: Optional[ScheduleBatch] = None) -> bool:
-        spec_algorithm = batch.spec_algorithm if batch is not None else self.spec_algorithm
+    def is_verify_worker_batch(
+        self: Scheduler, batch: Optional[ScheduleBatch] = None
+    ) -> bool:
+        spec_algorithm = (
+            batch.spec_algorithm if batch is not None else self.spec_algorithm
+        )
         return bool(spec_algorithm.is_decoupled_verify())
 
     def create_draft_tail_buffer(self: Scheduler) -> Optional[DraftTailBuffer]:
@@ -202,15 +213,11 @@ class SchedulerDecoupledSpecMixin:
         )
         dp_rank = self.dp_rank or 0
         file_names = {
-            "verifier": (
-                f"verifier_dp{dp_rank}_tp{self.tp_rank}_pp{self.pp_rank}.csv"
-            ),
+            "verifier": (f"verifier_dp{dp_rank}_tp{self.tp_rank}_pp{self.pp_rank}.csv"),
             "decode.forward_batch": (
                 f"decode-forward-batch_dp{dp_rank}_tp{self.tp_rank}_pp{self.pp_rank}.csv"
             ),
-            "drafter": (
-                f"drafter_dp{dp_rank}_tp{self.tp_rank}_pp{self.pp_rank}.csv"
-            ),
+            "drafter": (f"drafter_dp{dp_rank}_tp{self.tp_rank}_pp{self.pp_rank}.csv"),
             "draft_proxy": f"draft_proxy_verifier{dp_rank}.csv",
             "token_sync_thread": f"token_sync_thread_drafter{dp_rank}.csv",
         }
@@ -274,11 +281,7 @@ class SchedulerDecoupledSpecMixin:
         if component != "decode":
             if self.spec_algorithm.is_decoupled_draft():
                 fields["committed_lens_by_req"] = [
-                    int(
-                        self._get_draft_state_by_req(
-                            req
-                        ).verifier_committed_prefix_len
-                    )
+                    int(self._get_draft_state_by_req(req).verifier_committed_prefix_len)
                     for req in batch.reqs
                 ]
             else:
@@ -495,7 +498,6 @@ class SchedulerDecoupledSpecMixin:
                 f"kv_allocated_len={req.kv_allocated_len}"
             )
 
-
         bonus_token_matches = (
             bonus_token_pos < output_len
             and int(req.output_ids[bonus_token_pos]) == bonus_token_id
@@ -561,9 +563,7 @@ class SchedulerDecoupledSpecMixin:
                         self.token_to_kv_pool_allocator.free(indices_to_free)
                 req.kv_committed_len = min(req.kv_committed_len, kv_truncate_from)
                 req.kv_allocated_len = min(req.kv_allocated_len, kv_truncate_from)
-                req.cache_protected_len = min(
-                    req.cache_protected_len, kv_truncate_from
-                )
+                req.cache_protected_len = min(req.cache_protected_len, kv_truncate_from)
 
             # Truncate per-output arrays with the same output-index interval:
             # delete [truncate_from, old_output_len).
@@ -844,9 +844,7 @@ class SchedulerDecoupledSpecMixin:
                     for req in created_reqs
                 ],
                 committed_lens_by_req=[
-                    int(
-                        self._get_draft_state_by_req(req).verifier_committed_prefix_len
-                    )
+                    int(self._get_draft_state_by_req(req).verifier_committed_prefix_len)
                     for req in created_reqs
                 ],
                 output_lens_by_req=[len(req.output_ids) for req in created_reqs],
@@ -882,8 +880,8 @@ class SchedulerDecoupledSpecMixin:
 
         for commit_idx, verify_commit in enumerate(commits_to_apply):
             if int(verify_commit.bonus_token_pos) >= len(req.output_ids):
-                # if a drafter req has multiple pending verify commits, 
-                # it can only apply the first few commits that update the bonus token 
+                # if a drafter req has multiple pending verify commits,
+                # it can only apply the first few commits that update the bonus token
                 # within the current output_ids range.
                 result.deferred_commits.extend(commits_to_apply[commit_idx:])
                 state.pending_verify_commits.extend(commits_to_apply[commit_idx:])
@@ -1039,9 +1037,7 @@ class SchedulerDecoupledSpecMixin:
                     )
                 )
         if trace_enabled:
-            control_duration_ms = (
-                time.perf_counter_ns() - trace_start_ns
-            ) / 1_000_000
+            control_duration_ms = (time.perf_counter_ns() - trace_start_ns) / 1_000_000
             self.decoupled_spec_tracer.record(
                 "drafter",
                 "apply_commit_batch",
@@ -1081,9 +1077,7 @@ class SchedulerDecoupledSpecMixin:
                 ],
                 num_stream_outputs=num_stream_outputs,
                 committed_lens_by_req=[
-                    int(
-                        self._get_draft_state_by_req(req).verifier_committed_prefix_len
-                    )
+                    int(self._get_draft_state_by_req(req).verifier_committed_prefix_len)
                     for req in batch.reqs
                 ],
                 output_lens_by_req=[len(req.output_ids) for req in batch.reqs],
@@ -1180,7 +1174,11 @@ class SchedulerDecoupledSpecMixin:
                 "Decoupled verify returned extra verified ids: "
                 f"consumed={offset} total={len(verified_ids)}"
             )
-        for req, valid_draft_tokens, valid_accepted_tokens in valid_draft_metric_updates:
+        for (
+            req,
+            valid_draft_tokens,
+            valid_accepted_tokens,
+        ) in valid_draft_metric_updates:
             req.spec_valid_draft_tokens += valid_draft_tokens
             req.spec_valid_accepted_tokens += valid_accepted_tokens
 
@@ -1228,9 +1226,7 @@ class SchedulerDecoupledSpecMixin:
 
     def release_drafter_rank(self, request_id: str) -> None:
         """Release one request's drafter assignment after close/abort."""
-        drafter_rank = self.decoupled_verify_req_to_drafter_rank.pop(
-            request_id, None
-        )
+        drafter_rank = self.decoupled_verify_req_to_drafter_rank.pop(request_id, None)
         if drafter_rank is None:
             return
         self.decoupled_verify_drafter_loads[drafter_rank] = max(
@@ -1238,9 +1234,7 @@ class SchedulerDecoupledSpecMixin:
             self.decoupled_verify_drafter_loads.get(drafter_rank, 0) - 1,
         )
 
-    def _submit_verify_control_batch(
-        self, batch: DraftControlBatch
-    ) -> None:
+    def _submit_verify_control_batch(self, batch: DraftControlBatch) -> None:
         """
         Submit one verifier-to-drafter control batch.
 
@@ -1333,9 +1327,7 @@ class SchedulerDecoupledSpecMixin:
             The broadcast list of DraftTailSnapshot objects.
         """
         source_payload = (
-            list(local_snapshots or [])
-            if self.is_verify_entry_rank()
-            else []
+            list(local_snapshots or []) if self.is_verify_entry_rank() else []
         )
         if getattr(self.server_args, "enable_dp_attention", False):
             synced_snapshots = source_payload
@@ -1414,9 +1406,7 @@ class SchedulerDecoupledSpecMixin:
                 list(snapshot.raw_tail_tokens),
             )
 
-    def _sync_verify_requests(
-        self, batch: ScheduleBatch
-    ) -> None:
+    def _sync_verify_requests(self, batch: ScheduleBatch) -> None:
         """
         Send DraftSync messages before verifier prefill/extend processing.
 
@@ -1544,8 +1534,7 @@ class SchedulerDecoupledSpecMixin:
                 batch_size=len(target_reqs),
                 rids=[req.rid for req in target_reqs],
                 valid_tail_lens_by_req=[
-                    len(getattr(req, "draft_buffer", None) or [])
-                    for req in target_reqs
+                    len(getattr(req, "draft_buffer", None) or []) for req in target_reqs
                 ],
                 raw_tail_lens_by_req=[
                     int(getattr(snapshot_by_rid.get(req.rid), "raw_tail_len", 0))
@@ -1687,8 +1676,7 @@ class SchedulerDecoupledSpecMixin:
                 ],
                 output_lens_by_req=commit_output_lens,
                 dst_drafter_ranks=[
-                    int(message.dst_drafter_rank)
-                    for message in verify_commit_messages
+                    int(message.dst_drafter_rank) for message in verify_commit_messages
                 ],
             )
             self.decoupled_spec_tracer.record(

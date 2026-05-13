@@ -55,21 +55,29 @@ def _build_linear_topk1_tree_metadata(
     spec_steps: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    selected_index = torch.arange(
-        spec_steps,
-        dtype=torch.long,
-        device=device,
-    ).expand(batch_size, -1).contiguous()
+    selected_index = (
+        torch.arange(
+            spec_steps,
+            dtype=torch.long,
+            device=device,
+        )
+        .expand(batch_size, -1)
+        .contiguous()
+    )
 
     if spec_steps <= 1:
         parent_list = torch.empty((batch_size, 0), dtype=torch.long, device=device)
     else:
-        parent_list = torch.arange(
-            -1,
-            spec_steps - 1,
-            dtype=torch.long,
-            device=device,
-        ).expand(batch_size, -1).contiguous()
+        parent_list = (
+            torch.arange(
+                -1,
+                spec_steps - 1,
+                dtype=torch.long,
+                device=device,
+            )
+            .expand(batch_size, -1)
+            .contiguous()
+        )
 
     return selected_index, parent_list
 
@@ -101,7 +109,9 @@ class VerifyWorker:
         self.page_size = server_args.page_size
         self.topk = 1
         self.speculative_num_steps = int(server_args.speculative_num_steps)
-        self.speculative_num_draft_tokens = int(server_args.speculative_num_draft_tokens)
+        self.speculative_num_draft_tokens = int(
+            server_args.speculative_num_draft_tokens
+        )
         self.enable_nan_detection = bool(server_args.enable_nan_detection)
         self.device = self.model_runner.device
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -207,9 +217,7 @@ class VerifyWorker:
         # req.draft_buffer is a per-forward snapshot bound before verify. Any
         # concurrent drafter appends belong to later verify rounds.
         real_tail_lens = self._get_snapshot_tail_lens(batch)
-        raw_accept_lens = [
-            int(x) for x in verify_output.num_correct_drafts_per_req_cpu
-        ]
+        raw_accept_lens = [int(x) for x in verify_output.num_correct_drafts_per_req_cpu]
         for req, raw_accept_len, real_tail_len in zip(
             batch.reqs, raw_accept_lens, real_tail_lens
         ):
@@ -247,9 +255,7 @@ class VerifyWorker:
 
         # Accumulate penalty
         sampling_info = getattr(batch, "sampling_info", None)
-        penalizer_orchestrator = getattr(
-            sampling_info, "penalizer_orchestrator", None
-        )
+        penalizer_orchestrator = getattr(sampling_info, "penalizer_orchestrator", None)
         if (
             penalizer_orchestrator is not None
             and penalizer_orchestrator.is_required

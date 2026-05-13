@@ -21,7 +21,6 @@ from sglang.srt.speculative.decoupled_spec_io import (
 )
 from sglang.srt.utils.network import get_zmq_socket
 
-
 DraftControlMessage = DraftSync | VerifyCommit | DraftClose
 
 TOKEN_SYNC_THREAD_IDLE_WAIT_TIMEOUT_S = 0.0005  # 0.5ms
@@ -102,9 +101,7 @@ class TokenSyncThread:
     def _drain_control_socket(self) -> bool:
         trace_enabled = getattr(getattr(self, "tracer", None), "enabled", False)
         drain_start_ns = time.perf_counter_ns() if trace_enabled else 0
-        pending_controls_before = (
-            self._pending_controls_size() if trace_enabled else 0
-        )
+        pending_controls_before = self._pending_controls_size() if trace_enabled else 0
         num_control_batches = 0
         num_control_messages = 0
         did_work = False

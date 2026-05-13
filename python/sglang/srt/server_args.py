@@ -590,7 +590,7 @@ class ServerArgs:
     decoupled_spec_connect_endpoints: Optional[List[str]] = None
     decoupled_spec_rank: Optional[int] = None
     decoupled_spec_trace_dir: Optional[str] = None
-    
+
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False

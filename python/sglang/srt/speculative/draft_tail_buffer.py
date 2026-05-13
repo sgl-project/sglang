@@ -129,13 +129,10 @@ class DraftTailBuffer:
         raw_tail_len_before = len(state.tail_tokens)
         bonus_candidate_exists = 0 <= accepted_tail_len < raw_tail_len_before
         buffer_candidate_token_id = (
-            int(state.tail_tokens[accepted_tail_len])
-            if bonus_candidate_exists
-            else -1
+            int(state.tail_tokens[accepted_tail_len]) if bonus_candidate_exists else -1
         )
-        bonus_match = (
-            bonus_candidate_exists
-            and buffer_candidate_token_id == int(message.bonus_token_id)
+        bonus_match = bonus_candidate_exists and buffer_candidate_token_id == int(
+            message.bonus_token_id
         )
 
         if state.tail_tokens and not (0 <= accepted_tail_len < len(state.tail_tokens)):
@@ -153,7 +150,7 @@ class DraftTailBuffer:
         can_accept_prefix_len = new_committed_len
         if bonus_match:
             remaining = state.tail_tokens[accepted_tail_len + 1 :]
-            # if the bonus token matchs, the verifier do not need to truncate the tail
+            # if the bonus token matches, the verifier do not need to truncate the tail
             # Keep the previously accepted stale base. The preserved suffix may
             # itself have come from an older base, and in-flight stream outputs
             # from that base can still append contiguously.
@@ -217,9 +214,7 @@ class DraftTailBuffer:
             "raw_tail_lens_before_by_req": [
                 item["raw_tail_len_before"] for item in commit_stats
             ],
-            "bonus_token_ids_by_req": [
-                item["bonus_token_id"] for item in commit_stats
-            ],
+            "bonus_token_ids_by_req": [item["bonus_token_id"] for item in commit_stats],
             "buffer_candidate_token_ids_by_req": [
                 item["buffer_candidate_token_id"] for item in commit_stats
             ],
@@ -227,9 +222,7 @@ class DraftTailBuffer:
             "preserved_suffix_lens_by_req": [
                 item["preserved_suffix_len"] for item in commit_stats
             ],
-            "tail_lens_after_by_req": [
-                item["tail_len_after"] for item in commit_stats
-            ],
+            "tail_lens_after_by_req": [item["tail_len_after"] for item in commit_stats],
             "committed_lens_after_by_req": [
                 item["committed_len_after"] for item in commit_stats
             ],
@@ -300,7 +293,6 @@ class DraftTailBuffer:
         # buffer_end_len is the first absolute position not yet present in the
         # buffer, so a normal append must use token_pos == buffer_end_len.
         buffer_end_len = state_committed_len + tail_len_before
-
 
         if src_drafter_rank != int(state.drafter_rank):
             raise RuntimeError(
@@ -484,9 +476,8 @@ class DraftTailBuffer:
         min_draft_tokens = max(0, int(min_draft_tokens))
         if min_draft_tokens <= 0:
             return
-        while (
-            not self._closed
-            and not self._has_min_draft_tokens_locked(rids, min_draft_tokens)
+        while not self._closed and not self._has_min_draft_tokens_locked(
+            rids, min_draft_tokens
         ):
             self._condition.wait()
         if self._closed:
@@ -494,9 +485,7 @@ class DraftTailBuffer:
                 "DraftTailBuffer closed while waiting for draft tail tokens."
             )
 
-    def wait_for_draft_tokens(
-        self, rids: list[str], min_draft_tokens: int
-    ) -> None:
+    def wait_for_draft_tokens(self, rids: list[str], min_draft_tokens: int) -> None:
         """Wait until every request has at least N raw draft tokens buffered."""
         with self._condition:
             self._wait_for_draft_tokens_locked(rids, min_draft_tokens)
@@ -511,9 +500,7 @@ class DraftTailBuffer:
         with self._condition:
             if not allow_partial:
                 min_raw_tail_len = (
-                    self.required_tail_len + 1
-                    if self.required_tail_len > 0
-                    else 1
+                    self.required_tail_len + 1 if self.required_tail_len > 0 else 1
                 )
                 self._wait_for_draft_tokens_locked(
                     [req.rid for req in reqs], min_raw_tail_len

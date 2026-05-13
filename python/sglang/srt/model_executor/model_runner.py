@@ -2477,7 +2477,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if major < 9:
             return False
 
-        if self.spec_algorithm.is_speculative() and not self.spec_algorithm.is_decoupled_draft():
+        if (
+            self.spec_algorithm.is_speculative()
+            and not self.spec_algorithm.is_decoupled_draft()
+        ):
             return not self.is_draft_worker
 
         return True
@@ -2542,7 +2545,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
-        if self.spec_algorithm.is_speculative() and not self.spec_algorithm.is_decoupled_draft():
+        if (
+            self.spec_algorithm.is_speculative()
+            and not self.spec_algorithm.is_decoupled_draft()
+        ):
             if self.is_draft_worker:
                 if not self.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")

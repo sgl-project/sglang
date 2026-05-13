@@ -97,9 +97,7 @@ class DraftProxyThread:
         recv_start_ns = time.perf_counter_ns() if trace_enabled else 0
         message = self.result_recv_socket.recv_pyobj()
         recv_duration_ms = (
-            (time.perf_counter_ns() - recv_start_ns) / 1_000_000
-            if trace_enabled
-            else 0
+            (time.perf_counter_ns() - recv_start_ns) / 1_000_000 if trace_enabled else 0
         )
         if not isinstance(message, DraftMeshMessage):
             raise RuntimeError(f"Unexpected draft proxy message: {message}")

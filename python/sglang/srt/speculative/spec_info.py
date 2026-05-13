@@ -206,7 +206,7 @@ class DecoupledVerifySpecAlgo(CustomSpecAlgo):
 
     def supports_spec_v2(self) -> bool:
         return False
-    
+
     @staticmethod
     def validate_server_args(server_args: ServerArgs) -> None:
         if server_args.enable_dp_attention:
@@ -214,9 +214,7 @@ class DecoupledVerifySpecAlgo(CustomSpecAlgo):
                 "decoupled speculative decoding does not support dp attention."
             )
         if server_args.dp_size != 1:
-            raise ValueError(
-                "decoupled verifier currently requires dp_size == 1."
-            )
+            raise ValueError("decoupled verifier currently requires dp_size == 1.")
         if not server_args.decoupled_spec_bind_endpoint:
             raise ValueError(
                 "decoupled speculative decoding requires --decoupled-spec-bind-endpoint."
@@ -282,7 +280,7 @@ class DecoupledDraftSpecAlgo(CustomSpecAlgo):
 
     def supports_spec_v2(self) -> bool:
         return False
-    
+
     @staticmethod
     def validate_server_args(server_args: ServerArgs) -> None:
         if server_args.enable_dp_attention:
@@ -290,9 +288,7 @@ class DecoupledDraftSpecAlgo(CustomSpecAlgo):
                 "decoupled speculative decoding does not support dp attention."
             )
         if server_args.dp_size != 1:
-            raise ValueError(
-                "decoupled drafter currently requires dp_size == 1."
-            )
+            raise ValueError("decoupled drafter currently requires dp_size == 1.")
         if not server_args.decoupled_spec_bind_endpoint:
             raise ValueError(
                 "decoupled speculative decoding requires --decoupled-spec-bind-endpoint."

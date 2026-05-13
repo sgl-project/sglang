@@ -395,9 +395,13 @@ class Scheduler(
         )
         if self.spec_algorithm.is_decoupled_draft():
             if self.enable_overlap:
-                raise ValueError("decoupled drafter does not support overlap scheduler.")
+                raise ValueError(
+                    "decoupled drafter does not support overlap scheduler."
+                )
             if not server_args.disable_radix_cache:
-                raise ValueError("decoupled drafter requires radix cache to be disabled.")
+                raise ValueError(
+                    "decoupled drafter requires radix cache to be disabled."
+                )
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -417,13 +421,10 @@ class Scheduler(
             )
         )
         self.decoupled_spec_tracer = None
-        if (
-            getattr(server_args, "decoupled_spec_trace_dir", None)
-            and (
-                self.spec_algorithm.is_decoupled_verify()
-                or self.spec_algorithm.is_decoupled_draft()
-                or self.spec_algorithm.is_none()
-            )
+        if getattr(server_args, "decoupled_spec_trace_dir", None) and (
+            self.spec_algorithm.is_decoupled_verify()
+            or self.spec_algorithm.is_decoupled_draft()
+            or self.spec_algorithm.is_none()
         ):
             self.decoupled_spec_tracer = self.create_spec_tracer()
 
@@ -599,9 +600,7 @@ class Scheduler(
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
         if self.spec_algorithm.is_decoupled_verify() and not self.is_generation:
-            raise ValueError(
-                "decoupled_verify only supports generation models."
-            )
+            raise ValueError("decoupled_verify only supports generation models.")
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None

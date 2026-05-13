@@ -2174,7 +2174,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        if self.spec_algorithm.is_decoupled_draft() or self.spec_algorithm.is_decoupled_verify():
+        if (
+            self.spec_algorithm.is_decoupled_draft()
+            or self.spec_algorithm.is_decoupled_verify()
+        ):
             raise RuntimeError(
                 "Retract decode is not supported for decoupled draft/verify algorithm"
             )
@@ -2307,8 +2310,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input.prepare_for_decode(self)
 
         if not (
-            self.spec_algorithm.is_none()
-            or self.spec_algorithm.is_decoupled_draft()
+            self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft()
         ):
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
