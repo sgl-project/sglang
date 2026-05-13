@@ -90,10 +90,12 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             )
             for prompt in prompts
         ]
+
+        effective_max_length = tok_kwargs.pop("max_length", 512)
         return tokenizer(
             rendered_prompts,
             padding="max_length",
-            max_length=512,  # TODO (yhyang201): set max length according to config
+            max_length=effective_max_length,
             truncation=True,
             return_tensors="pt",
         )

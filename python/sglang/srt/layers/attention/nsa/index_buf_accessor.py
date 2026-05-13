@@ -5,10 +5,14 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter.ops.cache import cp_gather_indexer_k_quant_cache
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -163,7 +167,51 @@ class GetS:
 class GetKAndS:
     @classmethod
     def execute(cls, *args, **kwargs):
+        if _use_aiter:
+            return cls.aiter(*args, **kwargs)
         return cls.triton(*args, **kwargs)
+
+    @classmethod
+    def aiter(
+        cls,
+        pool: "NSATokenToKVPool",
+        buf: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_tensor: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ):
+        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+
+        page_size = pool.page_size
+        index_head_dim = pool.index_head_dim
+        quant_block_size = pool.quant_block_size
+        scale_elems = index_head_dim // quant_block_size
+
+        kv_cache = buf.view(-1, page_size, index_head_dim + scale_elems * 4).view(
+            fp8_dtype
+        )
+        dst_k = torch.empty(
+            (seq_len_sum, index_head_dim), dtype=torch.uint8, device=buf.device
+        )
+        dst_scale = torch.empty(
+            (seq_len_sum, scale_elems * 4), dtype=torch.uint8, device=buf.device
+        )
+
+        cu_seq_lens = torch.zeros(
+            seq_len_tensor.shape[0] + 1, dtype=torch.int32, device=buf.device
+        )
+        torch.cumsum(seq_len_tensor.to(torch.int32), dim=0, out=cu_seq_lens[1:])
+
+        cp_gather_indexer_k_quant_cache(
+            kv_cache,
+            dst_k.view(fp8_dtype),
+            dst_scale,
+            page_indices.to(torch.int32),
+            cu_seq_lens,
+            preshuffle=True,
+        )
+        return dst_k, dst_scale
 
     @classmethod
     def triton(
@@ -366,15 +414,14 @@ def _set_k_and_s_triton(
         raise ValueError(
             f"index_k_scale must be 1D or 2D, got shape {index_k_scale.shape}"
         )
-    if _is_hip:
-        assert buf_numel_per_page == 1 * (128 + 4)
-    else:
-        assert buf_numel_per_page == 64 * (128 + 4)
+    assert buf_numel_per_page == page_size * (128 + 4)
     assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__
     assert index_head_dim == 128
     assert scale_dim == 1
     if _is_hip:
-        assert page_size == 1
+        assert (
+            page_size % 16 == 0
+        ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
     else:
         assert page_size == 64
 

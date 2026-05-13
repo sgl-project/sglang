@@ -1839,15 +1839,8 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    if is_hip():
-                        self.page_size = 1
-                        logger.warning(
-                            "Setting page size to 1 for DeepSeek DSA on ROCm."
-                        )
-                    else:
-                        # For CUDA GPU
-                        self.page_size = 64
-                        logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                    self.page_size = 64
+                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     import torch
 
@@ -3992,11 +3985,11 @@ class ServerArgs:
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
                 envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-                and self.disaggregation_transfer_backend != "mooncake"
+                and self.disaggregation_transfer_backend not in ("mooncake", "nixl")
             ):
                 raise ValueError(
                     f"SGLANG_DISAGG_STAGING_BUFFER requires "
-                    f"disaggregation_transfer_backend='mooncake', "
+                    f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                     f"got '{self.disaggregation_transfer_backend}'."
                 )
 
