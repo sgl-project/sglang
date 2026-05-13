@@ -64,9 +64,39 @@ if _is_cuda:
 
 
 if _use_aiter:
-    from aiter.ops.fused_qk_norm_rope_cache_quant import (
-        fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
-    )
+    # aiter ROCm/aiter#2958 renamed the public `fused_qk_rmsnorm` in
+    # `aiter.ops.fused_qk_norm_rope_cache_quant` to a private `_fused_qk_rmsnorm`
+    # and introduced a unified entry point in `aiter.ops.fused_qk_rmsnorm_group_quant`
+    # with a different (in-place, kwarg-only, no-return) signature. Probe for the
+    # new symbol first so SGLang works with both pre- and post-#2958 aiter without
+    # requiring the docker pin to be bumped atomically.
+    try:
+        from aiter.ops.enum import QuantType as _AiterQuantType
+        from aiter.ops.fused_qk_rmsnorm_group_quant import (
+            fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm_unified,
+        )
+
+        def fused_qk_rmsnorm_bf16(q, q_weight, q_eps, k, k_weight, k_eps):
+            q_out = torch.empty_like(q)
+            k_out = torch.empty_like(k)
+            _aiter_fused_qk_rmsnorm_unified(
+                q_out_quantized=q_out,
+                k_out=k_out,
+                q=q,
+                q_weight=q_weight,
+                q_epsilon=q_eps,
+                k=k,
+                k_weight=k_weight,
+                k_epsilon=k_eps,
+                quant_type=_AiterQuantType.No,
+            )
+            return q_out, k_out
+
+    except ImportError:
+        from aiter.ops.fused_qk_norm_rope_cache_quant import (
+            fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
+        )
+
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
@@ -322,10 +352,12 @@ class DeepseekMLAForwardMixin:
         q_nope_out = q_nope_out.transpose(0, 1)
 
         skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
+        skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
             and (not skip_rope_for_nsa_tilelang_fused)
+            and (not skip_rope_for_aiter_fused_mla)
             and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -633,4 +665,16 @@ class DeepseekMLAForwardMixin:
                 server_args.nsa_decode_backend == "tilelang"
                 or server_args.nsa_prefill_backend == "tilelang"
             )
+        )
+
+    def _skip_rope_for_aiter_fused_mla(self: DeepseekV2AttentionMLA) -> bool:
+        """
+        Skip rope in prepare and let the fused kernel in forward_absorb_core handle it,
+        when running aiter-backend MLA on gfx95 (i.e., the `else` branch in forward_absorb_core
+        that calls fused_qk_rope_cat_and_cache_mla).
+        """
+        return (
+            _use_aiter_gfx95
+            and self.current_attention_backend
+            not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
         )
