@@ -559,6 +559,25 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
         self.manager._sync_refinement_stage_transformer("stage1")
         self.manager._active_phase = "stage1"
 
+    def finish_request(
+        self,
+        module: torch.nn.Module,
+        use: ComponentUse,
+        state: ResidencyState,
+        *,
+        preferred: bool,
+    ) -> None:
+        if (
+            preferred
+            and state.batch_is_warmup
+            and self._snapshot_low_vram_mode
+            and self._phase(use) == "stage1"
+        ):
+            # keep the text encoder warm, but avoid stage1 DiT overlap before the first real request
+            self.manager._active_phase = None
+            return
+        super().finish_request(module, use, state, preferred=preferred)
+
     def finish_use(
         self,
         module: torch.nn.Module,
@@ -618,6 +637,13 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
         if not self.server_args.dit_cpu_offload:
             return True
         phase = self._phase(use)
+        if (
+            self._snapshot_low_vram_mode
+            and phase == "stage1"
+            and state.current_use is not None
+            and state.current_use.component_name.startswith("text_encoder")
+        ):
+            return False
         if phase == "stage2":
             if self._snapshot_strategy.is_ready("transformer_2"):
                 return True
