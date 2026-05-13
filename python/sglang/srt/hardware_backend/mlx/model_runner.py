@@ -204,10 +204,17 @@ class MlxModelRunner:
 
         # We need the config dict to pass into quantize_model so it knows tied/embedding
         # layout. return_config=True is cheap and ignored when no quantization is requested.
+        #
+        # lazy=True keeps the fp16 weights mmap-backed instead of letting mlx_lm.load
+        # eagerly materialize them. The explicit mx.eval below is the actual
+        # materialization point; if a quantize_model graph is in place by then, MLX can
+        # stream fp16 → quantized per-Linear and never hold the full fp16 model resident.
+        # On Qwen3-32B that drops peak from ~61 GB to ~20 GB and load from ~250s to ~7s.
         loaded = mlx_lm_load(
             self.model_path,
             tokenizer_config={"trust_remote_code": self.trust_remote_code},
             return_config=True,
+            lazy=True,
         )
         self.model, _tokenizer, config = loaded
 
@@ -241,6 +248,10 @@ class MlxModelRunner:
                     group_size=group_size,
                     bits=bits,
                 )
+                # Force the streaming materialization here so q_time captures the
+                # actual fp16 → quant work (graph build alone is ~ms and would
+                # otherwise hide the seconds of work that follow).
+                mx.eval(self.model.parameters())
                 bytes_after = sum(
                     p.size * p.itemsize
                     for _, p in tree_flatten(self.model.parameters())
