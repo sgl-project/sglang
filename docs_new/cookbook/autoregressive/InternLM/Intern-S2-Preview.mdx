@@ -1,0 +1,222 @@
+---
+title: Intern-S2-Preview
+metatags:
+    description: "Deploy Intern-S2-Preview with SGLang"
+---
+
+## 1. Model introduction
+
+[Intern-S2-Preview](https://huggingface.co/internLM/Intern-S2-Preview) is an efficient 35B scientific multimodal foundation model. Beyond conventional parameter and data scaling, Intern-S2-Preview explores task scaling: increasing the difficulty, diversity, and coverage of scientific tasks to further unlock model capabilities.
+
+## 2. SGLang installation
+
+Install SGLang from source or use an NVIDIA Docker image:
+
+```bash Command
+# Install from source
+uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+
+# Or use Docker for NVIDIA GPUs
+docker pull lmsysorg/sglang:latest
+```
+
+For full installation details, see the [SGLang installation guide](/docs/get-started/install).
+
+## 3. Model deployment
+
+
+**NVIDIA:**
+
+Deploy internLM/Intern-S2-Preview with the following commands:
+
+### Standard Version
+
+```shell Command
+sglang serve \
+  --model-path internLM/Intern-S2-Preview \
+  --tp 8 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --mem-fraction-static 0.8 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+### Multi-Token Prediction (MTP)
+
+```shell Command
+SGLANG_ENABLE_SPEC_V2=1 \
+sglang serve \
+  --model-path internLM/Intern-S2-Preview \
+  --tp 8 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --mamba-scheduler-strategy extra_buffer \
+  --speculative-algo 'NEXTN' \
+  --speculative-eagle-topk 1 \
+  --speculative-num-steps 3 \
+  --speculative-num-draft-tokens 4 \
+  --mem-fraction-static 0.8 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+### Configuration tips
+
+- Use `tp>=2` for the NVIDIA deployment commands.
+- Use `--reasoning-parser qwen3` to separate reasoning content from final content in streaming responses.
+- Use `--tool-call-parser qwen3_coder` when serving tool-calling workloads.
+- Add `--mamba-scheduler-strategy extra_buffer with `--speculative-algo 'NEXTN'` to enable MTP.
+- If weight loading is slow, add `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'`.
+
+## 4. Model invocation
+
+### 4.1 Basic usage
+
+For basic API usage and request examples, see the [SGLang basic usage guide](/docs/basic_usage/send_request).
+
+### 4.2 Vision input
+
+Intern-S2-Preview supports image inputs. Here is an example with an image:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+response = client.chat.completions.create(
+    model="internLM/Intern-S2-Preview",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://raw.githubusercontent.com/open-mmlab/mmdeploy/main/tests/data/tiger.jpeg"
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": "Describe this image in detail.",
+                },
+            ],
+        }
+    ],
+    max_tokens=2048,
+    stream=True,
+)
+
+thinking_started = False
+has_thinking = False
+has_answer = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        if delta.content:
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+### 4.3 Reasoning parser
+
+Enable streaming to read reasoning content separately from the final answer:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+response = client.chat.completions.create(
+    model="internLM/Intern-S2-Preview",
+    messages=[
+        {"role": "user", "content": "Solve this step by step: What is 15% of 240?"}
+    ],
+    max_tokens=2048,
+    stream=True,
+)
+
+thinking_started = False
+has_thinking = False
+has_answer = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        if delta.content:
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+### 4.4 Tool calling
+
+Serve with `--tool-call-parser qwen3_coder` enabled, then send OpenAI-compatible tool requests:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name",
+                    }
+                },
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+response = client.chat.completions.create(
+    model="internLM/Intern-S2-Preview",
+    messages=[{"role": "user", "content": "What is the weather in Beijing?"}],
+    tools=tools,
+    max_tokens=1024,
+)
+
+print(response.choices[0].message)
+```

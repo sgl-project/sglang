@@ -17,9 +17,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     InsertParams,
     MatchPrefixParams,
+    MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -28,7 +30,10 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+    CacheTransferPhase,
+    ComponentType,
+)
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     UnifiedTreeNode,
@@ -939,6 +944,62 @@ class UnifiedRadixCacheSuite:
     # Evict chain tests covering demotion, cascade, and tombstone cleanup.
     # ================================================================
 
+    def test_aux_evict_full_locked_leaf_tombstones_aux_only(self):
+        aux_types = [
+            ct
+            for ct in (ComponentType.SWA, ComponentType.MAMBA)
+            if ct in self.cfg.components
+        ]
+        if not aux_types:
+            self.skipTest("requires an auxiliary component")
+        if len(aux_types) > 1:
+            self.skipTest("single-aux case keeps cascade expectations precise")
+        aux = aux_types[0]
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        node = match.last_device_node
+        full_cd = node.component_data[ComponentType.FULL]
+        aux_cd = node.component_data[aux]
+        self.assertEqual(len(node.children), 0)
+        self.assertIsNotNone(full_cd.value)
+        self.assertIsNotNone(aux_cd.value)
+
+        lock_result = tree.inc_lock_ref(node)
+        self.assertGreater(full_cd.lock_ref, 0)
+        self.assertGreater(aux_cd.lock_ref, 0)
+
+        aux_len = len(aux_cd.value)
+        tree.component_protected_size_[aux] -= aux_len
+        tree.component_evictable_size_[aux] += aux_len
+        aux_cd.lock_ref = 0
+        self.assertNotIn(node, tree.evictable_device_leaves)
+
+        evict_params = EvictParams(num_tokens=0)
+        if aux == ComponentType.SWA:
+            evict_params.swa_num_tokens = aux_len
+        else:
+            evict_params.mamba_num = aux_len
+        result = tree.evict(evict_params)
+
+        self.assertEqual(result.num_tokens_evicted, 0)
+        if aux == ComponentType.SWA:
+            self.assertEqual(result.swa_num_tokens_evicted, aux_len)
+        else:
+            self.assertEqual(result.mamba_num_evicted, aux_len)
+        self.assertIsNotNone(full_cd.value)
+        self.assertIsNone(aux_cd.value)
+        self.assertFalse(tree.lru_lists[aux].in_list(node))
+
+        tree.dec_lock_ref(
+            node,
+            DecLockRefParams(swa_uuid_for_lock=lock_result.swa_uuid_for_lock),
+        )
+        tree.sanity_check()
+
     def test_evict_leaf_frees_all_components(self):
         """Evicting a device leaf frees Full and all aux components atomically."""
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -1201,6 +1262,24 @@ class UnifiedRadixCacheSuite:
             self.skipTest("HiCache tests do not run on SWA stacks")
         return False
 
+    def _simulate_backup(self, tree, node):
+        """Simulate D->H backup by setting host_value on each component."""
+        for ct in (ComponentType.FULL, ComponentType.MAMBA, ComponentType.SWA):
+            if ct not in self.cfg.components:
+                continue
+            cd = node.component_data[ct]
+            if cd.value is not None and cd.host_value is None:
+                cd.host_value = cd.value.clone()
+
+    def _simulate_backup_tree(self, tree):
+        """Backup all non-root nodes (simulates write-through)."""
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node is not tree.root_node:
+                self._simulate_backup(tree, node)
+            stack.extend(node.children.values())
+
     def _init_hicache(self, tree):
         import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
@@ -1393,6 +1472,47 @@ class UnifiedRadixCacheSuite:
         self.assertGreaterEqual(len(m.device_indices), len(base))
         tree.sanity_check()
 
+    def test_hicache_partial_match_splits_evicted_backed_up_node(self):
+        """Partial matches on host-only nodes must keep the host prefix usable."""
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        seq = self._make_seq(1, 4)
+        expected_prefix = seq[: 2 * ps]
+        expected_suffix = seq[len(expected_prefix) :]
+        query = expected_prefix + self._make_seq(9000, 1)
+
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        node = m.last_device_node
+        self._simulate_backup(tree, node)
+
+        tree.evict(EvictParams(num_tokens=len(seq)))
+        self.assertTrue(node.evicted)
+        self.assertTrue(node.backuped)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(query)))
+
+        self.assertEqual(len(m.device_indices), 0)
+        self.assertIs(m.last_device_node, tree.root_node)
+
+        split_parent = node.parent
+        self.assertIsNot(split_parent, tree.root_node)
+        self.assertTrue(split_parent.evicted)
+        self.assertTrue(split_parent.backuped)
+        self.assertEqual(split_parent.key.token_ids, expected_prefix)
+        self.assertEqual(node.key.token_ids, expected_suffix)
+
+        if self.cfg.has_mamba:
+            self.assertEqual(m.host_hit_length, 0)
+            self.assertIs(m.last_host_node, tree.root_node)
+            self.assertIsNone(
+                split_parent.component_data[ComponentType.MAMBA].host_value
+            )
+        else:
+            self.assertEqual(m.host_hit_length, len(expected_prefix))
+            self.assertIs(m.last_host_node, split_parent)
+        tree.sanity_check()
+
     def test_hicache_d_leaf_h_leaf_mutual_exclusion(self):
         """D-leaf and H-leaf sets are always disjoint."""
         if self._skip_unsupported_hicache_test():
@@ -1516,32 +1636,367 @@ class UnifiedRadixCacheSuite:
         tree.sanity_check()
 
     def test_hicache_evict_to_host_updates_aux_lru(self):
-        """Aux components move from device LRU to host LRU on device-to-host eviction."""
-        if self._skip_unsupported_hicache_test():
-            return
-        if not self.cfg.has_mamba:
-            self.skipTest("requires Mamba component")
-        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        """Aux components (MAMBA / SWA) move from device LRU to host LRU on D->H eviction."""
+        aux_types = [
+            ct
+            for ct in (ComponentType.MAMBA, ComponentType.SWA)
+            if ct in self.cfg.components
+        ]
+        if not aux_types:
+            self.skipTest("requires at least one aux component")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2)
         self._insert(tree, allocator, req_to_token_pool, seq)
 
         m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
         node = m.last_device_node
 
-        # Check mamba is in device LRU
-        mamba_lru = tree.lru_lists[ComponentType.MAMBA]
-        host_mamba_lru = tree.host_lru_lists[ComponentType.MAMBA]
-        self.assertTrue(mamba_lru.in_list(node))
-        self.assertFalse(host_mamba_lru.in_list(node))
+        for aux in aux_types:
+            self.assertTrue(tree.lru_lists[aux].in_list(node))
+            self.assertFalse(tree.host_lru_lists[aux].in_list(node))
 
-        self._backup_node(tree, node)
+        self._simulate_backup(tree, node)
         tree.evict(EvictParams(num_tokens=len(seq)))
 
-        # Mamba should move to host LRU
-        self.assertFalse(mamba_lru.in_list(node))
-        if node.component_data[ComponentType.MAMBA].host_value is not None:
-            self.assertTrue(host_mamba_lru.in_list(node))
+        for aux in aux_types:
+            self.assertFalse(tree.lru_lists[aux].in_list(node))
+            if node.component_data[aux].host_value is not None:
+                self.assertTrue(tree.host_lru_lists[aux].in_list(node))
         tree.sanity_check()
+
+    def _build_chain_pages(self, tree, allocator, req_to_token_pool, num_pages):
+        """Insert an incremental chain of single-page extensions.
+
+        Returns the chain root-to-leaf. Length may differ from num_pages
+        when the radix tree merges or splits nodes.
+        """
+        seq: list[int] = []
+        for i in range(num_pages):
+            seq = seq + self._make_seq(1000 * (i + 1), 1)
+            self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        chain: list = []
+        cur = m.last_device_node
+        while cur is not tree.root_node:
+            chain.append(cur)
+            cur = cur.parent
+        chain.reverse()
+        return chain
+
+    def test_hicache_swa_load_back_min_suffix(self):
+        """LOAD_BACK collects only the suffix nodes needed to cover sliding_window_size."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            # Mamba's per-insert req allocation exhausts max_num_reqs on long chains.
+            self.skipTest("SWA-only path keeps the chain construction simple")
+        ps = self.cfg.page_size
+        sw = self.cfg.sliding_window_size
+        expected_pages = (sw + ps - 1) // ps
+        chain_pages = expected_pages + 2
+        if chain_pages * ps > self.cfg.kv_size // 2:
+            self.skipTest("kv_size too small for the desired chain")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, chain_pages)
+        if len(chain) <= expected_pages:
+            self.skipTest("chain collapsed below the suffix length being tested")
+
+        self._simulate_backup_tree(tree)
+
+        # Tombstone every chain node on the device side without going through
+        # the tree-wide eviction loop. This isolates build_hicache_transfers
+        # from LRU and cascade ordering.
+        for n in chain:
+            n.component_data[ComponentType.FULL].value = None
+            n.component_data[ComponentType.SWA].value = None
+
+        leaf = chain[-1]
+        swa_comp = tree.components[ComponentType.SWA]
+        transfers = swa_comp.build_hicache_transfers(leaf, CacheTransferPhase.LOAD_BACK)
+        self.assertIsNotNone(transfers)
+        self.assertEqual(len(transfers), 1)
+        xfer = transfers[0]
+        self.assertEqual(xfer.name, PoolName.SWA)
+        self.assertEqual(len(xfer.nodes_to_load), expected_pages)
+        # host_indices must cover exactly the expected suffix tokens (>= sw).
+        self.assertEqual(int(xfer.host_indices.numel()), expected_pages * ps)
+        self.assertGreaterEqual(int(xfer.host_indices.numel()), sw)
+        self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
+
+    def test_hicache_swa_host_independent_of_full(self):
+        """FULL host and SWA host are physically independent.
+        Freeing one component's host_value must not touch the other.
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        node = m.last_device_node
+
+        self._simulate_backup(tree, node)
+        tree.evict(EvictParams(num_tokens=len(seq)))
+
+        cd_full = node.component_data[ComponentType.FULL]
+        cd_swa = node.component_data[ComponentType.SWA]
+        self.assertIsNotNone(cd_full.host_value)
+        self.assertIsNotNone(cd_swa.host_value)
+        self.assertIn(node, tree.evictable_host_leaves)
+        self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(node))
+
+        # Drop FULL host bookkeeping. SWA side must stay intact.
+        tree.evictable_host_leaves.discard(node)
+        cd_full.host_value = None
+        self.assertIsNotNone(cd_swa.host_value)
+        self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(node))
+        self.assertNotIn(node, tree.evictable_host_leaves)
+
+        # Drop SWA host bookkeeping. FULL side (already cleared) stays cleared.
+        tree.host_lru_lists[ComponentType.SWA].remove_node(node)
+        cd_swa.host_value = None
+        self.assertIsNone(cd_full.host_value)
+        self.assertIsNone(cd_swa.host_value)
+        self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(node))
+        self.assertNotIn(node, tree.evictable_host_leaves)
+
+    def _swa_finalize_setup(self):
+        """Build a SWA chain long enough to fill at least the window
+        plus one extra page, and host-back every node so we can flip
+        SWA tombstones at will."""
+        ps = self.cfg.page_size
+        sw = self.cfg.sliding_window_size
+        window_pages = (sw + ps - 1) // ps
+        chain_pages = window_pages + 2
+        if chain_pages * ps > self.cfg.kv_size // 2:
+            self.skipTest("kv_size too small for the desired chain")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, chain_pages)
+        if len(chain) <= window_pages:
+            self.skipTest("chain collapsed below the window length")
+        self._simulate_backup_tree(tree)
+        return tree, allocator, req_to_token_pool, chain, window_pages
+
+    def test_hicache_swa_finalize_match_result(self):
+        """finalize_match_result bumps host_hit_length to 1 iff some SWA node
+        within the trailing window is tombstoned (cd.value is None,
+        cd.host_value is not None). Out-of-window tombstones and chains fully
+        on device must leave host_hit_length untouched.
+
+        Sentinel only — never the real SWA token count, since SWA load-back
+        does not grow req.prefix_indices and any non-zero value gets
+        subtracted from extend_input_len in schedule_policy.
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+
+        tree, _, _, chain, window_pages = self._swa_finalize_setup()
+        leaf = chain[-1]
+        swa_comp = tree.components[ComponentType.SWA]
+
+        cases = [
+            ("all_on_device", None, 0),
+            ("tombstone_in_window", chain[-window_pages], 1),
+            ("tombstone_outside_window", chain[-(window_pages + 1)], 0),
+        ]
+        for name, victim, expected in cases:
+            with self.subTest(name):
+                # Reset SWA state for each subcase.
+                for n in chain:
+                    cd = n.component_data[ComponentType.SWA]
+                    if cd.value is None and cd.host_value is not None:
+                        cd.value = cd.host_value.clone()
+                if victim is not None:
+                    victim.component_data[ComponentType.SWA].value = None
+
+                result = MatchResult(
+                    device_indices=torch.empty(
+                        (0,), dtype=torch.int64, device=tree.device
+                    ),
+                    last_device_node=leaf,
+                    last_host_node=leaf,
+                    host_hit_length=0,
+                )
+                result = swa_comp.finalize_match_result(
+                    result=result,
+                    params=MatchPrefixParams(key=RadixKey(self._make_seq(1, 1))),
+                    value_chunks=[],
+                    best_value_len=0,
+                )
+                self.assertEqual(result.host_hit_length, expected)
+
+    def test_hicache_swa_commit_load_back_rebuilds_mapping(self):
+        """LOAD_BACK commit must:
+        (1) restore SWA cd.value via _restore_device_value (host LRU -> device LRU),
+        (2) rewrite full_to_swa_index_mapping[full_idx] = new_swa_idx for every
+            loaded chunk so subsequent SWA reads via translate_loc_from_full_to_swa
+            return the freshly allocated SWA slot."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+
+        tree, allocator, _, chain, window_pages = self._swa_finalize_setup()
+
+        # Tombstone every SWA node in the trailing window.
+        loaded_nodes = chain[-window_pages:]
+        for n in loaded_nodes:
+            n.component_data[ComponentType.SWA].value = None
+            # SWA LRU bookkeeping must reflect tombstone state for the
+            # _restore_device_value path to exercise the host->device move.
+            tree.lru_lists[ComponentType.SWA].remove_node(n)
+            tree.host_lru_lists[ComponentType.SWA].insert_mru(n)
+
+        # Build the LOAD_BACK transfer the same way load_back() would.
+        swa_comp = tree.components[ComponentType.SWA]
+        transfers = swa_comp.build_hicache_transfers(
+            chain[-1], CacheTransferPhase.LOAD_BACK
+        )
+        self.assertIsNotNone(transfers)
+        xfer = transfers[0]
+        self.assertEqual(xfer.nodes_to_load, loaded_nodes)
+
+        # Allocate SWA device slots from the inner allocator (mirrors how
+        # _resolve_pool_transfers_allocation routes via device_alloc_fn ->
+        # swa_attn_allocator.alloc on the load-back path).
+        n_swa = int(xfer.host_indices.numel())
+        new_swa = allocator.swa_attn_allocator.alloc(n_swa)
+        self.assertIsNotNone(new_swa)
+        xfer.device_indices = new_swa
+
+        # Snapshot pre-commit state for invariants checks.
+        pre_evictable = tree.component_evictable_size_[ComponentType.SWA]
+
+        swa_comp.commit_hicache_transfer(
+            chain[-1], CacheTransferPhase.LOAD_BACK, transfers=transfers
+        )
+
+        # (1) cd.value restored, host LRU -> device LRU swap done.
+        offset = 0
+        for n in loaded_nodes:
+            cd = n.component_data[ComponentType.SWA]
+            self.assertIsNotNone(cd.value)
+            chunk_len = int(cd.value.numel())
+            self.assertEqual(
+                cd.value.tolist(),
+                new_swa[offset : offset + chunk_len].tolist(),
+            )
+            offset += chunk_len
+            self.assertTrue(tree.lru_lists[ComponentType.SWA].in_list(n))
+            self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(n))
+        self.assertEqual(offset, n_swa)
+
+        # (2) full_to_swa_index_mapping rebuilt for every loaded chunk.
+        for n in loaded_nodes:
+            full_idx = n.component_data[ComponentType.FULL].value
+            swa_idx = n.component_data[ComponentType.SWA].value
+            translated = allocator.translate_loc_from_full_to_swa(full_idx)
+            self.assertEqual(translated.tolist(), swa_idx.tolist())
+
+        # Evictable size moved up by the restored token count.
+        self.assertEqual(
+            tree.component_evictable_size_[ComponentType.SWA] - pre_evictable,
+            n_swa,
+        )
+
+    def test_hicache_swa_temp_lock_does_not_release_restored_tombstone(self):
+        """A temporary scheduler lock that skipped a SWA tombstone must not
+        release later load-back/request locks after the tombstone is restored.
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+
+        tree, allocator, _, chain, _ = self._swa_finalize_setup()
+        leaf = chain[-1]
+        tombstone = leaf
+        cd = tombstone.component_data[ComponentType.SWA]
+        old_swa = cd.value
+        self.assertIsNotNone(old_swa)
+
+        cd.value = None
+        tree.lru_lists[ComponentType.SWA].remove_node(tombstone)
+        tree.host_lru_lists[ComponentType.SWA].insert_mru(tombstone)
+        tree.component_evictable_size_[ComponentType.SWA] -= len(old_swa)
+
+        temp_lock = tree.inc_lock_ref(leaf)
+        self.assertEqual(cd.lock_ref, 0)
+
+        xfer = tree.components[ComponentType.SWA].build_hicache_transfers(
+            leaf, CacheTransferPhase.LOAD_BACK
+        )[0]
+        new_swa = allocator.swa_attn_allocator.alloc(int(xfer.host_indices.numel()))
+        self.assertIsNotNone(new_swa)
+        xfer.device_indices = new_swa
+        tree.components[ComponentType.SWA].commit_hicache_transfer(
+            leaf, CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+        )
+
+        load_back_lock = tree.inc_lock_ref(leaf)
+        request_lock = tree.inc_lock_ref(leaf)
+        self.assertEqual(cd.lock_ref, 2)
+
+        tree.dec_lock_ref(leaf, temp_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 2)
+
+        tree.dec_lock_ref(leaf, load_back_lock.to_dec_params())
+        tree.dec_lock_ref(leaf, request_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 0)
+
+    def test_hicache_mamba_temp_lock_does_not_release_restored_tombstone(self):
+        """A temporary scheduler lock that skipped a Mamba tombstone must not
+        release later load-back/request locks after the tombstone is restored.
+        """
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba component")
+        if self.cfg.has_swa:
+            self.skipTest("Mamba-only path keeps the chain construction simple")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        node = m.last_device_node
+        cd = node.component_data[ComponentType.MAMBA]
+        old_mamba = cd.value
+        self.assertIsNotNone(old_mamba)
+        self._simulate_backup(tree, node)
+
+        cd.value = None
+        tree.lru_lists[ComponentType.MAMBA].remove_node(node)
+        tree.host_lru_lists[ComponentType.MAMBA].insert_mru(node)
+        tree.component_evictable_size_[ComponentType.MAMBA] -= len(old_mamba)
+
+        temp_lock = tree.inc_lock_ref(node)
+        self.assertEqual(cd.lock_ref, 0)
+
+        xfer = tree.components[ComponentType.MAMBA].build_hicache_transfers(
+            node, CacheTransferPhase.LOAD_BACK
+        )[0]
+        new_mamba = req_to_token_pool.mamba_pool.alloc(1)
+        self.assertIsNotNone(new_mamba)
+        xfer.device_indices = new_mamba
+        tree.components[ComponentType.MAMBA].commit_hicache_transfer(
+            node, CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+        )
+
+        load_back_lock = tree.inc_lock_ref(node)
+        request_lock = tree.inc_lock_ref(node)
+        self.assertEqual(cd.lock_ref, 2)
+
+        tree.dec_lock_ref(node, temp_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 2)
+
+        tree.dec_lock_ref(node, load_back_lock.to_dec_params())
+        tree.dec_lock_ref(node, request_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 0)
 
     def test_hicache_mixed_backup_evict_insert(self):
         """Complex scenario: backup some, evict, insert new, verify invariants."""
