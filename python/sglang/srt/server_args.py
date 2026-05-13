@@ -846,7 +846,7 @@ class ServerArgs:
         # lags by one round, which causes a one-step shift in the forced
         # sequence. Force overlap off when the feature is enabled.
         if (
-            os.environ.get("SGLANG_ENABLE_FORCED_TOKEN_IDS") == "1"
+            envs.SGLANG_ENABLE_FORCED_TOKEN_IDS.get()
             and not self.disable_overlap_schedule
         ):
             logger.warning(

@@ -187,6 +187,7 @@ class Envs:
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
     # Test & Debug
+    SGLANG_ENABLE_FORCED_TOKEN_IDS = EnvBool(False)
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)

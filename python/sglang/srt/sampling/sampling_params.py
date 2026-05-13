@@ -14,8 +14,9 @@
 """Sampling parameters for text generation."""
 
 import logging
-import os
 from typing import Any, Dict, List, Optional, Union
+
+from sglang.srt.environ import envs
 
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
 try:
@@ -25,11 +26,6 @@ except ImportError:
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
-
-# Env var that gates the forced-token-ids debug feature server-side.
-# Without this, the server rejects any request carrying forced_token_ids /
-# forced_token_ids_path so arbitrary clients can't trigger forced decoding.
-SGLANG_ENABLE_FORCED_TOKEN_IDS_ENV = "SGLANG_ENABLE_FORCED_TOKEN_IDS"
 
 logger = logging.getLogger(__name__)
 
@@ -193,10 +189,10 @@ class SamplingParams:
             )
         if (
             self.forced_token_ids is not None or self.forced_token_ids_path is not None
-        ) and os.environ.get(SGLANG_ENABLE_FORCED_TOKEN_IDS_ENV) != "1":
+        ) and not envs.SGLANG_ENABLE_FORCED_TOKEN_IDS.get():
             raise ValueError(
-                f"forced_token_ids requires {SGLANG_ENABLE_FORCED_TOKEN_IDS_ENV}=1 "
-                f"on the server."
+                "forced_token_ids requires SGLANG_ENABLE_FORCED_TOKEN_IDS=1 "
+                "on the server."
             )
         if self.forced_token_ids is not None:
             for tid in self.forced_token_ids:
@@ -218,10 +214,10 @@ class SamplingParams:
         """
         if self.forced_token_ids_path is None:
             return
-        if os.environ.get(SGLANG_ENABLE_FORCED_TOKEN_IDS_ENV) != "1":
+        if not envs.SGLANG_ENABLE_FORCED_TOKEN_IDS.get():
             raise ValueError(
-                f"forced_token_ids_path requires "
-                f"{SGLANG_ENABLE_FORCED_TOKEN_IDS_ENV}=1 on the server."
+                "forced_token_ids_path requires "
+                "SGLANG_ENABLE_FORCED_TOKEN_IDS=1 on the server."
             )
         if self.forced_token_ids is not None:
             raise ValueError(
