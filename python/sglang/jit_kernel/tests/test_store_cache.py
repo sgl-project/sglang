@@ -6,10 +6,11 @@ import torch
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=28, suite="stage-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=55, suite="jit-kernel-unit-test-amd")
 
 BS_LIST = [2**n for n in range(0, 15)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
