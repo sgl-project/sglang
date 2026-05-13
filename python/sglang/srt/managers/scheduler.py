@@ -33,7 +33,7 @@ from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
 
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import ModelConfig, is_deepseek_compressed
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -329,6 +329,11 @@ class Scheduler(
 
         # Init model configs
         self.init_model_config()
+        self._dsv4_compressed_prefill_guard_warned = False
+        self._is_dsv4_compressed_with_compressed_backend = (
+            is_deepseek_compressed(self.model_config.hf_config)
+            and self.server_args.get_attention_backends() == ("compressed", "compressed")
+        )
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
@@ -1950,6 +1955,23 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _get_effective_prefill_max_requests(self, running_bs: int) -> Optional[int]:
+        prefill_max_requests = self.server_args.prefill_max_requests
+        if (
+            running_bs > 0
+            and self._is_dsv4_compressed_with_compressed_backend
+            and (prefill_max_requests is None or prefill_max_requests > 1)
+        ):
+            if not self._dsv4_compressed_prefill_guard_warned:
+                logger.warning(
+                    "DSv4 compressed prefill guard active: running_bs=%s, "
+                    "effective_prefill_max_requests=1",
+                    running_bs,
+                )
+                self._dsv4_compressed_prefill_guard_warned = True
+            return 1
+        return prefill_max_requests
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2020,6 +2042,8 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        prefill_max_requests = self._get_effective_prefill_max_requests(running_bs)
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -2031,7 +2055,7 @@ class Scheduler(
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
-            prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_max_requests=prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
         )
