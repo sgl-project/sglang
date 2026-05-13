@@ -8,10 +8,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import get_device_sm
+from sglang.srt.utils.common import is_sm120_supported
 
 _is_cuda = torch.cuda.is_available() and not is_hip()
-_is_sm120 = _is_cuda and get_device_sm() // 10 == 12
+_is_sm120 = _is_cuda and is_sm120_supported()
 
 if TYPE_CHECKING:
     pass

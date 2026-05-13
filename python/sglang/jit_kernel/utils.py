@@ -310,9 +310,9 @@ def is_arch_support_pdl() -> bool:
     if is_hip_runtime():
         return False
     arch = get_jit_cuda_arch()
-    # PDL requires SM100+ datacenter (tcgen05/TMEM); SM120 (desktop Blackwell) lacks these
-    if arch.major == 12:
-        return False
+    # PDL (griddepcontrol) instruction is supported on SM90+ (Hopper, Blackwell).
+    # SM120 (desktop Blackwell) supports PDL despite lacking TMEM/tcgen05 —
+    # PDL uses griddepcontrol for kernel scheduling, independent of TMEM.
     return arch.major >= 9
 
 

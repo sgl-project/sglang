@@ -36,9 +36,10 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import get_device_sm, is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils.common import is_sm120_supported
 
-_is_sm120 = is_cuda() and get_device_sm() // 10 == 12
+_is_sm120 = is_cuda() and is_sm120_supported()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -1313,7 +1314,7 @@ class NativeSparseAttnBackend(
         # this replay (the captured graph holds stale data otherwise, which can
         # deadlock the kernel when the runtime work decomposition diverges from
         # the captured one).
-        if is_cuda():
+        if is_cuda() and not _is_sm120:
             try:
                 import deep_gemm
 

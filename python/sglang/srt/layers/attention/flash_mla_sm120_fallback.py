@@ -22,12 +22,12 @@ import os
 import torch
 
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import get_device_sm
+from sglang.srt.utils.common import is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = torch.cuda.is_available() and not is_hip()
-_is_sm120 = _is_cuda and get_device_sm() // 10 == 12
+_is_sm120 = _is_cuda and is_sm120_supported()
 
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
@@ -204,11 +204,22 @@ def _sm120_sparse_decode_fwd(
     return out.to(torch.bfloat16), lse.permute(0, 2, 1)
 
 
-_use_triton_flashmla = os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "1") == "1"
+# Default SM120 FlashMLA backend: "triton" (optimized) or "torch" (pure-PyTorch fallback).
+# Controlled by SGLANG_SM120_TRITON_FLASHMLA env var for backward compat (1=triton, 0=torch).
+_sm120_default_backend = (
+    "triton"
+    if os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "1") == "1"
+    else "torch"
+)
 
 
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if _is_sm120:
+        # On SM120, the `backend` parameter selects between "triton" (default,
+        # optimized Triton kernel) and "torch" (pure-PyTorch fallback).
+        # The original flash_mla CUDA "kernel" backend is unavailable on SM120.
+        sm120_backend = _sm120_default_backend if backend == "kernel" else backend
+
         q = kwargs["q"]
         k_cache = kwargs["k_cache"]
         indices = kwargs["indices"]
@@ -222,7 +233,7 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         extra_indices = kwargs.get("extra_indices_in_kvcache")
         extra_topk_length = kwargs.get("extra_topk_length")
 
-        if _use_triton_flashmla:
+        if sm120_backend == "triton":
             from sglang.srt.layers.attention.flash_mla_sm120_triton import (
                 flash_mla_sparse_decode_triton,
             )
