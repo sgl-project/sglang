@@ -1,7 +1,6 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -13,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=500, suite="stage-c-test-dsv4-8-gpu-h200")
+register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 
