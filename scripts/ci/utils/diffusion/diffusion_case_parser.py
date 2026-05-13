@@ -16,11 +16,10 @@ Usage:
 
 import ast
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
-
-from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 # Mapping from list variable names to suite names
 CASE_LIST_TO_SUITE = {
@@ -44,7 +43,9 @@ STARTUP_OVERHEAD_SECONDS = 120.0
 BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines.json"
 RUN_SUITE_REL_PATH = "python/sglang/multimodal_gen/test/run_suite.py"
 
-if get_bool_env_var("USE_NPU_CONFIGS"):
+USE_NPU_CONFIGS = os.getenv("USE_NPU_CONFIGS", "0").lower() in ("1", "true")
+
+if USE_NPU_CONFIGS:
     BASELINE_REL_PATH = (
         "python/sglang/multimodal_gen/test/server/perf_baselines_npu.json"
     )

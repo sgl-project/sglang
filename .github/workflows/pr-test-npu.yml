@@ -334,7 +334,7 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
-          python3 sglang/multimodal_gen/test/run_suite_npu.py --suite 1-npu
+          python3 sglang/multimodal_gen/test/run_suite.py --suite 1-npu
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -393,7 +393,7 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
-          python3 sglang/multimodal_gen/test/run_suite_npu.py --suite 2-npu
+          python3 sglang/multimodal_gen/test/run_suite.py --suite 2-npu
 
       - name: Upload diffusion failure artifacts
         if: always()
