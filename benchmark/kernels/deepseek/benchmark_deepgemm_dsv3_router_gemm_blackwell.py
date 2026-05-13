@@ -4,8 +4,6 @@ from typing import List
 
 import torch
 import triton
-from flashinfer.gemm import mm_M1_16_K7168_N256
-from sgl_kernel import dsv3_router_gemm
 
 N = 256
 K = 7168
@@ -24,6 +22,10 @@ def dsv3_router_gemm_flashinfer(
     router_weights: torch.Tensor,
 ):
     """Flashinfer implementation of dsv3 router gemm"""
+    from flashinfer.gemm import (
+        mm_M1_16_K7168_N256,  # pyright: ignore[reportMissingImports]
+    )
+
     output = torch.empty(
         hidden_states.shape[0],
         router_weights.shape[0],
@@ -41,6 +43,10 @@ def dsv3_router_gemm_sgl(
     router_weights: torch.Tensor,
 ):
     """SGLang implementation of dsv3 router gemm"""
+    from sglang.jit_kernel.dsv3_router_gemm import (
+        dsv3_router_gemm,  # pyright: ignore[reportMissingImports]
+    )
+
     output = dsv3_router_gemm(
         hidden_states,
         router_weights,

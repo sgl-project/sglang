@@ -3,12 +3,21 @@ import sys
 import pytest
 import torch
 import torch.nn.functional as F
-from sgl_kernel import dsv3_router_gemm
+
+try:
+    from sgl_kernel import dsv3_router_gemm  # pyright: ignore[reportMissingImports]
+
+    AOT_AVAILABLE = True
+except ImportError:
+    AOT_AVAILABLE = False
 
 
 @pytest.mark.parametrize("num_tokens", [i + 1 for i in range(16)])
 @pytest.mark.parametrize("num_experts", [256, 384])
 def test_dsv3_router_gemm(num_tokens, num_experts):
+    if not AOT_AVAILABLE:
+        pytest.skip("sgl_kernel AOT dsv3_router_gemm is not available")
+
     hidden_dim = 7168
 
     mat_a = torch.randn(
