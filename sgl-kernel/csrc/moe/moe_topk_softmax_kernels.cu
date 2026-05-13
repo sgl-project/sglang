@@ -20,6 +20,23 @@ limitations under the License.
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
+// HIP/CUDA expose WARP_SIZE as a context-dependent macro that expands to
+// different values in host vs device compile contexts on wave32 ROCm targets
+// (32 in device, 64 in host on RDNA gfx11xx/gfx12xx), which makes
+// __launch_bounds__(WARPS_PER_CTA * WARP_SIZE) and dim3(WARP_SIZE, ...)
+// disagree and produces hipErrorLaunchFailure on the first MoE forward. Use
+// our own identifier so the HIP WARP_SIZE macro cannot shadow it (a
+// `static constexpr int WARP_SIZE = 32;` at file scope silently has no effect
+// because the macro is expanded first).
+#if defined(USE_ROCM) && (defined(__gfx900__) || defined(__gfx906__) || \
+    defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx940__) || \
+    defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__))
+static constexpr int kWarpSize = 64;  // CDNA wavefront
+#else
+static constexpr int kWarpSize = 32;  // CUDA / RDNA wave32
+#endif
+
+
 #ifndef USE_ROCM
 #include <cub/cub.cuh>
 #include <cub/util_type.cuh>
@@ -338,7 +355,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(
 */
 
 template <typename T, int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG>
-__launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
+__launch_bounds__(WARPS_PER_CTA* kWarpSize) __global__ void topkGatingSoftmax(
     const T* input,
     const bool* finished,
     float* output,
@@ -364,12 +381,12 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
 
   // Restrictions based on previous section.
   static_assert(VPT % ELTS_PER_LDG == 0, "The elements per thread must be a multiple of the elements per ldg");
-  static_assert(WARP_SIZE % THREADS_PER_ROW == 0, "The threads per row must cleanly divide the threads per warp");
+  static_assert(kWarpSize % THREADS_PER_ROW == 0, "The threads per row must cleanly divide the threads per warp");
   static_assert(THREADS_PER_ROW == (THREADS_PER_ROW & -THREADS_PER_ROW), "THREADS_PER_ROW must be power of 2");
-  static_assert(THREADS_PER_ROW <= WARP_SIZE, "THREADS_PER_ROW can be at most warp size");
+  static_assert(THREADS_PER_ROW <= kWarpSize, "THREADS_PER_ROW can be at most warp size");
 
   // We have NUM_EXPERTS elements per row. We specialize for small #experts
-  static constexpr int ELTS_PER_WARP = WARP_SIZE * VPT;
+  static constexpr int ELTS_PER_WARP = kWarpSize * VPT;
   static constexpr int ROWS_PER_WARP = ELTS_PER_WARP / ELTS_PER_ROW;
   static constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;
 
@@ -593,11 +610,11 @@ namespace detail {
 template <typename T, int EXPERTS, int BYTES_PER_LDG>
 struct TopkConstants {
   static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
-  static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 || EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0, "");
-  static constexpr int VECs_PER_THREAD = MAX(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE));
+  static_assert(EXPERTS / (ELTS_PER_LDG * kWarpSize) == 0 || EXPERTS % (ELTS_PER_LDG * kWarpSize) == 0, "");
+  static constexpr int VECs_PER_THREAD = MAX(1, EXPERTS / (ELTS_PER_LDG * kWarpSize));
   static constexpr int VPT = VECs_PER_THREAD * ELTS_PER_LDG;
   static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
-  static constexpr int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
+  static constexpr int ROWS_PER_WARP = kWarpSize / THREADS_PER_ROW;
 };
 }  // namespace detail
 
@@ -624,7 +641,7 @@ void topkGatingSoftmaxLauncherHelper(
   const int num_warps = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
   const int num_blocks = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
 
-  dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
+  dim3 block_dim(kWarpSize, WARPS_PER_TB);
   topkGatingSoftmax<T, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG><<<num_blocks, block_dim, 0, stream>>>(
       input,
       finished,
