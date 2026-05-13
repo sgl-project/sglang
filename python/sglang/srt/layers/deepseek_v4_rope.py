@@ -2,17 +2,26 @@ import math
 from functools import lru_cache
 from typing import Optional
 
-import tilelang
 import torch
 import triton
 import triton.language as tl
 
-tilelang.set_log_level("WARNING")
+# tilelang isn't shipped on every platform (e.g. Ascend NPU images) and the
+# only tilelang artifacts in this file are pass_configs that downstream
+# tilelang.jit decorators would consume — the kernels actually defined here
+# are Triton. Keep the import optional so this module loads on NPU.
+try:
+    import tilelang
 
-pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-}
+    tilelang.set_log_level("WARNING")
+
+    pass_configs = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
+except ImportError:
+    tilelang = None
+    pass_configs = None
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
@@ -21,8 +30,16 @@ INT32 = "int32"
 
 
 @lru_cache(2)
+def _yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
+    # iforgetmyname/dsv4_release rotary_embedding/yarn.py:yarn_get_mscale
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
 def precompute_freqs_cis(
-    dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow
+    dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow,
+    mscale: float = 1.0, mscale_all_dim: float = 0.0,
 ) -> torch.Tensor:
 
     def find_correction_dim(num_rotations, dim, base, max_seq_len):
@@ -54,6 +71,12 @@ def precompute_freqs_cis(
 
     t = torch.arange(seqlen)
     freqs = torch.outer(t, freqs)
+    # iforgetmyname does NOT bake mscale into cos/sin — verified by
+    # dumping Q/K post-rope on both servers. Our earlier "mscale on
+    # cos/sin" workaround was compensating for an unrelated KV cache
+    # collision bug in DeepSeekV4TokenToKVPool (compress_layer_id per-
+    # bucket counters overlapping). Once that's fixed, mscale-off is the
+    # architecturally correct shape.
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
