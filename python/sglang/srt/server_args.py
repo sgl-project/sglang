@@ -3194,8 +3194,6 @@ class ServerArgs:
 
         if self.moe_a2a_backend == "megamoe":
             self.ep_size = self.tp_size
-            if not envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.is_set():
-                envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.set(True)
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
             logger.info(
