@@ -2,8 +2,8 @@
 """Update est_time values in CI test files based on actual execution times.
 
 Fetches logs from recent scheduled PR Test workflow runs on main,
-parses per-file elapsed times from successful jobs, computes medians,
-and updates the est_time literals in test registration calls.
+parses per-file elapsed times from successful jobs, computes the 90th
+percentile, and updates the est_time literals in test registration calls.
 
 Usage:
     python scripts/ci/update_est_time.py [--dry-run] [--repo OWNER/REPO]
@@ -29,8 +29,15 @@ LOG_PATTERN = re.compile(
 
 WORKFLOW_NAME = "PR Test"
 MIN_DATA_POINTS = 3
-TARGET_DATA_POINTS = 10
-MAX_RUNS = 20
+TARGET_DATA_POINTS = 15
+MAX_RUNS = 25
+
+# A change is "significant" if |delta| >= this many seconds AND the relative
+# change is at least SIGNIFICANT_REL_DELTA. Dual threshold filters out both
+# tiny absolute drifts on long tests and small-but-noisy relative swings on
+# short tests.
+SIGNIFICANT_ABS_DELTA = 30
+SIGNIFICANT_REL_DELTA = 0.3
 
 
 def gh_api(endpoint, paginate=False):
@@ -162,37 +169,39 @@ def collect_timings(repo):
     return timings
 
 
-def compute_medians(timings):
-    """Compute median of last TARGET_DATA_POINTS timings for each entry.
+def compute_p90(timings):
+    """Compute 90th percentile of last TARGET_DATA_POINTS timings for each entry.
 
-    Returns dict mapping (rel_path, suite, backend) -> median (int).
+    Returns dict mapping (rel_path, suite, backend) -> p90 (int).
     Only includes entries with >= MIN_DATA_POINTS data points.
     """
-    medians = {}
+    p90s = {}
     for key, values in timings.items():
         recent = values[:TARGET_DATA_POINTS]
         if len(recent) < MIN_DATA_POINTS:
             continue
-        medians[key] = round(statistics.median(recent))
-    return medians
+        p90s[key] = round(statistics.quantiles(recent, n=10, method="inclusive")[8])
+    return p90s
 
 
-def update_est_times(medians, dry_run=False):
+def update_est_times(p90s, dry_run=False):
     """Update est_time values in source files.
 
     Each registration call is matched by both the function name and suite,
     so files with multiple registrations for different suites get the correct
-    per-suite median.
+    per-suite p90.
 
-    Returns (updated_count, skipped_count).
+    Returns (updated_count, skipped_count, changes) where changes is a list
+    of (rel_path, suite, backend, old_val, new_val) for each modified entry.
     """
     updated = 0
     skipped = 0
+    changes = []
 
-    # Group medians by file: {rel_path: [(suite, backend, median), ...]}
+    # Group p90s by file: {rel_path: [(suite, backend, p90), ...]}
     by_file = defaultdict(list)
-    for (rel_path, suite, backend), median in medians.items():
-        by_file[rel_path].append((suite, backend, median))
+    for (rel_path, suite, backend), p90 in p90s.items():
+        by_file[rel_path].append((suite, backend, p90))
 
     for rel_path, entries in sorted(by_file.items()):
         filepath = REPO_ROOT / rel_path
@@ -204,7 +213,7 @@ def update_est_times(medians, dry_run=False):
         content = filepath.read_text()
         new_content = content
 
-        for suite, backend, median in entries:
+        for suite, backend, p90 in entries:
             # Match registration calls with this specific backend and suite.
             # Handles: register_cuda_ci(est_time=300, suite="stage-c-test-4-gpu-h100")
             pattern = re.compile(
@@ -216,13 +225,14 @@ def update_est_times(medians, dry_run=False):
                 continue
 
             old_val = int(match.group(2))
-            if old_val == median:
+            if old_val == p90:
                 continue
 
-            new_content = pattern.sub(rf"\g<1>{median}\3", new_content)
+            new_content = pattern.sub(rf"\g<1>{p90}\3", new_content)
+            changes.append((rel_path, suite, backend, old_val, p90))
             print(
                 f"  {rel_path}: register_{backend}_ci "
-                f'suite="{suite}" est_time={old_val} -> {median}'
+                f'suite="{suite}" est_time={old_val} -> {p90}'
             )
 
         if new_content != content:
@@ -232,7 +242,45 @@ def update_est_times(medians, dry_run=False):
         else:
             skipped += 1
 
-    return updated, skipped
+    return updated, skipped, changes
+
+
+def is_significant(old_val, new_val):
+    """Return True if the change meets both absolute and relative thresholds."""
+    delta = abs(new_val - old_val)
+    return delta >= SIGNIFICANT_ABS_DELTA and delta / old_val >= SIGNIFICANT_REL_DELTA
+
+
+def write_summary(changes, summary_file):
+    """Write a markdown summary of significant est_time changes."""
+    significant = [c for c in changes if is_significant(c[3], c[4])]
+    significant.sort(key=lambda c: abs(c[4] - c[3]), reverse=True)
+
+    lines = []
+    if significant:
+        lines.append(
+            f"### Significant est_time changes "
+            f"({len(significant)} of {len(changes)} updates)"
+        )
+        lines.append("")
+        lines.append("| File | Suite | Old (s) | New (s) | Δ |")
+        lines.append("| --- | --- | ---: | ---: | ---: |")
+        for rel_path, suite, _backend, old_val, new_val in significant:
+            delta = new_val - old_val
+            sign = "+" if delta > 0 else ""
+            pct = round(delta / old_val * 100)
+            lines.append(
+                f"| `{Path(rel_path).name}` | `{suite}` | "
+                f"{old_val} | {new_val} | {sign}{delta} ({sign}{pct}%) |"
+            )
+    else:
+        lines.append(
+            f"_{len(changes)} est_time update(s); none exceeded both "
+            f"±{SIGNIFICANT_ABS_DELTA}s and "
+            f"±{int(SIGNIFICANT_REL_DELTA * 100)}% thresholds._"
+        )
+
+    Path(summary_file).write_text("\n".join(lines) + "\n")
 
 
 def main():
@@ -249,20 +297,29 @@ def main():
         default="sgl-project/sglang",
         help="GitHub repository (default: sgl-project/sglang)",
     )
+    parser.add_argument(
+        "--summary-file",
+        default=None,
+        help="Write a markdown summary of significant changes to this path",
+    )
     args = parser.parse_args()
 
     print("Collecting timings from CI logs...")
     timings = collect_timings(args.repo)
 
-    print("\nComputing medians...")
-    medians = compute_medians(timings)
-    print(f"Computed medians for {len(medians)} (file, suite, backend) entries")
+    print("\nComputing 90th percentiles...")
+    p90s = compute_p90(timings)
+    print(f"Computed p90 for {len(p90s)} (file, suite, backend) entries")
 
     print("\nUpdating est_time values...")
-    updated, skipped = update_est_times(medians, dry_run=args.dry_run)
+    updated, skipped, changes = update_est_times(p90s, dry_run=args.dry_run)
 
     action = "Would update" if args.dry_run else "Updated"
     print(f"\n{action} {updated} files, skipped {skipped} files")
+
+    if args.summary_file:
+        write_summary(changes, args.summary_file)
+        print(f"Wrote summary to {args.summary_file}")
 
     if args.dry_run:
         print("(dry-run mode, no files modified)")

@@ -22,15 +22,15 @@ from common_utils import (
 )
 from ray.experimental.tqdm_ray import tqdm
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     get_config_dtype_str,
     invoke_fused_moe_kernel,
     moe_align_block_size,
 )
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     get_config_file_name,
 )
-from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.server_args import (
     ServerArgs,

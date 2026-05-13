@@ -25,7 +25,7 @@ if [ "$FLASHINFER_JIT_CACHE_INSTALLED" = false ]; then
     FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
     mkdir -p "${FLASHINFER_CACHE_DIR}"
 
-    FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_PYTHON_REQUIRED}*.whl"
+    FLASHINFER_WHEEL_PATTERN="flashinfer_jit_cache-${FLASHINFER_PYTHON_REQUIRED}+${CU_VERSION}*.whl"
     CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
 
     if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then

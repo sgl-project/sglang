@@ -1,5 +1,5 @@
 """
-E2E smoke test for HiCache storage runtime attach/detach.
+E2E check for HiCache storage runtime attach/detach.
 
 This test launches an SGLang server with hierarchical cache enabled but WITHOUT
 any storage backend at startup, then attaches/detaches a storage backend via the

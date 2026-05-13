@@ -1,5 +1,5 @@
 name: Check Stage Health
-description: Fail fast if any job in the current workflow run has already failed, or if the lint check (from lint.yml) has failed. Auto-skips for scheduled runs.
+description: Fail fast if any job in the current workflow run has already failed, or if the lint check (from lint.yml) has failed. Auto-skips for scheduled runs. The jobs-failed check (but not the lint check) is bypassed when the PR carries the `bypass-fastfail` label.
 
 inputs:
   github-token:
@@ -47,6 +47,26 @@ runs:
             return;
           }
 
+          // Skip the jobs-failed check when the PR carries the bypass-fastfail label.
+          // Lint check above still runs.
+          let labels = [];
+          if (context.payload.pull_request?.labels) {
+            labels = context.payload.pull_request.labels.map(l => l.name);
+          } else {
+            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: ref,
+            });
+            if (prs.length > 0) {
+              labels = prs[0].labels.map(l => l.name);
+            }
+          }
+          if (labels.includes('bypass-fastfail')) {
+            core.info('Skipping jobs-failed check (bypass-fastfail label present)');
+            return;
+          }
+
           const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
             owner: context.repo.owner,
             repo: context.repo.repo,
@@ -56,6 +76,12 @@ runs:
           // Find jobs that failed from a real error, not from fast-fail cascade
           const rootCauseFailures = jobs.filter(j => {
             if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
+            // h20 runners are flaky (dirty GPU state from prior runs); their failures
+            // should not cascade fast-fail to other stages. Exact match avoids
+            // accidentally matching the h200 job names.
+            if (j.name === 'stage-c-test-8-gpu-h20') {
+              return false;
+            }
             // If the failing step is the health check, it's a cascade — skip it
             const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
             if (failedStep && (failedStep.name.includes('check-stage-health') || failedStep.name.includes('Check stage health'))) {

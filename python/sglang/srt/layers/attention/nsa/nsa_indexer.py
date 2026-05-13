@@ -14,8 +14,11 @@ from sglang.jit_kernel.fused_store_index_cache import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.state_capturer.indexer_topk import (
+    maybe_capture_indexer_topk,
+)
 from sglang.srt.utils import (
     add_prefix,
     ceil_align,
@@ -32,13 +35,15 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95_supported = is_gfx95_supported()
 if _is_cuda:
     try:
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
+
+if _use_aiter:
+    from aiter.ops.cache import indexer_k_quant_and_cache
 
 if is_npu():
     import torch_npu
@@ -51,7 +56,6 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
-    cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
 )
@@ -59,6 +63,7 @@ from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -143,7 +148,6 @@ class BaseIndexerMetadata(ABC):
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    assert x.dtype == torch.bfloat16
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
@@ -220,7 +224,7 @@ class Indexer(MultiPlatformOp):
             self.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.bfloat16 if _is_cuda else torch.float32,
+            params_dtype=torch.bfloat16,
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(
@@ -262,19 +266,13 @@ class Indexer(MultiPlatformOp):
         # avoiding an expensive FP8-to-bf16 dequantization.
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            weight = self.weights_proj.weight
-            out = torch.empty(
-                (x.shape[0], weight.shape[0]),
-                dtype=torch.float32,
-                device=x.device,
-            )
-            deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
-            return out
+        if _is_cuda:
+            return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
 
-        if _is_hip:
-            x = x.to(self.weights_proj.weight.dtype)
         weights, _ = self.weights_proj(x)
+        if _is_hip:
+            # Return bf16; multiplying with q_scale promotes back to fp32.
+            return weights
         return weights.float()
 
     @torch.compile(dynamic=True)
@@ -293,6 +291,12 @@ class Indexer(MultiPlatformOp):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
+
+    @torch.compile(dynamic=True)
+    def _apply_q_scale_and_softmax_scale(
+        self, weights: torch.Tensor, q_scale: torch.Tensor
+    ):
+        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     def _get_q_k_bf16(
         self,
@@ -355,7 +359,7 @@ class Indexer(MultiPlatformOp):
             current_stream.wait_stream(self.alt_stream)
         elif (
             self.alt_stream is not None
-            and forward_batch.nsa_cp_metadata is not None
+            and forward_batch.attn_cp_metadata is not None
             and self.nsa_enable_prefill_cp
         ):
             key = rotate_activation(key)
@@ -377,7 +381,7 @@ class Indexer(MultiPlatformOp):
             key = rotate_activation(key)
 
         # allgather+rerrange
-        if forward_batch.nsa_cp_metadata is not None and self.nsa_enable_prefill_cp:
+        if forward_batch.attn_cp_metadata is not None and self.nsa_enable_prefill_cp:
             key = cp_all_gather_rerange_output(
                 key.contiguous(),
                 self.cp_size,
@@ -427,12 +431,13 @@ class Indexer(MultiPlatformOp):
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
-            assert page_size == 1, "only support page size 1"
-            block_tables = metadata.get_page_table_1()
+            assert (
+                page_size % 16 == 0
+            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
         else:
             assert page_size == 64, "only support page size 64"
-            # NOTE(dark): this support extend/decode/decode+graph
-            block_tables = metadata.get_page_table_64()
+        # NOTE(dark): this support extend/decode/decode+graph
+        block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
@@ -450,26 +455,29 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        # DeepGEMM release-0426 requires context_lens of shape [batch_size, next_n]
+        # to match q.shape = [batch_size, next_n, heads, head_dim]. The indexer uses
+        # next_n=1 with batch_size=N_total via q_fp8.unsqueeze(1) below, so mirror
+        # that layout here.
+        if seqlens_32.dim() == 2:
+            seqlens_32_2d = seqlens_32
+        else:
+            seqlens_32_2d = seqlens_32.unsqueeze(-1)
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, blocksize, self.sm_count
+                    seqlens_32_2d, blocksize, self.sm_count
                 )
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
-        block_kv = 1 if _is_hip else 64
+        block_kv = page_size
         num_heads_kv = 1
         head_dim_with_sf = 132
-        if _is_hip:
-            kv_cache_fp8 = kv_cache_fp8.view(
-                -1, block_kv, num_heads_kv, head_dim_with_sf
-            )
-        else:
-            kv_cache_fp8 = kv_cache_fp8.view(
-                kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-            )
+        kv_cache_fp8 = kv_cache_fp8.view(
+            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+        )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
@@ -480,9 +488,8 @@ class Indexer(MultiPlatformOp):
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
             batch_size, next_n, heads, _ = q_fp8.shape
-            logits = torch.full(
+            logits = torch.empty(
                 (batch_size * next_n, max_seq_len),
-                float("-inf"),
                 device=q_fp8.device,
                 dtype=torch.float32,
             )
@@ -494,7 +501,7 @@ class Indexer(MultiPlatformOp):
                 seqlens_32,
                 block_tables,
                 max_seq_len,
-                Preshuffle=False,
+                Preshuffle=_use_aiter,
                 KVBlockSize=block_kv,
             )
         else:
@@ -502,7 +509,7 @@ class Indexer(MultiPlatformOp):
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
-                seqlens_32,
+                seqlens_32_2d,
                 block_tables,
                 schedule_metadata,
                 max_seq_len,
@@ -558,7 +565,9 @@ class Indexer(MultiPlatformOp):
 
         page_size = forward_batch.token_to_kv_pool.page_size
         if _is_hip:
-            assert page_size == 1, "only support page size 1"
+            assert (
+                page_size % 16 == 0
+            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
         else:
             assert page_size == 64, "only support page size 64"
 
@@ -569,10 +578,7 @@ class Indexer(MultiPlatformOp):
         )
         weights = weights.squeeze(-1)
 
-        if _is_hip:
-            block_tables = metadata.get_page_table_1()
-        else:
-            block_tables = metadata.get_page_table_64()
+        block_tables = metadata.get_page_table_64()
 
         assert (
             forward_batch.seq_lens_cpu is not None
@@ -1028,6 +1034,27 @@ class Indexer(MultiPlatformOp):
             )
             return
 
+        # Fast path: AITER fused quant + cache store (HIP, preshuffle)
+        if _use_aiter:
+            page_size = forward_batch.token_to_kv_pool.page_size
+            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
+            # Reshape from (num_pages, page_size*(128+4)) uint8 to (num_pages, page_size, 132) fp8
+            kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
+            out_loc = forward_batch.out_cache_loc
+            if not out_loc.is_contiguous():
+                out_loc = out_loc.contiguous()
+            indexer_k_quant_and_cache(
+                key,
+                kv_cache,
+                out_loc,
+                self.block_size,
+                self.scale_fmt,
+                preshuffle=True,
+            )
+            return
+
         # Fallback: original path
         assert act_quant is not None
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
@@ -1041,6 +1068,19 @@ class Indexer(MultiPlatformOp):
             loc=out_loc,
             index_k=k_fp8,
             index_k_scale=k_scale,
+        )
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        return self.forward_cuda(
+            x, q_lora, positions, forward_batch, layer_id, return_indices
         )
 
     def forward_cuda(
@@ -1089,15 +1129,18 @@ class Indexer(MultiPlatformOp):
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
-            return self._forward_cuda_k_only(
-                x,
-                positions,
-                forward_batch,
+            return maybe_capture_indexer_topk(
                 layer_id,
-                act_quant,
-                enable_dual_stream,
-                metadata,
-                return_indices,
+                self._forward_cuda_k_only(
+                    x,
+                    positions,
+                    forward_batch,
+                    layer_id,
+                    act_quant,
+                    enable_dual_stream,
+                    metadata,
+                    return_indices,
+                ),
             )
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
@@ -1116,7 +1159,7 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+            weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
@@ -1195,11 +1238,14 @@ class Indexer(MultiPlatformOp):
                 #     print(
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
-                return torch.full(
-                    (x_meta.shape[0], self.index_topk),
-                    -1,
-                    dtype=torch.int,
-                    device=x_meta.device,
+                return maybe_capture_indexer_topk(
+                    layer_id,
+                    torch.full(
+                        (x_meta.shape[0], self.index_topk),
+                        -1,
+                        dtype=torch.int,
+                        device=x_meta.device,
+                    ),
                 )
 
             if (
@@ -1212,17 +1258,17 @@ class Indexer(MultiPlatformOp):
                 )
             else:
                 if (
-                    forward_batch.nsa_cp_metadata is not None
+                    forward_batch.attn_cp_metadata is not None
                     and is_nsa_prefill_cp_in_seq_split()
                 ):
-                    kv_len_prev = forward_batch.nsa_cp_metadata.kv_len_prev
-                    kv_len_next = forward_batch.nsa_cp_metadata.kv_len_next
-                    actual_seq_q_prev = forward_batch.nsa_cp_metadata.actual_seq_q_prev
-                    actual_seq_q_next = forward_batch.nsa_cp_metadata.actual_seq_q_next
+                    kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev
+                    kv_len_next = forward_batch.attn_cp_metadata.kv_len_next
+                    actual_seq_q_prev = forward_batch.attn_cp_metadata.actual_seq_q_prev
+                    actual_seq_q_next = forward_batch.attn_cp_metadata.actual_seq_q_next
 
                     # TODO support mutil-batch
-                    # cp_batch_seq_index_prev = forward_batch.nsa_cp_metadata["cp_batch_seq_index_prev"]
-                    # cp_batch_seq_index_next = forward_batch.nsa_cp_metadata["cp_batch_seq_index_next"]
+                    # cp_batch_seq_index_prev = forward_batch.attn_cp_metadata["cp_batch_seq_index_prev"]
+                    # cp_batch_seq_index_next = forward_batch.attn_cp_metadata["cp_batch_seq_index_next"]
                     # TODO prev, next, combined into a single call
                     q_fp8_prev, q_fp8_next = torch.split(
                         q_fp8, (q_fp8.shape[0] + 1) // 2, dim=0
@@ -1249,7 +1295,10 @@ class Indexer(MultiPlatformOp):
                         kv_len_next,
                         actual_seq_q_next,
                     )
-                    return torch.cat([topk_result_prev, topk_result_next], dim=0)
+                    return maybe_capture_indexer_topk(
+                        layer_id,
+                        torch.cat([topk_result_prev, topk_result_next], dim=0),
+                    )
                 else:
                     topk_result = self._get_topk_ragged(
                         enable_dual_stream,
@@ -1267,7 +1316,7 @@ class Indexer(MultiPlatformOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
-        return topk_result
+        return maybe_capture_indexer_topk(layer_id, topk_result)
 
     def forward_npu(
         self,
@@ -1423,7 +1472,7 @@ class Indexer(MultiPlatformOp):
         if (
             is_prefill
             and self.nsa_enable_prefill_cp
-            and forward_batch.nsa_cp_metadata is not None
+            and forward_batch.attn_cp_metadata is not None
         ):
             k = cp_all_gather_rerange_output(
                 k.contiguous().view(-1, self.head_dim),
@@ -1436,15 +1485,32 @@ class Indexer(MultiPlatformOp):
             layer_id, forward_batch.out_cache_loc, k
         )
         if is_prefill:
-            if self.nsa_enable_prefill_cp and forward_batch.nsa_cp_metadata is not None:
+            if (
+                self.nsa_enable_prefill_cp
+                and forward_batch.attn_cp_metadata is not None
+            ):
                 forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q = (
-                    forward_batch.nsa_cp_metadata.actual_seq_q_prev_tensor,
-                    forward_batch.nsa_cp_metadata.actual_seq_q_next_tensor,
+                    forward_batch.attn_cp_metadata.actual_seq_q_prev_tensor,
+                    forward_batch.attn_cp_metadata.actual_seq_q_next_tensor,
                 )
-                forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv = (
-                    forward_batch.nsa_cp_metadata.kv_len_prev_tensor,
-                    forward_batch.nsa_cp_metadata.kv_len_next_tensor,
-                )
+                if sum(forward_batch.extend_prefix_lens_cpu) > 0:
+                    total_kv_len_prev_tensor = (
+                        forward_batch.attn_cp_metadata.kv_len_prev_tensor
+                        + forward_batch.extend_prefix_lens.squeeze()
+                    )
+                    total_kv_len_next_tensor = (
+                        forward_batch.attn_cp_metadata.kv_len_next_tensor
+                        + forward_batch.extend_prefix_lens.squeeze()
+                    )
+                    forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv = (
+                        total_kv_len_prev_tensor,
+                        total_kv_len_next_tensor,
+                    )
+                else:
+                    forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv = (
+                        forward_batch.attn_cp_metadata.kv_len_prev_tensor,
+                        forward_batch.attn_cp_metadata.kv_len_next_tensor,
+                    )
                 actual_seq_lengths_q = (
                     forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q
                 )
@@ -1498,7 +1564,7 @@ class Indexer(MultiPlatformOp):
         if (
             is_prefill
             and self.nsa_enable_prefill_cp
-            and forward_batch.nsa_cp_metadata is not None
+            and forward_batch.attn_cp_metadata is not None
         ):
             block_table = block_table[: actual_seq_lengths_q[0].numel()]
             topk_indices = self.do_npu_cp_balance_indexer(

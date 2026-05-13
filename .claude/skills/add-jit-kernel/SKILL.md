@@ -186,7 +186,9 @@ LaunchKernel(num_blocks, kBlockSize, device.unwrap())(kernel, params);
 ## Step 0 (optional): Generate a `.clangd` config for better IDE support
 
 ```bash
+python -m sglang.jit_kernel -h  # for verbose help info about clangd configuration
 python -m sglang.jit_kernel
+python -m sglang.jit_kernel --dep cutlass flashinfer  # with cutlass/flashinfer dependency
 ```
 
 ---
@@ -198,6 +200,8 @@ Create `python/sglang/jit_kernel/csrc/elementwise/scale.cuh`.
 The implementation fully uses the project abstractions described above:
 
 ```cpp
+// NOTE: Comments for headers are not common in practice.
+// It is only shown here for tutorial purposes to highlight the key abstractions.
 #include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/type.cuh>   // For dtype_trait, fp16_t, bf16_t, fp32_t
 #include <sgl_kernel/utils.h>    // For RuntimeCheck, div_ceil
@@ -215,13 +219,17 @@ namespace {
 // kVecN   = number of elements per vector load (e.g. 8 for fp16)
 // factor  = runtime scale factor
 // ----------------------------------------------------------------
-template <typename T, int kVecN>
+template <typename T, int kVecN, bool kUsePDL>
 __global__ void scale_kernel(T* __restrict__ dst,
                               const T* __restrict__ src,
                               float factor,
                               uint32_t n_total) {
   using vec_t = device::AlignedVector<T, kVecN>;
   const uint32_t n_vecs = n_total / kVecN;
+
+  // If using PDL, wait for primary kernel before any global memory load.
+  // This is NOT a synchronization point, which means some threads can early exit before this.
+  device::PDLWaitPrimary<kUsePDL>();
 
   // --- vectorised body ---
   const uint32_t vec_stride = blockDim.x * gridDim.x;
@@ -245,12 +253,16 @@ __global__ void scale_kernel(T* __restrict__ dst,
        i += scalar_stride) {
     dst[base + i] = static_cast<T>(static_cast<float>(src[base + i]) * factor);
   }
+
+  // If using PDL, signal for the secondary kernel to start after all threads have finished
+  // This is NOT a synchronization point, which means some threads can early exit before this.
+  device::PDLTriggerSecondary<kUsePDL>();
 }
 
 // ----------------------------------------------------------------
 // Launcher: validates tensors, selects vector width, launches kernel
 // ----------------------------------------------------------------
-template <typename T>
+template <typename T, bool kUsePDL>
 void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
   using namespace host;
 
@@ -271,8 +283,12 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
   RuntimeCheck(n > 0, "scale: num_elements must be > 0, got ", n);
 
   // 2. Choose vector width for 128-bit loads (16 bytes)
-  //    fp16/bf16: 8 elements × 2 bytes = 16 bytes
-  //    fp32:      4 elements × 4 bytes = 16 bytes
+  //    fp16/bf16: 8 elements x 2 bytes = 16 bytes
+  //    fp32:      4 elements x 4 bytes = 16 bytes
+  // We encourage using `device::kMaxVecBytes`, which will change according to
+  // the target architecture and can enable 256-bit vectorization on SM100+ if desired.
+  // But 128-bit is more commonly adapted for better compatibility,
+  // so it's still ok to hardcode 16 here just for simplicity.
   constexpr int kVecN = 16 / sizeof(T);
   const uint32_t n_work_items = div_ceil(n, static_cast<uint32_t>(kVecN));
 
@@ -280,8 +296,10 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
   constexpr uint32_t kBlockSize = 256;
   const uint32_t grid = div_ceil(n_work_items, kBlockSize);
 
-  LaunchKernel(grid, kBlockSize, device)(
-      scale_kernel<T, kVecN>,
+  // PDL feature is 100% optional. Without `enable_pdl`, the code should still be correct.
+  // Try to enable it if profiling shows that it can benefit the performance of this kernel.
+  LaunchKernel(grid, kBlockSize, device).enable_pdl(kUsePDL)(
+      scale_kernel<T, kVecN, kUsePDL>,
       static_cast<T*>(dst.data_ptr()),
       static_cast<const T*>(src.data_ptr()),
       factor,
@@ -302,7 +320,8 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
 - Prefer passing runtime scalars like `factor` directly unless compile-time specialisation is genuinely required
 - `fp16_t` / `bf16_t` / `fp32_t` are the project's type aliases (from `utils.cuh`)
 - `device::cast<To, From>` or `dtype_trait<T>::from(val)` for cross-type conversions
-- `device::math::` functions for device math instead of bare `__` intrinsics
+- `device::math::` functions for device math instead of bare `__` intrinsics if possible.
+- Try to use `PDL` feature. In some cases, this will benefit the performance.
 
 ---
 
@@ -317,7 +336,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -326,7 +350,7 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_scale_module(dtype: torch.dtype) -> Module:
     """Compile and cache the JIT scale module for a given dtype."""
-    args = make_cpp_args(dtype)
+    args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
         "scale",
         *args,
@@ -351,24 +375,16 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
     -------
     Scaled tensor (dst = src * factor).
     """
-    if not src.is_cuda:
-        raise RuntimeError("src must be a CUDA tensor")
+    # DO NOT add too much proactive validation here.
+    # Keep the Python wrapper thin, only enforce the preconditions
+    # that the current JIT/FFI path (C++ side) does not reject on its own.
     if src.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise RuntimeError(
             f"Unsupported dtype {src.dtype}. Supported: float16, bfloat16, float32"
         )
     if out is None:
         out = torch.empty_like(src)
-    else:
-        if out.shape != src.shape:
-            raise RuntimeError("out shape must match src")
-        if out.dtype != src.dtype:
-            raise RuntimeError("out dtype must match src")
-        if out.device != src.device:
-            raise RuntimeError("out device must match src")
 
-    # Keep the Python wrapper thin, but still enforce the basic preconditions
-    # that the current JIT/FFI path does not reject safely on its own.
     module = _jit_scale_module(src.dtype)
     module.scale(out, src, factor)
     return out
@@ -381,6 +397,7 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
 - Only include compile-time specialisation knobs in the build marker; runtime values like `factor` should stay runtime unless the kernel truly needs templating
 - `cuda_wrappers`: `(export_name, kernel_symbol)` — `export_name` is called from Python
 - `make_cpp_args(dtype, ...)` converts `torch.dtype` to C++ type alias:
+- `is_arch_support_pdl()` checks if the current architecture supports PDL, which is typically passed as a template argument to the kernel.
 - Keep Python launchers thin, but still validate the basic invariants (`is_cuda`, supported dtype, `out` metadata). In the current JIT/FFI path, invalid tensors are not always rejected safely before launch
 
 | `torch.dtype`      | C++ type   |
@@ -392,6 +409,8 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
 ---
 
 ## Step 3 (optional): Tune JIT build flags
+
+If your kernel uses some math functions like `expf` or `sinf`, consider enabling `--use_fast_math` for better performance (with a potential precision tradeoff):
 
 ```python
 return load_jit(
@@ -414,9 +433,9 @@ if torch.cuda.get_device_capability()[0] < 9:
 
 ## Step 4: Write tests (required)
 
-JIT kernel tests live under `python/sglang/jit_kernel/tests/`. **CI does not run `pytest` in that directory directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` there (and every `bench_*.py` under `benchmark/`), collects `register_*_ci(...)` calls by **statically parsing each file’s AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
+JIT kernel tests live under `python/sglang/jit_kernel/tests/`. **CI does not run `pytest` in that directory directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` there (and every `bench_*.py` under `benchmark/`), collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
 
-- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `stage-b-kernel-unit-1-gpu-large` (see `.github/workflows/pr-test-jit-kernel.yml`: `python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large`).
+- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `stage-b-kernel-unit-1-gpu-large` on H100 and `stage-b-kernel-unit-1-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`). Multi-GPU JIT tests use `stage-b-kernel-unit-8-gpu-h200`.
 - **Nightly kernel suite**: `nightly-kernel-1-gpu` with `--nightly` — typically used with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` in CI for expanded parameter grids (see `python/sglang/jit_kernel/utils.py` → `should_run_full_tests` / `get_ci_test_range`). Wired in `.github/workflows/nightly-test-nvidia.yml` (e.g. `python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error`).
 
 Registration pattern (module level, **literal** `est_time` and `suite` strings — required for AST parsing):
@@ -425,6 +444,8 @@ Registration pattern (module level, **literal** `est_time` and `suite` strings �
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
+# Optional B200/SM100 registration for tests that cover Blackwell-specific code paths
+# register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-b200")
 # Optional second registration: same file also listed under the nightly kernel suite
 # register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 ```
@@ -436,7 +457,9 @@ Use `register_cuda_ci(..., disabled="reason")` if the file must stay in-tree but
 **Run like CI** (from repo root):
 
 ```bash
-cd test && python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large
+(cd test && python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large)
+# For B200/SM100-specific coverage:
+(cd test && python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-b200)
 ```
 
 For fast iteration you can still run `pytest` on a single file locally; CI coverage is via `run_suite.py`.

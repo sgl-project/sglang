@@ -85,6 +85,7 @@ class LoadConfig:
     modelexpress_ep_size: Optional[int] = None
     modelexpress_dtype: Optional[str] = None
     modelexpress_quantization: Optional[str] = None
+    modelexpress_transport: str = "transfer_engine"
 
     # ModelOpt-specific loading options
     modelopt_checkpoint_restore_path: Optional[str] = None

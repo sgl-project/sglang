@@ -15,7 +15,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.srt.layers.attention.fla.kda import fused_kda_gate
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -382,11 +381,13 @@ class KimiDeltaAttention(nn.Module):
                 hidden_states
             )
 
-        # fused_kda_gate is fused to KimiLinearAttentionBackend with decode
+        # For prefill: raw gate is passed to chunk_kda_fwd, which fuses gate
+        # activation with chunk_local_cumsum (kda_gate_chunk_cumsum kernel).
+        # For decode: gate activation is handled inside fused_recurrent kernel.
         if not forward_batch.forward_mode.is_decode():
-            forget_gate = fused_kda_gate(
-                forget_gate, self.A_log, self.head_dim, g_bias=self.dt_bias
-            )
+            forget_gate = forget_gate.unflatten(
+                -1, (-1, self.head_dim)
+            )  # [T, H*K] -> [T, H, K]
             beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)

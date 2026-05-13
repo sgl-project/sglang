@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -15,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=462, suite="stage-c-test-deepep-8-gpu-h200")
+register_cuda_ci(est_time=528, suite="stage-c-test-deepep-8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -86,48 +87,49 @@ class TestDeepseekMTP(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "8",
-                "--enable-dp-attention",
-                "--dp",
-                "8",
-                "--moe-dense-tp-size",
-                "1",
-                "--enable-dp-lm-head",
-                "--moe-a2a-backend",
-                "deepep",
-                "--moe-runner-backend",
-                "deep_gemm",
-                "--enable-two-batch-overlap",
-                "--ep-num-redundant-experts",
-                "32",
-                "--ep-dispatch-algorithm",
-                "dynamic",
-                "--eplb-algorithm",
-                "deepseek",
-                "--cuda-graph-bs",
-                "64",  # TODO: increase it to 128 when TBO is supported in draft_extend
-                "--max-running-requests",
-                "512",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "1",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "2",
-                "--disable-radix-cache",
-                "--model-loader-extra-config",
-                '{"enable_multithread_load": true,"num_threads": 64}',
-            ],
-        )
+        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--trust-remote-code",
+                    "--tp",
+                    "8",
+                    "--enable-dp-attention",
+                    "--dp",
+                    "8",
+                    "--moe-dense-tp-size",
+                    "1",
+                    "--enable-dp-lm-head",
+                    "--moe-a2a-backend",
+                    "deepep",
+                    "--moe-runner-backend",
+                    "deep_gemm",
+                    "--enable-two-batch-overlap",
+                    "--ep-num-redundant-experts",
+                    "32",
+                    "--ep-dispatch-algorithm",
+                    "dynamic",
+                    "--eplb-algorithm",
+                    "deepseek",
+                    "--cuda-graph-bs",
+                    "64",  # TODO: increase it to 128 when TBO is supported in draft_extend
+                    "--max-running-requests",
+                    "512",
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-num-steps",
+                    "1",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "2",
+                    "--disable-radix-cache",
+                    "--model-loader-extra-config",
+                    '{"enable_multithread_load": true,"num_threads": 64}',
+                ],
+            )
 
     @classmethod
     def tearDownClass(cls):

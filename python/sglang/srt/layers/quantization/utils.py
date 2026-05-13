@@ -43,6 +43,26 @@ def get_scalar_types():
 ScalarType, scalar_types = get_scalar_types()
 
 
+def _module_path_match(ignored: str, prefix: str) -> bool:
+    # Match on dotted module-path boundaries so that `mlp.gate` does NOT
+    # match `mlp.gate_up_proj`. Needed for quant configs (e.g. Qwen3.6-FP8)
+    # whose `modules_to_not_convert` lists MoE-template names like `mlp.gate`
+    # that collide with fused dense MLP names by plain substring.
+    if ignored == prefix:
+        return True
+    if prefix.startswith(ignored + "."):
+        return True
+    return ("." + ignored + ".") in ("." + prefix + ".")
+
+
+# Known fused-linear -> shard names. Used as a fallback when the quant
+# config doesn't ship packed_modules_mapping (typical for HF FP8 configs).
+_FALLBACK_FUSED_SHARDS: Mapping[str, List[str]] = {
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    "gate_up_proj": ["gate_proj", "up_proj"],
+}
+
+
 def is_layer_skipped(
     prefix: str,
     ignored_layers: List[str],
@@ -56,16 +76,19 @@ def is_layer_skipped(
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
     # each shard of the fused layer has the same scheme.
-    if proj_name in fused_mapping:
+    effective_fused = (
+        fused_mapping if proj_name in fused_mapping else _FALLBACK_FUSED_SHARDS
+    )
+    if proj_name in effective_fused:
         shard_prefixes = [
             prefix.replace(proj_name, shard_proj_name)
-            for shard_proj_name in fused_mapping[proj_name]
+            for shard_proj_name in effective_fused[proj_name]
         ]
 
         is_skipped = None
         for shard_prefix in shard_prefixes:
             is_shard_skipped = any(
-                ignored in shard_prefix for ignored in ignored_layers
+                _module_path_match(ignored, shard_prefix) for ignored in ignored_layers
             )
 
             if is_skipped is None:
@@ -77,7 +100,9 @@ def is_layer_skipped(
                     "to have the same precision."
                 )
     else:
-        is_skipped = any(ignored in prefix for ignored in ignored_layers)
+        is_skipped = any(
+            _module_path_match(ignored, prefix) for ignored in ignored_layers
+        )
         if "gate_up_proj" in prefix:
             prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
             prefix_up = prefix.replace("gate_up_proj", "up_proj")
@@ -625,6 +650,7 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     hidden_size,
     intermediate_size,
     num_experts,
+    is_gated: bool = True,
 ):
     from flashinfer import nvfp4_block_scale_interleave
     from flashinfer.fused_moe.core import (
@@ -636,14 +662,16 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     _cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
     epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
 
+    gemm1_rows = (2 if is_gated else 1) * intermediate_size
+
     # Convert quantized weights to proper formats
     gemm1_weights_fp4 = gemm1_weights.view(torch.float8_e4m3fn).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // 2
+        num_experts, gemm1_rows, hidden_size // 2
     )  # packed fp4
     gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
         torch.float8_e4m3fn
     ).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // 16
+        num_experts, gemm1_rows, hidden_size // 16
     )  # fp8 scaling factors
 
     gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
@@ -660,14 +688,11 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     gemm2_weights_fp4_shuffled = []
     gemm2_scales_fp4_shuffled = []
     for i in range(num_experts):
-        # Calculate the permute indices for the following:
-        # 1. Reorder rows of W1 and scales for fused gated activation
-        # 2. Shuffle weights and scaling factors for transposed mma output
-        # for both w3_w1 and w2 weights and scale factors
         permute_indices = _maybe_get_cached_w3_w1_permute_indices(
             _cache_permute_indices,
             gemm1_weights_fp4[i].view(torch.uint8),
             epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
         )
         gemm1_weights_fp4_shuffled.append(
             gemm1_weights_fp4[i]
@@ -680,6 +705,7 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             gemm1_scales_linear_fp4[i].view(torch.uint8),
             epilogue_tile_m,
             num_elts_per_sf=16,
+            is_gated_act_gemm=is_gated,
         )
         gemm1_scales_fp4_shuffled.append(
             nvfp4_block_scale_interleave(
@@ -723,7 +749,7 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     gemm1_scales_fp4_shuffled = (
         torch.stack(gemm1_scales_fp4_shuffled)
         .view(torch.float8_e4m3fn)
-        .reshape(num_experts, 2 * intermediate_size, hidden_size // 16)
+        .reshape(num_experts, gemm1_rows, hidden_size // 16)
     )
 
     gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
