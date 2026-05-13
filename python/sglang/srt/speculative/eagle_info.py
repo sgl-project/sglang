@@ -252,10 +252,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accepted token logits.
         """
         if batch.forward_mode.is_idle():
+            # Defer hidden_states shape decision to the worker fixup in
+            # `forward_draft_extend_after_decode`, which has the worker
+            # reference and uses `EagleDraftExtendInput.hidden_size_for(worker)`
+            # (single source of truth incl. EAGLE-3 aux widening).
             draft_extend_input = EagleDraftExtendInput.create_idle_input(
                 device=batch.device,
-                hidden_size=batch.model_config.spec_hidden_size,
-                dtype=batch.model_config.dtype,
+                hidden_size=None,
+                dtype=None,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             return EagleVerifyOutput.create_idle(
@@ -645,10 +649,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     req_pool_indices=batch.req_pool_indices[unfinished_index_device],
                 )
             else:
+                # All reqs in this batch finished at verify; the worker fixup
+                # (see EAGLEWorker.forward_draft_extend_after_decode) rebuilds
+                # this stub with `EagleDraftExtendInput.hidden_size_for(worker)`
+                # so the column shape is irrelevant here.
                 draft_extend_input = EagleDraftExtendInput.create_idle_input(
                     device=batch.device,
-                    hidden_size=batch.model_config.spec_hidden_size,
-                    dtype=batch.model_config.dtype,
+                    hidden_size=None,
+                    dtype=None,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
 

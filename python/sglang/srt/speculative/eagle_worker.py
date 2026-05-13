@@ -1161,8 +1161,13 @@ class EAGLEWorker(TpModelWorker):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
-        if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
-            # All reqs finished this verify; swap to an idle ExtendInput.
+        if draft_extend_input.input_ids.shape[0] == 0:
+            # Rebuild the idle ExtendInput stub here (single source for
+            # hidden_states width via `hidden_size_for(self)`, incl. EAGLE-3
+            # aux widening). Covers two stub origins:
+            #   - `verify()` Site 1: fully-idle batch (DP attn rank w/o reqs)
+            #   - `verify()` Site 2: active batch, all reqs finished at verify
+            # `prepare_for_idle()` is idempotent when already idle.
             batch = batch.copy()
             batch.prepare_for_idle()
             draft_extend_input = EagleDraftExtendInput.create_idle_input(
