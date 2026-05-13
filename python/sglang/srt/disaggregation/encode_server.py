@@ -316,6 +316,18 @@ class MMEncoder:
                 self._forward_ready_events: Dict[str, asyncio.Event] = {}
                 self._forward_results: Dict[str, dict] = {}
 
+        # Bind unified encode entry point based on backend and cache config
+        if self.mm_global_cache is not None:
+            if self.server_args.encoder_transfer_backend == "mooncake":
+                self._encode_fn = self.encode_with_global_cache_mooncake
+            else:
+                self._encode_fn = self.encode_with_global_cache
+        else:
+            if self.server_args.encoder_transfer_backend == "mooncake":
+                self._encode_fn = self.encode_with_mooncake
+            else:
+                self._encode_fn = self.encode
+
         logger.info(f"rank {rank} init finish ")
 
     def _infer_embedding_dims(self) -> dict:
@@ -891,16 +903,16 @@ class MMEncoder:
             grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
             mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
             num_items = len(grid_thw)
-
-            # Compute metadata without running forward (all ranks)
-            total_tokens = sum(self.get_num_tokens(g, modality) for g in grid_thw)
-            embedding_dim = self._embedding_dims.get(
-                modality, self.model_config.hidden_size
-            )
-            nbytes = total_tokens * embedding_dim * self._element_size
             aux_data = _build_mm_aux_data(mm_inputs)
 
-            # Rank 0: compute hashes, store metadata, set up events
+            # Setup metadata and event management
+            nbytes, total_tokens, embedding_dim, event = (
+                self._setup_mooncake_async_encode(
+                    req_id, num_parts, part_idx, grid_thw, modality, aux_data
+                )
+            )
+
+            # Rank 0: compute hashes
             if self.rank == 0:
                 if hashes is None:
                     mm_hashes = self._calculate_hashes_from_features(
@@ -908,22 +920,6 @@ class MMEncoder:
                     )
                 else:
                     mm_hashes = hashes
-
-                mm_data = EmbeddingData(
-                    req_id,
-                    num_parts,
-                    part_idx,
-                    grid_thw,
-                    modality,
-                    embedding=None,
-                    embedding_shape=[total_tokens, embedding_dim],
-                    **aux_data,
-                )
-                self.embedding_to_send[req_id] = mm_data
-
-                event = asyncio.Event()
-                self._forward_ready_events[req_id] = event
-                self._forward_results[req_id] = {}
 
             # All ranks: launch background task for cache check + VIT forward.
             # Do NOT use run_in_executor: get_feature_fn relies on a session
@@ -1071,9 +1067,7 @@ class MMEncoder:
                     if self.profiler is not None:
                         self.profiler.step()
 
-            task = asyncio.create_task(_run_forward_with_cache())
-            self.background_tasks.add(task)
-            task.add_done_callback(self.background_tasks.discard)
+            self._launch_mooncake_background_task(_run_forward_with_cache())
 
             if self.rank == 0:
                 logger.info(
@@ -1090,22 +1084,9 @@ class MMEncoder:
                 f"Rank {self.rank} encode_with_global_cache_mooncake "
                 f"failed: {error_msg} {error_code = }"
             )
-            if self.rank == 0:
-                # Clean up forward events to prevent /send from blocking forever
-                if req_id in self._forward_ready_events:
-                    self._forward_results[req_id] = {"error": error_msg}
-                    self._forward_ready_events[req_id].set()
-                mm_data = EmbeddingData(
-                    req_id,
-                    num_parts,
-                    part_idx,
-                    None,
-                    modality,
-                    error_msg=error_msg,
-                    error_code=error_code,
-                )
-                self.embedding_to_send[req_id] = mm_data
-            return 0, 0, 0, error_msg, error_code
+            return self._handle_mooncake_encode_error(
+                req_id, num_parts, part_idx, modality, error_msg, error_code
+            )
 
     async def _flatten_and_load_audios(self, mm_items):
         """
@@ -1434,7 +1415,9 @@ class MMEncoder:
 
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
 
-    async def encode(self, mm_items, modality: Modality, req_id, num_parts, part_idx):
+    async def encode(
+        self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
+    ):
         try:
             grid_dim, mm_embedding, aux_data = await self._encode(mm_items, modality)
 
@@ -1474,22 +1457,85 @@ class MMEncoder:
                 logger.debug(f"Created error EmbeddingData: {mm_data}")
             return 0, 0, 0, error_msg, error_code
 
+    def _setup_mooncake_async_encode(
+        self,
+        req_id: str,
+        num_parts: int,
+        part_idx: int,
+        grid_thw,
+        modality: Modality,
+        aux_data: dict,
+    ):
+        """Setup metadata and event management for mooncake async encode.
+        Returns (nbytes, total_tokens, embedding_dim, event)."""
+        total_tokens = sum(self.get_num_tokens(g, modality) for g in grid_thw)
+        embedding_dim = self._embedding_dims.get(
+            modality, self.model_config.hidden_size
+        )
+        nbytes = total_tokens * embedding_dim * self._element_size
+
+        event = None
+        if self.rank == 0:
+            mm_data = EmbeddingData(
+                req_id,
+                num_parts,
+                part_idx,
+                grid_thw,
+                modality,
+                embedding=None,
+                embedding_shape=[total_tokens, embedding_dim],
+                **aux_data,
+            )
+            self.embedding_to_send[req_id] = mm_data
+            event = asyncio.Event()
+            self._forward_ready_events[req_id] = event
+            self._forward_results[req_id] = {}
+
+        return nbytes, total_tokens, embedding_dim, event
+
+    def _handle_mooncake_encode_error(
+        self, req_id, num_parts, part_idx, modality, error_msg, error_code
+    ):
+        """Handle outer exception for mooncake async encode methods."""
+        if self.rank == 0:
+            if req_id in self._forward_ready_events:
+                self._forward_results[req_id] = {"error": error_msg}
+                self._forward_ready_events[req_id].set()
+            mm_data = EmbeddingData(
+                req_id,
+                num_parts,
+                part_idx,
+                None,
+                modality,
+                error_msg=error_msg,
+                error_code=error_code,
+            )
+            self.embedding_to_send[req_id] = mm_data
+        return 0, 0, 0, error_msg, error_code
+
+    def _launch_mooncake_background_task(self, coro):
+        """Launch an async background task and track it."""
+        task = asyncio.create_task(coro)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        return task
+
     async def encode_with_mooncake(
-        self, mm_items, modality: Modality, req_id, num_parts, part_idx
+        self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
     ):
         """Async encode for mooncake: all ranks participate in VIT forward via background task,
         rank 0 returns metadata immediately."""
         try:
             mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
             grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
-
-            # Compute metadata without running forward (all ranks)
-            total_tokens = sum(self.get_num_tokens(g, modality) for g in grid_thw)
-            embedding_dim = self._embedding_dims.get(
-                modality, self.model_config.hidden_size
-            )
-            nbytes = total_tokens * embedding_dim * self._element_size
             aux_data = _build_mm_aux_data(mm_inputs)
+
+            # Setup metadata and event management
+            nbytes, total_tokens, embedding_dim, event = (
+                self._setup_mooncake_async_encode(
+                    req_id, num_parts, part_idx, grid_thw, modality, aux_data
+                )
+            )
 
             # Build mm_item (all ranks)
             mm_item = MultimodalDataItem.from_dict(
@@ -1503,24 +1549,6 @@ class MMEncoder:
                     continue
                 val = _convert(v)
                 mm_item.set(k, val)
-
-            # Rank 0: store metadata and set up async forward synchronization
-            if self.rank == 0:
-                mm_data = EmbeddingData(
-                    req_id,
-                    num_parts,
-                    part_idx,
-                    grid_thw,
-                    modality,
-                    embedding=None,
-                    embedding_shape=[total_tokens, embedding_dim],
-                    **aux_data,
-                )
-                self.embedding_to_send[req_id] = mm_data
-
-                event = asyncio.Event()
-                self._forward_ready_events[req_id] = event
-                self._forward_results[req_id] = {}
 
             async def _run_forward():
                 try:
@@ -1543,9 +1571,7 @@ class MMEncoder:
                     if self.profiler is not None:
                         self.profiler.step()
 
-            task = asyncio.create_task(_run_forward())
-            self.background_tasks.add(task)
-            task.add_done_callback(self.background_tasks.discard)
+            self._launch_mooncake_background_task(_run_forward())
 
             if self.rank == 0:
                 logger.info(
@@ -1563,22 +1589,9 @@ class MMEncoder:
                 f"{error_msg} {error_code = }",
                 exc_info=True,
             )
-            if self.rank == 0:
-                # Clean up forward events to prevent /send from blocking forever
-                if req_id in self._forward_ready_events:
-                    self._forward_results[req_id] = {"error": error_msg}
-                    self._forward_ready_events[req_id].set()
-                mm_data = EmbeddingData(
-                    req_id,
-                    num_parts,
-                    part_idx,
-                    None,
-                    modality,
-                    error_msg=error_msg,
-                    error_code=error_code,
-                )
-                self.embedding_to_send[req_id] = mm_data
-            return 0, 0, 0, error_msg, error_code
+            return self._handle_mooncake_encode_error(
+                req_id, num_parts, part_idx, modality, error_msg, error_code
+            )
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
@@ -1770,42 +1783,14 @@ async def run_encoder(
             else:
                 encoder.profiler.stop()
         else:
-            if encoder.mm_global_cache is not None:
-                if encoder.server_args.encoder_transfer_backend == "mooncake":
-                    await encoder.encode_with_global_cache_mooncake(
-                        mm_items=request["mm_items"],
-                        modality=Modality.from_str(request["modality"]),
-                        req_id=request["req_id"],
-                        num_parts=request["num_parts"],
-                        part_idx=request["part_idx"],
-                        hashes=request.get("hashes", None),
-                    )
-                else:
-                    await encoder.encode_with_global_cache(
-                        mm_items=request["mm_items"],
-                        modality=Modality.from_str(request["modality"]),
-                        req_id=request["req_id"],
-                        num_parts=request["num_parts"],
-                        part_idx=request["part_idx"],
-                        hashes=request.get("hashes", None),
-                    )
-            else:
-                if encoder.server_args.encoder_transfer_backend == "mooncake":
-                    await encoder.encode_with_mooncake(
-                        mm_items=request["mm_items"],
-                        modality=Modality.from_str(request["modality"]),
-                        req_id=request["req_id"],
-                        num_parts=request["num_parts"],
-                        part_idx=request["part_idx"],
-                    )
-                else:
-                    await encoder.encode(
-                        mm_items=request["mm_items"],
-                        modality=Modality.from_str(request["modality"]),
-                        req_id=request["req_id"],
-                        num_parts=request["num_parts"],
-                        part_idx=request["part_idx"],
-                    )
+            await encoder._encode_fn(
+                mm_items=request["mm_items"],
+                modality=Modality.from_str(request["modality"]),
+                req_id=request["req_id"],
+                num_parts=request["num_parts"],
+                part_idx=request["part_idx"],
+                hashes=request.get("hashes", None),
+            )
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
@@ -1866,50 +1851,16 @@ async def handle_encode_request(request: dict):
         request.update({"enter_time": time.time()})
         for socket in send_sockets:
             socket.send_pyobj(request)
-        if encoder.mm_global_cache is not None:
-            if encoder.server_args.encoder_transfer_backend == "mooncake":
-                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                    await encoder.encode_with_global_cache_mooncake(
-                        mm_items=request["mm_items"],
-                        modality=Modality.from_str(request["modality"]),
-                        req_id=request["req_id"],
-                        num_parts=request["num_parts"],
-                        part_idx=request["part_idx"],
-                        hashes=request.get("hashes", None),
-                    )
-                )
-            else:
-                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                    await encoder.encode_with_global_cache(
-                        mm_items=request["mm_items"],
-                        modality=Modality.from_str(request["modality"]),
-                        req_id=request["req_id"],
-                        num_parts=request["num_parts"],
-                        part_idx=request["part_idx"],
-                        hashes=request.get("hashes", None),
-                    )
-                )
-        else:
-            if encoder.server_args.encoder_transfer_backend == "mooncake":
-                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                    await encoder.encode_with_mooncake(
-                        mm_items=request["mm_items"],
-                        modality=Modality.from_str(request["modality"]),
-                        req_id=request["req_id"],
-                        num_parts=request["num_parts"],
-                        part_idx=request["part_idx"],
-                    )
-                )
-            else:
-                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                    await encoder.encode(
-                        mm_items=request["mm_items"],
-                        modality=Modality.from_str(request["modality"]),
-                        req_id=request["req_id"],
-                        num_parts=request["num_parts"],
-                        part_idx=request["part_idx"],
-                    )
-                )
+        nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+            await encoder._encode_fn(
+                mm_items=request["mm_items"],
+                modality=Modality.from_str(request["modality"]),
+                req_id=request["req_id"],
+                num_parts=request["num_parts"],
+                part_idx=request["part_idx"],
+                hashes=request.get("hashes", None),
+            )
+        )
 
         if error_msg:
             if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
