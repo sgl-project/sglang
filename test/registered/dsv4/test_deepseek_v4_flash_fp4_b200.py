@@ -153,7 +153,7 @@ class TestDSV4FlashFP4B200Balanced_CP(ServerSanityMixin, CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-cp-size",
                 "4",
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
