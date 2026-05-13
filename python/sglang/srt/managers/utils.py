@@ -59,10 +59,18 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
-    def copy_to_cpu(self, return_logprob: bool):
+    def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
+
+        ``return_hidden_states`` defaults True for back-compat. Pass False when
+        no request in the batch asked for hidden states in its response — for
+        EAGLE3 spec decoding the draft worker already holds a GPU reference via
+        ``next_draft_input.hidden_states``, so the DtoH copy here is pure waste
+        (≈7 ms per chunk for 8192-token × 3-aux-layer × hidden=7168 BF16).
+        Because ``process_batch_result_prefill`` blocks on ``copy_done`` it sits
+        on the prefill critical path.
         """
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
@@ -88,7 +96,7 @@ class GenerationBatchResult:
                     v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-        if self.logits_output.hidden_states is not None:
+        if return_hidden_states and self.logits_output.hidden_states is not None:
             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True
             )

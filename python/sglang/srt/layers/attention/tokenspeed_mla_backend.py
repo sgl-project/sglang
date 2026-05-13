@@ -162,6 +162,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             )
         return self._tokenspeed_workspace
 
+    def init_mha_chunk_metadata(self, forward_batch: "ForwardBatch") -> None:
+        """Skip parent's flashinfer wrapper plan()."""
+        return None
+
     def _fused_rope_fp8_quantize(
         self,
         q_nope: torch.Tensor,
