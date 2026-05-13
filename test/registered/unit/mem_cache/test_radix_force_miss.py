@@ -33,6 +33,7 @@ class _StubReq:
         self.prefix_indices = None
         self.last_node = None
         self.last_host_node = None
+        self.best_match_node = None
         self.host_hit_length = None
         self.mamba_branching_seqlen = None
         self.cache_protected_len = None
@@ -50,6 +51,7 @@ class TestZeroMatchResult(unittest.TestCase):
         self.assertEqual(int(zeroed.device_indices.numel()), 0)
         self.assertIs(zeroed.last_device_node, tree.root_node)
         self.assertIs(zeroed.last_host_node, tree.root_node)
+        self.assertIs(zeroed.best_match_node, tree.root_node)
         self.assertEqual(zeroed.host_hit_length, 0)
         # dtype/device preserved (slice-not-allocate).
         self.assertEqual(zeroed.device_indices.dtype, match.device_indices.dtype)
@@ -64,6 +66,7 @@ class TestZeroMatchResult(unittest.TestCase):
             device_indices=torch.empty((0,), dtype=torch.int64),
             last_device_node=None,
             last_host_node=None,
+            best_match_node=None,
             host_hit_length=0,
         )
         self.assertIs(zero_match_result(_StubChunkCache(), original), original)

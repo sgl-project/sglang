@@ -922,19 +922,19 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(node_count_before, 2)
 
         tree._match_prefix_helper(RadixKey([1, 2]))
-        value, best_node, best_value_len = tree._match_prefix_helper(
+        value, best_match_node, best_value_len = tree._match_prefix_helper(
             RadixKey([1, 2, 3, 4])
         )
         self.assertEqual(best_value_len, 2)
-        self.assertEqual(best_node.key.token_ids, [3, 4])
+        self.assertEqual(best_match_node.key.token_ids, [3, 4])
         node_count_after_regular = count_nodes(tree.root_node)
         self.assertEqual(node_count_after_regular, node_count_before + 2)
 
-        value, best_node, best_value_len = tree._match_prefix_helper_readonly(
+        value, best_match_node, best_value_len = tree._match_prefix_helper_readonly(
             RadixKey([1, 2, 3])
         )
         self.assertEqual(best_value_len, 1)
-        self.assertEqual(best_node.key.token_ids, [1, 2])
+        self.assertEqual(best_match_node.key.token_ids, [1, 2])
         node_count_after_readonly = count_nodes(tree.root_node)
         self.assertEqual(node_count_after_readonly, node_count_after_regular)
 
@@ -1724,6 +1724,7 @@ class UnifiedRadixCacheSuite:
                     ),
                     last_device_node=leaf,
                     last_host_node=leaf,
+                    best_match_node=leaf,
                     host_hit_length=0,
                 )
                 result = swa_comp.finalize_match_result(
@@ -1808,6 +1809,127 @@ class UnifiedRadixCacheSuite:
             n_swa,
         )
 
+    def _swa_anchor_chain_tokens(self, num_pages: int) -> list[int]:
+        """Reproduce the token sequence used by _build_chain_pages."""
+        tokens: list[int] = []
+        for i in range(num_pages):
+            tokens.extend(self._make_seq(1000 * (i + 1), 1))
+        return tokens
+
+    def _swa_anchor_setup(self):
+        """Build chain[-3]=N, chain[-2]=Y, chain[-1]=X where the FULL-derived
+        `last_host_node` (Y) is strictly shallower than the validator-derived
+        `best_match_node` (X) — the structural condition under which the SWA
+        load_back assert used to fire.
+
+        Per-node state:
+            N: SWA fully tombstone, FULL device-on, FULL host removed
+            Y: SWA host-only, FULL host-only (evicted + backuped)
+            X: SWA on device, FULL device-on, FULL host removed
+
+        match_prefix outcome:
+            last_device_node = X         (X not evicted)
+            last_host_node   = Y         (X not backuped -> walk up)
+            best_match_node  = X         (SWA validator state resets at N then
+                                          accumulates over Y and X)
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+        ps = self.cfg.page_size
+        sw = self.cfg.sliding_window_size
+        window_pages = (sw + ps - 1) // ps
+        chain_pages = window_pages + 3
+        if chain_pages * ps > self.cfg.kv_size // 2:
+            self.skipTest("kv_size too small for the desired chain")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, chain_pages)
+        if len(chain) < 3:
+            self.skipTest("chain too short for N/Y/X")
+        self._simulate_backup_tree(tree)
+
+        x = chain[-1]
+        y = chain[-2]
+        n = chain[-3]
+
+        n.component_data[ComponentType.SWA].value = None
+        n.component_data[ComponentType.SWA].host_value = None
+        n.component_data[ComponentType.FULL].host_value = None
+
+        y.component_data[ComponentType.FULL].value = None
+        y.component_data[ComponentType.SWA].value = None
+
+        x.component_data[ComponentType.FULL].host_value = None
+        x.component_data[ComponentType.SWA].host_value = None
+
+        tokens = self._swa_anchor_chain_tokens(len(chain))
+        return tree, chain, n, y, x, tokens
+
+    def test_hicache_swa_match_prefix_picks_best_match_node_above_last_host(self):
+        """match_prefix populates best_match_node = X strictly deeper than
+        last_host_node = Y. Pre-fix scheduler fed last_host_node into SWA
+        build_hicache_transfers and tripped the assert above N."""
+        tree, _, _, y, x, tokens = self._swa_anchor_setup()
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        self.assertIs(result.best_match_node, x)
+        self.assertIs(result.last_device_node, x)
+        self.assertIs(result.last_host_node, y)
+
+    def test_hicache_swa_load_back_anchored_on_best_match_node(self):
+        """SWA build_hicache_transfers(LOAD_BACK) anchored on best_match_node
+        (X) collects [Y] only and never touches the SWA-tombstoned N.
+        Feeding Y (last_host_node) instead would over-reach into N and assert.
+        """
+        tree, _, _, y, x, _ = self._swa_anchor_setup()
+        ps = self.cfg.page_size
+        sw = self.cfg.sliding_window_size
+        swa_comp = tree.components[ComponentType.SWA]
+
+        transfers = swa_comp.build_hicache_transfers(x, CacheTransferPhase.LOAD_BACK)
+        if ps >= sw:
+            self.assertIsNone(transfers)
+        else:
+            self.assertEqual(len(transfers), 1)
+            xfer = transfers[0]
+            self.assertEqual(xfer.name, PoolName.SWA)
+            self.assertEqual(xfer.nodes_to_load, [y])
+            self.assertEqual(int(xfer.host_indices.numel()), ps)
+
+        # Anchor on Y (the pre-fix scheduler input) and watch the assert fire.
+        # Only reproducible when the window does not fit within Y alone.
+        if ps < sw:
+            with self.assertRaises(AssertionError):
+                swa_comp.build_hicache_transfers(y, CacheTransferPhase.LOAD_BACK)
+
+    def test_hicache_swa_finalize_anchored_on_best_match_node(self):
+        """SWA finalize_match_result scans from best_match_node so the
+        sentinel decision lines up with what build_hicache_transfers will
+        actually walk."""
+        tree, _, _, y, x, _ = self._swa_anchor_setup()
+        ps = self.cfg.page_size
+        sw = self.cfg.sliding_window_size
+        swa_comp = tree.components[ComponentType.SWA]
+
+        base = MatchResult(
+            device_indices=torch.empty((0,), dtype=torch.int64, device=tree.device),
+            last_device_node=x,
+            last_host_node=y,
+            best_match_node=x,
+            host_hit_length=0,
+        )
+        result = swa_comp.finalize_match_result(
+            result=base,
+            params=MatchPrefixParams(key=RadixKey(self._make_seq(1, 1))),
+            value_chunks=[],
+            best_value_len=0,
+        )
+        if ps >= sw:
+            self.assertEqual(result.host_hit_length, 0)
+        else:
+            self.assertEqual(result.host_hit_length, 1)
+
     def test_hicache_swa_temp_lock_does_not_release_restored_tombstone(self):
         """A temporary scheduler lock that skipped a SWA tombstone must not
         release later load-back/request locks after the tombstone is restored.
@@ -1852,6 +1974,59 @@ class UnifiedRadixCacheSuite:
         tree.dec_lock_ref(leaf, load_back_lock.to_dec_params())
         tree.dec_lock_ref(leaf, request_lock.to_dec_params())
         self.assertEqual(cd.lock_ref, 0)
+
+    def test_hicache_full_temp_lock_skips_evicted_ancestor_and_mirrors_on_release(
+        self,
+    ):
+        """A FULL load_back lock anchored on best_match_node walks past
+        evicted ancestors (e.g. Y = evicted+backuped) and locks only the
+        device-on nodes (X above Y, A below Y). Once Y is restored to device,
+        a second lock covers Y fully; releasing the first lock must mirror
+        its skip and not decrement Y's lock_ref."""
+        if self._skip_unsupported_hicache_test():
+            return
+        ps = self.cfg.page_size
+        if 3 * ps > self.cfg.kv_size // 2:
+            self.skipTest("kv_size too small")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        a, y, x = chain
+        self._simulate_backup_tree(tree)
+
+        # y goes FULL evicted+backuped while a / x stay device-on.
+        y.component_data[ComponentType.FULL].value = None
+
+        cd_a = a.component_data[ComponentType.FULL]
+        cd_y = y.component_data[ComponentType.FULL]
+        cd_x = x.component_data[ComponentType.FULL]
+        self.assertEqual(cd_a.lock_ref, 0)
+        self.assertEqual(cd_x.lock_ref, 0)
+
+        temp_lock = tree.inc_lock_ref(x)
+        self.assertEqual(cd_a.lock_ref, 1)
+        self.assertEqual(cd_x.lock_ref, 1)
+        self.assertIn(ComponentType.FULL, temp_lock.skip_lock_node_ids)
+        self.assertIn(y.id, temp_lock.skip_lock_node_ids[ComponentType.FULL])
+
+        # Simulate commit restoring y's device value.
+        cd_y.value = torch.empty((ps,), dtype=torch.int64, device=tree.device)
+
+        second_lock = tree.inc_lock_ref(x)
+        self.assertEqual(cd_y.lock_ref, 1)
+        self.assertEqual(cd_a.lock_ref, 2)
+        self.assertEqual(cd_x.lock_ref, 2)
+
+        tree.dec_lock_ref(x, temp_lock.to_dec_params())
+        self.assertEqual(cd_y.lock_ref, 1)
+        self.assertEqual(cd_a.lock_ref, 1)
+        self.assertEqual(cd_x.lock_ref, 1)
+
+        tree.dec_lock_ref(x, second_lock.to_dec_params())
+        self.assertEqual(cd_y.lock_ref, 0)
+        self.assertEqual(cd_a.lock_ref, 0)
+        self.assertEqual(cd_x.lock_ref, 0)
 
     def test_hicache_mamba_temp_lock_does_not_release_restored_tombstone(self):
         """A temporary scheduler lock that skipped a Mamba tombstone must not

@@ -353,6 +353,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             ),
             last_device_node=self.root_node,
             last_host_node=self.root_node,
+            best_match_node=self.root_node,
         )
         self._record_all_cleared_event()
 
@@ -413,6 +414,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
+            best_match_node=last_node,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:

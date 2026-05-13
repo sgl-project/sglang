@@ -104,6 +104,7 @@ def test_preabort_detaches_session_and_preserves_slot():
                 device_indices=torch.tensor([], dtype=torch.int64),
                 last_device_node=None,
                 last_host_node=None,
+                best_match_node=None,
             )
         ],
     )
