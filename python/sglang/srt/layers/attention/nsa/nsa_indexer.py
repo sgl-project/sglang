@@ -501,7 +501,7 @@ class Indexer(MultiPlatformOp):
                 seqlens_32,
                 block_tables,
                 max_seq_len,
-                Preshuffle=True,
+                Preshuffle=_use_aiter,
                 KVBlockSize=block_kv,
             )
         else:
