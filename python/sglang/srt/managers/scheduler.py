@@ -398,10 +398,6 @@ class Scheduler(
                 raise ValueError(
                     "decoupled drafter does not support overlap scheduler."
                 )
-            if not server_args.disable_radix_cache:
-                raise ValueError(
-                    "decoupled drafter requires radix cache to be disabled."
-                )
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
