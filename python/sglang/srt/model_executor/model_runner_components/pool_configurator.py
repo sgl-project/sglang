@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     is_deepseek_nsa,
@@ -92,7 +93,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, mr: ModelRunner):
         # Determine effective number of layers for KV cache
-        if mambaish := mr.mambaish_config:
+        if mambaish := mambaish_config(mr.model_config):
             effective_layer_ids = [
                 i
                 for i in mambaish.full_attention_layer_ids
@@ -110,7 +111,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 scale_kv_cell_size_per_token_for_dflash,
             )
 
-            draft_num_layers = getattr(mr, "dflash_draft_num_layers", None)
+            draft_num_layers = mr.dflash_draft_num_layers
             if (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
@@ -323,7 +324,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None
-        if mr.enable_hisparse:
+        if mr.server_args.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             self.c4_shrink_factor = parse_hisparse_config(

@@ -149,13 +149,9 @@ class TransferBuffer:
     Overlapping buffer preparation and transfer operations to improve throughput.
     """
 
-    def __init__(
-        self, stop_event, buffer_count: int = 3, max_buffer_size: int = 1024
-    ) -> None:
+    def __init__(self, stop_event, buffer_count: int = 3) -> None:
         self.stop_event = stop_event
         self.buffers = Queue(maxsize=buffer_count)
-        # todo: adjust the buffer size based on throughput profile of the system
-        self.max_buffer_size = max_buffer_size
 
     def full(self) -> bool:
         return self.buffers.full()
@@ -322,9 +318,7 @@ class HiCacheController:
 
         self.stop_event = threading.Event()
         self.write_buffer = TransferBuffer(self.stop_event)
-        self.load_buffer = TransferBuffer(
-            self.stop_event, buffer_count=10, max_buffer_size=100
-        )
+        self.load_buffer = TransferBuffer(self.stop_event, buffer_count=10)
 
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()

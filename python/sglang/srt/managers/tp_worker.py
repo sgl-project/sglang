@@ -41,7 +41,9 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+    MemoryPoolConfig,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -55,7 +57,9 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+    from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+        MemoryPoolConfig,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +98,7 @@ class BaseTpWorker(ABC):
         )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = self.model_runner.update_weights_from_disk(
+        success, message = self.model_runner.weight_updater.update_weights_from_disk(
             recv_req.model_path,
             recv_req.load_format,
             recapture_cuda_graph=recv_req.recapture_cuda_graph,
@@ -102,7 +106,7 @@ class BaseTpWorker(ABC):
         return success, message
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
-        success, message = self.model_runner.init_weights_update_group(
+        success, message = self.model_runner.weight_updater.init_weights_update_group(
             recv_req.master_address,
             recv_req.master_port,
             recv_req.rank_offset,
@@ -113,8 +117,10 @@ class BaseTpWorker(ABC):
         return success, message
 
     def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
-        success, message = self.model_runner.destroy_weights_update_group(
-            recv_req.group_name,
+        success, message = (
+            self.model_runner.weight_updater.destroy_weights_update_group(
+                recv_req.group_name,
+            )
         )
         return success, message
 
@@ -122,7 +128,7 @@ class BaseTpWorker(ABC):
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
     ):
         success, message = (
-            self.model_runner.init_weights_send_group_for_remote_instance(
+            self.model_runner.weight_exporter.init_weights_send_group_for_remote_instance(
                 recv_req.master_address,
                 recv_req.ports,
                 recv_req.group_rank,
@@ -136,29 +142,33 @@ class BaseTpWorker(ABC):
     def send_weights_to_remote_instance(
         self, recv_req: SendWeightsToRemoteInstanceReqInput
     ):
-        success, message = self.model_runner.send_weights_to_remote_instance(
-            recv_req.master_address,
-            recv_req.ports,
-            recv_req.group_name,
+        success, message = (
+            self.model_runner.weight_exporter.send_weights_to_remote_instance(
+                recv_req.master_address,
+                recv_req.ports,
+                recv_req.group_name,
+            )
         )
         return success, message
 
     def update_weights_from_distributed(
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
-        success, message = self.model_runner.update_weights_from_distributed(
-            recv_req.names,
-            recv_req.dtypes,
-            recv_req.shapes,
-            recv_req.group_name,
-            recv_req.load_format,
+        success, message = (
+            self.model_runner.weight_updater.update_weights_from_distributed(
+                recv_req.names,
+                recv_req.dtypes,
+                recv_req.shapes,
+                recv_req.group_name,
+                recv_req.load_format,
+            )
         )
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
 
         monkey_patch_torch_reductions()
-        success, message = self.model_runner.update_weights_from_tensor(
+        success, message = self.model_runner.weight_updater.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
                 recv_req.serialized_named_tensors[self.tp_rank]
             ),
@@ -168,11 +178,13 @@ class BaseTpWorker(ABC):
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""
-        success, message = self.model_runner.update_weights_from_ipc(recv_req)
+        success, message = self.model_runner.weight_updater.update_weights_from_ipc(
+            recv_req
+        )
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
-        parameter = self.model_runner.get_weights_by_name(
+        parameter = self.model_runner.weight_exporter.get_weights_by_name(
             recv_req.name, recv_req.truncate_size
         )
         return parameter
@@ -301,9 +313,14 @@ class TpModelWorker(BaseTpWorker):
         assert (
             self.max_queued_requests is None or self.max_queued_requests >= 1
         ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
+        pool_tokens = (
+            self.model_runner.full_max_total_num_tokens
+            if self.model_runner.is_hybrid_swa
+            else self.model_runner.max_total_num_tokens
+        )
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.max_token_pool_size - 1,
+            pool_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert (

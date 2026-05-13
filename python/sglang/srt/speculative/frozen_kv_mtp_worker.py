@@ -25,6 +25,11 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    hybrid_lightning_config,
+    mamba2_config,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
@@ -39,7 +44,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+    MemoryPoolConfig,
+)
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
@@ -762,9 +769,10 @@ class FrozenKVMTPWorker(TpModelWorker):
         logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]
 
         if (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
-            or self.target_worker.model_runner.hybrid_lightning_config is not None
+            hybrid_gdn_config(self.target_worker.model_runner.model_config) is not None
+            or mamba2_config(self.target_worker.model_runner.model_config) is not None
+            or hybrid_lightning_config(self.target_worker.model_runner.model_config)
+            is not None
         ):
             logger.warning(
                 "Frozen-KV MTP does not implement mamba state updates; "
