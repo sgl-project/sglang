@@ -1747,7 +1747,7 @@ class UnloadLoRAAdapterReqInput(BaseReq):
 class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
     lora_name: str
     config_dict: Dict[str, Any]
-    serialized_tensors: str
+    serialized_named_tensors: List[Union[str, bytes]]
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, Any]] = None
     lora_id: Optional[str] = None
