@@ -318,11 +318,11 @@ class ServerArgs(DisaggArgsMixin):
         """set defaults and normalize values."""
         auto_tuner = ServerArgsAutoTuner(self)
         auto_tuner.adjust()
-        if auto_tuner.should_apply_performance_defaults():
+        if auto_tuner.could_override_server_args():
             self._adjust_offload()
-            auto_tuner.adjust_auto_dit_layerwise_offload()
-            auto_tuner.adjust_auto_component_residency_after_offload()
-            auto_tuner.adjust_auto_fsdp_after_offload()
+            auto_tuner.maybe_adjust_auto_dit_layerwise_offload()
+            auto_tuner.maybe_adjust_auto_component_residency_after_offload()
+            auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
         self._adjust_ltx2_two_stage_device_mode()
         self._adjust_path()
         self._adjust_quant_config()

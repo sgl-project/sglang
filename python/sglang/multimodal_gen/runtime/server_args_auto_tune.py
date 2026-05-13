@@ -63,7 +63,7 @@ class ServerArgsAutoTuner:
                 self._set_component_offload_defaults()
             return
 
-    def adjust_auto_component_residency_after_offload(self) -> None:
+    def maybe_adjust_auto_component_residency_after_offload(self) -> None:
         args = self.server_args
         if (
             args.performance_mode != "auto"
@@ -102,7 +102,7 @@ class ServerArgsAutoTuner:
                     ", ".join(changed),
                 )
 
-    def adjust_auto_fsdp_after_offload(self) -> None:
+    def maybe_adjust_auto_fsdp_with_offload_enabled(self) -> None:
         args = self.server_args
         if (
             args.performance_mode == "auto"
@@ -122,9 +122,9 @@ class ServerArgsAutoTuner:
                 args.dit_layerwise_offload = False
             self._enable_cfg_parallel_if_supported()
 
-    def adjust_auto_dit_layerwise_offload(self) -> None:
+    def maybe_adjust_auto_dit_layerwise_offload(self) -> None:
         args = self.server_args
-        if not self.should_apply_performance_defaults():
+        if not self.could_override_server_args():
             return
         if self._explicit_memory_policy:
             return
@@ -175,7 +175,7 @@ class ServerArgsAutoTuner:
 
     def finalize_auto_flags(self) -> None:
         """if some args are unset after all the adjustment, set them to defaults"""
-        if not self.should_apply_performance_defaults():
+        if not self.could_override_server_args():
             return
         args = self.server_args
         if args.use_fsdp_inference is None:
@@ -200,7 +200,7 @@ class ServerArgsAutoTuner:
             )
         return mode
 
-    def should_apply_performance_defaults(self) -> bool:
+    def could_override_server_args(self) -> bool:
         return self.server_args.performance_mode != "manual"
 
     def _set_gpu_resident_defaults(self, *, use_fsdp: bool) -> None:
