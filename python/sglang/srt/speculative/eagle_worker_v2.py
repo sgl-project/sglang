@@ -724,6 +724,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.adaptive_controller.init_states(
                     cuda_graph_bs=self.server_args.cuda_graph_bs,
                 )
+                max_steps = max(self.adaptive_controller.candidate_steps)
+                topk = self.server_args.speculative_eagle_topk or 1
+                self.server_args._adaptive_max_alloc_len_per_decode = max(
+                    max_steps * topk, max_steps + 1
+                )
 
     @property
     def target_worker(self):
@@ -945,6 +950,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
         if cuda_graph_bs is not None:
             sa.cuda_graph_bs = cuda_graph_bs
+            # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
+            # for steps that no BS range uses (e.g. step=1). Disable graph
+            # capture for those steps; restore in finally so subsequent steps
+            # are not affected.
             if not cuda_graph_bs:
                 sa.disable_cuda_graph = True
         dw._adaptive_init_max_bs = init_max_bs

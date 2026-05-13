@@ -440,6 +440,10 @@ class EAGLEWorker(TpModelWorker):
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
         if cuda_graph_bs is not None:
             sa.cuda_graph_bs = cuda_graph_bs
+            # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
+            # for steps that no BS range uses (e.g. step=1). Disable graph
+            # capture for those steps; restore in finally so subsequent steps
+            # are not affected.
             if not cuda_graph_bs:
                 sa.disable_cuda_graph = True
         # Expose init_max_bs for init_cuda_graphs() → EAGLEDraftCudaGraphRunner.

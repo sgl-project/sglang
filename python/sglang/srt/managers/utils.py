@@ -215,6 +215,14 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     if server_args.speculative_algorithm is None:
         return 1
 
+    # When adaptive spec is enabled, use the pre-computed max across all
+    # candidate steps so the allocation stays constant regardless of which
+    # step is currently active.  This prevents KV pool accounting drift
+    # when the overlap scheduler switches steps between decode rounds.
+    adaptive_max = getattr(server_args, "_adaptive_max_alloc_len_per_decode", None)
+    if adaptive_max is not None:
+        return adaptive_max
+
     # Spec v1:
     # 1) alloc topk * num_steps when draft decoding and then restore the allocation
     # 2) alloc num_draft_tokens when verifying the drafts

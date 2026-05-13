@@ -164,11 +164,6 @@ class AdaptiveController:
         include *v* for *step* when that coverage interval overlaps with at least
         one BS slot whose candidate_steps contains *step*.
 
-        Note: the global max is intentionally NOT appended here.  init_states()
-        passes global_max separately as init_max_bs so that every step's draft
-        attention backend is initialised with the same max_bs (fixing FA3
-        scheduler-metadata shape consistency) without capturing an extra
-        CUDA graph for the global-max batch size on every step.
         """
         relevant_ranges: List[tuple] = []
         for i, slot_key in enumerate(self._bs_list):
@@ -206,10 +201,7 @@ class AdaptiveController:
                 (original behaviour).
         """
         # All steps share the same init_max_bs so that each draft attention
-        # backend allocates _sched_meta_buf with a consistent shape.  FA3 may
-        # use the metadata tensor's shape to determine CUDA block scheduling,
-        # so an inconsistent shape can cause subtle FP differences between
-        # steps at the same batch size, triggering spurious EMA oscillation.
+        # backend allocates _sched_meta_buf with a consistent shape.
         init_max_bs = max(cuda_graph_bs) if cuda_graph_bs is not None else None
 
         for steps in self.candidate_steps:
