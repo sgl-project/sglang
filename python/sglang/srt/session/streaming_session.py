@@ -330,8 +330,15 @@ class StreamingSession(BasePrefixCache):
         if not _is_streaming(req):
             return False
         if chunked:
+            # Bound row read by kv_committed_len, NOT len(fill_ids): after
+            # a SWA early-return the next iter's init_next_round_input
+            # restores fill_ids to origin+output (full length), but the
+            # row only holds KV up to kv_committed_len — reading beyond
+            # that yields garbage slot indices. See radix_cache.py for
+            # the same fix applied to the non-session caches.
+            assert req.kv_committed_len >= req.cache_protected_len
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
+                req.req_pool_idx, : req.kv_committed_len
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return True
