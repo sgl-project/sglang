@@ -46,6 +46,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_dp_global_num_tokens,
@@ -855,7 +856,7 @@ class CommunicateSimpleFn:
             return tuple(gathered_hidden_states)
 
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(),
+            get_local_dp_buffer(get_attention_tp_group()),
             hidden_states,
         )
         attn_tp_all_gather_into_tensor(
@@ -965,7 +966,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
             residual, local_residual = (
-                get_local_dp_buffer(),
+                get_local_dp_buffer(get_attention_tp_group()),
                 residual,
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
@@ -982,7 +983,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states += residual
 
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(),
+                get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
@@ -1210,8 +1211,12 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
     ):
+        if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+            group = get_tp_group()
+        else:
+            group = get_attention_tp_group()
         hidden_states, global_hidden_states = (
-            get_local_dp_buffer(),
+            get_local_dp_buffer(group),
             hidden_states,
         )
         if should_use_dp_reduce_scatterv():
@@ -1237,7 +1242,7 @@ class CommunicateSummableTensorPairFn:
         hidden_states += residual
         residual = None
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(),
+            get_local_dp_buffer(get_attention_tp_group()),
             hidden_states,
         )
         attn_tp_all_gather_into_tensor(
