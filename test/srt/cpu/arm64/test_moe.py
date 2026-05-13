@@ -1,16 +1,21 @@
-"""Arm64-safe INT8 MoE test.
+"""Arm64 MoE test.
 
 Tests fused_experts_cpu with W8A8 INT8 quantization, which is supported
-on Arm64 via aarch64/moe.cpp (PR #16045). BF16/FP8/INT4 MoE paths are
-x86-only and tested separately in test_moe.py.
+on Arm64 via aarch64/moe.cpp (PR #16045). Additional quantization paths
+(BF16, INT4) will be added here as Arm kernels land.
 """
 
 import itertools
 import math
+import os
 import platform
+import sys
 import unittest
 
 import torch
+
+# Add parent dir (test/srt/cpu/) to path for utils import
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from sglang.srt.layers.amx_utils import CPUQuantMethod
 from sglang.test.test_utils import CustomTestCase

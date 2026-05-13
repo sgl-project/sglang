@@ -51,7 +51,7 @@ suite_arm64 = {
     "per-commit-cpu-arm64": [
         TestFile("cpu/test_activation.py"),
         TestFile("cpu/test_decode.py"),
-        TestFile("cpu/test_moe_int8.py"),
+        TestFile("cpu/arm64/test_moe.py"),
         TestFile("cpu/test_norm.py"),
         TestFile("cpu/test_qwen3.py"),
         TestFile("cpu/test_rope.py"),
