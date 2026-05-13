@@ -235,6 +235,12 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
+            if r.has_pending_chunk:
+                # Chunked-resume reqs already have prefix_indices + last_node
+                # set by the prior chunk's Stage A stash, plus an inc'd
+                # lock_ref on last_node. Re-running match_prefix here would
+                # overwrite both, leaving the prior inc unbalanced.
+                continue
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             match_result = match_prefix_for_req(self.tree_cache, r, prefix_ids)
