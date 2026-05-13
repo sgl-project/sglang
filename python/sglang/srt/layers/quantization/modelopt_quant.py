@@ -1358,10 +1358,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Idempotent across update_weights_from_disk: source params (input_scale,
-        # weight_scale_2, weight_scale, weight) stay registered so the loader can
-        # refill them on hot reload; this function re-derives + re-aliases the
-        # post-processed views in place every time it runs.
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
@@ -1712,10 +1708,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         """Process FP4 MoE weights after loading from serialized checkpoint.
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
-
-        Idempotent across update_weights_from_disk: source params remain
-        registered so the loader can refill them on hot reload; this function
-        re-derives + re-aliases the post-processed views in place every call.
         """
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
@@ -1768,10 +1760,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
-        # Create shared parameters. alias_or_bind_derived_param reuses the
-        # source Parameter's storage when shapes are broadcast-compatible, so
-        # the derived view shares one buffer with the source while keeping the
-        # source slot loadable on update_weights_from_disk.
+        # Create shared parameters
         alias_or_bind_derived_param(
             layer,
             "w13_weight_scale_2",
@@ -1848,10 +1837,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # FlashInfer TRTLLM processing - handles both w13 and w2
             align_fp4_moe_weights_for_flashinfer_trtllm(layer)
-            # TRTLLM apply() reads the in-place-shuffled w*_weight_scale and
-            # never reads *_blockscale_swizzled. Alias the swizzled-name slots
-            # to the source so the unused placeholders allocated in
-            # create_weights are freed (and idempotent on hot-reload re-entry).
+            # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
+            # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
             layer.w2_blockscale_swizzled = layer.w2_weight_scale
 
