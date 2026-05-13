@@ -802,7 +802,7 @@ class CPUGraphRunner:
             captured_forward_batch.encoder_lens[:raw_bs].copy_(
                 forward_batch.encoder_lens
             )
-        if enable_num_token_non_padded(self.model_runner.server_args):
+        if enable_num_token_non_padded():
             captured_forward_batch.num_token_non_padded.copy_(
                 forward_batch.num_token_non_padded
             )

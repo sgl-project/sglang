@@ -104,7 +104,7 @@ class CompressorBackendMixin:
             freqs_cis_cache,
             plan,
         )
-        return rotate_activation(kv_compressed.bfloat16()) if rotate else kv_compressed
+        return rotate_activation(kv_compressed) if rotate else kv_compressed
 
     def forward_core_compressor(
         self,
