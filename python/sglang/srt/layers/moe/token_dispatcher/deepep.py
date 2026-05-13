@@ -403,7 +403,6 @@ class _DeepEPDispatcherImplBase:
                     "Warning: GPU does not support int8 "
                     "deepep_dispatcher_output_dtype, switching to fp8... "
                 )
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
             self.params_bytes = 1
             self.use_nvfp4 = False
             self.use_fp8 = True
