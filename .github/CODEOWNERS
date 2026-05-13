@@ -15,6 +15,8 @@
 /python/sglang/srt/constrained @hnyls2002 @DarkSharpness
 /python/sglang/srt/disaggregation @ByronHsu @hnyls2002 @ShangmingCai
 /python/sglang/srt/disaggregation/ascend @ping1jing2 @iforgetmyname
+/python/sglang/srt/disaggregation/encode_receiver.py @ShangmingCai @liusy58 @ZhengWG @gty111
+/python/sglang/srt/disaggregation/encode_server.py @ShangmingCai @liusy58 @ZhengWG @gty111
 /python/sglang/srt/distributed @yizhang2077 @merrymercy @ch-wan
 /python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py @ShangmingCai @stmatengss
 /python/sglang/srt/dllm @ClawSeven @btw616
@@ -53,6 +55,7 @@
 /python/sglang/srt/ray @Qiaolin-Yu @xyuzh
 /python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002 @Qiaolin-Yu
 /sgl-kernel @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
+/sgl-kernel/csrc/musa @yeahdongcn
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
 /sgl-model-gateway/bindings/python @CatherineSue @key4ng @slin1237

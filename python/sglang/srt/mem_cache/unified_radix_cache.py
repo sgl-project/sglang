@@ -287,6 +287,16 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
 
+        self._empty_match_result = MatchResult(
+            device_indices=torch.empty(
+                (0,),
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            last_device_node=self.root_node,
+            last_host_node=self.root_node,
+        )
+
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -309,6 +319,8 @@ class UnifiedRadixCache(BasePrefixCache):
             params,
             server_args,
             load_cache_event=self.load_cache_event,
+            attn_cp_group=params.attn_cp_cache_group,
+            attn_tp_group=params.attn_tp_cache_group,
         )
 
         # State initialization
@@ -340,16 +352,10 @@ class UnifiedRadixCache(BasePrefixCache):
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
-            return MatchResult(
-                device_indices=torch.empty(
-                    (0,),
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                last_device_node=self.root_node,
-                last_host_node=self.root_node,
-            )
+            return self._empty_match_result
         key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return self._empty_match_result
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
         return self._match_post_processor(params, value, last_node, best_value_len)
@@ -653,10 +659,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
-                if child.evicted:
-                    break
                 node = self._split_node(child.key, child, prefix_len)
-                value.append(node.component_data[BASE_COMPONENT_TYPE].value)
+                if not node.evicted:
+                    value.append(node.component_data[BASE_COMPONENT_TYPE].value)
                 _update_best_if_valid(node)
                 break
 
@@ -703,7 +708,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if best_value_len > 0:
             device_indices = torch.cat(value[:best_value_len])
         else:
-            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+            device_indices = self._empty_match_result.device_indices
         result = MatchResult(
             device_indices=device_indices,
             last_device_node=last_device_node,
@@ -892,7 +897,13 @@ class UnifiedRadixCache(BasePrefixCache):
         target: EvictLayer = EvictLayer.DEVICE,
     ):
         """Cascade eviction from trigger to lower-or-equal priority components."""
-        is_leaf = len(node.children) == 0
+
+        is_leaf = False
+        if target == EvictLayer.DEVICE:
+            is_leaf = node in self.evictable_device_leaves
+        elif target == EvictLayer.HOST:
+            is_leaf = node in self.evictable_host_leaves
+
         trigger_priority = trigger.eviction_priority(is_leaf)
 
         for comp in self._components_tuple:
@@ -1397,7 +1408,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 last_node = last_node.parent
 
         return (
-            torch.empty((0,), dtype=torch.int64, device=self.device),
+            self._empty_match_result.device_indices,
             last_node,
         )
 

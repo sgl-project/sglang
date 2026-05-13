@@ -23,6 +23,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPContext,
+    FrozenKVMTPDraftExtendInput,
     FrozenKVMTPDraftInput,
 )
 from sglang.srt.speculative.spec_utils import fast_topk
@@ -134,15 +135,12 @@ def select_last_extend_hidden(
 
 
 def select_last_verified_seed(
-    draft_input: FrozenKVMTPDraftInput,
+    draft_input: FrozenKVMTPDraftExtendInput,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if draft_input.num_accepted_tokens is None:
-        return draft_input.verified_id, draft_input.hidden_states
-
-    counts = draft_input.num_accepted_tokens.to(torch.long)
+    counts = draft_input.num_accept_tokens.to(torch.long)
     last_indices = torch.cumsum(counts, dim=0) - 1
     return (
-        draft_input.verified_id[last_indices],
+        draft_input.bonus_tokens[last_indices],
         draft_input.hidden_states[last_indices],
     )
 

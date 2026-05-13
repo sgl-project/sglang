@@ -16,7 +16,7 @@ When using the diffusers backend, `--attention-backend` is passed through to dif
 - **CUDA**: prefers FlashAttention (FA3/FA4) when supported; otherwise falls back to PyTorch SDPA.
 - **ROCm**: uses FlashAttention when available; otherwise falls back to PyTorch SDPA.
 - **Intel XPU**: uses XPU Flash Attention backend (fp16/bf16, head sizes 64/96/128/192/256); otherwise falls back to PyTorch SDPA.
-- **MUSA**: uses FlashAttention when available; otherwise falls back to PyTorch SDPA.
+- **MUSA**: uses FlashAttention when available; also supports Sage Attention when installed; otherwise falls back to PyTorch SDPA.
 - **MPS**: always uses PyTorch SDPA.
 - **NPU**: for ring attention uses FA otherwise uses PyTorch SDPA.
 
@@ -349,10 +349,10 @@ Some backends require additional configuration. You can pass these parameters vi
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only (optional dependency).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Optional dependency on CUDA and MUSA. Falls back to FlashAttention if <code>sageattention</code> is not installed.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sage_attn_3`</td>

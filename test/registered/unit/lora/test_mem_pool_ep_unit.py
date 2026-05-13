@@ -13,10 +13,11 @@ Usage:
     python -m pytest test/registered/unit/lora/test_mem_pool_ep_unit.py -v
 """
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
 register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 import types
 import unittest

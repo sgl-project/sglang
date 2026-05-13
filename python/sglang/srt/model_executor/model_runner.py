@@ -40,6 +40,7 @@ from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
@@ -784,8 +785,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
-        elif self.device in ["npu", "cpu"]:
+        elif self.device == "cpu":
             self.init_attention_backend()
+            self.init_device_graphs()
+        elif self.device == "npu":
+            self.init_attention_backend()
+            # lazy init for zbal with mix mode(before graph capture when enable_cuda_graph)
+            if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 and not self.is_draft_worker:
+                from sglang.srt.hardware_backend.npu.utils import lazy_init_zbal_gva_mem
+
+                lazy_init_zbal_gva_mem(
+                    self.device,
+                    self.gpu_id,
+                    get_world_group().rank_in_group,
+                    get_world_group().world_size,
+                    get_world_group().cpu_group,
+                )
             self.init_device_graphs()
         elif current_platform.is_out_of_tree():
             self.init_attention_backend()
@@ -1154,8 +1169,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
             if (
-                moe_intermediate_size // moe_tp_size
-            ) % weight_block_size_n != 0 and not _use_aiter:
+                not envs.SGLANG_SHARED_EXPERT_TP1.get()
+                and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
+                and not _use_aiter
+            ):
                 raise ValueError(
                     f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
                     f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
@@ -1474,7 +1491,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self._publish_modelexpress_metadata()
 
-        get_offloader().post_init()
+        if not self.is_draft_worker:
+            get_offloader().post_init()
 
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:
@@ -2192,6 +2210,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             Qwen3NextConfig
             | Qwen3_5Config
             | Qwen3_5MoeConfig
+            | InternS2PreviewConfig
             | JetNemotronConfig
             | JetVLMConfig,
         ):
