@@ -12,11 +12,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_info import (
-    EagleDraftInput,
-    EagleVerifyInput,
-    EagleVerifyOutput,
-)
+from sglang.srt.speculative.eagle_info import EagleVerifyInput, EagleVerifyOutput
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_utils import generate_token_bitmask, maybe_detect_nan
@@ -76,93 +72,6 @@ def _build_linear_topk1_tree_metadata(
         ).expand(batch_size, -1).contiguous()
 
     return selected_index, parent_list
-
-
-def _slice_tensor_head_or_empty(
-    value: torch.Tensor | None,
-    live_count: int,
-    *,
-    empty_shape: tuple[int, ...],
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    if value is None:
-        return torch.empty(empty_shape, dtype=dtype, device=device)
-    return value[:live_count]
-
-
-def normalize_external_draft_batch_spec_info(batch: ScheduleBatch) -> None:
-    spec_info = getattr(batch, "spec_info", None)
-    if not isinstance(spec_info, EagleDraftInput):
-        return
-
-    seq_lens = getattr(batch, "seq_lens", None)
-    seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
-    req_pool_indices = getattr(batch, "req_pool_indices", None)
-    seq_lens_dtype = seq_lens.dtype if isinstance(seq_lens, torch.Tensor) else torch.int32
-    seq_lens_cpu_dtype = (
-        seq_lens_cpu.dtype if isinstance(seq_lens_cpu, torch.Tensor) else torch.int32
-    )
-    req_pool_indices_dtype = (
-        req_pool_indices.dtype
-        if isinstance(req_pool_indices, torch.Tensor)
-        else torch.int32
-    )
-
-    live_count = sum(1 for req in batch.reqs if not req.is_retracted and not req.finished())
-    if live_count == 0:
-        batch.spec_info = EagleDraftInput.create_idle_input(
-            device=batch.device,
-            hidden_size=batch.model_config.hidden_size,
-            dtype=batch.model_config.dtype,
-            topk=1,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
-        )
-        return
-
-    hidden_states = _slice_tensor_head_or_empty(
-        spec_info.hidden_states,
-        live_count,
-        empty_shape=(live_count, batch.model_config.hidden_size),
-        dtype=batch.model_config.dtype,
-        device=batch.device,
-    )
-    seq_lens_for_draft_extend_cpu = getattr(
-        spec_info, "seq_lens_for_draft_extend_cpu", seq_lens_cpu
-    )
-    batch.spec_info = EagleDraftInput(
-        hidden_states=hidden_states,
-        bonus_tokens=torch.empty((live_count,), dtype=torch.int32, device=batch.device),
-        accept_tokens=torch.empty((0,), dtype=torch.long, device=batch.device),
-        num_accepted_drafts=torch.zeros(
-            (live_count,), dtype=torch.int32, device=batch.device
-        ),
-        num_accepted_tokens=torch.zeros(
-            (live_count,), dtype=torch.int32, device=batch.device
-        ),
-        num_accepted_drafts_cpu=[0] * live_count,
-        num_accepted_tokens_cpu=[0] * live_count,
-        topk_p=torch.empty((live_count, 1), dtype=torch.float32, device=batch.device),
-        topk_index=torch.empty((live_count, 1), dtype=torch.int64, device=batch.device),
-        capture_hidden_mode=CaptureHiddenMode.LAST,
-        seq_lens_for_draft_extend=_slice_tensor_head_or_empty(
-            getattr(spec_info, "seq_lens_for_draft_extend", seq_lens),
-            live_count,
-            empty_shape=(live_count,),
-            dtype=seq_lens_dtype,
-            device=batch.device,
-        ),
-        seq_lens_for_draft_extend_cpu=seq_lens_for_draft_extend_cpu[:live_count]
-        if seq_lens_for_draft_extend_cpu is not None
-        else torch.empty((0,), dtype=seq_lens_cpu_dtype),
-        req_pool_indices_for_draft_extend=_slice_tensor_head_or_empty(
-            getattr(spec_info, "req_pool_indices_for_draft_extend", req_pool_indices),
-            live_count,
-            empty_shape=(live_count,),
-            dtype=req_pool_indices_dtype,
-            device=batch.device,
-        ),
-    )
 
 
 class VerifyWorker:
@@ -299,7 +208,7 @@ class VerifyWorker:
         # concurrent drafter appends belong to later verify rounds.
         real_tail_lens = self._get_snapshot_tail_lens(batch)
         raw_accept_lens = [
-            int(x) for x in verify_output.num_accepted_drafts_per_req_cpu
+            int(x) for x in verify_output.num_correct_drafts_per_req_cpu
         ]
         for req, raw_accept_len, real_tail_len in zip(
             batch.reqs, raw_accept_lens, real_tail_lens
@@ -516,11 +425,11 @@ class VerifyWorker:
         )
 
         logits_output.next_token_logits = logits_output.next_token_logits[
-            verify_output.accepted_indices
+            verify_output.accept_indices
         ]
         if logits_output.hidden_states is not None:
             logits_output.hidden_states = logits_output.hidden_states[
-                verify_output.accepted_indices
+                verify_output.accept_indices
             ]
 
         if (
@@ -538,7 +447,9 @@ class VerifyWorker:
             add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
 
         batch.forward_mode = ForwardMode.IDLE if was_idle else ForwardMode.DECODE
-        batch.spec_info = verify_output.draft_input
+        # Decoupled verify rebuilds verify inputs from fresh external draft
+        # snapshots each round, so there is no in-process draft state to carry.
+        batch.spec_info = None
         return (
             logits_output,
             verify_output,
@@ -573,20 +484,19 @@ class VerifyWorker:
         ) = self.verify(batch, spec_info, timings)
 
         start_ns = self._trace_timestamp_ns()
-        num_accepted_drafts_per_req_cpu = (
+        num_correct_drafts_per_req_cpu = (
             self._assert_verify_output_within_snapshot_tail(batch, verify_output)
         )
         assert_ms = self._trace_elapsed_ms(start_ns)
         accepted_tokens = verify_output.accept_tokens
-        num_accepted_drafts = sum(num_accepted_drafts_per_req_cpu)
+        num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
         reported_can_run_cuda_graph = can_run_cuda_graph and can_use_full_graph_path
-        normalize_external_draft_batch_spec_info(batch)
 
         result = GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=accepted_tokens,
-            num_accepted_drafts=num_accepted_drafts,
-            num_accepted_drafts_per_req_cpu=num_accepted_drafts_per_req_cpu,
+            num_correct_drafts=num_correct_drafts,
+            num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=reported_can_run_cuda_graph,
             model_forward_mode=str(ForwardMode.TARGET_VERIFY),
         )
@@ -605,7 +515,7 @@ class VerifyWorker:
                 valid_tail_sum=int(sum(valid_tail_lens)),
                 valid_tail_min=int(min(valid_tail_lens)) if valid_tail_lens else 0,
                 valid_tail_max=int(max(valid_tail_lens)) if valid_tail_lens else 0,
-                num_accepted_drafts=int(num_accepted_drafts),
+                num_accepted_drafts=int(num_correct_drafts),
                 accepted_tokens_num=accepted_tokens_num,
                 draft_ms=draft_ms,
                 verify_impl="eagle",
@@ -626,7 +536,7 @@ class VerifyWorker:
             ):
                 timings.setdefault(timing_name, 0.0)
             result.decoupled_verify_timings = timings
-        num_verified_reqs = len(num_accepted_drafts_per_req_cpu)
-        self.total_accept_length += int(result.num_accepted_drafts)
+        num_verified_reqs = len(num_correct_drafts_per_req_cpu)
+        self.total_accept_length += int(result.num_correct_drafts)
         self.total_num_verified_reqs += num_verified_reqs
         return result

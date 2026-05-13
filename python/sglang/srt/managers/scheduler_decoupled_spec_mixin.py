@@ -1095,10 +1095,12 @@ class SchedulerDecoupledSpecMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ) -> None:
-        accept_lens = result.num_accepted_drafts_per_req_cpu
+        accept_lens = result.num_correct_drafts_per_req_cpu
+        # Compatibility with older decoupled verifier results during rolling
+        # migrations from v0.5.10-dev.
         if accept_lens is None:
-            # Compatibility with older decoupled verifier results during rolling
-            # migrations from v0.5.10-dev.
+            accept_lens = getattr(result, "num_accepted_drafts_per_req_cpu", None)
+        if accept_lens is None:
             accept_lens = getattr(result, "accept_length_per_req_cpu", None)
         if accept_lens is None:
             raise RuntimeError("Decoupled verify result is missing accept lengths.")
