@@ -25,7 +25,6 @@ from __future__ import annotations
 import bisect
 import inspect
 import logging
-import os
 from typing import TYPE_CHECKING, Union
 
 import torch
@@ -85,17 +84,6 @@ class BreakableCudaGraphRunner:
         self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
-        self._debug_log_enabled = os.environ.get(
-            "SGLANG_BCG_DEBUG_LOG", ""
-        ).lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        self._debug_log_limit = int(os.environ.get("SGLANG_BCG_DEBUG_LOG_LIMIT", "64"))
-        self._debug_can_run_count = 0
-        self._debug_replay_count = 0
 
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.is_multimodal
@@ -157,54 +145,6 @@ class BreakableCudaGraphRunner:
         self._capture_all()
 
         self.raw_num_tokens = 0
-
-    def _debug_rank_label(self) -> str:
-        return (
-            f"dp={getattr(self.model_runner, 'dp_rank', None)} "
-            f"tp={getattr(self.model_runner, 'tp_rank', None)} "
-            f"gpu={getattr(self.model_runner, 'gpu_id', None)}"
-        )
-
-    def _debug_format_batch(self, forward_batch: "ForwardBatch") -> str:
-        global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
-        if global_num_tokens is not None and hasattr(global_num_tokens, "tolist"):
-            global_num_tokens = global_num_tokens.tolist()
-        return (
-            f"mode={getattr(forward_batch, 'forward_mode', None)} "
-            f"batch_size={getattr(forward_batch, 'batch_size', None)} "
-            f"extend_num_tokens={getattr(forward_batch, 'extend_num_tokens', None)} "
-            f"num_token_non_padded_cpu="
-            f"{getattr(forward_batch, 'num_token_non_padded_cpu', None)} "
-            f"global_num_tokens_cpu={global_num_tokens} "
-            f"can_run_dp_piecewise_cuda_graph="
-            f"{getattr(forward_batch, 'can_run_dp_piecewise_cuda_graph', None)} "
-            f"return_logprob={getattr(forward_batch, 'return_logprob', None)} "
-            f"input_embeds={getattr(forward_batch, 'input_embeds', None) is not None} "
-            f"replace_embeds={getattr(forward_batch, 'replace_embeds', None) is not None}"
-        )
-
-    def _debug_log_can_run(
-        self,
-        forward_batch: "ForwardBatch",
-        decision: bool,
-        reason: str,
-        num_tokens: int = -1,
-    ) -> None:
-        if (
-            not self._debug_log_enabled
-            or self._debug_can_run_count >= self._debug_log_limit
-        ):
-            return
-        self._debug_can_run_count += 1
-        logger.info(
-            "[BCG_DEBUG] can_run=%s reason=%s num_tokens=%s max_num_tokens=%s " "%s %s",
-            decision,
-            reason,
-            num_tokens,
-            self.max_num_tokens,
-            self._debug_rank_label(),
-            self._debug_format_batch(forward_batch),
-        )
 
     def _has_inactive_dp_rank(self, forward_batch: "ForwardBatch") -> bool:
         global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
@@ -419,28 +359,20 @@ class BreakableCudaGraphRunner:
 
     def can_run(self, forward_batch: "ForwardBatch"):
         if self.layer_model is None:
-            self._debug_log_can_run(forward_batch, False, "no_layer_model")
             return False
         if forward_batch.forward_mode.is_target_verify():
-            self._debug_log_can_run(forward_batch, False, "target_verify")
             return False
         if forward_batch.input_embeds is not None:
-            self._debug_log_can_run(forward_batch, False, "input_embeds")
             return False
         if forward_batch.replace_embeds is not None:
-            self._debug_log_can_run(forward_batch, False, "replace_embeds")
             return False
         if self._has_inactive_dp_rank(forward_batch):
-            self._debug_log_can_run(forward_batch, False, "inactive_dp_rank")
             return False
         if getattr(
             forward_batch, "global_num_tokens_cpu", None
         ) is not None and not getattr(
             forward_batch, "can_run_dp_piecewise_cuda_graph", False
         ):
-            self._debug_log_can_run(
-                forward_batch, False, "dp_piecewise_cuda_graph_disabled"
-            )
             return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
@@ -449,18 +381,8 @@ class BreakableCudaGraphRunner:
                 forward_batch.extend_seq_lens_cpu,
             ):
                 if start_len is not None and start_len < seq_len:
-                    self._debug_log_can_run(
-                        forward_batch, False, "return_logprob_extra", num_tokens
-                    )
                     return False
-        decision = num_tokens <= self.max_num_tokens
-        self._debug_log_can_run(
-            forward_batch,
-            decision,
-            "ok" if decision else "num_tokens_exceed_max",
-            num_tokens,
-        )
-        return decision
+        return num_tokens <= self.max_num_tokens
 
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
@@ -489,16 +411,6 @@ class BreakableCudaGraphRunner:
         num_tokens = len(forward_batch.input_ids)
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
-
-        if self._debug_log_enabled and self._debug_replay_count < self._debug_log_limit:
-            self._debug_replay_count += 1
-            logger.info(
-                "[BCG_DEBUG] replay raw_num_tokens=%s static_num_tokens=%s %s %s",
-                num_tokens,
-                static_num_tokens,
-                self._debug_rank_label(),
-                self._debug_format_batch(forward_batch),
-            )
 
         captured_graph = self.graphs[static_num_tokens]
         captured_hidden = self.output_buffers[static_num_tokens]
