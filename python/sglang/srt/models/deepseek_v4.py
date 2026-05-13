@@ -127,22 +127,24 @@ def deepseek_v4_attention_with_output(
         if hasattr(token_to_kv_pool, "set_swa_loc"):
             token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
-    ret = forward_batch.attn_backend.forward(
-        q=query,
-        k=key_value,
-        v=key_value,
-        layer=attention_layer,
-        forward_batch=forward_batch,
-        compress_ratio=compress_ratio,
-        attn_sink=attn_sink,
-        save_kv_cache=save_kv_cache,
-    )
-    forward_batch.out_cache_loc = original_out_cache_loc
-    forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
-    if original_out_cache_loc_swa is not None and hasattr(
-        token_to_kv_pool, "set_swa_loc"
-    ):
-        token_to_kv_pool.set_swa_loc(original_swa_loc)
+    try:
+        ret = forward_batch.attn_backend.forward(
+            q=query,
+            k=key_value,
+            v=key_value,
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            compress_ratio=compress_ratio,
+            attn_sink=attn_sink,
+            save_kv_cache=save_kv_cache,
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
+        if original_out_cache_loc_swa is not None and hasattr(
+            token_to_kv_pool, "set_swa_loc"
+        ):
+            token_to_kv_pool.set_swa_loc(original_swa_loc)
 
     assert (
         output[:real_num_tokens].numel() == ret.numel()
