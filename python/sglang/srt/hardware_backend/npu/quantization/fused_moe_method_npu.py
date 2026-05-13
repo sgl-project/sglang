@@ -539,7 +539,7 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             )
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "fp8"})
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "int8"})
 
     def apply(
         self,
@@ -708,7 +708,7 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         layer.w2_weight.data = self._pack_to_int32(layer.w2_weight.data)
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "fp8"})
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "int8"})
 
     def _process_weights_without_clip(
         self, layer: torch.nn.Module, is_per_channel_weight
