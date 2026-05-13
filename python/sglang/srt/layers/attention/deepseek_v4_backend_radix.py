@@ -32,6 +32,9 @@ from sglang.srt.layers.attention.compressed.metadata import (
     PagedIndexerMetadata,
     maybe_copy_inplace,
 )
+from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
+    chunk_ranges_from_seq_lens,
+)
 from sglang.srt.layers.attention.debug_flash_mla_adapter import (
     flash_mla_with_kvcache_entrypoint,
 )
@@ -125,6 +128,87 @@ def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
 
 
+_FLASHMLA_ROW_ARGS = (
+    "q",
+    "indices",
+    "topk_length",
+    "extra_indices_in_kvcache",
+    "extra_topk_length",
+)
+
+
+def _slice_flashmla_rows(input_dict: Dict, start: int, end: int, total_rows: int):
+    chunk = dict(input_dict)
+    chunk.pop("_chunk_ranges", None)
+    for key in _FLASHMLA_ROW_ARGS:
+        value = chunk.get(key)
+        if isinstance(value, torch.Tensor) and value.shape[0] == total_rows:
+            chunk[key] = value[start:end]
+    return chunk
+
+
+def _sequence_chunk_ranges(
+    seq_lens: Optional[torch.Tensor], total_rows: int, chunk_size: int
+) -> List[Tuple[int, int]]:
+    if seq_lens is None or seq_lens.shape[0] != total_rows:
+        return [(0, total_rows)]
+
+    lens = seq_lens.detach().flatten().to("cpu")
+    boundary_indices = torch.nonzero(lens[1:] < lens[:-1], as_tuple=False).flatten()
+    starts = [0, *boundary_indices.add(1).tolist(), total_rows]
+
+    ranges: List[Tuple[int, int]] = []
+    current_start = starts[0]
+    current_end = starts[1]
+    for seq_start, seq_end in zip(starts[1:-1], starts[2:]):
+        if current_end - current_start + seq_end - seq_start <= chunk_size:
+            current_end = seq_end
+        else:
+            ranges.append((current_start, current_end))
+            current_start, current_end = seq_start, seq_end
+    ranges.append((current_start, current_end))
+    return ranges
+
+
+def _flash_mla_with_optional_prefill_chunking(
+    input_dict: Dict,
+    backend: str,
+    forward_mode: ForwardMode,
+    runner: Callable = flash_mla_with_kvcache_entrypoint,
+) -> torch.Tensor:
+    q = input_dict["q"]
+    chunk_size = envs.SGLANG_DSV4_PREFILL_METADATA_CHUNK_SIZE.get()
+    if (
+        chunk_size <= 0
+        or not forward_mode.is_extend()
+        or q.shape[0] <= chunk_size
+    ):
+        input_dict = dict(input_dict)
+        input_dict.pop("_chunk_ranges", None)
+        return runner(**input_dict, backend=backend)[0]
+
+    outputs = []
+    total_rows = q.shape[0]
+    chunk_ranges = input_dict.get("_chunk_ranges") or _sequence_chunk_ranges(
+        input_dict.get("topk_length"), total_rows, chunk_size
+    )
+    if chunk_ranges == [(0, total_rows)]:
+        input_dict = dict(input_dict)
+        input_dict.pop("_chunk_ranges", None)
+        return runner(**input_dict, backend=backend)[0]
+
+    for start, end in chunk_ranges:
+        chunk = _slice_flashmla_rows(
+            input_dict=input_dict,
+            start=start,
+            end=end,
+            total_rows=total_rows,
+        )
+        chunk["tile_scheduler_metadata"] = _create_flashmla_metadata()
+        outputs.append(runner(**chunk, backend=backend)[0])
+    return torch.cat(outputs, dim=0)
+
+
 @dataclass
 class DSV4AttnMetadataRadix:
     page_size: int
@@ -150,6 +234,7 @@ class DSV4AttnMetadataRadix:
     c128_positions: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
+    chunk_ranges: Optional[List[Tuple[int, int]]] = None
 
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -200,6 +285,7 @@ class DSV4AttnMetadataRadix:
                 "c1_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
+                "chunk_ranges",
             ],
         )
 
@@ -414,11 +500,16 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
 
-    def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadataRadix):
+    def init_forward_metadata_indexer(
+        self,
+        core_attn_metadata: DSV4AttnMetadataRadix,
+        chunk_ranges: Optional[List[Tuple[int, int]]] = None,
+    ):
         return PagedIndexerMetadata(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
+            chunk_ranges=chunk_ranges,
         )
 
     def init_forward_metadata_decode(
@@ -495,8 +586,12 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             need_compress=need_compress,
             is_prefill=True,
         )
+        chunk_ranges = chunk_ranges_from_seq_lens(
+            extend_seq_lens_cpu, envs.SGLANG_DSV4_PREFILL_METADATA_CHUNK_SIZE.get()
+        )
+        core_attn_metadata.chunk_ranges = chunk_ranges
         indexer_metadata = (
-            self.init_forward_metadata_indexer(core_attn_metadata)
+            self.init_forward_metadata_indexer(core_attn_metadata, chunk_ranges)
             if need_compress
             else None
         )
@@ -1109,10 +1204,15 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 extra_k_cache=extra_k_cache,
                 extra_indices_in_kvcache=extra_indices,
                 extra_topk_length=extra_topk_lengths,
+                _chunk_ranges=core_attn_metadata.chunk_ranges,
             )
 
             backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
-            o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
+            o = _flash_mla_with_optional_prefill_chunking(
+                input_dict=input_dict,
+                backend=backend,
+                forward_mode=forward_batch.forward_mode,
+            )
 
             o = o.squeeze(1)
             return o

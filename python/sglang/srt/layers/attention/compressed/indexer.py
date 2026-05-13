@@ -379,7 +379,10 @@ class C4IndexerBackend:
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             fn = fp8_paged_mqa_logits_torch
         else:
-            if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
+            if (
+                envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1
+                or not isinstance(indexer_metadata.deep_gemm_metadata, torch.Tensor)
+            ):
                 from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
                     fp8_paged_mqa_logits_chunked as fn,
                 )

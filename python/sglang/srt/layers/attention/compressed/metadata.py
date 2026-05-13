@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 
@@ -118,6 +118,7 @@ class PagedIndexerMetadata(IndexerMetadata):
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
+    chunk_ranges: Optional[List[Tuple[int, int]]] = None
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
@@ -127,10 +128,23 @@ class PagedIndexerMetadata(IndexerMetadata):
         else:
             import deep_gemm
 
+            use_chunked_metadata = False
             if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
                 from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
                     get_paged_mqa_logits_metadata_chunked as get_paged_mqa_logits_metadata,
                 )
+
+                use_chunked_metadata = True
+            elif (
+                envs.SGLANG_DSV4_PREFILL_METADATA_CHUNK_SIZE.get() > 0
+                and self.c4_seq_lens.shape[0]
+                > envs.SGLANG_DSV4_PREFILL_METADATA_CHUNK_SIZE.get()
+            ):
+                from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
+                    get_paged_mqa_logits_metadata_chunked as get_paged_mqa_logits_metadata,
+                )
+
+                use_chunked_metadata = True
             elif envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
                 from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
             else:
@@ -139,16 +153,19 @@ class PagedIndexerMetadata(IndexerMetadata):
             _c4 = self.c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
                 _c4 = _c4.unsqueeze(-1)
-            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                _c4,
-                self.c4_page_size,
-                deep_gemm.get_num_sms(),
-            )
-
-            if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
-                pass
+            if use_chunked_metadata:
+                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                    _c4,
+                    self.c4_page_size,
+                    deep_gemm.get_num_sms(),
+                    self.chunk_ranges,
+                )
             else:
-                assert isinstance(self.deep_gemm_metadata, torch.Tensor)
+                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                    _c4,
+                    self.c4_page_size,
+                    deep_gemm.get_num_sms(),
+                )
 
         from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
 
@@ -180,7 +197,7 @@ class PagedIndexerMetadata(IndexerMetadata):
         copy_metadata(
             src=other,
             dst=self,
-            check_eq_fields=["page_size"],
+            check_eq_fields=["page_size", "chunk_ranges"],
             copy_fields=copy_fields,
         )
 

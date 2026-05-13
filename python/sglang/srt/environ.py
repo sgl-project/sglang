@@ -511,6 +511,10 @@ class Envs:
     SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE = EnvInt(-1)
     SGLANG_DSV4_FIX_ATTN_PADDING = EnvBool(True)  # verified in journal 2026-04-21-017
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
+    # DSv4 FlashMLA and DeepGEMM metadata kernels use shared memory that scales
+    # with flattened prefill query rows. Keep internal prefill work units under
+    # the validated GB200 metadata-kernel limit.
+    SGLANG_DSV4_PREFILL_METADATA_CHUNK_SIZE = EnvInt(4096)
     SGLANG_DEBUG_SANITY_CHECK_CONFIG = EnvBool(False)
     SGLANG_DEBUG_HACK_CP_ASSERT_PURE_EXTEND = EnvBool(False)
     SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY = EnvBool(False)
