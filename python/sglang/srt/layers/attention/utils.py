@@ -77,7 +77,10 @@ def create_triton_kv_indices_for_dcp_triton(
         kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
 
     # First absolute token position in this range owned by dcp_rank.
-    first = kv_start + ((dcp_rank - kv_start) % dcp_size)
+    # Triton follows C-style remainder for negative values, so avoid
+    # computing the offset as a negative remainder when kv_start > dcp_rank.
+    kv_start_mod = kv_start % dcp_size
+    first = kv_start + ((dcp_rank + dcp_size - kv_start_mod) % dcp_size)
     local_len = tl.load(dcp_kernel_lens_ptr + pid).to(tl.int32)
 
     num_loop = tl.cdiv(local_len, BLOCK_SIZE)
