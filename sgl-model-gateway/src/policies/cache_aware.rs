@@ -1165,4 +1165,346 @@ mod tests {
             "removing a prefill worker must not touch the decode tree"
         );
     }
+
+    /// Shared setup for `PolicyRegistry::remove_pd_worker_from_cache_aware` tests:
+    /// build a registry whose prefill and decode policies are separate
+    /// `CacheAwarePolicy` instances seeded with the matching pool's workers, then
+    /// return the registry, the per-pool policy handles (for tree inspection), and
+    /// representative workers from each pool.
+    fn pd_registry_with_cache_aware_pools() -> (
+        Arc<crate::policies::PolicyRegistry>,
+        Arc<CacheAwarePolicy>,
+        Arc<CacheAwarePolicy>,
+        Arc<dyn Worker>,
+        Arc<dyn Worker>,
+        Arc<dyn Worker>,
+        Arc<dyn Worker>,
+    ) {
+        let registry = Arc::new(crate::policies::PolicyRegistry::new(
+            crate::config::types::PolicyConfig::RoundRobin,
+        ));
+        let no_eviction = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let prefill_ca = Arc::new(CacheAwarePolicy::with_config(no_eviction.clone()));
+        let decode_ca = Arc::new(CacheAwarePolicy::with_config(no_eviction));
+        registry.set_prefill_policy(prefill_ca.clone() as Arc<dyn LoadBalancingPolicy>);
+        registry.set_decode_policy(decode_ca.clone() as Arc<dyn LoadBalancingPolicy>);
+
+        let prefill0 = make_prefill("http://prefill0:8000");
+        let prefill1 = make_prefill("http://prefill1:8000");
+        let decode0 = make_decode("http://decode0:8000");
+        let decode1 = make_decode("http://decode1:8000");
+
+        let prefill_workers: Vec<Arc<dyn Worker>> = vec![prefill0.clone(), prefill1.clone()];
+        let decode_workers: Vec<Arc<dyn Worker>> = vec![decode0.clone(), decode1.clone()];
+        registry.init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+
+        (
+            registry, prefill_ca, decode_ca, prefill0, prefill1, decode0, decode1,
+        )
+    }
+
+    /// Seed both pool trees so each has a known tenant for `prompt`, then return
+    /// the (prefill_tenant, decode_tenant) snapshot to compare against after a
+    /// dispatched removal.
+    async fn seed_pd_pools(
+        prefill_ca: &CacheAwarePolicy,
+        decode_ca: &CacheAwarePolicy,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        prompt: &str,
+    ) -> (Arc<str>, Arc<str>) {
+        let info = SelectWorkerInfo {
+            request_text: Some(prompt),
+            ..Default::default()
+        };
+        prefill_ca
+            .select_worker(prefill_workers, &info)
+            .await
+            .expect("prefill seed");
+        decode_ca
+            .select_worker(decode_workers, &info)
+            .await
+            .expect("decode seed");
+
+        let prefill_key = format!("prefill::{}", UNKNOWN_MODEL_ID);
+        let decode_key = format!("decode::{}", UNKNOWN_MODEL_ID);
+        let prefill_tenant = prefill_ca
+            .trees
+            .get(&prefill_key)
+            .map(|t| t.value().prefix_match_with_counts(prompt).tenant)
+            .expect("prefill tree seeded");
+        let decode_tenant = decode_ca
+            .trees
+            .get(&decode_key)
+            .map(|t| t.value().prefix_match_with_counts(prompt).tenant)
+            .expect("decode tree seeded");
+        (prefill_tenant, decode_tenant)
+    }
+
+    /// A `Prefill` worker passed to `remove_pd_worker_from_cache_aware` must hit
+    /// the registry's `prefill_policy` and leave `decode_policy` untouched.
+    /// Catches a dispatch swap like `Prefill => self.decode_policy.get()`.
+    #[tokio::test]
+    async fn test_registry_remove_pd_worker_prefill_dispatches_to_prefill_policy() {
+        let (registry, prefill_ca, decode_ca, prefill0, prefill1, decode0, decode1) =
+            pd_registry_with_cache_aware_pools();
+        let prefill_workers: Vec<Arc<dyn Worker>> = vec![prefill0.clone(), prefill1.clone()];
+        let decode_workers: Vec<Arc<dyn Worker>> = vec![decode0.clone(), decode1.clone()];
+
+        let prompt = "prefix used to seed both pool trees";
+        let (_prefill_before, decode_before) = seed_pd_pools(
+            &prefill_ca,
+            &decode_ca,
+            &prefill_workers,
+            &decode_workers,
+            prompt,
+        )
+        .await;
+
+        registry.remove_pd_worker_from_cache_aware(prefill0.as_ref());
+
+        let prefill_key = format!("prefill::{}", UNKNOWN_MODEL_ID);
+        let decode_key = format!("decode::{}", UNKNOWN_MODEL_ID);
+        let prefill_after = prefill_ca
+            .trees
+            .get(&prefill_key)
+            .map(|t| t.value().prefix_match_with_counts(prompt).tenant)
+            .expect("prefill tree still exists");
+        assert_ne!(
+            &*prefill_after,
+            prefill0.url(),
+            "registry dispatch must drop prefill0 from the prefill pool's tree"
+        );
+        let decode_after = decode_ca
+            .trees
+            .get(&decode_key)
+            .map(|t| t.value().prefix_match_with_counts(prompt).tenant)
+            .expect("decode tree still exists");
+        assert_eq!(
+            decode_after, decode_before,
+            "removing a prefill worker must not touch the decode pool's tree"
+        );
+    }
+
+    /// Mirror of the prefill dispatch test for `Decode`. Catches a dispatch swap
+    /// in the other direction (`Decode => self.prefill_policy.get()`).
+    #[tokio::test]
+    async fn test_registry_remove_pd_worker_decode_dispatches_to_decode_policy() {
+        let (registry, prefill_ca, decode_ca, prefill0, prefill1, decode0, decode1) =
+            pd_registry_with_cache_aware_pools();
+        let prefill_workers: Vec<Arc<dyn Worker>> = vec![prefill0.clone(), prefill1.clone()];
+        let decode_workers: Vec<Arc<dyn Worker>> = vec![decode0.clone(), decode1.clone()];
+
+        let prompt = "prefix used to seed both pool trees";
+        let (prefill_before, _decode_before) = seed_pd_pools(
+            &prefill_ca,
+            &decode_ca,
+            &prefill_workers,
+            &decode_workers,
+            prompt,
+        )
+        .await;
+
+        registry.remove_pd_worker_from_cache_aware(decode0.as_ref());
+
+        let prefill_key = format!("prefill::{}", UNKNOWN_MODEL_ID);
+        let decode_key = format!("decode::{}", UNKNOWN_MODEL_ID);
+        let decode_after = decode_ca
+            .trees
+            .get(&decode_key)
+            .map(|t| t.value().prefix_match_with_counts(prompt).tenant)
+            .expect("decode tree still exists");
+        assert_ne!(
+            &*decode_after,
+            decode0.url(),
+            "registry dispatch must drop decode0 from the decode pool's tree"
+        );
+        let prefill_after = prefill_ca
+            .trees
+            .get(&prefill_key)
+            .map(|t| t.value().prefix_match_with_counts(prompt).tenant)
+            .expect("prefill tree still exists");
+        assert_eq!(
+            prefill_after, prefill_before,
+            "removing a decode worker must not touch the prefill pool's tree"
+        );
+    }
+
+    /// `remove_pd_worker_from_cache_aware` must short-circuit on `Regular`
+    /// workers and silently ignore non-cache_aware policies (`name() != "cache_aware"`).
+    /// Both branches are no-ops: neither pool tree changes, and no downcast panic.
+    #[tokio::test]
+    async fn test_registry_remove_pd_worker_regular_and_non_cache_aware_noop() {
+        // (a) Regular worker: should early-return regardless of policy state.
+        let (registry, prefill_ca, decode_ca, prefill0, prefill1, decode0, decode1) =
+            pd_registry_with_cache_aware_pools();
+        let prefill_workers: Vec<Arc<dyn Worker>> = vec![prefill0.clone(), prefill1.clone()];
+        let decode_workers: Vec<Arc<dyn Worker>> = vec![decode0.clone(), decode1.clone()];
+
+        let prompt = "regular-noop seed prompt";
+        let (prefill_before, decode_before) = seed_pd_pools(
+            &prefill_ca,
+            &decode_ca,
+            &prefill_workers,
+            &decode_workers,
+            prompt,
+        )
+        .await;
+
+        let regular: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://regular0:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        registry.remove_pd_worker_from_cache_aware(regular.as_ref());
+
+        let prefill_key = format!("prefill::{}", UNKNOWN_MODEL_ID);
+        let decode_key = format!("decode::{}", UNKNOWN_MODEL_ID);
+        let prefill_after = prefill_ca
+            .trees
+            .get(&prefill_key)
+            .map(|t| t.value().prefix_match_with_counts(prompt).tenant)
+            .expect("prefill tree still exists");
+        let decode_after = decode_ca
+            .trees
+            .get(&decode_key)
+            .map(|t| t.value().prefix_match_with_counts(prompt).tenant)
+            .expect("decode tree still exists");
+        assert_eq!(
+            prefill_after, prefill_before,
+            "Regular worker dispatch must not touch the prefill tree"
+        );
+        assert_eq!(
+            decode_after, decode_before,
+            "Regular worker dispatch must not touch the decode tree"
+        );
+
+        // (b) Non-cache_aware policy: PD pool is round_robin. The downcast must
+        // be skipped (no panic) and the call must be a no-op.
+        let registry =
+            crate::policies::PolicyRegistry::new(crate::config::types::PolicyConfig::RoundRobin);
+        let rr_prefill: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(crate::policies::RoundRobinPolicy::new());
+        let rr_decode: Arc<dyn LoadBalancingPolicy> =
+            Arc::new(crate::policies::RoundRobinPolicy::new());
+        registry.set_prefill_policy(rr_prefill);
+        registry.set_decode_policy(rr_decode);
+        // No panic, no downcast — this would fault if the guard
+        // `policy.name() == "cache_aware"` were dropped.
+        registry.remove_pd_worker_from_cache_aware(prefill0.as_ref());
+        registry.remove_pd_worker_from_cache_aware(decode0.as_ref());
+    }
+
+    /// `init_pd_cache_aware_policies` must seed only the pool whose policy is
+    /// cache_aware AND whose worker list is non-empty. Covers all four corners:
+    /// both seeded, only-prefill-cache_aware, empty-worker short-circuit, and the
+    /// non-cache_aware side staying a no-op.
+    #[tokio::test]
+    async fn test_registry_init_pd_cache_aware_policies_gating() {
+        let no_eviction = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let prefill_key = format!("prefill::{}", UNKNOWN_MODEL_ID);
+        let decode_key = format!("decode::{}", UNKNOWN_MODEL_ID);
+
+        let prefill0 = make_prefill("http://prefill0:8000");
+        let decode0 = make_decode("http://decode0:8000");
+        let prefill_workers: Vec<Arc<dyn Worker>> = vec![prefill0.clone()];
+        let decode_workers: Vec<Arc<dyn Worker>> = vec![decode0.clone()];
+
+        // (a) Both pools are cache_aware with workers → both trees seeded under
+        // the correct composite key.
+        {
+            let registry = crate::policies::PolicyRegistry::new(
+                crate::config::types::PolicyConfig::RoundRobin,
+            );
+            let prefill_ca = Arc::new(CacheAwarePolicy::with_config(no_eviction.clone()));
+            let decode_ca = Arc::new(CacheAwarePolicy::with_config(no_eviction.clone()));
+            registry.set_prefill_policy(prefill_ca.clone() as Arc<dyn LoadBalancingPolicy>);
+            registry.set_decode_policy(decode_ca.clone() as Arc<dyn LoadBalancingPolicy>);
+
+            registry.init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+
+            assert!(
+                prefill_ca.trees.contains_key(&prefill_key),
+                "prefill cache_aware policy must be seeded under '{prefill_key}'"
+            );
+            assert!(
+                decode_ca.trees.contains_key(&decode_key),
+                "decode cache_aware policy must be seeded under '{decode_key}'"
+            );
+            assert!(
+                !prefill_ca.trees.contains_key(&decode_key),
+                "prefill_workers must not seed the decode tree key"
+            );
+            assert!(
+                !decode_ca.trees.contains_key(&prefill_key),
+                "decode_workers must not seed the prefill tree key"
+            );
+        }
+
+        // (b) Only prefill is cache_aware (decode is round_robin) → prefill seeded,
+        // decode side skipped silently (no downcast, no panic).
+        {
+            let registry = crate::policies::PolicyRegistry::new(
+                crate::config::types::PolicyConfig::RoundRobin,
+            );
+            let prefill_ca = Arc::new(CacheAwarePolicy::with_config(no_eviction.clone()));
+            let decode_rr: Arc<dyn LoadBalancingPolicy> =
+                Arc::new(crate::policies::RoundRobinPolicy::new());
+            registry.set_prefill_policy(prefill_ca.clone() as Arc<dyn LoadBalancingPolicy>);
+            registry.set_decode_policy(decode_rr);
+
+            registry.init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+
+            assert!(
+                prefill_ca.trees.contains_key(&prefill_key),
+                "prefill cache_aware side must seed even when decode side is non-cache_aware"
+            );
+        }
+
+        // (c) Both cache_aware but prefill worker list is empty → prefill tree
+        // NOT seeded (the inner `!is_empty()` guard short-circuits); decode side
+        // is still seeded.
+        {
+            let registry = crate::policies::PolicyRegistry::new(
+                crate::config::types::PolicyConfig::RoundRobin,
+            );
+            let prefill_ca = Arc::new(CacheAwarePolicy::with_config(no_eviction.clone()));
+            let decode_ca = Arc::new(CacheAwarePolicy::with_config(no_eviction.clone()));
+            registry.set_prefill_policy(prefill_ca.clone() as Arc<dyn LoadBalancingPolicy>);
+            registry.set_decode_policy(decode_ca.clone() as Arc<dyn LoadBalancingPolicy>);
+
+            registry.init_pd_cache_aware_policies(&[], &decode_workers);
+
+            assert!(
+                prefill_ca.trees.is_empty(),
+                "empty prefill worker list must not seed the prefill tree"
+            );
+            assert!(
+                decode_ca.trees.contains_key(&decode_key),
+                "decode side must still seed when only the prefill list is empty"
+            );
+        }
+
+        // (d) Both worker lists empty → neither pool seeded (init is a full no-op).
+        {
+            let registry = crate::policies::PolicyRegistry::new(
+                crate::config::types::PolicyConfig::RoundRobin,
+            );
+            let prefill_ca = Arc::new(CacheAwarePolicy::with_config(no_eviction.clone()));
+            let decode_ca = Arc::new(CacheAwarePolicy::with_config(no_eviction));
+            registry.set_prefill_policy(prefill_ca.clone() as Arc<dyn LoadBalancingPolicy>);
+            registry.set_decode_policy(decode_ca.clone() as Arc<dyn LoadBalancingPolicy>);
+
+            registry.init_pd_cache_aware_policies(&[], &[]);
+
+            assert!(prefill_ca.trees.is_empty());
+            assert!(decode_ca.trees.is_empty());
+        }
+    }
 }
