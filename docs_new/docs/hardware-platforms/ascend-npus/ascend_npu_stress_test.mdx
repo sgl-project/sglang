@@ -10,7 +10,7 @@ This page walks through stress testing your SGLang deployment on Ascend NPUs. We
 
 ### 1.1 Start SGLang server
 
-Launch the server with the appropriate flags for each model type. Make sure SGLang is installed first — see [Ascend NPU Quickstart](/hardware-platforms/ascend-npus/ascend_npu_quick_start) for environment setup.
+Launch the server with the appropriate flags for each model type. Make sure SGLang is installed first — see [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) for environment setup.
 
 <Tabs>
   <Tab title="Text Generation">
@@ -288,7 +288,7 @@ After several minutes, you will see results like:
 
 SGLang's built-in `bench_serving` requires no extra installation. Make sure the server is running at `http://127.0.0.1:30000` before running the benchmark.
 
-<Note>See the [Bench Serving Guide](/developer_guide/bench_serving) for all backends, datasets, and advanced options.</Note>
+<Note>See the [Bench Serving Guide](/docs/developer_guide/bench_serving) for all backends, datasets, and advanced options.</Note>
 
 ```shell Command
 python -m sglang.bench_serving \
@@ -305,7 +305,7 @@ python -m sglang.bench_serving \
 
 <Note>`--dataset-name random` samples token IDs from the ShareGPT dataset to generate realistic input; the first run downloads ShareGPT from Hugging Face automatically. Set `export HF_ENDPOINT=https://hf-mirror.com` if network is not available.</Note>
 
-<Tip>Set `--random-range-ratio 1` for fixed input/output lengths (recommended for consistent comparisons) or `0` (default) for uniform distribution. Add `--request-rate` to control the request rate. For all backends, datasets, and advanced options, see the full [Bench Serving Guide](/developer_guide/bench_serving).</Tip>
+<Tip>Set `--random-range-ratio 1` for fixed input/output lengths (recommended for consistent comparisons) or `0` (default) for uniform distribution. Add `--request-rate` to control the request rate. For all backends, datasets, and advanced options, see the full [Bench Serving Guide](/docs/developer_guide/bench_serving).</Tip>
 
 After several minutes, you will see results like:
 
@@ -496,7 +496,7 @@ After several minutes, you will see results like:
 
 Set `--dataset-name image` for image datasets. `bench_serving` will generate random prompts with image inputs. Make sure the server is running at `http://127.0.0.1:30000` before running the benchmark.
 
-<Note>See the [Bench Serving Guide](/developer_guide/bench_serving) for the full list of image-related flags.</Note>
+<Note>See the [Bench Serving Guide](/docs/developer_guide/bench_serving) for the full list of image-related flags.</Note>
 
 ```shell Command
 python -m sglang.bench_serving \
@@ -652,7 +652,7 @@ python -m sglang.bench_offline_throughput \
 
 ## See also
 
-- [Bench Serving Guide](/developer_guide/bench_serving) — all backends, datasets, and advanced options for `bench_serving`
-- [Ascend NPU Quickstart](/hardware-platforms/ascend-npus/ascend_npu_quick_start) — environment setup for Ascend NPUs
+- [Bench Serving Guide](/docs/developer_guide/bench_serving) — all backends, datasets, and advanced options for `bench_serving`
+- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) — environment setup for Ascend NPUs
 - [Evalscope Stress Test Guide](https://evalscope.readthedocs.io/en/latest/user_guides/stress_test/quick_start.html) — full Evalscope documentation
 - [AISBench Documentation](https://ais-bench-benchmark.readthedocs.io/en/latest/) — full AISBench documentation
