@@ -32,3 +32,11 @@ class BaseSpecWorker(ABC):
     def clear_cache_pool(self):
         # TODO: move this abstract method to BaseTpWorker and call through self.model_runner
         pass
+
+    def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:
+        """Hook called after verify finishes and accept counts are on CPU.
+
+        Default no-op. Adaptive-aware workers override this to feed the
+        controller without forcing a GPU→CPU sync in the worker hot path.
+        """
+        pass

@@ -139,10 +139,10 @@ class SamplingParams:
             raise ValueError(
                 "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
             )
-        if not 0.0 <= self.repetition_penalty <= 2.0:
+        if not 0.0 < self.repetition_penalty <= 2.0:
             raise ValueError(
-                "repetition_penalty must be in [0, 2], got "
-                f"{self.repetition_penalty}."
+                "repetition_penalty must be in (0, 2] (1.0 = no penalty), "
+                f"got {self.repetition_penalty}."
             )
         if not 0 <= self.min_new_tokens:
             raise ValueError(
