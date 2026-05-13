@@ -243,7 +243,6 @@ def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
     else:
         supports_activation = layer.moe_runner_config.activation in {
             "silu",
-            "gelu",
             "relu2",
         }
 

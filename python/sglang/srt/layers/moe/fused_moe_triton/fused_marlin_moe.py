@@ -247,8 +247,6 @@ def fused_marlin_moe(
         silu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
-    elif activation == "gelu" and not is_gated:
-        intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
     elif activation == "relu2" and not is_gated:
         intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
     else:
