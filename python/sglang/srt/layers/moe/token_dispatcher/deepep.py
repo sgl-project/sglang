@@ -410,7 +410,9 @@ class _DeepEPDispatcherImplBase:
             self.use_nvfp4 = True
             self.use_fp8 = False
             if _is_npu:
-                raise RuntimeError("Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype.")
+                raise RuntimeError(
+                    "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
+                )
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
