@@ -351,16 +351,18 @@ class MoriKVManager(CommonKVManager):
                 MemoryLocationType.CPU,
             )
             self.aux_mem_descs.append(desc)
-        for ptr, length in zip(
-            self.kv_args.state_data_ptrs, getattr(self.kv_args, "state_data_lens", [])
+        for component_ptrs, component_lens in zip(
+            self.kv_args.state_data_ptrs,
+            getattr(self.kv_args, "state_data_lens", []),
         ):
-            desc = self.engine.register_memory(
-                ptr,
-                length,
-                self.kv_args.gpu_id,
-                MemoryLocationType.GPU,
-            )
-            self.state_mem_descs.append(desc)
+            for ptr, length in zip(component_ptrs, component_lens):
+                desc = self.engine.register_memory(
+                    ptr,
+                    length,
+                    self.kv_args.gpu_id,
+                    MemoryLocationType.GPU,
+                )
+                self.state_mem_descs.append(desc)
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
@@ -1239,7 +1241,7 @@ class MoriKVSender(CommonKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -1453,7 +1455,7 @@ class MoriKVReceiver(CommonKVReceiver):
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None or self.bootstrap_room is None:
