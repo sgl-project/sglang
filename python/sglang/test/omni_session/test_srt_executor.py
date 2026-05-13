@@ -14,6 +14,9 @@ from sglang.srt.omni_session.srt_executor import (
     OmniSRTSchedulerExecutor,
     OmniSRTSchedulerExecutorError,
 )
+from sglang.srt.managers.schedule_batch import (
+    _normalize_custom_position_ids_for_batch,
+)
 
 
 def test_idle_cleanup_drains_active_batch_when_no_pending_requests():
@@ -98,6 +101,14 @@ def test_request_token_indices_for_active_req_reads_tree_cache_session_slot():
     token_indices = executor._request_token_indices_for_active_req(req)
 
     assert token_indices.tolist() == [10, 11, 12]
+
+
+def test_custom_position_ids_promote_text_positions_for_mrope_batching():
+    positions = _normalize_custom_position_ids_for_batch(
+        [0, [1, 0, 0], 2, [3, 4, 5]]
+    )
+
+    assert positions == [[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 4, 5]]
 
 
 def test_async_execute_submits_native_req_to_scheduler_state():

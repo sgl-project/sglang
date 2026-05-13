@@ -1366,6 +1366,33 @@ def _resolve_attention_math_mode(reqs: List[Req]) -> Optional[str]:
     return next((mode for mode in modes if mode is not None), None)
 
 
+def _normalize_custom_position_ids_for_batch(
+    custom_position_ids: list[Any],
+) -> list[Any]:
+    position_dim = 0
+    for position in custom_position_ids:
+        if isinstance(position, (list, tuple)):
+            position_dim = len(position)
+            break
+    if position_dim == 0:
+        return custom_position_ids
+
+    normalized_positions: list[list[int]] = []
+    for position in custom_position_ids:
+        if isinstance(position, (list, tuple)):
+            if len(position) != position_dim:
+                raise ValueError(
+                    "custom_position_ids in one batch must have the same dimension"
+                )
+            normalized_positions.append([int(value) for value in position])
+        else:
+            # 1. allow text-only positions to batch with MRoPE-style positions
+            normalized_positions.append(
+                [int(position)] + [0 for _ in range(position_dim - 1)]
+            )
+    return normalized_positions
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1949,9 +1976,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.replace_embeds = replace_embeds_tensor
         self.replace_positions = replace_positions_tensor
         self.custom_position_ids = (
-            torch.tensor(custom_position_ids, dtype=torch.int64, pin_memory=_pin).to(
-                self.device, non_blocking=True
-            )
+            torch.tensor(
+                _normalize_custom_position_ids_for_batch(custom_position_ids),
+                dtype=torch.int64,
+                pin_memory=_pin,
+            ).to(self.device, non_blocking=True)
             if has_custom_position_ids
             else None
         )
