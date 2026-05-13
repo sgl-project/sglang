@@ -765,33 +765,6 @@ class GroupCoordinator:
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
 
-    def reduce_scatter_along_dim(
-        self, input_: torch.Tensor, dim: int = -1
-    ) -> torch.Tensor:
-        world_size = self.world_size
-        if world_size == 1:
-            return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-
-        if dim < 0:
-            dim += input_.dim()
-
-        with self.use_symmetric_memory(self):
-            input_tensor = input_.movedim(0, dim).contiguous()
-        assert input_tensor.shape[0] % world_size == 0
-
-        chunk_size = input_tensor.shape[0] // world_size
-        output_shape = (chunk_size,) + input_tensor.shape[1:]
-        with self.use_symmetric_memory(self):
-            output_tensor = torch.empty(
-                output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-            )
-
-        self.reduce_scatter_tensor(output_tensor, input_tensor)
-        return output_tensor.movedim(0, dim).contiguous()
-
     def reduce_scatterv(
         self,
         input_: torch.Tensor,
