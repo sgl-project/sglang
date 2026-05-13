@@ -352,10 +352,12 @@ class DeepseekMLAForwardMixin:
         q_nope_out = q_nope_out.transpose(0, 1)
 
         skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
+        skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
             and (not skip_rope_for_nsa_tilelang_fused)
+            and (not skip_rope_for_aiter_fused_mla)
             and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -663,4 +665,16 @@ class DeepseekMLAForwardMixin:
                 server_args.nsa_decode_backend == "tilelang"
                 or server_args.nsa_prefill_backend == "tilelang"
             )
+        )
+
+    def _skip_rope_for_aiter_fused_mla(self: DeepseekV2AttentionMLA) -> bool:
+        """
+        Skip rope in prepare and let the fused kernel in forward_absorb_core handle it,
+        when running aiter-backend MLA on gfx95 (i.e., the `else` branch in forward_absorb_core
+        that calls fused_qk_rope_cat_and_cache_mla).
+        """
+        return (
+            _use_aiter_gfx95
+            and self.current_attention_backend
+            not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
         )

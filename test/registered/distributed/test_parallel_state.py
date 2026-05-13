@@ -41,9 +41,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 
 # Import the actual parallel_state module
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
