@@ -15,7 +15,11 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
+)
+from sglang.srt.lora.deepseek_mla_correction import (
     apply_v_correction as apply_kv_b_lora_v_correction,
+)
+from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
