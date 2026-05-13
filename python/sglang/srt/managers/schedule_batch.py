@@ -2507,8 +2507,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Caller must filter_batch(exclude_chunked_req=True) on the other batch
         # before merging — running_batch runs decode forward and admitting a
-        # prefill-in-progress req there breaks shape + KV accounting.
-        assert not any(r.has_pending_chunk for r in other.reqs)
+        # prefill-in-progress req there breaks shape + KV accounting. Mirror
+        # the full exclude_chunked_req predicate so PP middle-chunk and DLLM
+        # staging reqs are also caught here.
+        assert not any(
+            r.has_pending_chunk or r.pending_middle_outputs > 0 or r.is_dllm()
+            for r in other.reqs
+        )
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
