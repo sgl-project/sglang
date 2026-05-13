@@ -462,17 +462,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_seqlens=batch.mamba_track_seqlens,
             mamba_cow_src_indices=(
                 batch.mamba_cow_src_indices
-                if batch.forward_mode == ForwardMode.EXTEND
+                if batch.forward_mode.is_extend()
                 else None
             ),
             mamba_cow_dst_indices=(
                 batch.mamba_cow_dst_indices
-                if batch.forward_mode == ForwardMode.EXTEND
+                if batch.forward_mode.is_extend()
                 else None
             ),
             mamba_clear_indices=(
                 batch.mamba_clear_indices
-                if batch.forward_mode == ForwardMode.EXTEND
+                if batch.forward_mode.is_extend()
                 else None
             ),
             mm_inputs=batch.multimodal_inputs,

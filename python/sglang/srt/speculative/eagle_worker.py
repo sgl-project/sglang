@@ -460,11 +460,7 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph,
             ) = self.forward_target_extend(batch)
 
-            # Target forward already executed deferred mamba clear/COW.
-            # Prevent the draft forward from re-executing them.
-            batch.mamba_clear_indices = None
-            batch.mamba_cow_src_indices = None
-            batch.mamba_cow_dst_indices = None
+            batch.clear_deferred_mamba_ops()
 
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group

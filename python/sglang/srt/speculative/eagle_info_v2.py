@@ -14,7 +14,11 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
+    ScheduleBatch,
+    set_mamba_track_indices_from_reqs,
+)
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -174,27 +178,11 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
-        # Set mamba tracking indices for the ScheduleBatch so that
-        # batch.copy() in the overlap scheduler preserves them for
-        # process_batch_result_decode → _mamba_prefix_cache_update.
         # ScheduleBatch.prepare_for_decode returns early for spec v2,
-        # skipping the normal mamba tracking setup.
+        # skipping the normal mamba tracking setup. Set them here so
+        # batch.copy() preserves them for _mamba_prefix_cache_update.
         if get_global_server_args().enable_mamba_extra_buffer():
-            all_buffers = torch.stack(
-                [req.mamba_ping_pong_track_buffer for req in batch.reqs]
-            )
-            idx = (
-                torch.tensor(
-                    [req.mamba_next_track_idx for req in batch.reqs],
-                    dtype=torch.int64,
-                    pin_memory=True,
-                )
-                .unsqueeze(1)
-                .to(device=all_buffers.device, non_blocking=True)
-            )
-            batch.mamba_track_indices = (
-                torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
-            )
+            set_mamba_track_indices_from_reqs(batch)
             batch.mamba_track_mask = (
                 (
                     batch.seq_lens_cpu % get_global_server_args().mamba_track_interval
@@ -297,28 +285,8 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
-            # Set mamba_track_indices for mamba prefix-cache state tracking.
-            # Read from req objects directly (not the mapping table) because
-            # cache_unfinished_req may have donated and replaced ping-pong
-            # buffer entries without updating the mapping.
             if get_global_server_args().enable_mamba_extra_buffer():
-                all_buffers = torch.stack(
-                    [req.mamba_ping_pong_track_buffer for req in batch.reqs]
-                )
-                track_col_idx = (
-                    torch.tensor(
-                        [req.mamba_next_track_idx for req in batch.reqs],
-                        dtype=torch.int64,
-                        pin_memory=True,
-                    )
-                    .unsqueeze(1)
-                    .to(device=all_buffers.device, non_blocking=True)
-                )
-                batch.mamba_track_indices = (
-                    torch.gather(all_buffers, 1, track_col_idx)
-                    .squeeze(1)
-                    .to(dtype=torch.int64)
-                )
+                set_mamba_track_indices_from_reqs(batch)
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 

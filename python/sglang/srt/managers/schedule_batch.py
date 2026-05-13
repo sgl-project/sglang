@@ -1379,6 +1379,28 @@ class Req(ReqDllmMixin):
         )
 
 
+def set_mamba_track_indices_from_reqs(batch):
+    """Build mamba_track_indices from req objects (authoritative source).
+
+    Works on both ScheduleBatch and ModelWorkerBatch.
+    """
+    all_buffers = torch.stack(
+        [req.mamba_ping_pong_track_buffer for req in batch.reqs]
+    )
+    idx = (
+        torch.tensor(
+            [req.mamba_next_track_idx for req in batch.reqs],
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        .unsqueeze(1)
+        .to(device=all_buffers.device, non_blocking=True)
+    )
+    batch.mamba_track_indices = (
+        torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+    )
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1428,6 +1450,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
     mamba_clear_indices: torch.Tensor = None
+
+    def clear_deferred_mamba_ops(self):
+        """Null out deferred mamba COW/clear indices after they have been consumed."""
+        self.mamba_clear_indices = None
+        self.mamba_cow_src_indices = None
+        self.mamba_cow_dst_indices = None
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -2648,21 +2676,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
-            mamba_cow_src_indices=(
-                self.mamba_cow_src_indices
-                if self.forward_mode == ForwardMode.EXTEND
-                else None
-            ),
-            mamba_cow_dst_indices=(
-                self.mamba_cow_dst_indices
-                if self.forward_mode == ForwardMode.EXTEND
-                else None
-            ),
-            mamba_clear_indices=(
-                self.mamba_clear_indices
-                if self.forward_mode == ForwardMode.EXTEND
-                else None
-            ),
+            mamba_cow_src_indices=self.mamba_cow_src_indices,
+            mamba_cow_dst_indices=self.mamba_cow_dst_indices,
+            mamba_clear_indices=self.mamba_clear_indices,
         )
 
     def copy(self):
@@ -2904,3 +2920,9 @@ class ModelWorkerBatch:
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
+
+    def clear_deferred_mamba_ops(self):
+        """Null out deferred mamba COW/clear indices after they have been consumed."""
+        self.mamba_clear_indices = None
+        self.mamba_cow_src_indices = None
+        self.mamba_cow_dst_indices = None
