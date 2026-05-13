@@ -1,11 +1,7 @@
-"""Compute per-suite partition counts from the CI registry.
+"""Sum CIRegistry est_time per per-commit suite and emit one $GITHUB_OUTPUT line
+keyed by suite name. Consumed by pr-test.yml stage jobs as
+`fromJson(needs.check-changes.outputs.partitions)['<suite>']`.
 
-Reads test/registered/ (+ jit_kernel) for register_*_ci(...) calls via AST, sums
-est_time per per-commit suite, and emits one JSON output containing each suite's
-matrix partition count + max-parallel cap. Consumed by pr-test.yml stage jobs as
-`fromJson(needs.check-changes.outputs.partitions)['<suite-name>']`.
-
-Output format (single line for $GITHUB_OUTPUT):
     partitions={"stage-b-test-1-gpu-small": {"size": 8, "arr": [0,...,7], "max_parallel": 2}, ...}
 """
 
@@ -21,9 +17,9 @@ REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-# Load ci_register.py as a standalone module to avoid pulling sglang.__init__
-# (which imports torch / orjson). check-changes runs on ubuntu-latest without
-# sglang installed; ci_register itself only depends on stdlib + AST.
+# Load ci_register.py directly: `import sglang.test...` pulls torch/orjson via
+# sglang.__init__ but check-changes runs on bare ubuntu-latest. ci_register
+# itself is stdlib-only (AST).
 _CI_REGISTER_PATH = os.path.join(
     REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
 )
@@ -33,31 +29,25 @@ _spec.loader.exec_module(_ci_register)
 collect_tests = _ci_register.collect_tests
 HWBackend = _ci_register.HWBackend
 
-# PR-A scope: CUDA + CPU per-commit suites. AMD / NPU workflows have their own
-# dispatch (pr-test-amd.yml, pr-test-npu.yml) and can adopt this scheme later.
+# pr-test-amd.yml / pr-test-npu.yml have their own dispatch.
 _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
-# stage-a is the critical-path entry gate. Its partition counts are fixed
-# defaults rather than est_time-driven, because (a) every PR pays this latency,
-# (b) the entry-stage budget is set by smoke coverage, not registry size,
-# (c) max-parallel = size leaves no throttle since stage-a must finish fast.
+# stage-a is the critical-path entry gate; pin its fanout to smoke-coverage
+# defaults instead of est_time. max_parallel = size (no throttle).
 _STAGE_A_OVERRIDES = {
     "stage-a-test-cpu": 4,
     "stage-a-test-1-gpu-small": 1,
 }
 
-# Wall-clock budget per partition. LPT-balanced est_time sum / TARGET_SECONDS
-# gives the number of partitions. Single knob for the whole pipeline.
+# Per-partition wall-clock budget. Single knob for the whole pipeline.
 TARGET_SECONDS = 17 * 60
 
-# LPT (Longest Processing Time first) worst case is 4/3 * OPT; the constant
-# below pads the divisor by ~15% so a slightly-unlucky LPT result still fits
-# inside MAX_PARTITION_SECONDS.
+# LPT (Longest Processing Time first) worst case is 4/3 * OPT; pad ~15% so a
+# slightly-unlucky LPT result still fits inside MAX_PARTITION_SECONDS.
 LPT_SLOP = 1.15
 
-# Hard ceiling: if any partition's est_time after LPT would exceed this,
-# compute_partitions exits non-zero so the maintainer is forced to either
-# split a slow test file or raise TARGET_SECONDS deliberately.
+# Hard ceiling. Exceeded → raise, forcing the maintainer to split a slow file
+# or bump TARGET_SECONDS deliberately.
 MAX_PARTITION_SECONDS = 25 * 60
 
 
@@ -87,8 +77,8 @@ def compute_max_parallel(size: int) -> int:
 def compute_partitions(tests, full_parallel=False):
     """Group per-commit tests by suite and emit partition metadata.
 
-    When `full_parallel` is True (scheduled cron or `high priority` PR label),
-    every suite's max_parallel = size, i.e. matrix fanout is unthrottled.
+    `full_parallel=True` (scheduled cron or `high priority` PR) sets
+    max_parallel = size, lifting the matrix-fanout throttle.
     """
     suite_tests = defaultdict(list)
     for t in tests:
@@ -107,10 +97,8 @@ def compute_partitions(tests, full_parallel=False):
         else:
             size = max(1, math.ceil(total * LPT_SLOP / TARGET_SECONDS))
             max_parallel = size if full_parallel else compute_max_parallel(size)
-        # Coarse upper bound: assuming perfect LPT balance gives total/size
-        # seconds per partition. Real LPT can be up to ~4/3 of that, but the
-        # ceil + LPT_SLOP padding above already absorbs the slack, so the
-        # naive average is a fair regression check.
+        # Check naive average (total/size). LPT can be ~4/3 of that, but the
+        # ceil + LPT_SLOP padding above absorbs that slack.
         if total / size > MAX_PARTITION_SECONDS:
             raise RuntimeError(
                 f"Suite {suite!r}: total est_time {total:.0f}s / size {size} "
@@ -128,31 +116,24 @@ def compute_partitions(tests, full_parallel=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--repo-root",
-        default=REPO_ROOT,
-        help="Repo root for file discovery (default: derived from this script's location)",
-    )
+    parser.add_argument("--repo-root", default=REPO_ROOT)
     parser.add_argument(
         "--output-format",
         choices=("gha", "json"),
         default="gha",
-        help="`gha` emits `partitions=<json>` for $GITHUB_OUTPUT; `json` emits raw JSON",
+        help="`gha` emits `partitions=<json>` for $GITHUB_OUTPUT; `json` is raw",
     )
     parser.add_argument(
         "--full-parallel",
         choices=("true", "false"),
         default="false",
-        help="If true, max_parallel = size for every suite (no matrix throttle). "
-        "Set by the check-changes step when github.event_name == 'schedule' or "
-        "the PR carries the 'high priority' label.",
+        help="Lift the max_parallel throttle (set by schedule / `high priority`)",
     )
     args = parser.parse_args()
 
     files = discover_files(args.repo_root)
-    # sanity_check=False so a file with no register_*_ci is a warning, not a
-    # hard fail. The actual test runner (run_suite.py) uses sanity_check=True
-    # to catch this at test-execution time; the CI dispatch should keep going.
+    # Warn-not-fail on unregistered files: run_suite.py catches this at
+    # test-execution time with sanity_check=True; dispatch should keep going.
     all_tests = collect_tests(files, sanity_check=False)
 
     result = compute_partitions(all_tests, full_parallel=(args.full_parallel == "true"))
