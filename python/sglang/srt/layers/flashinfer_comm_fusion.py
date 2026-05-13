@@ -7,7 +7,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed import (
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
@@ -39,6 +38,57 @@ _mnnvl_comm_backend = None
 _create_allreduce_fusion_workspace = None
 _flashinfer_allreduce_unavailable = False
 _posix_transport_override_logged = False
+_mnnvl_non_blackwell_fallback_logged = False
+
+
+def _is_blackwell_system() -> bool:
+    """Return True on Blackwell GPUs (SM10x).
+
+    MNNVL allreduce fusion is only validated on Blackwell; on every other
+    platform we fall back to the TRT-LLM backend.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    except Exception as e:
+        logger.debug("Failed to get CUDA device capability: %s", e)
+        return False
+    return major == 10
+
+
+def _resolve_backend(backend: str) -> str:
+    """Force any auto/mnnvl selection back to trtllm when not on a Blackwell system.
+
+    MNNVL is only enabled on Blackwell GPUs where it has been validated;
+    elsewhere we use TRT-LLM unconditionally.
+    """
+    global _mnnvl_non_blackwell_fallback_logged
+    if backend in ("auto", "mnnvl") and not _is_blackwell_system():
+        if not _mnnvl_non_blackwell_fallback_logged:
+            logger.info(
+                "FlashInfer allreduce fusion: forcing trtllm backend "
+                "(mnnvl is only enabled on Blackwell systems)."
+            )
+            _mnnvl_non_blackwell_fallback_logged = True
+        return "trtllm"
+    return backend
+
+
+def flashinfer_mnnvl_allreduce_fusion_enabled(server_args) -> bool:
+    """True when FlashInfer is configured to (potentially) run MNNVL allreduce fusion.
+
+    MNNVL has a known piecewise-CUDA-graph replay hang (Lamport spin in the
+    FlashInfer MNNVL path), so callers use this to skip PCG capture entirely.
+    Returns True if the user selected ``mnnvl`` explicitly, or if ``auto`` is
+    used on a Blackwell system where the auto-resolver may pick mnnvl.
+    """
+    backend = getattr(server_args, "flashinfer_allreduce_fusion_backend", None)
+    if backend is None:
+        return False
+    return _resolve_backend(backend) == "mnnvl" or (
+        backend == "auto" and _is_blackwell_system()
+    )
 
 
 def _should_force_posix_fd_transport() -> bool:
@@ -205,27 +255,9 @@ if is_flashinfer_available():
 #   trtllm    | Yes   | Yes  | Yes         | No         |
 #   mnnvl     | Yes   | No   | Yes         | Yes        |
 #
-# auto: selects trtllm for single-node (SM90/SM100), mnnvl for multi-node (SM100).
-# mnnvl can also be used explicitly on single-node (SM100).
-
-
-def flashinfer_ar_needs_piecewise_cuda_graph_split(server_args) -> bool:
-    """True when FlashInfer resolves to MNNVL so piecewise compile must split this op.
-
-    MNNVL (like NCCL via ``inplace_all_reduce``) is not CUDA-graph-capture-safe
-    and must run eagerly outside any CUDA graph.  TRT-LLM IS graph-safe so it
-    can stay inside the piecewise graph.
-    """
-    fi = getattr(server_args, "flashinfer_allreduce_fusion_backend", None)
-    if fi is None:
-        return False
-    if fi == "mnnvl":
-        return True
-    if fi == "auto":
-        from sglang.srt.utils.common import is_cuda, is_sm100_supported
-
-        return is_cuda() and is_sm100_supported()
-    return False
+# auto/mnnvl: only resolves to mnnvl on Blackwell GPUs (SM10x) where it has
+# been validated. On every other platform the selection is forced to trtllm
+# (see _resolve_backend).
 
 
 def is_flashinfer_allreduce_unavailable() -> bool:
@@ -688,7 +720,9 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
-    backend = get_global_server_args().flashinfer_allreduce_fusion_backend or "auto"
+    backend = _resolve_backend(
+        get_global_server_args().flashinfer_allreduce_fusion_backend or "auto"
+    )
 
     if (
         not workspace_manager.initialized
@@ -741,7 +775,6 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     mutates_args=["input_tensor", "residual", "weight"],
     fake_impl=fake_flashinfer_allreduce_residual_rmsnorm,
 )
-@register_split_op()
 def flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
@@ -757,12 +790,6 @@ def flashinfer_allreduce_residual_rmsnorm(
     Use FlashInfer's unified fused allreduce + residual + RMS norm operation.
     Automatically selects between trtllm and mnnvl backends based on topology
     and hardware (controlled by --flashinfer-allreduce-fusion-backend).
-
-    This function is registered as a split op so it always runs eagerly outside
-    any piecewise CUDA graph piece — PCG has no visibility into this op.
-    Results are written back into the original input buffers so that the
-    downstream CUDA graph piece (captured with those buffer addresses baked in)
-    reads the correct post-allreduce data.
 
     Args:
         input_tensor: Input tensor that needs allreduce
