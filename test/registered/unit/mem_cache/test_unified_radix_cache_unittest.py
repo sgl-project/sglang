@@ -1472,6 +1472,47 @@ class UnifiedRadixCacheSuite:
         self.assertGreaterEqual(len(m.device_indices), len(base))
         tree.sanity_check()
 
+    def test_hicache_partial_match_splits_evicted_backed_up_node(self):
+        """Partial matches on host-only nodes must keep the host prefix usable."""
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        seq = self._make_seq(1, 4)
+        expected_prefix = seq[: 2 * ps]
+        expected_suffix = seq[len(expected_prefix) :]
+        query = expected_prefix + self._make_seq(9000, 1)
+
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        node = m.last_device_node
+        self._simulate_backup(tree, node)
+
+        tree.evict(EvictParams(num_tokens=len(seq)))
+        self.assertTrue(node.evicted)
+        self.assertTrue(node.backuped)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(query)))
+
+        self.assertEqual(len(m.device_indices), 0)
+        self.assertIs(m.last_device_node, tree.root_node)
+
+        split_parent = node.parent
+        self.assertIsNot(split_parent, tree.root_node)
+        self.assertTrue(split_parent.evicted)
+        self.assertTrue(split_parent.backuped)
+        self.assertEqual(split_parent.key.token_ids, expected_prefix)
+        self.assertEqual(node.key.token_ids, expected_suffix)
+
+        if self.cfg.has_mamba:
+            self.assertEqual(m.host_hit_length, 0)
+            self.assertIs(m.last_host_node, tree.root_node)
+            self.assertIsNone(
+                split_parent.component_data[ComponentType.MAMBA].host_value
+            )
+        else:
+            self.assertEqual(m.host_hit_length, len(expected_prefix))
+            self.assertIs(m.last_host_node, split_parent)
+        tree.sanity_check()
+
     def test_hicache_d_leaf_h_leaf_mutual_exclusion(self):
         """D-leaf and H-leaf sets are always disjoint."""
         if self._skip_unsupported_hicache_test():
