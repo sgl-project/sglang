@@ -51,9 +51,10 @@ class ServerWithGrammar(CustomTestCase):
             "--speculative-num-draft-tokens=8",
         ]
 
-        with envs.SGLANG_SPEC_NAN_DETECTION.override(
-            True
-        ), envs.SGLANG_SPEC_OOB_DETECTION.override(True):
+        with (
+            envs.SGLANG_SPEC_NAN_DETECTION.override(True),
+            envs.SGLANG_SPEC_OOB_DETECTION.override(True),
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
