@@ -1083,7 +1083,7 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         # Chunked-resume tracking is now per-req (Req.has_pending_chunk +
-        # is_chunked counter); the scheduler no longer holds a global pointer.
+        # pending_middle_outputs counter); the scheduler no longer holds a global pointer.
         # Stage A stashes any waiting_queue req with has_pending_chunk; cache
         # impls bound row reads by kv_committed_len so a stash after
         # init_next_round_input is safe without the old gate.
@@ -2513,7 +2513,7 @@ class Scheduler(
             and self.last_batch.forward_mode.is_extend()
         ):
             # filter_batch's internal predicate excludes still-prefilling reqs
-            # (has_pending_chunk / is_chunked > 0 / is_dllm) from merge.
+            # (has_pending_chunk / pending_middle_outputs > 0 / is_dllm) from merge.
             last_bs = self.last_batch.batch_size()
             self.last_batch.filter_batch()
             if self.last_batch.batch_size() < last_bs:
@@ -2788,7 +2788,7 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        # Bump pending_middle_outputs (the is_chunked counter) for every
+        # Bump pending_middle_outputs (the pending_middle_outputs counter) for every
         # admitted req that's still mid-prefill — output processor uses this
         # to know its forward's sample is garbage. Counter semantics needed
         # for PP, where multiple microbatches may admit the same req.
@@ -2798,7 +2798,7 @@ class Scheduler(
         ), "single-flight invariant: at most one chunked-resume req per batch"
         chunk_deduct = 0
         for r in chunked_in_batch:
-            r.is_chunked += 1
+            r.pending_middle_outputs += 1
             chunk_deduct = r.extend_input_len
 
         # Record for logging prefill stats after forward
@@ -3669,7 +3669,7 @@ class Scheduler(
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             # filter_batch's internal predicate excludes still-prefilling reqs
-            # (has_pending_chunk / is_chunked > 0 / is_dllm).
+            # (has_pending_chunk / pending_middle_outputs > 0 / is_dllm).
             self.last_batch.filter_batch()
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into

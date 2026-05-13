@@ -752,16 +752,20 @@ class Req(ReqDllmMixin):
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
-        # Whether or not if it is chunked. It increments whenever
-        # it is chunked, and decrement whenever chunked request is
-        # processed.
-        self.is_chunked = 0
+        # Counter of middle-block prefill forwards that have been admitted
+        # but not yet output-processed for this req. Increments at admission
+        # for non-last chunks; decrements at output_processor. In PP, can
+        # exceed 1 because multiple microbatches may hold the same chunked
+        # req in flight concurrently. In non-PP, oscillates 0/1 within each
+        # iter. Used by output_processor to know whether this forward's
+        # sample is real (==0) or garbage (>0).
+        self.pending_middle_outputs = 0
 
         # Persistent (cross-iter) flag set by admission when this req's
         # current admission was truncated (more chunks remain). Cleared
         # when last chunk is admitted (truncated=False) or on retract.
         # Used by Stage A stash detection, filter_batch exclusion, and
-        # add_one_req's reuse-vs-fresh branch. Independent of is_chunked
+        # add_one_req's reuse-vs-fresh branch. Independent of pending_middle_outputs
         # counter (transient) and kv_committed_len (derived).
         self.has_pending_chunk = False
 
@@ -1265,7 +1269,7 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
-        self.is_chunked = 0
+        self.pending_middle_outputs = 0
         self.has_pending_chunk = False
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
@@ -2415,7 +2419,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # runs decode forward, and admitting a mid-prefill req there causes
         # shape mismatch + double KV accounting. Enforced per-req:
         #   - has_pending_chunk: chunked-resume scheduled to continue
-        #   - is_chunked > 0: PP in-flight middle chunk for this req
+        #   - pending_middle_outputs > 0: PP in-flight middle chunk for this req
         #   - is_dllm(): DllmManager-managed (separate staging queue)
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
@@ -2427,7 +2431,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
                 and not self.reqs[i].has_pending_chunk
-                and not self.reqs[i].is_chunked > 0
+                and not self.reqs[i].pending_middle_outputs > 0
                 and not self.reqs[i].is_dllm()
             ]
 

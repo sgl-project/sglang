@@ -241,7 +241,7 @@ class SchedulerOutputProcessorMixin:
                     # decode req in mixed batch or retracted req
                     continue
 
-                if req.is_chunked <= 0:
+                if req.pending_middle_outputs <= 0:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
@@ -314,7 +314,7 @@ class SchedulerOutputProcessorMixin:
 
                 else:
                     # being chunked reqs' prefill is not finished
-                    req.is_chunked -= 1
+                    req.pending_middle_outputs -= 1
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
@@ -380,7 +380,7 @@ class SchedulerOutputProcessorMixin:
                 req.embedding = embeddings[i]
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
-                if req.is_chunked <= 0:
+                if req.pending_middle_outputs <= 0:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
@@ -393,7 +393,7 @@ class SchedulerOutputProcessorMixin:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                 else:
                     # being chunked reqs' prefill is not finished
-                    req.is_chunked -= 1
+                    req.pending_middle_outputs -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
