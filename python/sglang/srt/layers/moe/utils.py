@@ -360,7 +360,7 @@ def is_sbo_enabled() -> bool:
 def is_deepep_class_backend() -> bool:
     """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_deepep()
+    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_alltoallv()
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:

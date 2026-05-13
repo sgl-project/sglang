@@ -600,6 +600,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_nixl()
                 or get_moe_a2a_backend().is_mori()
                 or get_moe_a2a_backend().is_ascend_fuseep()
+                or get_moe_a2a_backend().is_alltoallv()
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
@@ -2198,7 +2199,11 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake() or get_moe_a2a_backend().is_alltoallv():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_alltoallv()
+        ):
             self.enable_a2a_moe = True
         else:
             self.enable_a2a_moe = False

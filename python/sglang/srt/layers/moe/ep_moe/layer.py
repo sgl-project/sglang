@@ -286,7 +286,11 @@ class DeepEPMoE(FusedMoE):
         from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
             npu_fused_moe_without_routing_weights_bf16,
         )
-        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker, DeepEPNormalDispatchOutput, NpuDispatcherWithAllToAllVOutput
+        from sglang.srt.layers.moe.token_dispatcher import (
+            DispatchOutputChecker,
+            DeepEPNormalDispatchOutput,
+            NpuDispatcherWithAllToAllVOutput
+        )
 
         # NOTE: Ascend's Dispatch & Combine does not support FP16
         output_dtype = torch.bfloat16
