@@ -3711,14 +3711,26 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch = None
 
-        if recv_req.mode == "retract" and not self.running_batch.is_empty():
-            self.running_batch.filter_batch(v1_spec_info_filtered=True)
-            if len(self.running_batch.reqs) != 0:
-                retracted_reqs = self.running_batch.retract_all(self.server_args)
-                for req in retracted_reqs:
-                    self._add_request_to_queue(req)
+        if recv_req.mode == "retract":
+            if not self.running_batch.is_empty():
+                self.running_batch.filter_batch(v1_spec_info_filtered=True)
+                if len(self.running_batch.reqs) != 0:
+                    retracted_reqs = self.running_batch.retract_all(self.server_args)
+                    for req in retracted_reqs:
+                        self._add_request_to_queue(req)
 
-            self.running_batch.batch_is_full = False
+                self.running_batch.batch_is_full = False
+
+            # Chunked-resume reqs in waiting_queue still hold their row + KV +
+            # radix lock_ref from prior admissions. Without explicit release,
+            # pause(retract)'s 'flush_cache can succeed' contract (see
+            # PauseGenerationReqInput docstring) is violated. Release in-place
+            # and reset their chunked state so continue_generation re-prefills
+            # them from origin_input_ids.
+            for req in self.waiting_queue:
+                if req.has_pending_chunk and req.req_pool_idx is not None:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    req.reset_for_retract()
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
