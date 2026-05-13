@@ -2341,6 +2341,12 @@ class Scheduler(
         deleted_reqs = set()
         deadline = time.perf_counter() - timeout_s
         for req in self.waiting_queue:
+            # Chunked-resume reqs sit in waiting_queue across iters while
+            # actively prefilling — they are not idle. Their entry_time is
+            # from their original arrival, so a long prefill would falsely
+            # trigger the timeout and leak KV + row.
+            if req.has_pending_chunk:
+                continue
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
                 if self.enable_hicache_storage:
