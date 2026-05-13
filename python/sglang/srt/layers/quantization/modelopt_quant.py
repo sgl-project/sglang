@@ -1365,11 +1365,17 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
-        copy_or_rebind_param(
-            layer, "alpha", (input_scale_2 * weight_scale_2).to(torch.float32)
+        alias_or_bind_derived_param(
+            layer,
+            "weight_scale_2",
+            "alpha",
+            (input_scale_2 * weight_scale_2).to(torch.float32),
         )
-        copy_or_rebind_param(
-            layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
+        alias_or_bind_derived_param(
+            layer,
+            "input_scale",
+            "input_scale_inv",
+            (1 / input_scale_2).to(torch.float32),
         )
 
         # Store original output size before any padding
@@ -1762,24 +1768,31 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
-        # Create shared parameters
-        copy_or_rebind_param(
+        # Create shared parameters. alias_or_bind_derived_param reuses the
+        # source Parameter's storage when shapes are broadcast-compatible, so
+        # the derived view shares one buffer with the source while keeping the
+        # source slot loadable on update_weights_from_disk.
+        alias_or_bind_derived_param(
             layer,
+            "w13_weight_scale_2",
             "g1_alphas",
             (w13_input_scale * w13_weight_scale_2).to(torch.float32),
         )
-        copy_or_rebind_param(
+        alias_or_bind_derived_param(
             layer,
+            "w2_weight_scale_2",
             "g2_alphas",
             (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
         )
-        copy_or_rebind_param(
+        alias_or_bind_derived_param(
             layer,
+            "w13_input_scale",
             "w13_input_scale_quant",
             (1 / w13_input_scale).to(torch.float32),
         )
-        copy_or_rebind_param(
+        alias_or_bind_derived_param(
             layer,
+            "w2_input_scale",
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
