@@ -785,8 +785,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
-        elif self.device in ["npu", "cpu"]:
+        elif self.device == "cpu":
             self.init_attention_backend()
+            self.init_device_graphs()
+        elif self.device == "npu":
+            self.init_attention_backend()
+            # lazy init for zbal with mix mode(before graph capture when enable_cuda_graph)
+            if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 and not self.is_draft_worker:
+                from sglang.srt.hardware_backend.npu.utils import lazy_init_zbal_gva_mem
+
+                lazy_init_zbal_gva_mem(
+                    self.device,
+                    self.gpu_id,
+                    get_world_group().rank_in_group,
+                    get_world_group().world_size,
+                    get_world_group().cpu_group,
+                )
             self.init_device_graphs()
         elif current_platform.is_out_of_tree():
             self.init_attention_backend()
