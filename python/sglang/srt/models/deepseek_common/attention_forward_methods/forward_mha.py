@@ -63,7 +63,7 @@ def _resolve_attn_backend(forward_batch: ForwardBatch):
 #   The minimum sum_prefix_length to enable mha with kv chunking, 8192 by default (can be changed with SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD)
 #   For batches with smaller sum_prefix_length > 0, MLA kernel with absorption will be used instead.
 # max_kv_chunk_capacity:
-#   The maximum number of tokens in each kv chunk, 128 * 1024 by default (can be get with forward_batch.get_max_chunk_capacity())
+#   The maximum number of tokens in each kv chunk, 128 * 1024 by default (can be changed with SGLANG_MAX_KV_CHUNK_CAPACITY, or get with forward_batch.get_max_chunk_capacity())
 
 # The forward methods for MHA in DeepSeek models:
 #

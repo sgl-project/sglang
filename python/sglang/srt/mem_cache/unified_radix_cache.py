@@ -37,7 +37,6 @@ from sglang.srt.mem_cache.unified_cache_components import (
     TreeComponent,
     get_and_increase_time_counter,
 )
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
@@ -225,10 +224,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self.hicache_anchor_kv_shared_indices_pools: list[
             tuple[PoolName, PoolHitPolicy]
         ] = []
-        if self.is_eagle:
-            self.key_convert_fn = convert_to_bigram_key
-        else:
-            self.key_convert_fn = lambda key: key
 
         # Streaming session: embedded StreamingSession with self as inner.
         # Always on -- zero overhead when no streaming session is open (the
@@ -319,6 +314,8 @@ class UnifiedRadixCache(BasePrefixCache):
             params,
             server_args,
             load_cache_event=self.load_cache_event,
+            attn_cp_group=params.attn_cp_cache_group,
+            attn_tp_group=params.attn_tp_cache_group,
         )
 
         # State initialization
@@ -657,10 +654,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
-                if child.evicted:
-                    break
                 node = self._split_node(child.key, child, prefix_len)
-                value.append(node.component_data[BASE_COMPONENT_TYPE].value)
+                if not node.evicted:
+                    value.append(node.component_data[BASE_COMPONENT_TYPE].value)
                 _update_best_if_valid(node)
                 break
 
