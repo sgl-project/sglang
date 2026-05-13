@@ -378,7 +378,6 @@ export const DeepSeekV4Deployment = () => {
           "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
           "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN=1",
           "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=0",
-          "SGLANG_OPT_FIX_HASH_MEGA_MOE=0",
           "SGLANG_OPT_USE_FAST_MASK_EP=1",
           "SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1",
           "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
@@ -392,6 +391,9 @@ export const DeepSeekV4Deployment = () => {
       }
     } else if (recipe === "max-throughput") {
       if (hardware === "h200") {
+        if (!isBig) {
+          recipeEnv.push("SGLANG_JIT_DEEPGEMM_PRECOMPILE=0");
+        }
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
@@ -412,7 +414,6 @@ export const DeepSeekV4Deployment = () => {
           "NVSHMEM_DISABLE_IB=1",
           "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1",
           "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1",
-          "SGLANG_OPT_FIX_HASH_MEGA_MOE=1",
           "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
         );
       } else {
@@ -926,7 +927,6 @@ python3 -m sglang_router.launch_router \\
 
 # And set these env vars:
 SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1
-SGLANG_OPT_FIX_HASH_MEGA_MOE=1
 SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1
 SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1
 SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320

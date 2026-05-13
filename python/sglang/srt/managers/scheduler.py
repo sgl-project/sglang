@@ -214,6 +214,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
+    empty_device_cache,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -416,6 +417,9 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
+        # Init ZBAL, switch allocator should before any torch alloc action
+        self.init_zbal_on_npu()
+
         # Init PD-multiplexing context
         if self.enable_pdmux:
             self.init_pdmux()
@@ -494,6 +498,16 @@ class Scheduler(
         self.grammar_manager = GrammarManager(self)
 
         self.is_initializing = False
+
+    def init_zbal_on_npu(self):
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import init_zbal
+
+            if self.pp_size > 1:
+                logger.error(f"only zbal mix mode support pp_size > 1!")
+            init_zbal(
+                self.tp_size, self.gpu_id, self.tp_rank
+            )  # only switch allocator if is mix mode
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -1119,17 +1133,14 @@ class Scheduler(
                     dp_size=self.dp_size,
                     attn_tp_size=self.attn_tp_size,
                     cpu_group=self.tp_cpu_group,
+                    device_group=self.tp_group.device_group,
                     server_args=self.server_args,
                     metrics_collector=(
                         self.metrics_collector if self.enable_metrics else None
                     ),
                     max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
-                    device=(
-                        self.tp_group.device
-                        if self.server_args.disable_overlap_schedule
-                        else "cpu"
-                    ),
+                    device=self.tp_group.device,
                 )
 
         # NOTE: preemption is enabled by default for priority scheduling.
@@ -2003,6 +2014,7 @@ class Scheduler(
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
+                routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -2159,6 +2171,27 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        if recv_req.return_routed_experts:
+            error_msg = None
+            if recv_req.routed_experts_start_len < 0:
+                error_msg = (
+                    f"{recv_req.routed_experts_start_len=} is lower than 0. "
+                    "Please use a non-negative routed_experts_start_len."
+                )
+
+            if recv_req.routed_experts_start_len > len(req.origin_input_ids):
+                error_msg = (
+                    f"{recv_req.routed_experts_start_len=} is higher than the "
+                    f"number of input tokens {len(req.origin_input_ids)=}. Please "
+                    f"use a smaller routed_experts_start_len."
+                )
+
+            if error_msg is not None:
+                req.routed_experts_start_len = 0
+                req.set_finish_with_abort(error_msg)
+                self._add_request_to_queue(req)
+                return
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
@@ -2439,6 +2472,8 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        if self.enable_fpm:
+            self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
@@ -2552,6 +2587,8 @@ class Scheduler(
 
         if ret:
             set_schedule_time_batch(ret)
+            if self.enable_fpm:
+                ret.fpm_start_time = self._fpm_batch_t0
 
         return ret
 
@@ -2647,6 +2684,7 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            waiting_queue_len=len(self.waiting_queue),
         )
 
         if self.chunked_req is not None:
@@ -3132,6 +3170,11 @@ class Scheduler(
             self.process_batch_result_idle(batch, result)
 
         self.log_batch_result_stats(batch, result)
+
+        # Emit forward pass metrics (every iteration when enabled)
+        if self.enable_fpm:
+            self._emit_forward_pass_metrics(batch, result)
+
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.update_device_timer()
@@ -3380,7 +3423,7 @@ class Scheduler(
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
     def flush_cache(self, empty_cache: bool = True):
-        """Flush the memory pool and cache."""
+        """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle():
             self.cur_batch = None
             self.last_batch = None
@@ -3394,7 +3437,7 @@ class Scheduler(
                 self.draft_worker.clear_cache_pool()
 
             if empty_cache:
-                torch.cuda.empty_cache()
+                empty_device_cache(self.device_module)
             logger.info("Cache flushed successfully!")
             success = True
         else:
@@ -3421,7 +3464,7 @@ class Scheduler(
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
-                self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
+                self.spec_total_num_accept_tokens / self.spec_total_num_forward_ct
             )
 
         if RECORD_STEP_TIME:
@@ -3460,10 +3503,10 @@ class Scheduler(
         if if_success:
             if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
                 avg_spec_accept_length = (
-                    self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
+                    self.spec_total_num_accept_tokens / self.spec_total_num_forward_ct
                 )
                 logger.info(f"{avg_spec_accept_length=}")
-            self.spec_total_num_accepted_tokens = self.spec_total_num_forward_ct = 0
+            self.spec_total_num_accept_tokens = self.spec_total_num_forward_ct = 0
             for k, v in server_args_dict.items():
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")
@@ -3647,6 +3690,15 @@ class Scheduler(
             self.chunked_req = None
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        if recv_req.torch_empty_cache:
+            before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+            torch.cuda.empty_cache()
+            after_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+            logger.info(
+                f"[continue_generation] torch.cuda.empty_cache() called: "
+                f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
+                f"(freed {before_mb - after_mb:.1f} MB)"
+            )
         self._engine_paused = False
 
     def load_lora_adapter(
@@ -3783,7 +3835,7 @@ class IdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            torch.cuda.empty_cache()
+            empty_device_cache()
 
 
 def is_health_check_generate_req(recv_req):
@@ -3951,6 +4003,7 @@ def run_scheduler_process(
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
     # Create a scheduler and run the event loop
+    scheduler = None
     try:
         scheduler = Scheduler(
             server_args,
@@ -3974,3 +4027,8 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+    finally:
+        if scheduler is not None:
+            # FPM has a background ZMQ publisher thread that needs explicit
+            # teardown to flush queued metrics and close the socket cleanly.
+            scheduler._shutdown_fpm()

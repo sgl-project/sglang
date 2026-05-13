@@ -614,9 +614,15 @@ class ServerArgs(DisaggArgsMixin):
             if component_name is None:
                 continue
             key = component_name.replace("-", "_")
-            backend = self.component_attention_backends.get(key)
-            if backend is not None:
-                return AttentionBackendEnum[backend.upper()], key
+            fallback_keys = [key]
+            if key.endswith("_2"):
+                # Secondary two-stage components inherit the base component
+                # backend unless explicitly overridden.
+                fallback_keys.append(key[:-2])
+            for backend_key in fallback_keys:
+                backend = self.component_attention_backends.get(backend_key)
+                if backend is not None:
+                    return AttentionBackendEnum[backend.upper()], backend_key
         return None, None
 
     def _adjust_warmup(self):

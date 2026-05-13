@@ -32,6 +32,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-large-8-gpu-35x-disaggregation-amd",
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
+        "jit-kernel-unit-test-amd",
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
