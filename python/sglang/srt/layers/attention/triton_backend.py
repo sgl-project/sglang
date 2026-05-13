@@ -1417,7 +1417,11 @@ class TritonAttnBackend(AttentionBackend):
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         if save_kv_cache:
-            if self.use_mla:  # Triton MLA currently doesn't support quantized kv cache
+            if self.use_mla:
+                if layer.k_scale is not None:
+                    # MLATokenToKVPool doesn't accept scale parameters; k is unused
+                    # after this point in decode, so scale in place.
+                    k.div_(layer.k_scale)
                 self._set_kv_buffer(
                     forward_batch, layer, self._kv_cache_loc(forward_batch), k, v
                 )
