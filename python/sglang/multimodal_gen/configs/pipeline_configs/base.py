@@ -22,6 +22,9 @@ from sglang.multimodal_gen.configs.models import (
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
@@ -239,6 +242,9 @@ class PipelineConfig:
 
     # image encoding
     image_encoder_extra_args: dict = field(default_factory=lambda: {})
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig()
 
     def postprocess_image(self, image):
         return image.last_hidden_state

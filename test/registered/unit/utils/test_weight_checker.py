@@ -466,11 +466,14 @@ class TestCompare(_WeightCheckerTestBase):
 class TestHandle(_WeightCheckerTestBase):
 
     def test_routes_to_actions(self):
-        with patch.object(self.checker, "_snapshot") as m_snap, patch.object(
-            self.checker, "_reset_tensors"
-        ) as m_reset, patch.object(self.checker, "_compare") as m_compare, patch.object(
-            self.checker, "_compute_checksum", return_value={"checksums": {}}
-        ) as m_checksum:
+        with (
+            patch.object(self.checker, "_snapshot") as m_snap,
+            patch.object(self.checker, "_reset_tensors") as m_reset,
+            patch.object(self.checker, "_compare") as m_compare,
+            patch.object(
+                self.checker, "_compute_checksum", return_value={"checksums": {}}
+            ) as m_checksum,
+        ):
             self.checker.handle("snapshot")
             self.checker.handle("reset_tensors")
             self.checker.handle("compare")
