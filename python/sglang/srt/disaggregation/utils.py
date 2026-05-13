@@ -553,6 +553,7 @@ def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
     draft_token_to_kv_pool=None,
+    total_kv_layers: int = None,
     req_to_token_pool=None,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
@@ -560,6 +561,7 @@ def setup_state_kv_args(
     lives in one place.
     """
     from sglang.srt.disaggregation.base.conn import StateType
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 
@@ -587,7 +589,7 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
             )
-        elif isinstance(token_to_kv_pool, NSATokenToKVPool):
+        elif isinstance(token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, NSATokenToKVPool
             ):
@@ -599,9 +601,15 @@ def setup_state_kv_args(
                 data_ptrs = data_ptrs + draft_data_ptrs
                 data_lens = data_lens + draft_data_lens
                 item_lens = item_lens + draft_item_lens
-            append_state_component(
-                kv_args, StateType.NSA, data_ptrs, data_lens, item_lens
-            )
+            if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
+                kv_args.kv_buf_groups = (
+                    len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
+                )
+                kv_args.total_kv_layers = total_kv_layers
+            else:
+                append_state_component(
+                    kv_args, StateType.NSA, data_ptrs, data_lens, item_lens
+                )
 
     if (
         StateType.MAMBA not in kv_args.state_types
