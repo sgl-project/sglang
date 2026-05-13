@@ -973,7 +973,9 @@ class SchedulerMetricsMixin:
                 time ``prefix_indices`` is already up-to-date, so the default
                 0 is correct.
         """
-        num_pending_tokens = sum(req.seqlen for req in self.waiting_queue)
+        num_pending_tokens = sum(
+            req.seqlen - len(req.prefix_indices) for req in self.waiting_queue
+        )
         if self.chunked_req is not None:
             req = self.chunked_req
             num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
