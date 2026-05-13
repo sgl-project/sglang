@@ -3550,10 +3550,22 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
+        # Build batch rid set: chunked-resume reqs may live in both waiting_queue
+        # and batch.reqs simultaneously (stateless-scheduler refactor). Skip the
+        # waiting_queue removal for those — let the to_finish path below handle
+        # them, otherwise we send_output / release_kv_cache twice.
+        if self.cur_batch is self.running_batch or self.cur_batch is None:
+            batch_reqs = self.running_batch.reqs
+        else:
+            batch_reqs = self.running_batch.reqs + self.cur_batch.reqs
+        batch_rids = {r.rid for r in batch_reqs}
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if (recv_req.abort_all or req.rid.startswith(recv_req.rid)) and (
+                req.rid not in batch_rids
+            ):
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
@@ -3632,13 +3644,8 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # Delete requests in the running batch
-        if self.cur_batch is self.running_batch or self.cur_batch is None:
-            reqs = self.running_batch.reqs
-        else:
-            reqs = self.running_batch.reqs + self.cur_batch.reqs
-
-        for req in reqs:
+        # Delete requests in the running batch (reuse batch_reqs built above)
+        for req in batch_reqs:
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
