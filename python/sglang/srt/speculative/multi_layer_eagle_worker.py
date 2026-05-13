@@ -707,10 +707,9 @@ class MultiLayerEagleWorker(TpModelWorker):
             else CaptureHiddenMode.LAST
         )
         if draft_extend_input.input_ids.shape[0] == 0:
-            # Single source for hidden_states width via `hidden_size_for(self)`
-            # (incl. EAGLE-3 aux widening). Covers both `verify()` Site 1
-            # (fully-idle) and Site 2 (active w/ all reqs finished).
-            # `prepare_for_idle()` is idempotent when already idle.
+            # Single source for hidden_size via hidden_size_for(self) (incl.
+            # EAGLE-3 aux widening). Two stub origins from verify(): fully-idle
+            # batch and active batch with all reqs finished.
             batch = batch.copy()
             batch.prepare_for_idle()
             draft_extend_input = EagleDraftExtendInput.create_idle_input(
