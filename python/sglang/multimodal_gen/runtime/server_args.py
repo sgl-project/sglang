@@ -320,6 +320,8 @@ class ServerArgs(DisaggArgsMixin):
         auto_tuner.adjust()
         if auto_tuner.should_apply_performance_defaults():
             self._adjust_offload()
+            auto_tuner.adjust_auto_component_residency_after_offload()
+            auto_tuner.adjust_auto_fsdp_after_offload()
         self._adjust_ltx2_two_stage_device_mode()
         self._adjust_path()
         self._adjust_quant_config()

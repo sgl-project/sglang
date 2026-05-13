@@ -19,9 +19,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
-    ModelDeploymentConfig,
-)
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
 )
@@ -181,9 +178,6 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             None,
         ]
     )
-
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(fsdp_auto_min_available_memory_gb=70)
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)

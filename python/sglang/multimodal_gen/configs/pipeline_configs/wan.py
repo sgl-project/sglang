@@ -98,8 +98,6 @@ class WanT2V480PConfig(PipelineConfig):
         return ModelDeploymentConfig(
             auto_dit_layerwise_offload=True,
             auto_dit_layerwise_offload_high_memory_disable_gb=130,
-            fsdp_auto_min_available_memory_gb=40,
-            fsdp_auto_requires_cfg=False,
         )
 
 
@@ -146,6 +144,14 @@ class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
     def __post_init__(self) -> None:
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            auto_dit_layerwise_offload_high_memory_disable_gb=130,
+            fsdp_auto_min_available_memory_gb=40,
+            fsdp_auto_requires_cfg=False,
+        )
 
 
 @dataclass

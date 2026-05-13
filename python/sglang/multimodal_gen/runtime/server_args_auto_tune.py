@@ -26,6 +26,7 @@ class ServerArgsAutoTuner:
 
     def __init__(self, server_args: "ServerArgs"):
         self.server_args = server_args
+        self._explicit_memory_policy = self._has_explicit_memory_policy()
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
@@ -62,18 +63,60 @@ class ServerArgsAutoTuner:
                 self._set_component_offload_defaults()
             return
 
+    def adjust_auto_component_residency_after_offload(self) -> None:
+        args = self.server_args
+        if (
+            args.performance_mode != "auto"
+            or self._explicit_memory_policy
+            or current_platform.is_cpu()
+        ):
+            return
+
+        min_available_gb = self._get_min_available_device_memory_gb()
+        disable_threshold_gb = (
+            self._deployment_config().auto_disable_component_offload_min_available_memory_gb
+        )
+        if (
+            min_available_gb is not None
+            and disable_threshold_gb is not None
+            and min_available_gb >= disable_threshold_gb
+        ):
+            changed = []
+            if args.dit_cpu_offload:
+                args.dit_cpu_offload = False
+                changed.append("dit_cpu_offload=False")
+            if args.text_encoder_cpu_offload:
+                args.text_encoder_cpu_offload = False
+                changed.append("text_encoder_cpu_offload=False")
+            if args.image_encoder_cpu_offload:
+                args.image_encoder_cpu_offload = False
+                changed.append("image_encoder_cpu_offload=False")
+            if changed:
+                logger.info(
+                    "Disabling component offload for %s because minimum available memory on selected GPUs is %.2f GiB: %s",
+                    args.pipeline_config.__class__.__name__,
+                    min_available_gb,
+                    ", ".join(changed),
+                )
+
+    def adjust_auto_fsdp_after_offload(self) -> None:
+        args = self.server_args
         if (
             args.performance_mode == "auto"
             and args.num_gpus >= 2
-            and not self._has_explicit_memory_policy()
-            and self._auto_would_use_component_offload_without_fsdp()
+            and not self._explicit_memory_policy
+            and self._auto_uses_dit_offload()
             and self._can_apply_fsdp_policy(require_memory_headroom=True)
         ):
             logger.info(
-                "Automatically selecting FSDP defaults for multi-GPU %s to replace component offload",
+                "Automatically selecting FSDP defaults for multi-GPU %s to replace DiT offload",
                 args.pipeline_config.__class__.__name__,
             )
-            self._set_gpu_resident_defaults(use_fsdp=True)
+            args.use_fsdp_inference = True
+            if args.dit_cpu_offload:
+                args.dit_cpu_offload = False
+            if args.dit_layerwise_offload:
+                args.dit_layerwise_offload = False
             self._enable_cfg_parallel_if_supported()
 
     def adjust_auto_dit_layerwise_offload(self) -> None:
@@ -219,21 +262,9 @@ class ServerArgsAutoTuner:
             and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
         )
 
-    def _auto_would_use_component_offload_without_fsdp(self) -> bool:
-        """try fsdp only with offload enabled for some components"""
+    def _auto_uses_dit_offload(self) -> bool:
         args = self.server_args
-        explicit_offload_flags = (
-            args.dit_cpu_offload,
-            args.dit_layerwise_offload,
-            args.text_encoder_cpu_offload,
-            args.image_encoder_cpu_offload,
-        )
-        if any(flag is not None for flag in explicit_offload_flags):
-            return any(flag is True for flag in explicit_offload_flags)
-        if self._can_apply_dit_layerwise_offload_policy():
-            return True
-        # legacy automatic defaults keep large components offloaded on non-CPU platforms
-        return True
+        return bool(args.dit_cpu_offload or args.dit_layerwise_offload)
 
     def _get_min_available_device_memory_gb(self) -> float | None:
         args = self.server_args
@@ -307,7 +338,21 @@ class ServerArgsAutoTuner:
         return True
 
     def _can_apply_fsdp_policy(self, *, require_memory_headroom: bool) -> bool:
+        args = self.server_args
+        deployment_config = self._deployment_config()
         if not self._supports_high_confidence_fsdp():
+            return False
+        if envs.SGLANG_CACHE_DIT_ENABLED:
+            logger.info("Skipping automatic FSDP defaults because cache-dit is enabled")
+            return False
+        if (
+            args.performance_mode == "auto"
+            and deployment_config.fsdp_auto_requires_default_parallelism
+            and self._has_explicit_parallel_policy()
+        ):
+            logger.info(
+                "Skipping automatic FSDP defaults because an explicit parallel policy is set"
+            )
             return False
         return (
             not require_memory_headroom or self._has_enough_available_memory_for_fsdp()

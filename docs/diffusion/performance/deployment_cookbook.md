@@ -26,11 +26,11 @@ Base the decision on available memory on the selected GPU(s).
 | Mode       | Meaning                                                                                                                   |
 |------------|---------------------------------------------------------------------------------------------------------------------------|
 | `manual`   | Keeps performance-related server args under explicit user control.                                                       |
-| `auto`     | Default. Keeps legacy safe offload defaults and uses FSDP/CFG on validated multi-GPU deployments when FSDP can replace component offload. |
+| `auto`     | Default. Keeps legacy safe offload defaults and uses FSDP/CFG only on validated multi-GPU deployments where FSDP can replace DiT offload. |
 | `speed`    | Favors GPU-resident execution for lower latency and higher throughput. Disables CPU offload when unset; may OOM.           |
 | `memory`   | Favors lower GPU memory. Uses component offload, or Wan/MOVA layerwise DiT offload when supported.                         |
 
-`auto` checks selected GPU memory before applying GPU-resident FSDP defaults. In multi-GPU runs it uses the least available memory across selected GPUs, and only turns on FSDP automatically when doing so can replace component offload. When the model default uses CFG and the user did not set a parallelism policy, `auto` also enables CFG parallelism. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk.
+`auto` checks selected GPU memory before applying FSDP. In multi-GPU runs it uses the least available memory across selected GPUs, and only turns on FSDP automatically when doing so can replace DiT offload. Text encoder, image encoder, and other component residency still follow the offload policy unless the model marks a high-memory resident path as safe. When the model default uses CFG and the user did not set a parallelism policy, `auto` may also enable CFG parallelism. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk.
 
 The modes tune residency for native pipeline components declared to the component residency manager. Today this covers the major DiT, text/image encoder, VAE, vocoder, and upsampler components; DiT can use layerwise offload when supported, while text encoders use either resident execution or component CPU offload. Do not assume text-encoder layerwise offload unless a model implements and validates it.
 
@@ -72,7 +72,7 @@ In this example, `auto` will not re-enable FSDP. The same applies to parallelism
 
 **Layerwise DiT offload** lowers DiT memory further for supported Wan/MOVA models by moving DiT layers between CPU and GPU. It can be the best single-GPU memory mode, but may increase latency and lower throughput.
 
-**FSDP** shards DiT weights across multiple GPUs and all-gathers weights during forward. It can reduce CPU offload cost on multi-GPU deployments, especially when combined with CFG parallelism for Qwen/Wan.
+**FSDP** shards DiT weights across multiple GPUs and all-gathers weights during forward. It can reduce DiT CPU offload cost on multi-GPU deployments, especially for validated Wan I2V workloads.
 
 FSDP sharding granularity matters. SGLang Diffusion prefers sharding direct repeated transformer block entries such as `transformer_blocks.0` or `blocks.0`. Coarser sharding lowers wrapper count but can increase all-gather peak memory; finer sharding can reduce transient memory but adds communication and scheduling overhead. If a model does not define an explicit sharding rule, the loader falls back to repeated block class names and common direct numbered block paths.
 
@@ -87,8 +87,8 @@ FSDP sharding granularity matters. SGLang Diffusion prefers sharding direct repe
 Observed regular-scale trends:
 
 - Z-Image: single-GPU no-offload was faster than FSDP/SP in the tested setting; keep FSDP off unless memory or parallelism requires it.
-- Qwen-Image: FSDP+CFG on 2 GPUs reduced latency from about 12.7s to 6.7s in the tested 1024x1024, 50-step run.
-- Wan 1.3B: FSDP+CFG on 2 GPUs reduced latency from about 47.8s to 26.7s in the tested 832x480, 81-frame, 50-step run.
+- Qwen-Image: keep the default non-FSDP path unless a specific FSDP/SP/Ring setting has been benchmarked on the target hardware.
+- Wan I2V: FSDP can replace DiT offload on validated multi-GPU workloads, while text/image encoders may still need component offload.
 - Component offload mainly reduced memory; it did not improve latency in the tested no-offload-vs-offload runs.
 
 Always benchmark with your actual resolution, frame count, step count, and GPU type before locking production defaults.
