@@ -786,6 +786,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
     ) -> torch.Tensor:
         """Hook for subclasses to swap the decode/spec-verify kernel."""
+
+        # Scale computation for TRTLLM MLA kernel BMM1 operation:
+        # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
+        # Scale components:
+        # - q_scale: Query scaling factor (set to 1.0 for both FP16/FP8 paths)
+        # - k_scale: Key scaling factor from model checkpoint. Only applied when KV cache
+        #   stores FP8-quantized values, to compensate for the quantization scaling.
+        #   For BF16/FP16 KV cache, k_scale must be 1.0 since values are unscaled.
+        # - softmax_scale: Attention softmax scaling = 1/sqrt(head_dim), pre-computed as layer.scaling
         bmm1_scale = self._compute_decode_bmm1_scale(layer)
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)

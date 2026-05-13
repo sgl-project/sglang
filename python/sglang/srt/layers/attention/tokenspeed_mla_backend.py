@@ -1,3 +1,23 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 from __future__ import annotations
 
 """Attention backend for the tokenspeed-mla CuTe DSL kernels on Blackwell.
@@ -89,8 +109,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2 min;
         # without warm-up the first request trips the 300 s scheduler watchdog.
-        # The public ``warmup_compile_prefill`` skips ``return_lse=False``, so
-        # we drive the private compile helper for the (causal, no-LSE) variant.
         if is_tokenspeed_mla_available():
             _compile_prefill_kernel = tokenspeed_mla.mla_prefill._compile_prefill_kernel
             _compiled_kernels = tokenspeed_mla.mla_prefill._compiled_kernels
@@ -143,9 +161,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         max_seq_len: int,
         layer: "RadixAttention",
     ) -> torch.Tensor:
-        # tokenspeed splits trtllm-gen's ``bmm1_scale`` into ``softmax_scale``
-        # (applied at QK^T) and ``output_scale`` (applied at attn @ V). K and V
-        # share the kv_lora_rank prefix, so both use the same k_scale.
         k_scale = getattr(layer, "k_scale_float", None)
         if k_scale is None:
             k_scale = 1.0
@@ -188,10 +203,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
     ):
         # Quantize to FP8 for the Blackwell FP8 GEMM speedup (mirrors trtllm-gen).
         # The kernel has no per-tensor scale knob for either K or V, so we
-        # require both ``k_scale_float`` and ``v_scale_float`` to be 1.0 — the
-        # case for Kimi K2.5 and other NVFP4 / fp8_e4m3-KV setups. This matches
-        # tokenspeed's own engine (uses ``softmax_scale = layer.scaling`` with
-        # no per-tensor scale baked in).
+        # require both ``k_scale_float`` and ``v_scale_float`` to be 1.0.
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
             assert k_scale == 1.0 and v_scale == 1.0, (
