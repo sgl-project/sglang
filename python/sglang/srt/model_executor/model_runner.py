@@ -3028,9 +3028,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             flashinfer_mnnvl_allreduce_fusion_enabled,
         )
 
-        # MNNVL allreduce fusion has a known PCG replay hang (Lamport spin in
-        # the FlashInfer MNNVL path), so skip PCG capture entirely whenever
-        # MNNVL is (potentially) selected.
+        # TODO(wenscarl): remove this constraint once
+        # https://github.com/flashinfer-ai/flashinfer/pull/3304 is merged
+        # (kernel-side FTZ-safe sentinel check removes the PCG-replay hang).
         if flashinfer_mnnvl_allreduce_fusion_enabled(self.server_args):
             log_info_on_rank0(
                 logger,
