@@ -13,6 +13,11 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.lora.deepseek_mla_correction import (
+    apply_q_correction as apply_kv_b_lora_q_correction,
+    apply_v_correction as apply_kv_b_lora_v_correction,
+    is_kv_b_lora_active,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
@@ -350,7 +355,8 @@ class DeepseekMLAForwardMixin:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
-        q_nope_out = self._apply_kv_b_lora_q_correction(q_nope, q_nope_out)
+        if is_kv_b_lora_active(self):
+            q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
         if (
@@ -502,7 +508,6 @@ class DeepseekMLAForwardMixin:
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        kv_b_lora_v_corrected = False
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(
@@ -558,22 +563,16 @@ class DeepseekMLAForwardMixin:
                         self.w_vc.to(torch.bfloat16) * self.w_scale,
                     )
 
-            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-            attn_bmm_output = self._apply_kv_b_lora_v_correction(
-                attn_output, attn_bmm_output
-            )
-            kv_b_lora_v_corrected = True
-
             if self.o_proj.weight.dtype == torch.uint8:
-                attn_bmm_output = fused_flatten_mxfp4_quant(
-                    attn_bmm_output.view(-1, self.num_local_heads, self.v_head_dim)
-                )
+                attn_bmm_output = attn_bmm_output.transpose(0, 1)
+                attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
             elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_fp8_group_quant(
-                    attn_bmm_output.view(-1, self.num_local_heads, self.v_head_dim),
-                    group_size=128,
-                    dtype_quant=torch.float8_e4m3fn,
+                    attn_bmm_output, group_size=128, dtype_quant=torch.float8_e4m3fn
                 )
+            else:
+                attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             if _is_cpu:
@@ -627,9 +626,9 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
-        if not kv_b_lora_v_corrected:
-            attn_bmm_output = self._apply_kv_b_lora_v_correction(
-                attn_output, attn_bmm_output
+        if is_kv_b_lora_active(self):
+            attn_bmm_output = apply_kv_b_lora_v_correction(
+                self, attn_output, attn_bmm_output
             )
         output, _ = self.o_proj(attn_bmm_output)
 
