@@ -20,10 +20,11 @@ from urllib.request import Request, urlopen
 import numpy as np
 from PIL import Image, ImageFilter
 
-REFERENCE_ENV = "SGLANG_OMNI_U1_REFERENCE_IMAGE"
 T2I_REFERENCE_ENV = "SGLANG_OMNI_U1_T2I_REFERENCE_IMAGE"
 EDIT_INPUT_ENV = "SGLANG_OMNI_U1_EDIT_INPUT_IMAGE"
 EDIT_REFERENCE_ENV = "SGLANG_OMNI_U1_EDIT_REFERENCE_IMAGE"
+THREE_TURN_REFERENCE_ENV = "SGLANG_OMNI_U1_THREE_TURN_REFERENCE_IMAGE"
+THREE_TURN_OUTPUT_ENV = "SGLANG_OMNI_U1_THREE_TURN_OUTPUT_IMAGE"
 THREE_TURN_PROMPTS = (
     (
         "Create one clean studio image of a matte cobalt-blue cube centered on a "
@@ -138,10 +139,12 @@ class TestSenseNovaU1E2EPrecision(unittest.TestCase):
                 session_id=session_id,
             )
             actual = _last_image(third)
-            reference = Image.open(_require_env(REFERENCE_ENV)).convert("RGB")
+            reference = Image.open(_require_env(THREE_TURN_REFERENCE_ENV)).convert(
+                "RGB"
+            )
             metrics = _compare_images(actual, reference)
 
-            output_path = os.getenv("SGLANG_OMNI_U1_OUTPUT_IMAGE")
+            output_path = os.getenv(THREE_TURN_OUTPUT_ENV)
             if output_path:
                 actual.save(output_path)
             _save_output_image(third, "SGLANG_OMNI_U1_TURN3_OUTPUT_IMAGE")
