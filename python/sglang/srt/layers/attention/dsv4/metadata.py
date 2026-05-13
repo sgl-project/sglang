@@ -103,7 +103,7 @@ class PagedIndexerMetadata:
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TRITON.get():
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
