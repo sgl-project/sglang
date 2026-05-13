@@ -401,17 +401,16 @@ class MoEGate(nn.Module):
                 and _device_sm >= 90
             ):
                 if _device_sm in [100, 103] and self.weight.shape[0] == 256:
-                    # router gemm output float32
                     logits = torch.empty(
                         hidden_states.shape[0],
                         self.weight.shape[0],
                         device=hidden_states.device,
-                        dtype=torch.float32,
+                        dtype=torch.bfloat16,
                     )
                     flashinfer_dsv3_router_gemm(logits, hidden_states, self.weight)
                 else:
                     logits = dsv3_router_gemm(
-                        hidden_states, self.weight, out_dtype=torch.float32
+                        hidden_states, self.weight, out_dtype=torch.bfloat16
                     )
 
             elif _use_aiter:
