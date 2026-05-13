@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
