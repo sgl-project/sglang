@@ -777,6 +777,10 @@ class ServerArgs:
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
 
+        # Handle PD disaggregation early: sets disable_radix_cache=True for decode
+        # nodes, which must be visible to subsequent mamba/attention backend validation.
+        self._handle_pd_disaggregation()
+
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
@@ -821,9 +825,6 @@ class ServerArgs:
 
         # Handle model loading format.
         self._handle_load_format()
-
-        # Handle PD disaggregation.
-        self._handle_pd_disaggregation()
 
         # Handle Encoder disaggregation.
         self._handle_encoder_disaggregation()
