@@ -364,7 +364,7 @@ class EAGLEDraftCudaGraphRunner:
             )
             set_is_extend_in_batch(False)
 
-            # Backup two fields, which will be modified in-place in `draft_forward`.
+            # Backup fields that are modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
@@ -372,6 +372,7 @@ class EAGLEDraftCudaGraphRunner:
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
         self.deepep_adapter.capture(is_extend_in_batch=False)

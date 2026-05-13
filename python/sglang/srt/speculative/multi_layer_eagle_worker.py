@@ -195,9 +195,10 @@ class MultiLayerEagleWorker(TpModelWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.mtp_model_runner(0).tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+            speculative_moe_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -267,9 +268,10 @@ class MultiLayerEagleWorker(TpModelWorker):
                 seq_lens_cpu,
                 can_run_cuda_graph,
             ) = self.forward_target_extend(batch)
-            with self.draft_tp_context(
-                self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            with (
+                self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+                speculative_moe_backend_context(),
+            ):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
@@ -282,9 +284,10 @@ class MultiLayerEagleWorker(TpModelWorker):
         else:
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
-            with self.draft_tp_context(
-                self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            with (
+                self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+                speculative_moe_backend_context(),
+            ):
                 verify_input = self.draft(batch)
 
             set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
@@ -306,9 +309,10 @@ class MultiLayerEagleWorker(TpModelWorker):
                 batch.reqs, "set_spec_draft_extend_start_time", trace_only=True
             )
 
-            with self.draft_tp_context(
-                self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            with (
+                self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+                speculative_moe_backend_context(),
+            ):
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 draft_extend_input = verify_output.draft_extend_input
@@ -732,7 +736,10 @@ class MultiLayerEagleWorker(TpModelWorker):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
-        if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
+        if draft_extend_input.input_ids.shape[0] == 0:
+            # Single source for hidden_size via hidden_size_for(self) (incl.
+            # EAGLE-3 aux widening). Two stub origins from verify(): fully-idle
+            # batch and active batch with all reqs finished.
             batch = batch.copy()
             batch.prepare_for_idle()
             draft_extend_input = EagleDraftExtendInput.create_idle_input(
