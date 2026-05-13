@@ -294,7 +294,9 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         self._staging_ctx.buffers = init_staging_buffers(
-            self.engine, self.kv_args, count
+            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self.kv_args,
+            count,
         )
         self.kv_buffer_tensors = None
 
@@ -303,7 +305,10 @@ class MooncakeKVManager(CommonKVManager):
             init_staging_allocator,
         )
 
-        self._staging_ctx.allocator = init_staging_allocator(self.engine, self.kv_args)
+        self._staging_ctx.allocator = init_staging_allocator(
+            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self.kv_args,
+        )
         self.kv_buffer_tensors = None
 
     def _handle_staging_req(self, msg):
@@ -1399,47 +1404,19 @@ class MooncakeKVManager(CommonKVManager):
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
-                    wm_round = int(waiting_req_bytes[1].decode("ascii"))
-                    wm_tail = int(waiting_req_bytes[2].decode("ascii"))
-                    wm_session = (
-                        waiting_req_bytes[3].decode("ascii")
-                        if len(waiting_req_bytes) > 3
-                        else ""
+                    from sglang.srt.disaggregation.common.staging_handler import (
+                        handle_watermark_msg,
                     )
-                    with self._staging_ctx.watermark_cv:
-                        prev = self._staging_ctx.remote_watermarks.get(
-                            wm_session, (0, 0)
-                        )
-                        if (wm_round, wm_tail) > prev:
-                            self._staging_ctx.remote_watermarks[wm_session] = (
-                                wm_round,
-                                wm_tail,
-                            )
-                            self._staging_ctx.watermark_cv.notify_all()
+
+                    handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
                     continue
                 # Staging: decode replies with allocated staging offset
                 if room == "STAGING_RSP":
-                    stg_room = int(waiting_req_bytes[1].decode("ascii"))
-                    stg_chunk_idx = int(waiting_req_bytes[2].decode("ascii"))
-                    stg_offset = int(waiting_req_bytes[3].decode("ascii"))
-                    stg_round = int(waiting_req_bytes[4].decode("ascii"))
-                    stg_end = int(waiting_req_bytes[5].decode("ascii"))
-                    stg_session = waiting_req_bytes[6].decode("ascii")
-                    room_infos = self.transfer_infos.get(stg_room, {})
-                    tinfo = room_infos.get(stg_session)
-                    if tinfo is not None:
-                        if tinfo.staging is None:
-                            tinfo.staging = StagingTransferInfo()
-                        tinfo.staging.set_chunk(
-                            stg_chunk_idx, stg_offset, stg_round, stg_end
-                        )
-                    else:
-                        logger.warning(
-                            "STAGING_RSP RECV but tinfo=None room=%s chunk=%d session=%s",
-                            stg_room,
-                            stg_chunk_idx,
-                            stg_session,
-                        )
+                    from sglang.srt.disaggregation.common.staging_handler import (
+                        handle_staging_rsp,
+                    )
+
+                    handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
@@ -1493,28 +1470,18 @@ class MooncakeKVManager(CommonKVManager):
                     page_start = int(msg[3].decode("ascii"))
                     num_pages = int(msg[4].decode("ascii"))
                     session_id = msg[5].decode("ascii")
-                    self._chunk_writer_counts[room][chunk_idx].append(
-                        (page_start, num_pages, session_id)
-                    )
                     handler = self._staging_handler
                     assert (
                         handler is not None
                     ), "CHUNK_READY received before staging handler initialized"
-                    writers_arrived = len(self._chunk_writer_counts[room][chunk_idx])
-                    decode_req = handler._room_to_decode_req.get(room)
-                    if decode_req is None:
-                        logger.warning(
-                            "CHUNK_READY received for unregistered room=%s chunk=%d, skipping",
-                            room,
-                            chunk_idx,
-                        )
-                        continue
-                    num_writers = handler.num_writers_for(decode_req)
-                    if writers_arrived >= num_writers:
-                        handler.submit_chunk_scatter(
-                            room, chunk_idx, page_start, num_pages
-                        )
-                        del self._chunk_writer_counts[room][chunk_idx]
+                    handler.handle_chunk_arrived(
+                        room,
+                        chunk_idx,
+                        page_start,
+                        num_pages,
+                        session_id,
+                        self._chunk_writer_counts,
+                    )
                     continue
 
                 # Staging: prefill pre-requests staging allocation before forward
