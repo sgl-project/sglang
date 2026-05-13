@@ -77,6 +77,11 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.finished.return_value = False
+        # v2 add_one_req reads these on the reuse-branch gate; MagicMock(spec=Req)
+        # doesn't surface attributes set only in Req.__init__, so seed them.
+        req.has_pending_chunk = False
+        req.is_dllm.return_value = False
+        req.host_hit_length = 0
         return req
 
     def create_adder(self, running_batch, **kwargs):
