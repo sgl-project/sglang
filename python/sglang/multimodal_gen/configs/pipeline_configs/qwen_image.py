@@ -168,6 +168,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (qwen_image_postprocess_text,)
     )
+
     text_encoder_extra_args: list[dict] = field(
         default_factory=lambda: [
             dict(
