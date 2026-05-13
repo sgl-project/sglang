@@ -349,6 +349,13 @@ class PipelineConfig:
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         return tokenizer(prompt, **tok_kwargs)
 
+    def is_flux_v1(self) -> bool:
+        """True if this pipeline is FLUX v1 (dual CLIP + T5 text encoders).
+
+        Used by text encoding (e.g. fixed CLIP context). Other pipelines return False.
+        """
+        return False
+
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio
         width = batch.width // self.vae_config.arch_config.spatial_compression_ratio
