@@ -185,6 +185,9 @@ class TextEncodingStage(PipelineStage):
 
         all_indices: list[int] = list(range(len(self.text_encoders)))
 
+        # Get max_sequence_length from batch if available
+        max_seq_length = getattr(batch, "max_sequence_length", None)
+
         (
             prompt_embeds_list,
             prompt_masks_list,
@@ -196,6 +199,7 @@ class TextEncodingStage(PipelineStage):
             server_args,
             encoder_index=all_indices,
             return_attention_mask=True,
+            max_length=max_seq_length,
         )
 
         for pe in prompt_embeds_list:
@@ -475,6 +479,11 @@ class TextEncodingStage(PipelineStage):
                 encoder_config.tokenizer_kwargs,
                 **text_encoder_extra_arg,
             )
+            # Pass max_length to tokenizer if specified in the request. Flux v1 encoder 0
+            # is CLIP with a fixed 77-token context; overriding breaks tokenization.
+            is_flux_v1 = server_args.pipeline_config.is_flux_v1()
+            if max_length is not None and not (is_flux_v1 and i == 0):
+                tok_kwargs["max_length"] = max_length
 
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
