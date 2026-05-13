@@ -406,6 +406,7 @@ class Envs:
 
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
+    SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
 
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
