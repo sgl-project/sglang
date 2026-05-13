@@ -302,11 +302,6 @@ class EagleVerifyInputV2Mixin:
             # cache_unfinished_req may have donated and replaced ping-pong
             # buffer entries without updating the mapping.
             if get_global_server_args().enable_mamba_extra_buffer():
-                import logging as _logging
-
-                _logging.getLogger(__name__).info(
-                    f"[DEBUG verify_v2] USING REQ OBJECTS for mamba_track_indices, bs={len(batch.reqs)}"
-                )
                 all_buffers = torch.stack(
                     [req.mamba_ping_pong_track_buffer for req in batch.reqs]
                 )
