@@ -33,6 +33,7 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
                 "seed": 7,
                 "cfg_text_scale": 1.0,
                 "timestep_shift": 1.0,
+                "omni_generation_mode": "t2i",
             }
         )
         batch = Req(sampling_params=params, prompt="draw")
@@ -79,9 +80,9 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
             {
                 "cfg_text_scale": 4.0,
                 "cfg_img_scale": 1.0,
+                "omni_generation_mode": "edit",
             }
         )
-        params.omni_generation_mode = "edit"
         batch = Req(sampling_params=params, prompt="edit")
 
         full, img_condition, uncondition = _resolve_u1_contexts(
@@ -102,9 +103,9 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
                 "height": 16,
                 "num_inference_steps": 1,
                 "cfg_text_scale": 1.0,
+                "omni_generation_mode": "interleave",
             }
         )
-        params.omni_generation_mode = "interleave"
         batch = Req(sampling_params=params, prompt="draw")
         stage = SenseNovaU1PixelFlowStage()
 
