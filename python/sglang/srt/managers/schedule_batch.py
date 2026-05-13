@@ -1843,12 +1843,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.cached_tokens_host = host_portion
                     req.cached_tokens_storage = storage_portion
                     req._cache_breakdown_computed = True
-                    # Reset host_hit_length after metric is computed so that
-                    # subsequent chunks' admission paths see host_hit_length == 0
-                    # and naturally skip init_load_back (host KV already loaded).
-                    req.host_hit_length = 0
 
                 req.already_computed = seq_len
+            # Reset host_hit_length after init_load_back consumed it so that
+            # subsequent chunks' admissions skip init_load_back (host KV
+            # already loaded). Runs unconditionally: post-retract reqs have
+            # retracted_stain=True (skipping the outer block) but still
+            # match_prefix + init_load_back on their re-admission, so the
+            # reset must apply to them too.
+            req.host_hit_length = 0
             req.is_retracted = False
 
             if get_global_server_args().enable_mamba_extra_buffer():
