@@ -134,6 +134,10 @@ QUANTIZATION_CHOICES = [
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
+    # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
+    # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
+    "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
+    "mlx_q8",  # 8 bits, group_size=64
     "unquant",
 ]
 
@@ -487,6 +491,9 @@ class ServerArgs:
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
+    enable_forward_pass_metrics: bool = False
+    forward_pass_metrics_worker_id: str = ""
+    forward_pass_metrics_ipc_name: Optional[str] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
 
@@ -910,6 +917,9 @@ class ServerArgs:
 
         # Set kernel backends.
         self._handle_sampling_backend()
+        # Must run before _handle_attention_backend_compatibility so the
+        # deterministic backend is set before auto-detection fills it in.
+        self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
         self._handle_linear_attn_backend()
@@ -966,9 +976,6 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
-
-        # Handle deterministic inference.
-        self._handle_deterministic_inference()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -1833,15 +1840,8 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    if is_hip():
-                        self.page_size = 1
-                        logger.warning(
-                            "Setting page size to 1 for DeepSeek DSA on ROCm."
-                        )
-                    else:
-                        # For CUDA GPU
-                        self.page_size = 64
-                        logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                    self.page_size = 64
+                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     import torch
 
@@ -2059,6 +2059,11 @@ class ServerArgs:
                     self.moe_runner_backend = "triton"
                     logger.warning(
                         "Detected ROCm with SGLANG_USE_AITER for GPT-OSS bf16 model, using triton MOE kernel."
+                    )
+                elif is_musa() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
+                    self.moe_runner_backend = "deep_gemm"
+                    logger.warning(
+                        "Detected MUSA with SGLANG_DEEPEP_BF16_DISPATCH for bf16 model, using deep_gemm kernel."
                     )
                 elif (
                     self.ep_size == 1
@@ -3986,11 +3991,11 @@ class ServerArgs:
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
                 envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-                and self.disaggregation_transfer_backend != "mooncake"
+                and self.disaggregation_transfer_backend not in ("mooncake", "nixl")
             ):
                 raise ValueError(
                     f"SGLANG_DISAGG_STAGING_BUFFER requires "
-                    f"disaggregation_transfer_backend='mooncake', "
+                    f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                     f"got '{self.disaggregation_transfer_backend}'."
                 )
 
@@ -5235,6 +5240,25 @@ class ServerArgs:
             type=str,
             default=None,
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        )
+        parser.add_argument(
+            "--enable-forward-pass-metrics",
+            action="store_true",
+            help="Enable per-iteration forward pass metrics via ZMQ IPC. "
+            "External consumers (e.g. Dynamo planner) subscribe to the IPC "
+            "endpoint exposed in server_args.forward_pass_metrics_ipc_name.",
+        )
+        parser.add_argument(
+            "--forward-pass-metrics-worker-id",
+            type=str,
+            default="",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--forward-pass-metrics-ipc-name",
+            type=str,
+            default=None,
+            help=argparse.SUPPRESS,
         )
         parser.add_argument(
             "--enable-trace",
