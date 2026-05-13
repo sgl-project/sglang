@@ -1,10 +1,8 @@
-import contextlib
 import logging
 from typing import Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -36,14 +34,6 @@ from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
-
-
-def _get_plan_stream(device: str):
-    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
-        plan_stream = torch.get_device_module(device).Stream()
-        plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
-        return plan_stream, plan_stream_ctx
-    return None, contextlib.nullcontext()
 
 
 class DFlashWorkerV2(DFlashWorker):
@@ -80,7 +70,6 @@ class DFlashWorkerV2(DFlashWorker):
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
         self._use_triton_accept_bonus = supports_gpu_triton
-        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
     def _validate_phase1_sampling_support(
         self, model_worker_batch: ModelWorkerBatch
@@ -467,17 +456,11 @@ class DFlashWorkerV2(DFlashWorker):
             model_worker_batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
             model_worker_batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 
-        caller_stream = torch.get_device_module(self.device).current_stream()
-        with self.plan_stream_ctx:
-            if self.plan_stream is not None:
-                self.plan_stream.wait_stream(caller_stream)
-            verify_forward_batch, _ = verify_input.prepare_for_v2_verify(
-                model_worker_batch, self.target_worker
-            )
+        verify_forward_batch, _ = verify_input.prepare_for_v2_verify(
+            model_worker_batch, self.target_worker
+        )
         model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
         model_worker_batch.seq_lens_sum = seq_lens_sum_backup
-        if self.plan_stream:
-            caller_stream.wait_stream(self.plan_stream)
 
         target_out = self.target_worker.forward_batch_generation(
             model_worker_batch=None,
