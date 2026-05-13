@@ -3729,6 +3729,17 @@ class Scheduler(
             # them from origin_input_ids.
             for req in self.waiting_queue:
                 if req.has_pending_chunk and req.req_pool_idx is not None:
+                    # Disagg-prefill: signal the decode side that the send was
+                    # retracted and drop our sender ref so re-prefill rebuilds
+                    # the bootstrap state. start_send_idx / tmp_end_idx are
+                    # reset by reset_for_retract.
+                    if (
+                        self.disaggregation_mode == DisaggregationMode.PREFILL
+                        and req.disagg_kv_sender is not None
+                    ):
+                        if hasattr(req.disagg_kv_sender, "abort"):
+                            req.disagg_kv_sender.abort()
+                        req.disagg_kv_sender = None
                     release_kv_cache(req, self.tree_cache, is_insert=False)
                     req.reset_for_retract()
 

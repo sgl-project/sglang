@@ -1284,6 +1284,14 @@ class Req(ReqDllmMixin):
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+        # Disagg-prefill send-side bookkeeping. The pre-v2 retract path never
+        # ran against a req that had started sending (retract only touched
+        # running_batch), so these stayed at init values. After v2 added
+        # pause(retract) coverage for waiting chunked-resume reqs, a retracted
+        # disagg-prefill req's stale start_send_idx would index garbage in the
+        # new row on re-prefill.
+        self.start_send_idx = 0
+        self.tmp_end_idx = -1
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
