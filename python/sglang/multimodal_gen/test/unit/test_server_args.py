@@ -12,6 +12,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -248,12 +249,12 @@ class TestOffloadDefaults(unittest.TestCase):
         wan_deployment = WanT2V480PConfig().get_model_deployment_config()
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
+        ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
 
-        self.assertEqual(qwen_deployment.fsdp_auto_min_available_memory_gb, 70)
+        self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
         self.assertFalse(qwen_deployment.auto_dit_layerwise_offload)
 
-        self.assertEqual(wan_deployment.fsdp_auto_min_available_memory_gb, 40)
-        self.assertFalse(wan_deployment.fsdp_auto_requires_cfg)
+        self.assertIsNone(wan_deployment.fsdp_auto_min_available_memory_gb)
         self.assertTrue(wan_deployment.auto_dit_layerwise_offload)
 
         self.assertIsNone(mova_deployment.fsdp_auto_min_available_memory_gb)
@@ -262,6 +263,13 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(zimage_deployment.fsdp_auto_min_available_memory_gb, 40)
         self.assertTrue(zimage_deployment.fsdp_auto_requires_cfg)
         self.assertFalse(zimage_deployment.auto_dit_layerwise_offload)
+
+        self.assertEqual(
+            ltx_deployment.auto_disable_component_offload_min_available_memory_gb, 70
+        )
+        self.assertEqual(
+            ltx_deployment.auto_disable_component_offload_components, ("dit",)
+        )
 
     def test_manual_mode_preserves_unset_performance_args(self):
         args = self._from_dict_with_pipeline_config(
@@ -326,7 +334,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.dit_layerwise_offload)
         self.assertTrue(args.use_fsdp_inference)
 
-    def test_auto_multi_gpu_wan_can_use_fsdp_without_cfg(self):
+    def test_auto_multi_gpu_wan_uses_layerwise_offload_without_cfg(self):
         with patch.object(ServerArgs, "_model_default_uses_cfg", return_value=False):
             args = self._from_dict_with_pipeline_config(
                 WanT2V480PConfig(),
@@ -337,12 +345,12 @@ class TestOffloadDefaults(unittest.TestCase):
                 },
             )
 
-        self.assertTrue(args.use_fsdp_inference)
+        self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.enable_cfg_parallel)
         self.assertFalse(args.dit_cpu_offload)
-        self.assertFalse(args.dit_layerwise_offload)
+        self.assertTrue(args.dit_layerwise_offload)
 
-    def test_auto_multi_gpu_qwen_prefers_fsdp_cfg(self):
+    def test_auto_multi_gpu_qwen_keeps_legacy_offload_with_cfg(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={
@@ -352,11 +360,11 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertTrue(args.use_fsdp_inference)
+        self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.dit_layerwise_offload)
-        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
 
     def test_auto_multi_gpu_zimage_base_prefers_fsdp(self):
@@ -434,7 +442,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
-    def test_auto_multi_gpu_qwen_accepts_when_all_selected_gpus_have_headroom(self):
+    def test_auto_multi_gpu_qwen_keeps_legacy_offload_with_headroom(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             available_memory_gb={1: 72, 2: 80},
@@ -446,8 +454,11 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertTrue(args.use_fsdp_inference)
+        self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
 
     def test_speed_mode_single_gpu_disables_offload(self):
         args = self._from_dict_with_pipeline_config(
@@ -560,7 +571,7 @@ class TestOffloadDefaults(unittest.TestCase):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
-        self.assertTrue(server_args.use_fsdp_inference)
+        self.assertFalse(server_args.use_fsdp_inference)
         self.assertFalse(server_args.enable_cfg_parallel)
 
 
