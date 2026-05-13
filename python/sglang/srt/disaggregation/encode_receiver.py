@@ -193,7 +193,17 @@ _MODALITY_GRID_ATTRS = {
     Modality.VIDEO: ("video_grid_thw", False),
     Modality.AUDIO: ("audio_feature_lens", True),
 }
-_VIDEO_META_ATTRS = ("video_timestamps", "second_per_grid_ts")
+# Per-part video metadata; keys must match MiMoProcessor.preprocess_for_encoder.
+# Tensor attrs cat on dim=0 across parts; others chain as lists.
+VIDEO_META_ATTRS = (
+    "video_timestamps",
+    "second_per_grid_ts",
+    "video_audio_feature_lens",
+    "video_audio_segment_lens_flat",
+    "video_audio_per_video_num_units",
+    "video_audio_embedding",
+)
+_VIDEO_META_TENSOR_ATTRS = ("video_audio_feature_lens", "video_audio_embedding")
 
 
 def _cat_grid(dims, flatten_items=False):
@@ -256,8 +266,8 @@ class MultiModalEmbeddingData(EmbeddingData):
         self.embedding_shape_list = [
             embedding_shape if i == part_idx else None for i in range(num_parts)
         ]
-        self.video_timestamps = [None] * num_parts
-        self.second_per_grid_ts = [None] * num_parts
+        for attr in VIDEO_META_ATTRS:
+            setattr(self, attr, [None] * num_parts)
 
         self._set_part_grid(part_idx, modality, self.get_grid())
         if modality == Modality.VIDEO:
@@ -274,7 +284,7 @@ class MultiModalEmbeddingData(EmbeddingData):
 
     def _set_video_meta_for_part(self, part_idx, source):
         """Copy video_timestamps and second_per_grid_ts from source (dict or object)."""
-        for attr_name in _VIDEO_META_ATTRS:
+        for attr_name in VIDEO_META_ATTRS:
             val = (
                 source.get(attr_name)
                 if isinstance(source, dict)
@@ -288,7 +298,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         """Create MultiModalEmbeddingData from an EmbeddingData instance."""
         # Only forward known optional attrs (e.g. video metadata) so they land on the instance
         extra = {}
-        for attr in _VIDEO_META_ATTRS:
+        for attr in VIDEO_META_ATTRS:
             val = getattr(embedding_data, attr, None)
             if val is not None:
                 extra[attr] = val
@@ -313,11 +323,8 @@ class MultiModalEmbeddingData(EmbeddingData):
             groups = defaultdict(list)
             for i, e in enumerate(self.embedding_list):
                 if e is not None:
-                    groups[self.modality_list[i]].append(e.cuda())
-            return {
-                mod: torch.concat(tensors).to("cpu", non_blocking=True)
-                for mod, tensors in groups.items()
-            }
+                    groups[self.modality_list[i]].append(e)
+            return {mod: torch.cat(tensors, dim=0) for mod, tensors in groups.items()}
         return self.embedding_list
 
     @property
@@ -333,12 +340,16 @@ class MultiModalEmbeddingData(EmbeddingData):
                 self.audio_feature_lens, flatten_items=True
             ),
         }
-        for attr in _VIDEO_META_ATTRS:
+        for attr in VIDEO_META_ATTRS:
             lst = getattr(self, attr, None)
             if not lst:
                 continue
             valid = [a for a in lst if a is not None]
-            if valid:
+            if not valid:
+                continue
+            if attr in _VIDEO_META_TENSOR_ATTRS:
+                kwargs[attr] = torch.cat(valid, dim=0)
+            else:
                 kwargs[attr] = list(itertools.chain(*valid))
         return kwargs
 
@@ -634,6 +645,7 @@ class MMReceiverBase(ABC):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
+        self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.host = get_local_ip_auto(server_args.host)
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
@@ -724,15 +736,25 @@ class MMReceiverBase(ABC):
                 self.context, zmq.PULL, host=self.host
             )
             mm_data = self._extract_url_data(request_obj)
+            modalities = [m.get("modality") for m in mm_data]
+            logger.info(
+                f"[{req_id}] Sending encode request to E, "
+                f"modalities={modalities}, num_items={len(mm_data)}"
+            )
+            send_time = time.monotonic()
             asyncio.create_task(
                 self.encode(req_id, mm_data, embedding_port, "encode", "send")
             )
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
-                timeout=20,
+                timeout=self.recv_timeout,
             )
+            elapsed = time.monotonic() - send_time
+            logger.info(f"[{req_id}] Received embedding from E in {elapsed:.3f}s")
+            return result
         except asyncio.TimeoutError:
-            logger.warning(f"Embedding recv timeout for request {req_id}")
+            elapsed = time.monotonic() - send_time
+            logger.warning(f"[{req_id}] Embedding recv timeout after {elapsed:.3f}s")
             if req_id is not None:
                 self._cleanup_mooncake_buffer(req_id)
             return None
