@@ -1598,7 +1598,7 @@ _DEVICE_TO_DISTRIBUTED_BACKEND = {
     "xpu": "xccl",
     "hpu": "hccl",
     "cpu": "gloo",
-    "npu": "hccl",
+    "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
     "musa": "mccl",
 }
 

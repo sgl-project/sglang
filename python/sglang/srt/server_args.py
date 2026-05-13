@@ -305,6 +305,10 @@ def add_rl_on_policy_target_choices(choices):
     RL_ON_POLICY_TARGET_CHOICES.extend(choices)
 
 
+def add_linear_attn_kernel_backend_choices(choices):
+    LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
+
+
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
@@ -483,6 +487,9 @@ class ServerArgs:
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
+    enable_forward_pass_metrics: bool = False
+    forward_pass_metrics_worker_id: str = ""
+    forward_pass_metrics_ipc_name: Optional[str] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
 
@@ -906,6 +913,9 @@ class ServerArgs:
 
         # Set kernel backends.
         self._handle_sampling_backend()
+        # Must run before _handle_attention_backend_compatibility so the
+        # deterministic backend is set before auto-detection fills it in.
+        self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
         self._handle_linear_attn_backend()
@@ -962,9 +972,6 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
-
-        # Handle deterministic inference.
-        self._handle_deterministic_inference()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -1829,15 +1836,8 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    if is_hip():
-                        self.page_size = 1
-                        logger.warning(
-                            "Setting page size to 1 for DeepSeek DSA on ROCm."
-                        )
-                    else:
-                        # For CUDA GPU
-                        self.page_size = 64
-                        logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                    self.page_size = 64
+                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     import torch
 
@@ -3982,11 +3982,11 @@ class ServerArgs:
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
                 envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-                and self.disaggregation_transfer_backend != "mooncake"
+                and self.disaggregation_transfer_backend not in ("mooncake", "nixl")
             ):
                 raise ValueError(
                     f"SGLANG_DISAGG_STAGING_BUFFER requires "
-                    f"disaggregation_transfer_backend='mooncake', "
+                    f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                     f"got '{self.disaggregation_transfer_backend}'."
                 )
 
@@ -5231,6 +5231,25 @@ class ServerArgs:
             type=str,
             default=None,
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        )
+        parser.add_argument(
+            "--enable-forward-pass-metrics",
+            action="store_true",
+            help="Enable per-iteration forward pass metrics via ZMQ IPC. "
+            "External consumers (e.g. Dynamo planner) subscribe to the IPC "
+            "endpoint exposed in server_args.forward_pass_metrics_ipc_name.",
+        )
+        parser.add_argument(
+            "--forward-pass-metrics-worker-id",
+            type=str,
+            default="",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--forward-pass-metrics-ipc-name",
+            type=str,
+            default=None,
+            help=argparse.SUPPRESS,
         )
         parser.add_argument(
             "--enable-trace",
@@ -7061,6 +7080,14 @@ class ServerArgs:
         ), (
             "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
             f"Got: {self.pp_max_micro_batch_size}"
+        )
+
+        assert not (self.disable_cuda_graph_padding and self.enable_torch_compile), (
+            "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
+            "With padding disabled, every distinct batch size gets its own torch.compile + "
+            "Triton autotune cycle (O(max_batch_size) compilations) instead of the small fixed "
+            "set of padded bucket sizes, causing engine initialisation to stall for many minutes. "
+            "Remove --disable-cuda-graph-padding or --enable-torch-compile."
         )
 
         if self.pp_size > 1:

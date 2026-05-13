@@ -26,7 +26,6 @@ import os
 import pickle
 import sys
 import threading
-from functools import partialmethod
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
@@ -589,20 +588,6 @@ def write_data_for_multi_tokenizer(
     args_shm.close()
 
     return args_shm
-
-
-def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
-    """Monkey patch uvicorn multiprocessing is_alive timeout"""
-    # from default 5s -> 10s
-    try:
-        from uvicorn.supervisors.multiprocess import Process
-
-        Process.is_alive = partialmethod(Process.is_alive, timeout=timeout)
-
-    except ImportError:
-        logger.warning(
-            "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
-        )
 
 
 class SenderWrapper:
