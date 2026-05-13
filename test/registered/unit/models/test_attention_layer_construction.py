@@ -5,13 +5,19 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from transformers import Gemma2Config, GPT2Config
+from transformers import Gemma2Config, GPT2Config, LlamaConfig
 
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models.gemma2 import Gemma2Model
 from sglang.srt.models.gpt2 import GPT2Attention
+from sglang.srt.models.llama import LlamaDecoderLayer, LlamaModel
+from sglang.srt.models.ministral3 import (
+    Ministral3Attention,
+    Ministral3DecoderLayer,
+    Ministral3Model,
+)
 from sglang.srt.runtime_context import get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -129,6 +135,87 @@ class TestGpt2KvHeadsUnderTp(_ContextTestCase):
                 attn = GPT2Attention(layer_id=0, config=config)
                 self.assertEqual(attn.attn.tp_k_head_num, attn.c_attn.num_kv_heads)
                 self.assertEqual(attn.attn.tp_v_head_num, attn.c_attn.num_kv_heads)
+
+
+class TestMinistral3LayerConstruction(_ContextTestCase):
+    @staticmethod
+    def config():
+        return LlamaConfig(
+            hidden_size=32,
+            intermediate_size=48,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=64,
+            max_position_embeddings=32,
+            original_max_position_embeddings=32,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        )
+
+    def test_decoder_layers_are_built_once(self):
+        # A superclass model followed by replacement layers temporarily keeps
+        # both stacks' weights alive. Count real decoder constructions, rather
+        # than only inspecting the final ModuleList, which hides the duplicate.
+        original_init = LlamaDecoderLayer.__init__
+        for tp_size in (1, 2):
+            for pp_size in (1, 2):
+                for pp_rank in range(pp_size):
+                    built = []
+                    tp_group = SimpleNamespace(rank_in_group=0, world_size=tp_size)
+
+                    def record_init(layer, *args, **kwargs):
+                        built.append(type(layer))
+                        original_init(layer, *args, **kwargs)
+
+                    with (
+                        self.subTest(tp=tp_size, pp=pp_size, rank=pp_rank),
+                        parallel_scope(
+                            tp_size=tp_size,
+                            tp_group=tp_group,
+                            attn_tp_group=tp_group,
+                            moe_tp_group=tp_group,
+                            attn_tp_size=tp_size,
+                            moe_tp_size=tp_size,
+                            pp_rank=pp_rank,
+                            pp_size=pp_size,
+                            pp_group=SimpleNamespace(
+                                is_first_rank=pp_rank == 0,
+                                is_last_rank=pp_rank == pp_size - 1,
+                                rank_in_group=pp_rank,
+                                world_size=pp_size,
+                            ),
+                        ),
+                        patch.object(LlamaDecoderLayer, "__init__", record_init),
+                    ):
+                        model = Ministral3Model(self.config(), prefix="model")
+                        start, end = model.start_layer, model.end_layer
+                        self.assertEqual(
+                            built, [Ministral3DecoderLayer] * (end - start)
+                        )
+                        self.assertEqual(
+                            (start, end),
+                            (pp_rank * 4 // pp_size, (pp_rank + 1) * 4 // pp_size),
+                        )
+                        for layer in model.layers[start:end]:
+                            self.assertIsInstance(layer.self_attn, Ministral3Attention)
+
+    def test_llama_still_builds_llama_layers(self):
+        model = LlamaModel(self.config(), prefix="model")
+        self.assertEqual(
+            [type(layer) for layer in model.layers], [LlamaDecoderLayer] * 4
+        )
+
+    def test_ministral_mlp_weights_are_allocated_once(self):
+        recorder = _PrefixRecorder()
+        Ministral3Model(self.config(), quant_config=recorder, prefix="model")
+        self.assertEqual(
+            sorted(name for name in recorder.linear_prefixes if ".mlp." in name),
+            sorted(
+                f"model.layers.{i}.mlp.{name}"
+                for i in range(4)
+                for name in ("gate_up_proj", "down_proj")
+            ),
+        )
 
 
 if __name__ == "__main__":
