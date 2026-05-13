@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
 
 
@@ -35,6 +36,7 @@ def set_mla_kv_buffer_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     pid_loc = tl.program_id(0)
     pid_blk = tl.program_id(1)
@@ -43,6 +45,9 @@ def set_mla_kv_buffer_kernel(
     offs = base + tl.arange(0, BLOCK)
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
@@ -82,6 +87,9 @@ def set_mla_kv_buffer_kernel(
 
     tl.store(dst_ptr, src, mask=mask)
 
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def set_mla_kv_buffer_triton(
     kv_buffer: torch.Tensor,
@@ -96,6 +104,8 @@ def set_mla_kv_buffer_triton(
     n_loc = loc.numel()
     grid = (n_loc, triton.cdiv(total_dim, BLOCK))
 
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+
     set_mla_kv_buffer_kernel[grid](
         kv_buffer,
         cache_k_nope,
@@ -107,6 +117,7 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
+        **pdl_kwargs,
     )
 
 
@@ -122,6 +133,7 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     """Fuse BF16/FP16->FP8 cast with paged KV write."""
     pid_loc = tl.program_id(0)
@@ -131,6 +143,9 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     offs = base + tl.arange(0, BLOCK)
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_fp8_ptr + loc * buffer_stride + offs
@@ -165,6 +180,9 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     # Destination pointer is FP8-typed view; tl.store performs downcast.
     tl.store(dst_ptr, src, mask=mask)
 
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def set_mla_kv_buffer_triton_fp8_quant(
     kv_buffer: torch.Tensor,
@@ -183,6 +201,8 @@ def set_mla_kv_buffer_triton_fp8_quant(
     n_loc = loc.numel()
     grid = (n_loc, triton.cdiv(total_dim, BLOCK))
 
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+
     set_mla_kv_buffer_fp8_quant_kernel[grid](
         kv_buffer_fp8,
         cache_k_nope,
@@ -194,6 +214,7 @@ def set_mla_kv_buffer_triton_fp8_quant(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
+        **pdl_kwargs,
     )
 
 

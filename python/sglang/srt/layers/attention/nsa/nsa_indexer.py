@@ -266,15 +266,8 @@ class Indexer(MultiPlatformOp):
         # avoiding an expensive FP8-to-bf16 dequantization.
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            weight = self.weights_proj.weight
-            out = torch.empty(
-                (x.shape[0], weight.shape[0]),
-                dtype=torch.float32,
-                device=x.device,
-            )
-            deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
-            return out
+        if _is_cuda:
+            return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
 
         weights, _ = self.weights_proj(x)
         if _is_hip:
@@ -298,6 +291,12 @@ class Indexer(MultiPlatformOp):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
+
+    @torch.compile(dynamic=True)
+    def _apply_q_scale_and_softmax_scale(
+        self, weights: torch.Tensor, q_scale: torch.Tensor
+    ):
+        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     def _get_q_k_bf16(
         self,
@@ -1161,7 +1160,7 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+            weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch

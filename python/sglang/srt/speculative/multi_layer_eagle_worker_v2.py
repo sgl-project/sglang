@@ -28,7 +28,10 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -138,6 +141,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Alias for better readability
         self.draft_runner_list: List[ModelRunner] = self.draft_worker.model_runner_list
+        # Match `EagleDraftWorker.draft_runner` so `_draft_runner_of(self)` works
+        # for the EagleDraftInput shape classmethods.
+        self.draft_runner: ModelRunner = self.draft_runner_list[0]
 
         # Chain-style MTP: each step propagates its own output hidden states to the
         # next step.  Non-chain: each step uses the target model's hidden states.
@@ -655,7 +661,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            target_capture_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.FULL
+            )
+            model_worker_batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
@@ -675,12 +686,17 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             return batch_output
         else:
             if model_worker_batch.spec_info is None:
+                capture_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.speculative_algorithm.is_standalone()
+                    else CaptureHiddenMode.LAST
+                )
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
-                    hidden_size=self.target_worker.model_config.spec_hidden_size,
-                    dtype=self.target_worker.model_config.dtype,
+                    hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
+                    dtype=EagleDraftInput.dtype_for(self.draft_worker),
                     topk=self.topk * self.speculative_num_steps,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                    capture_hidden_mode=capture_mode,
                 )
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)

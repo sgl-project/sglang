@@ -466,6 +466,7 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] in [
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "InternS2PreviewForConditionalGeneration",
         ]:
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
@@ -608,6 +609,7 @@ class ModelConfig:
             )
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
+            or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1521,6 +1523,7 @@ multimodal_model_archs = [
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "InternS2PreviewForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
