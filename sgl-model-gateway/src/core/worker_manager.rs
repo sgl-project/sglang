@@ -67,6 +67,32 @@ async fn fan_out(
         .await
 }
 
+/// Parsed `/v1/loads` response for a single engine process.
+///
+/// Holds both the aggregate (used for DP-blind worker views) and the per-DP-rank
+/// num_total_tokens map (used to derive per-rank loads for DPAwareWorker entries).
+#[derive(Debug, Clone)]
+struct ParsedLoads {
+    aggregate_total_tokens: Option<isize>,
+    per_rank: HashMap<usize, isize>,
+}
+
+impl ParsedLoads {
+    /// Resolve the load value for a specific worker.
+    /// DP-aware workers get their per-rank num_total_tokens; everyone else
+    /// gets the aggregate, falling back to -1 only if the JSON lacked the field.
+    fn load_for_worker(&self, worker: &dyn Worker) -> isize {
+        if worker.is_dp_aware() {
+            if let Some(rank) = worker.dp_rank() {
+                if let Some(v) = self.per_rank.get(&rank) {
+                    return *v;
+                }
+            }
+        }
+        self.aggregate_total_tokens.unwrap_or(-1)
+    }
+}
+
 pub enum EngineMetricsResult {
     Ok(String),
     Err(String),
@@ -164,35 +190,59 @@ impl WorkerManager {
         let workers = worker_registry.get_all();
         let total_workers = workers.len();
 
-        let futures: Vec<_> = workers
-            .iter()
-            .map(|worker| {
-                let url = worker.url().to_string();
-                let api_key = worker.api_key().clone();
-                let worker_type = match worker.worker_type() {
-                    WorkerType::Regular => None,
-                    WorkerType::Prefill { .. } => Some("prefill".to_string()),
-                    WorkerType::Decode => Some("decode".to_string()),
-                };
-                let is_http = matches!(worker.connection_mode(), ConnectionMode::Http);
-                let client = client.clone();
+        // Group workers by base URL so we issue at most one /v1/loads request per
+        // engine process even when N DPAwareWorker entries share the same backend.
+        let mut groups: HashMap<String, (Option<String>, Vec<Arc<dyn Worker>>)> = HashMap::new();
+        for worker in &workers {
+            if !matches!(worker.connection_mode(), ConnectionMode::Http) {
+                continue;
+            }
+            let base = worker.base_url().to_string();
+            groups
+                .entry(base)
+                .or_insert_with(|| (worker.api_key().clone(), Vec::new()))
+                .1
+                .push(Arc::clone(worker));
+        }
 
+        let futures: Vec<_> = groups
+            .into_iter()
+            .map(|(base_url, (api_key, group_workers))| {
+                let client = client.clone();
                 async move {
-                    let load = if is_http {
-                        Self::parse_load_response(&client, &url, api_key.as_deref()).await
-                    } else {
-                        -1
-                    };
-                    WorkerLoadInfo {
-                        worker: url,
-                        worker_type,
-                        load,
-                    }
+                    let parsed =
+                        Self::parse_load_response(&client, &base_url, api_key.as_deref()).await;
+                    (group_workers, parsed)
                 }
             })
             .collect();
 
-        let loads = future::join_all(futures).await;
+        let group_results = future::join_all(futures).await;
+
+        let mut loads = Vec::with_capacity(total_workers);
+        for worker in &workers {
+            if !matches!(worker.connection_mode(), ConnectionMode::Http) {
+                loads.push(WorkerLoadInfo {
+                    worker: worker.url().to_string(),
+                    worker_type: Self::worker_type_label(worker.worker_type()),
+                    load: -1,
+                });
+            }
+        }
+        for (group_workers, parsed) in group_results {
+            for worker in group_workers {
+                let load = match &parsed {
+                    Some(p) => p.load_for_worker(worker.as_ref()),
+                    None => -1,
+                };
+                loads.push(WorkerLoadInfo {
+                    worker: worker.url().to_string(),
+                    worker_type: Self::worker_type_label(worker.worker_type()),
+                    load,
+                });
+            }
+        }
+
         let successful = loads.iter().filter(|l| l.load >= 0).count();
         let failed = loads.iter().filter(|l| l.load < 0).count();
 
@@ -204,29 +254,55 @@ impl WorkerManager {
         }
     }
 
+    fn worker_type_label(worker_type: &WorkerType) -> Option<String> {
+        match worker_type {
+            WorkerType::Regular => None,
+            WorkerType::Prefill { .. } => Some("prefill".to_string()),
+            WorkerType::Decode => Some("decode".to_string()),
+        }
+    }
+
+    /// Fetch and parse /v1/loads for a single engine base URL.
+    /// Returns `None` on transport/parse failure so callers can treat all
+    /// workers in the group as `load = -1`.
     async fn parse_load_response(
         client: &reqwest::Client,
-        url: &str,
+        base_url: &str,
         api_key: Option<&str>,
-    ) -> isize {
-        let load_url = format!("{}/v1/loads?include=core", url);
+    ) -> Option<ParsedLoads> {
+        let load_url = format!("{}/v1/loads?include=core", base_url);
         let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
 
-        match req.send().await {
-            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) => json
-                    .get("aggregate")
-                    .and_then(|a| a.get("total_tokens"))
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n as isize)
-                    .unwrap_or(-1),
-                _ => -1,
-            },
-            _ => -1,
+        let resp = req.send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
         }
+        let json: Value = resp.json().await.ok()?;
+
+        let aggregate_total_tokens = json
+            .get("aggregate")
+            .and_then(|a| a.get("total_tokens"))
+            .and_then(|v| v.as_i64())
+            .map(|n| n as isize);
+
+        let mut per_rank = HashMap::new();
+        if let Some(arr) = json.get("loads").and_then(|v| v.as_array()) {
+            for entry in arr {
+                let rank = entry.get("dp_rank").and_then(|v| v.as_i64());
+                let tokens = entry.get("num_total_tokens").and_then(|v| v.as_i64());
+                if let (Some(r), Some(t)) = (rank, tokens) {
+                    per_rank.insert(r as usize, t as isize);
+                }
+            }
+        }
+
+        Some(ParsedLoads {
+            aggregate_total_tokens,
+            per_rank,
+        })
     }
 
     pub async fn get_engine_metrics(
@@ -348,9 +424,10 @@ impl LoadMonitor {
             interval_timer.tick().await;
 
             let power_of_two_policies = policy_registry.get_all_power_of_two_policies();
+            let cache_aware_policies = policy_registry.get_all_cache_aware_policies();
 
-            if power_of_two_policies.is_empty() {
-                debug!("No PowerOfTwo policies found, skipping load fetch");
+            if power_of_two_policies.is_empty() && cache_aware_policies.is_empty() {
+                debug!("No load-aware policies found, skipping load fetch");
                 continue;
             }
 
@@ -363,11 +440,15 @@ impl LoadMonitor {
 
             if !loads.is_empty() {
                 debug!(
-                    "Fetched loads from {} workers, updating {} PowerOfTwo policies",
+                    "Fetched loads from {} workers, updating {} PoT + {} CacheAware policies",
                     loads.len(),
-                    power_of_two_policies.len()
+                    power_of_two_policies.len(),
+                    cache_aware_policies.len()
                 );
                 for policy in &power_of_two_policies {
+                    policy.update_loads(&loads);
+                }
+                for policy in &cache_aware_policies {
                     policy.update_loads(&loads);
                 }
                 let _ = tx.send(loads);

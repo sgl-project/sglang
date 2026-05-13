@@ -63,7 +63,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use rand::Rng;
 use smg_mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager};
 use tracing::{debug, warn};
 
@@ -75,15 +74,38 @@ use crate::core::{Worker, UNKNOWN_MODEL_ID};
 
 /// Cache-aware routing policy
 ///
-/// Routes requests based on cache affinity when load is balanced,
-/// switches to shortest-queue routing when load is imbalanced.
-/// Maintains separate trees per model for multi-model support.
+/// Scores every healthy worker by `pending_tokens + miss_chars`, where:
+///   - `pending_tokens` comes from each worker's most recent `/v1/loads`
+///     report (`num_total_tokens` = used + queued prefill tokens). The
+///     LoadMonitor pushes these in via `update_loads` on its own cadence.
+///   - `miss_chars` is the prefill the worker would have to redo: zero
+///     for the worker the gateway radix tree reports as the longest-prefix
+///     tenant, `input_chars` for everyone else.
+///
+/// Newcomers start at `pending_tokens = 0`, so a fresh worker can beat a
+/// cache holder once the holder's backlog exceeds the input length.
+/// Note that `pending_tokens` is in tokens and `miss_chars` is in chars;
+/// we deliberately add them with a 1:1 implicit ratio. This biases the
+/// selection toward cache affinity for tokenizers where chars/token > 1
+/// (typical English BPE ≈ 4), which is acceptable for v1.
+///
+/// Maintains separate radix trees per model for multi-model support.
 /// Supports mesh synchronization of tree operations across cluster nodes.
-/// When mesh is not enabled, the policy works independently without synchronization.
+/// When mesh is not enabled, the policy works independently without sync.
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
+    // Held only so existing CLI surface (cache_threshold, balance_*_threshold,
+    // max_tree_size, eviction_interval_secs) continues to parse without error.
+    // The new scoring rule consumes the eviction settings at construction
+    // time; the threshold knobs are dead. Prune in a follow-up PR once we
+    // remove them from CacheAwareConfig / CLI.
+    #[allow(dead_code)]
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
+    /// Per-worker pending-token snapshot, keyed by `worker.url()` (which is
+    /// `base@rank` for DPAwareWorker, plain `base` otherwise). Populated by
+    /// `LoadMonitor` via `update_loads`; unknown workers fall back to 0.
+    pending_tokens: Arc<DashMap<String, isize>>,
     mesh_sync: OptionalMeshSyncManager,
     _eviction_task: Option<PeriodicTask>,
 }
@@ -124,6 +146,7 @@ impl CacheAwarePolicy {
         Self {
             config,
             trees,
+            pending_tokens: Arc::new(DashMap::new()),
             mesh_sync: None,
             _eviction_task: eviction_task,
         }
@@ -158,6 +181,9 @@ impl CacheAwarePolicy {
                 .or_insert_with(|| Arc::new(Tree::new()));
             for worker in model_workers {
                 tree.insert("", worker.url());
+                self.pending_tokens
+                    .entry(worker.url().to_string())
+                    .or_insert(0);
             }
         }
     }
@@ -170,6 +196,9 @@ impl CacheAwarePolicy {
             .entry(tree_key.to_string())
             .or_insert_with(|| Arc::new(Tree::new()));
         tree.insert("", worker.url());
+        self.pending_tokens
+            .entry(worker.url().to_string())
+            .or_insert(0);
     }
 
     /// Add a worker by URL and model (for backward compatibility)
@@ -179,6 +208,7 @@ impl CacheAwarePolicy {
             .entry(model_id.to_string())
             .or_insert_with(|| Arc::new(Tree::new()));
         tree.insert("", url);
+        self.pending_tokens.entry(url.to_string()).or_insert(0);
     }
 
     /// Remove a worker from the tree
@@ -187,6 +217,7 @@ impl CacheAwarePolicy {
         if let Some(tree) = self.trees.get(tree_key) {
             tree.remove_tenant(worker.url());
         }
+        self.pending_tokens.remove(worker.url());
     }
 
     /// Remove a worker by URL (removes from all model trees for backward compatibility)
@@ -195,6 +226,7 @@ impl CacheAwarePolicy {
         for tree_ref in self.trees.iter() {
             tree_ref.value().remove_tenant(url);
         }
+        self.pending_tokens.remove(url);
     }
 
     /// Restore tree state from mesh store
@@ -283,66 +315,44 @@ impl CacheAwarePolicy {
         }
     }
 
-    fn select_worker_min_load(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        request_text: &Option<&str>,
-        healthy_indices: &[usize],
-        model_id: &str,
-        max_load: usize,
-        min_load: usize,
-    ) -> Option<usize> {
-        // Log load balancing trigger (only compute worker loads if debug enabled)
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let worker_loads: Vec<(&str, usize)> =
-                workers.iter().map(|w| (w.url(), w.load())).collect();
+    /// Look up a worker's most recently reported pending-token count.
+    /// Returns 0 for workers the LoadMonitor hasn't reached yet (newcomers).
+    /// Negative values mean the worker's /v1/loads probe failed; treat as 0
+    /// rather than `isize::MAX` so a transient outage doesn't permanently
+    /// exclude a worker from selection.
+    fn pending_tokens_for(&self, worker_url: &str) -> isize {
+        self.pending_tokens
+            .get(worker_url)
+            .map(|v| (*v).max(0))
+            .unwrap_or(0)
+    }
+
+    /// Insert request text into the tree under the chosen worker and mirror
+    /// the op into the mesh. Pulled out so both the imbalanced and
+    /// balanced paths can share it.
+    fn record_request_in_tree(&self, model_id: &str, text: &str, worker_url: &str) {
+        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+        let Some(tree) = tree else {
             debug!(
-                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-                max_load, min_load, worker_loads
+                "Warning: No tree found for model '{}', skipping cache update",
+                model_id
             );
-        }
+            return;
+        };
 
-        // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
+        tree.insert(text, worker_url);
 
-        // Even in imbalanced mode, update the tree to maintain cache state
-        if let Some(text) = request_text {
-            // Get the tree reference without locking the entire HashMap
-            // DashMap only locks the specific shard containing this key
-            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-            if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
-                // Now we can work with the tree without holding the HashMap lock
-                tree.insert(text, worker_url);
-
-                // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
-                if let Some(ref mesh_sync) = self.mesh_sync {
-                    use smg_mesh::tree_ops::TreeInsertOp;
-                    let op = TreeOperation::Insert(TreeInsertOp {
-                        text: text.to_string(),
-                        tenant: worker_url.to_string(),
-                    });
-                    let mesh_model_id = Self::normalize_mesh_model_id(model_id);
-                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
-                        warn!("Failed to sync tree insert operation to mesh: {}", e);
-                    }
-                }
-            } else {
-                debug!(
-                    "Warning: No tree found for model '{}', skipping cache update",
-                    model_id
-                );
+        if let Some(ref mesh_sync) = self.mesh_sync {
+            use smg_mesh::tree_ops::TreeInsertOp;
+            let op = TreeOperation::Insert(TreeInsertOp {
+                text: text.to_string(),
+                tenant: worker_url.to_string(),
+            });
+            let mesh_model_id = Self::normalize_mesh_model_id(model_id);
+            if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
+                warn!("Failed to sync tree insert operation to mesh: {}", e);
             }
         }
-
-        // Increment processed counter
-        workers[min_load_idx].increment_processed();
-
-        Some(min_load_idx)
     }
 }
 
@@ -353,133 +363,77 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
-        let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
-
         if healthy_indices.is_empty() {
             return None;
         }
 
-        // Determine the model for this set of workers (router pre-filters by model)
-        // All workers should be from the same model
+        // Router pre-filters by model, so any healthy worker yields the key.
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
+        let text = info.request_text.unwrap_or("");
 
-        // Get current load statistics - compute min/max in single pass without allocation
-        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
-            let load = w.load();
-            (min.min(load), max.max(load))
-        });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
+        // Single tree walk: returns the deepest reachable node, the cached
+        // tenant at that node (our "longest-prefix worker"), and the matched
+        // / input char counts. If there's no tree yet for this model, treat
+        // every worker as having zero match.
+        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+        let (best_tenant, best_match_chars, input_chars) = match &tree {
+            Some(t) => {
+                let r = t.prefix_match_with_counts(text);
+                (Some(r.tenant), r.matched_char_count, r.input_char_count)
+            }
+            None => {
+                debug!(
+                    "No cache tree for model '{}'; scoring on pending tokens only",
+                    model_id
+                );
+                (None, 0usize, text.chars().count())
+            }
+        };
 
-        // Check if load is imbalanced
-        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
-            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
+        // Score every healthy worker by `pending_tokens + miss_chars`.
+        // The longest-prefix tenant gets `miss_chars = input - matched`;
+        // everyone else is assumed to have zero overlap and pays the full
+        // `input_chars`. Units are intentionally mixed 1:1 — see struct
+        // doc-comment for rationale.
+        let best_tenant_str: Option<&str> = best_tenant.as_ref().map(|t| t.as_ref());
+        let scored_idx = healthy_indices
+            .iter()
+            .min_by_key(|&&idx| {
+                let w = &workers[idx];
+                let is_best = best_tenant_str == Some(w.url());
+                let miss_chars = if is_best {
+                    input_chars.saturating_sub(best_match_chars)
+                } else {
+                    input_chars
+                };
+                let pending = self.pending_tokens_for(w.url()) as i128;
+                pending + miss_chars as i128
+            })
+            .copied();
 
-        if is_imbalanced {
-            return self.select_worker_min_load(
-                workers,
-                &request_text,
-                &healthy_indices,
-                model_id,
-                max_load,
-                min_load,
-            );
+        let Some(idx) = scored_idx else {
+            return None;
+        };
+
+        // Update gateway-side tree + mesh with this request (skip if model
+        // had no tree yet — caller may not have init'd one for this model).
+        if tree.is_some() {
+            self.record_request_in_tree(model_id, text, workers[idx].url());
         }
 
-        // Use cache-aware routing when balanced
-        let text = request_text.unwrap_or("");
+        workers[idx].increment_processed();
+        Some(idx)
+    }
 
-        // Get the tree reference without locking the entire HashMap
-        // DashMap only locks the specific shard containing this key
-        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-        if let Some(tree) = tree {
-            // Now we work with the tree without holding the HashMap lock
-            // Use prefix_match_with_counts to avoid redundant chars().count() calls
-            let result = tree.prefix_match_with_counts(text);
-            let match_rate = if result.input_char_count == 0 {
-                0.0
-            } else {
-                result.matched_char_count as f32 / result.input_char_count as f32
-            };
-
-            // Select worker without String allocation
-            let selected_idx = if match_rate > self.config.cache_threshold {
-                // Cache hit path: find worker by URL (compare &str directly, no allocation)
-                let tenant_url: &str = &result.tenant;
-                workers
-                    .iter()
-                    .position(|w| w.url() == tenant_url)
-                    .filter(|&idx| workers[idx].is_healthy())
-            } else {
-                // Low cache match: use worker with minimum load
-                healthy_indices
-                    .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
-                    .copied()
-            };
-
-            if let Some(idx) = selected_idx {
-                // Update the tree with this request (use worker URL directly, no allocation)
-                tree.insert(text, workers[idx].url());
-
-                // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
-                if let Some(ref mesh_sync) = self.mesh_sync {
-                    use smg_mesh::tree_ops::TreeInsertOp;
-                    let op = TreeOperation::Insert(TreeInsertOp {
-                        text: text.to_string(),
-                        tenant: workers[idx].url().to_string(),
-                    });
-                    let mesh_model_id = Self::normalize_mesh_model_id(model_id);
-                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
-                        warn!("Failed to sync tree insert operation to mesh: {}", e);
-                    }
-                }
-
-                // Increment processed counter
-                workers[idx].increment_processed();
-
-                return Some(idx);
-            }
-
-            // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-            if match_rate > self.config.cache_threshold {
-                let tenant_url: &str = &result.tenant;
-                tree.remove_tenant(tenant_url);
-                debug!("Removed stale worker {} from cache tree", tenant_url);
-
-                // Sync removal to mesh if enabled (no-op if mesh is not enabled)
-                if let Some(ref mesh_sync) = self.mesh_sync {
-                    use smg_mesh::tree_ops::TreeRemoveOp;
-                    let op = TreeOperation::Remove(TreeRemoveOp {
-                        tenant: tenant_url.to_string(),
-                    });
-                    let mesh_model_id = Self::normalize_mesh_model_id(model_id);
-                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
-                        warn!("Failed to sync tree remove operation to mesh: {}", e);
-                    }
-                }
-            }
-
-            // Fallback to first healthy worker
-            healthy_indices.first().copied()
-        } else {
-            // No tree for this model, log warning and use random selection
-            debug!(
-                "Warning: No tree found for model '{}', using random worker selection",
-                model_id
-            );
-            // Return a random healthy worker
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+    fn update_loads(&self, loads: &std::collections::HashMap<String, isize>) {
+        for (url, v) in loads.iter() {
+            self.pending_tokens.insert(url.clone(), *v);
         }
     }
 
     fn on_request_complete(&self, worker_url: &str, success: bool) {
-        // Could track success rates per worker for more intelligent routing
         if !success {
-            // Optionally reduce affinity for failed requests
             tracing::debug!(
                 "Request to {} completed with success={}",
                 worker_url,
@@ -578,40 +532,205 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_aware_with_imbalanced_load() {
-        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 5,
-            balance_rel_threshold: 2.0,
-            eviction_interval_secs: 0, // Disable eviction thread
-            max_tree_size: 10000,
-        });
-
-        let worker1 = BasicWorkerBuilder::new("http://w1:8000")
-            .worker_type(WorkerType::Regular)
-            .build();
-        let worker2 = BasicWorkerBuilder::new("http://w2:8000")
-            .worker_type(WorkerType::Regular)
-            .build();
-
-        // Create significant load imbalance
-        for _ in 0..20 {
-            worker1.increment_load();
-        }
-        // worker2 has load 0
-
-        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
-        policy.init_workers(&workers);
-
-        // Should select worker2 (lower load) despite cache affinity
-        let info = SelectWorkerInfo {
-            request_text: Some("test"),
+    async fn test_newcomer_wins_when_cache_holder_saturated() {
+        // Cache holder w1 has the prefix but is buried under pending tokens;
+        // newcomer w2 has no overlap but pending=0. For short input, w2 wins.
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
             ..Default::default()
         };
-        for _ in 0..5 {
-            let idx = policy.select_worker(&workers, &info).await.unwrap();
-            assert_eq!(idx, 1); // Should always pick worker2
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        // Seed the tree so w1 owns "hello world" entirely.
+        for _ in 0..3 {
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some("hello world"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(idx, 0);
         }
+
+        // LoadMonitor reports w1 with a huge backlog, w2 idle.
+        let mut loads = std::collections::HashMap::new();
+        loads.insert("http://w1:8000".to_string(), 1_000_000);
+        loads.insert("http://w2:8000".to_string(), 0);
+        policy.update_loads(&loads);
+
+        // A short prompt: w1's pending dwarfs any cache savings → w2.
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(idx, 1, "saturated cache holder should lose to idle newcomer");
+    }
+
+    #[tokio::test]
+    async fn test_cache_holder_wins_when_balanced() {
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        // First request lands somewhere (deterministic: index 0 ties broken first).
+        let first = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("the quick brown fox"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Both workers report identical pending. The cache holder should win
+        // any subsequent identical-prefix request.
+        let mut loads = std::collections::HashMap::new();
+        loads.insert("http://w1:8000".to_string(), 10);
+        loads.insert("http://w2:8000".to_string(), 10);
+        policy.update_loads(&loads);
+
+        for _ in 0..3 {
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some("the quick brown fox"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(idx, first, "cache affinity should win when pending is equal");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pending_tokens_default_zero_for_unknown_worker() {
+        // No update_loads call has happened yet; both workers should be
+        // treated as pending=0 and the tie should break the same way every
+        // call (longest-prefix tenant wins).
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        let first = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("alpha beta"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let second = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("alpha beta"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn test_failed_load_probe_treated_as_zero() {
+        // LoadMonitor reports w1 with -1 (probe failed) — must not cause w1
+        // to be permanently preferred-or-excluded; we treat -1 as 0.
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        let mut loads = std::collections::HashMap::new();
+        loads.insert("http://w1:8000".to_string(), -1);
+        loads.insert("http://w2:8000".to_string(), 500);
+        policy.update_loads(&loads);
+
+        // w1 (treated as 0) should beat w2 (500) for a fresh prompt.
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("never seen before"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(idx, 0);
     }
 
     #[tokio::test]
