@@ -99,7 +99,9 @@ class HiSparseCoordinator:
         ) // self.compress_ratio
 
         # to have an extra page for new tokens
-        self.padded_buffer_size = self.device_buffer_size + self.page_size
+        self.padded_buffer_size = (
+            self.device_buffer_size + self.mem_pool_device.page_size
+        )
 
         self.req_to_device_buffer = torch.zeros(
             (max_num_req_slots, self.padded_buffer_size),
@@ -223,9 +225,7 @@ class HiSparseCoordinator:
         return self.req_to_host_pool[req_pool_idx, start_pos : start_pos + num_tokens]
 
     def _allocated_host_indices(self, req: Req) -> torch.Tensor:
-        allocated_len = req.kv_allocated_len
-        if self.is_dsv4_hisparse:
-            allocated_len = allocated_len // self.compress_ratio
+        allocated_len = req.kv_allocated_len // self.compress_ratio
         host_len = min(
             self._round_up_to_host_page(allocated_len),
             self.req_to_host_pool.shape[1],
