@@ -46,7 +46,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
     mrope_positions: torch.Tensor
-    hidden_states: torch.Tensor
+    hidden_states: Optional[torch.Tensor]
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     extend_seq_lens: torch.Tensor
@@ -132,12 +132,14 @@ class EAGLEDraftExtendCudaGraphRunner:
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
-            hidden_states = torch.zeros(
-                (
-                    self.max_num_token,
-                    EagleDraftExtendInput.hidden_size_for(self.eagle_worker),
-                ),
-                dtype=EagleDraftExtendInput.dtype_for(self.eagle_worker),
+            _hidden_size = EagleDraftExtendInput.hidden_size_for(self.eagle_worker)
+            hidden_states = (
+                torch.zeros(
+                    (self.max_num_token, _hidden_size),
+                    dtype=EagleDraftExtendInput.dtype_for(self.eagle_worker),
+                )
+                if _hidden_size is not None
+                else None
             )
             self.seq_len_fill_value = (
                 self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -292,7 +294,11 @@ class EAGLEDraftExtendCudaGraphRunner:
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        hidden_states = buffers.hidden_states[:num_tokens]
+        hidden_states = (
+            buffers.hidden_states[:num_tokens]
+            if buffers.hidden_states is not None
+            else None
+        )
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
         next_token_logits_buffer = buffers.next_token_logits_buffer[
@@ -462,7 +468,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
         if (
-            forward_batch.spec_info.hidden_states.shape[1]
+            buffers.hidden_states is not None
+            and forward_batch.spec_info.hidden_states is not None
+            and forward_batch.spec_info.hidden_states.shape[1]
             == buffers.hidden_states.shape[1]
         ):
             buffers.hidden_states[:num_tokens].copy_(
