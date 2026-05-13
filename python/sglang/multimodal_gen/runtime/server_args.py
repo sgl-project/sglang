@@ -320,6 +320,7 @@ class ServerArgs(DisaggArgsMixin):
         auto_tuner.adjust()
         if auto_tuner.should_apply_performance_defaults():
             self._adjust_offload()
+            auto_tuner.adjust_auto_dit_layerwise_offload()
             auto_tuner.adjust_auto_component_residency_after_offload()
             auto_tuner.adjust_auto_fsdp_after_offload()
         self._adjust_ltx2_two_stage_device_mode()
@@ -788,8 +789,6 @@ class ServerArgs(DisaggArgsMixin):
         if current_platform.is_mps():
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
-
-        ServerArgsAutoTuner(self).adjust_auto_dit_layerwise_offload()
 
     def _adjust_autocast(self):
         if self.disable_autocast is None:
