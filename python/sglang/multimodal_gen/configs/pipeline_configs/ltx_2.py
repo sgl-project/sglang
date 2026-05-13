@@ -192,7 +192,8 @@ class LTX2PipelineConfig(PipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_disable_component_offload_min_available_memory_gb=70
+            auto_disable_component_offload_min_available_memory_gb=70,
+            auto_disable_component_offload_components=("dit",),
         )
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):

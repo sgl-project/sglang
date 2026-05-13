@@ -82,13 +82,16 @@ class ServerArgsAutoTuner:
             and min_available_gb >= disable_threshold_gb
         ):
             changed = []
-            if args.dit_cpu_offload:
+            components = (
+                self._deployment_config().auto_disable_component_offload_components
+            )
+            if args.dit_cpu_offload and "dit" in components:
                 args.dit_cpu_offload = False
                 changed.append("dit_cpu_offload=False")
-            if args.text_encoder_cpu_offload:
+            if args.text_encoder_cpu_offload and "text_encoder" in components:
                 args.text_encoder_cpu_offload = False
                 changed.append("text_encoder_cpu_offload=False")
-            if args.image_encoder_cpu_offload:
+            if args.image_encoder_cpu_offload and "image_encoder" in components:
                 args.image_encoder_cpu_offload = False
                 changed.append("image_encoder_cpu_offload=False")
             if changed:

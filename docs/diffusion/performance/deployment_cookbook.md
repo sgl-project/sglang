@@ -88,7 +88,7 @@ Observed regular-scale trends:
 
 - Z-Image: single-GPU no-offload was faster than FSDP/SP in the tested setting; keep FSDP off unless memory or parallelism requires it.
 - Qwen-Image: keep the default non-FSDP path unless a specific FSDP/SP/Ring setting has been benchmarked on the target hardware.
-- Wan I2V: FSDP can replace DiT offload on validated multi-GPU workloads, while text/image encoders may still need component offload.
+- Wan: FSDP can replace DiT offload on validated multi-GPU workloads, while text/image encoders may still need component offload. Keep model-specific precision checks before making FSDP automatic for a path.
 - Component offload mainly reduced memory; it did not improve latency in the tested no-offload-vs-offload runs.
 
 Always benchmark with your actual resolution, frame count, step count, and GPU type before locking production defaults.
