@@ -87,23 +87,41 @@ def write_marker(model, tp):
 
 def kill_server(proc):
     """Kill server process tree."""
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, OSError):
-        pass
-    try:
-        proc.wait(timeout=15)
-    except subprocess.TimeoutExpired:
+    if proc.poll() is None:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except (ProcessLookupError, OSError):
             pass
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    # sglang's scheduler_TP* and detokenizer workers spawn through
+    # multiprocessing with their own session/process group, so they escape
+    # killpg on launch_server and stay alive holding GPU memory after a
+    # readiness-timeout or unclean exit. Kill any survivors by name so the
+    # next model (or the next CI step) starts with empty GPUs.
+    for pattern in ("sglang::scheduler", "sglang::detokenizer"):
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", pattern],
+                timeout=5,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
+    # Let the driver release device memory before the caller measures it.
+    time.sleep(2)
 
 
 def wait_for_server(base_url, proc, timeout):
