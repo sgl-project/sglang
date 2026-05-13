@@ -179,7 +179,7 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
     1. Parse server argument.
     2. If quant_config contains input_global_scale → NVFP4 path.
     3. Parse quant config
-    4. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes to NVFP4 internally).
+    4. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
     5. Otherwise default for NPU → BF16 (the default for NPU).
     6. Otherwise → FP8 (the default for most models like DeepSeek-V3).
     """
