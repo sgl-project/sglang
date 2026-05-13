@@ -373,16 +373,6 @@ def maybe_init_custom_mem_pool(
         return False, None, None
 
 
-def convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
-    # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
-    # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
-    if len(tokens) and isinstance(tokens[0], tuple):
-        return tokens
-    if len(tokens) < 2:
-        return []
-    return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
-
-
 def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
     hasher = hashlib.sha256()
 
