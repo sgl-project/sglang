@@ -285,7 +285,9 @@ class HummingConfig(QuantizationConfig):
 
         is_online_quant = False
         online_quant_config = envs.SGLANG_HUMMING_ONLINE_QUANT_CONFIG.get() or {}
-        if not self.full_config or online_quant_config.get("force_requant", False):
+        if online_quant_config and (
+            not self.full_config or online_quant_config.get("force_requant", False)
+        ):
             online_quant_config["quant_method"] = "humming"
             schema = self.get_layer_weight_schema(online_quant_config, prefix)
             if not self.full_config:
