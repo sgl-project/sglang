@@ -53,6 +53,16 @@ class SGLangFailuresAnalyzer:
         ]
         self.test_summaries = {}
 
+        # Counters for auth failures hit while fetching workflow runs.
+        # When the token is expired/invalid every API call returns 401,
+        # which previously caused the analyzer to silently produce an empty
+        # report (the upstream daily-report bot then had no data to file
+        # an issue from). main() inspects these counters and exits non-zero
+        # so the workflow goes red and the operator knows to rotate the
+        # token.
+        self.auth_failure_count = 0
+        self.workflow_fetch_attempts = 0
+
     def get_recent_runs(
         self,
         limit: int = 500,
@@ -77,6 +87,7 @@ class SGLangFailuresAnalyzer:
 
         for workflow_file in workflow_filter:
             print(f"Fetching runs for {workflow_file}...")
+            self.workflow_fetch_attempts += 1
 
             # Use workflow filename directly - much simpler!
             url = f"{self.base_url}/repos/{self.repo}/actions/workflows/{workflow_file}/runs"
@@ -97,6 +108,13 @@ class SGLangFailuresAnalyzer:
 
             except requests.exceptions.RequestException as e:
                 print(f"Error fetching runs for {workflow_file}: {e}")
+                # Track auth failures separately so main() can fail loudly
+                # when the token is broken instead of silently producing
+                # an empty report. 401 = bad/expired token, 403 = scope
+                # missing or rate-limited.
+                resp = getattr(e, "response", None)
+                if resp is not None and resp.status_code in (401, 403):
+                    self.auth_failure_count += 1
                 continue
 
         print(f"Collected {len(all_runs)} total runs")
@@ -2543,9 +2561,72 @@ def main():
         # pulling months of history from the unfiltered general fetch.
         runner_runs = pr_test_nvidia_scheduled_runs + nightly_nvidia_scheduled_runs
 
-        if not runner_runs and not pr_test_nvidia_scheduled_runs:
-            print("No workflow runs found")
-            return
+        # Aggregate every batch we tried to fetch above. This lets us
+        # detect a "completely empty" result (token broken / network
+        # broken) and fail loudly instead of producing an empty report.
+        all_collected_runs = (
+            pr_test_nvidia_scheduled_runs
+            + pr_test_amd_scheduled_runs
+            + pr_test_xeon_scheduled_runs
+            + pr_test_xpu_scheduled_runs
+            + pr_test_npu_scheduled_runs
+            + nightly_nvidia_scheduled_runs
+            + nightly_amd_scheduled_runs
+            + nightly_intel_scheduled_runs
+            + nightly_npu_scheduled_runs
+            + pr_test_nvidia_general_runs
+            + pr_test_amd_general_runs
+            + pr_test_xeon_general_runs
+            + pr_test_xpu_general_runs
+            + pr_test_npu_general_runs
+            + nightly_nvidia_general_runs
+            + nightly_amd_general_runs
+            + nightly_intel_general_runs
+            + nightly_npu_general_runs
+        )
+
+        if not all_collected_runs:
+            # Distinguish "token broken" (every attempt 401/403) from
+            # "GitHub API down or new account with no history". The first
+            # case must page maintainers to rotate the secret; the
+            # second is genuinely a no-op but still suspicious.
+            if (
+                analyzer.auth_failure_count > 0
+                and analyzer.auth_failure_count == analyzer.workflow_fetch_attempts
+            ):
+                print(
+                    "\nERROR: Every workflow-runs API call returned an "
+                    "auth error (401/403). The GITHUB_TOKEN passed to this "
+                    "script is most likely expired, revoked, or missing the "
+                    "'actions: read' scope. Rotate "
+                    "secrets.GH_PAT_FOR_NIGHTLY_CI_DATA in the sgl-project/"
+                    "sglang repo settings, or fall back to the workflow's "
+                    "built-in GITHUB_TOKEN (the ci-failure-monitor.yml "
+                    "workflow already declares actions: read)."
+                )
+                sys.exit(1)
+            print(
+                "\nERROR: No workflow runs found across any of the 9 "
+                "monitored workflows. This usually means the GitHub "
+                "Actions API is unavailable or the token has lost access. "
+                "Failing the job so the monitor does not silently produce "
+                "an empty daily report."
+            )
+            sys.exit(1)
+
+        # If most fetches failed with auth errors but a few somehow
+        # succeeded, still fail. The report would be misleadingly partial.
+        if analyzer.workflow_fetch_attempts > 0 and analyzer.auth_failure_count >= max(
+            1, analyzer.workflow_fetch_attempts // 2
+        ):
+            print(
+                f"\nERROR: {analyzer.auth_failure_count}/"
+                f"{analyzer.workflow_fetch_attempts} workflow-runs API "
+                "calls returned 401/403. Refusing to publish a partial "
+                "report. Rotate GH_PAT_FOR_NIGHTLY_CI_DATA or check token "
+                "scopes."
+            )
+            sys.exit(1)
 
         print("\n" + "=" * 80)
         print("ANALYZING CONSECUTIVE FAILURES")
