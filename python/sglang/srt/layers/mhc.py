@@ -9,6 +9,7 @@ import torch
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
+from sglang.srt.utils import is_sm120_supported
 
 tilelang.set_log_level("WARNING")
 
@@ -46,7 +47,7 @@ def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
 
             mixes_shared = T.alloc_shared(mix_hc, FP32)
             comb_frag = T.alloc_fragment((hc, hc), FP32)
-            T.copy(mixes[i, :], mixes_shared)
+            T.copy(mixes[i, :], mixes_shared, disable_tma=True)
 
             for j in T.Parallel(hc):
                 pre[i, j] = T.sigmoid(mixes_shared[j] * hc_scale[0] + hc_base[j]) + eps
@@ -83,7 +84,7 @@ def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
                 for j, k in T.Parallel(hc, hc):
                     comb_frag[j, k] = comb_frag[j, k] / (col_sum[k] + eps)
 
-            T.copy(comb_frag, comb[i, :, :])
+            T.copy(comb_frag, comb[i, :, :], disable_tma=True)
             if ENABLE_PDL:
                 T.pdl_trigger()
 
@@ -98,19 +99,42 @@ def hc_split_sinkhorn(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ):
+    """Pure PyTorch fallback for SM120 — avoids tilelang.jit deadlocks."""
     b, s, _ = mixes.size()
-    pre = mixes.new_empty(b, s, hc_mult)
-    post = mixes.new_empty(b, s, hc_mult)
-    comb = mixes.new_empty(b, s, hc_mult, hc_mult)
-    kernel = hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
-    kernel(
-        mixes.view(-1, (2 + hc_mult) * hc_mult),
-        hc_scale,
-        hc_base,
-        pre.view(-1, hc_mult),
-        post.view(-1, hc_mult),
-        comb.view(-1, hc_mult, hc_mult),
+    mixes_flat = mixes.view(-1, (2 + hc_mult) * hc_mult)
+
+    # pre: sigmoid of first hc_mult elements
+    pre_raw = mixes_flat[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    pre_out = torch.sigmoid(pre_raw) + eps
+
+    # post: 2 * sigmoid of next hc_mult elements
+    post_raw = (
+        mixes_flat[:, hc_mult : 2 * hc_mult] * hc_scale[1]
+        + hc_base[hc_mult : 2 * hc_mult]
     )
+    post_out = 2.0 * torch.sigmoid(post_raw)
+
+    # comb: exp(scaled + base) for remaining hc_mult*hc_mult elements, then sinkhorn normalize
+    comb_base = hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
+    comb_raw = (
+        mixes_flat[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult) * hc_scale[2]
+        + comb_base
+    )
+    comb_frag = torch.exp(comb_raw - comb_raw.max(dim=-1, keepdim=True).values)
+    row_sum = comb_frag.sum(dim=-1, keepdim=True)
+    comb_frag = comb_frag / row_sum + eps
+    col_sum = comb_frag.sum(dim=-2, keepdim=True)
+    comb_frag = comb_frag / (col_sum + eps)
+
+    for _ in range(sinkhorn_iters - 1):
+        row_sum = comb_frag.sum(dim=-1, keepdim=True)
+        comb_frag = comb_frag / (row_sum + eps)
+        col_sum = comb_frag.sum(dim=-2, keepdim=True)
+        comb_frag = comb_frag / (col_sum + eps)
+
+    pre = pre_out.view(b, s, hc_mult)
+    post = post_out.view(b, s, hc_mult)
+    comb = comb_frag.view(b, s, hc_mult, hc_mult)
     return pre, post, comb
 
 
@@ -171,7 +195,7 @@ def mhc_pre_big_fuse_tilelang(
                 mixes[j] += gemm_out_mul[i_split, i, j]
             mixes[j] *= rms[0]
         mixes_shared = T.alloc_shared(hc_mult3, T.float32)
-        T.copy(mixes, mixes_shared)
+        T.copy(mixes, mixes_shared, disable_tma=True)
 
         if T.get_thread_binding() < 32:
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
@@ -223,11 +247,11 @@ def mhc_pre_big_fuse_tilelang(
                     )
                     + hc_pre_eps
                 )
-            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
+            for i0_h in T.serial(hidden_size // hidden_block):
                 xs = T.alloc_shared((hc_mult, hidden_block), T.float32)
                 xl = T.alloc_fragment((hc_mult, hidden_block), T.float32)
-                T.copy(residual[i, 0, i0_h * hidden_block], xs)
-                T.copy(xs, xl)
+                T.copy(residual[i, 0, i0_h * hidden_block], xs, disable_tma=True)
+                T.copy(xs, xl, disable_tma=True)
 
                 ol = T.alloc_fragment(hidden_block, T.float32)
                 T.clear(ol)
@@ -237,7 +261,7 @@ def mhc_pre_big_fuse_tilelang(
                     for i1_h in T.Parallel(hidden_block):
                         ol[i1_h] += pre * xl[i_hc, i1_h]
 
-                T.copy(ol, layer_input[i, i0_h * hidden_block])
+                T.copy(ol, layer_input[i, i0_h * hidden_block], disable_tma=True)
 
         if ENABLE_PDL:
             T.pdl_trigger()
@@ -271,7 +295,7 @@ def mhc_pre_gemm_sqrsum_tilelang(
         T.clear(sqrsum_part)
         if ENABLE_PDL:
             T.pdl_sync()
-        for pz in T.Pipelined(hc_hidden_size // hidden_block, num_stages=2):
+        for pz in T.serial(hc_hidden_size // hidden_block):
             x_smem_16 = T.alloc_shared((token_block, hidden_block), T.bfloat16)
             fn_smem = T.alloc_shared((32, hidden_block), T.float32)
 
@@ -279,13 +303,13 @@ def mhc_pre_gemm_sqrsum_tilelang(
                 {x_smem_16: tilelang.layout.make_swizzled_layout(x_smem_16)}
             )
 
-            T.copy(x[px * token_block, pz * hidden_block], x_smem_16)
-            T.copy(fn[0, pz * hidden_block], fn_smem)
+            T.copy(x[px * token_block, pz * hidden_block], x_smem_16, disable_tma=True)
+            T.copy(fn[0, pz * hidden_block], fn_smem, disable_tma=True)
 
             x_frag_16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
-            T.copy(x_smem_16, x_frag_16)
+            T.copy(x_smem_16, x_frag_16, disable_tma=True)
             x_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
-            T.copy(x_frag_16, x_frag)
+            T.copy(x_frag_16, x_frag, disable_tma=True)
 
             for jj in T.serial(hidden_block // 4):
                 for i, j in T.Parallel(token_block, 4):
@@ -351,7 +375,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
             if ENABLE_PDL:
                 T.pdl_sync()
 
-            for pz in T.Pipelined(split_size // hidden_block, num_stages=2):
+            for pz in T.serial(split_size // hidden_block):
                 x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
                 fn_smem = T.alloc_shared((32, hidden_block), T.float32)
 
@@ -359,13 +383,17 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                     {x_smem: tilelang.layout.make_swizzled_layout(x_smem)}
                 )
 
-                T.copy(x[px * token_block, k_base + pz * hidden_block], x_smem)
-                T.copy(fn[0, k_base + pz * hidden_block], fn_smem)
+                T.copy(
+                    x[px * token_block, k_base + pz * hidden_block],
+                    x_smem,
+                    disable_tma=True,
+                )
+                T.copy(fn[0, k_base + pz * hidden_block], fn_smem, disable_tma=True)
 
                 x_f16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
-                T.copy(x_smem, x_f16)
+                T.copy(x_smem, x_f16, disable_tma=True)
                 x_f = T.alloc_fragment((token_block, hidden_block), T.float32)
-                T.copy(x_f16, x_f)
+                T.copy(x_f16, x_f, disable_tma=True)
 
                 for jj in T.serial(hidden_block // 4):
                     for i, j in T.Parallel(token_block, 4):
@@ -493,8 +521,13 @@ def mhc_pre(
 
     if num_tokens <= 2048:
         assert n_splits == 1
+        # SM120 (consumer Blackwell) has only ~99KB shared memory per block.
+        # The splitk kernel with hidden_block=256 and 2-stage pipelining uses
+        # ~96KB shared memory (x_smem*2 + fn_smem*2), which is very close to
+        # the 99KB limit. Use hidden_block=128 on SM120 to stay well within limits.
+        _is_sm120 = is_sm120_supported()
         if hc_hidden_size == 16384:
-            hidden_block = 256
+            hidden_block = 128 if _is_sm120 else 256
         elif hc_hidden_size == 28672:
             hidden_block = 128
         else:
@@ -598,22 +631,22 @@ def mhc_post_tilelang(
 
         a_local = T.alloc_fragment((hc, hc), T.float32)
         c_local = T.alloc_fragment(hc, T.float32)
-        T.copy(a[i_n, 0, 0], a_local)
-        T.copy(c[i_n, 0], c_local)
+        T.copy(a[i_n, 0, 0], a_local, disable_tma=True)
+        T.copy(c[i_n, 0], c_local, disable_tma=True)
 
-        for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=2):
-            T.copy(b[i_n, 0, i0_h * h_blk], b_shared)
-            T.copy(d[i_n, i0_h * h_blk], d_shared)
+        for i0_h in T.serial(T.ceildiv(h, h_blk)):
+            T.copy(b[i_n, 0, i0_h * h_blk], b_shared, disable_tma=True)
+            T.copy(d[i_n, i0_h * h_blk], d_shared, disable_tma=True)
 
-            T.copy(b_shared, b_local)
-            T.copy(d_shared, d_local)
+            T.copy(b_shared, b_local, disable_tma=True)
+            T.copy(d_shared, d_local, disable_tma=True)
             for i_hco, i1_h in T.Parallel(hc, h_blk):
                 x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
                 for i_hci in T.serial(hc):
                     x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
-            T.copy(x_local, x_shared)
+            T.copy(x_local, x_shared, disable_tma=True)
 
-            T.copy(x_shared, x[i_n, 0, i0_h * h_blk])
+            T.copy(x_shared, x[i_n, 0, i0_h * h_blk], disable_tma=True)
 
         if ENABLE_PDL:
             T.pdl_trigger()

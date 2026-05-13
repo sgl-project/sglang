@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -122,7 +123,7 @@ class PagedIndexerMetadata(IndexerMetadata):
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or not ENABLE_JIT_DEEPGEMM:
             self.deep_gemm_metadata = None
         else:
             import deep_gemm

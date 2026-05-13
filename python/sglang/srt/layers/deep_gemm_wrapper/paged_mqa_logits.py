@@ -1,10 +1,13 @@
 from dataclasses import dataclass
 from typing import List, Union
 
-import deep_gemm
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+
+if ENABLE_JIT_DEEPGEMM:
+    import deep_gemm
 
 
 @dataclass

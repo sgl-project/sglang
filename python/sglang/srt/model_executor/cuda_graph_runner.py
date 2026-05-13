@@ -542,8 +542,29 @@ class CudaGraphRunner:
             if memory_saver_adapter.enabled
             else self.device_module.graph
         )
-        with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
-            out = run_once_fn()
+
+        # SM120 debug: enable sync debug mode to catch implicit syncs during capture
+        import os as _os
+
+        if _os.environ.get("SGLANG_DEBUG_CUDA_GRAPH_CAPTURE") == "1":
+            self.device_module.set_sync_debug_mode("error")
+            logger.info("CUDA sync debug mode enabled for graph capture")
+
+        try:
+            with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
+                out = run_once_fn()
+        except Exception as e:
+            if _os.environ.get("SGLANG_DEBUG_CUDA_GRAPH_CAPTURE") == "1":
+                self.device_module.set_sync_debug_mode("default")
+            logger.error(f"Graph capture FAILED: {type(e).__name__}: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            raise
+        finally:
+            if _os.environ.get("SGLANG_DEBUG_CUDA_GRAPH_CAPTURE") == "1":
+                self.device_module.set_sync_debug_mode("default")
+
         return out
 
     def _create_device_graph(self):
@@ -733,6 +754,11 @@ class CudaGraphRunner:
             self.model_runner.tp_group.barrier()
             run_once()
             attn_backend.on_after_cuda_graph_warmup_pass()
+
+        # Sync after warmup to catch any async CUDA errors before capture
+        self.device_module.synchronize()
+        self.model_runner.tp_group.barrier()
+        logger.info(f"Warmup completed for bs={bs}, starting capture")
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())

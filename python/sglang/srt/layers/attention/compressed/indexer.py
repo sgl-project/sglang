@@ -45,44 +45,64 @@ def fp8_paged_mqa_logits_torch(
     max_seq_len: int,
     clean_logits: bool = True,
 ) -> torch.Tensor:
+    """CUDA-graph compatible FP8 paged MQA logits.
+
+    Retains the original per-batch loop structure for correctness, but replaces
+    .item() calls with GPU-only ops. For decode (bs=1), the loop runs once.
+    """
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
-    block_size = kvcache_fp8.shape[1]
+    block_size = kvcache_fp8.shape[1]  # 64
 
-    assert head_dim == 128, "TODO"
-    assert block_size == 64, "TODO"
-    assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
-    assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
-    assert weight.shape == (batch_size, num_heads)
-    assert seq_lens.shape == (batch_size,)
-    assert page_table.shape[0] == batch_size
-    assert clean_logits == False
+    if seq_lens.dim() == 2 and seq_lens.shape[1] == 1:
+        seq_lens = seq_lens.squeeze(-1)
 
-    logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
+    logits = page_table.new_zeros((batch_size, max_seq_len), dtype=torch.float32)
+    SCALE_OFFSET = block_size * head_dim
+
+    # Use max_pages from page_table columns
+    max_pages_in_table = page_table.shape[1]
+    # Pre-compute arange for valid token masking (avoid re-creation per batch)
+    token_arange = torch.arange(max_seq_len, device=seq_lens.device)
+
+    kvcache_flat = kvcache_fp8.reshape(-1, block_size * (head_dim + 4))
+    num_total_pages = kvcache_flat.shape[0]
+
     for i in range(batch_size):
-        q = q_fp8[i, 0]
-        q = q.to(torch.float32)
-        q_scale = weight[i]
-        seq_len = int(seq_lens[i].item())
-        assert seq_len <= max_seq_len
-        num_pages = (seq_len + block_size - 1) // block_size
-        padded_seq_len = num_pages * block_size
-        pages = page_table[i, :num_pages]
-        kvcache_fp8 = kvcache_fp8.view(-1, block_size * (head_dim + 4))
-        kvcache = kvcache_fp8[pages]
-        SCALE_OFFSET = block_size * head_dim
-        kvcache_value = kvcache[..., :SCALE_OFFSET].view(dtype=FP8_DTYPE)
-        kvcache_scale = kvcache[..., SCALE_OFFSET:].view(dtype=torch.float32)
-        kvcache_value = kvcache_value.to(torch.float32)
-        kvcache_scale = kvcache_scale.contiguous()
-        kvcache_value = kvcache_value.view(padded_seq_len, head_dim)
-        kvcache_scale = kvcache_scale.view(padded_seq_len)
-        score = F.linear(kvcache_value, q)
-        score = F.relu(score)
-        score *= q_scale[None, :]
-        score = score.sum(dim=1)
-        score *= kvcache_scale
-        logits[i, :seq_len] = score[:seq_len]
+        q = q_fp8[i, 0].to(torch.float32)  # (num_heads, head_dim)
+        q_scale = weight[i]  # (num_heads,)
+
+        # Gather pages for this batch item (GPU-only, no .item())
+        pages = page_table[i].clamp(0, num_total_pages - 1)  # (max_pages,)
+        kvcache = kvcache_flat[pages]  # (max_pages, block_size * (head_dim + 4))
+
+        # Split value and scale
+        kvcache_value = kvcache[..., :SCALE_OFFSET].reshape(-1, head_dim)
+        kvcache_value = kvcache_value.view(FP8_DTYPE).to(torch.float32)
+        kvcache_scale = (
+            kvcache[..., SCALE_OFFSET:].contiguous().view(torch.float32).reshape(-1)
+        )
+
+        padded_len = kvcache_value.shape[0]
+
+        # Score: F.linear(Q_flat, K) -> (padded_len, num_heads)
+        score = F.linear(kvcache_value, q)  # (padded_len, num_heads)
+        score = torch.relu(score)
+        score = score * q_scale.unsqueeze(0)  # broadcast per-head weight
+        score = score.sum(dim=1)  # (padded_len,)
+        score = score * kvcache_scale  # apply KV scale
+
+        # Mask invalid tokens using GPU comparison (no .item())
+        # seq_len is on GPU, arange is on GPU — all GPU ops
+        valid_len = seq_lens[i]  # GPU scalar tensor, no sync
+        valid_mask = token_arange[:padded_len] < valid_len
+        # Truncate to max_seq_len if needed
+        store_len = min(padded_len, max_seq_len)
+        score_valid = score[:store_len]
+        mask_valid = valid_mask[:store_len]
+        logits[i, :store_len] = torch.where(
+            mask_valid, score_valid, torch.zeros_like(score_valid)
+        )
 
     return logits
 
@@ -136,27 +156,27 @@ def topk_transform_512_pytorch_vectorized(
         pad_mask = torch.arange(TOPK, device=device).unsqueeze(0) >= actual_k
         valid_topk = valid_topk & ~pad_mask
 
+    # CUDA graph compatible: compute sequential path unconditionally,
+    # select with torch.where (no .any() GPU->CPU sync)
     needs_sequential = seq_lens <= TOPK
-    if needs_sequential.any():
-        sequential_indices = (
-            torch.arange(TOPK, device=device, dtype=torch.int32)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
+    sequential_indices = (
+        torch.arange(TOPK, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+    sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
 
-        raw_indices = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK),
-            torch.where(
-                sequential_valid,
-                sequential_indices,
-                torch.tensor(-1, device=device, dtype=torch.int32),
-            ),
-            raw_indices,
-        )
-        valid_topk = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK), sequential_valid, valid_topk
-        )
+    needs_seq_expand = needs_sequential.unsqueeze(1).expand(-1, TOPK)
+    raw_indices = torch.where(
+        needs_seq_expand,
+        torch.where(
+            sequential_valid,
+            sequential_indices,
+            torch.tensor(-1, device=device, dtype=torch.int32),
+        ),
+        raw_indices,
+    )
+    valid_topk = torch.where(needs_seq_expand, sequential_valid, valid_topk)
 
     page_idx = raw_indices >> page_bits
     offset_in_page = raw_indices & page_mask
@@ -379,12 +399,16 @@ class C4IndexerBackend:
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             fn = fp8_paged_mqa_logits_torch
         else:
-            if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
-                from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
-                    fp8_paged_mqa_logits_chunked as fn,
-                )
-            else:
-                from deep_gemm import fp8_paged_mqa_logits as fn
+            try:
+                if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
+                    from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
+                        fp8_paged_mqa_logits_chunked as fn,
+                    )
+                else:
+                    from deep_gemm import fp8_paged_mqa_logits as fn
+            except (ImportError, RuntimeError, FileNotFoundError):
+                # DeepGEMM not available or SM120 unsupported, use PyTorch fallback
+                fn = fp8_paged_mqa_logits_torch
 
         _c4sl = indexer_metadata.c4_seq_lens
         if _c4sl.dim() == 1:

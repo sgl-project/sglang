@@ -612,7 +612,7 @@ class NativeSparseAttnBackend(
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
-            except (ImportError, ModuleNotFoundError):
+            except (ImportError, ModuleNotFoundError, RuntimeError):
                 paged_mqa_schedule_metadata = None
 
         metadata = NSAMetadata(
@@ -894,7 +894,7 @@ class NativeSparseAttnBackend(
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
-            except (ImportError, ModuleNotFoundError):
+            except (ImportError, ModuleNotFoundError, RuntimeError):
                 paged_mqa_schedule_metadata = None
 
         metadata = NSAMetadata(
@@ -1067,7 +1067,7 @@ class NativeSparseAttnBackend(
                     metadata.paged_mqa_schedule_metadata = new_schedule
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            except (ImportError, ModuleNotFoundError):
+            except (ImportError, ModuleNotFoundError, RuntimeError):
                 metadata.paged_mqa_schedule_metadata = None
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (

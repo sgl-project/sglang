@@ -465,7 +465,17 @@ struct CombinedTopKKernel {
           .enable_pdl(true)(kernel, params);
     } else {
       // Some items may be large -- launch stage-1 + main
-      if (batch_size <= kNumClusters) {
+      // SM120 (consumer Blackwell, CC 12.0) has only ~99KB shared memory per block.
+      // kStage1SMEM (~144KB) exceeds this limit, so skip the cluster path on SM120
+      // and use only the Medium/Small (stage-2) paths which fit in ~84KB.
+      int device_cc_major = 0;
+      {
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, 0);
+        device_cc_major = prop.major;
+      }
+      const bool is_sm120 = (device_cc_major == 12);
+      if (!is_sm120 && batch_size <= kNumClusters) {
         // can fuse into 1 stage
         constexpr auto kernel = topk_fused_transform;
         constexpr auto kSMEM = std::max(kStage1SMEM, kStage2SMEM);
@@ -473,7 +483,7 @@ struct CombinedTopKKernel {
         LaunchKernel({batch_size, kClusterSize}, kBlockSize, device, kSMEM)
             .enable_cluster({1, kClusterSize})
             .enable_pdl(true)(kernel, params);
-      } else {
+      } else if (!is_sm120) {
         // stage 1 + stage 2
         constexpr auto kernel_stage_1 = topk_combine_preprocess;
         setup_kernel_smem_once<kernel_stage_1, kStage1SMEM>();
@@ -485,6 +495,12 @@ struct CombinedTopKKernel {
         setup_kernel_smem_once<kernel_stage_2, kStage2SMEM>();
         LaunchKernel(batch_size, kBlockSize, device, kStage2SMEM)  //
             .enable_pdl(true)(kernel_stage_2, params);
+      } else {
+        // SM120 fallback: use only stage-2 (Small/Medium) path which fits in ~84KB
+        constexpr auto kernel = topk_short_transform;
+        setup_kernel_smem_once<kernel, kStage2SMEM>();
+        LaunchKernel(batch_size, kBlockSize, device, kStage2SMEM)
+            .enable_pdl(true)(kernel, params);
       }
     }
   }
