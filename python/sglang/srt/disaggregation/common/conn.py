@@ -350,7 +350,7 @@ class CommonKVManager(BaseKVManager):
         `Connection refused`, and the leader's `prefill_port_table` ends
         up missing rows.
         """
-        if not self.dist_init_addr:
+        if not self.dist_init_addr or self.server_args.nnodes == 1:
             return local_port
 
         if not (dist.is_available() and dist.is_initialized()):
