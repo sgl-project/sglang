@@ -231,9 +231,6 @@ class ElasticEPStateManager:
 _PEER_STATE_POLL_INTERVAL_SEC = 0.01
 
 
-def _get_process_group_backend(process_group, device: str):
-    return process_group._get_backend(torch.device(device))
-
 
 def _iter_live_parallel_groups() -> Iterator[parallel_state.GroupCoordinator]:
     groups = []
@@ -252,10 +249,10 @@ def _map_global_to_group_local_ranks(
     return [rank_to_local[rank] for rank in global_ranks if rank in rank_to_local]
 
 
-def _wait_for_peer_state(mooncake_ep, backend, ranks: List[int]) -> None:
+def _wait_for_peer_state(mooncake_ep, process_group, ranks: List[int]) -> None:
     # Relaunched ranks become recoverable asynchronously, so we poll until the
-    # target backend reports all requested peers as ready.
-    while not all(mooncake_ep.get_peer_state(backend, ranks)):
+    # target process group reports all requested peers as ready.
+    while not all(mooncake_ep.get_peer_state(process_group, ranks)):
         time.sleep(_PEER_STATE_POLL_INTERVAL_SEC)
 
 
@@ -279,30 +276,30 @@ def _refresh_ep_members() -> None:
 def can_recover_ranks(global_ranks: List[int]) -> bool:
     from mooncake import ep as mooncake_ep
 
-    world_backend = _get_process_group_backend(torch.distributed.group.WORLD, "cuda")
-    return all(mooncake_ep.get_peer_state(world_backend, global_ranks))
+    world_group = torch.distributed.group.WORLD
+    return all(mooncake_ep.get_peer_state(world_group, global_ranks))
 
 
 def recover_ranks(global_ranks: List[int]) -> None:
     from mooncake import ep as mooncake_ep
 
-    # Recover the world backend first, then recover each derived process group
+    # Recover the world process group first, then recover each derived process group
     # using ranks mapped into that group's local rank space.
-    world_backend = _get_process_group_backend(torch.distributed.group.WORLD, "cuda")
-    mooncake_ep.recover_ranks(world_backend, global_ranks)
+    world_group = torch.distributed.group.WORLD
+    mooncake_ep.recover_ranks(world_group, global_ranks)
 
     for group in _iter_live_parallel_groups():
         group_local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
         if not group_local_ranks:
             continue
 
-        device_backend = _get_process_group_backend(group.device_group, "cuda")
-        _wait_for_peer_state(mooncake_ep, device_backend, group_local_ranks)
-        mooncake_ep.recover_ranks(device_backend, group_local_ranks)
+        device_group = group.device_group
+        _wait_for_peer_state(mooncake_ep, device_group, group_local_ranks)
+        mooncake_ep.recover_ranks(device_group, group_local_ranks)
 
-        cpu_backend = _get_process_group_backend(group.cpu_group, "cpu")
-        _wait_for_peer_state(mooncake_ep, cpu_backend, group_local_ranks)
-        mooncake_ep.recover_ranks(cpu_backend, group_local_ranks)
+        cpu_group = group.cpu_group
+        _wait_for_peer_state(mooncake_ep, cpu_group, group_local_ranks)
+        mooncake_ep.recover_ranks(cpu_group, group_local_ranks)
         _maybe_create_message_queue(group)
 
     _refresh_ep_members()
@@ -311,26 +308,26 @@ def recover_ranks(global_ranks: List[int]) -> None:
 def join_process_groups():
     from mooncake import ep as mooncake_ep
 
-    def join_backend(label: str, backend) -> None:
-        logger.info("Recovered rank joining Mooncake backend %s", label)
-        mooncake_ep.join_group(backend)
+    def join_process_group(label: str, process_group) -> None:
+        logger.info("Recovered rank joining Mooncake process group %s", label)
+        mooncake_ep.join_group(process_group)
 
-    join_backend(
+    join_process_group(
         "default_world",
-        _get_process_group_backend(torch.distributed.group.WORLD, "cuda"),
+        torch.distributed.group.WORLD,
     )
 
     for group in _iter_live_parallel_groups():
         if group.world_size <= 1:
             continue
 
-        join_backend(
+        join_process_group(
             f"{group.unique_name}:device",
-            _get_process_group_backend(group.device_group, "cuda"),
+            group.device_group,
         )
-        join_backend(
+        join_process_group(
             f"{group.unique_name}:cpu",
-            _get_process_group_backend(group.cpu_group, "cpu"),
+            group.cpu_group,
         )
         _maybe_create_message_queue(group)
 
