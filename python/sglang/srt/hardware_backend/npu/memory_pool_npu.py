@@ -1,7 +1,6 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import torch_npu
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import (
@@ -10,9 +9,13 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
 )
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+
+if is_npu():
+    import torch_npu
 
 
 def _init_npu_conv_state(
@@ -291,6 +294,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.k_buffer[layer_id - self.start_layer],
             self.v_buffer[layer_id - self.start_layer],
         )
+
+    def get_state_buf_infos(self):
+        data_ptrs = [self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)]
+        data_lens = [self.index_k_buffer[i].nbytes for i in range(self.layer_num)]
+        item_lens = [self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)]
+        return data_ptrs, data_lens, item_lens
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
