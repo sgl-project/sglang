@@ -48,6 +48,7 @@ class UnifiedRadixTreeTestMixin:
     prefix_len: int = 512
     prefill_cache_assert = None
     decode_cache_assert = None
+    sampling_temperature: float = 1
 
     gsm8k_threshold: float = 0.93
     mmlu_threshold: float = 0.8
@@ -106,6 +107,7 @@ class UnifiedRadixTreeTestMixin:
             turn_suffixes=[t2, t3],
             assert_decode_cached_tokens=self.decode_cache_assert,
             max_new_tokens=self.max_new_tokens,
+            sampling_temperature=self.sampling_temperature,
         )
 
     def test_multiturn_prefill_cache_hit_branching(self):
@@ -135,6 +137,7 @@ class UnifiedRadixTreeTestMixin:
             assert_decode_cached_tokens=self.decode_cache_assert,
             branches_per_group=branches,
             max_new_tokens=self.max_new_tokens,
+            sampling_temperature=self.sampling_temperature,
         )
 
     def test_multiturn_decode_cache_hit_branching(self):
@@ -159,6 +162,7 @@ class UnifiedRadixTreeTestMixin:
             assert_decode_cached_tokens=self.decode_cache_assert,
             branches_per_group=branches,
             max_new_tokens=self.max_new_tokens,
+            sampling_temperature=self.sampling_temperature,
         )
 
 
