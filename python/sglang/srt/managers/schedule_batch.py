@@ -60,6 +60,7 @@ from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.prefix_cache_key import encode_prefix_cache_key_parts
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -680,10 +681,9 @@ class Req(ReqDllmMixin):
         self.return_hidden_states = return_hidden_states
 
         # extra key for classifying the request (e.g. cache_salt)
-        if lora_id is not None:
-            extra_key = (
-                extra_key or ""
-            ) + lora_id  # lora_id is concatenated to the extra key
+        extra_key = encode_prefix_cache_key_parts(
+            [("extra_key", extra_key), ("lora_id", lora_id)]
+        )
 
         self.extra_key = extra_key
         self.lora_id = lora_id
