@@ -61,8 +61,8 @@ class TestAscendW8A8CompressedTensors(GSM8KAscendMixin, CustomTestCase):
         res = self.run_decode(max_tokens)
         tok = time.perf_counter()
         throughput = max_tokens / (tok - tic)
-        summary = res["text"] + f"\nThroughput: {throughput} tokens/s"
-        print(summary)
+        summary = f"\nThroughput: {throughput} tokens/s"
+        print(res["text"] + summary)
 
         if is_in_ci():
             write_github_step_summary(summary + "\nThroughput threshold: 25 tokens/s")

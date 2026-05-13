@@ -570,7 +570,6 @@ def run_bench_serving(
 
 
 HEADER = """
-### Models
 | Model | Server | Client | Output Throughput | Expected Output Throughput | Latency | Expected Latency | Accuracy | Expected Accuracy | Status |
 | ----- | ------ | ------ | -------- | ------------------ | ------- | ---------------- | -------- | --------- | ------ |
 """
