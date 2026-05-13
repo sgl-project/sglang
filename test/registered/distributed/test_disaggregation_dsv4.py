@@ -15,23 +15,24 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=500, suite="stage-c-test-dsv4-8-gpu-h200")
 
-DSV4_FLASH_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 DSV4_FLASH_ENV = {
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+    "SGLANG_DSV4_FP4_EXPERTS": "0",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
 }
 
 _EAGLE_SPEC_ARGS = [
     "--speculative-algorithm",
     "EAGLE",
     "--speculative-num-steps",
-    "3",
+    "1",
     "--speculative-eagle-topk",
     "1",
     "--speculative-num-draft-tokens",
-    "4",
+    "2",
 ]
 
 
@@ -39,7 +40,6 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
         cls.model = try_cached_model(DSV4_FLASH_MODEL)
 
