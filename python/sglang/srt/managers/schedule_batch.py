@@ -2419,22 +2419,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     (0,), dtype=torch.int64, device=self.device
                 )
             else:
-                # already on device
-                all_buffers = torch.stack(
-                    [req.mamba_ping_pong_track_buffer for req in self.reqs]
-                )
-                idx = (
-                    torch.tensor(
-                        [req.mamba_next_track_idx for req in self.reqs],
-                        dtype=torch.int64,
-                        pin_memory=True,
-                    )
-                    .unsqueeze(1)
-                    .to(device=all_buffers.device, non_blocking=True)
-                )
-                self.mamba_track_indices = (
-                    torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
-                )
+                set_mamba_track_indices_from_reqs(self)
 
             # async H2D
             self.mamba_track_mask = (
@@ -2698,9 +2683,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
-            mamba_cow_src_indices=self.mamba_cow_src_indices,
-            mamba_cow_dst_indices=self.mamba_cow_dst_indices,
-            mamba_clear_indices=self.mamba_clear_indices,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             forward_iter=self.forward_iter,
