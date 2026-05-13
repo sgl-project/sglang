@@ -40,7 +40,7 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-RUN pip3 install torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
+RUN uv pip install --no-cache-dir torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
 
 WORKDIR /sgl-workspace
 
