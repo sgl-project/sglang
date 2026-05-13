@@ -351,6 +351,7 @@ Consider updating perf_baselines.json with the snippets below:
         )
 
         summary = validator.collect_metrics(perf_record)
+        self._print_performance_log(case, summary, scenario)
 
         if case.run_perf_check:
             if is_baseline_generation_mode:
@@ -399,6 +400,44 @@ Consider updating perf_baselines.json with the snippets below:
         print(
             f"[DEBUG _validate_and_record] Appended result for {case.id}, class {self.__class__.__name__} now has {len(self.__class__._perf_results)} results"
         )
+
+    def _print_performance_log(
+        self,
+        case: DiffusionTestCase,
+        summary: PerformanceSummary,
+        scenario: ScenarioConfig | None,
+    ) -> None:
+        lines = [
+            "",
+            f"--- Performance Log: {case.id} ---",
+            (
+                f"  e2e={summary.e2e_ms:.2f}ms, "
+                f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
+                f"median_denoise={summary.median_denoise_ms:.2f}ms"
+            ),
+        ]
+        if scenario is not None:
+            lines.append(
+                "  baseline: "
+                f"e2e={scenario.expected_e2e_ms:.2f}ms, "
+                f"avg_denoise={scenario.expected_avg_denoise_ms:.2f}ms, "
+                f"median_denoise={scenario.expected_median_denoise_ms:.2f}ms"
+            )
+        if summary.stage_metrics:
+            stages = ", ".join(
+                f"{name}={duration:.2f}ms"
+                for name, duration in summary.stage_metrics.items()
+            )
+            lines.append(f"  stages: {stages}")
+        if summary.all_denoise_steps:
+            # ci retries need the exact outlier, not only sampled checkpoints
+            steps = ", ".join(
+                f"{idx}={duration:.2f}ms"
+                for idx, duration in sorted(summary.all_denoise_steps.items())
+            )
+            lines.append(f"  denoise_steps: {steps}")
+        lines.append(f"--- End Performance Log: {case.id} ---")
+        print("\n".join(lines), flush=True)
 
     def _check_for_improvement(
         self,
