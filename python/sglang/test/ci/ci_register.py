@@ -16,7 +16,12 @@ __all__ = [
     "ut_parse_one_file",
 ]
 
+# Positional argument order. `suite` stays in slot 2 for backward compat with
+# `register_cpu_ci(1.0, "stage-a-test-cpu")` style positional calls. New
+# fields (`stage`, `runner`) are kwarg-only.
 _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
+_KWARG_ONLY = ("stage", "runner")
+_ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
 
 
@@ -33,23 +38,47 @@ class CIRegistry:
     filename: str
     # Estimated time to run the test in seconds.
     est_time: float
-    # The suite this test is registered in.
-    suite: str
+    # New-style fields. Mutually exclusive with `suite` below.
+    #   stage="stage-b", runner="1-gpu-small"  →  effective_suite "stage-b-test-1-gpu-small"
+    stage: Optional[str] = None
+    runner: Optional[str] = None
+    # Legacy single-string suite name. Held for nightly suites + AMD/NPU
+    # per-commit suites that haven't migrated yet.
+    suite: Optional[str] = None
     # Whether the test is a nightly test.
     nightly: bool = False
     # Reason for disabling the test. None = enabled, string = disabled with reason.
     disabled: Optional[str] = None
 
+    @property
+    def effective_suite(self) -> str:
+        """Single suite-name string, regardless of how the test was registered."""
+        if self.stage is not None and self.runner is not None:
+            return f"{self.stage}-test-{self.runner}"
+        return self.suite
+
 
 def register_cpu_ci(
-    est_time: float, suite: str, nightly: bool = False, disabled: Optional[str] = None
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner: Optional[str] = None,
 ):
     """Marker for CPU CI registration (parsed via AST; runtime no-op)."""
     return None
 
 
 def register_cuda_ci(
-    est_time: float, suite: str, nightly: bool = False, disabled: Optional[str] = None
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner: Optional[str] = None,
 ):
     """Marker for CUDA CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -57,9 +86,12 @@ def register_cuda_ci(
 
 def register_amd_ci(
     est_time: float,
-    suite: str,
+    suite: Optional[str] = None,
     nightly: bool = False,
     disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner: Optional[str] = None,
 ):
     """Marker for AMD CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -67,9 +99,12 @@ def register_amd_ci(
 
 def register_npu_ci(
     est_time: float,
-    suite: str,
+    suite: Optional[str] = None,
     nightly: bool = False,
     disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner: Optional[str] = None,
 ):
     """Marker for NPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -94,10 +129,8 @@ class RegistryVisitor(ast.NodeVisitor):
             return node.value
         return _UNSET
 
-    def _parse_call_args(
-        self, func_call: ast.Call
-    ) -> tuple[float, str, bool, Optional[str]]:
-        args = {name: _UNSET for name in _PARAM_ORDER}
+    def _parse_call_args(self, func_call: ast.Call) -> dict:
+        args = {name: _UNSET for name in _ALL_PARAMS}
         seen = set()
 
         if any(isinstance(arg, ast.Starred) for arg in func_call.args):
@@ -129,23 +162,48 @@ class RegistryVisitor(ast.NodeVisitor):
             seen.add(kw.arg)
             args[kw.arg] = self._constant_value(kw.value)
 
-        if args["est_time"] is _UNSET or args["suite"] is _UNSET:
+        if args["est_time"] is _UNSET:
             raise ValueError(
-                f"{self.filename}: est_time and suite are required constants in {func_call.func.id}()"
+                f"{self.filename}: est_time is a required constant in {func_call.func.id}()"
             )
 
-        est_time, suite = args["est_time"], args["suite"]
-        nightly_value = args["nightly"]
+        # Exactly one of (stage+runner) pair or `suite` must be specified.
+        has_pair = args["stage"] is not _UNSET and args["runner"] is not _UNSET
+        has_suite = args["suite"] is not _UNSET
+        if has_pair and has_suite:
+            raise ValueError(
+                f"{self.filename}: cannot mix (stage, runner) and suite in {func_call.func.id}()"
+            )
+        if not has_pair and not has_suite:
+            raise ValueError(
+                f"{self.filename}: must specify either (stage, runner) or suite in {func_call.func.id}()"
+            )
+        if (args["stage"] is _UNSET) != (args["runner"] is _UNSET):
+            raise ValueError(
+                f"{self.filename}: stage and runner must be set together in {func_call.func.id}()"
+            )
 
+        est_time = args["est_time"]
         if not isinstance(est_time, (int, float)):
             raise ValueError(
                 f"{self.filename}: est_time must be a number in {func_call.func.id}()"
             )
-        if not isinstance(suite, str):
+
+        suite = args["suite"] if has_suite else None
+        if suite is not None and not isinstance(suite, str):
             raise ValueError(
                 f"{self.filename}: suite must be a string in {func_call.func.id}()"
             )
 
+        stage = args["stage"] if has_pair else None
+        runner = args["runner"] if has_pair else None
+        for name, value in (("stage", stage), ("runner", runner)):
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"{self.filename}: {name} must be a string in {func_call.func.id}()"
+                )
+
+        nightly_value = args["nightly"]
         if nightly_value is _UNSET:
             nightly = False
         elif isinstance(nightly_value, bool):
@@ -161,7 +219,14 @@ class RegistryVisitor(ast.NodeVisitor):
                 f"{self.filename}: disabled must be a string in {func_call.func.id}()"
             )
 
-        return float(est_time), suite, nightly, disabled
+        return {
+            "est_time": float(est_time),
+            "stage": stage,
+            "runner": runner,
+            "suite": suite,
+            "nightly": nightly,
+            "disabled": disabled,
+        }
 
     def _collect_ci_registry(self, func_call: ast.Call):
         if not isinstance(func_call.func, ast.Name):
@@ -171,14 +236,11 @@ class RegistryVisitor(ast.NodeVisitor):
         if backend is None:
             return None
 
-        est_time, suite, nightly, disabled = self._parse_call_args(func_call)
+        parsed = self._parse_call_args(func_call)
         return CIRegistry(
             backend=backend,
             filename=self.filename,
-            est_time=est_time,
-            suite=suite,
-            nightly=nightly,
-            disabled=disabled,
+            **parsed,
         )
 
     @staticmethod

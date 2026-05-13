@@ -88,7 +88,7 @@ def compute_partitions(tests, full_parallel=False):
             continue
         if t.nightly or t.disabled is not None:
             continue
-        suite_tests[t.suite].append(t)
+        suite_tests[t.effective_suite].append(t)
 
     result = {}
     for suite, group in suite_tests.items():
