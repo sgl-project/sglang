@@ -174,7 +174,7 @@ EOF
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
 
   # Install cache-dit for qwen_image_t2i_cache_dit_enabled test (added in PR 16204)
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache cache-dit || echo "cache-dit installation failed"
+  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'cache-dit==1.3.0' || echo "cache-dit installation failed"
 
   # Install accelerate for distributed training and inference support
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
@@ -306,7 +306,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # build AITER
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
