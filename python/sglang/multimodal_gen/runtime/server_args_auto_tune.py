@@ -123,6 +123,8 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if not self.should_apply_performance_defaults():
             return
+        if self._explicit_memory_policy:
+            return
         deployment_config = self._deployment_config()
         if envs.SGLANG_CACHE_DIT_ENABLED:
             return
@@ -166,6 +168,7 @@ class ServerArgsAutoTuner:
                 args.pipeline_config.__class__.__name__,
             )
             args.dit_layerwise_offload = True
+            args.dit_cpu_offload = False
 
     def finalize_auto_flags(self) -> None:
         """if some args are unset after all the adjustment, set them to defaults"""
