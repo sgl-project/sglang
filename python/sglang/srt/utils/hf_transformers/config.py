@@ -18,6 +18,10 @@ from typing import Optional
 
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sglang.srt.configs.nano_nemotron_vl import (
+    NEMOTRON_ARCH_ALIASES,
+    NemotronH_Nano_VL_V2_Config,
+)
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, lru_cache_frozenset
 
@@ -74,6 +78,18 @@ def get_config(
     else:
         config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+
+    archs = getattr(config, "architectures", None) or []
+    if archs and NEMOTRON_ARCH_ALIASES.get(archs[0]) == "NemotronH_Nano_VL_V2":
+        original_arch = archs[0]
+        raw = config.to_dict()
+        raw["architectures"] = ["NemotronH_Nano_VL_V2"]
+        raw["model_type"] = "NemotronH_Nano_VL_V2"
+        raw.pop("auto_map", None)
+        config = NemotronH_Nano_VL_V2_Config.from_dict(raw)
+        logger.info(
+            "Coerced renamed-arch %s -> NemotronH_Nano_VL_V2", original_arch
         )
 
     if (
