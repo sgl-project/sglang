@@ -33,6 +33,7 @@ from sglang.omni.bridges.sensenova_u1.context import (
     build_u1_native_t2i_prepared_input,
     build_u1_native_vlm_prepared_input,
 )
+from sglang.omni.protocol import GeneratedSegment
 from sglang.omni.streaming import STREAMED_TEXT_METADATA_KEY, OmniStreamSink
 from sglang.srt.omni_session.bridge import SRTBackedOmniSessionBridge
 from sglang.srt.omni_session.model_policy import (
@@ -84,23 +85,17 @@ def build_sensenova_u1_srt_bridge(
     """
 
     if srt_request_executor is None:
-        if scheduler is None:
-            raise ValueError(
-                "SenseNova U1 requires an attached SRT scheduler so AR owns the session/KV"
-            )
         srt_request_executor = OmniSRTSchedulerExecutor(scheduler)
     if srt_ar_decode_max_new_tokens is None:
         srt_ar_decode_max_new_tokens = DEFAULT_U1_INTERLEAVE_DECODE_MAX_NEW_TOKENS
     session_controller = srt_request_executor.session_controller
-    model_config = getattr(scheduler, "model_config", None)
+    tokenizer = scheduler.tokenizer
     runtime = OmniSessionRuntime(
-        model_policy=U1OmniSessionModelPolicy(
-            native_tokenizer=getattr(scheduler, "tokenizer", None)
-        ),
+        model_policy=U1OmniSessionModelPolicy(native_tokenizer=tokenizer),
         session_controller=session_controller,
         srt_request_executor=srt_request_executor,
-        tokenizer=getattr(scheduler, "tokenizer", None),
-        vocab_size=getattr(model_config, "vocab_size", 32000),
+        tokenizer=tokenizer,
+        vocab_size=scheduler.model_config.vocab_size,
         srt_ar_decode_max_new_tokens=srt_ar_decode_max_new_tokens,
     )
     return U1SRTBackedOmniSessionBridge(runtime)
@@ -685,7 +680,7 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         self,
         *,
         contexts: OmniContextBundle,
-        segment: Any,
+        segment: GeneratedSegment,
     ) -> None:
         self._bridge.commit_generated_segment(contexts=contexts, segment=segment)
         self._commit_interleave_text_uncondition_path(
@@ -755,15 +750,13 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         self,
         *,
         contexts: OmniContextBundle,
-        segment: Any,
+        segment: GeneratedSegment,
     ) -> None:
         policy = self._u1_policy()
         tokenizer = None if policy is None else policy.native_tokenizer
         if tokenizer is None or contexts.full.session is None:
             return
-        image = getattr(segment, "commit_image", None)
-        if image is None:
-            image = getattr(segment, "image", None)
+        image = segment.commit_image
         if image is None:
             return
         condition_path_handle = self.runtime.get_condition_path_handle(

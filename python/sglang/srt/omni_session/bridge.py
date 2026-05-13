@@ -3,6 +3,7 @@
 
 from typing import Any
 
+from sglang.omni.protocol import GeneratedSegment
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniInterleavedMessage,
@@ -154,7 +155,7 @@ class SRTBackedOmniSessionBridge:
         )
 
     def commit_generated_segment(
-        self, *, contexts: OmniContextBundle, segment: Any
+        self, *, contexts: OmniContextBundle, segment: GeneratedSegment
     ) -> None:
         if segment.type != "image":
             raise ValueError(f"omni commit expects image segment, got {segment.type}")

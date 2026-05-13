@@ -61,18 +61,16 @@ class OmniSRTTemporaryForwardBatch:
     released: bool = False
 
     def release(self) -> None:
-        """
-        release the temporary kv slots allocated for denoise
-        """
+        """release scratch KV allocated for one denoise context forward"""
         if self.released:
             return
         self.released = True
         try:
-            # 4. release temporary query KV after the denoise forward
             if self.synchronize_before_release and self.out_cache_loc.is_cuda:
                 # 1. wait for kernels that may still read temporary KV slots
                 torch.cuda.current_stream(self.out_cache_loc.device).synchronize()
             if self.owned_cache_loc is not None:
+                # 2. release temporary query KV after the denoise forward
                 self.token_to_kv_pool_allocator.free(self.owned_cache_loc)
         finally:
             free_mamba_cache = getattr(self.req_to_token_pool, "free_mamba_cache", None)
@@ -250,7 +248,9 @@ class OmniSRTSchedulerExecutor:
     ) -> OmniSRTTemporaryForwardBatch:
         """build a temporary extend batch that reads a committed SRT context
 
-        This is required by cocolated omni model (like U1) which needs to access KV cache from srt seesion
+        Colocated omni models such as U1 use this adapter when diffusion denoise
+        needs SRT model attention over the live session KV without committing
+        the denoise query tokens into that session.
         """
 
         model_runner: ModelRunner = self._require_model_runner()
@@ -292,6 +292,7 @@ class OmniSRTSchedulerExecutor:
                 "Temporary context forward binding token_count exceeds token_indices length"
             )
 
+        # 1. materialize diffusion query shape before borrowing ModelRunner state
         generation_input = prepared.generation_input
         packed_seqlens = generation_input.get("packed_seqlens")
         packed_position_ids = generation_input.get("packed_position_ids")
@@ -337,18 +338,19 @@ class OmniSRTSchedulerExecutor:
         self._check_context_capacity(req_to_token_pool, seq_len)
         scheduler_exclusive_lease = self._enter_temporary_context_region()
         try:
+            # 2. ensure scheduler state will not mutate while denoise reads SRT KV
             self._check_scheduler_idle_for_temporary_context()
         except Exception:
             if scheduler_exclusive_lease is not None:
                 scheduler_exclusive_lease.release()
             raise
 
-        # 3. allocate temporary query KV without committing it to the session
         temp_req = None
         out_cache_loc = None
         owned_cache_loc = None
         context = None
         try:
+            # 3. allocate scratch query KV without committing it to the session
             temp_req = self._alloc_temp_req_slot(req_to_token_pool)
             out_cache_loc, owned_cache_loc = self._alloc_temporary_context_cache(
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -390,6 +392,7 @@ class OmniSRTSchedulerExecutor:
                 scheduler_exclusive_lease=scheduler_exclusive_lease,
             )
             scheduler_exclusive_lease = None
+            # 4. initialize SRT attention metadata over prefix KV + scratch query KV
             prepare_forward_batch = getattr(
                 model_runner.model, "prepare_forward_batch", None
             )

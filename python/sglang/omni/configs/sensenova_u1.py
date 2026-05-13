@@ -244,7 +244,11 @@ def _build_default_generation_backend(
 def _resolve_omni_max_concurrent_generations(
     srt_server_args: "SRTServerArgs | None",
 ) -> int:
-    value = getattr(srt_server_args, "omni_max_concurrent_generations", 1)
+    value = (
+        1
+        if srt_server_args is None
+        else srt_server_args.omni_max_concurrent_generations
+    )
     if value is None:
         value = 1
     value = int(value)
@@ -260,7 +264,7 @@ def _build_diffusion_server_kwargs(
     srt_server_args: "SRTServerArgs | None",
 ) -> dict[str, Any]:
     kwargs = _parse_diffusion_server_args(
-        getattr(srt_server_args, "diffusion_server_args", None)
+        None if srt_server_args is None else srt_server_args.diffusion_server_args
     )
     kwargs.setdefault("model_path", _resolve_model_path(srt_server_args))
     kwargs["pipeline_class_name"] = "SenseNovaU1Pipeline"
@@ -375,7 +379,7 @@ def _validate_diffusion_server_args(server_args: "DiffusionServerArgs") -> None:
 
 def _resolve_model_path(server_args: "SRTServerArgs | None") -> str:
     if server_args is not None:
-        model_path = getattr(server_args, "model_path", None)
+        model_path = server_args.model_path
         if model_path:
             return model_path
     return SenseNovaU1OmniPlugin.model_name
