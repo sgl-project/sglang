@@ -1002,6 +1002,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
             lora_use_virtual_experts=self.lora_use_virtual_experts,
+            # CPU-side flag from LoRAManager.prepare_lora_batch; read by
+            # build_lora_hooks to skip fused_moe_lora when no real adapter
+            # is active in the batch.
+            has_active_lora=bool(getattr(batch_info, "has_active_lora", True)),
         )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):

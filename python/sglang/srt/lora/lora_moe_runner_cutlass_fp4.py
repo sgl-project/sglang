@@ -5,7 +5,7 @@ MoE forward (see ``ModelOptNvFp4FusedMoEMethod.apply``).  That upstream
 call is a single black-box kernel that performs the entire MoE forward
 in one shot, leaving no hook between w13 and w2 to inject a LoRA delta.
 We therefore break the forward open into the same FP4 group GEMMs the
-primitive uses and insert standard LoRA hooks between them — mirroring
+primitive uses and insert standard LoRA hooks between them, mirroring
 the structure of ``MarlinLoraRunnerCore``.
 
 Layout bridge between the FP4 group GEMM and the LoRA hooks:
@@ -16,10 +16,9 @@ Layout bridge between the FP4 group GEMM and the LoRA hooks:
   ``build_lora_hooks``) expect **token-major** ``[M, topk, *]`` layout.
 
 We bridge with ``shuffle_rows(out, c_map, ...)`` to un-sort to token-major
-before the hook fires, then re-sort back with ``shuffle_rows(..., a_map)``
-for the next FP4 GEMM.  For w2 the un-sort doubles as the combine
-permutation we already needed, so only the w13 path pays the extra
-``shuffle_rows`` round-trip.
+before the hook fires, then re-sort back with the inverse ``c_map`` for the
+next FP4 GEMM.  For w2 the output un-sort doubles as the combine permutation
+we already needed; only the w2 hook input needs a separate un-sort.
 
 The core is wired in ``MoeRunner.__init__`` under
 ``runner_backend.is_flashinfer_cutlass() and lora_enabled``.
@@ -65,7 +64,7 @@ class CutlassFp4MoeQuantInfo(MoeQuantInfo):
     w13 loader layout (Kimi-K2.5).
     """
 
-    # Packed FP4 weights (uint8) — viewable as torch.long for the cutlass
+    # Packed FP4 weights (uint8), viewable as torch.long for the cutlass
     # primitive.
     w13_weight: torch.Tensor  # [E, 2 * N, K // 2] uint8
     w2_weight: torch.Tensor  # [E, K, N // 2]     uint8
@@ -108,13 +107,13 @@ class CutlassFp4LoraRunnerCore:
          from ``prepare_moe_input``).
       2. Base FP4 GEMM 1 (w13)            via ``cutlass_fp4_group_mm``.
       3. ``shuffle_rows(.., c_map)``      un-sort -> token-major.
-      4. ``hooks.after_gate_up(...)``     standard LoRA delta (proven).
-      5. ``shuffle_rows(.., a_map)``      re-sort -> expert-sorted.
+      4. ``hooks.after_gate_up(...)``     standard LoRA delta.
+      5. ``shuffle_rows(.., inv_c_map)``  re-sort -> expert-sorted.
       6. ``silu_and_mul``                 (or ``[up | gate]`` variant).
       7. Base FP4 GEMM 2 (w2)             via ``cutlass_fp4_group_mm``.
       8. ``shuffle_rows(.., c_map)``      un-sort -> token-major
                                           (also needed for combine).
-      9. ``hooks.after_down(...)``        standard LoRA delta (proven).
+      9. ``hooks.after_down(...)``        standard LoRA delta.
       10. Combine (topk weighting + reduce).
     """
 
@@ -151,7 +150,7 @@ class CutlassFp4LoraRunnerCore:
         E = quant_info.num_local_experts
         K = quant_info.hidden_size
         # ``prepare_moe_input`` expects the *un-doubled* intermediate size as
-        # its ``n`` argument — it derives ``problem_sizes1`` (whose ``n`` is
+        # its ``n`` argument; it derives ``problem_sizes1`` (whose ``n`` is
         # ``2 * inter`` for stacked w13) internally.  ``N`` below is the
         # doubled w13 output width used for ``silu_and_mul`` / ``shuffle_rows``.
         inter = quant_info.intermediate_size_per_partition
@@ -165,7 +164,7 @@ class CutlassFp4LoraRunnerCore:
         # ``StandardDispatcher`` skips local-id remapping for flashinfer_cutlass
         # (it hands global topk_ids to the kernel which handles EP internally),
         # so we do it here.  Non-local tokens get routed to local expert 0 with
-        # weight 0.0 — they pay GEMM cost but contribute zero to the combine.
+        # weight 0.0; they pay GEMM cost but contribute zero to the combine.
         local_offset = quant_info.moe_ep_rank * E
         local_ids = topk_ids.to(torch.int32) - local_offset
         non_local = (local_ids < 0) | (local_ids >= E)
@@ -212,16 +211,33 @@ class CutlassFp4LoraRunnerCore:
         # The hook builder ``build_lora_hooks`` produces closures that operate
         # on token-major ``[M, topk, 2*N]``, matching what Marlin / Triton MoE
         # cores hand them.  ``cutlass_fp4_group_mm`` writes expert-sorted
-        # output, so un-sort with ``c_map`` first, then re-sort with
-        # ``a_map`` for the next GEMM.
+        # output, so un-sort with ``c_map`` first (``c_map[pair] = sorted_pos``
+        # so ``token_major[pair] = expert_sorted[c_map[pair]]``), then re-sort
+        # with ``inv_c_map`` to put the post-hook deltas back into
+        # expert-sorted order for the next FP4 GEMM.
+        #
+        # NOTE: do NOT use ``a_map`` for the inverse shuffle.  ``a_map[sorted_pos]
+        # = token_index`` (an M-index), not a pair-index.  That works for the
+        # input-quant shuffle (whose source is the ``[M, K]`` token tensor) but
+        # produces the wrong row when the source is the ``[M*topk, *]`` pair
+        # tensor.  For ``topk > 1`` it silently picks the (token, k=0) entry
+        # for every sorted_pos, corrupting the output for every other topk
+        # position.
         if hooks is not None and hooks.after_gate_up is not None:
+            inv_c_map = torch.empty_like(c_map)
+            inv_c_map[c_map.long()] = torch.arange(
+                total_tokens, device=c_map.device, dtype=c_map.dtype
+            )
+
             gateup_token_major = shuffle_rows(gateup_flat, c_map, (total_tokens, N))
             gateup_3d = gateup_token_major.view(m_a, num_topk, N)
             hooks.after_gate_up(hidden_states, gateup_3d, topk_weights, topk_ids)
             gateup_flat = shuffle_rows(
-                gateup_token_major.view(total_tokens, N), a_map, (total_tokens, N)
+                gateup_token_major.view(total_tokens, N),
+                inv_c_map,
+                (total_tokens, N),
             )
-            del gateup_token_major, gateup_3d
+            del gateup_token_major, gateup_3d, inv_c_map
 
         # ---------------------------------------- silu + mul
         if quant_info.w13_swap_halves:
@@ -263,18 +279,20 @@ class CutlassFp4LoraRunnerCore:
         out_3d = out_token_major.view(m_a, num_topk, K)
         del out_flat
 
+        # Match the standard hook contract: the down hook adds a router-weighted
+        # delta into an already-router-weighted per-expert output.
+        if not runner_config.apply_router_weight_on_input:
+            out_3d = out_3d * local_weights.view(m_a, num_topk, 1).to(out_dtype)
+
         # ---------------------------------------- LoRA w2 delta via hook
         if hooks is not None and hooks.after_down is not None:
-            # ``intermediate`` is the input to the w2 GEMM; pass it as the
-            # "down input" the hook expects.  It is still in expert-sorted
-            # layout, but the existing ``_add_lora_down_delta`` only uses it
-            # for activation shape / dtype and routes via ``topk_ids`` —
-            # safe to hand over as-is.
-            hooks.after_down(intermediate, out_3d, topk_weights, topk_ids)
+            intermediate_token_major = shuffle_rows(
+                intermediate, c_map, (total_tokens, N // 2)
+            )
+            hooks.after_down(intermediate_token_major, out_3d, local_weights, topk_ids)
+            del intermediate_token_major
 
         del intermediate
 
         # ---------------------------------------- combine
-        if not runner_config.apply_router_weight_on_input:
-            out_3d = out_3d * local_weights.view(m_a, num_topk, 1).to(out_dtype)
         return StandardCombineInput(hidden_states=out_3d.sum(dim=1).to(out_dtype))
