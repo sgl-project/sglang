@@ -37,6 +37,8 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
 class FluxPipelineConfig(ImagePipelineConfig):
     """Configuration for the FLUX pipeline."""
 
+    continuous_batching_supported_tasks = (ModelTaskType.T2I,)
+
     embedded_cfg_scale: float = 3.5
 
     task_type: ModelTaskType = ModelTaskType.T2I
@@ -121,9 +123,6 @@ class FluxPipelineConfig(ImagePipelineConfig):
 
     def get_text_encoder_pooler_output(self, outputs, encoder_index):
         return outputs.pooler_output
-
-    def supports_continuous_batching(self):
-        return True
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
@@ -451,9 +450,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     embedded_cfg_scale: float = 4.0
 
     task_type: ModelTaskType = ModelTaskType.TI2I
-
-    def supports_continuous_batching(self):
-        return False
 
     vae_precision: str = "bf16"
 
