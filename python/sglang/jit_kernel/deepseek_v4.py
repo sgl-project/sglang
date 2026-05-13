@@ -9,6 +9,7 @@ import triton.language as tl
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -307,13 +308,18 @@ def topk_transform_512(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    if out_page_indices.shape[1] == 512:
-        module = _jit_topk_module()
+    if is_hip_runtime():
+        torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
+            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        )
     else:
-        module = _jit_topk1024_module()
-    module.topk_transform(
-        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
-    )
+        if out_page_indices.shape[1] == 512:
+            module = _jit_topk_module()
+        else:
+            module = _jit_topk1024_module()
+        module.topk_transform(
+            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        )
 
 
 _WORKSPACE_INTS_PER_BATCH = 2 + 1024 * 2
