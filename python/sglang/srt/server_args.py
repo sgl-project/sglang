@@ -3281,6 +3281,21 @@ class ServerArgs:
                     self.chunked_prefill_size
                 ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
 
+        # When Mega MoE is enabled together with EP, both the Mega MoE path
+        # (decode) and the normal/DeepEP path (prefill fallback) share the
+        # same MoE weights at runtime. Auto-enable FIX_MEGA_MOE_MEMORY so
+        # they share one copy instead of duplicating.
+        if (
+            envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
+            and self.ep_size > 1
+            and not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set()
+        ):
+            envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
+            logger.info(
+                "Mega MoE with EP enabled: auto-setting "
+                "SGLANG_OPT_FIX_MEGA_MOE_MEMORY=True to share weights."
+            )
+
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
