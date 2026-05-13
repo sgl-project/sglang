@@ -85,7 +85,9 @@ class BreakableCudaGraphRunner:
         self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
-        self._debug_log_enabled = os.environ.get("SGLANG_BCG_DEBUG_LOG", "").lower() in (
+        self._debug_log_enabled = os.environ.get(
+            "SGLANG_BCG_DEBUG_LOG", ""
+        ).lower() in (
             "1",
             "true",
             "yes",
@@ -195,8 +197,7 @@ class BreakableCudaGraphRunner:
             return
         self._debug_can_run_count += 1
         logger.info(
-            "[BCG_DEBUG] can_run=%s reason=%s num_tokens=%s max_num_tokens=%s "
-            "%s %s",
+            "[BCG_DEBUG] can_run=%s reason=%s num_tokens=%s max_num_tokens=%s " "%s %s",
             decision,
             reason,
             num_tokens,
@@ -432,11 +433,10 @@ class BreakableCudaGraphRunner:
         if self._has_inactive_dp_rank(forward_batch):
             self._debug_log_can_run(forward_batch, False, "inactive_dp_rank")
             return False
-        if (
-            getattr(forward_batch, "global_num_tokens_cpu", None) is not None
-            and not getattr(
-                forward_batch, "can_run_dp_piecewise_cuda_graph", False
-            )
+        if getattr(
+            forward_batch, "global_num_tokens_cpu", None
+        ) is not None and not getattr(
+            forward_batch, "can_run_dp_piecewise_cuda_graph", False
         ):
             self._debug_log_can_run(
                 forward_batch, False, "dp_piecewise_cuda_graph_disabled"
@@ -490,10 +490,7 @@ class BreakableCudaGraphRunner:
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
 
-        if (
-            self._debug_log_enabled
-            and self._debug_replay_count < self._debug_log_limit
-        ):
+        if self._debug_log_enabled and self._debug_replay_count < self._debug_log_limit:
             self._debug_replay_count += 1
             logger.info(
                 "[BCG_DEBUG] replay raw_num_tokens=%s static_num_tokens=%s %s %s",

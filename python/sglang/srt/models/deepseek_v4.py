@@ -17,7 +17,10 @@ from sglang.jit_kernel.deepseek_v4 import (
     fused_rope_inplace,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
@@ -621,7 +624,9 @@ class MQALayer(nn.Module):
         attn_q = q_padded if q_padded is not None else q
         attn_k = kv if kv is not None else q
         save_kv_cache = False
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+        if forward_batch.forward_mode.is_extend() and (
+            is_in_breakable_cuda_graph() or is_in_piecewise_cuda_graph()
+        ):
             o = attn_q.new_empty(
                 (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
             )
