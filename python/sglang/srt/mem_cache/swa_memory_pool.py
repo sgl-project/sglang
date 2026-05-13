@@ -214,20 +214,55 @@ class SWAKVPool(BaseSWAKVPool):
         src_loc_swa = self.translate_loc_from_full_to_swa(src_loc)
         self.swa_kv_pool.move_kv_cache(tgt_loc_swa, src_loc_swa)
 
+    def _filter_swa_cpu_copy(self, swa_kv_cpu, row_mask: torch.Tensor):
+        if swa_kv_cpu is None:
+            return None
+        if row_mask is None or bool(torch.all(row_mask).item()):
+            return swa_kv_cpu
+
+        chunk_size = getattr(
+            self.swa_kv_pool, "cpu_offloading_chunk_size", len(row_mask)
+        )
+        filtered = []
+        for layer_chunks in swa_kv_cpu:
+            if len(layer_chunks) == 0:
+                filtered.append([])
+                continue
+
+            k_cpu = torch.cat([chunk[0] for chunk in layer_chunks], dim=0)
+            v_cpu = torch.cat([chunk[1] for chunk in layer_chunks], dim=0)
+            k_cpu = k_cpu[row_mask]
+            v_cpu = v_cpu[row_mask]
+
+            filtered_layer = []
+            for i in range(0, len(k_cpu), chunk_size):
+                filtered_layer.append(
+                    [k_cpu[i : i + chunk_size], v_cpu[i : i + chunk_size]]
+                )
+            filtered.append(filtered_layer)
+        return filtered
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         # For SWA, we need to copy KV cache from both full and SWA pools
         # The indices are for the full pool, and we use mapping to get SWA indices
         full_kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
 
-        # Get SWA indices through the mapping
-        # Note: SWA allocation always creates 1:1 mapping, so no need to filter
+        swa_mask = None
         if self.full_to_swa_index_mapping is not None:
             swa_indices = self.full_to_swa_index_mapping[indices]
-            swa_kv_cpu = self.swa_kv_pool.get_cpu_copy(swa_indices)
+            # Slot 0 is reserved as a dummy slot. Tail-only SWA allocations leave
+            # the out-of-window full KV indices unmapped, so only copy mapped SWA
+            # tokens and keep their positions for load_cpu_copy().
+            swa_mask = swa_indices > 0
+            if torch.any(swa_mask):
+                swa_kv_cpu = self.swa_kv_pool.get_cpu_copy(swa_indices[swa_mask])
+                swa_mask = swa_mask.cpu()
+            else:
+                swa_kv_cpu = None
         else:
             swa_kv_cpu = None
 
-        return {"full": full_kv_cpu, "swa": swa_kv_cpu}
+        return {"full": full_kv_cpu, "swa": swa_kv_cpu, "swa_mask": swa_mask}
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         # Load KV cache back from CPU to both full and SWA pools
@@ -241,6 +276,20 @@ class SWAKVPool(BaseSWAKVPool):
         # Load SWA KV cache if it exists
         if swa_kv_cpu is not None and self.full_to_swa_index_mapping is not None:
             swa_indices = self.full_to_swa_index_mapping[indices]
+            new_swa_mask = swa_indices > 0
+            old_swa_mask = kv_cache_cpu.get("swa_mask")
+            if old_swa_mask is not None:
+                old_swa_mask = old_swa_mask.to(indices.device)
+                row_mask = new_swa_mask[old_swa_mask].cpu()
+                swa_indices = swa_indices[old_swa_mask][row_mask.to(indices.device)]
+            else:
+                row_mask = new_swa_mask.cpu()
+                swa_indices = swa_indices[new_swa_mask]
+
+            if swa_indices.numel() == 0:
+                return
+
+            swa_kv_cpu = self._filter_swa_cpu_copy(swa_kv_cpu, row_mask)
             self.swa_kv_pool.load_cpu_copy(swa_kv_cpu, swa_indices)
 
 
@@ -435,6 +484,71 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
 
+        return alloc_full_indices
+
+    def alloc_extend_swa_tail(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,  # last_loc for full layers
+        extend_num_tokens: int,
+        swa_tail_len: int,
+    ):
+        """Allocate full KV for the whole extend and SWA KV only for the tail.
+
+        This is used by disaggregated decode preallocation: decode receives full
+        prompt KV for full-attention layers, but only the sliding-window state is
+        transferred for SWA layers.
+        """
+        assert self.page_size > 1
+        assert len(seq_lens_cpu) == 1, "SWA tail allocation currently supports bs=1"
+        assert len(prefix_lens_cpu) == 1
+        assert 0 <= swa_tail_len <= extend_num_tokens
+
+        num_full_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
+        )
+        num_swa_pages = (swa_tail_len + self.page_size - 1) // self.page_size
+        if num_full_pages > self.full_attn_allocator.available_size() // self.page_size:
+            return None
+        if num_swa_pages > self.swa_attn_allocator.available_size() // self.page_size:
+            return None
+
+        alloc_full_indices = self.full_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        assert alloc_full_indices is not None
+
+        if swa_tail_len == 0:
+            return alloc_full_indices
+
+        device = self.device
+        swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
+        swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
+        swa_seq_lens = torch.tensor([swa_tail_len], dtype=torch.int64, device=device)
+        swa_seq_lens_cpu = torch.tensor([swa_tail_len], dtype=torch.int64)
+        swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+
+        alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
+            swa_prefix_lens,
+            swa_prefix_lens_cpu,
+            swa_seq_lens,
+            swa_seq_lens_cpu,
+            swa_last_loc,
+            swa_tail_len,
+        )
+        assert alloc_swa_indices is not None
+
+        self.full_to_swa_index_mapping[alloc_full_indices[-swa_tail_len:]] = (
+            alloc_swa_indices
+        )
         return alloc_full_indices
 
     def alloc_decode(
