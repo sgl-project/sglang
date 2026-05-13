@@ -271,6 +271,9 @@ def init_mori_op(
                 block_num = 256
                 warp_num_per_block = 16
 
+    # Fp8 blockwise combine uses its own internal scale_dim driven which can be
+    # overridden by env ``MORI_FP8_COMBINE_SCALE_DIM`` (default 56)
+    # See https://github.com/ROCm/mori/blob/96ffa169710f214e76e07abe5008d686fe54522b/python/mori/ops/dispatch_combine.py#L81-L84
     combine_quant_type = "none"
     if combine_dtype == CombineDtype.fp8:
         combine_quant_type = "fp8_blockwise"
