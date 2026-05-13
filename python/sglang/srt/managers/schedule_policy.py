@@ -782,12 +782,13 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, truncation_align_size: Optional[int]
     ):
-        # Reuse path: this req was admitted in a previous iter, has a row
-        # with committed KV (kv_committed_len > 0), and is mid-prefill. Skip
-        # fresh-req setup (lock_ref already held by previous stash;
-        # init_load_back already ran on first admission; prefix already
-        # counted in tree). DLLM has its own path and never takes reuse here.
-        is_resume = req.kv_committed_len > 0 and not req.is_dllm()
+        # Reuse path: this req's previous chunk left lock_ref held, prefix
+        # already in tree, and init_load_back already consumed host KV. We
+        # must skip fresh-req setup. Gate on `has_pending_chunk` (the
+        # persistent chunked-resume flag) — `kv_committed_len > 0` alone is
+        # wider (streaming-session turn N>1 also has it without being
+        # chunked-resume) and would skip _req_inc_lock_ref incorrectly.
+        is_resume = req.has_pending_chunk and not req.is_dllm()
 
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
