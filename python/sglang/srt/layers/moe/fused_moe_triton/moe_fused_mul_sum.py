@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from torch._subclasses.fake_tensor import FakeTensor
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.utils import get_device_capability
 
 
 @triton.jit
@@ -81,10 +81,11 @@ def _heuristic_config(
     element_size: int,
 ):
     is_fp32 = element_size > 2
-    is_sm90_plus = current_platform.has_device_capability(90)
-    is_sm80_before = not current_platform.has_device_capability(80)
+    major, _ = get_device_capability()
+    is_sm90_plus = major is not None and major >= 9
+    is_sm80_before = major is None or major < 8
 
-    if current_platform.has_device_capability(90):
+    if is_sm90_plus:
         # SM90/SM100+: prefer small tiles + many CTAs.
         if is_fp32:
             BLOCK_M = 1 if num_tokens <= 4 else 2
