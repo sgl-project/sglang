@@ -130,9 +130,6 @@ def _compute_pad_value(hash: int) -> int:
 
 
 class BaseFinishReason:
-    def __init__(self, is_error: bool = False):
-        self.is_error = is_error
-
     def to_json(self):
         raise NotImplementedError()
 
@@ -187,7 +184,7 @@ class FINISH_LENGTH(BaseFinishReason):
 
 class FINISH_ABORT(BaseFinishReason):
     def __init__(self, message=None, status_code=None, err_type=None):
-        super().__init__(is_error=True)
+        super().__init__()
         self.message = message or "Aborted"
         self.status_code = status_code
         self.err_type = err_type
@@ -623,7 +620,6 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.origin_input_text = origin_input_text
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
             if origin_input_ids_unpadded
@@ -777,8 +773,6 @@ class Req(ReqDllmMixin):
         self.logprob_start_len = 0
         self.top_logprobs_num = top_logprobs_num
         self.token_ids_logprob = token_ids_logprob
-        self.temp_scaled_logprobs = False
-        self.top_p_normalized_logprobs = False
 
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.

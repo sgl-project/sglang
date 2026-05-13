@@ -37,7 +37,6 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
-from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -557,10 +556,6 @@ class TokenizerWorker(TokenizerManager):
         )
         self.disaggregation_transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
-        )
-        # Communicator
-        self.register_multi_tokenizer_communicator = FanOutCommunicator(
-            self.send_to_scheduler, 2
         )
 
         # Register this worker with the router for pause/continue broadcasting

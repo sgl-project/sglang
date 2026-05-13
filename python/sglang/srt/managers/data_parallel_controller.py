@@ -135,9 +135,6 @@ class DataParallelController:
         )
         self.run_scheduler_process_func = run_scheduler_process_func
 
-        # For DP balance
-        self.global_balance_id = 0
-
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
         if server_args.node_rank == 0:
