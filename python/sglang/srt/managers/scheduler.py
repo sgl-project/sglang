@@ -2492,6 +2492,16 @@ class Scheduler(
         # Per-req loop over waiting_queue covers chunked-resume; DLLM staging
         # reqs are owned by DllmManager (not in waiting_queue), handled
         # separately below.
+        #
+        # Why this runs at the iter boundary (not at the end of the prior iter):
+        # admission inside get_new_batch_prefill_raw reads req.prefix_indices to
+        # decide extend_input_len. Stashing in the middle of admission would let
+        # a chunked-resume req "match itself" — the tree would expose KV this
+        # same req just wrote, double-counting it as cached prefix. Keeping
+        # stash here means admission only ever sees tree state that is stable
+        # for the duration of the scheduling pass. vLLM / TokenSpeed do not
+        # need this because their admission reads a single monotone counter
+        # (num_computed_tokens / FSM state), not a prefix-indices splice.
         for req in self.waiting_queue:
             if req.has_pending_chunk and not req.is_dllm():
                 maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
