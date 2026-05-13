@@ -1656,6 +1656,20 @@ class SchedulerDecoupledSpecMixin:
                 delattr(req, "_decoupled_verify_pre_committed_len")
             if hasattr(req, "_decoupled_verify_snapshot_raw_tail_tokens"):
                 delattr(req, "_decoupled_verify_snapshot_raw_tail_tokens")
+        if verify_commit_messages:
+            # Applying a VerifyCommit needs the raw bonus-candidate anchor in
+            # DraftTailBuffer; without it `_apply_commit_locked` falls into the
+            # bonus_match=False branch and unconditionally advances
+            # `can_accept_prefix_len`, which causes any in-flight drafter
+            # stream outputs still based on the old committed prefix to be
+            # rejected as `stale_base` and silently dropped. Block here until
+            # each committed request has at least one tail token so the
+            # anchor-match decision is exact and consistent with the drafter,
+            # otherwise consistency is lost.
+            draft_tail_buffer.wait_for_draft_tokens(
+                [message.request_id for message in verify_commit_messages],
+                1,
+            )
         if trace_enabled:
             duration_ms = (time.perf_counter_ns() - trace_start_ns) / 1_000_000
             self.decoupled_spec_tracer.record(
