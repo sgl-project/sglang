@@ -56,6 +56,15 @@ class TestTraceFunctions(unittest.TestCase):
         self.assertEqual(mod.global_trace_level, 5)
         mod.global_trace_level = orig
 
+    def test_global_trace_level_env_var(self):
+        import importlib
+
+        with patch.dict(os.environ, {"SGLANG_TRACE_LEVEL": "2"}):
+            importlib.reload(mod)
+            self.assertEqual(mod.global_trace_level, 2)
+        importlib.reload(mod)  # restore default (SGLANG_TRACE_LEVEL unset → 3)
+        self.assertEqual(mod.global_trace_level, 3)
+
     def test_get_global_tracing_enabled(self):
         self.assertEqual(get_global_tracing_enabled(), mod.opentelemetry_initialized)
 

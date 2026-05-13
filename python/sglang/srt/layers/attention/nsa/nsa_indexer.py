@@ -266,15 +266,8 @@ class Indexer(MultiPlatformOp):
         # avoiding an expensive FP8-to-bf16 dequantization.
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            weight = self.weights_proj.weight
-            out = torch.empty(
-                (x.shape[0], weight.shape[0]),
-                dtype=torch.float32,
-                device=x.device,
-            )
-            deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
-            return out
+        if _is_cuda:
+            return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
 
         weights, _ = self.weights_proj(x)
         if _is_hip:

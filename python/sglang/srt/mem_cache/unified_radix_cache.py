@@ -896,7 +896,13 @@ class UnifiedRadixCache(BasePrefixCache):
         target: EvictLayer = EvictLayer.DEVICE,
     ):
         """Cascade eviction from trigger to lower-or-equal priority components."""
-        is_leaf = len(node.children) == 0
+
+        is_leaf = False
+        if target == EvictLayer.DEVICE:
+            is_leaf = node in self.evictable_device_leaves
+        elif target == EvictLayer.HOST:
+            is_leaf = node in self.evictable_host_leaves
+
         trigger_priority = trigger.eviction_priority(is_leaf)
 
         for comp in self._components_tuple:

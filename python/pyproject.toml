@@ -27,8 +27,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.8.post1", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.8.post1",
+  "flashinfer_python==0.6.11", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.11",
   "gguf",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
@@ -37,7 +37,7 @@ dependencies = [
   "ninja",
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "numpy",
-  "nvidia-cutlass-dsl==4.4.2",
+  "nvidia-cutlass-dsl==4.5.0",
   "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
@@ -53,7 +53,7 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
-  "quack-kernels>=0.3.0",
+  "quack-kernels>=0.4.1",
   "requests",
   "scipy",
   "sentencepiece",

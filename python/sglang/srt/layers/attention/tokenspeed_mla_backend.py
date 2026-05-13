@@ -1,13 +1,26 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 from __future__ import annotations
 
 """Attention backend for the tokenspeed-mla CuTe DSL kernels on Blackwell.
-
-Subclasses :class:`TRTLLMMLABackend` and overrides only ``_run_decode_kernel``
-and ``_run_prefill_kernel``. The backend also exposes ``prepare_prefill_qkv``
-and ``pack_prefix_chunk_kv`` hooks that the DeepSeek MLA prefill path
-dispatches to via ``hasattr``; they fuse RoPE + FP8 quantize for Q/K and
-quantize V with a stride-aware kernel, avoiding ~280 ms of redundant casts
-per 80k-input prefill at TP=4.
 """
 
 import logging
@@ -35,6 +48,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
 
 logger = logging.getLogger(__name__)
 
@@ -266,9 +280,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         max_seq_len: int,
         layer: "RadixAttention",
     ) -> torch.Tensor:
-        # tokenspeed splits trtllm-gen's ``bmm1_scale`` into ``softmax_scale``
-        # (applied at QK^T) and ``output_scale`` (applied at attn @ V). K and V
-        # share the kv_lora_rank prefix, so both use the same k_scale.
         k_scale = getattr(layer, "k_scale_float", None)
         if k_scale is None:
             k_scale = 1.0
@@ -308,8 +319,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         return_lse: bool,
         out_buffer: torch.Tensor,
         o_sf_scale: float = 1.0,
-    ):
-        # Q/K/V arrive already in FP8 via the model-side fused path
+    ):  # Q/K/V arrive already in FP8 via the model-side fused path
         # (prepare_prefill_qkv / pack_prefix_chunk_kv); no quantize here.
         return tokenspeed_mla.tokenspeed_mla_prefill(
             query=q,
@@ -335,8 +345,8 @@ class TokenspeedMLAMultiStepDraftBackend(TRTLLMMLAMultiStepDraftBackend):
         self, model_runner: "ModelRunner", topk: int, speculative_num_steps: int
     ):
         super().__init__(model_runner, topk, speculative_num_steps)
-        # Parent populates self.attn_backends with TRT-LLM instances; swap to
-        # tokenspeed instances sharing the parent's index buffers.
+        # Parent populates self.attn_backends with TRT-LLM instances; replace
+        # them with tokenspeed instances sharing the parent's index buffers.
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i] = TokenspeedMLABackend(
                 model_runner,
