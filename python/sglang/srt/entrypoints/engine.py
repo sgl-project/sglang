@@ -245,11 +245,6 @@ class Engine(EngineScoreMixin, EngineBase):
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
-        # Access transfer engine info if bootstrap server is started.
-        if scheduler_init_result.engine_info_bootstrap_server is not None:
-            self.remote_instance_transfer_engine_info = (
-                scheduler_init_result.engine_info_bootstrap_server.transfer_engine_info
-            )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
