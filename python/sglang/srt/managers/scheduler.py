@@ -2703,7 +2703,16 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+            # Chunked-resume reqs hold a row + tree lock_ref from their prior
+            # admission. If the LoRA drainer rejects them mid-prefill, they
+            # stay in waiting_queue forever — deadlock + KV leak. Their LoRA
+            # adapter was already accepted on the first admission, so the
+            # drainer/validate check is moot for them.
+            if (
+                self.enable_lora
+                and not req.has_pending_chunk
+                and not self._can_schedule_lora_req(req, running_loras)
+            ):
                 continue
 
             running_bs = len(self.running_batch.reqs)
