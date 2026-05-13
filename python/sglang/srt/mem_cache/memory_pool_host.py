@@ -91,6 +91,80 @@ class HostTensorAllocator(abc.ABC):
         return tensor
 
 
+class HiSparseHostPoolMixin:
+    def _round_up_to_page_size(self, size: int) -> int:
+        return (size + self.page_size - 1) // self.page_size * self.page_size
+
+    def alloc_page(self, num_pages: int) -> Optional[torch.Tensor]:
+        return self.alloc(num_pages * self.page_size)
+
+    def alloc_paged_token_slots(
+        self,
+        req_to_host_pool: torch.Tensor,
+        req_pool_idx: int,
+        start_pos: int,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Allocate request host slots, reusing existing page mappings."""
+        device = req_to_host_pool.device
+        if num_tokens <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=device)
+
+        page_start = (start_pos // self.page_size) * self.page_size
+        page_end = self._round_up_to_page_size(start_pos + num_tokens)
+
+        page_starts = torch.arange(
+            page_start,
+            page_end,
+            self.page_size,
+            dtype=torch.int64,
+            device=device,
+        )
+        page_is_missing = req_to_host_pool[req_pool_idx, page_starts] < 0
+        num_missing_pages = int(page_is_missing.sum().item())
+
+        if num_missing_pages > 0:
+            host_locs = self.alloc_page(num_missing_pages)
+            if host_locs is None:
+                logger.error(
+                    "HiSparse: host mem pool alloc failed for %d host pages "
+                    "(req_pool_idx=%d, start_pos=%d, num_tokens=%d)",
+                    num_missing_pages,
+                    req_pool_idx,
+                    start_pos,
+                    num_tokens,
+                )
+                raise RuntimeError(
+                    f"HiSparse host mem pool alloc failed for {num_missing_pages} pages"
+                )
+
+            host_locs = host_locs.to(device=device)
+            if num_missing_pages == page_starts.numel():
+                req_to_host_pool[req_pool_idx, page_start:page_end] = host_locs
+            else:
+                missing_page_starts = page_starts[page_is_missing]
+                offsets = torch.arange(self.page_size, dtype=torch.int64, device=device)
+                missing_indices = (
+                    missing_page_starts[:, None] + offsets[None, :]
+                ).reshape(-1)
+                req_to_host_pool[req_pool_idx, missing_indices] = host_locs
+
+        return req_to_host_pool[req_pool_idx, start_pos : start_pos + num_tokens]
+
+    def allocated_host_indices(
+        self,
+        req_to_host_pool: torch.Tensor,
+        req_pool_idx: int,
+        allocated_len: int,
+    ) -> torch.Tensor:
+        host_len = min(
+            self._round_up_to_page_size(allocated_len),
+            req_to_host_pool.shape[1],
+        )
+        host_indices = req_to_host_pool[req_pool_idx, :host_len]
+        return host_indices[host_indices >= 0]
+
+
 def get_allocator_from_storage(allocator_type):
     if allocator_type == "mooncake":
         try:
@@ -785,7 +859,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
 
-class MLATokenToKVPoolHost(HostKVCache):
+class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
 
     def __init__(
