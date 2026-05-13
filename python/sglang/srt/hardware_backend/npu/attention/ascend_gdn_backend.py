@@ -414,7 +414,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             nv=num_value_heads,
             intermediate_state=intermediate_state,
             cache_indices=cache_indices,
-            num_accept_tokens=num_accept_tokens,
+            num_accepted_tokens=num_accept_tokens,
             g=g,
         )
 
