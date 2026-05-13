@@ -73,7 +73,6 @@ class HiSparseCoordinator:
                 self.mem_pool_host.kv_cache_total_dim
                 * self.mem_pool_host.dtype.itemsize
             )
-            self.page_size = self.mem_pool_host.page_size
         else:
             assert isinstance(
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
@@ -90,7 +89,7 @@ class HiSparseCoordinator:
                 override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
-            self.page_size = self.mem_pool_host.page_size
+        self.page_size = self.mem_pool_host.page_size
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -178,7 +177,7 @@ class HiSparseCoordinator:
         start_pos: int,
         num_tokens: int,
     ) -> torch.Tensor:
-        """Ensure token-position host slots, backed by page-granular allocation."""
+        """Ensure host slots for compressed token positions."""
         if num_tokens <= 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
 
@@ -225,9 +224,8 @@ class HiSparseCoordinator:
         return self.req_to_host_pool[req_pool_idx, start_pos : start_pos + num_tokens]
 
     def _allocated_host_indices(self, req: Req) -> torch.Tensor:
-        allocated_len = req.kv_allocated_len // self.compress_ratio
         host_len = min(
-            self._round_up_to_host_page(allocated_len),
+            self._round_up_to_host_page(self._host_token_len(req.kv_allocated_len)),
             self.req_to_host_pool.shape[1],
         )
         host_indices = self.req_to_host_pool[req.req_pool_idx, :host_len]
@@ -300,15 +298,10 @@ class HiSparseCoordinator:
           buffer.  In the staging path this is correct (prefill filled the buffer),
           but here the buffer is empty.
         """
-        if self.is_dsv4_hisparse:
-            # TODO(dsv4): wire PD direct-to-host. Needs (a) load_to_device_per_layer
-            raise NotImplementedError(
-                "PD direct-to-host admission is not supported for dsv4 hisparse yet."
-            )
-
         self.alloc_device_buffer(req)
 
-        if req.kv_allocated_len <= self.device_buffer_size:
+        host_len = self._host_token_len(req.kv_allocated_len)
+        if host_len <= self.device_buffer_size:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
             # must preload all tokens from host pool into the device buffer
@@ -325,12 +318,16 @@ class HiSparseCoordinator:
         self._skip_first_backup[req.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
+    def _host_token_len(self, kv_allocated_len: int) -> int:
+        if self.is_dsv4_hisparse:
+            return (kv_allocated_len + self.compress_ratio - 1) // self.compress_ratio
+        return kv_allocated_len
+
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
-        n = req.kv_allocated_len
+        n = self._host_token_len(req.kv_allocated_len)
         host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
         device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
-
         for layer_id in range(self.mem_pool_device.layer_num):
             self.mem_pool_host.load_to_device_per_layer(
                 self.mem_pool_device,
@@ -339,6 +336,10 @@ class HiSparseCoordinator:
                 layer_id,
                 io_backend="kernel",
             )
+        # Direct PD admission runs outside the model forward stream.  The preload
+        # must be complete before the request is marked ready, otherwise decode
+        # can race the H2D copy and read a partially populated hot buffer.
+        device_module.current_stream().synchronize()
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
@@ -604,11 +605,12 @@ class HiSparseCoordinator:
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
+        actual_compressed_pos_cpu = actual_compressed_pos.cpu()
         host_locs = torch.cat(
             [
                 self.ensure_host_slots(
                     int(req_pool_indices_cpu[i]),
-                    int(actual_compressed_pos[j].item()),
+                    int(actual_compressed_pos_cpu[j]),
                     1,
                 )
                 for j, i in enumerate(backup_indices)
@@ -656,9 +658,8 @@ class HiSparseCoordinator:
         This is a naive per-request loop implementation for debugging/validation.
         Production code uses swap_in_selected_pages (JIT CUDA kernel) instead.
 
-        Note: dsv4 hisparse is not supported — DeepSeekV4SingleKVPoolHost has no
-        load_to_device_per_layer and indices live in compressed space. Currently
-        only used as a kernel oracle in test_hisparse_unit.py (non-dsv4 path).
+        Note: dsv4 hisparse is not supported here. This helper is only used as
+        a kernel oracle in test_hisparse_unit.py (non-dsv4 path).
 
         Args:
             req_pool_indices: Pool indices for each request.  Shape: (num_reqs,)
@@ -782,7 +783,6 @@ class HiSparseCoordinator:
         # subsequent release_kv_cache -> allocator.free -> free_hisparse path
         # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv_allocated_len
-        compressed_len = allocated_len // self.compress_ratio
 
         # release memory -- only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])

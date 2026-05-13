@@ -483,6 +483,42 @@ class DeepSeekV4SingleKVPoolHost:
             cpu_indices=host_indices_i64,
         )
 
+    def get_contiguous_buf_infos(self):
+        """Return host C4 buffers as token-linear transfer targets."""
+        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        item_lens = [
+            self.kv_cache_total_dim * self.dtype.itemsize
+        ] * self.layer_num
+        return data_ptrs, data_lens, item_lens
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend="kernel"
+    ):
+        if io_backend != "kernel":
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+        from sglang.jit_kernel.deepseek_v4 import hisparse_load_to_device
+
+        if host_indices.device != device_indices.device:
+            host_indices = host_indices.to(device=device_indices.device)
+        host_indices_i64 = (
+            host_indices.to(torch.int64)
+            if host_indices.dtype != torch.int64
+            else host_indices
+        )
+        device_indices_i64 = (
+            device_indices.to(torch.int64)
+            if device_indices.dtype != torch.int64
+            else device_indices
+        )
+        hisparse_load_to_device(
+            gpu_cache=device_pool.kv_buffer[layer_id],
+            cpu_cache=self.kv_buffer[layer_id],
+            gpu_indices=device_indices_i64,
+            cpu_indices=host_indices_i64,
+        )
+
     def available_size(self):
         return len(self.free_slots)
 
@@ -607,10 +643,29 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             "use alloc_extend or alloc_decode instead."
         )
 
+    def alloc_logical_only(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        return self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        hisparse_indices = hisparse_indices[hisparse_indices > 0]
 
         device_buffer_size = need_size - self.page_size
         P = len(hisparse_indices)
