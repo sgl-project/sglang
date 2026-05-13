@@ -756,16 +756,14 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             response_json_list = [await r.json() for r in responses]
 
             # Sort by part_idx
-            embedding_sizes = [None] * total_num_parts
-            response_sorted = [None] * total_num_parts
-            for rj in response_json_list:
-                idx = rj["part_idx"]
-                embedding_sizes[idx] = rj["embedding_size"]
-                response_sorted[idx] = rj
+            embedding_sizes, response_sorted, total_bytes = (
+                _sort_responses_and_compute_total_bytes(
+                    response_json_list, total_num_parts
+                )
+            )
 
             # Phase 2: Pre-allocate and register GPU landing buffer with Mooncake engine
             # (encode server will write embeddings directly to this address via GPU-direct transfer)
-            total_bytes = sum(s for s in embedding_sizes if s is not None)
             if total_bytes > 0:
                 gpu_buffer = torch.empty(
                     total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
@@ -859,20 +857,9 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         # Slice pre-registered GPU buffer into per-part tensors; no H2D copy needed
         # (encode server wrote embeddings directly into this buffer via Mooncake GPU-direct transfer)
         if self.embeddings_buffer is not None:
-            raw_buffer = self.embeddings_buffer
-            elem_size = torch.tensor([], dtype=self.dtype).element_size()
-            byte_offset = 0
-            for i in range(self.recv_embedding_data.num_parts):
-                shape = self.recv_embedding_data.embedding_shape_list[i]
-                if shape is None:
-                    continue
-                part_bytes = shape[0] * shape[1] * elem_size
-                self.recv_embedding_data.embedding_list[i] = (
-                    raw_buffer[byte_offset : byte_offset + part_bytes]
-                    .view(self.dtype)
-                    .reshape(shape)
-                )
-                byte_offset += part_bytes
+            _slice_embedding_buffer(
+                self.embeddings_buffer, self.recv_embedding_data, self.dtype
+            )
 
         recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
         mm_inputs = self.mm_processor.get_mm_data(
@@ -894,6 +881,35 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             except Exception:
                 logger.exception("Failed to deregister GPU buffer for rid=%s", self.rid)
             self.embeddings_buffer = None
+
+
+def _sort_responses_and_compute_total_bytes(response_json_list, total_num_parts):
+    """Sort responses by part_idx and compute total embedding bytes."""
+    embedding_sizes = [None] * total_num_parts
+    response_sorted = [None] * total_num_parts
+    for rj in response_json_list:
+        idx = rj["part_idx"]
+        embedding_sizes[idx] = rj["embedding_size"]
+        response_sorted[idx] = rj
+    total_bytes = sum(s for s in embedding_sizes if s is not None)
+    return embedding_sizes, response_sorted, total_bytes
+
+
+def _slice_embedding_buffer(raw_buffer, embedding_data, dtype):
+    """Slice a flat GPU buffer into per-part embedding tensors in-place."""
+    elem_size = torch.tensor([], dtype=dtype).element_size()
+    byte_offset = 0
+    for i in range(embedding_data.num_parts):
+        shape = embedding_data.embedding_shape_list[i]
+        if shape is None:
+            continue
+        part_bytes = shape[0] * shape[1] * elem_size
+        embedding_data.embedding_list[i] = (
+            raw_buffer[byte_offset : byte_offset + part_bytes]
+            .view(dtype)
+            .reshape(shape)
+        )
+        byte_offset += part_bytes
 
 
 def _determine_tensor_transport_mode(server_args):
@@ -921,6 +937,16 @@ class MMReceiverBase(ABC):
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
         self.host = get_local_ip_auto(server_args.host)
+        self.pp_rank = pp_rank
+        self.tp_rank = tp_rank
+        self.tp_size = server_args.tp_size
+        self.tp_group = tp_group
+        self.nnodes = server_args.nnodes
+        self.hostname = get_local_ip_auto()
+        self.waiting_list: List[WaitingImageRequest] = []
+        self.scheduler = scheduler
+        self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
+
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
             self.embeddings_engine = get_mooncake_transfer_engine()
@@ -937,109 +963,75 @@ class MMReceiverBase(ABC):
                     ),
                 )
             self.embeddings_buffer = dict()
-            # Also init scheduler-side properties for WaitingImageRDMARequest
-            self.pp_rank = pp_rank
-            self.tp_rank = tp_rank
-            self.tp_size = server_args.tp_size
-            self.tp_group = tp_group
-            self.nnodes = server_args.nnodes
-            self.hostname = get_local_ip_auto()
-            self.waiting_list: List[WaitingImageRequest] = []
-            self.scheduler = scheduler
-            self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
             if hf_config is not None:
-                transport_mode = _determine_tensor_transport_mode(server_args)
-                import_processors("sglang.srt.multimodal.processors")
-                _processor = None
-                try:
-                    _processor = get_processor(
-                        server_args.tokenizer_path,
-                        tokenizer_mode=server_args.tokenizer_mode,
-                        trust_remote_code=server_args.trust_remote_code,
-                        revision=server_args.revision,
-                        use_fast=not server_args.disable_fast_image_processor,
-                    )
-                except ValueError as e:
-                    error_message = str(e)
-                    if "does not have a slow version" in error_message:
-                        logger.info(
-                            f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
-                        )
-                        _processor = get_processor(
-                            server_args.tokenizer_path,
-                            tokenizer_mode=server_args.tokenizer_mode,
-                            trust_remote_code=server_args.trust_remote_code,
-                            revision=server_args.revision,
-                            use_fast=True,
-                        )
-                    else:
-                        raise e
-                enable_adaptive_dispatch_to_encoder = (
-                    server_args.enable_adaptive_dispatch_to_encoder
-                )
-                self.mm_processor = get_mm_processor(
-                    hf_config,
-                    server_args,
-                    _processor,
-                    transport_mode,
-                    skip_mm_pool=not enable_adaptive_dispatch_to_encoder,
-                )
+                self._init_mm_processor(server_args, hf_config)
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
-            self.pp_rank = pp_rank
-            self.tp_rank = tp_rank
-            self.tp_size = server_args.tp_size
-            self.tp_group = tp_group
-            self.nnodes = server_args.nnodes
-            self.hostname = get_local_ip_auto()
-            self.waiting_list: List[WaitingImageRequest] = []
-            self.scheduler = scheduler
-            self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
             if hf_config is not None:
-                transport_mode = _determine_tensor_transport_mode(server_args)
-                import_processors("sglang.srt.multimodal.processors")
-                _processor = None
-                try:
-                    _processor = get_processor(
-                        server_args.tokenizer_path,
-                        tokenizer_mode=server_args.tokenizer_mode,
-                        trust_remote_code=server_args.trust_remote_code,
-                        revision=server_args.revision,
-                        use_fast=not server_args.disable_fast_image_processor,
-                        tokenizer_backend=server_args.tokenizer_backend,
-                    )
-                except ValueError as e:
-                    error_message = str(e)
-                    if "does not have a slow version" in error_message:
-                        logger.info(
-                            f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
-                        )
-                        _processor = get_processor(
-                            server_args.tokenizer_path,
-                            tokenizer_mode=server_args.tokenizer_mode,
-                            trust_remote_code=server_args.trust_remote_code,
-                            revision=server_args.revision,
-                            use_fast=True,
-                            tokenizer_backend=server_args.tokenizer_backend,
-                        )
-                    else:
-                        raise e
-
-                # Skip mm_pool if not adaptive dispatch to encoder
-                enable_adaptive_dispatch_to_encoder = (
-                    server_args.enable_adaptive_dispatch_to_encoder
-                )
-                self.mm_processor = get_mm_processor(
-                    hf_config,
+                self._init_mm_processor(
                     server_args,
-                    _processor,
-                    transport_mode,
+                    hf_config,
                     model_config=(
                         getattr(self.scheduler, "model_config", None)
                         if self.scheduler is not None
                         else None
                     ),
-                    skip_mm_pool=not enable_adaptive_dispatch_to_encoder,
                 )
+
+    def _init_mm_processor(
+        self,
+        server_args: "ServerArgs",
+        hf_config: "PretrainedConfig",
+        model_config=None,
+    ):
+        """Load processor and initialize mm_processor, shared by all backends."""
+        transport_mode = _determine_tensor_transport_mode(server_args)
+        import_processors("sglang.srt.multimodal.processors")
+
+        extra_kwargs = {}
+        if getattr(server_args, "tokenizer_backend", None) is not None:
+            extra_kwargs["tokenizer_backend"] = server_args.tokenizer_backend
+
+        _processor = None
+        try:
+            _processor = get_processor(
+                server_args.tokenizer_path,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=not server_args.disable_fast_image_processor,
+                **extra_kwargs,
+            )
+        except ValueError as e:
+            error_message = str(e)
+            if "does not have a slow version" in error_message:
+                logger.info(
+                    f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
+                )
+                _processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                    use_fast=True,
+                    **extra_kwargs,
+                )
+            else:
+                raise e
+
+        enable_adaptive_dispatch_to_encoder = (
+            server_args.enable_adaptive_dispatch_to_encoder
+        )
+        mm_processor_kwargs = {}
+        if model_config is not None:
+            mm_processor_kwargs["model_config"] = model_config
+        self.mm_processor = get_mm_processor(
+            hf_config,
+            server_args,
+            _processor,
+            transport_mode,
+            skip_mm_pool=not enable_adaptive_dispatch_to_encoder,
+            **mm_processor_kwargs,
+        )
 
     @abstractmethod
     def process_waiting_requests(self, recv_reqs):
@@ -1143,22 +1135,7 @@ class MMReceiverBase(ABC):
                     return None
                 raw_buffer = self.embeddings_buffer.pop(req_id)
                 self.embeddings_engine.deregister(raw_buffer.data_ptr())
-                byte_offset = 0
-                for i in range(recv_embedding_data.num_parts):
-                    shape = recv_embedding_data.embedding_shape_list[i]
-                    if shape is None:
-                        continue
-                    part_bytes = (
-                        shape[0]
-                        * shape[1]
-                        * torch.tensor([], dtype=self.dtype).element_size()
-                    )
-                    recv_embedding_data.embedding_list[i] = (
-                        raw_buffer[byte_offset : byte_offset + part_bytes]
-                        .view(self.dtype)
-                        .reshape(shape)
-                    )
-                    byte_offset += part_bytes
+                _slice_embedding_buffer(raw_buffer, recv_embedding_data, self.dtype)
 
             recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
 
@@ -1587,15 +1564,10 @@ class MMReceiverHTTP(MMReceiverBase):
 
             # mooncake backend: send bootstrap info
 
-            embedding_size_list_sort = [None for _ in range(total_num_parts)]
-            response_json_list_sort = [None for _ in range(total_num_parts)]
-            for response_json in response_json_list_unsort:
-                idx = response_json["part_idx"]
-                embedding_size_list_sort[idx] = response_json["embedding_size"]
-                response_json_list_sort[idx] = response_json
-
-            total_embedding_bytes = sum(
-                s for s in embedding_size_list_sort if s is not None
+            embedding_size_list_sort, response_json_list_sort, total_embedding_bytes = (
+                _sort_responses_and_compute_total_bytes(
+                    response_json_list_unsort, total_num_parts
+                )
             )
             offset = 0
             metadata_tasks = []
@@ -1743,14 +1715,9 @@ class MMReceiverGrpc(MMReceiverBase):
         if None in response_json_unsorted:
             return
 
-        embedding_size_by_part = [None for _ in range(num_parts)]
-        response_json_sorted = [None for _ in range(num_parts)]
-        for response_json in response_json_unsorted:
-            idx = response_json["part_idx"]
-            embedding_size_by_part[idx] = response_json["embedding_size"]
-            response_json_sorted[idx] = response_json
-
-        total_embedding_bytes = sum(s for s in embedding_size_by_part if s is not None)
+        embedding_size_by_part, response_json_sorted, total_embedding_bytes = (
+            _sort_responses_and_compute_total_bytes(response_json_unsorted, num_parts)
+        )
         offset = 0
         buffer_address = await self.allocate_embedding_buffer(
             req_id,
