@@ -3184,10 +3184,6 @@ class ServerArgs:
             )
             self.moe_a2a_backend = "deepep"
 
-        # Mega MoE uses deep_gemm for its own all-to-all communication and
-        # does not depend on DeepEP.  When the user has not explicitly chosen
-        # an a2a backend, auto-configure EP so that megamoe can run without
-        # requiring the deep_ep library or the DeepEP dispatcher.
         if (
             envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
             and self.moe_a2a_backend == "none"
@@ -3281,10 +3277,6 @@ class ServerArgs:
                     self.chunked_prefill_size
                 ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
 
-        # When Mega MoE is enabled together with EP, both the Mega MoE path
-        # (decode) and the normal/DeepEP path (prefill fallback) share the
-        # same MoE weights at runtime. Auto-enable FIX_MEGA_MOE_MEMORY so
-        # they share one copy instead of duplicating.
         if (
             envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
             and self.ep_size > 1
