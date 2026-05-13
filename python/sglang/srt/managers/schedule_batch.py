@@ -1967,7 +1967,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         Produces mamba_track_mask, mamba_track_indices, mamba_track_seqlens as
         GPU tensors directly, avoiding per-request GPU->CPU syncs.
+
+        mamba_track_seqlen is used to calculate the indices to track in
+        hybrid_linear_attn_backend's _init_track_ssm_indices. The ssm state
+        between aligned and non-aligned positions is retrieved differently:
+        if 1) last pos and 2) is aligned, then retrieved from the
+        last_recurrent_state; otherwise retrieved from h (i.e. unaligned).
+        We need to pass the non-aligned seqlen to the calculation. Even though
+        we pass in mamba_track_seqlen, the actual tracked seqlen is
+        mamba_last_track_seqlen.
         """
+
+        def _force_track_h(i):
+            # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens:
+            # 1) aligned with FLA_CHUNK_SIZE -> retrieve from last_recurrent_state
+            #    a) is the last position -> retrieve from last_recurrent_state
+            #    b) is NOT the last position -> retrieve from h
+            # 2) unaligned with FLA_CHUNK_SIZE -> retrieve from h
+            # Currently, the math calculation only supports case 1a and 2. So for 1b,
+            # we need to add 1 to force the math calculation to retrieve the correct
+            # mamba state from h.
+            return i + 1
+
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
 
         extend_lens = torch.tensor(
@@ -1983,9 +2004,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             [r.req_pool_idx for r in reqs], dtype=torch.int64, pin_memory=True
         ).to(self.device, non_blocking=True)
         track_col_idx = torch.tensor(
-            [r.mamba_next_track_idx for r in reqs],
-            dtype=torch.int64,
-            pin_memory=True,
+            [r.mamba_next_track_idx for r in reqs], dtype=torch.int64, pin_memory=True
         ).to(self.device, non_blocking=True)
         track_indices_gpu = (
             self.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
@@ -1994,8 +2013,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         # 3) track_seqlens: vectorised arithmetic.
-        # When fla_aligned != seqlen_aligned, _force_track_h returns seqlen_aligned + 1;
-        # otherwise the tracked seqlen is total_seqlen (prefix + extend).
+        # total_seqlen is the per-req prefix + extend length.
+        # seqlen_aligned / mamba_last_track_seqlen is the actual tracked seqlen,
+        # passed to the mamba radix cache to record which seqlen the mamba state
+        # should be stored at.
+        # fla_aligned is the seqlen aligned to FLA_CHUNK_SIZE. When fla_aligned !=
+        # seqlen_aligned (can happen when page_size > FLA_CHUNK_SIZE), we want to
+        # track seqlen_aligned but it is not the last position, so _force_track_h()
+        # adds 1 so the math calculation retrieves from h.
         total_seqlen = prefix_lens_t + extend_lens
         aligned_extend = (
             extend_lens // mamba_cache_chunk_size
@@ -2005,7 +2030,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         fla_aligned = prefix_lens_t + fla_aligned_extend
         track_seqlens = torch.where(
             fla_aligned != seqlen_aligned,
-            seqlen_aligned + 1,
+            _force_track_h(seqlen_aligned),
             total_seqlen,
         )
 
@@ -2022,6 +2047,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.mamba_next_track_idx = ping_pong_other(req.mamba_next_track_idx)
             cur_seqlen_aligned = seqlen_aligned_list[i]
             if req.mamba_branching_seqlen is not None:
+                # Track the branching point in this forward if it falls within
+                # the current extend batch. Same not-last-position adjustment as
+                # the fla-misaligned case: add 1 to retrieve the state from h.
                 p = prefix_lens[i]
                 branching_aligned = (
                     req.mamba_branching_seqlen - p
@@ -2031,16 +2059,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     and req.mamba_branching_seqlen < track_seqlens_list[i]
                     and branching_aligned
                 ):
-                    track_seqlens_list[i] = req.mamba_branching_seqlen + 1
+                    track_seqlens_list[i] = _force_track_h(req.mamba_branching_seqlen)
                     cur_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = cur_seqlen_aligned
         track_seqlens = torch.tensor(track_seqlens_list, dtype=torch.int64)
 
-        self.mamba_track_mask = mask.pin_memory().to(self.device, non_blocking=True)
-        self.mamba_track_indices = track_indices_gpu  # already on GPU
-        self.mamba_track_seqlens = track_seqlens.pin_memory().to(
-            self.device, non_blocking=True
-        )
+        self.mamba_track_mask = mask.to(self.device)
+        self.mamba_track_indices = track_indices_gpu
+        self.mamba_track_seqlens = track_seqlens.to(self.device)
 
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
