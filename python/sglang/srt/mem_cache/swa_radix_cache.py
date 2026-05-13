@@ -492,7 +492,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 req.req_pool_idx, :read_len
             ]
 
-            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+            # `req.prefix_indices` will be used by add_one_req reuse branch next iter
             req.prefix_indices = kv_indices
             return
 
@@ -543,7 +543,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         result = self.inc_lock_ref(new_last_node)
         swa_uuid_for_lock = result.swa_uuid_for_lock
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        # `req.prefix_indices` will be used by add_one_req reuse branch next iter
         if len(new_indices) < len(kv_indices):
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]

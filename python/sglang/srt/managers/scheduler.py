@@ -1082,16 +1082,11 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
-        self.chunked_req = None
-        # Tracks whether the current self.chunked_req was actually scheduled
-        # into last iteration's batch (i.e., in can_run_list -> got a fresh
-        # req_pool_idx from prepare_for_extend). Used to gate the
-        # stash_chunked_request call at the top of get_next_batch_to_run:
-        # if add_chunked_req early-returned under hybrid-SWA pressure,
-        # the req_pool_idx was already freed and fill_ids was reset by
-        # init_next_round_input, so running stash would double-free and
-        # corrupt prefix_indices.
-        self._chunked_req_scheduled_last_iter = False
+        # Chunked-resume tracking is now per-req (Req.has_pending_chunk +
+        # is_chunked counter); the scheduler no longer holds a global pointer.
+        # Stage A stashes any waiting_queue req with has_pending_chunk; cache
+        # impls bound row reads by kv_committed_len so a stash after
+        # init_next_round_input is safe without the old gate.
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2443,9 +2438,6 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
-    def stash_chunked_request(self, req: Req):
-        maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
-
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
         device = self.device
@@ -2490,21 +2482,17 @@ class Scheduler(
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
-        # Merge the prefill batch into the running batch
-        chunked_req_to_exclude = set()
+        # Stage A: stash any in-flight chunked prefill KV into radix tree.
+        # Per-req loop over waiting_queue covers chunked-resume; DLLM staging
+        # reqs are owned by DllmManager (not in waiting_queue), handled
+        # separately below.
+        for req in self.waiting_queue:
+            if req.has_pending_chunk and not req.is_dllm():
+                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
-            chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
-                self.stash_chunked_request(req)
-
-        if self.chunked_req is not None:
-            # Move the chunked request out of the batch so that we can merge
-            # only finished requests to running_batch.
-            chunked_req_to_exclude.add(self.chunked_req)
-
-            if self._chunked_req_scheduled_last_iter:
-                self.stash_chunked_request(self.chunked_req)
+                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
@@ -2524,19 +2512,10 @@ class Scheduler(
             and self.last_batch
             and self.last_batch.forward_mode.is_extend()
         ):
-            if self.last_batch.chunked_req is not None:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
-
-            if self.dllm_config is not None and self.last_batch.reqs:
-                chunked_req_to_exclude.update(self.last_batch.reqs)
-
-            # Filter batch
+            # filter_batch's internal predicate excludes still-prefilling reqs
+            # (has_pending_chunk / is_chunked > 0 / is_dllm) from merge.
             last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            self.last_batch.filter_batch()
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -2642,21 +2621,26 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
+        # Identify any in-flight chunked-resume req held in waiting_queue —
+        # priority + has_pending_chunk make it sit at the head, but its
+        # presence relaxes the "is queue empty / pool full" early exits below
+        # (we must keep scheduling it to make progress, or memory leaks).
+        has_chunked_resume = any(r.has_pending_chunk for r in self.waiting_queue)
+
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and not has_chunked_resume:
             return None
 
         running_bs = len(self.running_batch.reqs)
 
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
-        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+        # Ignore the check if there is a chunked-resume in flight.
+        # In the non-PP case the row was just released so the count is fine;
+        # in PP case, chunked reqs span microbatches so the per-mb max_running
+        # check should not block them.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is None
+            and not has_chunked_resume
             and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -2673,11 +2657,17 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.enable_dynamic_chunking:
-            history_len = len(self.chunked_req.prefix_indices)
-            dynamic_size = self.predict_next_chunk_size(history_len)
-            if dynamic_size is not None:
-                chunked_prefill_size = dynamic_size
+        if self.enable_dynamic_chunking:
+            # Single-flight invariant: at most one chunked-resume req in the
+            # queue at any time (priority + budget enforce this naturally).
+            chunked_resume = next(
+                (r for r in self.waiting_queue if r.has_pending_chunk), None
+            )
+            if chunked_resume is not None:
+                history_len = len(chunked_resume.prefix_indices)
+                dynamic_size = self.predict_next_chunk_size(history_len)
+                if dynamic_size is not None:
+                    chunked_prefill_size = dynamic_size
 
         # Prefill policy
         adder = PrefillAdder(
@@ -2697,26 +2687,6 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
         )
-
-        # Re-admit the in-flight chunked req via the unified add_one_req
-        # entry. add_one_req's reuse branch (gated on kv_committed_len > 0)
-        # mirrors the old add_chunked_req's behavior: skip lock_ref inc,
-        # init_load_back, and prefix budget. Sets req.has_pending_chunk to
-        # truncated.
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            adder.add_one_req(
-                self.chunked_req,
-                truncation_align_size=self.truncation_align_size,
-            )
-            # After admit, has_pending_chunk reflects whether more chunks
-            # remain. Mirror it into self.chunked_req for the existing
-            # Stage A stash path (deleted in a later commit).
-            if not self.chunked_req.has_pending_chunk:
-                self.chunked_req = None
-            self._chunked_req_scheduled_last_iter = self.chunked_req is not None
-        else:
-            self._chunked_req_scheduled_last_iter = False
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
@@ -2758,7 +2728,14 @@ class Scheduler(
                     req.rid
                 )
 
-            req.init_next_round_input(self.tree_cache)
+            # Chunked-resume reqs must NOT re-match prefix at admission
+            # (would re-assign req.last_node without rebalancing lock_ref,
+            # corrupting cache_unfinished_req's dec_lock_ref/inc_lock_ref
+            # pairing). They keep last_node from previous stash.
+            if req.has_pending_chunk:
+                req.init_next_round_input()
+            else:
+                req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 truncation_align_size=self.truncation_align_size,
@@ -2797,30 +2774,32 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
+        # Drop admitted reqs from waiting_queue, but KEEP chunked-resume reqs
+        # (has_pending_chunk == True after admission) so they stay at the head
+        # for the next iter's stash + admission. Single-flight is preserved
+        # naturally by budget + priority.
         can_run_set = set(can_run_list)
-        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        self.waiting_queue = [
+            x
+            for x in self.waiting_queue
+            if x not in can_run_set or x.has_pending_chunk
+        ]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        # Identify newly-truncated chunked-resume reqs admitted this iter via
-        # add_one_req's reuse/chunked branch. has_pending_chunk is set by
-        # add_one_req when truncated=True. The "newly chunked" set excludes
-        # self.chunked_req which was already tracked from previous iter.
-        new_chunked = [
-            r for r in can_run_list if r.has_pending_chunk and r is not self.chunked_req
-        ]
+        # Bump pending_middle_outputs (the is_chunked counter) for every
+        # admitted req that's still mid-prefill — output processor uses this
+        # to know its forward's sample is garbage. Counter semantics needed
+        # for PP, where multiple microbatches may admit the same req.
+        chunked_in_batch = [r for r in can_run_list if r.has_pending_chunk]
         assert (
-            len(new_chunked) <= 1
-        ), "single-flight invariant: at most one new chunked req per iter"
-        if new_chunked:
-            assert self.chunked_req is None
-            self.chunked_req = new_chunked[0]
-            # The chunked req is scheduled this iter -> stash needed next iter.
-            self._chunked_req_scheduled_last_iter = True
-
-        if self.chunked_req is not None:
-            self.chunked_req.is_chunked += 1
+            len(chunked_in_batch) <= 1
+        ), "single-flight invariant: at most one chunked-resume req per batch"
+        chunk_deduct = 0
+        for r in chunked_in_batch:
+            r.is_chunked += 1
+            chunk_deduct = r.extend_input_len
 
         # Record for logging prefill stats after forward
         self.adder = adder
@@ -2838,7 +2817,6 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            chunked_req=self.chunked_req,
         )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
@@ -2855,11 +2833,7 @@ class Scheduler(
             self.running_batch.reqs,
             self.enable_priority_scheduling,
             num_pending_tokens=self._get_num_pending_tokens(
-                chunk_deduct=(
-                    self.chunked_req.extend_input_len
-                    if self.chunked_req is not None
-                    else 0
-                )
+                chunk_deduct=chunk_deduct
             ),
         )
 
@@ -3313,7 +3287,6 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
@@ -3681,11 +3654,11 @@ class Scheduler(
 
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
-            # All scheduler state (running_batch, last_batch, chunked_req,
+            # All scheduler state (running_batch, last_batch, waiting_queue,
             # result_queue) is left untouched. On resume, the normal event
             # loop (get_next_batch_to_run) handles last_batch merge,
-            # chunked_req cleanup, and overlap result processing through
-            # the standard code paths. This avoids duplicating batch
+            # chunked-resume re-admission, and overlap result processing
+            # through the standard code paths. This avoids duplicating batch
             # manipulation logic and the accounting bugs that come with it.
             return
 
@@ -3695,10 +3668,9 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            chunked_req_to_exclude = set()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            # filter_batch's internal predicate excludes still-prefilling reqs
+            # (has_pending_chunk / is_chunked > 0 / is_dllm).
+            self.last_batch.filter_batch()
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
@@ -3723,7 +3695,6 @@ class Scheduler(
                     self._add_request_to_queue(req)
 
             self.running_batch.batch_is_full = False
-            self.chunked_req = None
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:

@@ -1402,9 +1402,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    # For chunked prefill in PP
-    chunked_req: Optional[Req] = None
-
     # Sampling info
     sampling_info: SamplingBatchInfo = None
 
@@ -1538,7 +1535,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
-        chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1564,7 +1560,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             return_indexer_topk=any(req.return_indexer_topk for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
-            chunked_req=chunked_req,
             dllm_config=dllm_config,
         )
         return batch
@@ -2411,31 +2406,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
-        # Invariant: reqs still doing prefill (chunked-resume or DLLM staging)
+        # Invariant: reqs still doing prefill (chunked-resume or DLLM-managed)
         # must never be merged into running_batch via this filter — running_batch
         # runs decode forward, and admitting a mid-prefill req there causes
-        # shape mismatch + double KV accounting. Today the invariant is enforced
-        # by callers passing chunked_req_to_exclude; the stateless-scheduler v2
-        # refactor will move this to a per-req predicate.
+        # shape mismatch + double KV accounting. Enforced per-req:
+        #   - has_pending_chunk: chunked-resume scheduled to continue
+        #   - is_chunked > 0: PP in-flight middle chunk for this req
+        #   - is_dllm(): DllmManager-managed (separate staging queue)
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
 
         if keep_indices is None:
-            if isinstance(chunked_req_to_exclude, Req):
-                chunked_req_to_exclude = [chunked_req_to_exclude]
-            elif chunked_req_to_exclude is None:
-                chunked_req_to_exclude = []
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and self.reqs[i] not in chunked_req_to_exclude
+                and not self.reqs[i].has_pending_chunk
+                and not self.reqs[i].is_chunked > 0
+                and not self.reqs[i].is_dllm()
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -2505,6 +2498,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
         self.maybe_wait_verify_done()
+
+        # Invariant: chunked-resume / mid-prefill reqs must never reach
+        # running_batch via merge — running_batch runs decode forward and
+        # admitting a prefill-in-progress req there breaks shape + KV accounting.
+        # filter_batch's predicate is responsible for excluding these from
+        # last_batch before this merge call.
+        assert not any(r.has_pending_chunk for r in other.reqs)
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it

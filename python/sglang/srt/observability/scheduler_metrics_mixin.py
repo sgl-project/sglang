@@ -976,10 +976,11 @@ class SchedulerMetricsMixin:
         num_pending_tokens = sum(
             req.seqlen - len(req.prefix_indices) for req in self.waiting_queue
         )
-        if self.chunked_req is not None:
-            req = self.chunked_req
-            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
-        return num_pending_tokens
+        # The chunked-resume req (if any) is now in self.waiting_queue, so
+        # it's already counted in the sum above. chunk_deduct subtracts the
+        # current chunk's extend that has been planned but not yet reflected
+        # in prefix_indices.
+        return num_pending_tokens - chunk_deduct
 
     def get_loads(self: Scheduler, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
         """
