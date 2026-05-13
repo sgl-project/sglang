@@ -55,7 +55,7 @@ from sglang.srt.layers.quantization.utils import (
     swizzle_blockscale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda,
     is_sm120_supported,
@@ -1356,13 +1356,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
 
         layer.register_parameter("weight_scale", weight_scale)
-        layer._weights_postprocessed = False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if getattr(layer, "_weights_postprocessed", False):
-            return
-        layer._weights_postprocessed = True
-
+        # Idempotent across update_weights_from_disk: source params (input_scale,
+        # weight_scale_2, weight_scale, weight) stay registered so the loader can
+        # refill them on hot reload; this function re-derives + re-aliases the
+        # post-processed views in place every time it runs.
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
@@ -1372,7 +1371,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         copy_or_rebind_param(
             layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
         )
-        del layer.input_scale, layer.weight_scale_2
 
         # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
@@ -1423,10 +1421,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 .view(torch.float8_e4m3fn)
             )
 
-            copy_or_rebind_param(layer, "weight_scale_interleaved", scale)
+            alias_or_bind_derived_param(
+                layer, "weight_scale", "weight_scale_interleaved", scale
+            )
             copy_or_rebind_param(layer, "weight", weight)
             layer.weights_padding_cols = weights_padding_cols
-            del layer.weight_scale
             return
 
         # Pad weights for CUTLASS/FlashInfer kernel alignment (K and N divisible by 32)
@@ -1456,8 +1455,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             if scale_ndim == 2
             else padded_scales.reshape(B, M_padded, K_padded)
         )
-        copy_or_rebind_param(layer, "weight_scale_interleaved", padded_scales)
-        del layer.weight_scale
+        alias_or_bind_derived_param(
+            layer, "weight_scale", "weight_scale_interleaved", padded_scales
+        )
 
     def apply(
         self,
@@ -1701,17 +1701,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
-        layer._weights_postprocessed = False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP4 MoE weights after loading from serialized checkpoint.
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
-        """
-        if getattr(layer, "_weights_postprocessed", False):
-            return
-        layer._weights_postprocessed = True
 
+        Idempotent across update_weights_from_disk: source params remain
+        registered so the loader can refill them on hot reload; this function
+        re-derives + re-aliases the post-processed views in place every call.
+        """
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
             if layer.w13_weight_scale_2.dim() == 1:
@@ -1784,12 +1783,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
-        del layer.w13_input_scale, layer.w2_input_scale
-        # TODO: w13_weight_scale_2 / w2_weight_scale_2 are also unused by apply()
-        # after this point. flashinfer_cutedsl reads them via hasattr() but has a
-        # mathematically-equivalent fallback through w13_input_scale_quant and
-        # g1_alphas. Kept for now to avoid a silent code-path switch and possible
-        # sub-ULP precision drift; revisit once the fallback is validated.
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         layer.dispatcher.set_quant_config(
@@ -1842,7 +1835,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # FlashInfer TRTLLM processing - handles both w13 and w2
             align_fp4_moe_weights_for_flashinfer_trtllm(layer)
-            del layer.w13_blockscale_swizzled, layer.w2_blockscale_swizzled
+            # TRTLLM apply() reads the in-place-shuffled w*_weight_scale and
+            # never reads *_blockscale_swizzled. Alias the swizzled-name slots
+            # to the source so the unused placeholders allocated in
+            # create_weights are freed (and idempotent on hot-reload re-entry).
+            layer.w13_blockscale_swizzled = layer.w13_weight_scale
+            layer.w2_blockscale_swizzled = layer.w2_weight_scale
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
@@ -1871,8 +1869,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Process w13 weights
             w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
-            copy_or_rebind_param(
-                layer, "w13_blockscale_swizzled", w13_blockscale_swizzled
+            alias_or_bind_derived_param(
+                layer,
+                "w13_weight_scale",
+                "w13_blockscale_swizzled",
+                w13_blockscale_swizzled,
             )
 
             w13_weight = layer.w13_weight
@@ -1909,8 +1910,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Process w2 weights
             w2_blockscale_swizzled = swizzle_blockscale(layer.w2_weight_scale)
-            copy_or_rebind_param(
-                layer, "w2_blockscale_swizzled", w2_blockscale_swizzled
+            alias_or_bind_derived_param(
+                layer,
+                "w2_weight_scale",
+                "w2_blockscale_swizzled",
+                w2_blockscale_swizzled,
             )
 
             if self._is_cutedsl_v2_standard:
@@ -1976,7 +1980,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     intermediate_size_per_partition=inter_size,  # n
                     hidden_size=hidden_size,
                 )  # k
-            del layer.w13_weight_scale, layer.w2_weight_scale
 
     @property
     def load_up_proj_weight_first(self) -> bool:
