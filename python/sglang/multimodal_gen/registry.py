@@ -932,10 +932,15 @@ def _register_configs():
 
     # Cosmos3 — single checkpoint serves T2V, I2V, and T2I. Mode is dispatched
     # per-request inside the pipeline from ``num_frames`` and ``image_path``.
-    # TODO: update to hf_model_paths once it is released.
+    # Both Nano (8B) and Super (32B) share the same pipeline; arch dimensions
+    # come from ``transformer/config.json`` via ``update_model_arch``.
     register_configs(
         sampling_param_cls=Cosmos3SamplingParams,
         pipeline_config_cls=Cosmos3Config,
+        hf_model_paths=[
+            "nvidia/Cosmos3-Nano",
+            "nvidia/Cosmos3-Super",
+        ],
         model_detectors=[lambda hf_id: "cosmos3omnidiffuserspipeline" in hf_id.lower()],
     )
 
