@@ -20,7 +20,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from sgl_kernel import dsv3_router_gemm
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -80,6 +79,9 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 _device_sm = get_device_sm()
+
+if _is_cuda:
+    from sgl_kernel import dsv3_router_gemm
 
 logger = logging.getLogger(__name__)
 

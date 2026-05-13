@@ -118,6 +118,24 @@ def is_ltx23_native_variant(arch_config: object) -> bool:
     return str(getattr(arch_config, "ltx_variant", "ltx_2")) == "ltx_2_3"
 
 
+def sync_ltx23_runtime_vae_markers(
+    arch_config: object,
+    loaded_vae_config: object | None,
+) -> None:
+    if loaded_vae_config is None:
+        return
+    source = getattr(loaded_vae_config, "arch_config", loaded_vae_config)
+    for key in (
+        "ltx_variant",
+        "condition_encoder_subdir",
+        "video_decoder_variant",
+        "video_decoder_config",
+    ):
+        value = getattr(source, key, None)
+        if value is not None:
+            setattr(arch_config, key, value)
+
+
 def _gemma_postprocess_func(
     outputs: BaseEncoderOutput,
     text_inputs: dict,
@@ -226,6 +244,9 @@ class LTX2PipelineConfig(PipelineConfig):
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         # Adapted from diffusers_pipeline.py _get_gemma_prompt_embeds
         # But we only need tokenization here, the embedding happens in TextEncodingStage
+        # Official LTX Gemma tokenizer trims surrounding whitespace before
+        # tokenization.
+        prompt = [text.strip() for text in prompt]
 
         # Gemma expects left padding for chat-style prompts
         tokenizer.padding_side = "left"
