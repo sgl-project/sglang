@@ -1042,7 +1042,8 @@
                   {
                     "group": "InternLM",
                     "pages": [
-                      "cookbook/autoregressive/InternLM/Intern-S1"
+                      "cookbook/autoregressive/InternLM/Intern-S1",
+                      "cookbook/autoregressive/InternLM/Intern-S2-Preview"
                     ]
                   },
                   {
@@ -1089,6 +1090,12 @@
                     "group": "Tencent",
                     "pages": [
                       "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
+                    ]
+                  },
+                  {
+                    "group": "Poolside",
+                    "pages": [
+                      "cookbook/autoregressive/Poolside/Laguna-XS.2"
                     ]
                   }
                 ]

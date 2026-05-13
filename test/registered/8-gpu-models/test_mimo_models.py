@@ -46,7 +46,7 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     ]
 
     bs_1_speed_thres = 170
-    num_accepted_drafts_thres = 3.2
+    accept_length_thres = 3.2
 
 
 MIMO_V2_MODEL = "XiaomiMiMo/MiMo-V2.5"
