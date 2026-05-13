@@ -217,12 +217,28 @@ else
   retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
-# CACHE_HOST=/home/runner/sgl-data
-CACHE_HOST=/home/runner/sglang-data
-if [[ -d "$CACHE_HOST" ]]; then
+# Persistent cache mount for HF models, pip wheels, MIOpen kernels, etc.
+# Prefer the new (non-Weka) host path; fall back to the legacy one if a
+# given runner host hasn't been migrated yet. Print a loud WARNING when
+# neither exists -- otherwise the container falls back to an ephemeral
+# /sgl-data and we silently re-download multi-hundred-GB HF models on
+# every job (HF_HOME below is unconditionally pointed at /sgl-data).
+CACHE_HOST=""
+for candidate in /home/runner/sglang-data /home/runner/sgl-data; do
+    if [[ -d "$candidate" ]]; then
+        CACHE_HOST="$candidate"
+        break
+    fi
+done
+
+if [[ -n "$CACHE_HOST" ]]; then
     CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+    echo "Persistent cache: mounting $CACHE_HOST -> /sgl-data"
 else
     CACHE_VOLUME=""
+    echo "WARNING: neither /home/runner/sglang-data nor /home/runner/sgl-data" >&2
+    echo "         exists on this runner; HF_HOME=/sgl-data/hf-cache will be" >&2
+    echo "         ephemeral and HF models will be re-downloaded every run." >&2
 fi
 
 # Detect libionic library for RDMA support
