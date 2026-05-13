@@ -543,6 +543,20 @@ class FlashInferAttnBackend(AttentionBackend):
             cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
         ]
 
+        # PR #20978 pads max_bs beyond pool_size for higher cuda-graph coverage.
+        # Reallocate indptr / last_page_len buffers so they fit the padded max_bs. 
+        if max_bs > self.kv_indptr[0].shape[0] - 1:
+            for i in range(self.num_wrappers):
+                self.kv_indptr[i] = torch.zeros(
+                    (max_bs + 1,),
+                    dtype=torch.int32, 
+                    device=self.kv_indptr[i].device, 
+                )
+            self.kv_last_page_len = torch.ones(
+                (max_bs,), dtype=torch.int32, device=self.kv_last_page_len.device
+            )
+            self.indices_updater_decode.kv_last_page_len = self.kv_last_page_len
+
         # Ensure tensors are properly allocated
         for i in range(self.num_wrappers):
             # Force allocation by performing a small operation
