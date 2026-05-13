@@ -732,7 +732,7 @@ TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)
 
 
 def _discover_unit_tests() -> list[str]:
-    unit_dir = Path(__file__).resolve().parent / "unit"
+    unit_dir = Path(__file__).resolve().parent.parent / "unit"
     if not unit_dir.is_dir():
         return []
     return sorted(
