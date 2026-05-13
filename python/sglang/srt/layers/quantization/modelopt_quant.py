@@ -1359,11 +1359,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer._weights_postprocessed = False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Idempotent across update_weights_from_disk re-entry: source scales
-        # are del'd below, so we can't re-derive on a second pass. Callers that
-        # need to refresh derived state must rebuild the layer or write into
-        # the post-processed slots (weight, weight_scale_interleaved, alpha,
-        # input_scale_inv) directly.
         if getattr(layer, "_weights_postprocessed", False):
             return
 
@@ -1714,11 +1709,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
-        # Idempotent across update_weights_from_disk re-entry: source scales
-        # are del'd below, so we can't re-derive on a second pass. Callers that
-        # need to refresh derived state must rebuild the layer or write into
-        # the post-processed slots (w*_weight, blockscale_*, g*_alphas,
-        # w*_input_scale_quant) directly.
         if getattr(layer, "_weights_postprocessed", False):
             return
 
