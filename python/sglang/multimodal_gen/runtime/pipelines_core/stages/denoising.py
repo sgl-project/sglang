@@ -1912,7 +1912,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
     @staticmethod
     def _merge_step_input_value(
-        values: list[Any], *, allow_shared: bool = False
+        values: list[Any], *, allow_shared: bool = False, key: str | None = None
     ) -> Any:
         first = values[0]
         if first is None:
@@ -1921,6 +1921,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     "step batch kwargs mix None and non-None values"
                 )
             return None
+
+        if key == "freqs_cis":
+            return DenoisingStage._merge_rope_cache(values)
 
         if isinstance(first, torch.Tensor):
             if any(not isinstance(value, torch.Tensor) for value in values):
@@ -1939,6 +1942,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 raise DenoisingStepPackingError(
                     "step batch shared tensor kwarg values differ"
                 )
+            if key in {
+                "encoder_hidden_states",
+                "encoder_hidden_states_mask",
+                "encoder_attention_mask",
+            } and all(
+                value.ndim >= 2
+                and first.ndim >= 2
+                and tuple(value.shape[2:]) == tuple(first.shape[2:])
+                and value.dtype == first.dtype
+                and value.device == first.device
+                for value in values
+            ):
+                return DenoisingStage._pad_and_cat_text_tensors(values)
             if all(
                 value.ndim > 0
                 and first.ndim > 0
@@ -1965,6 +1981,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 DenoisingStage._merge_step_input_value(
                     [value[index] for value in values],
                     allow_shared=allow_shared,
+                    key=key,
                 )
                 for index in range(len(first))
             )
@@ -1974,6 +1991,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 raise DenoisingStepPackingError(
                     "step batch kwargs mix list and non-list values"
                 )
+            if key in {"img_shapes", "txt_seq_lens"}:
+                merged = []
+                for value in values:
+                    merged.extend(value)
+                return merged
             if any(len(value) != len(first) for value in values):
                 raise DenoisingStepPackingError(
                     "step batch list kwargs have different lengths"
@@ -1982,6 +2004,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 DenoisingStage._merge_step_input_value(
                     [value[index] for value in values],
                     allow_shared=allow_shared,
+                    key=key,
                 )
                 for index in range(len(first))
             ]
@@ -1998,6 +2021,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 key: DenoisingStage._merge_step_input_value(
                     [value[key] for value in values],
                     allow_shared=allow_shared,
+                    key=str(key),
                 )
                 for key in first
             }
@@ -2011,6 +2035,67 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         raise DenoisingStepPackingError(
             f"step batch scalar kwarg values differ for {type(first).__name__}"
         )
+
+    @staticmethod
+    def _pad_and_cat_text_tensors(values: list[torch.Tensor]) -> torch.Tensor:
+        max_seq_len = max(int(value.shape[1]) for value in values)
+        padded_values = []
+        for value in values:
+            seq_len = int(value.shape[1])
+            if seq_len < max_seq_len:
+                pad_shape = list(value.shape)
+                pad_shape[1] = max_seq_len - seq_len
+                pad_value = False if value.dtype == torch.bool else 0
+                value = torch.cat(
+                    [value, value.new_full(pad_shape, pad_value)],
+                    dim=1,
+                )
+            padded_values.append(value)
+        return torch.cat(padded_values, dim=0)
+
+    @staticmethod
+    def _merge_rope_cache(values: list[Any]) -> Any:
+        first = values[0]
+        if isinstance(first, torch.Tensor):
+            if any(not isinstance(value, torch.Tensor) for value in values):
+                raise DenoisingStepPackingError(
+                    "step batch RoPE cache mixes tensor and non-tensor values"
+                )
+            if not all(
+                value.ndim == first.ndim
+                and tuple(value.shape[1:]) == tuple(first.shape[1:])
+                and value.dtype == first.dtype
+                and value.device == first.device
+                for value in values
+            ):
+                raise DenoisingStepPackingError(
+                    "step batch RoPE cache tensors are incompatible"
+                )
+            longest = max(values, key=lambda value: int(value.shape[0]))
+            for value in values:
+                if not torch.equal(longest[: value.shape[0]], value):
+                    raise DenoisingStepPackingError(
+                        "step batch RoPE cache tensors differ"
+                    )
+            return longest
+
+        if isinstance(first, tuple):
+            if any(not isinstance(value, tuple) for value in values):
+                raise DenoisingStepPackingError(
+                    "step batch RoPE cache mixes tuple and non-tuple values"
+                )
+            if any(len(value) != len(first) for value in values):
+                raise DenoisingStepPackingError(
+                    "step batch RoPE cache tuples have different lengths"
+                )
+            return tuple(
+                DenoisingStage._merge_rope_cache([value[index] for value in values])
+                for index in range(len(first))
+            )
+
+        if all(value == first for value in values):
+            return first
+        raise DenoisingStepPackingError("step batch RoPE cache values differ")
 
     @staticmethod
     def _step_input_can_be_shared(key: str) -> bool:
@@ -2027,6 +2112,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             key: self._merge_step_input_value(
                 [kwargs[key] for kwargs in branch_kwargs],
                 allow_shared=self._step_input_can_be_shared(key),
+                key=key,
             )
             for key in keys
         }

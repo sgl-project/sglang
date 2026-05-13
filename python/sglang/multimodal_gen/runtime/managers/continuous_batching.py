@@ -166,12 +166,12 @@ def validate_continuous_batching_config(server_args: Any) -> None:
 
     if getattr(server_args, "dit_cpu_offload", False):
         raise ContinuousBatchingError(
-            "continuous batching does not support DiT CPU offload yet"
+            "continuous batching requires a GPU-resident DiT; disable --dit-cpu-offload"
         )
 
     if getattr(server_args, "dit_layerwise_offload", False):
         raise ContinuousBatchingError(
-            "continuous batching does not support DiT layerwise offload yet"
+            "continuous batching requires a GPU-resident DiT; disable --dit-layerwise-offload"
         )
 
     allowed_attention_backends = {"fa", "fa2", "torch_sdpa"}

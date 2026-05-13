@@ -629,6 +629,12 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.vae_cpu_offload = False
             return
 
+        if self.batching_mode == "continuous":
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = False
+            if self.dit_layerwise_offload is None:
+                self.dit_layerwise_offload = False
+
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
             logger.info(

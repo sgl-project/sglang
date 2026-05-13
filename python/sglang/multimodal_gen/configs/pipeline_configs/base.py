@@ -7,7 +7,7 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL
@@ -197,6 +197,8 @@ def maybe_unpad_latents(latents, batch):
 @dataclass
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
+
+    continuous_batching_supported_tasks: ClassVar[tuple[ModelTaskType, ...]] = ()
 
     task_type: ModelTaskType = ModelTaskType.I2I
     skip_input_image_preprocess: bool = False
@@ -398,7 +400,7 @@ class PipelineConfig:
         return False
 
     def supports_continuous_batching(self):
-        return False
+        return self.task_type in self.continuous_batching_supported_tasks
 
     def estimate_request_cost(self, batch) -> float:
         """Return the relative cost used for batching admission caps.
