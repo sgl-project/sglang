@@ -14,6 +14,7 @@ import math
 import os
 import unittest
 from io import BytesIO
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -25,6 +26,10 @@ EDIT_INPUT_ENV = "SGLANG_OMNI_U1_EDIT_INPUT_IMAGE"
 EDIT_REFERENCE_ENV = "SGLANG_OMNI_U1_EDIT_REFERENCE_IMAGE"
 THREE_TURN_REFERENCE_ENV = "SGLANG_OMNI_U1_THREE_TURN_REFERENCE_IMAGE"
 THREE_TURN_OUTPUT_ENV = "SGLANG_OMNI_U1_THREE_TURN_OUTPUT_IMAGE"
+REFERENCE_DIR = Path(__file__).with_name("references") / "sensenova_u1"
+T2I_REFERENCE_PATH = REFERENCE_DIR / "t2i_512_1step.png"
+EDIT_REFERENCE_PATH = REFERENCE_DIR / "edit_512_1step.png"
+THREE_TURN_REFERENCE_PATH = REFERENCE_DIR / "three_turn_1024_seed7.png"
 THREE_TURN_PROMPTS = (
     (
         "Create one clean studio image of a matte cobalt-blue cube centered on a "
@@ -57,13 +62,21 @@ class TestSenseNovaU1E2EPrecision(unittest.TestCase):
             model=model,
             task="t2i",
             text=T2I_PRECISION_PROMPT,
-            sampling_params=_precision_sampling_params("SGLANG_OMNI_U1_T2I"),
+            sampling_params=_precision_sampling_params(
+                "SGLANG_OMNI_U1_T2I",
+                default_width=512,
+                default_height=512,
+                default_num_steps=1,
+                default_cfg_text_scale=1.0,
+                default_cfg_img_scale=1.0,
+            ),
             max_images=1,
         )
 
         _assert_reference_match(
             response,
             reference_env=T2I_REFERENCE_ENV,
+            default_reference_path=T2I_REFERENCE_PATH,
             output_env="SGLANG_OMNI_U1_T2I_OUTPUT_IMAGE",
             metric_prefix="SGLANG_OMNI_U1_T2I",
         )
@@ -77,16 +90,26 @@ class TestSenseNovaU1E2EPrecision(unittest.TestCase):
             task="edit",
             text=EDIT_PRECISION_PROMPT,
             messages=[
-                _image_segment_from_path(_require_env(EDIT_INPUT_ENV)),
+                _image_segment_from_path(
+                    _path_from_env(EDIT_INPUT_ENV, T2I_REFERENCE_PATH)
+                ),
                 {"type": "text", "text": EDIT_PRECISION_PROMPT},
             ],
-            sampling_params=_precision_sampling_params("SGLANG_OMNI_U1_EDIT"),
+            sampling_params=_precision_sampling_params(
+                "SGLANG_OMNI_U1_EDIT",
+                default_width=512,
+                default_height=512,
+                default_num_steps=1,
+                default_cfg_text_scale=1.0,
+                default_cfg_img_scale=1.0,
+            ),
             max_images=1,
         )
 
         _assert_reference_match(
             response,
             reference_env=EDIT_REFERENCE_ENV,
+            default_reference_path=EDIT_REFERENCE_PATH,
             output_env="SGLANG_OMNI_U1_EDIT_OUTPUT_IMAGE",
             metric_prefix="SGLANG_OMNI_U1_EDIT",
         )
@@ -139,9 +162,9 @@ class TestSenseNovaU1E2EPrecision(unittest.TestCase):
                 session_id=session_id,
             )
             actual = _last_image(third)
-            reference = Image.open(_require_env(THREE_TURN_REFERENCE_ENV)).convert(
-                "RGB"
-            )
+            reference = Image.open(
+                _path_from_env(THREE_TURN_REFERENCE_ENV, THREE_TURN_REFERENCE_PATH)
+            ).convert("RGB")
             metrics = _compare_images(actual, reference)
 
             output_path = os.getenv(THREE_TURN_OUTPUT_ENV)
@@ -519,11 +542,14 @@ def _assert_reference_match(
     payload: dict,
     *,
     reference_env: str,
+    default_reference_path: Path,
     output_env: str,
     metric_prefix: str,
 ) -> None:
     actual = _last_image(payload)
-    reference = Image.open(_require_env(reference_env)).convert("RGB")
+    reference = Image.open(_path_from_env(reference_env, default_reference_path)).convert(
+        "RGB"
+    )
     metrics = _compare_images(actual, reference)
 
     output_path = os.getenv(output_env)
@@ -578,14 +604,26 @@ def _env_float(name: str, default: float) -> float:
     return float(os.getenv(name, str(default)))
 
 
-def _precision_sampling_params(env_prefix: str) -> dict:
+def _precision_sampling_params(
+    env_prefix: str,
+    *,
+    default_width: int = 1024,
+    default_height: int = 1024,
+    default_num_steps: int = 50,
+    default_cfg_text_scale: float = 4.0,
+    default_cfg_img_scale: float = 1.0,
+) -> dict:
     return {
-        "width": _env_int(f"{env_prefix}_WIDTH", 1024),
-        "height": _env_int(f"{env_prefix}_HEIGHT", 1024),
-        "num_steps": _env_int(f"{env_prefix}_STEPS", 50),
+        "width": _env_int(f"{env_prefix}_WIDTH", default_width),
+        "height": _env_int(f"{env_prefix}_HEIGHT", default_height),
+        "num_steps": _env_int(f"{env_prefix}_STEPS", default_num_steps),
         "seed": _env_int(f"{env_prefix}_SEED", 223),
-        "cfg_text_scale": _env_float(f"{env_prefix}_CFG_TEXT_SCALE", 4.0),
-        "cfg_img_scale": _env_float(f"{env_prefix}_CFG_IMG_SCALE", 1.0),
+        "cfg_text_scale": _env_float(
+            f"{env_prefix}_CFG_TEXT_SCALE", default_cfg_text_scale
+        ),
+        "cfg_img_scale": _env_float(
+            f"{env_prefix}_CFG_IMG_SCALE", default_cfg_img_scale
+        ),
         "cfg_interval": [
             _env_float(f"{env_prefix}_CFG_START", 0.0),
             _env_float(f"{env_prefix}_CFG_END", 1.0),
@@ -636,11 +674,8 @@ def _max_repeated_char_run(text: str, char: str) -> int:
     return max_run
 
 
-def _require_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise AssertionError(f"set {name} to run this e2e test")
-    return value
+def _path_from_env(name: str, default: Path) -> str:
+    return os.getenv(name) or str(default)
 
 
 if __name__ == "__main__":
