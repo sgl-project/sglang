@@ -365,6 +365,10 @@
       "destination": "/docs/sglang-diffusion/attention_backends"
     },
     {
+      "source": "/diffusion/performance/dynamic_batching.html",
+      "destination": "/docs/sglang-diffusion/dynamic_batching"
+    },
+    {
       "source": "/diffusion/performance/cache/cache_dit.html",
       "destination": "/docs/sglang-diffusion/cache_dit"
     },
@@ -891,6 +895,7 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_examples",
                   "docs/hardware-platforms/ascend-npus/mindspore_backend",
                   "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
@@ -1037,6 +1042,7 @@
                   {
                     "group": "InternLM",
                     "pages": [
+                      "cookbook/autoregressive/InternLM/Intern-S2-Preview",
                       "cookbook/autoregressive/InternLM/Intern-S1"
                     ]
                   },
@@ -1044,6 +1050,12 @@
                     "group": "InternVL",
                     "pages": [
                       "cookbook/autoregressive/InternVL/InternVL3.5"
+                    ]
+                  },
+                  {
+                    "group": "OpenBMB",
+                    "pages": [
+                      "cookbook/autoregressive/OpenBMB/MiniCPM-V-4_6"
                     ]
                   },
                   {
@@ -1079,6 +1091,12 @@
                     "pages": [
                       "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
                     ]
+                  },
+                  {
+                    "group": "Poolside",
+                    "pages": [
+                      "cookbook/autoregressive/Poolside/Laguna-XS.2"
+                    ]
                   }
                 ]
               },
@@ -1102,7 +1120,7 @@
                   {
                     "group": "LTX",
                     "pages": [
-                      "cookbook/diffusion/LTX/LTX"
+                      "cookbook/diffusion/LTX/LTX2 & LTX2.3"
                     ]
                   },
                   {
@@ -1170,6 +1188,12 @@
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/attention_backends",
+                  {
+                    "group": "Inference Batching",
+                    "pages": [
+                      "docs/sglang-diffusion/dynamic_batching"
+                    ]
+                  },
                   "docs/sglang-diffusion/profiling",
                   "docs/sglang-diffusion/ci_perf"
                 ]

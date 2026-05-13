@@ -17,6 +17,7 @@ import requests
 
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -642,7 +643,7 @@ class TestSRTEndpoint(CustomTestCase):
 
 
 # -------------------------------------------------------------------------
-#    /tokenize & /detokenize Test Class: TestTokenizeDetokenize
+#    /tokenize, /v1/tokenize & /detokenize Test Class: TestTokenizeDetokenize
 # -------------------------------------------------------------------------
 
 
@@ -652,6 +653,7 @@ class TestTokenizeDetokenize(CustomTestCase):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tokenize_url = f"{cls.base_url}/tokenize"
+        cls.openai_tokenize_url = f"{cls.base_url}/v1/tokenize"
         cls.detokenize_url = f"{cls.base_url}/detokenize"
         cls.session = requests.Session()
         cls.process = popen_launch_server(
@@ -659,6 +661,7 @@ class TestTokenizeDetokenize(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         )
+        cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
     def tearDownClass(cls):
@@ -704,6 +707,58 @@ class TestTokenizeDetokenize(CustomTestCase):
             self.tokenize_url, json={"model": self.model, "prompt": 12345}
         )
         self.assertEqual(r.status_code, 400)
+
+    def test_openai_tokenize_chat_messages(self):
+        messages = [{"role": "user", "content": "What is the weather in Paris?"}]
+        resp = self._post_json(
+            self.openai_tokenize_url,
+            {"model": self.model, "messages": messages},
+        )
+        expected_tokens = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        if not isinstance(expected_tokens, list):
+            expected_tokens = expected_tokens["input_ids"]
+        if hasattr(expected_tokens, "tolist"):
+            expected_tokens = expected_tokens.tolist()
+        self.assertEqual(resp["tokens"], expected_tokens)
+        self.assertEqual(resp["count"], len(expected_tokens))
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather for a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ]
+        tools_resp = self._post_json(
+            self.openai_tokenize_url,
+            {"model": self.model, "messages": messages, "tools": tools},
+        )
+        self.assertIsInstance(tools_resp["tokens"], list)
+        self.assertEqual(tools_resp["count"], len(tools_resp["tokens"]))
+        self.assertNotEqual(tools_resp["tokens"], resp["tokens"])
+
+        no_tools_resp = self._post_json(
+            self.openai_tokenize_url,
+            {
+                "model": self.model,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "none",
+            },
+        )
+        self.assertEqual(no_tools_resp["tokens"], resp["tokens"])
+        self.assertEqual(no_tools_resp["count"], resp["count"])
 
     def test_detokenize_roundtrip(self):
         text = "Verify detokenization round trip. यह डिटोकेनाइजेशन है"

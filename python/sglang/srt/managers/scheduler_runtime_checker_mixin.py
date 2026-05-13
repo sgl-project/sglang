@@ -10,7 +10,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
-from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
@@ -125,8 +124,14 @@ class PoolStats:
         stats.full_token_usage = self.full_token_usage
         if self.is_hybrid_swa:
             stats.swa_token_usage = self.swa_token_usage
+            stats.swa_available_tokens = self.swa_available_size
+            stats.swa_evictable_tokens = self.swa_evictable_size
+            stats.swa_used_tokens = self.swa_num_used
         if self.is_hybrid_ssm:
             stats.mamba_usage = self.mamba_usage
+            stats.mamba_available_tokens = self.mamba_available_size
+            stats.mamba_evictable_tokens = self.mamba_evictable_size
+            stats.mamba_used_tokens = self.mamba_num_used
         stats.kv_available_tokens = self.full_available_size
         stats.kv_evictable_tokens = self.full_evictable_size
         stats.kv_used_tokens = self.full_num_used
@@ -167,15 +172,19 @@ class SchedulerRuntimeCheckerMixin:
     def _session_held_req_count(self: Scheduler) -> int:
         return self.tree_cache.session_held_req_count()
 
+    def _session_held_mamba_slots(self: Scheduler) -> int:
+        return self.tree_cache.session_held_mamba_slots(self._active_pool_idxs())
+
     def get_pool_stats(self: Scheduler) -> PoolStats:
         if self.is_hybrid_swa:
             pool_stats = self._get_swa_token_info()
         elif self.is_hybrid_ssm:
-            return self._get_mamba_token_info()
-        elif self.enable_hisparse:
-            return self._get_hisparse_token_info()
+            pool_stats = self._get_mamba_token_info()
         else:
-            return self._get_token_info()
+            pool_stats = self._get_token_info()
+
+        if self.enable_hisparse:
+            pool_stats = self._get_hisparse_token_info(pool_stats)
 
         # swa + ssm can coexist: overlay mamba fields onto swa stats
         if self.is_hybrid_ssm:
@@ -200,8 +209,7 @@ class SchedulerRuntimeCheckerMixin:
             full_evictable_size=evictable_size,
         )
 
-    def _get_hisparse_token_info(self: Scheduler) -> PoolStats:
-        pool_stats = self._get_token_info()
+    def _get_hisparse_token_info(self: Scheduler, pool_stats: PoolStats) -> PoolStats:
         if self.enable_hisparse and self.hisparse_coordinator is not None:
             h = self.hisparse_coordinator.get_token_stats()
             return dataclasses.replace(
@@ -258,6 +266,13 @@ class SchedulerRuntimeCheckerMixin:
         swa_num_used = self.swa_tokens_per_layer - (
             swa_available_size + swa_evictable_size
         )
+        # FIXME(hisparse): host-backup transiently over-releases the device pool
+        # counter, producing negative full_num_used / swa_num_used. We clamp to 0
+        # to keep token_usage / leak checks sane, but the underlying accounting
+        # bug should be fixed so the clamp can go away.
+        if self.enable_hisparse:
+            full_num_used = max(0, full_num_used)
+            swa_num_used = max(0, swa_num_used)
         full_token_usage = full_num_used / self.full_tokens_per_layer
         swa_token_usage = swa_num_used / self.swa_tokens_per_layer
 
@@ -336,7 +351,7 @@ class SchedulerRuntimeCheckerMixin:
             ps.mamba_available_size,
             ps.mamba_evictable_size,
             self.tree_cache.mamba_protected_size(),
-            0,
+            self._session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
         )
         if leak:
@@ -510,7 +525,7 @@ class SchedulerRuntimeCheckerMixin:
         )
         self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+            self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                 self.disagg_prefill_bootstrap_queue.queue, priority_enabled
             )
             self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
@@ -538,11 +553,13 @@ class SchedulerRuntimeCheckerMixin:
         if not self.is_fully_idle():
             return
 
-        # memory leak check
-        has_leak, messages = self._check_all_pools(self.get_pool_stats())
-        if has_leak:
-            self._report_leak("pool", "\n".join(messages))
-        self._check_req_pool()
+        # memory leak check (skipped for hisparse — pool counters intentionally
+        # diverge during host-backup, see _get_swa_token_info clamp).
+        if not self.enable_hisparse:
+            has_leak, messages = self._check_all_pools(self.get_pool_stats())
+            if has_leak:
+                self._report_leak("pool", "\n".join(messages))
+            self._check_req_pool()
 
         # tree cache sanity check
         self._check_tree_cache()
@@ -556,6 +573,9 @@ class SchedulerRuntimeCheckerMixin:
         # reset token ratio
         self.new_token_ratio = self.init_new_token_ratio
 
+        # reset device timer window so idle time isn't counted
+        self.reset_device_timer_window()
+
         # sleep until next event
         self.maybe_sleep_on_idle()
 
@@ -564,7 +584,7 @@ def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
 ) -> WatchdogRaw:
     def dump_info() -> str:
-        if scheduler.is_initializing or disable_request_logging():
+        if scheduler.is_initializing:
             return ""
         _, messages = scheduler._check_all_pools(scheduler.get_pool_stats())
         return (

@@ -29,11 +29,17 @@ class SyncExecutor(PipelineExecutor):
         run_stage: Callable[[PipelineStage, Any], Any],
     ) -> Any:
         """Execute all pipeline stages sequentially and step the profiler."""
-        for stage in stages:
-            payload = run_stage(stage, payload)
-            profiler = SGLDiffusionProfiler.get_instance()
-            if profiler:
-                profiler.step_stage()
+        self.begin_component_residency_request(stages, payload, server_args)
+        try:
+            for stage_index, stage in enumerate(stages):
+                self.before_stage(stage, stage_index, payload, server_args)
+                payload = run_stage(stage, payload)
+                self.after_stage(stage_index)
+                profiler = SGLDiffusionProfiler.get_instance()
+                if profiler:
+                    profiler.step_stage()
+        finally:
+            self.finish_component_residency_request()
         return payload
 
     def run_profile_all_stages(

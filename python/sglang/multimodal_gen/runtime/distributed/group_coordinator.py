@@ -435,6 +435,8 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         # Broadcast.
+        if not input_.is_contiguous():
+            input_ = input_.contiguous()
         torch.distributed.broadcast(
             input_,
             src=self.ranks[src],

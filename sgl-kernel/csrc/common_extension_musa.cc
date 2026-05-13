@@ -72,6 +72,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
   m.impl("concat_mla_k", torch::kMUSA, &concat_mla_k);
 
+  m.def(
+      "rotary_embedding(Tensor positions, Tensor! query,"
+      "                 Tensor!? key, int head_size,"
+      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
+  m.impl("rotary_embedding", torch::kMUSA, &rotary_embedding);
+
   /*
    * From csrc/gemm
    */
@@ -271,6 +277,42 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
   m.impl("top_p_renorm_probs", torch::kMUSA, &top_p_renorm_probs);
+
+  /*
+   * From csrc/musa
+   */
+  m.def(
+      "musa_batched_rotary_embedding_contiguous(Tensor! positions, Tensor! query, Tensor! key, "
+      "int head_size, Tensor! cos_sin_cache, bool is_neox, int rot_dim, Tensor! cos_sin_cache_offsets) -> ()");
+  m.impl("musa_batched_rotary_embedding_contiguous", torch::kMUSA, &batched_rotary_embedding_contiguous);
+
+  m.def(
+      "musa_rotary_embedding_contiguous(Tensor! positions, Tensor! query, Tensor! key, "
+      "int head_size, Tensor! cos_sin_cache, bool is_neox) -> ()");
+  m.impl("musa_rotary_embedding_contiguous", torch::kMUSA, &rotary_embedding_contiguous);
+
+  m.def(
+      "musa_fused_moe_gemv(Tensor! A, Tensor! B, Tensor! C, Tensor? A_scale, Tensor? B_scale,"
+      "Tensor! topk_weights, Tensor! topk_ids, bool mul_routed_weight, int topk, bool use_int4_w4a16,"
+      "bool use_swigelu) -> ()");
+  m.impl("fused_moe_gemv", torch::kMUSA, &fused_moe_gemv);
+
+  m.def(
+      "musa_fused_gemv(Tensor! A, Tensor! B, Tensor! C, Tensor? A_scale, Tensor? B_scale,"
+      "bool use_int4_w4a16, bool use_swigelu, bool use_rms_norm, Tensor? gamma,"
+      "float eps) -> ()");
+  m.impl("musa_fused_gemv", torch::kMUSA, &musa_fused_gemv);
+
+  m.def(
+      "musa_fused_mul_add(Tensor! output, Tensor! self, Tensor! bias,"
+      "float scale) -> ()");
+  m.impl("musa_fused_mul_add", torch::kMUSA, &fused_mul_add);
+
+  m.def(
+      "musa_top_k_top_p_sampling_from_probs(Tensor probs, Tensor output, Tensor? maybe_indices, Tensor? "
+      "maybe_top_k_arr, "
+      "float top_k_val, Tensor? maybe_top_p_arr, float top_p_val, bool deterministic, Generator? gen) -> ()");
+  m.impl("musa_top_k_top_p_sampling_from_probs", torch::kMUSA, &musa_top_k_top_p_sampling_from_probs);
 
   /*
    * From csrc/memory

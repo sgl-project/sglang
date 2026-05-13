@@ -513,6 +513,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         super().__init__(base_layer, lora_rank, lora_alpha)
 
     def forward(self, input_: torch.Tensor):
+        if self.merged or self.disable_lora:
+            return self.base_layer(input_)
+
         lora_A = self.lora_A
         lora_B = self.lora_B
         if isinstance(self.lora_B, DTensor):

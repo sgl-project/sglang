@@ -42,6 +42,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
@@ -58,7 +59,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_musa,
+    is_npu,
+    log_info_on_rank0,
+    require_gathered_buffer,
+)
 
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
@@ -66,6 +73,8 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_musa = is_musa()
 
 
 @dataclass
@@ -141,6 +150,13 @@ def set_torch_compile_config():
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
 
+    if _is_musa:
+        from sglang.srt.hardware_backend.musa.utils.patch_torch import (
+            patch_fx_custom_device,
+        )
+
+        patch_fx_custom_device()
+
 
 class PiecewiseCudaGraphRunner:
     """A PiecewiseCudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
@@ -189,6 +205,21 @@ class PiecewiseCudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_num_tokens = self.compile_config.get_capture_sizes()
+        # When the layer communicator scatters/gathers across the attention TP
+        # group (e.g. with --moe-dense-tp-size 1), the model's reduce_scatter
+        # requires the token count to be divisible by attn_tp_size * attn_cp_size.
+        # Drop captures that would violate this (mirrors the filter used by
+        # the regular CUDA graph runner in get_batch_sizes_to_capture).
+        if require_gathered_buffer(self.model_runner.server_args):
+            mul_base = self.attn_tp_size
+            attn_cp_size = get_attention_cp_size()
+            if mul_base % attn_cp_size != 0:
+                mul_base *= attn_cp_size
+            filtered = [n for n in self.capture_num_tokens if n % mul_base == 0]
+            assert (
+                len(filtered) > 0
+            ), f"No piecewise CUDA graph capture sizes are multiples of {mul_base}"
+            self.capture_num_tokens = filtered
         log_info_on_rank0(
             logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
         )
@@ -217,7 +248,7 @@ class PiecewiseCudaGraphRunner:
                 (self.max_num_tokens,), dtype=self._cache_loc_dtype()
             )
             out_cache_loc_swa = (
-                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+                torch.zeros((self.max_num_tokens,), dtype=torch.int32)
                 if model_runner.is_hybrid_swa
                 else None
             )
@@ -283,8 +314,14 @@ class PiecewiseCudaGraphRunner:
             language_model = getattr(
                 self.model_runner.model, "language_model", self.model_runner.model
             )
+            layer_model = (
+                language_model.model
+                if hasattr(language_model, "model")
+                and hasattr(language_model.model, "layers")
+                else language_model
+            )
             with patch_model(
-                language_model.model, self.compile_config.compiler
+                layer_model, self.compile_config.compiler
             ) as patched_model:
 
                 # Dummy warmup for jit kernel

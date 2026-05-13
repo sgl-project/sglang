@@ -11,33 +11,40 @@ from sglang.srt.layers.attention.fla.kda import (
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
+from sglang.srt.utils.common import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=12, suite="stage-b-test-1-gpu-large")
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+@unittest.skipIf(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    "Test requires CUDA or XPU",
+)
 class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
     def setUp(self):
+        self.device = get_device()
         self.token_num = 4
-        self.query_start_loc = torch.tensor([0, 1, 2, 3, 4], device="cuda")
-        self.cache_indices = torch.tensor([0, 2, 5, 8], device="cuda")
+        self.query_start_loc = torch.tensor([0, 1, 2, 3, 4], device=self.device)
+        self.cache_indices = torch.tensor([0, 2, 5, 8], device=self.device)
         self.local_num_heads = 8
         self.head_dim = 128
         self.cache_len = 64
 
         self.A_log = torch.randn(
-            1, 1, self.local_num_heads, 1, dtype=torch.float32, device="cuda"
+            1, 1, self.local_num_heads, 1, dtype=torch.float32, device=self.device
         )
         self.a = torch.randn(
             1,
             self.token_num,
             self.local_num_heads * self.head_dim,
             dtype=torch.bfloat16,
-            device="cuda",
+            device=self.device,
         )
         self.dt_bias = torch.randn(
-            self.local_num_heads * self.head_dim, dtype=torch.bfloat16, device="cuda"
+            self.local_num_heads * self.head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
         )
         self.softplus_beta = 1.0
         self.softplus_threshold = 20.0
@@ -47,7 +54,7 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             self.local_num_heads,
             self.head_dim,
             dtype=torch.bfloat16,
-            device="cuda",
+            device=self.device,
         )
         self.k = torch.randn(
             1,
@@ -55,7 +62,7 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             self.local_num_heads,
             self.head_dim,
             dtype=torch.bfloat16,
-            device="cuda",
+            device=self.device,
         )
         self.v = torch.randn(
             1,
@@ -63,10 +70,14 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             self.local_num_heads,
             self.head_dim,
             dtype=torch.bfloat16,
-            device="cuda",
+            device=self.device,
         )
         self.beta = torch.randn(
-            1, self.token_num, self.local_num_heads, dtype=torch.bfloat16, device="cuda"
+            1,
+            self.token_num,
+            self.local_num_heads,
+            dtype=torch.bfloat16,
+            device=self.device,
         )
 
         self.ssm_states = torch.zeros(
@@ -75,7 +86,7 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             self.head_dim,
             self.head_dim,
             dtype=torch.float32,
-            device="cuda",
+            device=self.device,
         )
 
     def run_fused(self):

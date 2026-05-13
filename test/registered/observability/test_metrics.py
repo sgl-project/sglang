@@ -62,12 +62,12 @@ class TestEnableMetrics(CustomTestCase):
                     {"mode": "decode"},
                 ),
                 (
-                    "sglang:dp_cooperation_gpu_execution_seconds_total",
-                    {"category": "forward_extend"},
+                    "sglang:dp_cooperation_forward_execution_seconds_total",
+                    {"category": "extend"},
                 ),
                 (
-                    "sglang:dp_cooperation_gpu_execution_seconds_total",
-                    {"category": "forward_decode"},
+                    "sglang:dp_cooperation_forward_execution_seconds_total",
+                    {"category": "decode"},
                 ),
             ]
             _check_metrics_positive(self, metrics, metrics_to_check)
@@ -129,15 +129,17 @@ class TestEnableMetrics(CustomTestCase):
             for _ in response.iter_lines(decode_unicode=False):
                 pass
 
-            response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/generate",
-                json={
-                    "text": "Hello",
-                    "sampling_params": {"temperature": 0, "max_new_tokens": 5},
-                },
-                headers={"x-smg-routing-key": "test-key"},
-            )
-            self.assertEqual(response.status_code, 200)
+            for i in range(2):
+                # Send the request twice to trigger cached token metrics
+                response = requests.post(
+                    f"{DEFAULT_URL_FOR_TEST}/generate",
+                    json={
+                        "text": "Hello, " * 100,
+                        "sampling_params": {"temperature": 0, "max_new_tokens": 5},
+                    },
+                    headers={"x-smg-routing-key": "test-key"},
+                )
+                self.assertEqual(response.status_code, 200)
 
             # Get metrics
             metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
@@ -209,8 +211,8 @@ class TestEnableMetrics(CustomTestCase):
         metrics_to_check = [
             ("sglang:realtime_tokens_total", {"mode": "prefill_compute"}),
             ("sglang:realtime_tokens_total", {"mode": "decode"}),
-            ("sglang:gpu_execution_seconds_total", {"category": "forward_extend"}),
-            ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
+            ("sglang:forward_execution_seconds_total", {"category": "extend"}),
+            ("sglang:forward_execution_seconds_total", {"category": "decode"}),
             ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)

@@ -28,12 +28,15 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.eagle_info_v2 import fill_new_verified_id
+from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
@@ -138,6 +141,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Alias for better readability
         self.draft_runner_list: List[ModelRunner] = self.draft_worker.model_runner_list
+        # Match `EagleDraftWorker.draft_runner` so `_draft_runner_of(self)` works
+        # for the EagleDraftInput shape classmethods.
+        self.draft_runner: ModelRunner = self.draft_runner_list[0]
 
         # Chain-style MTP: each step propagates its own output hidden states to the
         # next step.  Non-chain: each step uses the target model's hidden states.
@@ -146,10 +152,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         self.init_lm_head()
 
-        # Used for KV Cache reversion
+        # KV cache reversion buffer; sized to mirror req_to_token (indexed by
+        # req_pool_idx).
         self.req_to_hidden_states_pool = torch.empty(
             (
-                self.req_to_token_pool.size,
+                self.req_to_token_pool.req_to_token.shape[0],
                 self.speculative_num_steps - 1,
                 self.model_config.hidden_size,
             ),
@@ -253,7 +260,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            draft_input.verified_id,
+            draft_input.bonus_tokens,
             parent_list,
             top_scores_index,
             draft_tokens,
@@ -373,7 +380,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Construct spec_info
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
-            verified_id=next_token_ids,
+            bonus_tokens=next_token_ids,
             new_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
@@ -654,7 +661,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            target_capture_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.FULL
+            )
+            model_worker_batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
@@ -674,12 +686,17 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             return batch_output
         else:
             if model_worker_batch.spec_info is None:
+                capture_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.speculative_algorithm.is_standalone()
+                    else CaptureHiddenMode.LAST
+                )
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
-                    hidden_size=self.target_worker.model_config.spec_hidden_size,
-                    dtype=self.target_worker.model_config.dtype,
+                    hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
+                    dtype=EagleDraftInput.dtype_for(self.draft_worker),
                     topk=self.topk * self.speculative_num_steps,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                    capture_hidden_mode=capture_mode,
                 )
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
@@ -761,16 +778,16 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
-            all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_lens, dtype=torch.int32)
-            fill_new_verified_id[(bs,)](
-                all_verified_id,
+            accept_tokens = predict[accept_index]
+            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+            fill_bonus_tokens[(bs,)](
+                accept_tokens,
                 accept_lens,
-                verified_id,
+                bonus_tokens,
                 self.speculative_num_draft_tokens,
             )
         else:
-            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(
@@ -779,7 +796,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
-            verified_id=verified_id,
+            bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
         )
@@ -787,9 +804,11 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             logits_output=logits_output,
             next_token_ids=predict,
             can_run_cuda_graph=can_run_cuda_graph,
+            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
+            indexer_topk_output=forward_batch_output.indexer_topk_output,
         )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):

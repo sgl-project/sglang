@@ -169,7 +169,7 @@ class LoRAPipeline(ComposedPipelineBase):
         Yields:
             List of modules that had offload disabled.
         """
-        from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+        from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
             OffloadableDiTMixin,
         )
 

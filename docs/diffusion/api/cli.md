@@ -78,6 +78,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--sp-degree {N}`: sequence parallelism size
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
 - `--attention-backend {BACKEND}`: attention backend for native SGLang pipelines
+- `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
 
 ### Sampling and output
@@ -194,6 +195,28 @@ sglang serve \
 ```
 
 The component key must match the key in the model's `model_index.json`, and the path must be either a Hugging Face repo ID or a complete component directory.
+
+## Component Attention Backend Overrides
+
+Use `--component-attention-backends` when one pipeline component needs a different native attention backend from the global `--attention-backend`.
+
+```bash
+sglang generate \
+  --model-path Lightricks/LTX-2.3 \
+  --attention-backend fa \
+  --component-attention-backends text_encoder=torch_sdpa
+```
+
+The component key must match a pipeline module key such as `text_encoder`, `text_encoder_2`, `transformer`, `transformer_2`, or `connectors`. Component overrides take precedence over the global `--attention-backend` only while that component is being constructed.
+
+You can also pass dotted CLI entries:
+
+```bash
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --component-attention-backends.text_encoder torch_sdpa \
+  --component-attention-backends.transformer fa
+```
 
 ## Diffusers Backend
 

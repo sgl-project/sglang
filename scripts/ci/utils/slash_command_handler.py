@@ -13,6 +13,126 @@ from github import Auth, Github
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 
 
+MAINTENANCE_ISSUE_NUMBER = 21065
+
+
+def _check_rebase_gate(gh_repo, pr, token):
+    """
+    Pre-dispatch gate mirroring `.github/actions/check-maintenance/action.yml`.
+
+    Without this, /rerun-stage and /rerun-test would dispatch a workflow_run
+    on a PR that's behind a required base, the action would catch it, and
+    every job in the run would fail at the gate — wasting runner time and
+    producing N error annotations instead of one comment. Pre-checking here
+    short-circuits the dispatch and posts a single explanatory comment.
+
+    Mirrors the action's two independent modes driven by issue #21065:
+      (1) Full-pause: maintenance issue is OPEN
+      (2) Rebase-required: issue body contains `MIN_BASE_SHA: <sha>`
+    Both bypassed by the `bypass-maintenance` PR label.
+
+    Returns (allowed: bool, message: Optional[str]). When allowed=False,
+    caller MUST post `message` to the PR and skip dispatch.
+    Fail-open on API errors (matches the action's behavior).
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    repo_full_name = gh_repo.full_name
+
+    try:
+        issue_resp = requests.get(
+            f"https://api.github.com/repos/{repo_full_name}/issues/{MAINTENANCE_ISSUE_NUMBER}",
+            headers=headers,
+            timeout=15,
+        )
+        if issue_resp.status_code != 200:
+            print(
+                f"check_rebase_gate: issue fetch returned {issue_resp.status_code}; fail-open"
+            )
+            return True, None
+        issue_data = issue_resp.json()
+    except Exception as e:
+        print(f"check_rebase_gate: issue fetch failed ({e}); fail-open")
+        return True, None
+
+    issue_state = (issue_data.get("state") or "").lower()
+    issue_body = issue_data.get("body") or ""
+
+    min_base_sha = None
+    # First MIN_BASE_SHA: <sha> line wins. Match the action's parser:
+    # tolerate optional backticks and either ':' or '=' separator.
+    for line in issue_body.replace("\r", "").split("\n"):
+        m = re.match(
+            r"^\s*`?MIN_BASE_SHA`?\s*[:=]\s*`?([A-Fa-f0-9]+)`?",
+            line,
+        )
+        if m:
+            candidate = m.group(1)
+            if 7 <= len(candidate) <= 40:
+                min_base_sha = candidate
+            break
+
+    gate_active = (issue_state == "open") or bool(min_base_sha)
+    if not gate_active:
+        return True, None
+
+    bypass = any(
+        (lbl.name if hasattr(lbl, "name") else lbl.get("name")) == "bypass-maintenance"
+        for lbl in pr.get_labels()
+    )
+    if bypass:
+        print("check_rebase_gate: PR has bypass-maintenance label; allowing dispatch")
+        return True, None
+
+    if issue_state == "open":
+        msg = (
+            "## ⚠️ CI Maintenance Mode is Active\n"
+            "The CI infrastructure is currently under maintenance. "
+            "All PR CI runs are paused until maintenance is complete. "
+            "**Merging non-CI-fix PRs is prohibited during maintenance mode.**\n\n"
+            f"Follow [issue #{MAINTENANCE_ISSUE_NUMBER}]"
+            f"(https://github.com/{repo_full_name}/issues/{MAINTENANCE_ISSUE_NUMBER}) "
+            "for status updates. Re-run was not dispatched."
+        )
+        return False, msg
+
+    # MIN_BASE_SHA set, issue not OPEN — check rebase status.
+    pr_head_sha = pr.head.sha
+    try:
+        compare_resp = requests.get(
+            f"https://api.github.com/repos/{repo_full_name}/compare/{min_base_sha}...{pr_head_sha}",
+            headers=headers,
+            timeout=15,
+        )
+        if compare_resp.status_code != 200:
+            print(
+                f"check_rebase_gate: compare API returned {compare_resp.status_code}; fail-open"
+            )
+            return True, None
+        status = compare_resp.json().get("status", "unknown")
+    except Exception as e:
+        print(f"check_rebase_gate: compare API failed ({e}); fail-open")
+        return True, None
+
+    if status in ("ahead", "identical"):
+        return True, None
+
+    msg = (
+        "## ⚠️ Rebase Required Before Re-run\n"
+        f"A major update has landed on `main`. Your PR is `{status}` relative "
+        f"to required base commit `{min_base_sha[:12]}`.\n\n"
+        "**Re-run was not dispatched.** What to do:\n"
+        "- Rebase your branch onto the latest `main` and push again\n"
+        f"- Follow [issue #{MAINTENANCE_ISSUE_NUMBER}]"
+        f"(https://github.com/{repo_full_name}/issues/{MAINTENANCE_ISSUE_NUMBER}) for context\n"
+        "- CI-fix PRs may request the `bypass-maintenance` label to skip this check"
+    )
+    return False, msg
+
+
 def find_workflow_run_url(
     gh_repo,
     workflow_id,
@@ -284,7 +404,7 @@ def handle_rerun_stage(
         print("Error: No stage name provided")
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            f"❌ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
+            f"⛔ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
             f"Examples: `/rerun-stage unit-test-backend-4-gpu`, `/rerun-stage accuracy-test-1-gpu`"
         )
         return False
@@ -303,10 +423,13 @@ def handle_rerun_stage(
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-h20",
         "stage-c-test-4-gpu-b200",
-        "stage-c-test-4-gpu-b200-small",
         "stage-c-test-4-gpu-gb200",
+        "stage-c-test-dsv4-4-gpu-b200",
+        "stage-c-test-dsv4-8-gpu-h200",
         "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
+        "stage-c-test-dsv4-4-gpu-b200",
+        "stage-c-test-dsv4-8-gpu-h200",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
         "multimodal-gen-component-accuracy",
@@ -337,13 +460,19 @@ def handle_rerun_stage(
     if stage_name not in valid_stages:
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            f"❌ Stage `{stage_name}` doesn't support isolated runs yet.\n\n"
+            f"⛔ Stage `{stage_name}` doesn't support isolated runs yet.\n\n"
             f"**NVIDIA stages:**\n"
             + "\n".join(f"- `{s}`" for s in nvidia_stages)
             + "\n\n**AMD stages:**\n"
             + "\n".join(f"- `{s}`" for s in amd_stages)
             + "\n\nOther stages will be added soon. For now, use `/rerun-failed-ci` for those stages."
         )
+        return False
+
+    allowed, gate_msg = _check_rebase_gate(gh_repo, pr, token)
+    if not allowed:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(gate_msg)
         return False
 
     try:
@@ -448,13 +577,13 @@ def handle_rerun_stage(
                 )
                 if run_url:
                     pr.create_issue_comment(
-                        f"✅ Triggered `{stage_name}` to run independently"
+                        f"🚀 Triggered `{stage_name}` to run independently"
                         f" (skipping dependencies)."
                         f" [View workflow run]({run_url})"
                     )
                 else:
                     pr.create_issue_comment(
-                        f"✅ Triggered `{stage_name}` to run independently"
+                        f"🚀 Triggered `{stage_name}` to run independently"
                         f" (skipping dependencies).\n"
                         f"⚠️ Could not retrieve workflow run URL. "
                         f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
@@ -468,7 +597,7 @@ def handle_rerun_stage(
         print(f"Error triggering workflow_dispatch: {e}")
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            f"❌ Failed to trigger workflow: {str(e)}\n\n"
+            f"⛔ Failed to trigger workflow: {str(e)}\n\n"
             f"Please check the logs or contact maintainers."
         )
         return False
@@ -479,16 +608,17 @@ CUDA_SUITE_TO_RUNNER = {
     "stage-a-test-1-gpu-small": "1-gpu-5090",
     "stage-a-test-cpu": "ubuntu-latest",
     "stage-b-test-1-gpu-small": "1-gpu-5090",
-    "stage-b-test-1-gpu-large": "1-gpu-h100-h200",
+    "stage-b-test-1-gpu-large": "1-gpu-h100",
     "stage-b-test-2-gpu-large": "2-gpu-h100",
     "stage-b-test-4-gpu-b200": "4-gpu-b200",
     "stage-c-test-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-8-gpu-h200": "8-gpu-h200",
     "stage-c-test-8-gpu-h20": "8-gpu-h20",
     "stage-c-test-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-4-gpu-b200-small": "4-gpu-b200-low-disk",
     "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
-    "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200",
+    "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200-deepep",
+    "stage-c-test-dsv4-4-gpu-b200": "4-gpu-b200",
+    "stage-c-test-dsv4-8-gpu-h200": "8-gpu-h200",
     # Nightly test suites (NVIDIA)
     "nightly-1-gpu": "1-gpu-h100",
     "nightly-4-gpu": "4-gpu-h100",
@@ -511,6 +641,8 @@ DEEPEP_SUITES = {
     "stage-c-test-8-gpu-h20",
     "stage-c-test-deepep-4-gpu-h100",
     "stage-c-test-deepep-8-gpu-h200",
+    "stage-c-test-dsv4-4-gpu-b200",
+    "stage-c-test-dsv4-8-gpu-h200",
 }
 
 
@@ -784,7 +916,7 @@ def _resolve_test_spec(test_spec):
     }
 
 
-def _dispatch_batch(gh_repo, pr, batch, token):
+def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker=""):
     """
     Dispatch a single workflow run for a batch of resolved test specs
     that share the same (runner_label, use_deepep, is_cpu).
@@ -827,6 +959,8 @@ def _dispatch_batch(gh_repo, pr, batch, token):
             "use_deepep": str(use_deepep).lower(),
             "is_cpu": str(is_cpu).lower(),
             "install_diffusion": str(install_diffusion).lower(),
+            "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
+            "reply_marker": reply_marker,
         }
         if is_fork:
             ref = "main"
@@ -874,6 +1008,7 @@ def _dispatch_batch(gh_repo, pr, batch, token):
             "test_commands": test_commands,
             "runner_label": runner_label,
             "run_url": run_url,
+            "reply_marker": reply_marker,
         }
 
     except Exception as e:
@@ -899,7 +1034,7 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
             print(f"Permission denied: /{command_name} on fork PR by {commenter}.")
             comment.create_reaction("confused")
             pr.create_issue_comment(
-                f"❌ `/{command_name}` is not available for fork PRs unless the commenter "
+                f"⛔ `/{command_name}` is not available for fork PRs unless the commenter "
                 "has write permission on the repo.\n\n"
                 "Please ask a maintainer to run this command, or use the normal CI flow."
             )
@@ -931,13 +1066,19 @@ def handle_rerun_test(
     if not test_specs:
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            "❌ Please specify a test: `/rerun-test <file>::<TestClass.test_method>`\n\n"
+            "⛔ Please specify a test: `/rerun-test <file>::<TestClass.test_method>`\n\n"
             "Examples:\n"
             "- `/rerun-test test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
             "- `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
             "- `/rerun-test test_srt_endpoint.py`\n"
             "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)"
         )
+        return False
+
+    allowed, gate_msg = _check_rebase_gate(gh_repo, pr, token)
+    if not allowed:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(gate_msg)
         return False
 
     # Phase 1: Resolve all specs
@@ -961,12 +1102,30 @@ def handle_rerun_test(
         )
         groups.setdefault(key, []).append(r)
 
-    # Phase 3: Dispatch one workflow per group
-    dispatch_results = []
-    for batch in groups.values():
-        dispatch_results.append(_dispatch_batch(gh_repo, pr, batch, token))
+    # Phase 3a: Create placeholder reply comment so we have its ID before
+    # dispatching workflows. This lets each dispatched run write its
+    # success/failure result back to the right line in this comment.
+    reply_comment = pr.create_issue_comment("🚀 Dispatching rerun-test workflow(s)...")
 
-    # Build consolidated comment
+    # Phase 3b: Dispatch one workflow per group, with a unique per-batch
+    # marker each. The marker is an HTML comment that the writeback step
+    # uses to locate the line and replace 🚀 with ✅/❌.
+    dispatch_results = []
+    for idx, batch in enumerate(groups.values()):
+        marker = f"<!--rrt:{idx}-->"
+        dispatch_results.append(
+            _dispatch_batch(
+                gh_repo,
+                pr,
+                batch,
+                token,
+                reply_comment_id=reply_comment.id,
+                reply_marker=marker,
+            )
+        )
+
+    # Build consolidated comment body (markers placed at line ends so the
+    # writeback step can locate and update each line).
     lines = []
     for dr in dispatch_results:
         if dr["success"]:
@@ -983,25 +1142,26 @@ def handle_rerun_test(
                 cmds = "\n".join(
                     f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
                 )
+            marker = dr.get("reply_marker", "")
             if dr.get("run_url"):
                 lines.append(
-                    f"✅ `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
-                    f"[View workflow run]({dr['run_url']})\n"
+                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
+                    f"⏳ [View workflow run]({dr['run_url']}) {marker}\n"
                     f"```\n{cmds}\n```"
                 )
             else:
                 lines.append(
-                    f"✅ `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}):\n"
+                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): ⏳ {marker}\n"
                     f"```\n{cmds}\n```\n"
                     f"⚠️ Could not retrieve workflow run URL. "
                     f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                 )
         else:
             specs_str = ", ".join(f"`{s}`" for s in dr["specs"])
-            lines.append(f"❌ {specs_str}: {dr['error']}")
+            lines.append(f"⛔ {specs_str}: {dr['error']}")
 
     for r in resolve_failures:
-        lines.append(f"❌ `{r['spec']}`: {r['error']}")
+        lines.append(f"⛔ `{r['spec']}`: {r['error']}")
 
     body = "\n\n".join(lines)
 
@@ -1011,7 +1171,7 @@ def handle_rerun_test(
     if not successes and (resolve_failures or dispatch_results):
         comment.create_reaction("confused")
 
-    pr.create_issue_comment(body)
+    reply_comment.edit(body)
     return len(successes) > 0
 
 
@@ -1028,7 +1188,7 @@ def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
     if not group_names:
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            "❌ Please specify a test group: `/rerun-group <group>`\n\n"
+            "⛔ Please specify a test group: `/rerun-group <group>`\n\n"
             "Example:\n"
             "- `/rerun-group hicache`"
         )
@@ -1050,7 +1210,7 @@ def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
 
     if failures:
         comment.create_reaction("confused")
-        lines = [f"❌ `{group}`: {err}" for group, err in failures]
+        lines = [f"⛔ `{group}`: {err}" for group, err in failures]
         pr.create_issue_comment("\n\n".join(lines))
         return False
 

@@ -462,10 +462,22 @@ async def async_request_openai_chat_completions(
                                 pass
                             else:
                                 data = json.loads(chunk)
+                                # Check for usage info in final chunks. OpenAI-compatible
+                                # servers may emit usage-only chunks with choices=[].
+                                output_len = (data.get("usage") or {}).get(
+                                    "completion_tokens", output_len
+                                )
 
-                                # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
+                                choices = data.get("choices") or []
+                                if not choices:
+                                    continue
+
+                                # Reasoning models stream thoughts via
+                                # `reasoning_content`; count them like content.
+                                delta = choices[0].get("delta") or {}
+                                content = (delta.get("reasoning_content") or "") + (
+                                    delta.get("content") or ""
+                                )
 
                                 if content:
                                     timestamp = time.perf_counter()
@@ -483,11 +495,6 @@ async def async_request_openai_chat_completions(
 
                                     most_recent_timestamp = timestamp
                                     generated_text += content
-
-                                # Check for usage info in final chunk
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
 
                         output.generated_text = generated_text
                         output.success = True
@@ -1129,6 +1136,24 @@ def calculate_metrics(
 MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
 
 
+def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
+    """Normalize a multi-turn round to a list of message dicts.
+
+    Accepts ``str`` (single user message) or ``List[Dict]`` with role/content
+    (e.g. multiple tool observations bundled into one round). Returns ``None``
+    on any other shape so callers can also use it as a predicate.
+    """
+    if isinstance(turn, str):
+        return [{"role": "user", "content": turn}]
+    if (
+        isinstance(turn, list)
+        and turn
+        and all(isinstance(m, dict) and "role" in m and "content" in m for m in turn)
+    ):
+        return [{"role": m["role"], "content": m["content"]} for m in turn]
+    return None
+
+
 def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
     assert (
         backend in MULTI_TURN_BACKENDS
@@ -1138,12 +1163,19 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
         request_func_input: RequestFuncInput,
         pbar: Optional[tqdm] = None,
     ) -> List[RequestFuncOutput]:
-        prompts: List[str] = request_func_input.prompt
+        prompts = request_func_input.prompt
         prev_messages: List[Dict[str, str]] = []
         outputs = []
 
         for round_index in range(len(prompts)):
-            prev_messages.append({"role": "user", "content": prompts[round_index]})
+            normalized = _normalize_round_messages(prompts[round_index])
+            if normalized is None:
+                raise ValueError(
+                    f"Multi-turn round {round_index} must be a str or a "
+                    "non-empty List[Dict] of role/content messages, got: "
+                    f"{type(prompts[round_index]).__name__}"
+                )
+            prev_messages.extend(normalized)
 
             inner_input = replace(
                 copy.deepcopy(request_func_input), prompt=copy.deepcopy(prev_messages)
@@ -1191,14 +1223,13 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    # Check for multi-turn: prompt is a list of strings (not OpenAI messages dicts)
-    # Multi-turn format: ["turn1", "turn2", ...] - list of strings
-    # OpenAI format: [{"role": "user", "content": "..."}, ...] - list of dicts
+    # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
+    # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
     first_prompt = input_requests[0].prompt
     is_multi_turn = (
         isinstance(first_prompt, list)
-        and len(first_prompt) > 0
-        and isinstance(first_prompt[0], str)
+        and bool(first_prompt)
+        and _normalize_round_messages(first_prompt[0]) is not None
     )
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)

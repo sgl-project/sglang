@@ -3,11 +3,22 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_module_list_entry,
+    is_module_list_entry_in,
+    is_zimage_layer,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ModelTaskType,
+    PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    QwenImageTransformer2DModel,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
@@ -44,6 +55,151 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(
             args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
         )
+
+    def test_component_attention_backends_are_normalized(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": "text-encoder=torch_sdpa,transformer=fa3",
+            }
+        )
+
+        self.assertEqual(
+            args.component_attention_backends,
+            {"text_encoder": "torch_sdpa", "transformer": "fa"},
+        )
+
+    def test_component_attention_backend_lookup(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {"text_encoder": "torch_sdpa"},
+            }
+        )
+
+        backend, matched_key = args.resolve_component_attention_backend(
+            "text_encoder", "transformer"
+        )
+
+        self.assertEqual(backend.name, "TORCH_SDPA")
+        self.assertEqual(matched_key, "text_encoder")
+
+    def test_invalid_component_attention_backend_raises(self):
+        with self.assertRaises(ValueError):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "component_attention_backends": {"text_encoder": "bad_backend"},
+                }
+            )
+        with self.assertRaises(ValueError):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "component_attention_backends": "text_encoder",
+                }
+            )
+
+    def test_dynamic_component_attention_backend_cli_args(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--component-attention-backends.text-encoder",
+            "torch_sdpa",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            with patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ):
+                server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(
+            server_args.component_attention_backends, {"text_encoder": "torch_sdpa"}
+        )
+
+
+class TestOffloadDefaults(unittest.TestCase):
+    def _from_dict_with_task_type(
+        self,
+        task_type,
+        *,
+        memory_gb=80,
+        kwargs=None,
+    ):
+        pipeline_config = PipelineConfig()
+        pipeline_config.task_type = task_type
+        with (
+            patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                return_value=memory_gb * 1024**3,
+            ),
+        ):
+            return ServerArgs.from_dict({"model_path": "/fake", **(kwargs or {})})
+
+    def test_vae_cpu_offload_defaults_false_for_video_generation(self):
+        args = self._from_dict_with_task_type(ModelTaskType.T2V)
+
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_vae_cpu_offload_defaults_false_on_low_memory_gpu(self):
+        args = self._from_dict_with_task_type(ModelTaskType.T2V, memory_gb=16)
+
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.image_encoder_cpu_offload)
+
+    def test_explicit_vae_cpu_offload_true_is_preserved(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={"vae_cpu_offload": True},
+        )
+
+        self.assertTrue(args.vae_cpu_offload)
+
+
+class TestFSDPShardConditions(unittest.TestCase):
+    def test_helpers_match_only_direct_block_entries(self):
+        self.assertTrue(
+            is_module_list_entry("transformer_blocks.0", "transformer_blocks")
+        )
+        self.assertFalse(
+            is_module_list_entry("transformer_blocks.0.ff.net.0", "transformer_blocks")
+        )
+        self.assertTrue(
+            is_module_list_entry_in(
+                "single_transformer_blocks.12",
+                ("transformer_blocks", "single_transformer_blocks"),
+            )
+        )
+        self.assertFalse(
+            is_module_list_entry_in(
+                "single_transformer_blocks.12.attn.to_out.0",
+                ("transformer_blocks", "single_transformer_blocks"),
+            )
+        )
+
+    def test_qwen_dit_has_fsdp_shard_condition(self):
+        conditions = QwenImageTransformer2DModel._fsdp_shard_conditions
+
+        self.assertTrue(conditions)
+        self.assertTrue(conditions[0]("transformer_blocks.0", None))
+        self.assertFalse(conditions[0]("transformer_blocks.0.attn", None))
+        self.assertFalse(conditions[0]("transformer_blocks.0.ff.net.0", None))
+
+    def test_zimage_condition_keeps_inner_numbered_modules(self):
+        self.assertTrue(is_zimage_layer("layers.0.mlp.0", None))
+        self.assertTrue(is_zimage_layer("noise_refiner.0.attention.to_out.0", None))
+        self.assertFalse(is_zimage_layer("transformer_blocks.0", None))
 
 
 class TestModelIdResolution(unittest.TestCase):

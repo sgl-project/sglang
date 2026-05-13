@@ -18,6 +18,8 @@ def _compute_enable_deep_gemm():
     sm_version = get_device_sm()
     if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
         return False
+    if not (_is_cuda or _is_musa):
+        return False
 
     try:
         import deep_gemm  # noqa: F401

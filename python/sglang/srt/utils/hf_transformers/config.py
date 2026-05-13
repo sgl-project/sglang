@@ -16,12 +16,10 @@
 from pathlib import Path
 from typing import Optional
 
-from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
-from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
+from sglang.srt.utils import is_remote_url, lru_cache_frozenset
 
 from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
@@ -30,10 +28,10 @@ from .common import (
     DeepseekVLV2Config,
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
-    _load_deepseek_v32_model,
     _override_v_head_dim_if_zero,
     check_gguf_file,
     get_hf_text_config,
+    resolve_runai_obj_uri,
 )
 from .mistral_utils import is_mistral_model, load_mistral_config
 
@@ -62,8 +60,7 @@ def get_config(
         kwargs["gguf_file"] = model
         model = Path(model).parent
 
-    if is_runai_obj_uri(model):
-        model = ObjectStorageModel.get_path(model)
+    model = resolve_runai_obj_uri(model)
 
     if is_remote_url(model):
         client = create_remote_connector(model)
@@ -75,39 +72,9 @@ def get_config(
             model, trust_remote_code=trust_remote_code, revision=revision
         )
     else:
-        try:
-            config = AutoConfig.from_pretrained(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-            )
-        except (ValueError, KeyError) as e:
-            if "deepseek_v32" in str(e):
-                config = _load_deepseek_v32_model(
-                    model,
-                    trust_remote_code=trust_remote_code,
-                    revision=revision,
-                    **kwargs,
-                )
-            elif isinstance(e, ValueError):
-                raise
-            else:
-                logger.warning(
-                    "AutoConfig.from_pretrained raised KeyError for %s: %s. "
-                    "Falling back to config registry lookup.",
-                    model,
-                    e,
-                )
-                config_dict, _ = PretrainedConfig.get_config_dict(
-                    model,
-                    trust_remote_code=trust_remote_code,
-                    revision=revision,
-                    **kwargs,
-                )
-                model_type = config_dict.get("model_type")
-                if model_type in _CONFIG_REGISTRY:
-                    config = _CONFIG_REGISTRY[model_type].from_dict(config_dict)
-                    config._name_or_path = model
-                else:
-                    raise
+        config = AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
 
     if (
         config.architectures is not None
@@ -173,7 +140,7 @@ def get_config(
     if config.model_type == "multi_modality":
         _set_architectures(config, "MultiModalityCausalLM")
 
-    if config.model_type == "gemma4":
+    if config.model_type in ("gemma4", "gemma4_assistant"):
         # Gemma4 configs use base attributes for SWA layers and `global_*`
         # variants for full-attention layers.  SGLang expects the opposite:
         # base = full-attention, `swa_*` = sliding-window overrides.

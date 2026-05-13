@@ -196,12 +196,18 @@ def _compile_deep_gemm_one_type_all(
             kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
         )
 
-        old_compile_mode = deep_gemm.get_compile_mode()
-        deep_gemm.set_compile_mode(1)
+        has_compile_mode_api = hasattr(deep_gemm, "get_compile_mode") and hasattr(
+            deep_gemm, "set_compile_mode"
+        )
+        if has_compile_mode_api:
+            old_compile_mode = deep_gemm.get_compile_mode()
+            deep_gemm.set_compile_mode(1)
+
         # TODO can use multi thread
         for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
             executor.execute(m=m)
-        deep_gemm.set_compile_mode(old_compile_mode)
+        if has_compile_mode_api:
+            deep_gemm.set_compile_mode(old_compile_mode)
 
         # clean up input buffers
         torch.cuda.current_stream().synchronize()
@@ -300,7 +306,7 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
-            m_indices=self.m_indices[:m],
+            self.m_indices[:m],
         )
 
 
