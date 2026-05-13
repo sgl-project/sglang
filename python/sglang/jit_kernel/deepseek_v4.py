@@ -1047,9 +1047,7 @@ def _plan_compress_prefill_torch(
         if use_cuda_graph and n_entries < num_tokens:
             for _ in range(num_tokens - n_entries):
                 payload.extend(invalid_row)
-        cpu_view = torch.frombuffer(payload, dtype=torch.uint8).view(
-            n_rows, 16
-        )
+        cpu_view = torch.frombuffer(payload, dtype=torch.uint8).view(n_rows, 16)
         buf[:n_rows].copy_(cpu_view)
         return num_tokens if use_cuda_graph else n_entries
 
