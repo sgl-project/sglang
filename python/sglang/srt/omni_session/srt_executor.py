@@ -245,6 +245,7 @@ class OmniSRTSchedulerExecutor:
         self,
         *,
         prepared: TemporaryForwardPrepared,
+        scheduler_exclusive_lease: "OmniSchedulerExclusiveLease | None" = None,
     ) -> OmniSRTTemporaryForwardBatch:
         """build a temporary extend batch that reads a committed SRT context
 
@@ -336,7 +337,8 @@ class OmniSRTSchedulerExecutor:
         )
         seq_len = prefix_len + extend_num_tokens
         self._check_context_capacity(req_to_token_pool, seq_len)
-        scheduler_exclusive_lease = self._enter_temporary_context_region()
+        if scheduler_exclusive_lease is None:
+            scheduler_exclusive_lease = self._enter_temporary_context_region()
         try:
             # 2. ensure scheduler state will not mutate while denoise reads SRT KV
             self._check_scheduler_idle_for_temporary_context()
@@ -424,11 +426,14 @@ class OmniSRTSchedulerExecutor:
         scheduler_exclusive_lease = self._enter_temporary_context_region()
 
         def run_forward() -> Any:
+            nonlocal scheduler_exclusive_lease
             temporary_batch = self.build_temporary_context_forward_batch(
-                prepared=prepared
+                prepared=prepared,
+                scheduler_exclusive_lease=scheduler_exclusive_lease,
             )
+            scheduler_exclusive_lease = None
             try:
-                # 1. run U1 denoise attention where srt model runner owns streams/KV
+                # 1. run denoise attention where srt model runner owns streams/KV
                 return forward(temporary_batch.forward_batch)
             finally:
                 # 2. release temporary query KV before scheduler accepts more AR work

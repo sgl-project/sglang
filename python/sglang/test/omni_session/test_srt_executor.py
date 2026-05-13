@@ -196,6 +196,8 @@ def test_temporary_context_forward_runs_on_scheduler_thread_and_releases():
         executor.build_thread_id
         == scheduler.omni_scheduler_state.scheduler_thread_id
     )
+    assert executor.received_scheduler_exclusive_lease is not None
+    assert scheduler.omni_scheduler_state.exclusive_active == 0
     assert executor.temporary_batch.released
 
 
@@ -361,19 +363,31 @@ class _FakeTemporaryContextBatch:
     def __init__(self):
         self.forward_batch = "temporary-batch"
         self.released = False
+        self.scheduler_exclusive_lease = None
+        self.release_count = 0
 
     def release(self):
         self.released = True
+        self.release_count += 1
+        if self.scheduler_exclusive_lease is not None:
+            self.scheduler_exclusive_lease.release()
 
 
 class _FakeTemporaryContextExecutor(OmniSRTSchedulerExecutor):
     def __init__(self, scheduler):
         super().__init__(scheduler)
         self.build_thread_id = None
+        self.build_count = 0
+        self.received_scheduler_exclusive_lease = None
         self.temporary_batch = _FakeTemporaryContextBatch()
 
-    def build_temporary_context_forward_batch(self, *, prepared):
+    def build_temporary_context_forward_batch(
+        self, *, prepared, scheduler_exclusive_lease=None
+    ):
         self.build_thread_id = get_ident()
+        self.build_count += 1
+        self.received_scheduler_exclusive_lease = scheduler_exclusive_lease
+        self.temporary_batch.scheduler_exclusive_lease = scheduler_exclusive_lease
         return self.temporary_batch
 
 
