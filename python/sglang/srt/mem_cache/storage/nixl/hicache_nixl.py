@@ -82,6 +82,16 @@ class HiCacheNixl(HiCacheStorage):
 
         self.registration = NixlRegistration(self.agent)
 
+    def _make_obj_reg_tuples(
+        self, keys: List[str], sizes: Optional[List[int]] = None
+    ) -> List[tuple[int, int, int, str]]:
+        if sizes is None:
+            sizes = [0] * len(keys)
+        return [
+            (0, int(size), uuid.uuid4().int & ((1 << 64) - 1), key)
+            for key, size in zip(keys, sizes)
+        ]
+
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
@@ -108,7 +118,7 @@ class HiCacheNixl(HiCacheStorage):
         """Register objects with NIXL."""
         if not keys:
             return None
-        tuples = [(0, 0, key, "") for key in keys]
+        tuples = self._make_obj_reg_tuples(keys, sizes)
         return self.registration._register_memory(tuples, "OBJ")
 
     def _execute_transfer(
@@ -128,18 +138,12 @@ class HiCacheNixl(HiCacheStorage):
             if not tuples or not self.registration._register_memory(tuples, "FILE"):
                 logger.error("Failed to prepare files for transfer")
                 return False
-        else:  # mem_type == "OBJ"
-            tuples = [(0, 0, key, "") for key in keys]
-            if not tuples or not self.registration._register_memory(tuples, "OBJ"):
-                logger.error("Failed to register objects")
-                return False
 
         # Prepare transfer descriptors
         if isinstance(buffers[0], torch.Tensor):
-            tensor_sizes = [
+            transfer_sizes = [
                 tensor.element_size() * tensor.numel() for tensor in buffers
             ]
-            storage_tuples = [(x[0], s, x[2]) for x, s in zip(tuples, tensor_sizes)]
             host_descs = self.agent.get_xfer_descs(buffers)
 
             if direction in ("READ", "WRITE"):
@@ -147,7 +151,7 @@ class HiCacheNixl(HiCacheStorage):
                 self.register_buffers(buffers)
 
         elif isinstance(buffers[0], tuple):
-            storage_tuples = [(x[0], y[1], x[2]) for x, y in zip(tuples, buffers)]
+            transfer_sizes = [buf[1] for buf in buffers]
             host_descs = self.agent.get_xfer_descs(
                 [(x[0], x[1], 0) for x in buffers], "DRAM"
             )
@@ -158,6 +162,20 @@ class HiCacheNixl(HiCacheStorage):
 
         else:
             return False
+
+        # FILE transfer tuples are (offset, length, fd).
+        # OBJ registration tuples are (addr, length, dev_id, key).
+        # OBJ transfer tuples are (addr, length, dev_id).
+        if self.backend_selector.mem_type == "OBJ":
+            tuples = self._make_obj_reg_tuples(keys, transfer_sizes)
+            if not tuples or not self.registration._register_memory(tuples, "OBJ"):
+                logger.error("Failed to register objects")
+                return False
+            storage_tuples = [(x[0], x[1], x[2]) for x in tuples]
+        else:  # mem_type == "FILE"
+            storage_tuples = [
+                (x[0], size, x[2]) for x, size in zip(tuples, transfer_sizes)
+            ]
 
         storage_descs = self.agent.get_xfer_descs(
             storage_tuples, self.backend_selector.mem_type
@@ -303,6 +321,9 @@ class HiCacheNixl(HiCacheStorage):
     ############################################################################
 
     def clear(self) -> None:
+        if self.backend_selector.mem_type == "OBJ":
+            logger.info("HiCacheNixl.clear is not implemented for OBJ storage")
+            return
         self.file_manager.clear()
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):

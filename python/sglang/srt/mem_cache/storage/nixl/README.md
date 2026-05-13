@@ -439,7 +439,7 @@ Configures an object storage backend compatible with S3 APIs (e.g., AWS S3, MinI
 | `req_checksum`           | string  | `"required"` | Request checksum behavior.                     |
 | `ca_bundle`              | string  | `""`         | Path to a custom CA bundle.                    |
 | `access_key`             | string  | `""`         | Access key credential.                         |
-| `secrete_key`            | string  | `""`         | Secret key credential.                         |
+| `secret_key`             | string  | `""`         | Secret key credential.                         |
 | `session_token`          | string  | `""`         | Session token (optional).                      |
 | `use_virtual_addressing` | string  | `"true"`     | Enables virtual-hosted-style addressing.       |
 | `bucket`                 | string  | `""`         | Default bucket name.                           |
