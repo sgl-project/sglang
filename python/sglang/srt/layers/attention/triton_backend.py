@@ -1041,11 +1041,14 @@ class TritonAttnBackend(AttentionBackend):
         else:
             # Save KV cache first (must do this before unified kernel)
             if save_kv_cache:
-                if (
-                    self.use_mla or layer.k_scale is None
-                ):  # Triton MLA currently doesn't support quantized kv cache
+                if layer.k_scale is None:
                     self._set_kv_buffer(
                         forward_batch, layer, self._kv_cache_loc(forward_batch), k, v
+                    )
+                elif self.use_mla:
+                    k_scaled = k.clone().div_(layer.k_scale)
+                    self._set_kv_buffer(
+                        forward_batch, layer, self._kv_cache_loc(forward_batch), k_scaled, v
                     )
                 else:
                     self._set_kv_buffer(
