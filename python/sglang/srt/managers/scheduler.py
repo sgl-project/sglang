@@ -2519,6 +2519,12 @@ class Scheduler(
             and self.last_batch.forward_mode.is_extend()
         ):
             last_bs = self.last_batch.batch_size()
+            # Drop chunked-resume reqs before merging last_batch into
+            # running_batch. running_batch runs decode forward and admitting
+            # a mid-prefill req there breaks shapes + KV accounting. The
+            # dropped reqs persist in self.waiting_queue (retention at
+            # ~line 2775: `x not in can_run_set or x.has_pending_chunk`)
+            # and re-enter via next iter's Stage A stash + admission.
             self.last_batch.filter_batch(exclude_chunked_req=True)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
@@ -2537,6 +2543,11 @@ class Scheduler(
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
+            # Defensive exclude_chunked_req: the merge step above already
+            # drops chunked-resume reqs from last_batch, so running_batch
+            # shouldn't normally hold one. Keep the flag set so any leak in
+            # that invariant doesn't survive here; the dropped req still
+            # has its waiting_queue retention to re-admit next iter.
             self.running_batch.filter_batch(exclude_chunked_req=True)
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
@@ -2863,6 +2874,10 @@ class Scheduler(
             and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
+            # exclude_chunked_req here is defensive — by design running_batch
+            # holds decode reqs only (the last_batch filter+merge step above
+            # already drops chunked-resume), and any dropped chunked-resume
+            # would still ride waiting_queue retention to next iter's Stage A.
             self.running_batch.filter_batch(
                 v1_spec_info_filtered=True, exclude_chunked_req=True
             )
@@ -3694,6 +3709,9 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
+            # Same invariant as the non-disagg merge path: drop chunked-resume
+            # reqs before potentially folding last_batch into running_batch.
+            # They re-enter via waiting_queue retention + Stage A next iter.
             self.last_batch.filter_batch(exclude_chunked_req=True)
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into

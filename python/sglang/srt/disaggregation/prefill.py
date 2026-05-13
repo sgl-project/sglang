@@ -733,6 +733,11 @@ class SchedulerDisaggregationPrefillMixin:
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             last_bs = self.last_batch.batch_size()
+            # Drop chunked-resume reqs from last_batch — running_batch runs
+            # decode forward and admitting a mid-prefill req there breaks
+            # shape + KV accounting. The dropped reqs stay in
+            # self.waiting_queue (chunked-resume retention) and re-enter via
+            # the next iter's Stage A stash + admission cycle.
             self.last_batch.filter_batch(exclude_chunked_req=True)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
