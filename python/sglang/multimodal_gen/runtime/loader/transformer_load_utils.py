@@ -16,7 +16,6 @@ from typing import Callable, Optional
 import torch
 from torch import nn
 
-from sglang.multimodal_gen.runtime.layers.quantization import get_quantization_config
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     _patch_nunchaku_scales,
