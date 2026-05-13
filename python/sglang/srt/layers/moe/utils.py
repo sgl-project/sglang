@@ -160,7 +160,7 @@ class DeepEPOutputDtype(Enum):
 
     - BF16: dispatch hidden states in bf16
     - FP8: dispatch hidden states in fp8
-    - FP8: dispatch hidden states in int8
+    - INT8: dispatch hidden states in int8
     - NVFP4: dispatch hidden states in nvfp4
     """
 
