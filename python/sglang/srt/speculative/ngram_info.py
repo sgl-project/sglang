@@ -34,9 +34,9 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, next_power_of_2
 
-if is_cuda():
+if is_cuda() or is_musa():
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
@@ -106,7 +106,6 @@ class NgramVerifyInput(SpecInput):
                 last_loc,
                 len(batch.input_ids),
             )
-            self.last_loc = last_loc
 
         bs = batch.batch_size()
         assign_req_to_token_pool[(bs,)](
@@ -158,7 +157,7 @@ class NgramVerifyInput(SpecInput):
         batch: ScheduleBatch,
         logits_output: torch.Tensor,
     ):
-        accept_index_cpu = self.accepted_indices.tolist()
+        accept_index_cpu = self.accept_indices.tolist()
         predict_cpu = self.predict.tolist()
         has_finished = False
         think_end_id = batch.model_config.think_end_id
@@ -177,7 +176,7 @@ class NgramVerifyInput(SpecInput):
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break
-                    self.accepted_indices[i, j + 1 :] = -1
+                    self.accept_indices[i, j + 1 :] = -1
                     break
                 else:
                     if req.grammar is not None:
@@ -186,47 +185,52 @@ class NgramVerifyInput(SpecInput):
                         except ValueError as e:
                             logger.info(
                                 f"{i=}, {req=}\n"
-                                f"{self.accepted_indices=}\n"
+                                f"{self.accept_indices=}\n"
                                 f"{self.predict=}\n"
                             )
                             raise e
             req.spec_verify_ct += 1
-            accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
-            req.spec_accepted_tokens += accepted_draft_tokens
-            req.update_spec_acceptance_histogram(accepted_draft_tokens)
+            num_correct_drafts_this_req = (
+                sum(1 for idx in accept_index_row if idx != -1) - 1
+            )
+            req.spec_num_correct_drafts += num_correct_drafts_this_req
+            req.update_spec_correct_drafts_histogram(num_correct_drafts_this_req)
 
         if has_finished:
-            self.accept_length = (self.accepted_indices != -1).sum(dim=1) - 1
-        self.accepted_indices = self.accepted_indices[self.accepted_indices != -1]
+            self.num_correct_drafts = (self.accept_indices != -1).sum(dim=1) - 1
+        self.accept_indices = self.accept_indices[self.accept_indices != -1]
 
         logits_output.next_token_logits = logits_output.next_token_logits[
-            self.accepted_indices
+            self.accept_indices
         ]
         if logits_output.hidden_states:
             logits_output.hidden_states = logits_output.hidden_states[
-                self.accepted_indices
+                self.accept_indices
             ]
-        self.verified_id = self.predict[self.accepted_indices]
+        self.accept_tokens = self.predict[self.accept_indices]
 
     def _free_cache(
-        self, batch: ScheduleBatch, page_size: int, accept_length_cpu: torch.Tensor
+        self,
+        batch: ScheduleBatch,
+        page_size: int,
+        num_correct_drafts_cpu: torch.Tensor,
     ):
         bs = batch.batch_size()
         # Free the KV cache for unaccepted tokens
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
-            evict_mask[self.accepted_indices] = False
+            evict_mask[self.accept_indices] = False
             batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-            batch.out_cache_loc = batch.out_cache_loc[self.accepted_indices]
+            batch.out_cache_loc = batch.out_cache_loc[self.accept_indices]
         else:
             # Shift the accepted tokens to the beginning.
             # Only evict the last part
             src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
                 batch.seq_lens,
                 batch.out_cache_loc,
-                self.accepted_indices,
-                self.accept_length,
+                self.accept_indices,
+                self.num_correct_drafts,
                 self.draft_token_num,
                 page_size,
             )
@@ -243,12 +247,12 @@ class NgramVerifyInput(SpecInput):
             # to_free_slots also needs to be page-aligned without the first partial page
             #
             # split each row of out_cache_loc into two parts.
-            # 1. the first part goes to tgt_cache_loc. length = accept_length[i] + 1
+            # 1. the first part goes to tgt_cache_loc. length = num_correct_drafts[i] + 1
             # 2. the second part goes to to_free_slots.
             get_target_cache_loc[(bs,)](
                 tgt_cache_loc,
                 to_free_slots,
-                self.accept_length,
+                self.num_correct_drafts,
                 to_free_num_slots,
                 batch.out_cache_loc,
                 self.draft_token_num,
@@ -265,16 +269,16 @@ class NgramVerifyInput(SpecInput):
             )
             batch.out_cache_loc = tgt_cache_loc
 
-        accept_length_list = accept_length_cpu.tolist()
+        num_correct_drafts_list = num_correct_drafts_cpu.tolist()
         for i, req in enumerate(batch.reqs):
-            req.kv_committed_len += accept_length_list[i] + 1
+            req.kv_committed_len += num_correct_drafts_list[i] + 1
             req.kv_allocated_len = req.kv_committed_len
 
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            batch.seq_lens + self.accept_length + 1,
+            batch.seq_lens + self.num_accept_tokens,
             batch.out_cache_loc,
             batch.req_to_token_pool.req_to_token.shape[1],
             triton.next_power_of_2(bs),
@@ -293,15 +297,17 @@ class NgramVerifyInput(SpecInput):
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         self.predict = torch.empty(predict_shape, dtype=torch.int32, device=self.device)
-        self.accepted_indices = torch.full(
+        self.accept_indices = torch.full(
             (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
         )
-        self.accept_length = torch.empty((bs,), dtype=torch.int32, device=self.device)
+        self.num_correct_drafts = torch.empty(
+            (bs,), dtype=torch.int32, device=self.device
+        )
 
         verify_tree_greedy(
             predicts=self.predict,  # mutable
-            accept_index=self.accepted_indices,  # mutable
-            accept_token_num=self.accept_length,  # mutable
+            accept_index=self.accept_indices,  # mutable
+            accept_token_num=self.num_correct_drafts,  # mutable
             candidates=candidates,
             # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
             retrive_index=self.retrieve_index,
@@ -321,10 +327,12 @@ class NgramVerifyInput(SpecInput):
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         self.predict = torch.empty(predict_shape, dtype=torch.int32, device=self.device)
-        self.accepted_indices = torch.full(
+        self.accept_indices = torch.full(
             (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
         )
-        self.accept_length = torch.empty((bs,), dtype=torch.int32, device=self.device)
+        self.num_correct_drafts = torch.empty(
+            (bs,), dtype=torch.int32, device=self.device
+        )
         # apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, self.draft_token_num, dim=0
@@ -363,8 +371,8 @@ class NgramVerifyInput(SpecInput):
         )
         tree_speculative_sampling_target_only(
             predicts=self.predict,  # mutable
-            accept_index=self.accepted_indices,  # mutable
-            accept_token_num=self.accept_length,  # mutable
+            accept_index=self.accept_indices,  # mutable
+            accept_token_num=self.num_correct_drafts,  # mutable
             candidates=candidates.to(torch.int64),
             # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
             retrive_index=self.retrieve_index.to(torch.int64),
@@ -445,15 +453,20 @@ class NgramVerifyInput(SpecInput):
 
         self._fill_requests(batch, logits_output)
 
-        accept_length_cpu = self.accept_length.cpu()
-        num_accepted_tokens = accept_length_cpu.sum().item()
+        # Sync the bonus-included view after the kernel + `_fill_requests`
+        # finalize `num_correct_drafts`.
+        self.num_accept_tokens = self.num_correct_drafts + 1
 
-        self._free_cache(batch, page_size, accept_length_cpu)
+        num_correct_drafts_cpu = self.num_correct_drafts.cpu()
+        num_accept_tokens_cpu = num_correct_drafts_cpu + 1
+        num_correct_drafts = num_correct_drafts_cpu.sum().item()
 
-        batch.seq_lens.add_(self.accept_length + 1)
-        batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+        self._free_cache(batch, page_size, num_correct_drafts_cpu)
 
-        return logits_output, self.verified_id, num_accepted_tokens
+        batch.seq_lens.add_(self.num_accept_tokens)
+        batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
+
+        return logits_output, self.accept_tokens, num_correct_drafts
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         pass

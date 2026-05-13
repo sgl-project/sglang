@@ -22,6 +22,7 @@ import torch
 
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
+    attention_tensor_model_parallel_quant_all_reduce,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -45,6 +46,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_dp_global_num_tokens,
@@ -699,9 +701,11 @@ class LayerCommunicator:
         if (
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
-            and forward_batch.dp_padding_mode.is_max_len()
         ):
-            return True
+            if should_use_dp_reduce_scatterv():
+                return True
+            if forward_batch.dp_padding_mode.is_max_len():
+                return True
         if nsa_use_prefill_cp(forward_batch):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
@@ -852,7 +856,7 @@ class CommunicateSimpleFn:
             return tuple(gathered_hidden_states)
 
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(),
+            get_local_dp_buffer(get_attention_tp_group()),
             hidden_states,
         )
         attn_tp_all_gather_into_tensor(
@@ -962,7 +966,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
             residual, local_residual = (
-                get_local_dp_buffer(),
+                get_local_dp_buffer(get_attention_tp_group()),
                 residual,
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
@@ -979,7 +983,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states += residual
 
             hidden_states, local_hidden_states = (
-                get_global_dp_buffer(),
+                get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
@@ -1000,9 +1004,18 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
-                hidden_states = attention_tensor_model_parallel_all_reduce(
-                    hidden_states
+                quantize_communications = (
+                    not forward_batch.forward_mode.is_decode_or_idle()
+                    and get_global_server_args().enable_quant_communications
                 )
+                if quantize_communications:
+                    hidden_states = attention_tensor_model_parallel_quant_all_reduce(
+                        hidden_states
+                    )
+                else:
+                    hidden_states = attention_tensor_model_parallel_all_reduce(
+                        hidden_states
+                    )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
@@ -1198,8 +1211,12 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
     ):
+        if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+            group = get_tp_group()
+        else:
+            group = get_attention_tp_group()
         hidden_states, global_hidden_states = (
-            get_local_dp_buffer(),
+            get_local_dp_buffer(group),
             hidden_states,
         )
         if should_use_dp_reduce_scatterv():
@@ -1225,7 +1242,7 @@ class CommunicateSummableTensorPairFn:
         hidden_states += residual
         residual = None
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(),
+            get_local_dp_buffer(get_attention_tp_group()),
             hidden_states,
         )
         attn_tp_all_gather_into_tensor(

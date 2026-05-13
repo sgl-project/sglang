@@ -1,0 +1,446 @@
+/*
+ * Copyright (c) 2020-2026, Moore Threads Technology Co., Ltd("Moore Threads").
+ * All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+#include <musa_runtime.h>
+#include <stdint.h>
+
+// #include "mudnn_config.h"
+// #include "mudnn/api/impl_base.h"
+#include "musa/integer_subbyte.h"
+
+#ifdef __MTGPU__
+#include <musa_robust.h>
+#endif
+
+#include "musa_fp16.h"
+#include "musa_bf16.h"
+#include "musa_fp8.h"
+#include <torch/all.h>
+
+namespace musa {
+namespace dnn {
+
+template <typename T> struct sizeof_bits {
+  static constexpr size_t value = sizeof(T) * 8;
+};
+
+
+template <int Bits, bool Signed>
+struct sizeof_bits<integer_subbyte<Bits, Signed>> {
+  static constexpr size_t value = Bits;
+};
+
+template <typename T>
+static constexpr int sizeof_bits_v = sizeof_bits<T>::value;
+
+typedef __half float16_t;
+#if defined(__MUSACC__) && (__MUSA_ARCH__ >= 220 || !defined(__MUSA_ARCH__))
+typedef __mt_bfloat16 bfloat16_t;
+#else
+typedef int16_t bfloat16_t;
+#endif
+
+#define MACRO_UNROLL _Pragma("unroll")
+
+#define ATTR_ALIGNED(v) __attribute__((aligned(v)))
+#define SELF_VEC_DEF(BASE_TYPE, VEC_TYPE_V2, VEC_TYPE_V4)                      \
+  struct ATTR_ALIGNED(sizeof(BASE_TYPE) * 2) VEC_TYPE_V2 {                     \
+    __device__ VEC_TYPE_V2() {}                                                \
+    __device__ VEC_TYPE_V2(const VEC_TYPE_V2 &t) {                             \
+      this->x = t.x;                                                           \
+      this->y = t.y;                                                           \
+    }                                                                          \
+    BASE_TYPE x, y;                                                            \
+  };                                                                           \
+                                                                               \
+  __device__ __forceinline__ VEC_TYPE_V2 make_##VEC_TYPE_V2(BASE_TYPE x,       \
+                                                            BASE_TYPE y) {     \
+    VEC_TYPE_V2 t;                                                             \
+    t.x = x, t.y = y;                                                          \
+    return t;                                                                  \
+  }                                                                            \
+                                                                               \
+  struct ATTR_ALIGNED(sizeof(BASE_TYPE) * 4) VEC_TYPE_V4 {                     \
+    __device__ VEC_TYPE_V4() {}                                                \
+    __device__ VEC_TYPE_V4(const VEC_TYPE_V4 &t) {                             \
+      this->x = t.x;                                                           \
+      this->y = t.y;                                                           \
+      this->z = t.z;                                                           \
+      this->w = t.w;                                                           \
+    }                                                                          \
+    BASE_TYPE x, y, z, w;                                                      \
+  };                                                                           \
+                                                                               \
+  __device__ __forceinline__ VEC_TYPE_V4 make_##VEC_TYPE_V4(                   \
+      BASE_TYPE x, BASE_TYPE y, BASE_TYPE z, BASE_TYPE w) {                    \
+    VEC_TYPE_V4 t;                                                             \
+    t.x = x, t.y = y, t.z = z, t.w = w;                                        \
+    return t;                                                                  \
+  }
+
+SELF_VEC_DEF(float16_t, Half2, Half4)
+#if defined(__MUSACC__) && (__MUSA_ARCH__ >= 220 || !defined(__MUSA_ARCH__))
+SELF_VEC_DEF(bfloat16_t, Bhalf2, Bhalf4)
+#endif
+
+#define GEN_VECTYPE(_CTYPE, _VECTYPE, _BYTES, _VLEN)                           \
+  struct ATTR_ALIGNED(_BYTES) _VECTYPE {                                       \
+    __device__ _VECTYPE() {}                                                   \
+    __device__ _VECTYPE(const _VECTYPE &t) {                                   \
+      MACRO_UNROLL                                                             \
+      for (int i = 0; i < _VLEN; i++) {                                        \
+        this->arr[i] = t.arr[i];                                               \
+      }                                                                        \
+    }                                                                          \
+    _CTYPE arr[_VLEN];                                                         \
+  }
+GEN_VECTYPE(float16_t, Half8, 16, 8);
+GEN_VECTYPE(signed char, Char8, 8, 8);
+GEN_VECTYPE(uint8_t, Uint8, 8, 8);
+GEN_VECTYPE(int16_t, Short8, 16, 8);
+GEN_VECTYPE(int16_t, Short16, 32, 16);
+GEN_VECTYPE(uint16_t, Ushort8, 16, 8);
+GEN_VECTYPE(uint32_t, UInt8, 32, 8);
+GEN_VECTYPE(uint32_t, UInt16, 64, 16);
+GEN_VECTYPE(uint64_t, ULong8, 64, 8);
+GEN_VECTYPE(uint64_t, ULong16, 128, 16);
+GEN_VECTYPE(float, Float8, 32, 8);
+#if defined(__MUSACC__) && (__MUSA_ARCH__ >= 220 || !defined(__MUSA_ARCH__))
+GEN_VECTYPE(bfloat16_t, Bhalf8, 16, 8);
+GEN_VECTYPE(bfloat16_t, Bhalf16, 32, 16);
+GEN_VECTYPE(bfloat16_t, Bhalf32, 64, 32);
+#endif
+GEN_VECTYPE(int32_t, Int8, 32, 8);
+GEN_VECTYPE(int64_t, Long8, 64, 8);
+GEN_VECTYPE(int64_t, Long16, 128, 16);
+GEN_VECTYPE(signed char, Char16, 16, 16);
+GEN_VECTYPE(float16_t, Half16, 32, 16);
+GEN_VECTYPE(float, Float16, 64, 16);
+GEN_VECTYPE(int32_t, Int16, 64, 16);
+
+template <typename type> class Dtype;
+
+#define INST(_type, _vec2, _vec4)                                              \
+  template <> class Dtype<_type> {                                             \
+  public:                                                                      \
+    using Scalar = _type;                                                      \
+    using Vec2 = _vec2;                                                        \
+    using Vec4 = _vec4;                                                        \
+    static __device__ __forceinline__ Vec2 make_vec2(_type x, _type y) {       \
+      return make_##_vec2(x, y);                                               \
+    }                                                                          \
+    static __device__ __forceinline__ Vec4 make_vec4(_type x, _type y,         \
+                                                     _type z, _type w) {       \
+      return make_##_vec4(x, y, z, w);                                         \
+    }                                                                          \
+  }
+
+INST(float, float2, float4);
+INST(float16_t, Half2, Half4);
+#if defined(__MUSACC__) && (__MUSA_ARCH__ >= 220 || !defined(__MUSA_ARCH__))
+INST(bfloat16_t, Bhalf2, Bhalf4);
+#endif
+INST(int32_t, int2, int4);
+INST(uint32_t, uint2, uint4);
+INST(int8_t, char2, char4);
+INST(uint8_t, uchar2, uchar4);
+INST(int16_t, short2, short4);
+INST(uint16_t, ushort2, ushort4);
+INST(int64_t, long2, long4);
+INST(uint64_t, ulong2, ulong4);
+INST(double, double2, double4);
+
+#undef INST
+
+template <typename T> struct DeduceVectorizedType {
+  using Type = T;
+};
+
+template <> struct DeduceVectorizedType<bool> {
+  using Type = int8_t;
+};
+
+template <> struct DeduceVectorizedType<half> {
+  using Type = _Float16;
+};
+
+#if defined(__MUSACC__) && (__MUSA_ARCH__ >= 220 || !defined(__MUSA_ARCH__))
+template <> struct DeduceVectorizedType<bfloat16_t> {
+  using Type = _Float16;
+};
+#endif
+
+#if defined(__MUSA_ARCH__) && __MUSA_ARCH__ == 310 // MUSIFY_EXCL_LINE
+#define LD_BYP_SLC(_BITS, _BYTES)                                              \
+  VecType dst;                                                                 \
+  const BaseType *addr = ptr + idx;                                            \
+  __lsu_ld_cache_hint(addr,0,2,1,1);                                           \
+  return dst;
+#else
+#define LD_BYP_SLC(_BITS, _BYTES) return *(VecType *)(ptr + idx);
+#endif
+
+template <typename T, int bits = 16 * 8> struct VecType;
+
+#define DEF_VECT(_CTYPE, _VECTYPE)                                             \
+  template <> struct VecType<_CTYPE, sizeof(_VECTYPE) * 8> {                   \
+    static constexpr int vec_bytes = sizeof(_VECTYPE);                         \
+    static constexpr int bit_per_byte = 8;                                     \
+    using BaseType = _CTYPE;                                                   \
+    using RobustTypePtr = __musa::robust_ptr<_CTYPE>;                          \
+    using Ttype = _VECTYPE;                                                    \
+    static constexpr int bits = vec_bytes * bit_per_byte;                      \
+    static constexpr int vlen = bits / (sizeof(BaseType) * bit_per_byte);      \
+    using VectorizedType = typename DeduceVectorizedType<BaseType>::Type;      \
+    typedef VectorizedType VxTy __attribute__((vector_size(vec_bytes)));       \
+    template <typename OffsetType>                                             \
+    static __device__ __forceinline__ VecType load(const BaseType *ptr,        \
+                                                   OffsetType idx) {           \
+      return *(VecType *)(ptr + idx);                                          \
+    }                                                                          \
+    template <typename OffsetType>                                             \
+    static __device__ __forceinline__ VecType                                  \
+    load_byp_slc(const BaseType *ptr, OffsetType idx) {                        \
+      if constexpr (vec_bytes == 16) {                                         \
+        LD_BYP_SLC(128, 16);                                                   \
+      } else if constexpr (vec_bytes == 8) {                                   \
+        LD_BYP_SLC(64, 8);                                                     \
+      } else if constexpr (vec_bytes == 4) {                                   \
+        LD_BYP_SLC(32, 4);                                                     \
+      } else if constexpr (vec_bytes == 2) {                                   \
+        LD_BYP_SLC(16, 2);                                                     \
+      } else {                                                                 \
+        LD_BYP_SLC(8, 1);                                                      \
+      }                                                                        \
+    }                                                                          \
+    template <typename OffsetType>                                             \
+    static __device__ __forceinline__ VecType                                  \
+    robust_load(const RobustTypePtr ptr, OffsetType idx) {                     \
+      return __musa::robust_load<VecType, BaseType>(ptr, idx);                 \
+    }                                                                          \
+                                                                               \
+    template <typename OffsetType>                                             \
+    static __device__ __forceinline__ void                                     \
+    store(BaseType *ptr, OffsetType idx, const VecType &dst) {                 \
+      *(VecType *)(ptr + idx) = dst;                                           \
+    }                                                                          \
+    template <typename OffsetType>                                             \
+    static __device__ __forceinline__ void                                     \
+    robust_store(RobustTypePtr ptr, OffsetType idx, const VecType &dst) {      \
+      __musa::robust_store<VecType, BaseType>(dst, ptr, idx);                  \
+    }                                                                          \
+                                                                               \
+    __device__ VecType() {                                                     \
+      MACRO_UNROLL                                                             \
+      for (int i = 0; i < sizeof(Ttype) / sizeof(BaseType); i++) {             \
+        this->val_.elem[i] = 0;                                                \
+      }                                                                        \
+    }                                                                          \
+    __device__ VecType(const VecType &t) {                                     \
+      MACRO_UNROLL                                                             \
+      for (int i = 0; i < sizeof(Ttype) / sizeof(BaseType); i++) {             \
+        this->val_.elem[i] = t.val_.elem[i];                                   \
+      }                                                                        \
+    }                                                                          \
+    __device__ VecType &operator=(const VecType &t) {                          \
+      MACRO_UNROLL                                                             \
+      for (int i = 0; i < sizeof(Ttype) / sizeof(BaseType); i++) {             \
+        this->val_.elem[i] = t.val_.elem[i];                                   \
+      }                                                                        \
+      return *this;                                                            \
+    }                                                                          \
+    __device__ VecType(_CTYPE val) {                                           \
+      MACRO_UNROLL                                                             \
+      for (int i = 0; i < sizeof(Ttype) / sizeof(BaseType); i++) {             \
+        this->val_.elem[i] = val;                                              \
+      }                                                                        \
+    }                                                                          \
+    template <typename SrcVecType>                                             \
+    friend __device__ VecType operator+(VecType lhs, const SrcVecType &rhs) {  \
+      MACRO_UNROLL                                                             \
+      for (int i = 0; i < sizeof(Ttype) / sizeof(BaseType); i++) {             \
+        lhs.val_.elem[i] += static_cast<BaseType>(rhs.val_.elem[i]);           \
+      }                                                                        \
+      return lhs;                                                              \
+    }                                                                          \
+    friend __device__ VecType operator+(VecType lhs, const _CTYPE &rhs) {      \
+      MACRO_UNROLL                                                             \
+      for (int i = 0; i < sizeof(Ttype) / sizeof(BaseType); i++) {             \
+        lhs.val_.elem[i] += rhs;                                               \
+      }                                                                        \
+      return lhs;                                                              \
+    }                                                                          \
+    friend __device__ VecType operator-(VecType lhs, const VecType &rhs) {     \
+      MACRO_UNROLL                                                             \
+      for (int i = 0; i < sizeof(Ttype) / sizeof(BaseType); i++) {             \
+        lhs.val_.elem[i] -= rhs.val_.elem[i];                                  \
+      }                                                                        \
+      return lhs;                                                              \
+    }                                                                          \
+    friend __device__ VecType operator*(VecType lhs, const VecType &rhs) {     \
+      MACRO_UNROLL                                                             \
+      for (int i = 0; i < sizeof(Ttype) / sizeof(BaseType); i++) {             \
+        lhs.val_.elem[i] *= rhs.val_.elem[i];                                  \
+      }                                                                        \
+      return lhs;                                                              \
+    }                                                                          \
+    template <typename Func> __device__ VecType &apply() {                     \
+      MACRO_UNROLL                                                             \
+      for (int i = 0; i < sizeof(Ttype) / sizeof(BaseType); i++) {             \
+        this->val_.elem[i] = Func::apply(this->val_.elem[i]);                  \
+      }                                                                        \
+      return *this;                                                            \
+    }                                                                          \
+    template <typename SrcVecType>                                             \
+    static __device__ VecType cvt(const SrcVecType &src) {                     \
+      VecType dst;                                                             \
+      MACRO_UNROLL                                                             \
+      for (int i = 0; i < sizeof(Ttype) / sizeof(BaseType); i++) {             \
+        dst.val_.elem[i] = (BaseType)(src.val_.elem[i]);                       \
+      }                                                                        \
+      return dst;                                                              \
+    }                                                                          \
+    union U {                                                                  \
+      __device__ U() {                                                         \
+        MACRO_UNROLL                                                           \
+        for (int i = 0; i < sizeof(Ttype) / sizeof(BaseType); i++) {           \
+          this->elem[i] = 0;                                                   \
+        }                                                                      \
+      }                                                                        \
+      Ttype storage;                                                           \
+      BaseType elem[sizeof(Ttype) / sizeof(BaseType)];                         \
+      VxTy vt_elem;                                                            \
+    };                                                                         \
+    U val_{};                                                                  \
+  }
+DEF_VECT(float16_t, float16_t);
+DEF_VECT(float16_t, Half2);
+DEF_VECT(float16_t, Half4);
+DEF_VECT(float16_t, Half8);
+DEF_VECT(float16_t, Half16);
+#if defined(__MUSACC__) && (__MUSA_ARCH__ >= 220 || !defined(__MUSA_ARCH__))
+DEF_VECT(bfloat16_t, bfloat16_t);
+DEF_VECT(bfloat16_t, Bhalf2);
+DEF_VECT(bfloat16_t, Bhalf4);
+DEF_VECT(bfloat16_t, Bhalf8);
+DEF_VECT(bfloat16_t, Bhalf16);
+DEF_VECT(bfloat16_t, Bhalf32);
+#endif
+DEF_VECT(bool, char);
+DEF_VECT(bool, char2);
+DEF_VECT(bool, char3);
+DEF_VECT(bool, char4);
+DEF_VECT(bool, Char8);
+DEF_VECT(bool, Char16);
+DEF_VECT(int8_t, int8_t);
+DEF_VECT(int8_t, char2);
+DEF_VECT(int8_t, char3);
+DEF_VECT(int8_t, char4);
+DEF_VECT(int8_t, Char8);
+DEF_VECT(int8_t, Char16);
+DEF_VECT(uint8_t, uint8_t);
+DEF_VECT(uint8_t, uchar2);
+DEF_VECT(uint8_t, uchar3);
+DEF_VECT(uint8_t, uchar4);
+DEF_VECT(uint8_t, uint4);
+DEF_VECT(uint8_t, Uint8);
+DEF_VECT(int16_t, int16_t);
+DEF_VECT(int16_t, short2);
+DEF_VECT(int16_t, short3);
+DEF_VECT(int16_t, short4);
+DEF_VECT(int16_t, Short8);
+DEF_VECT(int16_t, Short16);
+DEF_VECT(uint16_t, ushort);
+DEF_VECT(uint16_t, ushort2);
+DEF_VECT(uint16_t, ushort3);
+DEF_VECT(uint16_t, ushort4);
+DEF_VECT(uint16_t, Ushort8);
+DEF_VECT(int32_t, int);
+DEF_VECT(int32_t, int2);
+DEF_VECT(int32_t, int3);
+DEF_VECT(int32_t, int4);
+DEF_VECT(int32_t, Int8);
+DEF_VECT(int32_t, Int16);
+DEF_VECT(uint32_t, uint);
+DEF_VECT(uint32_t, uint2);
+DEF_VECT(uint32_t, uint3);
+DEF_VECT(uint32_t, uint4);
+DEF_VECT(uint32_t, UInt8);
+DEF_VECT(uint32_t, UInt16);
+DEF_VECT(uint64_t, uint64_t);
+DEF_VECT(uint64_t, ulong2);
+DEF_VECT(uint64_t, ulong3);
+DEF_VECT(uint64_t, ulong4);
+DEF_VECT(uint64_t, ULong8);
+DEF_VECT(uint64_t, ULong16);
+DEF_VECT(int64_t, int64_t);
+DEF_VECT(int64_t, long2);
+DEF_VECT(int64_t, long3);
+DEF_VECT(int64_t, long4);
+DEF_VECT(int64_t, Long8);
+DEF_VECT(int64_t, Long16);
+DEF_VECT(float, float);
+DEF_VECT(float, float2);
+DEF_VECT(float, float3);
+DEF_VECT(float, float4);
+DEF_VECT(float, Float8);
+DEF_VECT(float, Float16);
+
+DEF_VECT(double, double);
+DEF_VECT(double, double2);
+DEF_VECT(double, double3);
+DEF_VECT(double, double4);
+
+#undef DEF_VECT
+#undef MACRO_UNROLL
+template <typename T> struct ComputeDType {
+  using Type = typename std::conditional<
+      (sizeof(T) >= 4), T,
+      typename std::conditional<
+          std::is_integral<T>::value,
+          typename std::conditional<std::is_unsigned<T>::value, uint32_t,
+                                    int32_t>::type,
+          float>::type>::type;
+};
+template <> struct ComputeDType<bool> {
+  using Type = bool;
+};
+
+// static inline bool check_qint8_only_scale(CTR x) {
+//   if (x.type == TensorImpl::Type::QINT8) {
+//     size_t zp_size = x.quant_desc.zero_point.size();
+//     return zp_size == 0 || (zp_size == 1 && x.quant_desc.zero_point[0] == 0);
+//   }
+//   return true;
+// }
+
+template <typename T, typename... Types>
+bool check_qint8_only_scale(T x0, Types... xn) {
+  bool ok = check_qint8_only_scale(x0);
+  return ok && check_qint8_only_scale(xn...);
+}
+#define CHECK_QINT8(ARGS...)                                                   \
+  {                                                                            \
+    if (!check_qint8_only_scale(ARGS)) {                                       \
+      return fail::NOT_SUPPORTED() << "qint8 only support zero_point==0";      \
+    }                                                                          \
+  }
+
+
+} // namespace dnn
+} // namespace musa
