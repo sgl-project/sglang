@@ -641,6 +641,19 @@ class SchedulerOutputProcessorMixin:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
+            # Idempotency guard for PP cross-microbatch races: in PP+chunked
+            # prefill the same Req object can sit in multiple in-flight
+            # mbs[*] batches when chunks of one req are pipelined across
+            # microbatch slots. The slot that processes the last chunk's
+            # result finalizes the req (release_kv_cache nulls req_pool_idx),
+            # then a sibling slot's pending result hits the same req again
+            # here and would trip the assert in release_kv_cache. Treat
+            # `req_pool_idx is None at finalize` as "already released" and
+            # skip the redundant cleanup; the first call already collected
+            # multimodal/experts/indexer/time-stats state.
+            if req.req_pool_idx is None and not self.tree_cache.supports_mamba():
+                self.maybe_collect_customized_info(i, req, logits_output)
+                return
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
