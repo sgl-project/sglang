@@ -469,6 +469,14 @@ def main() -> None:
     if not args.model_path:
         raise SystemExit("--model-path is required")
 
+    if args.mode == "record" and args.record_dir is not None:
+        raise SystemExit(
+            "--record-dir is only valid in --mode verify "
+            "(record mode generates a fresh artifact; did you mean --mode verify?)"
+        )
+    if args.mode == "verify" and args.record_dir is None:
+        raise SystemExit("--mode verify requires --record-dir")
+
     # Establish base_url and (if needed) launch the server.
     proc = None
     if args.base_url:
