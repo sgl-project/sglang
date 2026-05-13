@@ -493,8 +493,11 @@ def _resolve_quant_config(
     reverse_param_names_mapping_dict = getattr(
         arch_config, "reverse_param_names_mapping", None
     )
-
-    quant_config = get_quant_config(hf_config, component_model_path)
+    quant_config = get_quant_config(
+        hf_config,
+        component_model_path,
+        reverse_param_names_mapping=reverse_param_names_mapping_dict,
+    )
     quant_config_name = _get_quant_config_name(quant_config)
     inferred_nvfp4_config = None
     if quant_config is None or quant_config_name == "modelopt_fp4":
