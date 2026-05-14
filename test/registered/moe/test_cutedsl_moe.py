@@ -899,14 +899,13 @@ class TestCuteDslV1(unittest.TestCase):
                         masked_m.to(hidden_states.device),
                     )
 
-                    a_global_scale = input_global_scale[:1]
                     a_fp4, a_scale_interleaved = fp4_quantize(
-                        hidden_states, a_global_scale
+                        hidden_states, input_global_scale
                     )
                     a_in_dtype = dequantize_nvfp4_to_dtype(
                         a_fp4,
                         a_scale_interleaved,
-                        a_global_scale,
+                        input_global_scale,
                         dtype=hidden_states.dtype,
                         device=hidden_states.device,
                         block_size=16,
@@ -1078,12 +1077,11 @@ class TestCuteDslV1(unittest.TestCase):
                 masked_m.to(device),
             )
 
-            a_global_scale = input_global_scale[:1]
-            a_fp4, a_scale_interleaved = fp4_quantize(hidden_states, a_global_scale)
+            a_fp4, a_scale_interleaved = fp4_quantize(hidden_states, input_global_scale)
             a_in_dtype = dequantize_nvfp4_to_dtype(
                 a_fp4,
                 a_scale_interleaved,
-                a_global_scale,
+                input_global_scale,
                 dtype=hidden_states.dtype,
                 device=device,
                 block_size=16,
@@ -1253,12 +1251,11 @@ class TestCuteDslV1(unittest.TestCase):
             )
 
             # PyTorch reference (same as the bf16 input test)
-            a_gs = input_gs[:1]
-            a_fp4, a_scale = fp4_quantize(hidden_states, a_gs)
+            a_fp4, a_scale = fp4_quantize(hidden_states, input_gs)
             a_deq = dequantize_nvfp4_to_dtype(
                 a_fp4,
                 a_scale,
-                a_gs,
+                input_gs,
                 dtype=torch.bfloat16,
                 device=device,
                 block_size=16,
