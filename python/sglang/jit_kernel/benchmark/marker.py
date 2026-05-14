@@ -91,7 +91,7 @@ def bench_one_function(
     graph_clone_args: Iterable[int] | Literal["all"] | None = "all",
     graph_clone_kwargs: Iterable[str] | Literal["all"] | None = "all",
     # NOTE: for memory-bandwidth profiling
-    memory_args: Iterable[torch.Tensor] | Literal["all"] | None = None,
+    memory_args: Iterable[Any] | None = None,
     extra_memory_footprint: int | None = None,
 ) -> BenchResult:
     """
@@ -109,7 +109,7 @@ def bench_one_function(
                              Only the read args need to be cloned to avoid L2 cache effect.
     :param graph_clone_kwargs: Keys of input_kwargs to clone for each iteration.
                                Only the read args need to be cloned to avoid L2 cache effect.
-    :param memory_args: Optional sequence of tensors to calculate total memory footprint.
+    :param memory_args: Optional sequence of arguments to calculate total memory footprint.
                         Used for memory bandwidth estimation in the profile report.
     :param extra_memory_footprint: Additional memory footprint to consider.
                                    Usually used for kernels with dynamic input shape.
@@ -183,10 +183,7 @@ def bench_one_function(
     result = _process_metrics(result, metrics)
     memory_footprint = None
     if memory_args is not None:
-        if memory_args == "all":
-            memory_footprint = _get_nbytes(input_args) + _get_nbytes(input_kwargs)
-        else:
-            memory_footprint = sum(arg.nbytes for arg in memory_args)
+        memory_footprint = sum(_get_nbytes(arg) for arg in memory_args)
     if extra_memory_footprint is not None:
         memory_footprint = (memory_footprint or 0) + extra_memory_footprint
     return BenchResult(metrics, result, memory_footprint)
