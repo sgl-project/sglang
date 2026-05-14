@@ -1,10 +1,13 @@
+#!/bin/bash
+
+# install other tools
+apt-get update -y
+apt-get install -y sqlite3 libsqlite3-dev libfmt-dev
+
 # download and install RPD
-apt update && apt install -y sqlite3 libsqlite3-dev libfmt-dev
+git clone https://github.com/ROCm/rocmProfileData.git
 
 # install rpd module
-git clone https://github.com/ROCmSoftwarePlatform/rocmProfileData
-cd rocmProfileData
-git apply rpd.patch
+cd rocmProfileData/
 make && make install
-cd rocpd_python && python setup.py install && cd ..
-cd rpd_tracer && make clean;make install && python setup.py install && cd ..
+
