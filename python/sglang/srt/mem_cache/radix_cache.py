@@ -71,12 +71,15 @@ class RadixKey:
 
     def __init__(
         self,
-        token_ids: array,
+        token_ids: Union[List[int], array],
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
     ):
-        # token ids sequence (raw ints in both modes)
-        self.token_ids = token_ids
+        # TODO(Jialin): clean up callers that still pass list[int] to
+        # RadixKey, then drop this coercion eventually.
+        self.token_ids: array = (
+            token_ids if isinstance(token_ids, array) else array("q", token_ids)
+        )
         # extra key (e.g. lora_id, cache_salt)
         self.extra_key = extra_key
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
