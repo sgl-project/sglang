@@ -774,9 +774,8 @@ def run_single(
                     sys.stdout.write(f"  [server] {line}")
                     sys.stdout.flush()
                     fh.write(line)
-                    if (
-                        not server_error
-                        and any(pattern in line for pattern in SERVER_FATAL_ERROR_PATTERNS)
+                    if not server_error and any(
+                        pattern in line for pattern in SERVER_FATAL_ERROR_PATTERNS
                     ):
                         server_error["message"] = line.strip()
                         try:
