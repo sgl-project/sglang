@@ -122,7 +122,11 @@ jobs:
         id: wait
         with:
           stage-name: stage-a
-          jobs: '["stage-a-test-1-gpu-small", {"prefix": "stage-a-test-cpu", "expected_count": 4}]'
+          jobs: |
+            [
+              {"prefix": "stage-a-test-1-gpu-small", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-1-gpu-small'].size }}},
+              {"prefix": "stage-a-test-cpu", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-cpu'].size }}}
+            ]
           max-wait-minutes: '240'
 
   wait-for-stage-b:
@@ -150,10 +154,10 @@ jobs:
           stage-name: stage-b
           jobs: |
             [
-              {"prefix": "stage-b-test-1-gpu-small", "expected_count": 8},
-              {"prefix": "stage-b-test-1-gpu-large", "expected_count": 14},
-              {"prefix": "stage-b-test-2-gpu-large", "expected_count": 4},
-              {"prefix": "stage-b-test-4-gpu-b200", "expected_count": 1}
+              {"prefix": "stage-b-test-1-gpu-small", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-small'].size }}},
+              {"prefix": "stage-b-test-1-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-large'].size }}},
+              {"prefix": "stage-b-test-2-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-2-gpu-large'].size }}},
+              {"prefix": "stage-b-test-4-gpu-b200", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-4-gpu-b200'].size }}}
             ]
           max-wait-minutes: '480'
 
@@ -194,71 +198,14 @@ jobs:
         (!inputs.target_stage && needs.call-gate.result == 'success') ||
         (inputs.target_stage && inputs.include_wheel_build)
       )
-    runs-on: x64-kernel-build-node
-    timeout-minutes: 240
-    strategy:
-      matrix:
-        include:
-          - python-version: "3.10"
-            cuda-version: "13.0"
-          - python-version: "3.10"
-            cuda-version: "12.9"
-    name: Build Wheel
-    steps:
-      - name: Cleanup
-        run: |
-          sudo rm -rf $GITHUB_WORKSPACE/* || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: "recursive"
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Free Docker disk space
-        run: |
-          set -x
-          # build.sh retags sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}
-          # on every run, leaving the previous image as a dangling <none>:<none>
-          # entry (~16-23 GB each). Prune them before building so the runner
-          # doesn't fill up. The local buildx cache at ~/.cache/sgl-kernel/buildx
-          # and the tagged sgl-kernel-deps image are not affected.
-          # `until=12h` avoids racing with a sibling matrix cell (cuda 12.9 vs
-          # 13.0) that may have just orphaned an image seconds ago.
-          docker image prune -f --filter "until=12h"
-          # Drop orphaned buildx builder volumes from past `docker buildx create`
-          # invocations. The active `sgl-kernel-builder` volume is held open and
-          # would fail to remove anyway, but skip it explicitly for clarity.
-          for v in $(docker volume ls -q | grep '^buildx_buildkit_' | grep -v '^buildx_buildkit_sgl-kernel-builder' || true); do
-            echo "Removing orphan buildx volume: $v"
-            docker volume rm "$v" || true
-          done
-          df -h /
-
-      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
-        run: |
-          cd sgl-kernel
-          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
-        env:
-          USE_CCACHE: 1
-
-      - name: Verify wheel artifacts
-        run: |
-          ls -alh sgl-kernel/dist
-          ls -alh sgl-kernel/dist/*.whl
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
-          path: sgl-kernel/dist/*
-          if-no-files-found: error
+    uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
+    with:
+      runs_on: x64-kernel-build-node
+      job_display_name: Build Wheel
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
@@ -276,66 +223,15 @@ jobs:
         (!inputs.target_stage && needs.call-gate.result == 'success') ||
         (inputs.target_stage && inputs.include_wheel_build)
       )
-    runs-on: arm-kernel-build-node
-    timeout-minutes: 240
-    strategy:
-      matrix:
-        include:
-          - python-version: "3.10"
-            cuda-version: "13.0"
-          - python-version: "3.10"
-            cuda-version: "12.9"
-    name: Build Wheel Arm
-    steps:
-      - name: Cleanup
-        run: |
-          if [ -d "$GITHUB_WORKSPACE" ]; then
-            sudo rm -rf "$GITHUB_WORKSPACE"/* || true
-          else
-            echo "$GITHUB_WORKSPACE does not exist, nothing to clean"
-          fi
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: "recursive"
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Free Docker disk space
-        run: |
-          set -x
-          # See sgl-kernel-build-wheels above for the rationale.
-          docker image prune -f --filter "until=12h"
-          for v in $(docker volume ls -q | grep '^buildx_buildkit_' | grep -v '^buildx_buildkit_sgl-kernel-builder' || true); do
-            echo "Removing orphan buildx volume: $v"
-            docker volume rm "$v" || true
-          done
-          df -h /
-
-      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
-        run: |
-          cd sgl-kernel
-          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
-        env:
-          USE_CCACHE: 1
-
-      - name: Verify wheel artifacts
-        run: |
-          ls -alh sgl-kernel/dist
-          ls -alh sgl-kernel/dist/*.whl
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}-aarch64
-          path: sgl-kernel/dist/*
-          if-no-files-found: error
+    uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
+    with:
+      runs_on: arm-kernel-build-node
+      job_display_name: Build Wheel Arm
+      arch_suffix: '-aarch64'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   call-sgl-kernel-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -393,6 +289,11 @@ jobs:
       )
     runs-on: 1-gpu-5090
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-1-gpu-small'].max_parallel }}
+      matrix:
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-1-gpu-small'].arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -422,7 +323,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-a-test-1-gpu-small $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-a-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-1-gpu-small'].size }} $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -447,8 +348,9 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-cpu'].max_parallel }}
       matrix:
-        partition: [0, 1, 2, 3]
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-cpu'].arr }}
     steps:
       - name: Free disk space
         run: |
@@ -499,7 +401,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite stage-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite stage-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-cpu'].size }} $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
   stage-b-test-1-gpu-small:
@@ -518,9 +420,9 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel_small) }}
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-small'].max_parallel }}
       matrix:
-        partition: [0, 1, 2, 3, 4, 5, 6, 7]
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-small'].arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -550,7 +452,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-small'].size }} $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -578,9 +480,9 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel) }}
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-large'].max_parallel }}
       matrix:
-        partition: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-large'].arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -610,7 +512,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-large'].size }} --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -637,9 +539,9 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel_2gpu) }}
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-2-gpu-large'].max_parallel }}
       matrix:
-        partition: [0, 1, 2, 3]
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-2-gpu-large'].arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -669,7 +571,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-2-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-2-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-2-gpu-large'].size }} $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -696,6 +598,9 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-4-gpu-b200'].max_parallel }}
+      matrix:
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-4-gpu-b200'].arr }}
 
     steps:
       - name: Checkout code
@@ -726,7 +631,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-4-gpu-b200'].size }} $CONTINUE_ON_ERROR_FLAG
 
       - name: Run FA4 jit_kernel tests (SM100+)
         timeout-minutes: 10
@@ -789,8 +694,9 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-h100'].max_parallel }}
       matrix:
-        part: [0, 1, 2]
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-h100'].arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -820,12 +726,12 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-h100 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-h100 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-h100'].size }} $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
         with:
-          artifact-suffix: ${{ matrix.part }}
+          artifact-suffix: ${{ matrix.partition }}
 
       - name: Cleanup venv
         if: always()
@@ -847,8 +753,9 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h200'].max_parallel }}
       matrix:
-        part: [0, 1, 2, 3]
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h200'].arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -897,12 +804,12 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h200'].size }} $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
         with:
-          artifact-suffix: ${{ matrix.part }}
+          artifact-suffix: ${{ matrix.partition }}
 
       - name: Cleanup venv
         if: always()
@@ -924,6 +831,11 @@ jobs:
     timeout-minutes: 240
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h20'].max_parallel }}
+      matrix:
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h20'].arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -953,7 +865,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h20'].size }} $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -976,6 +888,11 @@ jobs:
       )
     runs-on: 4-gpu-h100
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-4-gpu-h100'].max_parallel }}
+      matrix:
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-4-gpu-h100'].arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1022,7 +939,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu-h100 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu-h100 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-4-gpu-h100'].size }} $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -1045,6 +962,11 @@ jobs:
       )
     runs-on: 8-gpu-h200-deepep
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-8-gpu-h200'].max_parallel }}
+      matrix:
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-8-gpu-h200'].arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1092,7 +1014,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-8-gpu-h200'].size }} $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -1117,8 +1039,9 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-b200'].max_parallel }}
       matrix:
-        part: [0, 1, 2, 3, 4, 5]
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-b200'].arr }}
 
     steps:
       - name: Checkout code
@@ -1149,12 +1072,12 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 6 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-b200'].size }} --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
         with:
-          artifact-suffix: ${{ matrix.part }}
+          artifact-suffix: ${{ matrix.partition }}
 
       - name: Cleanup venv
         if: always()
@@ -1174,6 +1097,11 @@ jobs:
       )
     runs-on: ${{ needs.check-changes.outputs.b200_runner }}
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-4-gpu-b200'].max_parallel }}
+      matrix:
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-4-gpu-b200'].arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1203,7 +1131,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-4-gpu-b200 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-4-gpu-b200 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-4-gpu-b200'].size }} --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -1226,6 +1154,11 @@ jobs:
       )
     runs-on: 8-gpu-h200
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-8-gpu-h200'].max_parallel }}
+      matrix:
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-8-gpu-h200'].arr }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1255,7 +1188,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-8-gpu-h200 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-8-gpu-h200 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-8-gpu-h200'].size }} --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
