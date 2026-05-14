@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -14,14 +14,26 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
+_is_cuda = is_cuda()
+_is_hip = is_hip()
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def _resolve_future_token_ids(input_ids, future_token_ids_map):
+
+def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,
         future_token_ids_map[torch.clamp(-input_ids, min=0)],
         input_ids,
     )
+
+
+if _is_cuda or _is_hip:
+    from sglang.jit_kernel.resolve_future_token_ids import (
+        resolve_future_token_ids_cuda,
+    )
+
+    _resolve_future_token_ids = resolve_future_token_ids_cuda
+else:
+    _resolve_future_token_ids = _resolve_future_token_ids_native
 
 
 @dataclass
@@ -74,7 +86,7 @@ class FutureMap:
         # Get a reference for each tensor
         topk_p0 = draft_input.topk_p[0]
         topk_index0 = draft_input.topk_index[0]
-        verified_id0 = draft_input.verified_id[0]
+        bonus_token0 = draft_input.bonus_tokens[0]
         new_seq_lens0 = draft_input.new_seq_lens[0]
 
         self.topk_p_buf = torch.empty(
@@ -87,9 +99,9 @@ class FutureMap:
             dtype=topk_index0.dtype,
             device=self.device,
         )
-        self.verified_id_buf = torch.empty(
-            (self.future_buffer_len, *verified_id0.shape),
-            dtype=verified_id0.dtype,
+        self.bonus_tokens_buf = torch.empty(
+            (self.future_buffer_len, *bonus_token0.shape),
+            dtype=bonus_token0.dtype,
             device=self.device,
         )
         self.new_seq_lens_buf = torch.empty(
@@ -125,9 +137,16 @@ class FutureMap:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             indices = draft_input.future_indices.indices
+            # The indices tensor was allocated on the default stream but is
+            # used here on the forward stream. Meanwhile, the old spec_info
+            # holding this tensor will lose all Python references (replaced at
+            # model_worker_batch.spec_info and batch.spec_info), so the
+            # caching allocator (torch GC) could reclaim the memory before
+            # the GPU finishes reading it.
+            indices.record_stream(torch.get_device_module(self.device).current_stream())
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
-            draft_input.verified_id = self.verified_id_buf[indices]
+            draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
@@ -162,7 +181,7 @@ class FutureMap:
 
         self.topk_p_buf[intv] = draft_input.topk_p
         self.topk_index_buf[intv] = draft_input.topk_index
-        self.verified_id_buf[intv] = draft_input.verified_id
+        self.bonus_tokens_buf[intv] = draft_input.bonus_tokens
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states

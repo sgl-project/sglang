@@ -33,7 +33,7 @@ def load_pdmux_config(config_path: str) -> PDMuxConfig:
         raise ValueError("Missing required field: sm_group_num")
 
     if raw["sm_group_num"] < 3:
-        raise ValueError("sm_group_num must greater than 3")
+        raise ValueError("sm_group_num must be >= 3")
 
     manual_divisions = raw.get("manual_divisions", [])
 

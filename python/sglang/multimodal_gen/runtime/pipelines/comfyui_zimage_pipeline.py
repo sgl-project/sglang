@@ -15,10 +15,12 @@ from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     load_model_from_full_model_state_dict,
-    set_default_dtype,
     shard_model,
 )
-from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.loader.utils import (
+    get_param_names_mapping,
+    set_default_torch_dtype,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
@@ -141,7 +143,6 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         head_dim = dim // num_heads
         q_size = dim
         k_size = head_dim * num_kv_heads
-        v_size = head_dim * num_kv_heads
 
         for name, tensor in weight_iterator:
             # Match qkv weights in layers, noise_refiner, or context_refiner
@@ -299,7 +300,7 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 mp_policy=mp_policy,
             )
 
-            with set_default_dtype(default_dtype), torch.device("meta"):
+            with set_default_torch_dtype(default_dtype), torch.device("meta"):
                 model = model_cls(**{"config": dit_config, "hf_config": hf_config})
 
             # Check if we should use FSDP
@@ -309,7 +310,6 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
             if use_fsdp:
-                world_size = server_args.hsdp_replicate_dim * server_args.hsdp_shard_dim
                 device_mesh = init_device_mesh(
                     current_platform.device_type,
                     mesh_shape=(
@@ -324,7 +324,9 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                     reshard_after_forward=True,
                     mp_policy=mp_policy,
                     mesh=device_mesh,
-                    fsdp_shard_conditions=model._fsdp_shard_conditions,
+                    fsdp_shard_conditions=getattr(
+                        model, "_fsdp_shard_conditions", None
+                    ),
                     pin_cpu_memory=server_args.pin_cpu_memory,
                 )
 
@@ -379,24 +381,19 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
             "ComfyUIZImagePipeline.create_pipeline_stages() called - creating latent_preparation_stage and denoising_stage"
         )
 
-        # Add ComfyUILatentPreparationStage to handle latents properly for SP
-        # This stage includes device mismatch fix for ComfyUI pipelines in multi-GPU scenarios
-        self.add_stage(
-            stage_name="latent_preparation_stage",
-            stage=ComfyUILatentPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                transformer=self.get_module("transformer"),
-            ),
+        self.add_stages(
+            [
+                ComfyUILatentPreparationStage(
+                    scheduler=self.get_module("scheduler"),
+                    transformer=self.get_module("transformer"),
+                ),
+                DenoisingStage(
+                    transformer=self.get_module("transformer"),
+                    scheduler=self.get_module("scheduler"),
+                ),
+            ]
         )
 
-        # Add DenoisingStage for the actual denoising process
-        self.add_stage(
-            stage_name="denoising_stage",
-            stage=DenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-            ),
-        )
         logger.info(
             f"ComfyUIZImagePipeline stages created: {list(self._stage_name_mapping.keys())}"
         )

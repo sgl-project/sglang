@@ -1,0 +1,251 @@
+name: PR Test (MUSA)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    input:
+      target_stage:
+        description: "Specific test stage to run (Optional)"
+        required: false
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests (for releasing or testing purpose)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: pr-test-musa-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changes_exist: ${{ steps.filter.outputs.main_package == 'true'
+        || steps.filter.outputs.multimodal_gen == 'true'
+        || steps.filter.outputs.sgl_kernel == 'true'
+        || steps.run-mode.outputs.run_all_tests == 'true'
+        || inputs.target_stage != '' }}
+      main_package: ${{ steps.filter.outputs.main_package == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          # Run all tests for workflow_call (when ref input is provided)
+          # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+            echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }})"
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+            echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
+          fi
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
+        with:
+          filters: |
+            main_package:
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/pyproject_other.toml"
+              - "scripts/ci/musa/*"
+              - "scripts/ci/utils/*"
+              - "test/**"
+              - ".github/workflows/pr-test-musa.yml"
+            multimodal_gen:
+              - "python/sglang/multimodal_gen/**"
+              - "python/sglang/cli/**"
+              - "python/pyproject_other.toml"
+            sgl_kernel:
+              - "sgl-kernel/**"
+              - ".github/workflows/pr-test-musa.yml"
+
+  # ==================== PR Gate ==================== #
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.changes_exist == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
+  # ==================== Multimodal Gen Tests ==================== #
+  multimodal-gen-test-1-gpu-musa:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.multimodal_gen == 'true' || inputs.target_stage == 'multimodal-gen-test-1-gpu-musa'
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    runs-on: s5000-1-gpu-runner
+    timeout-minutes: 240
+    env:
+      USE_MODELSCOPE: true
+      SGLANG_IS_IN_CI: true
+      TORCHADA_ENABLE_CPP_OPS: 1
+      HF_HUB_CACHE: /hf-cache/hub
+    steps:
+      - name: Checkout code
+        timeout-minutes: 10
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/musa/musa_install_dependency.sh
+
+      - name: Run diffusion server tests (1-GPU)
+        timeout-minutes: 30
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite_musa.py \
+            --suite 1-gpu-musa \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2
+
+  multimodal-gen-test-2-gpu-musa:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.multimodal_gen == 'true' || inputs.target_stage == 'multimodal-gen-test-2-gpu-musa'
+    runs-on: s5000-2-gpu-runner
+    timeout-minutes: 240
+    env:
+      USE_MODELSCOPE: true
+      SGLANG_IS_IN_CI: true
+      TORCHADA_ENABLE_CPP_OPS: 1
+      HF_HUB_CACHE: /hf-cache/hub
+    steps:
+      - name: Checkout code
+        timeout-minutes: 10
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/musa/musa_install_dependency.sh
+
+      - name: Run diffusion server tests (2-GPU)
+        timeout-minutes: 30
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite_musa.py \
+            --suite 2-gpu-musa
+
+  multimodal-gen-layer-unit-test-musa:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.multimodal_gen == 'true' || inputs.target_stage == 'multimodal-gen-layer-unit-test-musa'
+    runs-on: s5000-1-gpu-runner
+    timeout-minutes: 240
+    env:
+      USE_MODELSCOPE: true
+      SGLANG_IS_IN_CI: true
+      TORCHADA_ENABLE_CPP_OPS: 1
+      HF_HUB_CACHE: /hf-cache/hub
+    steps:
+      - name: Checkout code
+        timeout-minutes: 10
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/musa/musa_install_dependency.sh
+
+      - name: Run multimodal gen layer unit test
+        timeout-minutes: 30
+        run: |
+          pytest python/sglang/multimodal_gen/test/layers/test_musa_rmsnorm.py
+          pytest python/sglang/multimodal_gen/test/layers/test_musa_silu_and_mul.py
+
+# =============================================== sgl-kernel ====================================================
+  sgl-kernel-unit-test-musa:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.sgl_kernel == 'true' || inputs.target_stage == 'sgl-kernel-unit-test-musa'
+    runs-on: s5000-1-gpu-runner
+    timeout-minutes: 240
+    env:
+      TORCHADA_ENABLE_CPP_OPS: 1
+      HF_HUB_CACHE: /hf-cache/hub
+    steps:
+      - name: Checkout code
+        timeout-minutes: 10
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/musa/musa_install_dependency.sh
+
+      - name: Run sgl-kernel test
+        timeout-minutes: 20
+        run: |
+          pytest sgl-kernel/tests/test_dsv3_router_gemm.py
+          pytest sgl-kernel/tests/test_per_token_quant_fp8.py
+          pytest sgl-kernel/tests/speculative/test_eagle_utils.py
+          pytest sgl-kernel/tests/speculative/test_ngram_utils.py
+          pytest sgl-kernel/tests/speculative/test_speculative_sampling.py
+          pytest sgl-kernel/tests/test_torch_defaults_reset.py
+
+
+  pr-test-musa-finish:
+    needs:
+      [
+        pr-gate,
+        check-changes,
+        multimodal-gen-test-1-gpu-musa,
+        multimodal-gen-test-2-gpu-musa,
+        multimodal-gen-layer-unit-test-musa,
+        sgl-kernel-unit-test-musa,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          # Convert the 'needs' context to a JSON string
+          json_needs='${{ toJson(needs) }}'
+
+          # Get a list of all job names from the JSON keys
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          for job in $job_names; do
+            # For each job, extract its result
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+
+            # Print the job name and its result
+            echo "$job: $result"
+
+            # Check for failure or cancellation and exit if found
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
+          # If the loop completes, all jobs were successful
+          echo "All jobs completed successfully"
+          exit

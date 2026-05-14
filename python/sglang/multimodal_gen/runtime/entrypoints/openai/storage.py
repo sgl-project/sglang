@@ -56,6 +56,8 @@ class CloudStorage:
                 ".jpeg": "image/jpeg",
                 ".webp": "image/webp",
                 ".mp4": "video/mp4",
+                ".glb": "model/gltf-binary",
+                ".obj": "text/plain",
             }.get(ext, "application/octet-stream")
 
             # Use the client created once in __init__
