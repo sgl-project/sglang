@@ -9,10 +9,10 @@ operations itself.
 
 Layering:
 
-ARBackend: Autoregressive text/session backend used by omni orchestrator
+ARBackend: Autoregressive text/session backend used by omni coordinator
   -> SRTBackedOmniSessionAdapter: concrete translator from generic omni AR semantics into SRT session operations
     -> OmniSessionRuntime
-         - model_policy: model-specific prompt/decode/accounting rules; runtime-aware hooks may ask the runtime to run SRT decode or mutate condition paths
+         - model_policy: `sglang.omni.model_adapters` contract for model-specific prompt/decode/accounting rules
          - OmniSRTSchedulerExecutor: concrete SRT scheduler execution owned by the runtime
             -> SRT scheduler
 """

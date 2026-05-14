@@ -16,12 +16,18 @@ from sglang.omni.core.interleaved import (
     INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
     STREAMED_TEXT_METADATA_KEY,
     ar_appended_token_positions,
-    ar_decode_input_position,
-    ar_next_output_position,
     ar_output_position,
     build_generation_boundary_metadata,
+    get_ar_decode_input_position,
+    get_ar_next_output_position,
 )
 from sglang.omni.core.protocol import GeneratedSegment
+from sglang.omni.model_adapters.model_policy import (
+    OmniModelAppendImageResult,
+    OmniModelPolicy,
+    OmniModelPrefillResult,
+    OmniModelSessionView,
+)
 from sglang.omni.model_adapters.sensenova_u1.context import (
     U1_EDIT_IMG_CONDITION_ROLE,
     U1_EDIT_UNCONDITION_ROLE,
@@ -29,8 +35,8 @@ from sglang.omni.model_adapters.sensenova_u1.context import (
     U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
     U1_SPECIAL_TOKENS,
     U1_T2I_CFG_UNCONDITION_ROLE,
-    U1SpecialTokens,
     U1ModelStateUpdate,
+    U1SpecialTokens,
     _u1_decode_token_ids,
     _u1_eos_token_ids,
     _u1_needs_any_cfg,
@@ -47,12 +53,6 @@ from sglang.omni.model_adapters.sensenova_u1.context import (
     build_u1_native_t2i_cfg_uncondition_prepared_input,
     build_u1_native_t2i_prepared_input,
     build_u1_native_vlm_prepared_input,
-)
-from sglang.srt.omni_session.model_policy import (
-    OmniModelAppendImageResult,
-    OmniModelPolicy,
-    OmniModelPrefillResult,
-    OmniModelSessionView,
 )
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
@@ -352,7 +352,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
             or 0
         )
         # 2. SRT decode replays the previous token, so its position is one step behind
-        decode_input_position = ar_decode_input_position(next_output_position)
+        decode_input_position = get_ar_decode_input_position(next_output_position)
 
         # iteratively decode
         for _ in range(max_new_tokens):
@@ -365,7 +365,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                     last_segment_type="interleave",
                     last_source="native_interleave_decode",
                     native_interleave_prompt=True,
-                    generation_position_start=ar_next_output_position(
+                    generation_position_start=get_ar_next_output_position(
                         decode_input_position
                     ),
                 ).to_model_state_updates(),
@@ -375,7 +375,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                     runtime,
                     session,
                     U1ModelStateUpdate(
-                        generation_position_start=ar_next_output_position(
+                        generation_position_start=get_ar_next_output_position(
                             decode_input_position
                         )
                     ),
@@ -401,7 +401,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                         native_interleave_prompt=True,
                         open_image_marker=True,
                         interleave_pending_image_marker=bool(generated_text_ids),
-                        generation_position_start=ar_next_output_position(
+                        generation_position_start=get_ar_next_output_position(
                             output_position
                         ),
                         generation_boundary_metadata=boundary_metadata,
@@ -437,7 +437,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                         last_segment_type="interleave",
                         last_source="native_interleave_eos",
                         native_interleave_prompt=True,
-                        generation_position_start=ar_next_output_position(
+                        generation_position_start=get_ar_next_output_position(
                             output_position
                         ),
                     ),
@@ -480,7 +480,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                 last_segment_type="interleave",
                 last_source="native_interleave_decode",
                 native_interleave_prompt=True,
-                generation_position_start=ar_next_output_position(
+                generation_position_start=get_ar_next_output_position(
                     decode_input_position
                 ),
             ),
@@ -596,7 +596,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
         next_output_position = int(
             u1_state.get("generation_position_start", session.context_length) or 0
         )
-        decode_input_position = ar_decode_input_position(next_output_position)
+        decode_input_position = get_ar_decode_input_position(next_output_position)
         for _ in range(max_new_tokens):
             # 1. official t2i/edit think mode starts from an open <think> prefix
             decoded = runtime.decode(
@@ -606,7 +606,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                 greedy=True,
                 model_state_updates=U1ModelStateUpdate(
                     last_source="native_image_think_decode",
-                    generation_position_start=ar_next_output_position(
+                    generation_position_start=get_ar_next_output_position(
                         decode_input_position
                     ),
                 ).to_model_state_updates(),
@@ -641,7 +641,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                 model_state_updates=U1ModelStateUpdate(
                     last_source="native_image_think_append_image_marker",
                     open_image_marker=True,
-                    generation_position_start=ar_next_output_position(
+                    generation_position_start=get_ar_next_output_position(
                         marker_position_ids[-1]
                     ),
                 ).to_model_state_updates(),

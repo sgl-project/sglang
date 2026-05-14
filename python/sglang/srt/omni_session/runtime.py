@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """SRT-owned session runtime for AR/generation interleaved models.
 
-The runtime is below the generic omni orchestrator. It materializes model-
+The runtime is below the generic omni coordinator. It materializes model-
 specific AR-side chunks as ordinary SRT session requests, tracks committed SRT
 KV bindings, and owns the scheduler executor used by runtime-aware policy hooks.
 """
@@ -27,19 +27,29 @@ from sglang.srt.session.session_controller import SessionController
 
 if TYPE_CHECKING:
     from sglang.omni.entrypoints.streaming import OmniStreamSink
-    from sglang.srt.omni_session.model_policy import (
+    from sglang.omni.model_adapters.model_policy import (
         OmniModelPolicy,
         OmniModelSessionView,
     )
 
 
 class OmniSegmentState(str, Enum):
-    """A segment marks a continuous region of tokens of text/image/audio"""
+    """State machine for one interleaved AR/media session segment.
 
+    The normal path is:
+    AR_PREFILL -> AR_DECODE -> GENERATE -> APPEND_IMAGE -> AR_DECODE.
+    AR_DECODE may also stay in AR_DECODE after text-only output, or move to DONE.
+    """
+
+    # 1. triggered by a new user turn; next action is committing prepared inputs to SRT KV
     AR_PREFILL = "ar_prefill"
+    # 2. triggered after prefill/image append; next action is AR decode to text/media boundary
     AR_DECODE = "ar_decode"
+    # 3. triggered when AR emits an image boundary; next action is multimodal generation
     GENERATE = "generate"
+    # 4. triggered after image generation; next action is committing the generated image to SRT KV
     APPEND_IMAGE = "append_image"
+    # 5. triggered by EOS/close; next action is returning final output or accepting a later user turn
     DONE = "done"
 
 
@@ -176,6 +186,7 @@ class OmniSessionRuntime:
         self.tokenizer = tokenizer
         self.vocab_size = vocab_size
         self.srt_ar_decode_max_new_tokens = srt_ar_decode_max_new_tokens
+        # tracks the omni sessions
         self._records: dict[str, OmniSessionRecord] = {}
 
     @staticmethod
@@ -191,7 +202,7 @@ class OmniSessionRuntime:
         return messages
 
     def _model_session_view(self, record: OmniSessionRecord) -> "OmniModelSessionView":
-        from sglang.srt.omni_session.model_policy import OmniModelSessionView
+        from sglang.omni.model_adapters.model_policy import OmniModelSessionView
 
         return OmniModelSessionView(
             handle=record.handle(),
@@ -222,6 +233,7 @@ class OmniSessionRuntime:
         *,
         session_id: str | None = None,
     ) -> OmniSessionHandle:
+        """perform a prefill based on the interleaved context"""
         if not messages:
             raise ValueError("omni prefill requires at least one text or image message")
         session_id = session_id or uuid.uuid4().hex
@@ -453,6 +465,8 @@ class OmniSessionRuntime:
     def append_generated_image(
         self, handle: OmniSessionHandle, image: Any | None
     ) -> OmniSessionHandle:
+        """Commit one generated image segment back into the AR session."""
+
         record = self._record_for(handle)
         if record.state != OmniSegmentState.GENERATE:
             raise ValueError(
@@ -463,11 +477,13 @@ class OmniSessionRuntime:
         next_context_version = record.context_version + 1
         next_anchor_request_id = f"{record.session_id}:ar{next_context_version}"
         record.anchor_request_id = next_anchor_request_id
+        # 1. generated image is a new assistant media segment, not a replay of the whole turn
         self._execute_srt_session_req(
             record,
             [OmniInterleavedMessage(type="image", content=image)],
             request_id=next_anchor_request_id,
         )
+        # 2. model policy accounts for model-specific context growth after SRT commit
         append_result = self.model_policy.append_generated_image(
             session=self._model_session_view(record), image=image
         )
@@ -760,7 +776,7 @@ class OmniSessionRuntime:
         return condition_path_record
 
     def _pad_srt_multimodal_input_ids(
-        self, req: Any, mm_inputs: MultimodalInputs | None
+        self, req: Req, mm_inputs: MultimodalInputs | None
     ) -> None:
         if self.srt_request_executor is None:
             return
@@ -799,7 +815,7 @@ class OmniSessionRuntime:
 
     def _populate_srt_req_from_prepared_input(
         self,
-        req: Any,
+        req: Req,
         *,
         record: OmniSessionRecord,
         recv_req: Any,
@@ -868,7 +884,7 @@ class OmniSessionRuntime:
 
     @staticmethod
     def _srt_prefix_and_strip_lengths(
-        req: Any,
+        req: Req,
         recv_req: Any,
         prepared: OmniSRTPreparedInput,
     ) -> tuple[int, int]:
@@ -896,9 +912,10 @@ class OmniSessionRuntime:
         ]
 
     @staticmethod
-    def _install_multidim_mm_positions(req: Any) -> None:
-        mm_inputs = getattr(req, "multimodal_inputs", None)
-        positions = getattr(req, "custom_position_ids", None)
+    def _install_multidim_mm_positions(req: Req) -> None:
+        # adjust mrope positions for qwen-vl series
+        mm_inputs = req.multimodal_inputs
+        positions = req.custom_position_ids
         if mm_inputs is None or not positions:
             return
         if not isinstance(positions[0], (list, tuple)):
@@ -1067,7 +1084,7 @@ class OmniSessionRuntime:
 
     @staticmethod
     def _attach_srt_request_overrides(
-        req: Any,
+        req: Req,
         *,
         srt_request_metadata: dict[str, Any] | None = None,
     ) -> None:
@@ -1083,7 +1100,7 @@ class OmniSessionRuntime:
     def _execute_srt_req(
         self,
         record: OmniSessionRecord,
-        req: Any,
+        req: Req,
         *,
         state: OmniSegmentState,
     ) -> None:
@@ -1104,7 +1121,7 @@ class OmniSessionRuntime:
     @staticmethod
     def _record_srt_req(
         record: OmniSessionRecord,
-        req: Any,
+        req: Req,
         *,
         request_id: str,
     ) -> None:
@@ -1163,8 +1180,8 @@ class OmniSessionRuntime:
         if mm_inputs is None:
             return []
         offsets: list[tuple[int, int]] = []
-        for item in getattr(mm_inputs, "mm_items", []):
-            offsets.extend(getattr(item, "offsets", []) or [])
+        for item in mm_inputs.mm_items:
+            offsets.extend(item.offsets)
         return offsets
 
     def _ensure_srt_session(self, session_id: str) -> None:

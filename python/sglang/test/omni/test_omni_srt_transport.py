@@ -23,7 +23,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 
-class FakeOrchestrator:
+class FakeCoordinator:
     def __init__(self):
         self.requests = []
         self.contexts = []
@@ -89,10 +89,11 @@ class FakeTokenizerManager:
 
 class TestOmniSRTTransport(unittest.TestCase):
     def test_scheduler_transport_serializes_images_and_reuses_session(self):
-        orchestrator = FakeOrchestrator()
+        coordinator = FakeCoordinator()
         scheduler = SimpleNamespace(
             omni_scheduler_state=OmniSchedulerState(
-                orchestrators={"sensenova-u1": orchestrator},
+                coordinator=coordinator,
+                coordinator_model_key="sensenova-u1",
             ),
             server_args=SimpleNamespace(),
         )
@@ -105,10 +106,10 @@ class TestOmniSRTTransport(unittest.TestCase):
             },
         )
 
-        self.assertEqual("draw", orchestrator.requests[0].messages[0].text)
+        self.assertEqual("draw", coordinator.requests[0].messages[0].text)
         self.assertEqual("ok", response["segments"][0]["text"])
         self.assertIn("b64_json", response["segments"][1]["image"])
-        self.assertEqual(1, len(orchestrator.ar_backend.released))
+        self.assertEqual(1, len(coordinator.ar_backend.released))
 
         first = handle_omni_generate_with_omni_coordinator(
             scheduler=scheduler,
@@ -129,8 +130,8 @@ class TestOmniSRTTransport(unittest.TestCase):
 
         self.assertEqual("s0", first["session"]["id"])
         self.assertEqual(2, second["session"]["turns"])
-        self.assertIs(orchestrator.contexts[1], orchestrator.contexts[2])
-        self.assertEqual(1, len(orchestrator.ar_backend.released))
+        self.assertIs(coordinator.contexts[1], coordinator.contexts[2])
+        self.assertEqual(1, len(coordinator.ar_backend.released))
 
         closed = handle_omni_generate_with_omni_coordinator(
             scheduler=scheduler,
@@ -138,7 +139,7 @@ class TestOmniSRTTransport(unittest.TestCase):
         )
 
         self.assertFalse(closed["session"]["alive"])
-        self.assertEqual(2, len(orchestrator.ar_backend.released))
+        self.assertEqual(2, len(coordinator.ar_backend.released))
 
     def test_tokenizer_manager_omni_generate_waits_for_scheduler_response(self):
         asyncio.run(self._run_tokenizer_manager_omni_generate())

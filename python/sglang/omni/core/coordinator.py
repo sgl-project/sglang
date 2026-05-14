@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class OmniCoordinator:
-    """Coordinate AR and multimodal-generation backends without owning model internals."""
+    """Top-level structs that resides in OmniSchedulerState and coordinate AR and multimodal-generation backends without owning model internals."""
 
     ar_backend: ARBackend
     mm_generation_backend: MultimodalGenerationBackend
@@ -98,7 +98,7 @@ class OmniCoordinator:
         num_video_segments = 0
 
         try:
-            # the main loop: orchestrator owns modality handoff; backends own token and pixel internals
+            # the main loop: coordinator owns modality handoff; backends own token and pixel internals
             # each round generates a text segment and an optional image segment
             while True:
                 # 1. decode until a boundary is met

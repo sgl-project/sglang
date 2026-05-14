@@ -2,7 +2,7 @@
 """SRT tokenizer-manager transport for `/v1/omni/*` routes.
 
 Requests enter through the SRT HTTP server and are forwarded to the scheduler
-process. The scheduler lazily builds the omni orchestrator. Actual SRT
+process. The scheduler lazily builds the omni coordinator. Actual SRT
 ModelRunner/session/KV execution remains in `sglang.srt.omni_session.runtime`.
 """
 
@@ -12,7 +12,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from sglang.omni.configs.registry import (
-    get_or_create_omni_orchestrator_from_scheduler,
+    get_or_create_omni_coordinator_from_scheduler,
     resolve_omni_model_key,
 )
 from sglang.omni.core.protocol import OmniContextBundle, OmniRequest
@@ -48,17 +48,17 @@ def handle_omni_generate_with_omni_coordinator(
         session_record = sessions.get(session_id)
         if session_record is None:
             raise ValueError(f"Unknown omni session: {session_id}")
-    orchestrator_key = _resolve_orchestrator_key(
+    model_key = _resolve_model_key(
         request=request,
         session_record=session_record,
     )
-    orchestrator = _get_orchestrator(
+    coordinator = _get_coordinator(
         scheduler,
-        orchestrator_key,
+        model_key,
     )
 
     # generate with request and session context
-    response, context = orchestrator.generate_with_context(
+    response, context = coordinator.generate_with_context(
         request,
         context=None if session_record is None else session_record.context,
         release_context=not keep_session,
@@ -73,7 +73,7 @@ def handle_omni_generate_with_omni_coordinator(
         if session_record is None:
             session_record = OmniSessionRecord(
                 context=context,
-                orchestrator_key=orchestrator_key,
+                model_key=model_key,
                 turns=0,
                 created_at=now,
                 updated_at=now,
@@ -95,25 +95,25 @@ def _close_omni_session(scheduler: "Scheduler", session_id: str) -> dict[str, An
     session_record = sessions.pop(session_id, None)
     if session_record is None:
         raise ValueError(f"Unknown omni session: {session_id}")
-    orchestrator = _get_orchestrator(
+    coordinator = _get_coordinator(
         scheduler,
-        session_record.orchestrator_key,
+        session_record.model_key,
     )
-    orchestrator.ar_backend.release(session_record.context)
+    coordinator.ar_backend.release(session_record.context)
     return {"session": {"id": session_id, "alive": False}}
 
 
-def _get_orchestrator(
+def _get_coordinator(
     scheduler: "Scheduler",
     model_key: str,
 ) -> "OmniCoordinator":
-    return get_or_create_omni_orchestrator_from_scheduler(
+    return get_or_create_omni_coordinator_from_scheduler(
         scheduler=scheduler,
         model_name=model_key,
     )
 
 
-def _resolve_orchestrator_key(
+def _resolve_model_key(
     *,
     request: OmniRequest,
     session_record: OmniSessionRecord | None,
@@ -121,12 +121,12 @@ def _resolve_orchestrator_key(
     if session_record is None:
         return resolve_omni_model_key(request.model)
     if request.model is None:
-        return session_record.orchestrator_key
+        return session_record.model_key
     model_key = resolve_omni_model_key(request.model)
-    if model_key != session_record.orchestrator_key:
+    if model_key != session_record.model_key:
         raise ValueError(
             "Omni session model mismatch: "
-            f"expected {session_record.orchestrator_key!r}, got {model_key!r}"
+            f"expected {session_record.model_key!r}, got {model_key!r}"
         )
     return model_key
 

@@ -17,15 +17,16 @@ from threading import Condition, Event, RLock, Thread, get_ident
 from typing import TYPE_CHECKING, Any, Callable
 
 from sglang.omni.core.protocol import OmniContextBundle
+from sglang.omni.entrypoints.streaming import OmniStreamSink
+from sglang.srt.managers.io_struct import (
+    OmniGenerateReqOutput,
+    OmniGenerateStreamOutput,
+)
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH
 
 if TYPE_CHECKING:
     from sglang.omni.core.coordinator import OmniCoordinator
-    from sglang.srt.managers.io_struct import (
-        OmniGenerateReqInput,
-        OmniGenerateReqOutput,
-        OmniGenerateStreamOutput,
-    )
+    from sglang.srt.managers.io_struct import OmniGenerateReqInput
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.omni_session.runtime import (
@@ -46,7 +47,7 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class OmniSessionRecord:
     context: OmniContextBundle
-    orchestrator_key: str
+    model_key: str
     turns: int
     created_at: float
     updated_at: float
@@ -130,7 +131,8 @@ class OmniSchedulerExclusiveLease:
 class OmniSchedulerState:
     """Scheduler-local state for omni transport and native SRT req handoff."""
 
-    orchestrators: dict[str, "OmniCoordinator"] = field(default_factory=dict)
+    coordinator: "OmniCoordinator | None" = None
+    coordinator_model_key: str | None = None
     sessions: dict[str, OmniSessionRecord] = field(default_factory=dict)
     pending_srt_requests: Queue[OmniSRTExecutionRequest] = field(default_factory=Queue)
     running_srt_requests: dict[str, OmniSRTExecutionRequest] = field(
@@ -140,7 +142,7 @@ class OmniSchedulerState:
         default_factory=Queue
     )
     completed_task_outputs: Queue[OmniTaskOutput] = field(default_factory=Queue)
-    orchestrator_lock: RLock = field(default_factory=RLock)
+    coordinator_lock: RLock = field(default_factory=RLock)
     scheduler_thread_id: int | None = None
     scheduler_condition: Condition = field(default_factory=Condition)
     exclusive_waiters: int = 0
@@ -344,15 +346,6 @@ class OmniSchedulerState:
     def _run_omni_generate_task(
         self, scheduler: "Scheduler", recv_req: "OmniGenerateReqInput"
     ) -> None:
-        from sglang.omni.entrypoints.streaming import OmniStreamSink
-        from sglang.omni.runtime.srt_transport import (
-            handle_omni_generate_with_omni_coordinator,
-        )
-        from sglang.srt.managers.io_struct import (
-            OmniGenerateReqOutput,
-            OmniGenerateStreamOutput,
-        )
-
         def emit_stream_event(event: dict[str, Any]) -> None:
             self.completed_task_outputs.put(
                 (
@@ -366,6 +359,10 @@ class OmniSchedulerState:
 
         stream_sink = OmniStreamSink(emit_stream_event) if recv_req.stream else None
         try:
+            from sglang.omni.runtime.srt_transport import (
+                handle_omni_generate_with_omni_coordinator,
+            )
+
             payload = handle_omni_generate_with_omni_coordinator(
                 scheduler=scheduler,
                 payload=recv_req.payload,

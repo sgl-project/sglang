@@ -21,7 +21,7 @@ INTERLEAVED_GENERATION_TOKEN_COUNT_SOURCE_KEY = "generation_token_count_source"
 STREAMED_TEXT_METADATA_KEY = "_omni_streamed_text"
 
 
-def ar_decode_input_position(next_output_position: int) -> int:
+def get_ar_decode_input_position(next_output_position: int) -> int:
     """Return the replayed input position used to sample the next AR token."""
 
     return max(0, int(next_output_position) - 1)
@@ -31,7 +31,7 @@ def ar_output_position(decode_input_position: int) -> int:
     return int(decode_input_position) + 1
 
 
-def ar_next_output_position(output_position: int) -> int:
+def get_ar_next_output_position(output_position: int) -> int:
     return int(output_position) + 1
 
 

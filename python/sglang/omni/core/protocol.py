@@ -277,7 +277,7 @@ class ContextOps(ABC):
 
 
 class ARBackend(ABC):
-    """Autoregressive text/session backend used by omni orchestrator"""
+    """Autoregressive text/session backend used by omni coordinator"""
 
     @abstractmethod
     def begin_request_context(

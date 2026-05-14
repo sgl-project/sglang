@@ -48,7 +48,7 @@ class _ImageBackend:
 class TestOmniHttp(unittest.TestCase):
     def test_generate_endpoint_returns_mixed_segments(self):
         app = create_app(
-            orchestrator=OmniCoordinator(
+            coordinator=OmniCoordinator(
                 _ScriptedARBackend(
                     [
                         OmniBoundary(type="text", text="before"),
@@ -72,7 +72,7 @@ class TestOmniHttp(unittest.TestCase):
 
     def test_generate_endpoint_streams_segment_events(self):
         app = create_app(
-            orchestrator=OmniCoordinator(
+            coordinator=OmniCoordinator(
                 _ScriptedARBackend(
                     [
                         OmniBoundary(type="text", text="before"),

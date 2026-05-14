@@ -31,26 +31,26 @@ if TYPE_CHECKING:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    factory = getattr(app.state, "orchestrator_factory", None)
-    if getattr(app.state, "orchestrator", None) is None:
-        app.state.orchestrator = (
-            factory() if callable(factory) else _default_orchestrator()
+    factory = getattr(app.state, "coordinator_factory", None)
+    if getattr(app.state, "coordinator", None) is None:
+        app.state.coordinator = (
+            factory() if callable(factory) else _default_coordinator()
         )
     try:
         yield
     finally:
-        shutdown = getattr(app.state.orchestrator, "shutdown", None)
+        shutdown = getattr(app.state.coordinator, "shutdown", None)
         if callable(shutdown):
             shutdown()
 
 
 def create_app(
-    orchestrator: OmniCoordinator | None = None,
-    orchestrator_factory: Callable[[], OmniCoordinator] | None = None,
+    coordinator: OmniCoordinator | None = None,
+    coordinator_factory: Callable[[], OmniCoordinator] | None = None,
 ) -> FastAPI:
     app = FastAPI(lifespan=lifespan)
-    app.state.orchestrator = orchestrator
-    app.state.orchestrator_factory = orchestrator_factory
+    app.state.coordinator = coordinator
+    app.state.coordinator_factory = coordinator_factory
 
     @app.get("/health")
     async def health():
@@ -67,11 +67,11 @@ def create_app(
             request = OmniRequest.from_payload(payload)
             if bool(payload.get("stream", False)):
                 return StreamingResponse(
-                    _stream_omni_generate(raw_request.app.state.orchestrator, request),
+                    _stream_omni_generate(raw_request.app.state.coordinator, request),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache"},
                 )
-            response = raw_request.app.state.orchestrator.generate(request)
+            response = raw_request.app.state.coordinator.generate(request)
             return ORJSONResponse(serialize_response(response))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -81,13 +81,13 @@ def create_app(
     return app
 
 
-async def _stream_omni_generate(orchestrator: OmniCoordinator, request: OmniRequest):
+async def _stream_omni_generate(coordinator: OmniCoordinator, request: OmniRequest):
     queue: Queue[dict[str, Any] | None] = Queue()
 
     def run_generate() -> None:
         stream_sink = OmniStreamSink(queue.put)
         try:
-            response, _ = orchestrator.generate_with_context(
+            response, _ = coordinator.generate_with_context(
                 request,
                 stream_sink=stream_sink,
             )
@@ -120,11 +120,11 @@ def create_sensenova_u1_app(
     srt_ar_decode_max_new_tokens: int | None = None,
 ) -> FastAPI:
     from sglang.omni.configs.sensenova_u1 import (
-        build_sensenova_u1_orchestrator_from_scheduler,
+        build_sensenova_u1_coordinator_from_scheduler,
     )
 
     return create_app(
-        orchestrator_factory=lambda: build_sensenova_u1_orchestrator_from_scheduler(
+        coordinator_factory=lambda: build_sensenova_u1_coordinator_from_scheduler(
             scheduler=scheduler,
             srt_request_executor=srt_request_executor,
             srt_ar_decode_max_new_tokens=srt_ar_decode_max_new_tokens,
@@ -137,15 +137,15 @@ def launch_server(
     *,
     host: str = "127.0.0.1",
     port: int = 30001,
-    orchestrator: OmniCoordinator | None = None,
+    coordinator: OmniCoordinator | None = None,
 ) -> None:
     import uvicorn
 
-    app = create_app(orchestrator=orchestrator)
+    app = create_app(coordinator=coordinator)
     uvicorn.run(app, host=host, port=port)
 
 
-def _default_orchestrator() -> OmniCoordinator:
+def _default_coordinator() -> OmniCoordinator:
     return OmniCoordinator(
         ar_backend=UnsupportedARBackend(),
         mm_generation_backend=UnsupportedGenerationBackend(),

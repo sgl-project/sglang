@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SenseNova U1 wiring for the generic omni orchestrator."""
+"""SenseNova U1 wiring for the generic omni coordinator."""
 
 from __future__ import annotations
 
@@ -90,7 +90,7 @@ class SenseNovaU1OmniPlugin:
         )
 
 
-def build_sensenova_u1_orchestrator(
+def build_sensenova_u1_coordinator(
     *,
     srt_session_adapter: "SRTBackedOmniSessionAdapter",
     mm_generation_backend: MultimodalGenerationBackend | None = None,
@@ -111,7 +111,7 @@ def build_sensenova_u1_orchestrator(
     return coordinator
 
 
-def build_sensenova_u1_orchestrator_from_scheduler(
+def build_sensenova_u1_coordinator_from_scheduler(
     *,
     scheduler: "Scheduler",
     srt_request_executor: "OmniSRTSchedulerExecutor | None" = None,
@@ -123,7 +123,7 @@ def build_sensenova_u1_orchestrator_from_scheduler(
         build_sensenova_u1_srt_session_adapter,
     )
 
-    return build_sensenova_u1_orchestrator(
+    return build_sensenova_u1_coordinator(
         srt_session_adapter=build_sensenova_u1_srt_session_adapter(
             scheduler=scheduler,
             srt_request_executor=srt_request_executor,

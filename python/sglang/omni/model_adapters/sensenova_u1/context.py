@@ -150,16 +150,16 @@ class U1ModelStateUpdate:
         if self.last_generated_image_commit is not None:
             state["last_generated_image_commit"] = self.last_generated_image_commit
         if self.native_generated_image_commit is not None:
-            state["native_generated_image_commit"] = (
-                self.native_generated_image_commit
-            )
+            state["native_generated_image_commit"] = self.native_generated_image_commit
         if self.session_id is not None:
             state["session_id"] = self.session_id
         if self.segments is not None:
             state["segments"] = [
-                segment.to_dict()
-                if isinstance(segment, U1GeneratedImageSegmentState)
-                else dict(segment)
+                (
+                    segment.to_dict()
+                    if isinstance(segment, U1GeneratedImageSegmentState)
+                    else dict(segment)
+                )
                 for segment in self.segments
             ]
         if self.generation_boundary_metadata is not None:
@@ -503,12 +503,10 @@ def _build_u1_native_interleave_like_prepared_input(
     policy_metadata = _u1_policy_metadata({"u1": u1_metadata})
     policy_metadata["omni_srt_position_count"] = generation_position_start
     if model_state_updates is not None:
-        policy_metadata["omni_model_state_updates"] = (
-            model_state_updates.with_context(
-                generation_position_start=generation_position_start,
-                session_id=session_id,
-            ).to_model_state_updates()
-        )
+        policy_metadata["omni_model_state_updates"] = model_state_updates.with_context(
+            generation_position_start=generation_position_start,
+            session_id=session_id,
+        ).to_model_state_updates()
     return OmniSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
@@ -1343,9 +1341,7 @@ def _u1_generated_image_commit_metadata(
     ]
     u1_segment = U1GeneratedImageSegmentState(
         token_indices=tuple(int(index) for index in token_indices),
-        image_grid_hw=tuple(
-            tuple(map(int, row)) for row in grid_hw.tolist()
-        ),
+        image_grid_hw=tuple(tuple(map(int, row)) for row in grid_hw.tolist()),
         omit_image_start=bool(omit_start),
     )
     state_patch = U1ModelStateUpdate(

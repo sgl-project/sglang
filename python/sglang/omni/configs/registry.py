@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Model registry for SRT-hosted omni orchestrators.
+"""Model registry for the SRT-hosted omni coordinator.
 
-Runtime transport asks this module for an orchestrator by model name. Model-
+Runtime transport asks this module for a coordinator by model name. Model-
 specific imports stay here so `sglang.omni.runtime` remains model-agnostic.
 """
 
@@ -26,24 +26,30 @@ def resolve_omni_model_key(model_name: str | None) -> str:
     raise ValueError(f"Unsupported omni model {model_name!r}")
 
 
-def get_or_create_omni_orchestrator_from_scheduler(
+def get_or_create_omni_coordinator_from_scheduler(
     *,
     scheduler: "Scheduler",
     model_name: str | None,
 ) -> "OmniCoordinator":
     model_key = resolve_omni_model_key(model_name)
-    cache = scheduler.omni_scheduler_state.orchestrators
-    with scheduler.omni_scheduler_state.orchestrator_lock:
-        if model_key not in cache:
+    state = scheduler.omni_scheduler_state
+    with state.coordinator_lock:
+        if state.coordinator is None:
             # 1. build model-specific wiring outside omni.runtime
-            cache[model_key] = _build_orchestrator_from_scheduler(
+            state.coordinator = _build_coordinator_from_scheduler(
                 scheduler=scheduler,
                 model_key=model_key,
             )
-    return cache[model_key]
+            state.coordinator_model_key = model_key
+        elif state.coordinator_model_key != model_key:
+            raise ValueError(
+                "Omni coordinator model mismatch: "
+                f"expected {state.coordinator_model_key!r}, got {model_key!r}"
+            )
+    return state.coordinator
 
 
-def _build_orchestrator_from_scheduler(
+def _build_coordinator_from_scheduler(
     *,
     scheduler: "Scheduler",
     model_key: str,
@@ -51,10 +57,10 @@ def _build_orchestrator_from_scheduler(
     # TODO: make a registry
     if model_key == DEFAULT_OMNI_MODEL_KEY:
         from sglang.omni.configs.sensenova_u1 import (
-            build_sensenova_u1_orchestrator_from_scheduler,
+            build_sensenova_u1_coordinator_from_scheduler,
         )
 
-        return build_sensenova_u1_orchestrator_from_scheduler(
+        return build_sensenova_u1_coordinator_from_scheduler(
             scheduler=scheduler,
             server_args=scheduler.server_args,
         )
