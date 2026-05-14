@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
 
 # Compressed-tensors per-expert FP8 MoE checkpoint that exercises the
 # loader path (gated repo + ~27 GB download + 4 GPUs at TP=4).
-register_cuda_ci(est_time=120, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=120, stage="stage-c", runner_config="4-gpu-h100")
 
 
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")

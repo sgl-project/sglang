@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1800, suite="stage-c-test-4-gpu-gb200")
+register_cuda_ci(est_time=1800, stage="stage-c", runner_config="4-gpu-gb200")
 
 
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
