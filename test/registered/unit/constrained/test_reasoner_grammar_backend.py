@@ -1,7 +1,7 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -167,14 +167,21 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         self.assertEqual(obj.think_excluded_token_ids, [3, 4])
 
     def test_init_strict_reasoning_grammar_supports_llguidance_masks(self):
-        from sglang.srt.constrained.llguidance_backend import GuidanceBackend
+        from sglang.srt.constrained import llguidance_backend
 
         os.environ["SGLANG_MAX_THINK_TOKENS"] = "0"
-        backend = GuidanceBackend.__new__(GuidanceBackend)
+
+        tokenizer = self._make_tokenizer()
+        with patch.object(
+            llguidance_backend,
+            "from_tokenizer",
+            return_value=SimpleNamespace(vocab_size=65),
+        ):
+            backend = llguidance_backend.GuidanceBackend(tokenizer=tokenizer)
         reasoner = ReasonerGrammarBackend(
             backend,
             self._make_parser(),
-            self._make_tokenizer(),
+            tokenizer,
             enable_strict_thinking=True,
         )
 
@@ -186,14 +193,20 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         self.assertEqual(_allowed_token_ids(mask, [0, 1, 2, 3, 4, 7]), [2])
 
     def test_init_strict_reasoning_grammar_supports_outlines_masks(self):
-        from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
+        from sglang.srt.constrained import outlines_backend
 
         os.environ["SGLANG_MAX_THINK_TOKENS"] = "0"
-        backend = OutlinesGrammarBackend.__new__(OutlinesGrammarBackend)
+        tokenizer = self._make_tokenizer()
+        with patch.object(
+            outlines_backend, "TransformerTokenizer", return_value=SimpleNamespace()
+        ):
+            backend = outlines_backend.OutlinesGrammarBackend(
+                tokenizer=tokenizer, whitespace_pattern=None
+            )
         reasoner = ReasonerGrammarBackend(
             backend,
             self._make_parser(),
-            self._make_tokenizer(),
+            tokenizer,
             enable_strict_thinking=True,
         )
 
