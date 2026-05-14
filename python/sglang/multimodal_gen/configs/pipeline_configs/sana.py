@@ -30,7 +30,6 @@ from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     SpatialImagePipelineConfig,
-    preprocess_text,
 )
 
 
@@ -65,8 +64,17 @@ class SanaPipelineConfig(SpatialImagePipelineConfig):
 
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (preprocess_text,),
+    text_encoder_extra_args: list[dict] = field(
+        default_factory=lambda: [
+            {
+                "padding": True,
+                "return_attention_mask": True,
+            }
+        ]
+    )
+
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None,),
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(

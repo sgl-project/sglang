@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -37,20 +38,23 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     get_kv_class,
     is_mla_backend,
-    kv_to_page_indices,
-    kv_to_page_num,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
+    setup_state_kv_args,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
     Req,
     ScheduleBatch,
 )
-from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.common import (
+    kv_to_page_indices,
+    kv_to_page_num,
+    maybe_cache_unfinished_req,
+    release_kv_cache,
+)
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -121,6 +125,11 @@ class PrefillBootstrapQueue:
         self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
         self.transfer_backend = transfer_backend
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
+            raise RuntimeError(
+                "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
+                "(e.g. GQA, MHA). MLA models should not set this flag."
+            )
         self.kv_manager = self._init_kv_manager()
 
         if self.scheduler.tp_worker.is_hybrid_swa:
@@ -167,32 +176,14 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
-        if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
-            state_data_ptrs, state_data_lens, state_item_lens = (
-                self.token_to_kv_pool.get_state_buf_infos()
-            )
-            kv_args.state_data_ptrs = state_data_ptrs
-            kv_args.state_data_lens = state_data_lens
-            kv_args.state_item_lens = state_item_lens
-
-            if isinstance(self.token_to_kv_pool, SWAKVPool):
-                kv_args.state_type = "swa"
-            elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-                kv_args.state_type = "mamba"
-                # Get state dimension info for cross-TP slice transfer
-                if hasattr(self.token_to_kv_pool, "get_state_dim_per_tensor"):
-                    kv_args.state_dim_per_tensor = (
-                        self.token_to_kv_pool.get_state_dim_per_tensor()
-                    )
-            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
-                kv_args.state_type = "nsa"
-            else:
-                kv_args.state_type = "none"
-        else:
-            kv_args.state_data_ptrs = []
-            kv_args.state_data_lens = []
-            kv_args.state_item_lens = []
-            kv_args.state_type = "none"
+        req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
+        setup_state_kv_args(
+            kv_args,
+            self.token_to_kv_pool,
+            self.draft_token_to_kv_pool,
+            self.scheduler.model_config.num_hidden_layers,
+            req_to_token_pool=req_to_token_pool,
+        )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
@@ -201,6 +192,21 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
+        if (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            and hasattr(kv_manager, "set_kv_buffer_tensors")
+            and not self.is_mla_backend
+        ):
+            kv_pool = self.token_to_kv_pool
+            if hasattr(kv_pool, "full_kv_pool"):
+                kv_pool = kv_pool.full_kv_pool
+            if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+                kv_manager.set_kv_buffer_tensors(
+                    kv_pool.k_buffer,
+                    kv_pool.v_buffer,
+                    kv_pool.page_size,
+                )
         return kv_manager
 
     def add(self, req: Req, num_kv_heads: int) -> None:
@@ -303,7 +309,7 @@ class PrefillBootstrapQueue:
                     self.scheduler.tree_cache.release_aborted_request(req.rid)
                 continue
 
-            # KV.WaitingForInput - init here
+            # KV.WaitingForInput - decode is ready to receive. initialize the kv sender
             req.time_stats.set_bootstrap_done_time()
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
@@ -314,7 +320,15 @@ class PrefillBootstrapQueue:
             )
             assert req.metadata_buffer_index is not None
 
-            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            # Cal number of pages to send
+            # if decode has a cached prefix, we need to send the delta indices
+            # otherwise, send the entire request
+            decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
+            req.start_send_idx = decode_prefix_len
+            num_kv_indices_to_send = num_kv_indices - decode_prefix_len
+            num_pages = kv_to_page_num(
+                num_kv_indices_to_send, self.token_to_kv_pool.page_size
+            )
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
@@ -336,6 +350,17 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)
+        if prefetch is None:
+            return
+        for req in batch.reqs:
+            room = getattr(req, "bootstrap_room", None)
+            if room is not None and room in kv_mgr.transfer_infos:
+                prefetch(room)
+
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
@@ -356,6 +381,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
             # Receive requests
@@ -364,6 +390,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            if self._engine_paused:
+                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -371,10 +399,12 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                if self.enable_staging:
+                    self.maybe_prefetch_staging_for_batch(batch)
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
-                self.self_check_during_idle()
+                self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
 
@@ -384,6 +414,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
             # Receive requests
@@ -392,6 +423,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            if self._engine_paused:
+                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -399,6 +432,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                if self.enable_staging:
+                    self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
@@ -410,7 +445,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
+                self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
 
@@ -446,6 +481,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        if result.routed_experts_output is not None:
+            result.routed_experts_output.finalize()
+            result.routed_experts_output = None
+        if result.indexer_topk_output is not None:
+            result.indexer_topk_output.finalize()
+            result.indexer_topk_output = None
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -468,7 +509,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
-                self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
@@ -537,6 +578,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
+            batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
@@ -577,9 +619,9 @@ class SchedulerDisaggregationPrefillMixin:
                     KVPoll.Success,
                     KVPoll.Failed,
                 ):
-                    logger.warning(
+                    logger.warning_once(
                         f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
-                        f"from consensus; treating as undone"
+                        f"from consensus; treating as undone",
                     )
                     undone_reqs.append(req)
                     continue
@@ -610,28 +652,25 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
-                logger.warning(
+                logger.warning_once(
                     f"Unexpected polling state {poll} for rid {req.rid} in inflight queue; "
-                    f"treating as undone"
+                    f"treating as undone",
                 )
                 undone_reqs.append(req)
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
 
-        page_size = self.token_to_kv_pool_allocator.page_size
-        kv_item_lens = (
-            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.kv_item_lens
-        )
-        bytes_per_page_all_layers = sum(kv_item_lens)
-
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
                 continue
+            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+                continue
+            kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
+            if kv_mgr and getattr(kv_mgr, "is_dummy_cp_rank", False):
+                continue
             metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
-                num_tokens=len(req.origin_input_ids),
-                page_size=page_size,
-                bytes_per_page_all_layers=bytes_per_page_all_layers,
+                req.disagg_kv_sender.get_transfer_metric()
             )
             if metrics:
                 # Update last-value for REST API
@@ -679,7 +718,7 @@ class SchedulerDisaggregationPrefillMixin:
         chunked_req_to_exclude = set()
         if self.chunked_req:
             chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+            maybe_cache_unfinished_req(self.chunked_req, self.tree_cache, chunked=True)
             if self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(
@@ -724,61 +763,73 @@ class SchedulerDisaggregationPrefillMixin:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
+        if end_idx < start_idx:
+            logger.debug(
+                "send_kv_chunk skip: rid=%s start_send_idx=%s end_idx=%s",
+                req.rid,
+                start_idx,
+                end_idx,
+            )
+            return
+
         kv_indices = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
             .cpu()
             .numpy()
         )
-        req.start_send_idx = end_idx
-        state_indices = None
+        state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
-            # Prepare extra pool indices for hybrid models
-            if isinstance(
-                self.token_to_kv_pool_allocator.get_kvcache(), HybridLinearKVPool
-            ):
-                # Mamba hybrid model: send single mamba state index
-                state_indices = [
+            seq_len = len(req.fill_ids)
+
+            def _mamba_payload():
+                return [
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
                         req.req_pool_idx
                     ]
                     .cpu()
                     .numpy()
                 ]
-            elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
-                # SWA hybrid model: send last window KV indices
-                seq_len = len(req.fill_ids)
+
+            def _swa_payload():
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
-
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
                 ]
-
-                # Translate to SWA pool indices
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                         window_kv_indices_full
                     )
                 )
-                state_indices = window_kv_indices_swa.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
-            elif isinstance(
-                self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
-            ):
-                seq_len = len(req.fill_ids)
+                return kv_to_page_indices(
+                    window_kv_indices_swa.cpu().numpy(), page_size
+                )
+
+            def _nsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
-                state_indices = kv_indices_full.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
+                return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+
+            state_types = (
+                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+            )
+            state_indices = []
+            for st in state_types:
+                if st == StateType.MAMBA:
+                    state_indices.append(_mamba_payload())
+                elif st == StateType.SWA:
+                    state_indices.append(_swa_payload())
+                elif st == StateType.NSA:
+                    state_indices.append(_nsa_payload())
+                else:
+                    state_indices.append(None)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
-        if len(page_indices) == 0:
-            logger.info(
-                f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
-            )
+        if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
+        req.start_send_idx = end_idx

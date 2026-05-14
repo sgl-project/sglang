@@ -122,14 +122,52 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     @lru_cache(maxsize=1)
+    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
+        backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
+        default_backend = "cudnn" if cls.is_blackwell() else "auto"
+        if backend is None:
+            return default_backend
+
+        backend = backend.lower()
+        backend = {
+            "flashinfer_cudnn": "cudnn",
+            "flashinfer_cutlass": "cutlass",
+            "flashinfer_trtllm": "trtllm",
+            "trtllm": "trtllm",
+            "cudnn": "cudnn",
+            "auto": "auto",
+        }.get(backend, backend)
+        if backend not in {"auto", "cudnn", "cutlass", "trtllm"}:
+            logger.warning(
+                "Unsupported SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r. "
+                "Falling back to %r.",
+                backend,
+                default_backend,
+            )
+            return default_backend
+        return backend
+
+    @classmethod
+    @lru_cache(maxsize=1)
     def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
-        if cls.is_blackwell():
+        requested_backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
+        prefer_flashinfer = requested_backend is not None
+
+        # TODO: Remove this explicit FlashInfer preference once the sm100 CUTLASS
+        # LargeM dispatch grows a validated fallback for Blackwell NVFP4 shapes
+        # such as Wan2.2's large-M attention projections.
+        if prefer_flashinfer:
             try:
                 from flashinfer import mm_fp4 as flashinfer_mm_fp4
 
-                return flashinfer_mm_fp4, "cudnn"
+                return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
             except ImportError:
-                pass
+                logger.warning(
+                    "Requested SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r "
+                    "but flashinfer.mm_fp4 is unavailable. Falling back to "
+                    "cutlass.",
+                    requested_backend,
+                )
 
         try:
             from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
@@ -141,56 +179,9 @@ class CudaPlatformBase(Platform):
         try:
             from flashinfer import mm_fp4 as flashinfer_mm_fp4
 
-            return flashinfer_mm_fp4, "auto"
+            return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
         except ImportError:
             return None, None
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def has_modelopt_fp4_best_performance_kit(cls) -> bool:
-        try:
-            import comfy_kitchen.backends.cuda  # noqa: F401
-
-            return True
-        except Exception:
-            return False
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def can_use_modelopt_fp4_best_performance_kit(cls) -> bool:
-        if not cls.is_blackwell() or not cls.has_modelopt_fp4_best_performance_kit():
-            return False
-
-        try:
-            import comfy_kitchen.backends.cuda as ck_cuda
-
-            device = cls.get_local_torch_device()
-            x = torch.zeros((16, 16), dtype=torch.bfloat16, device=device)
-            scale = torch.ones((), dtype=torch.float32, device=device)
-            ck_cuda.quantize_nvfp4(x, scale, pad_16x=True)
-            return True
-        except Exception as e:
-            logger.warning(
-                "best performance kit (comfy-kitchen) is installed but unusable on "
-                "this system (%s). Blackwell NVFP4 will fall back to the generic "
-                "ModelOpt FP4 path.",
-                e,
-            )
-            return False
-
-    @classmethod
-    def should_use_modelopt_fp4_best_performance_kit(cls) -> bool:
-        return cls.can_use_modelopt_fp4_best_performance_kit()
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def warn_if_modelopt_fp4_best_performance_kit_missing(cls) -> None:
-        if cls.is_blackwell() and not cls.has_modelopt_fp4_best_performance_kit():
-            logger.warning(
-                "best performance kit (comfy-kitchen) is not installed. "
-                "Blackwell NVFP4 will fall back to the generic ModelOpt FP4 path. "
-                "Install it with `pip install comfy-kitchen`."
-            )
 
     @classmethod
     def is_full_nvlink(cls, device_ids: list[int]) -> bool:
@@ -523,7 +514,10 @@ class NvmlCudaPlatform(CudaPlatformBase):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         physical_device_id = device_id_to_physical_device_id(device_id)
         handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
-        return int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
+        try:
+            return int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
+        except pynvml.NVMLError_NotSupported:
+            return int(torch.cuda.get_device_properties(device_id).total_memory)
 
     @classmethod
     @with_nvml_context

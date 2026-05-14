@@ -255,6 +255,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        self.verify_intermediate_state_indices = torch.arange(
+            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        if self.forward_metadata.has_mamba_track_mask:
+            self.forward_metadata.mamba_track_mask_indices = (
+                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+            )
+            self.forward_metadata.conv_states_mask_indices = (
+                forward_batch.mamba_track_indices[
+                    self.forward_metadata.mamba_track_mask_indices
+                ]
+            )
 
     def forward_decode(
         self,
@@ -361,14 +376,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            has_initial_states = torch.ones(
-                seq_len // forward_batch.spec_info.draft_token_num,
-                dtype=torch.bool,
-                device=forward_batch.input_ids.device,
-            )
-            intermediate_state_indices = torch.arange(
-                cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
-            )
+            intermediate_state_indices = self.verify_intermediate_state_indices
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
@@ -394,16 +402,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
-            if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
-                conv_dst = forward_batch.mamba_track_indices
+            if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
-                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
+                conv_states[forward_metadata.conv_states_mask_indices] = (
+                    mixed_qkv_to_track
+                )
 
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv,

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -52,8 +54,11 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_npu, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
 from sglang.utils import get_exception_traceback
+
+_is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
@@ -73,6 +78,7 @@ class LlamaMLP(nn.Module):
         reduce_results: bool = True,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        use_dp_attention_reduce: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -93,6 +99,7 @@ class LlamaMLP(nn.Module):
             reduce_results=reduce_results,
             tp_rank=tp_rank,
             tp_size=tp_size,
+            use_dp_attention_reduce=use_dp_attention_reduce,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -252,8 +259,13 @@ class LlamaDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if rope_parameters is not None:
+            rope_theta = rope_parameters.get("rope_theta", 10000)
+            rope_scaling = rope_parameters
+        else:
+            rope_theta = getattr(config, "rope_theta", 10000)
+            rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
@@ -754,8 +766,12 @@ class LlamaForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if _is_xpu:
+            torch.xpu.empty_cache()
+            torch.xpu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def get_embed(self):
         return self.model.embed_tokens.weight
@@ -769,8 +785,12 @@ class LlamaForCausalLM(nn.Module):
             return
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if _is_xpu:
+            torch.xpu.empty_cache()
+            torch.xpu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
@@ -788,6 +808,18 @@ class LlamaForCausalLM(nn.Module):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

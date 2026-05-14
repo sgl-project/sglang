@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVArgs,
     KVPoll,
+    KVTransferMetric,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed import get_pp_group
@@ -94,6 +95,8 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.kv_item_lens_sum = sum(args.kv_item_lens)
+        self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
@@ -141,6 +144,7 @@ class CommonKVManager(BaseKVManager):
             )
             self.register_to_bootstrap()
             self.transfer_infos = {}
+            self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
             # If a timeout happens on the prefill side, it means prefill instances
@@ -148,6 +152,7 @@ class CommonKVManager(BaseKVManager):
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.enable_staging: bool = False
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
@@ -179,6 +184,12 @@ class CommonKVManager(BaseKVManager):
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         if bootstrap_room not in self.request_status:
+            # Do not resurrect a cleared entry with Failed: once clear() has
+            # popped the room from request_status, any late update_status(Failed)
+            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
+            # pollute a future request that reuses the same bootstrap_room.
+            if status == KVPoll.Failed:
+                return
             self.request_status[bootstrap_room] = status
         else:
             if status == KVPoll.Failed:
@@ -216,11 +227,19 @@ class CommonKVManager(BaseKVManager):
 
         # Sanity checks
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
-            raise RuntimeError(
-                f"Page size mismatch: prefill server has page_size={info.page_size}, "
-                f"but decode server has page_size={self.kv_args.page_size}. "
-                f"Both servers must use the same --page-size value."
-            )
+            if self.server_args.enable_hisparse:
+                # HiSparse: decode host pool page_size=1, prefill device pool page_size >= 1.
+                # Transfer will use send_kvcache_hisparse with per-token item_lens.
+                logger.info(
+                    f"HiSparse PD transfer mode: prefill page_size={info.page_size}, "
+                    f"decode host page_size={self.kv_args.page_size}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Page size mismatch: prefill server has page_size={info.page_size}, "
+                    f"but decode server has page_size={self.kv_args.page_size}. "
+                    f"Both servers must use the same --page-size value."
+                )
 
         if (
             info.kv_cache_dtype is not None
@@ -326,7 +345,6 @@ class CommonKVManager(BaseKVManager):
             host = self.bootstrap_host
 
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
-        bootstrap_server_url = bootstrap_na.to_host_port_str()
         url = f"{bootstrap_na.to_url()}/route"
         payload = {
             "attn_tp_size": self.attn_tp_size,
@@ -427,6 +445,10 @@ class CommonKVSender(BaseKVSender):
         self.bootstrap_room = bootstrap_room
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
+        self.conclude_state: Optional[KVPoll] = None
+        self._transfer_metric = KVTransferMetric()
+        self._transfer_num_kv_indices = 0
+        self._transfer_num_state_indices = 0
         # inner state
         self.curr_idx = 0
         if self.kv_mgr.is_dummy_cp_rank:
@@ -435,11 +457,28 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if (
-            self.kv_mgr.server_args.dp_size > 1
-            and self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room"
-        ):
-            self._register_prefill_dp_rank()
+        if self.kv_mgr.server_args.dp_size > 1:
+            if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
+                self._register_prefill_dp_rank()
+            elif (
+                self.kv_mgr.attn_dp_rank
+                != self.bootstrap_room % self.kv_mgr.server_args.dp_size
+            ):
+                # follow_bootstrap_room was overridden by external routed_dp_rank
+                if envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get():
+                    self._register_prefill_dp_rank()
+                else:
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        f"follow_bootstrap_room conflict: dispatched to dp_rank "
+                        f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
+                        f"{self.bootstrap_room} implies dp_rank "
+                        f"{self.bootstrap_room % self.kv_mgr.server_args.dp_size}. "
+                        f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
+                        f"to allow mixed routing.",
+                    )
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    return
 
     def _register_prefill_dp_rank(self):
         """Register this request's prefill dp_rank to the bootstrap server."""
@@ -464,10 +503,35 @@ class CommonKVSender(BaseKVSender):
             f"CommonKVSender init with num_kv_indices: {num_kv_indices} and aux_index: {aux_index}"
         )
 
+    def pop_decode_prefix_len(self) -> int:
+        return 0
+
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0
+
+    def get_transfer_metric(self) -> KVTransferMetric:
+        total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
+        total_bytes += (
+            self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
+        )
+        self._transfer_metric.transfer_total_bytes = total_bytes
+        return self._transfer_metric
+
+    def _record_transfer_indices(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List],
+    ):
+        self._transfer_num_kv_indices += len(kv_indices)
+        if state_indices:
+            for component_indices in state_indices:
+                if component_indices is not None:
+                    self._transfer_num_state_indices += len(component_indices)
+
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         pass
 
@@ -476,6 +540,21 @@ class CommonKVSender(BaseKVSender):
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
+
+    def clear(self) -> None:
+        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
+            self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "transfer_infos"):
+            self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+
+    def abort(self):
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            "Aborted by AbortReq.",
+        )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self.conclude_state = KVPoll.Failed
 
 
 class CommonKVReceiver(BaseKVReceiver):
@@ -489,20 +568,23 @@ class CommonKVReceiver(BaseKVReceiver):
         mgr: CommonKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        prefill_dp_rank: Optional[int] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
+        self.conclude_state: Optional[KVPoll] = None
+        self.require_staging: bool = False
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
+    def init(self, prefill_dp_rank: int):
         if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
                 f"Prefill server with bootstrap_addr: {self.bootstrap_addr} is healthy before, but now it is down. Request (bootstrap_room: {self.bootstrap_room}) has been marked as failed.",
             )
+            self.conclude_state = KVPoll.Failed
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-            self.bootstrap_infos = None
             return
 
         # Read pre-computed rank mapping from prefill_info (computed in try_ensure_parallel_info)
@@ -520,11 +602,17 @@ class CommonKVReceiver(BaseKVReceiver):
             self.required_prefill_response_num
         )
 
-        assert (
-            prefill_dp_rank is not None
-        ), "prefill_dp_rank must be resolved before creating receiver"
+        if self.kv_mgr.enable_staging:
+            self.require_staging = (
+                self.prefill_info.attn_tp_size != 0
+                and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
+            )
+
         self.prefill_dp_rank = prefill_dp_rank
         self._setup_bootstrap_infos()
+        if self.conclude_state == KVPoll.Failed:
+            return
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def _setup_bootstrap_infos(self):
         all_bootstrap_infos = []
@@ -562,9 +650,11 @@ class CommonKVReceiver(BaseKVReceiver):
                                 self.bootstrap_room,
                                 f"Could not fetch bootstrap info for: prefill_dp_rank: {self.prefill_dp_rank} prefill_cp_rank: {target_cp_rank} target_tp_rank: {target_tp_rank} and target_pp_rank {target_pp_rank}",
                             )
+                            self.conclude_state = KVPoll.Failed
                             self.kv_mgr.update_status(
                                 self.bootstrap_room, KVPoll.Failed
                             )
+                            self.bootstrap_infos = None
                             return
 
                 self.bootstrap_infos = bootstrap_infos
@@ -645,8 +735,29 @@ class CommonKVReceiver(BaseKVReceiver):
     def _register_kv_args(self):
         pass
 
+    def send_metadata(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+        state_indices: Optional[List[int]] = None,
+    ):
+        raise NotImplementedError
+
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
+
+    def clear(self) -> None:
+        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
+        self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+
+    def abort(self):
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            "Aborted by AbortReq.",
+        )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self.conclude_state = KVPoll.Failed
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):

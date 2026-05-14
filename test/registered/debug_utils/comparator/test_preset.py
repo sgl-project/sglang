@@ -42,3 +42,9 @@ class TestExpandPreset:
         """Unknown preset name raises ValueError."""
         with pytest.raises(ValueError, match="Unknown value for --preset"):
             expand_preset(["--preset", "nonexistent"], presets=PRESETS)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

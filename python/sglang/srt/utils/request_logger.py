@@ -15,11 +15,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 if TYPE_CHECKING:
@@ -162,7 +160,6 @@ class RequestLogger:
         self,
         obj: Union["GenerateReqInput", "EmbeddingReqInput"],
         out: Any,
-        is_multimodal_gen: bool = False,
         request: Optional["fastapi.Request"] = None,
     ) -> None:
         if not self.log_requests:
@@ -181,20 +178,15 @@ class RequestLogger:
             }
             if headers:
                 log_data["headers"] = headers
-            if not is_multimodal_gen:
-                log_data["out"] = _transform_data_for_logging(
-                    out, max_length, out_skip_names
-                )
+            log_data["out"] = _transform_data_for_logging(
+                out, max_length, out_skip_names
+            )
             log_json(self.targets, "request.finished", log_data)
         else:
             obj_str = _dataclass_to_string_truncated(
                 obj, max_length, skip_names=skip_names
             )
-            out_str = (
-                ""
-                if is_multimodal_gen
-                else f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
-            )
+            out_str = f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
             headers_str = f", headers={headers}" if headers else ""
             self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
 
@@ -213,6 +205,7 @@ class RequestLogger:
                     "input_embeds",
                     "image_data",
                     "audio_data",
+                    "video_data",
                     "lora_path",
                     "sampling_params",
                 }
@@ -225,6 +218,7 @@ class RequestLogger:
                     "input_embeds",
                     "image_data",
                     "audio_data",
+                    "video_data",
                     "lora_path",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}
@@ -241,12 +235,6 @@ class RequestLogger:
     def _log(self, msg: str) -> None:
         for target in self.targets:
             target.info(msg)
-
-
-# TODO remove this?
-@lru_cache(maxsize=2)
-def disable_request_logging() -> bool:
-    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough

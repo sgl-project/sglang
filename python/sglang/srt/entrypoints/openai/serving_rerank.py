@@ -1,3 +1,4 @@
+import heapq
 import logging
 from typing import Any, Dict, List, Optional, Union
 
@@ -119,13 +120,14 @@ def _qwen3_rerank_score(p_yes: float, p_no: float) -> float:
 def _get_jinja_env():
     try:
         import jinja2  # Lazy import: server env should provide this dependency.
+        from jinja2.sandbox import ImmutableSandboxedEnvironment
     except ModuleNotFoundError as e:
         raise ValueError(
             "Rendering Qwen3 reranker prompts requires `jinja2`. "
             "Please install it in your runtime environment (e.g., `pip install jinja2`)."
         ) from e
-
-    return jinja2.Environment(
+    # Using a sandboxed environment to stop malicious execution during model loading.
+    return ImmutableSandboxedEnvironment(
         loader=jinja2.BaseLoader(),
         autoescape=False,
         undefined=jinja2.Undefined,
@@ -592,11 +594,11 @@ class OpenAIServingRerank(OpenAIServingBase):
                     )
                 )
 
-        # Sort by score in descending order (highest relevance first)
+        # When top_n is set, nlargest avoids fully sorting the candidate list
+        # (O(N log top_n) vs O(N log N)) — meaningful for large rerank batches.
+        # Validator (V1RerankReqInput.validate_top_n) guarantees top_n >= 1.
+        if request.top_n is not None:
+            return heapq.nlargest(request.top_n, responses, key=lambda x: x.score)
+
         responses.sort(key=lambda x: x.score, reverse=True)
-
-        # Apply top_n limit if specified
-        if request.top_n is not None and request.top_n > 0:
-            responses = responses[: request.top_n]
-
         return responses

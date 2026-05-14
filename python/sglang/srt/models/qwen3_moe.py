@@ -50,7 +50,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -92,7 +92,10 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import fused_qk_norm_rope
+    from sglang.jit_kernel.fused_qknorm_rope import (
+        can_use_fused_qk_norm_rope,
+        fused_qk_norm_rope,
+    )
 
 TConfig = TypeVar("TConfig", bound=PretrainedConfig)
 
@@ -245,9 +248,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
+        from sglang.srt.layers.quantization.gguf import GGUFConfig
+
+        norm_topk_prob = getattr(config, "norm_topk_prob", True)
+        if isinstance(quant_config, GGUFConfig):
+            norm_topk_prob = False
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
-            renormalize=config.norm_topk_prob,
+            renormalize=norm_topk_prob,
             use_grouped_topk=False,
             layer_id=layer_id,
         )
@@ -322,14 +331,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.ep_size > 1 and not should_allreduce_fusion:
+        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=False,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
+        ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = moe_tensor_model_parallel_all_reduce(
                 final_hidden_states
@@ -507,12 +519,20 @@ class Qwen3MoeAttention(nn.Module):
         self.compatible_with_fused_kv_buffer = (
             False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
         )
-        self.compatible_with_fused_qk_norm_rope = (
-            not isinstance(self.rotary_emb, MRotaryEmbedding)
+        self.compatible_with_fused_qk_norm_rope = not isinstance(
+            self.rotary_emb, MRotaryEmbedding
         ) and self.head_dim in (64, 128, 256)
+        _yarn_factor, _, _, _ = compute_yarn_parameters(config)
         self.use_fused_qk_norm_rope = (
             get_global_server_args().enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
+            and _is_cuda
+            and can_use_fused_qk_norm_rope(
+                self.head_dim,
+                self.rotary_emb.is_neox_style,
+                torch.bfloat16,
+                _yarn_factor != 1.0,
+            )
         )
         self._used_fused_qk_norm_rope_last_call = False
 
@@ -913,6 +933,11 @@ class Qwen3MoeModel(Qwen2MoeModel):
             alt_stream=alt_stream,
         )
 
+    def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
 
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
@@ -952,9 +977,10 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.attn_cp_rank = get_attn_context_model_parallel_rank()
         self.moe_dp_size = get_moe_data_parallel_world_size()
 
-        assert (
-            self.attn_cp_size == self.moe_dp_size
-        ), "Attention context parallel size must be equal to MoE context parallel size"
+        assert self.attn_cp_size % self.moe_dp_size == 0, (
+            f"attn_cp_size ({self.attn_cp_size}) must be divisible by "
+            f"moe_dp_size ({self.moe_dp_size})"
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -1067,6 +1093,18 @@ class Qwen3MoeForCausalLM(nn.Module):
             )  # Specific layers for EAGLE3 support
         else:
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

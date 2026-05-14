@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVArgs,
     KVPoll,
+    KVTransferMetric,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
@@ -27,6 +28,7 @@ class FakeKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.req_to_decode_prefix_len = {}
 
     def register_to_bootstrap(self):
         pass
@@ -41,6 +43,7 @@ class FakeKVSender(BaseKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
     ):
+        self.kv_mgr = mgr
         self.has_sent = False
 
     def poll(self) -> KVPoll:
@@ -51,6 +54,9 @@ class FakeKVSender(BaseKVSender):
             # Assume transfer completed instantly
             logger.debug("FakeKVSender poll success")
             return KVPoll.Success
+
+    def get_transfer_metric(self) -> KVTransferMetric:
+        return KVTransferMetric()
 
     def init(
         self,
@@ -65,7 +71,7 @@ class FakeKVSender(BaseKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         self.has_sent = True
         logger.debug(
@@ -82,28 +88,35 @@ class FakeKVReceiver(BaseKVReceiver):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        prefill_dp_rank: Optional[int] = None,
     ):
-        self.has_init = False
+        self.bootstrap_done = False
+        self.has_sent_metadata = False
+        self.require_staging: bool = False
 
     def poll(self) -> KVPoll:
-        if self.has_init is False:
-            # Assume handshake completed instantly
+        if not self.bootstrap_done:
+            return KVPoll.Bootstrapping
+        if not self.has_sent_metadata:
             return KVPoll.WaitingForInput
-        else:
-            # Assume transfer completed instantly
-            logger.debug("FakeKVReceiver poll success")
-            return KVPoll.Success
+        logger.debug("FakeKVReceiver poll success")
+        return KVPoll.Success
 
     def init(
         self,
+        prefill_dp_rank: int,
+    ):
+        self.bootstrap_done = True
+
+    def send_metadata(
+        self,
         kv_indices: list[int],
         aux_index: Optional[int] = None,
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
-        self.has_init = True
+        self.has_sent_metadata = True
         logger.debug(
-            f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}, state_indices: {state_indices}"
+            f"FakeKVReceiver send_metadata with kv_indices: {kv_indices}, aux_index: {aux_index}, state_indices: {state_indices}"
         )
 
     def failure_exception(self):

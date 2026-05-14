@@ -2,6 +2,43 @@
 
 Use the CLI for one-off generation with `sglang generate` or to start a persistent HTTP server with `sglang serve`.
 
+### Overlay repos for non-diffusers models
+
+If `--model-path` points to a supported non-diffusers source repo, SGLang can resolve it
+through a self-hosted overlay repo.
+
+SGLang first checks a built-in overlay registry. Concrete built-in mappings can be added over time without changing the CLI surface.
+
+Override example:
+
+```bash
+export SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY='{
+  "Wan-AI/Wan2.2-S2V-14B": {
+    "overlay_repo_id": "your-org/Wan2.2-S2V-14B-overlay",
+    "overlay_revision": "main"
+  }
+}'
+
+sglang generate \
+  --model-path Wan-AI/Wan2.2-S2V-14B \
+  --config configs/wan_s2v.yaml
+```
+
+The overlay repo should be a complete diffusers-style/componentized repo
+
+You can also pass the overlay repo itself as `--model-path` if it contains `_overlay/overlay_manifest.json`.
+
+Notes:
+1. `SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY` is only an optional override for
+development and debugging. It accepts either a JSON object or a path to a JSON
+file, and can extend or replace built-in entries for the current process.
+2. On the first load, SGLang will:
+   - download overlay metadata from the overlay repo
+   - download the required files from the original source repo
+   - materialize a local standard component repo under `~/.cache/sgl_diffusion/materialized_models/`
+3. Later loads reuse the materialized local repo. The materialized repo is what the runtime loads as a normal componentized model directory.
+
+
 ## Quick Start
 
 ### Generate
@@ -36,16 +73,21 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 - `--model-path {MODEL}`: model path or Hugging Face model ID
 - `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter
+- `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
 - `--num-gpus {N}`: number of GPUs to use
+- `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and keeps safe offload defaults, using FSDP only for validated DiT-offload replacement paths; use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
 - `--tp-size {N}`: tensor parallelism size, mainly for encoders
 - `--sp-degree {N}`: sequence parallelism size
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
+- `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism
 - `--attention-backend {BACKEND}`: attention backend for native SGLang pipelines
+- `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
 
 ### Sampling and output
 
 - `--prompt {PROMPT}` and `--negative-prompt {PROMPT}`
+- `--image-path {PATH} [{PATH} ...]`: input image(s) for image-to-video or image-to-image generation
 - `--num-inference-steps {STEPS}` and `--seed {SEED}`
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
@@ -156,6 +198,28 @@ sglang serve \
 ```
 
 The component key must match the key in the model's `model_index.json`, and the path must be either a Hugging Face repo ID or a complete component directory.
+
+## Component Attention Backend Overrides
+
+Use `--component-attention-backends` when one pipeline component needs a different native attention backend from the global `--attention-backend`.
+
+```bash
+sglang generate \
+  --model-path Lightricks/LTX-2.3 \
+  --attention-backend fa \
+  --component-attention-backends text_encoder=torch_sdpa
+```
+
+The component key must match a pipeline module key such as `text_encoder`, `text_encoder_2`, `transformer`, `transformer_2`, or `connectors`. Component overrides take precedence over the global `--attention-backend` only while that component is being constructed.
+
+You can also pass dotted CLI entries:
+
+```bash
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --component-attention-backends.text_encoder torch_sdpa \
+  --component-attention-backends.transformer fa
+```
 
 ## Diffusers Backend
 

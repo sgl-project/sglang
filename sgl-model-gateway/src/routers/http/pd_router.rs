@@ -1223,7 +1223,7 @@ impl RouterTrait for PDRouter {
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         // Get info from the first decode server to match sglang's server info format
         // Note: We use decode workers for server info to match expected format
-        self.proxy_to_first_prefill_worker("get_server_info", None)
+        self.proxy_to_first_prefill_worker("server_info", None)
             .await
     }
 
@@ -1241,7 +1241,7 @@ impl RouterTrait for PDRouter {
         let headers = header_utils::copy_request_headers(&req);
 
         // Proxy to first prefill worker
-        self.proxy_to_first_prefill_worker("get_model_info", Some(headers))
+        self.proxy_to_first_prefill_worker("model_info", Some(headers))
             .await
     }
 

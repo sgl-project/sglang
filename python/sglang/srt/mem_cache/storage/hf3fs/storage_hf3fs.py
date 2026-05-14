@@ -7,6 +7,7 @@ import signal
 import threading
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from functools import wraps
 from typing import Any, List, Optional, Tuple
 
@@ -16,6 +17,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
@@ -28,7 +33,9 @@ class Hf3fsMetadataInterface(ABC):
     """Interface for HF3FS metadata operations."""
 
     @abstractmethod
-    def initialize(self, rank: int, num_pages: int) -> None:
+    def initialize(
+        self, rank: int, num_pages: int, namespace: PoolName = PoolName.KV
+    ) -> None:
         """Initialize the metadata service with specified number of pages."""
         pass
 
@@ -37,12 +44,14 @@ class Hf3fsMetadataInterface(ABC):
         self,
         rank: int,
         keys: List[Tuple[str, str]],
+        namespace: PoolName = PoolName.KV,
     ) -> List[Tuple[bool, int]]:
         """
         Reserve and allocate page indices for the specified keys.
         Args:
             rank: The rank of the process.
             keys: The keys to reserve and allocate page indices for. Each tuple contains a key and the key of its prefix block.
+            namespace: The namespace (pool type) for the metadata.
         Returns:
             List[Tuple[bool, int]]: A list of tuples, where each tuple contains a boolean indicating whether the key has existed and an integer indicating the allocated page index.
         """
@@ -54,6 +63,7 @@ class Hf3fsMetadataInterface(ABC):
         rank: int,
         written_keys_to_confirm: List[Tuple[str, int]],
         pages_to_release: List[int],
+        namespace: PoolName = PoolName.KV,
     ) -> None:
         """
         Confirm that key-value pairs have been successfully written to storage.
@@ -61,16 +71,20 @@ class Hf3fsMetadataInterface(ABC):
             rank: The rank of the process.
             written_keys_to_confirm: A list of tuples, where each tuple contains a key and its corresponding page index.
             pages_to_release: A list of page indices to be released.
+            namespace: The namespace (pool type) for the metadata.
         """
         pass
 
     @abstractmethod
-    def get_page_indices(self, rank: int, keys: List[str]) -> List[Optional[int]]:
+    def get_page_indices(
+        self, rank: int, keys: List[str], namespace: PoolName = PoolName.KV
+    ) -> List[Optional[int]]:
         """
         Get page indices for the specified keys.
         Args:
             rank: The rank of the process.
             keys: A list of keys.
+            namespace: The namespace (pool type) for the metadata.
         Returns:
             List[Optional[int]]: A list of integers representing the page indices for the specified keys.
                                  If a key is not found, the corresponding index will be None.
@@ -78,17 +92,21 @@ class Hf3fsMetadataInterface(ABC):
         pass
 
     @abstractmethod
-    def delete_keys(self, rank: int, keys: List[str]) -> None:
+    def delete_keys(
+        self, rank: int, keys: List[str], namespace: PoolName = PoolName.KV
+    ) -> None:
         """Delete specified keys and their associated pages."""
         pass
 
     @abstractmethod
-    def exists(self, rank: int, keys: List[str]) -> List[bool]:
+    def exists(
+        self, rank: int, keys: List[str], namespace: PoolName = PoolName.KV
+    ) -> List[bool]:
         """Check if the specified keys exist."""
         pass
 
     @abstractmethod
-    def clear(self, rank: int) -> None:
+    def clear(self, rank: int, namespace: PoolName = PoolName.KV) -> None:
         """Clear all key-value pairs and page allocations for the specified rank."""
         pass
 
@@ -151,6 +169,18 @@ def create_hf3fs_client(
         return Hf3fsUsrBioClient(path, size, bytes_per_page, entries, client_timeout)
 
 
+@dataclass
+class _PoolStorageCtx:
+    """Per-pool storage context for hybrid KV cache pools."""
+
+    pool_name: str
+    bytes_per_page: int
+    num_pages: int
+    namespace: PoolName
+    clients: List[Hf3fsClient]
+    gb_per_page: float
+
+
 class HiCacheHF3FS(HiCacheStorage):
     """HiCache backend that stores KV cache pages in HF3FS files."""
 
@@ -185,6 +215,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.is_mla_model = is_mla_model
         self.is_page_first_layout = is_page_first_layout
         self.enable_storage_metrics = enable_storage_metrics
+        self.use_mock_client = use_mock_client
         self.numel = self.bytes_per_page // self.dtype.itemsize
         self.num_pages = self.file_size // self.bytes_per_page
         self.skip_backup = False
@@ -220,6 +251,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
         self.metadata_client.initialize(self.rank, self.num_pages)
         self.lock = threading.RLock()
+        self._pool_storage_ctx: dict = {}
 
         atexit.register(self.close)
 
@@ -503,6 +535,8 @@ class HiCacheHF3FS(HiCacheStorage):
     def clear(self) -> None:
         try:
             self.metadata_client.clear(self.rank)
+            for ctx in getattr(self, "_pool_storage_ctx", {}).values():
+                self.metadata_client.clear(self.rank, namespace=ctx.namespace)
             logger.info(f"Cleared HiCacheHF3FS for rank {self.rank}")
         except Exception as e:
             logger.error(f"Failed to clear HiCacheHF3FS: {e}")
@@ -511,6 +545,9 @@ class HiCacheHF3FS(HiCacheStorage):
         try:
             for c in self.clients:
                 c.close()
+            for ctx in getattr(self, "_pool_storage_ctx", {}).values():
+                for c in ctx.clients:
+                    c.close()
             self.executor.shutdown(wait=True)
         except Exception as e:
             logger.error(f"close HiCacheHF3FS: {e}")
@@ -536,6 +573,45 @@ class HiCacheHF3FS(HiCacheStorage):
         ]
 
         logger.info(f"{self.is_zero_copy=}, layout={self.mem_pool_host.layout}")
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if host_pool_name == PoolName.KV:
+            return
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+
+        pool_page_size = getattr(host_pool, "page_size", 1) or 1
+        pool_bytes_per_page = host_pool.get_ksize_per_token() * pool_page_size
+        pool_num_pages = self.file_size // pool_bytes_per_page
+        pool_file_path = f"{self.file_path}.{host_pool_name}"
+        namespace = host_pool_name  # e.g. PoolName.MAMBA, PoolName.INDEXER
+
+        pool_clients = [
+            create_hf3fs_client(
+                pool_file_path,
+                self.file_size,
+                pool_bytes_per_page,
+                self.entries,
+                self.client_timeout,
+                self.use_mock_client,
+            )
+            for _ in range(self.numjobs)
+        ]
+
+        self.metadata_client.initialize(self.rank, pool_num_pages, namespace=namespace)
+
+        self._pool_storage_ctx[host_pool_name] = _PoolStorageCtx(
+            pool_name=host_pool_name,
+            bytes_per_page=pool_bytes_per_page,
+            num_pages=pool_num_pages,
+            namespace=namespace,
+            clients=pool_clients,
+            gb_per_page=pool_bytes_per_page / (1 << 30),
+        )
+        logger.info(
+            f"[Rank {self.rank}] Registered hybrid pool '{host_pool_name}': "
+            f"bytes_per_page={pool_bytes_per_page}, num_pages={pool_num_pages}, "
+            f"namespace={namespace}, file={pool_file_path}"
+        )
 
     def _get_mha_zero_copy_keys(self, keys: List[str]) -> List[str]:
         _keys = []
@@ -594,6 +670,212 @@ class HiCacheHF3FS(HiCacheStorage):
                 host_indices[i * self.mem_pool_host.page_size], values[i]
             )
 
+        return results
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        kv_pages = self.batch_exists(keys, extra_info)
+
+        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+
+            pool_name = transfer.name
+            ctx = self._pool_storage_ctx.get(pool_name)
+            if ctx is None:
+                final_pages = 0
+                break
+
+            component_keys = [f"{key}_{pool_name}" for key in keys[:kv_pages]]
+            exists_results = self.metadata_client.exists(
+                self.rank, component_keys, namespace=ctx.namespace
+            )
+
+            boundary = 0
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                try:
+                    boundary = exists_results.index(False)
+                except ValueError:
+                    boundary = kv_pages
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                for prefix_len in range(kv_pages, 0, -1):
+                    if all(
+                        exists_results[i]
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
+                    ):
+                        boundary = prefix_len
+                        break
+
+            if boundary:
+                hit_count[pool_name] = boundary
+            final_pages = min(final_pages, boundary)
+
+        return PoolTransferResult(final_pages, hit_count)
+
+    def _pool_batch_get(self, transfer: PoolTransfer) -> List[bool]:
+        pool_name = transfer.name
+        ctx = self._pool_storage_ctx[pool_name]
+        host_pool = self.registered_pools[pool_name]
+        keys = transfer.keys
+        host_indices = transfer.host_indices
+        page_size = getattr(host_pool, "page_size", 1) or 1
+        page_num = len(keys)
+
+        component_keys = [f"{key}_{pool_name}" for key in keys]
+        page_indices = self.metadata_client.get_page_indices(
+            self.rank, component_keys, namespace=ctx.namespace
+        )
+
+        batch_indices, file_offsets, values = [], [], []
+        for i, page_index in enumerate(page_indices):
+            if page_index is not None:
+                batch_indices.append(i)
+                file_offsets.append(page_index * ctx.bytes_per_page)
+                values.append(host_pool.get_dummy_flat_data_page())
+
+        if not batch_indices:
+            return [False] * page_num
+
+        start_time = time.perf_counter()
+        futures = [
+            self.executor.submit(
+                ctx.clients[self.ac.next()].batch_read,
+                file_offsets[j : j + self.entries],
+                values[j : j + self.entries],
+            )
+            for j in range(0, len(batch_indices), self.entries)
+        ]
+        read_results = [r for f in futures for r in f.result()]
+        end_time = time.perf_counter()
+        ionum = len(batch_indices)
+
+        if self.enable_storage_metrics:
+            self.prefetch_pgs.append(ionum)
+            self.prefetch_bandwidth.append(
+                ionum / (end_time - start_time) * ctx.gb_per_page
+            )
+
+        results = [False] * page_num
+        for idx, (batch_idx, read_result) in enumerate(
+            zip(batch_indices, read_results)
+        ):
+            if read_result == ctx.bytes_per_page:
+                host_idx = host_indices[batch_idx * page_size].item()
+                host_pool.set_from_flat_data_page(host_idx, values[idx])
+                results[batch_idx] = True
+            else:
+                logger.error(
+                    f"[Rank {self.rank}][Pool {pool_name.upper()}] HiCacheHF3FS get {keys[batch_idx]} failed"
+                )
+
+        return results
+
+    def _pool_batch_set(self, transfer: PoolTransfer) -> List[bool]:
+        pool_name = transfer.name
+        ctx = self._pool_storage_ctx[pool_name]
+        host_pool = self.registered_pools[pool_name]
+        keys = transfer.keys
+        host_indices = transfer.host_indices
+        page_size = getattr(host_pool, "page_size", 1) or 1
+        page_num = len(keys)
+
+        component_keys = [f"{key}_{pool_name}" for key in keys]
+        key_with_prefix = [(k, "") for k in component_keys]
+        indices = self.metadata_client.reserve_and_allocate_page_indices(
+            self.rank, key_with_prefix, namespace=ctx.namespace
+        )
+
+        if len(indices) != page_num:
+            logger.error(
+                f"[Rank {self.rank}] Pool {pool_name}: mismatched indices length"
+            )
+            if indices:
+                self.metadata_client.confirm_write(
+                    self.rank, [], [idx[1] for idx in indices], namespace=ctx.namespace
+                )
+            return [False] * page_num
+
+        batch_indices, file_offsets, file_values = [], [], []
+        for i, (is_written, page_index) in enumerate(indices):
+            if is_written or page_index == -1:
+                continue
+            batch_indices.append(i)
+            file_offsets.append(page_index * ctx.bytes_per_page)
+            host_idx = host_indices[i * page_size].item()
+            data = host_pool.get_data_page(host_idx, flat=True)
+            assert data.is_contiguous()
+            file_values.append(data)
+
+        start_time = time.perf_counter()
+        futures = [
+            self.executor.submit(
+                ctx.clients[self.ac.next()].batch_write,
+                file_offsets[j : j + self.entries],
+                file_values[j : j + self.entries],
+            )
+            for j in range(0, len(batch_indices), self.entries)
+        ]
+        write_results = [r == ctx.bytes_per_page for f in futures for r in f.result()]
+        end_time = time.perf_counter()
+        ionum = len(batch_indices)
+
+        if self.enable_storage_metrics:
+            self.backup_pgs.append(ionum)
+            self.backup_bandwidth.append(
+                ionum / (end_time - start_time) * ctx.gb_per_page
+            )
+
+        written_keys_to_confirm = []
+        pages_to_release = []
+        results = [idx[0] for idx in indices]
+        for batch_idx, write_ok in zip(batch_indices, write_results):
+            key = component_keys[batch_idx]
+            page_index = indices[batch_idx][1]
+            if write_ok:
+                written_keys_to_confirm.append((key, page_index))
+            else:
+                logger.error(
+                    f"[Rank {self.rank}][Pool {pool_name.upper()}] HiCacheHF3FS set {keys[batch_idx]} failed"
+                )
+                pages_to_release.append(page_index)
+            results[batch_idx] = write_ok
+
+        if written_keys_to_confirm or pages_to_release:
+            self.metadata_client.confirm_write(
+                self.rank,
+                written_keys_to_confirm,
+                pages_to_release,
+                namespace=ctx.namespace,
+            )
+
+        return results
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        results = {}
+        for transfer in transfers:
+            results[transfer.name] = self._pool_batch_get(transfer)
+        return results
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        results = {}
+        for transfer in transfers:
+            results[transfer.name] = self._pool_batch_set(transfer)
         return results
 
     def batch_get_v1(

@@ -91,13 +91,17 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch = None,
+    ) -> torch.Tensor:
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
 
 
@@ -269,6 +273,7 @@ class Qwen2Model(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
@@ -576,7 +581,9 @@ class Qwen2ForCausalLM(nn.Module):
                 continue
 
             if name == "model.embed_tokens.weight":
-                if self.pp_group.is_last_rank and self.config.tie_word_embeddings:
+                if (
+                    not hasattr(self, "pp_group") or self.pp_group.is_last_rank
+                ) and self.config.tie_word_embeddings:
                     if "lm_head.weight" in params_dict:
                         param = params_dict["lm_head.weight"]
                         weight_loader = getattr(
