@@ -11,11 +11,7 @@ import triton
 import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.jit_kernel.deepseek_v4 import (
-    fused_norm_rope_inplace,
-    fused_q_norm_rope,
-    fused_rope_inplace,
-)
+from sglang.jit_kernel.deepseek_v4 import fused_rope, rmsnorm_self
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
@@ -29,6 +25,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
@@ -65,15 +62,71 @@ from sglang.srt.model_executor.cuda_graph_runner import (
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
-from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.deepseek_v2 import (
+    ParallelLMHead,
+    _is_cuda,
+    _is_hip,
+    _is_npu,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    cpu_has_amx_support,
+    is_cpu,
     log_info_on_rank0,
     make_layers,
+    use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
+
+
+def apply_rotary_emb_cpu(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: Optional[torch.Tensor] = None,
+    inverse: bool = False,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
+        x, freqs_cis, inverse, positions
+    )
+
+
+if _is_cpu and _cpu_amx:
+    apply_rotary_emb_triton = apply_rotary_emb_cpu
+
+
+def rms_normalize_cpu(
+    x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    if weight is None:
+        shape = x.shape
+        x_2d = x.reshape(-1, shape[-1])
+        if not x_2d.is_contiguous():
+            x_2d = x_2d.contiguous()
+        return torch.ops.sgl_kernel.l2norm_cpu(x_2d, eps).view(shape)
+    else:
+        shape = x.shape
+        x_2d = x.reshape(-1, shape[-1])
+        if x_2d.stride(-1) != 1:
+            x_2d = x_2d.contiguous()
+
+        w = weight.reshape(-1)
+        if w.dtype != x.dtype:
+            w = w.to(dtype=x.dtype)
+        if not w.is_contiguous():
+            w = w.contiguous()
+
+        out = torch.ops.sgl_kernel.rmsnorm_cpu(
+            x_2d,
+            w,
+            eps,
+        ).view(shape)
+        return out
+
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +138,6 @@ if TYPE_CHECKING:
         DeepseekV4AttnBackend,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import (
         ForwardBatch,
         PPProxyTensors,
@@ -248,6 +300,31 @@ class MQALayer(nn.Module):
                 )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
+
+        # Reuse the CPU-TP padding-aware helper to copy the checkpoint's
+        # (original_n_heads,) into the (possibly padded) param and zero any
+        # tail entries from CPU-TP head padding. shard_size = full param length
+        # since attn_sink is replicated, not sharded.
+        def _attn_sink_weight_loader(
+            param: torch.Tensor, loaded_weight: torch.Tensor
+        ) -> None:
+            from sglang.srt.model_loader.weight_utils import (
+                narrow_padded_param_and_loaded_weight,
+            )
+
+            # for attn_sink, we can set padded place to any finite value. just leverage
+            # the pad to zero path for simplicity
+            param_view, loaded_view = narrow_padded_param_and_loaded_weight(
+                param.data,
+                loaded_weight,
+                param_data_start=0,
+                weight_start=0,
+                dim=0,
+                shard_size=param.data.shape[0],
+            )
+            param_view.copy_(loaded_view)
+
+        self.attn_sink.weight_loader = _attn_sink_weight_loader
         self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
@@ -298,6 +375,13 @@ class MQALayer(nn.Module):
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
             self.wo_a.weight_scale_inv.format_ue8m0 = True
+        elif _is_cpu and _cpu_amx:
+            from sglang.srt.layers.amx_utils import PackWeightMethodBMM
+
+            self.wo_a.quant_method = PackWeightMethodBMM(
+                n_groups=self.n_local_groups,
+                group_size=self.o_lora_rank,
+            )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -319,9 +403,10 @@ class MQALayer(nn.Module):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
-        # KV cache write is always fused into the K kernel
-        # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
-        # has no effect here -- the fused path is on by default.
+        self.overlap_store_cache = envs.SGLANG_OPT_USE_OVERLAP_STORE_CACHE.get()
+        if _is_cpu and _cpu_amx:
+            self.overlap_store_cache = False
+        self.use_jit_norm = envs.SGLANG_OPT_USE_JIT_NORM.get()
 
     def _compute_q_a(
         self,
@@ -332,69 +417,56 @@ class MQALayer(nn.Module):
             q = qkv_a[..., : self.q_lora_rank]
         else:
             q, _ = self.wq_a(x)
-        return self.q_norm(q)
+        q = self.q_norm(q)
+        q_lora = q
+        return q_lora
 
     def _compute_q_b(
         self,
         q: torch.Tensor,
-        positions: torch.Tensor,
-        q_out: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if q_out is None:
-            q_out = torch.empty_like(q)
-        # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
-        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
-        return q_out
-
-    def _compute_kv_to_cache(
-        self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        qkv_a: Optional[torch.Tensor] = None,
-    ) -> None:
-        """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
-
-        Replaces the bf16-kv-intermediate path. Used everywhere except the NSA
-        prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
-        """
-        if qkv_a is not None:
-            kv = qkv_a[..., self.q_lora_rank :]
+        if self.use_jit_norm:
+            q = rmsnorm_self(q, self.eps)
         else:
-            kv, _ = self.wkv(x)
-        token_to_kv_pool = forward_batch.token_to_kv_pool
-        if TYPE_CHECKING:
-            assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
-            layer_id=self.layer_id,
-            raw_loc=forward_batch.out_cache_loc,
-            kv=kv,
-            kv_weight=self.kv_norm.weight.data,
-            eps=self.eps,
-            freqs_cis=self.freqs_cis,
-            positions=positions,
-        )
+            q = (
+                rms_normalize_triton(q, self.eps)
+                if not (_is_cpu and _cpu_amx)
+                else rms_normalize_cpu(q, self.eps)
+            )
+        if positions is not None:
+            fused_rope(
+                q[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+            )
+        else:
+            apply_rotary_emb_triton(q[..., -self.qk_rope_head_dim :], self.freqs_cis)
+        return q
 
-    def _compute_kv_bf16(
+    def _compute_kv(
         self,
         x: torch.Tensor,
-        positions: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
         qkv_a: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Bf16-kv path used by the NSA prefill-CP case (needs all-gather)."""
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
-        fused_norm_rope_inplace(
-            kv,
-            self.kv_norm.weight.data,
-            self.eps,
-            self.freqs_cis,
-            positions,
-        )
+        kv = self.kv_norm(kv)
+        if positions is not None:
+            fused_rope(
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                None,
+                self.freqs_cis,
+                positions=positions,
+            )
+        else:
+            apply_rotary_emb_triton(kv[..., -self.qk_rope_head_dim :], self.freqs_cis)
         return kv
 
     def _forward_prepare_multi_stream(
@@ -404,7 +476,7 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
 
@@ -439,8 +511,13 @@ class MQALayer(nn.Module):
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
-            # Fused norm + rope + cache write -- no bf16 KV intermediate.
-            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
+            kv = self._compute_kv(x, positions, qkv_a=qkv_a)
+            if self.overlap_store_cache:
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
+                )
 
         del qkv_a
 
@@ -450,12 +527,15 @@ class MQALayer(nn.Module):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_lora, positions, q_out)
+        q = self._compute_q_b(q_lora, positions)
+        if q_out is not None:
+            q_out.copy_(q)
+
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
 
-        return q
+        return q, kv
 
     def _forward_prepare(
         self,
@@ -464,38 +544,51 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x)
-            q_lora = qkv_a[..., : self.q_lora_rank]
+            q = qkv_a[..., : self.q_lora_rank]
+            kv = qkv_a[..., self.q_lora_rank :]
+            del qkv_a
         else:
-            q_lora, _ = self.wq_a(x)
-            qkv_a = None
-        q_lora = self.q_norm(q_lora)
-        q = self._compute_q_b(q_lora, positions, q_out)
+            kv, _ = self.wkv(x)
+            q, _ = self.wq_a(x)
+        q = self.q_norm(q)
+        q_lora = q
+        q, _ = self.wq_b(q)
+        q = q.view(-1, self.n_local_heads, self.head_dim)
+        if self.use_jit_norm:
+            q = rmsnorm_self(q, self.eps)
+        else:
+            q = (
+                rms_normalize_triton(q, self.eps)
+                if not (_is_cpu and _cpu_amx)
+                else rms_normalize_cpu(q, self.eps)
+            )
 
-        use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
-        kv: Optional[torch.Tensor]
-        if use_cp:
-            # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
-            # write to the FlashMLA cache after gather.
-            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+        kv = self.kv_norm(kv)
+
+        fused_rope(
+            q[..., -self.qk_rope_head_dim :],
+            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+            self.freqs_cis,
+            positions=positions,
+        )
+
+        if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
             kv = cp_all_gather_rerange_output(
                 kv.contiguous(),
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+
+        if self.overlap_store_cache:
             attn_backend.store_cache(
                 layer_id=self.layer_id,
                 swa_k=kv,
                 forward_batch=forward_batch,
             )
-        else:
-            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
-            kv = None
-
-        del qkv_a
 
         if self.indexer is not None:
             self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
@@ -507,6 +600,8 @@ class MQALayer(nn.Module):
                 self.compressor,
             )
 
+        if q_out is not None:
+            q_out.copy_(q)
         return q, kv
 
     def forward(
@@ -541,34 +636,26 @@ class MQALayer(nn.Module):
             q_out = q_padded[:, tp_slice, :]
 
         if enable_multi_stream:
-            # Multi-stream path always fuses cache write into the K kernel,
-            # so the bf16 KV intermediate is gone.
-            q = self._forward_prepare_multi_stream(
+            q, kv = self._forward_prepare_multi_stream(
                 x, positions, forward_batch, attn_backend, q_out
             )
-            kv = None
         else:
             q, kv = self._forward_prepare(
                 x, positions, forward_batch, attn_backend, q_out
             )
 
-        # The cache write is always fused / already done by _forward_prepare* --
-        # tell the backend to skip its own store_cache. When `kv is None`
-        # (no NSA-CP), pass `q` as a sentinel for the `k is v` assert; the
-        # attention path doesn't read it once `save_kv_cache=False`.
-        attn_k = kv if kv is not None else q
         o = attn_backend.forward(
             q=q_padded if q_padded is not None else q,
-            k=attn_k,
-            v=attn_k,
+            k=kv,
+            v=kv,
             layer=self.attn_mqa,
             forward_batch=forward_batch,
             compress_ratio=self.compress_ratio,
             attn_sink=self.attn_sink,
-            save_kv_cache=False,
+            save_kv_cache=not self.overlap_store_cache,
         )
         o = o[:, tp_slice, :]
-        fused_rope_inplace(
+        fused_rope(
             o[..., -self.qk_rope_head_dim :],
             None,
             self.freqs_cis,
@@ -594,6 +681,18 @@ class MQALayer(nn.Module):
                 (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                 output,
                 recipe=(1, 1, 128),
+            )
+            o = output
+        elif use_intel_amx_backend(self.wo_a):
+            T, G, D = o.shape
+            R = self.o_lora_rank
+            output = torch.empty([T, G, R], dtype=o.dtype, device=o.device)
+            torch.ops.sgl_kernel.bmm_cpu(
+                output.transpose(0, 1),  # [G, T, R]
+                o.transpose(0, 1),  # [G, T, D]
+                self.wo_a.weight,  # [G, R, D] packed in VNNI
+                True,  # is_vnni
+                None,  # scale
             )
             o = output
         else:
@@ -688,6 +787,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
+        if _is_cpu and _cpu_amx:
+            y, post, comb = torch.ops.sgl_kernel.hc_pre_fused_cpu(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+            return y, post, comb, False
+
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
 
@@ -751,6 +863,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         if x.shape[0] == 0:
             return torch.empty(
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
+            )
+
+        if _is_cpu and _cpu_amx:
+            return torch.ops.sgl_kernel.hc_post_fused_cpu(
+                x,
+                residual,
+                post,
+                comb,
             )
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
@@ -916,6 +1036,10 @@ class DeepseekV4Model(nn.Module):
         hc_base: torch.Tensor,
     ):
         if x.numel() > 0:
+            if _is_cpu and _cpu_amx:
+                return torch.ops.sgl_kernel.hc_head_fused_cpu(
+                    x, hc_fn, hc_scale, hc_base, self.hc_eps, self.norm_eps
+                )
             from sglang.srt.layers.mhc_head import fused_hc_head
 
             return fused_hc_head(

@@ -4,21 +4,13 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_hip
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-# aiter cp_gather kernel with preshuffle=True is only valid when the indexer
-# uses the page_size=64 preshuffle layout (i.e. when the matching MQA gluon path
-# is also enabled).
-_use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
-
-if _use_aiter_preshuffle:
-    from aiter.ops.cache import cp_gather_indexer_k_quant_cache
-
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
@@ -172,55 +164,7 @@ class GetS:
 class GetKAndS:
     @classmethod
     def execute(cls, *args, **kwargs):
-        # The aiter path uses cp_gather_indexer_k_quant_cache(preshuffle=True),
-        # which only matches the layout produced when the rest of the indexer
-        # is on the page_size=64 preshuffle path. Otherwise fall back to the
-        # triton implementation (which works on the page_size=1 legacy layout).
-        if _use_aiter_preshuffle:
-            return cls.aiter(*args, **kwargs)
         return cls.triton(*args, **kwargs)
-
-    @classmethod
-    def aiter(
-        cls,
-        pool: "NSATokenToKVPool",
-        buf: torch.Tensor,
-        page_indices: torch.Tensor,
-        seq_len_tensor: torch.Tensor,
-        seq_len_sum: int,
-        max_seq_len: int,
-    ):
-        from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
-
-        page_size = pool.page_size
-        index_head_dim = pool.index_head_dim
-        quant_block_size = pool.quant_block_size
-        scale_elems = index_head_dim // quant_block_size
-
-        kv_cache = buf.view(-1, page_size, index_head_dim + scale_elems * 4).view(
-            fp8_dtype
-        )
-        dst_k = torch.empty(
-            (seq_len_sum, index_head_dim), dtype=torch.uint8, device=buf.device
-        )
-        dst_scale = torch.empty(
-            (seq_len_sum, scale_elems * 4), dtype=torch.uint8, device=buf.device
-        )
-
-        cu_seq_lens = torch.zeros(
-            seq_len_tensor.shape[0] + 1, dtype=torch.int32, device=buf.device
-        )
-        torch.cumsum(seq_len_tensor.to(torch.int32), dim=0, out=cu_seq_lens[1:])
-
-        cp_gather_indexer_k_quant_cache(
-            kv_cache,
-            dst_k.view(fp8_dtype),
-            dst_scale,
-            page_indices.to(torch.int32),
-            cu_seq_lens,
-            preshuffle=True,
-        )
-        return dst_k, dst_scale
 
     @classmethod
     def triton(
@@ -256,7 +200,15 @@ class GetKAndS:
 class SetK:
     @classmethod
     def execute(cls, *args, buf, **kwargs):
-        return cls.torch_fast(*args, **kwargs, buf=buf)
+        if _is_cpu and _cpu_amx:
+            pool = args[0] if args else kwargs["pool"]
+            loc = args[1] if len(args) > 1 else kwargs["loc"]
+            index_k = args[2] if len(args) > 2 else kwargs["index_k"]
+            torch.ops.sgl_kernel.set_k_cpu(
+                buf, loc, index_k, pool.page_size, pool.index_head_dim
+            )
+        else:
+            return cls.torch_fast(*args, **kwargs, buf=buf)
 
     @classmethod
     def slow(
@@ -306,7 +258,15 @@ class SetK:
 class SetS:
     @classmethod
     def execute(cls, *args, buf, **kwargs):
-        return cls.torch_fast(*args, **kwargs, buf=buf)
+        if _is_cpu and _cpu_amx:
+            pool = args[0] if args else kwargs["pool"]
+            loc = args[1] if len(args) > 1 else kwargs["loc"]
+            index_k_scale = args[2] if len(args) > 2 else kwargs["index_k_scale"]
+            torch.ops.sgl_kernel.set_s_cpu(
+                buf, loc, index_k_scale, pool.page_size, pool.index_head_dim
+            )
+        else:
+            return cls.torch_fast(*args, **kwargs, buf=buf)
 
     @classmethod
     def slow(
@@ -374,8 +334,10 @@ class SetKAndS:
                 buf == buf_cloned
             ), f"{buf=} {buf_cloned=} {kwargs['loc'].to_list()=}"
             return
-
-        cls.triton(*args, **kwargs, buf=buf)
+        if _is_cpu and _cpu_amx:
+            cls.vanilla(*args, **kwargs, buf=buf)
+        else:
+            cls.triton(*args, **kwargs, buf=buf)
 
     @classmethod
     def vanilla(cls, pool, buf, loc, index_k, index_k_scale):
@@ -423,19 +385,15 @@ def _set_k_and_s_triton(
         raise ValueError(
             f"index_k_scale must be 1D or 2D, got shape {index_k_scale.shape}"
         )
-    assert buf_numel_per_page == page_size * (128 + 4)
+    if _is_hip:
+        assert buf_numel_per_page == 1 * (128 + 4)
+    else:
+        assert buf_numel_per_page == 64 * (128 + 4)
     assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__
     assert index_head_dim == 128
     assert scale_dim == 1
     if _is_hip:
-        if _use_aiter_preshuffle:
-            assert (
-                page_size % 16 == 0
-            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
-        else:
-            assert (
-                page_size == 1
-            ), f"HIP legacy NSA path requires page_size == 1, got {page_size}"
+        assert page_size == 1
     else:
         assert page_size == 64
 

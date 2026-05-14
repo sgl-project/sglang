@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.deepseek_v4 import (
-    fused_q_indexer_rope_hadamard_quant,
+    fused_rope,
     topk_transform_512,
     topk_transform_512_v2,
 )
@@ -17,10 +17,14 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
+from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_hip
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_hip
 
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.attention.dsv4.compressor import (
@@ -37,6 +41,15 @@ if is_hip():
 else:
     FP8_DTYPE = torch.float8_e4m3fn
     FP8_MAX = torch.finfo(FP8_DTYPE).max
+
+if _is_cpu and _cpu_amx:
+
+    def act_quant_cpu(
+        x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.sgl_kernel.act_quant_cpu(x, block_size, scale_fmt)
+
+    act_quant = act_quant_cpu
 
 
 def fp8_paged_mqa_logits_torch(
@@ -227,6 +240,53 @@ def fused_scale(
     return out
 
 
+def fp8_paged_mqa_logits_cpu(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.fp8_paged_mqa_logits_cpu(
+        q_fp8,
+        kvcache_fp8,
+        weight,
+        seq_lens,
+        page_table,
+        max_seq_len,
+        clean_logits,
+    )
+
+
+def topk_transform_512_cpu(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    torch.ops.sgl_kernel.topk_transform_512_cpu(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+    )
+
+
+def fused_scale_cpu(
+    weight: torch.Tensor,
+    out_scale: float,
+    q_scale: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.fused_scale_cpu(weight, out_scale, q_scale)
+
+
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
@@ -265,21 +325,21 @@ class C4IndexerBackendMixin:
             layer_id=c4_indexer.layer_id,
         )
 
-        # The weight projection is small and fast; compute it on its own
-        # stream, then have the Q stream wait on it before launching the big
-        # fused Q kernel (which folds rope + hadamard + fp8 quant + the
-        # weight*weight_scale*q_scale step into one pass).
-        with torch.cuda.stream(stream_weights):
-            weights = c4_indexer.compute_weights(x, skip_scale=True)
-            weights_ready = stream_weights.record_event()
-
         with torch.cuda.stream(stream_q):
             if q_lora_ready is not None:
                 stream_q.wait_event(q_lora_ready)
-            stream_q.wait_event(weights_ready)
-            q_fp8, weights = c4_indexer.compute_q(q_lora, positions, weights)
+            q = c4_indexer.compute_q(q_lora, positions=positions)
+            q_fp8, q_scale = act_quant(q)
+            q_scale_ready = stream_q.record_event()
+
+        with torch.cuda.stream(stream_weights):
+            weights = c4_indexer.compute_weights(x, skip_scale=True)
+            stream_weights.wait_event(q_scale_ready)
+            weights = fused_scale(weights, c4_indexer.weight_scale, q_scale)
 
         current_stream.wait_stream(stream_q)
+        current_stream.wait_stream(stream_weights)
+
         return q_fp8, weights, c4_indexer_kv_cache
 
     def _forward_prepare_normal(
@@ -294,8 +354,13 @@ class C4IndexerBackendMixin:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
 
+        q = c4_indexer.compute_q(q_lora, positions=positions)
+        q_fp8, q_scale = act_quant(q)
         weights = c4_indexer.compute_weights(x, skip_scale=True)
-        q_fp8, weights = c4_indexer.compute_q(q_lora, positions, weights)
+        if _is_cpu and _cpu_amx:
+            weights = fused_scale_cpu(weights, c4_indexer.weight_scale, q_scale)
+        else:
+            weights = fused_scale(weights, c4_indexer.weight_scale, q_scale)
         self.forward_indexer_compressor(
             x=x,
             forward_batch=forward_batch,
@@ -379,11 +444,13 @@ class C4IndexerBackendMixin:
             )
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             fn = fp8_paged_mqa_logits_torch
+        elif _is_cpu and _cpu_amx:
+            fn = fp8_paged_mqa_logits_cpu
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
         _c4sl = indexer_metadata.c4_seq_lens
-        if _c4sl.dim() == 1:
+        if _c4sl.dim() == 1 and not (_is_cpu and _cpu_amx):
             _c4sl = _c4sl.unsqueeze(-1)
         logits = fn(
             q_fp8,
@@ -433,6 +500,15 @@ class C4IndexerBackendMixin:
                 core_metadata.c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
+            )
+        elif _is_cpu and _cpu_amx:
+            topk_transform_512_cpu(
+                logits,
+                indexer_metadata.c4_seq_lens,
+                core_metadata.page_table,
+                core_metadata.c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                raw_indices,
             )
         else:
             topk_transform_512(
@@ -519,17 +595,17 @@ class C4Indexer(nn.Module):
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
         self.alt_streams = alt_streams
 
-    def compute_q(
-        self,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        weight: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def compute_q(self, q_lora: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        return fused_q_indexer_rope_hadamard_quant(
-            q, weight, self.weight_scale, self.freqs_cis, positions
+        fused_rope(
+            q[..., -self.rope_head_dim :],
+            None,
+            self.freqs_cis,
+            positions=positions,
         )
+        q = rotate_activation(q)
+        return q
 
     def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
         out, _ = self.weights_proj(x)

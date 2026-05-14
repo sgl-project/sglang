@@ -13,7 +13,10 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
@@ -192,52 +195,6 @@ def _jit_fused_store_module(
         *args,
         cuda_files=["deepseek_v4/store.cuh"],
         cuda_wrappers=[("run", f"{kernel_class}::run")],
-    )
-
-
-@cache_once
-def _jit_main_q_norm_rope_module(
-    dtype: torch.dtype, head_dim: int, rope_dim: int
-) -> Module:
-    """Main MLA path Q kernel: rmsnorm-self + RoPE, warp per (token, head)."""
-    args = make_cpp_args(dtype, head_dim, rope_dim, is_arch_support_pdl())
-    return load_jit(
-        make_name("main_q_norm_rope"),
-        *args,
-        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
-        cuda_wrappers=[
-            ("forward", f"FusedQNormRopeKernel<{args}>::forward"),
-        ],
-    )
-
-
-@cache_once
-def _jit_main_k_norm_rope_flashmla_module(
-    dtype: torch.dtype, head_dim: int, rope_dim: int, page_size: int
-) -> Module:
-    """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache."""
-    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
-    return load_jit(
-        make_name("main_k_norm_rope_flashmla"),
-        *args,
-        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
-        cuda_wrappers=[
-            ("forward", f"FusedKNormRopeFlashMLAKernel<{args}>::forward"),
-        ],
-    )
-
-
-@cache_once
-def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype) -> Module:
-    """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant (no norm)."""
-    args = make_cpp_args(dtype, is_arch_support_pdl())
-    return load_jit(
-        make_name("main_q_indexer_rope_hadamard_quant"),
-        *args,
-        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
-        cuda_wrappers=[
-            ("forward", f"FusedQIndexerRopeHadamardQuantKernel<{args}>::forward"),
-        ],
     )
 
 
@@ -462,19 +419,31 @@ class CompressorPrefillPlan(NamedTuple):
             (2, num_q_tokens, 16),
             dtype=torch.uint8,
             device=seq_lens.device,
-            pin_memory=seq_lens.is_cpu,
+            pin_memory=seq_lens.is_cpu if not _is_cpu else False,
         )
-        module = _jit_common_module()
+
         is_overlap = compress_ratio == 4
-        plan_lens = module.plan_compress_prefill(
-            extend_lens,
-            seq_lens,
-            plan_tensor[0],
-            plan_tensor[1],
-            compress_ratio,
-            is_overlap,
-            use_cuda_graph,
-        )
+        if _is_cpu:
+            plan_lens = _plan_compress_prefill_torch(
+                extend_lens,
+                seq_lens,
+                plan_tensor[0],
+                plan_tensor[1],
+                compress_ratio,
+                is_overlap,
+                use_cuda_graph,
+            )
+        else:
+            module = _jit_common_module()
+            plan_lens = module.plan_compress_prefill(
+                extend_lens,
+                seq_lens,
+                plan_tensor[0],
+                plan_tensor[1],
+                compress_ratio,
+                is_overlap,
+                use_cuda_graph,
+            )
         return CompressorPrefillPlan(
             compress_ratio,
             plan_tensor[0, : plan_lens[0]].to(device, non_blocking=True),
@@ -497,7 +466,7 @@ class CompressorPrefillPlan(NamedTuple):
             (2, num_q_tokens, 16),
             dtype=torch.uint8,
             device="cpu",
-            pin_memory=True,
+            pin_memory=True if not _is_cpu else False,
         )
         module = _jit_compress_128_online_plan_module()
         plan_lens = module.plan_compress_online_prefill(
@@ -617,26 +586,6 @@ def compress_fused_norm_rope_inplace(
     )
 
 
-def fused_norm_rope_inplace(
-    kv: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    freq_cis: torch.Tensor,
-    positions: torch.Tensor,
-) -> None:
-    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
-    module.forward(
-        kv,
-        weight,
-        positions,
-        freq_cis,
-        2,
-        eps,
-        0,
-    )
-
-
 def fused_rope(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -644,65 +593,14 @@ def fused_rope(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
-    module = _jit_fused_rope_module()
-    module.forward(q, k, freqs_real, positions, inverse)
-
-
-# Alias for V2 code paths
-fused_rope_inplace = fused_rope
-
-
-def fused_q_norm_rope(
-    q_input: torch.Tensor,
-    q_output: torch.Tensor,
-    eps: float,
-    freqs_cis: torch.Tensor,
-    positions: torch.Tensor,
-) -> None:
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    head_dim = q_input.shape[-1]
-    rope_dim = freqs_real.shape[-1]
-    module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
-    module.forward(q_input, q_output, freqs_real, positions, eps)
-
-
-def fused_q_indexer_rope_hadamard_quant(
-    q_input: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: float,
-    freqs_cis: torch.Tensor,
-    positions: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
-    weights_out = torch.empty(
-        (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
-    )
-    module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
-    module.forward(
-        q_input, q_fp8, weight, weights_out, float(weight_scale), freqs_real, positions
-    )
-    return q_fp8, weights_out
-
-
-def fused_k_norm_rope_flashmla(
-    kv: torch.Tensor,
-    kv_weight: torch.Tensor,
-    eps: float,
-    freqs_cis: torch.Tensor,
-    positions: torch.Tensor,
-    out_loc: torch.Tensor,
-    kvcache: torch.Tensor,
-    page_size: int,
-) -> None:
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    head_dim = kv.shape[-1]
-    rope_dim = freqs_real.shape[-1]
-    module = _jit_main_k_norm_rope_flashmla_module(
-        kv.dtype, head_dim, rope_dim, page_size
-    )
-    module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
+    if _is_cpu and _cpu_amx:
+        torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
+            q, freqs_cis, inverse, positions, k
+        )
+    else:
+        freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+        module = _jit_fused_rope_module()
+        module.forward(q, k, freqs_real, positions, inverse)
 
 
 @triton.jit
@@ -833,6 +731,56 @@ def triton_create_paged_compress_data(
     return out_0, out_1
 
 
+def torch_create_paged_compress_data(
+    *,
+    compress_ratio: int,
+    is_overlap: bool,
+    swa_page_size: int,
+    ring_size: int,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_swa_index_mapping: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch_size = req_pool_indices.shape[0]
+    device = req_pool_indices.device
+
+    rid = req_pool_indices.to(torch.int32)
+    seq_len = seq_lens[:batch_size].to(torch.int32)
+    extend_len = extend_seq_lens[:batch_size].to(torch.int32)
+    prefix_len = seq_len - extend_len
+
+    cr = compress_ratio
+    write_pos = ((seq_len - 1) // cr) * cr
+    load_pos = ((prefix_len - 1) // cr) * cr
+    write_overlap_pos = write_pos - cr
+    load_overlap_pos = load_pos - cr
+
+    def compute_state_loc(pos: torch.Tensor) -> torch.Tensor:
+        pos = pos.clamp(min=0)
+        loc = req_to_token[rid, pos].to(torch.int32)
+        swa_loc = full_to_swa_index_mapping[loc].to(torch.int32)
+        swa_page = swa_loc // swa_page_size
+        state_loc = swa_page * ring_size + (swa_loc % ring_size)
+        state_loc = state_loc // cr
+        return state_loc
+
+    v0 = compute_state_loc(load_pos)  # i == 0
+    v1 = compute_state_loc(write_pos)  # i == 1
+    v2 = compute_state_loc(load_overlap_pos)  # i == 2
+    v3 = compute_state_loc(write_overlap_pos)  # i == 3
+
+    out_0 = v1.clone()
+
+    if is_overlap:
+        out_1 = torch.stack([v2, v0, v3, write_pos.to(torch.int32)], dim=1)
+    else:
+        out_1 = v0.clone()
+
+    return out_0, out_1
+
+
 def fused_store_cache(
     input: torch.Tensor,
     cache: torch.Tensor,
@@ -940,12 +888,9 @@ def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm
     return metadata
 
 
-def rmsnorm_self(
-    q: torch.Tensor, eps: float, out: Optional[torch.Tensor] = None
-) -> torch.Tensor:
+def rmsnorm_self(q: torch.Tensor, eps: float) -> torch.Tensor:
     module = _jit_rmsnorm_head_module(q.shape[-1], q.dtype)
-    if out is None:
-        out = q.new_empty(q.shape)
+    out = q.new_empty(q.shape)
     module.run_self(q, out, eps)
     return out
 
@@ -1014,6 +959,8 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     from sglang.srt.environ import envs
 
     algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
+    if _is_cpu and _cpu_amx:
+        algo = "cpu_amx"
     return _dispatch_bf16_fp32_backend(x, y, algo=algo)
 
 
@@ -1029,5 +976,81 @@ def _dispatch_bf16_fp32_backend(
         z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
         deep_gemm.bf16_gemm_nt(x, y, z)
         return z
+    elif algo == "cpu_amx":
+        return torch.ops.sgl_kernel.weight_packed_linear(
+            x, y, None, True, torch.float32
+        )
     else:
         return torch.nn.functional.linear(x.float(), y.float())
+
+
+def _plan_compress_prefill_torch(
+    extend_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    compress_plan: torch.Tensor,
+    write_plan: torch.Tensor,
+    compress_ratio: int,
+    is_overlap: bool,
+    use_cuda_graph: bool,
+) -> Tuple[int, int]:
+    """Pure-torch fallback for ``plan_compress_prefill``."""
+    import struct
+
+    assert compress_plan.dtype == torch.uint8
+    assert write_plan.dtype == torch.uint8
+    num_tokens = compress_plan.shape[0]
+    assert write_plan.shape[0] == num_tokens
+    assert compress_plan.shape[1] == 16 and write_plan.shape[1] == 16
+
+    extend_lens_cpu = extend_lens.detach().to("cpu", dtype=torch.int64).tolist()
+    seq_lens_cpu = seq_lens.detach().to("cpu", dtype=torch.int64).tolist()
+    batch_size = len(extend_lens_cpu)
+    assert len(seq_lens_cpu) == batch_size
+
+    ratio = compress_ratio * (2 if is_overlap else 1)
+    counter = 0
+    compress_entries: list = []
+    write_entries: list = []
+
+    for i in range(batch_size):
+        seq_len = int(seq_lens_cpu[i])
+        extend_len = int(extend_lens_cpu[i])
+        assert 0 < extend_len <= seq_len
+        prefix_len = seq_len - extend_len
+        pos = (seq_len // compress_ratio) * compress_ratio
+        if is_overlap:
+            start_write_pos = pos - compress_ratio if pos >= compress_ratio else 0
+        else:
+            start_write_pos = pos
+        for j in range(extend_len):
+            position = prefix_len + j
+            window_len = ratio - min(j + 1, ratio)
+            plan = (counter + j, i, position, window_len)
+            if (position + 1) % compress_ratio == 0:
+                compress_entries.append(plan)
+            if position >= start_write_pos:
+                write_entries.append(plan)
+        counter += extend_len
+    assert counter == num_tokens, f"input size {counter} != num_q_tokens {num_tokens}"
+
+    kInvalid = 0xFFFFFFFF
+    invalid_row = struct.pack("<IIII", kInvalid, kInvalid, kInvalid, kInvalid)
+
+    def _fill(buf: torch.Tensor, entries: list) -> int:
+        n_entries = len(entries)
+        n_rows = num_tokens if use_cuda_graph else n_entries
+        if n_rows == 0:
+            return num_tokens if use_cuda_graph else 0
+        payload = bytearray()
+        for e in entries:
+            payload.extend(struct.pack("<IIII", *e))
+        if use_cuda_graph and n_entries < num_tokens:
+            for _ in range(num_tokens - n_entries):
+                payload.extend(invalid_row)
+        cpu_view = torch.frombuffer(payload, dtype=torch.uint8).view(n_rows, 16)
+        buf[:n_rows].copy_(cpu_view)
+        return num_tokens if use_cuda_graph else n_entries
+
+    compress_count = _fill(compress_plan, compress_entries)
+    write_count = _fill(write_plan, write_entries)
+    return compress_count, write_count

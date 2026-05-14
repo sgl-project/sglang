@@ -9,7 +9,6 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -164,17 +163,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     """MoE method without quantization."""
 
     def __init__(
-        self,
-        use_triton_kernels: bool = False,
-        use_flashinfer_trtllm_moe: bool = False,
-        use_deep_gemm: bool = False,
+        self, use_triton_kernels: bool = False, use_flashinfer_trtllm_moe: bool = False
     ):
         super().__init__()
         self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
-        self.use_deep_gemm = use_deep_gemm
         self._cache_permute_indices = dict({})
 
     def create_weights(
@@ -252,6 +247,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            if hasattr(layer, "w13_weight_bias"):
+                layer.w13_weight_bias = Parameter(
+                    layer.w13_weight_bias.float(), requires_grad=False
+                )
+            if hasattr(layer, "w2_weight_bias"):
+                layer.w2_weight_bias = Parameter(
+                    layer.w2_weight_bias.float(), requires_grad=False
+                )
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
@@ -380,8 +383,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 if get_moe_runner_backend().is_flashinfer_trtllm_routed()
                 else MoeRunnerBackend.FLASHINFER_TRTLLM
             )
-        elif self.use_deep_gemm:
-            backend = MoeRunnerBackend.DEEP_GEMM
         elif self.use_triton_kernels:
             backend = MoeRunnerBackend.TRITON_KERNELS
         else:
@@ -423,6 +424,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
 
@@ -439,22 +441,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 w2_bias=getattr(layer, "w2_weight_bias", None),
             )
             return self.runner.run(dispatch_output, quant_info)
-        elif self.runner.runner_backend.is_deep_gemm():
-            w13_weight = layer.w13_weight
-            w2_weight = layer.w2_weight
-            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
-
-            # Only use_fp8=False when SGLANG_DEEPEP_BF16_DISPATCH is true,
-            # otherwise use_fp8=True for FP8 dispatch path
-            use_fp8 = not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
-            quant_info = DeepGemmMoeQuantInfo(
-                w13_weight=w13_weight,
-                w2_weight=w2_weight,
-                use_fp8=use_fp8,
-            )
-            return self.runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_cutlass:
-            topk_output = dispatch_output.topk_output
             output = flashinfer_cutlass_fused_moe(
                 input=x,
                 token_selected_experts=topk_output.topk_ids,
@@ -550,6 +537,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 None,  # w1_zp
                 None,  # w2_zp
                 None,  # block_size
+                getattr(layer, "w13_weight_bias", None),
+                getattr(layer, "w2_weight_bias", None),
+                layer.moe_runner_config.gemm1_alpha,
+                layer.moe_runner_config.gemm1_clamp_limit,
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)

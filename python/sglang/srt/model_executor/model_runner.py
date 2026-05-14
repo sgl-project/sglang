@@ -122,7 +122,6 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
@@ -193,6 +192,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
+    is_cpu,
     is_hip,
     is_host_cpu_arm64,
     is_npu,
@@ -223,6 +223,7 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+_is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -245,7 +246,6 @@ MLA_ATTENTION_BACKENDS = [
     "flashmla",
     "cutlass_mla",
     "trtllm_mla",
-    "tokenspeed_mla",
     "ascend",
     "nsa",
     "intel_xpu",
@@ -258,7 +258,6 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "flashmla",
     "cutlass_mla",
     "trtllm_mla",
-    "tokenspeed_mla",
 ]
 
 TORCH_DTYPE_TO_KV_CACHE_STR = {
@@ -653,7 +652,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
-        self._prepare_moe_topk()
 
         # Load the expert backup client
         self.expert_backup_client = (
@@ -789,22 +787,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
-        elif self.device == "cpu":
+        elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
-            self.init_device_graphs()
-        elif self.device == "npu":
-            self.init_attention_backend()
-            # lazy init for zbal with mix mode(before graph capture when enable_cuda_graph)
-            if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 and not self.is_draft_worker:
-                from sglang.srt.hardware_backend.npu.utils import lazy_init_zbal_gva_mem
-
-                lazy_init_zbal_gva_mem(
-                    self.device,
-                    self.gpu_id,
-                    get_world_group().rank_in_group,
-                    get_world_group().world_size,
-                    get_world_group().cpu_group,
-                )
             self.init_device_graphs()
         elif current_platform.is_out_of_tree():
             self.init_attention_backend()
@@ -1601,49 +1585,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
-
-    def _prepare_moe_topk(self):
-        balancer_cls = None
-        num_prepared = 0
-        num_routed_experts = None
-        for module in self.model.modules():
-            if not isinstance(module, TopK):
-                continue
-            if (
-                not module.enable_deepep_waterfill
-                or module.deepep_waterfill_balancer is not None
-            ):
-                continue
-            if num_routed_experts is None:
-                num_routed_experts = getattr(
-                    self.model_config.hf_config, "n_routed_experts", None
-                )
-                if num_routed_experts is None:
-                    raise ValueError(
-                        "DeepEP waterfill requires model config n_routed_experts."
-                    )
-            if balancer_cls is None:
-                from sglang.srt.layers.moe.deepep_waterfill import (
-                    DeepEPWaterfillBalancer,
-                )
-
-                balancer_cls = DeepEPWaterfillBalancer
-            module.deepep_waterfill_balancer = balancer_cls(
-                num_routed_experts=num_routed_experts,
-                world_size=self.moe_ep_size,
-                rank=self.moe_ep_rank,
-                layer_id=module.layer_id,
-                routed_scaling_factor=(
-                    module.topk_config.routed_scaling_factor
-                    if module.topk_config.routed_scaling_factor is not None
-                    else 1.0
-                ),
-            )
-            num_prepared += 1
-        if num_prepared:
-            log_info_on_rank0(
-                logger, f"Prepared {num_prepared} DeepEP waterfill TopK modules."
-            )
 
     def update_expert_location(
         self,
@@ -3311,6 +3252,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         step_span_ctx = (
             torch.profiler.record_function(_build_step_span_name(forward_batch))
             if torch.autograd._profiler_enabled()
+            and not (_is_cpu and _is_cpu_amx_available)
             else contextlib.nullcontext()
         )
         with (

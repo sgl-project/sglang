@@ -67,7 +67,28 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
-enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3 };
+enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1, clamped_silu_and_mul = 2 };
+
+// Select activation based on which clamp/scale parameters the caller provided:
+//   limit + alpha ⇒ gpt-oss swiglu.
+//   limit only    ⇒ DSV4-2604B clamped silu_and_mul.
+//   neither       ⇒ plain silu_and_mul.
+inline CPUAcTMethod select_act_func(const std::optional<double>& alpha, const std::optional<double>& limit) {
+  if (!limit.has_value()) {
+    return CPUAcTMethod::silu_and_mul;
+  }
+  return alpha.has_value() ? CPUAcTMethod::swiglu : CPUAcTMethod::clamped_silu_and_mul;
+}
+
+constexpr bool operator==(CPUAcTMethod a, int b) {
+  return static_cast<int>(a) == b;
+}
+
+constexpr bool operator==(int a, CPUAcTMethod b) {
+  return a == static_cast<int>(b);
+}
+
+enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3, MXFP4 = 4 };
 
 constexpr bool operator==(CPUQuantMethod a, int64_t b) {
   return static_cast<int64_t>(a) == b;
@@ -124,9 +145,9 @@ void fused_experts_int8_kernel_impl(
     int64_t topk,
     int64_t num_tokens_post_pad);
 
-// moe implementations for fp8 w8a16
-template <typename scalar_t>
-void fused_experts_fp8_kernel_impl(
+// moe implementations for fp8 w8a16 and mxfp4
+template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4>
+void fused_experts_fp_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic0,
     scalar_t* __restrict__ ic1,
@@ -135,10 +156,12 @@ void fused_experts_fp8_kernel_impl(
     scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
     const scalar_t* __restrict__ input,
-    const at::Float8_e4m3fn* __restrict__ packed_w1,
-    const at::Float8_e4m3fn* __restrict__ packed_w2,
-    const float* __restrict__ w1s,
-    const float* __restrict__ w2s,
+    const packed_t* __restrict__ packed_w1,
+    const packed_t* __restrict__ packed_w2,
+    const float* __restrict__ w1_bias,
+    const float* __restrict__ w2_bias,
+    const param_t* __restrict__ w1s,
+    const param_t* __restrict__ w2s,
     int64_t block_size_N,
     int64_t block_size_K,
     const float* __restrict__ topk_weights,
@@ -150,7 +173,11 @@ void fused_experts_fp8_kernel_impl(
     int64_t K,
     int64_t E,
     int64_t topk,
-    int64_t num_tokens_post_pad);
+    int64_t num_tokens_post_pad,
+    float alpha,
+    float limit,
+    CPUAcTMethod act_func,
+    bool with_bias);
 
 // shared expert implementation for int8 w8a8
 template <typename scalar_t>
@@ -202,25 +229,29 @@ void fused_experts_int4_w4a8_kernel_impl(
     int64_t topk,
     int64_t num_tokens_post_pad);
 
-template <typename scalar_t>
-void shared_expert_fp8_kernel_impl(
+// moe implementations for fp8 w8a16 and mxfp4
+template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4>
+void shared_expert_fp_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic0,
     scalar_t* __restrict__ ic1,
     scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
     const scalar_t* __restrict__ input,
-    const at::Float8_e4m3fn* __restrict__ packed_w1,
-    const at::Float8_e4m3fn* __restrict__ packed_w2,
-    const float* __restrict__ w1s,
-    const float* __restrict__ w2s,
+    const packed_t* __restrict__ packed_w1,
+    const packed_t* __restrict__ packed_w2,
+    const param_t* __restrict__ w1s,
+    const param_t* __restrict__ w2s,
     int64_t block_size_N,
     int64_t block_size_K,
     const scalar_t* __restrict__ fused_experts_out,
     float routed_scaling_factor,
     int64_t M,
     int64_t N,
-    int64_t K);
+    int64_t K,
+    float alpha,
+    float limit,
+    CPUAcTMethod act_func);
 
 // tinygemm interface
 template <typename scalar_t>
@@ -261,6 +292,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
     const float* __restrict__ scale,
     int64_t M,
     int64_t N,
@@ -288,6 +320,26 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg);
+
+// mxfp4
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const uint8_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
+    const uint8_t* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K,
+    bool do_unpack = true);
 
 template <typename scalar_t>
 void tinygemm_kernel(
