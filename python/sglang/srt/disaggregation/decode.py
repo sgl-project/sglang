@@ -244,9 +244,19 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
                 (0, total_pool_size - len(self.req_index_to_mamba_index_mapping)),
             )
             if self.enable_mamba_extra_buffer:
-                self.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.nn.functional.pad(
-                    self.req_index_to_mamba_ping_pong_track_buffer_mapping,
-                    (0, 0, 0, total_pool_size - len(self.req_index_to_mamba_ping_pong_track_buffer_mapping)),
+                self.req_index_to_mamba_ping_pong_track_buffer_mapping = (
+                    torch.nn.functional.pad(
+                        self.req_index_to_mamba_ping_pong_track_buffer_mapping,
+                        (
+                            0,
+                            0,
+                            0,
+                            total_pool_size
+                            - len(
+                                self.req_index_to_mamba_ping_pong_track_buffer_mapping
+                            ),
+                        ),
+                    )
                 )
 
     def clear(self):

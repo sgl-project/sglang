@@ -430,6 +430,7 @@ def get_kv_class(
             P2PKVReceiver,
             P2PKVSender,
         )
+
         class_mapping = {
             KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: P2PKVManager,
