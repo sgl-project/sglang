@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/pull/18595/files#diff-f426a6de78c82ffec568eff6811bfbf0043dab5f87f1a8c0cffdbdcb8a81e035
 
 from __future__ import annotations
@@ -5,7 +7,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel import gelu_and_mul, silu_and_mul
 from triton_kernels.matmul_ogs import (
     FlexCtx,
     FnSpecs,
@@ -16,6 +17,13 @@ from triton_kernels.matmul_ogs import (
 from triton_kernels.numerics import InFlexData
 from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
+
+from sglang.srt.utils import is_cuda
+
+if is_cuda():
+    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
+else:
+    from sgl_kernel import gelu_and_mul, silu_and_mul
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig

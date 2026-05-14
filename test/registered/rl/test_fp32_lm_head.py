@@ -15,7 +15,7 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=9, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -86,8 +86,9 @@ class TestLMHeadFP32(unittest.TestCase):
                 state.update(called=True, ooperationp="linear", a=x.dtype, b=w.dtype)
             return original_linear(x, w, bias)
 
-        with patch("torch.matmul", new=probe_matmul), patch(
-            "torch.nn.functional.linear", new=probe_linear
+        with (
+            patch("torch.matmul", new=probe_matmul),
+            patch("torch.nn.functional.linear", new=probe_linear),
         ):
             logits = logprocessor._get_logits(hidden_state, head, meta)
         self.assertEqual(hidden_state.dtype, hidden_state_dtype)

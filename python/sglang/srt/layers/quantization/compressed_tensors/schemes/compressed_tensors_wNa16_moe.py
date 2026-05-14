@@ -354,6 +354,23 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+
+    def get_marlin_quant_info(self, layer):
+        from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+        return MarlinMoeQuantInfo(
+            w13_qweight=layer.w13_weight_packed,
+            w2_qweight=layer.w2_weight_packed,
+            w13_scales=layer.w13_weight_scale,
+            w2_scales=layer.w2_weight_scale,
+            w13_g_idx_sort_indices=getattr(layer, "w13_g_idx_sort_indices", None),
+            w2_g_idx_sort_indices=getattr(layer, "w2_g_idx_sort_indices", None),
+            weight_bits=self.num_bits,
+            w13_g_idx=getattr(layer, "w13_weight_g_idx", None),
+            w2_g_idx=getattr(layer, "w2_weight_g_idx", None),
+            is_k_full=self.is_k_full,
+        )
 
     def apply_weights(
         self,
@@ -448,18 +465,10 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
-    def apply_weights(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+    def get_triton_quant_info(self, layer):
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
-
-        quant_info = TritonMoeQuantInfo(
+        return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight_packed,
             w2_weight=layer.w2_weight_packed,
             use_int4_w4a16=True,
@@ -467,6 +476,17 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
             w2_scale=layer.w2_weight_scale,
             block_shape=[0, self.group_size],
         )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
 
 

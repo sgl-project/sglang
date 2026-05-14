@@ -64,22 +64,3 @@ jobs:
           name: ci-auto-bisect-${{ github.run_number }}
           path: scripts/ci_monitor/bisect_results.json
           retention-days: 14
-
-      - name: Post to Slack
-        if: always()
-        env:
-          SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
-        run: |
-          cd scripts/ci_monitor
-
-          # Report if the bisect step itself failed
-          if [ "${{ steps.bisect.outcome }}" = "failure" ]; then
-            echo "::error::Auto bisect analysis failed - check logs above"
-          fi
-
-          if [ -f bisect_results.json ] && [ -n "$SGLANG_DIFFUSION_SLACK_TOKEN" ]; then
-            pip install slack_sdk
-            python3 post_bisect_to_slack.py --report-file bisect_results.json
-          else
-            echo "Bisect results or Slack token not available, skipping notification"
-          fi

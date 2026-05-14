@@ -1,0 +1,29 @@
+{
+    "16": {
+        "BLOCK_N": 64,
+        "BLOCK_K": 32,
+        "num_warps": 4,
+        "num_stages": 2,
+        "maxnreg": 112
+    },
+    "32": {
+        "BLOCK_N": 64,
+        "BLOCK_K": 32,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "64": {
+        "BLOCK_N": 64,
+        "BLOCK_K": 32,
+        "num_warps": 4,
+        "num_stages": 3,
+        "maxnreg": 160
+    },
+    "128": {
+        "BLOCK_N": 64,
+        "BLOCK_K": 16,
+        "num_warps": 8,
+        "num_stages": 3,
+        "maxnreg": 128
+    }
+}

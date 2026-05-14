@@ -18,6 +18,7 @@ KV caching events
 """
 
 import atexit
+import enum
 import logging
 import queue
 import threading
@@ -56,9 +57,13 @@ class KVCacheEvent(
     """Base class for all KV cache-related events"""
 
 
-# Medium values for hicache storage tiers
-MEDIUM_GPU = "GPU"
-MEDIUM_CPU = "CPU_PINNED"
+class StorageMedium(str, enum.Enum):
+    """Storage tier for KV cache events."""
+
+    GPU = "GPU"  # L1: device HBM
+    CPU = "CPU_PINNED"  # L2: host pinned memory
+    DISK = "DISK"  # L3: SSD / NVMe
+    EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
 
 
 class OffloadedState:

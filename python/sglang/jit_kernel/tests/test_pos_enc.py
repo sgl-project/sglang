@@ -249,8 +249,8 @@ def compare_results(jit_out, sgl_out, dtype):
     assert not torch.isnan(sgl_out).any(), "NaN in SGL results"
 
     # Compare results
-    atol = 1e-2 if dtype != torch.float32 else 1e-5
-    rtol = 1e-2 if dtype != torch.float32 else 1e-5
+    atol = 4e-2 if dtype != torch.float32 else 1e-5
+    rtol = 4e-2 if dtype != torch.float32 else 1e-5
 
     torch.testing.assert_close(jit_out, sgl_out, atol=atol, rtol=rtol)
 

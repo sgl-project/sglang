@@ -57,7 +57,7 @@ Pass as a JSON string via `--hisparse-config`:
 | `device_buffer_size` | int | Number of token slots in the per-request GPU device buffer |
 | `host_to_device_ratio` | int | Ratio of logical pool size to device pool size, determining host memory capacity |
 
-Example: `--hisparse-config='{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 5}'`
+Example: `--hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10}'`
 
 ## Deployment
 
@@ -73,7 +73,6 @@ python3 -m sglang.launch_server \
     --context-length 81920 \
     --chunked-prefill-size 65536 \
     --tp-size 8 --dp-size 8 --enable-dp-attention \
-    --page-size 64 \
     --mem-fraction-static 0.85 \
     --disaggregation-mode prefill \
     --disaggregation-ib-device mlx5_0,mlx5_1,mlx5_2,mlx5_3 \
@@ -89,7 +88,6 @@ python3 -m sglang.launch_server \
     --port 8000 --host 0.0.0.0 \
     --context-length 81920 \
     --tp-size 8 --dp-size 8 --enable-dp-attention \
-    --page-size 64 \
     --mem-fraction-static 0.85 \
     --kv-cache-dtype bfloat16 \
     --nsa-decode-backend flashmla_sparse \
@@ -98,7 +96,26 @@ python3 -m sglang.launch_server \
     --dist-init-addr 127.0.0.1:5757 \
     --nnodes 1 --node-rank 0 \
     --enable-hisparse \
-    --hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 5}'
+    --hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10}'
+```
+
+### Benchmark
+
+```bash
+python3 -m sglang.bench_serving \
+    --backend sglang \
+    --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
+    --dataset-name random \
+    --random-input 40000 \
+    --random-output 20000 \
+    --num-prompts 200 \
+    --max-concurrency 200 \
+    --request-rate 40 \
+    --random-range-ratio 1.0 \
+    --host 127.0.0.1 \
+    --port 20000 \
+    --model /path/to/model \
+    --flush-cache \
 ```
 
 ### Key Notes
@@ -109,3 +126,10 @@ python3 -m sglang.launch_server \
   - `--nsa-decode-backend flashmla_sparse` — currently only `flashmla_sparse` backend is supported.
   - `--enable-hisparse` — enables HiSparse.
   - `--hisparse-config` — HiSparse configuration (top_k, device_buffer_size, host_to_device_ratio).
+    - `host_to_device_ratio` should be configured based on the host machine's available memory. For example:
+      - **~1 TB** host memory → `host_to_device_ratio: 5`
+      - **~2 TB** host memory → `host_to_device_ratio: 10`
+
+## Acknowledgments
+
+We would like to thank the SGLang team and community for the implementation and generous support, especially Zhiqiang Xie, Zhangheng Huang, Tingwei Huang, Shangming Cai, Teng Ma, and many others. We also thank the Alibaba Cloud TairKVCache team and the AntGroup SCT Inference team for their valuable contributions.
