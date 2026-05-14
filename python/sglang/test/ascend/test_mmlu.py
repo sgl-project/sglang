@@ -7,6 +7,8 @@ from sglang.test.run_eval import run_eval
 
 class TestMMLU:
 
+    mmlu_num_examples = 128
+
     def test_mmlu(self):
         accuracy_mmlu_threshold = getattr(self, "accuracy_mmlu", 0.00)
 
@@ -23,7 +25,7 @@ class TestMMLU:
                 base_url=self.base_url,
                 model=self.model,
                 eval_name="mmlu",
-                num_examples=128,
+                num_examples=self.mmlu_num_examples,
                 num_threads=32,
             )
             print("Starting mmlu test...")
