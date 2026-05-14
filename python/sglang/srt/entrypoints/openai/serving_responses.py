@@ -466,10 +466,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
             # Calculate usage from actual output
-            if hasattr(final_res, "meta_info"):
-                num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
-                num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
-                num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
+            if "meta_info" in final_res:
+                meta = final_res["meta_info"]
+                num_prompt_tokens = meta.get("prompt_tokens", 0)
+                num_generated_tokens = meta.get("completion_tokens", 0)
+                num_cached_tokens = meta.get("cached_tokens", 0)
+                num_reasoning_tokens = meta.get("reasoning_tokens", 0)
             elif hasattr(final_res, "prompt_token_ids") and hasattr(
                 final_res, "outputs"
             ):
@@ -602,20 +604,24 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         # Prepend the conversation history
         if prev_response is not None:
-            # Add the previous messages
+            # Add the previous user/assistant messages (skip system instructions
+            # from previous turns — instructions are not inherited per OpenAI spec)
             prev_msg = self.msg_store[prev_response.id]
-            messages.extend(prev_msg)
+            messages.extend(m for m in prev_msg if m.get("role") != "system")
 
-            # Add the previous output
+            # Add the previous assistant output
             for output_item in prev_response.output:
                 # NOTE: We skip the reasoning output of the previous response
                 if isinstance(output_item, ResponseReasoningItem):
                     continue
-                for content in output_item.content:
+                text_parts = [
+                    c.text for c in output_item.content if hasattr(c, "text")
+                ]
+                if text_parts:
                     messages.append(
                         {
-                            "role": "system",
-                            "content": request.instructions,
+                            "role": "assistant",
+                            "content": "".join(text_parts),
                         }
                     )
 
