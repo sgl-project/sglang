@@ -1,77 +1,23 @@
-"""Single source of truth for `runner_config` → CUDA-stage setup details.
-
-Each `register_cuda_ci(stage="stage-X", runner_config="Y", ...)` registers a
-test to one of the keys below. The matching pr-test.yml stage job calls
-`./.github/actions/setup-cuda-test-stage` with `runner_config: Y`; the action
-shells out to this script for install script, artifact download version,
-and install timeout.
+"""CLI wrapper around scripts/ci/runner_configs.yml. Used by
+.github/actions/setup-cuda-test-stage to look up install script / artifact
+version / install timeout for a given runner_config (see register_cuda_ci
+declarations in test/registered/).
 """
 
 import argparse
+import os
 import sys
 
-_CUDA_DEFAULT_INSTALL = "scripts/ci/cuda/ci_install_dependency.sh"
-_CUDA_DEEPEP_INSTALL = "scripts/ci/cuda/ci_install_deepep.sh"
-_CUDA_DSV4_INSTALL = "scripts/ci/cuda/ci_install_dsv4_dep.sh"
+import yaml
 
-# Keep in sync with pr-test.yml stage jobs.
-RUNNER_CONFIGS: dict[str, dict] = {
-    "1-gpu-small": {
-        "install": _CUDA_DEFAULT_INSTALL,
-        "artifact_version": "v4",
-        "install_timeout": "20",
-    },
-    "1-gpu-large": {
-        "install": _CUDA_DEFAULT_INSTALL,
-        "artifact_version": "v4",
-        "install_timeout": "20",
-    },
-    "2-gpu-large": {
-        "install": _CUDA_DEFAULT_INSTALL,
-        "artifact_version": "v4",
-        "install_timeout": "20",
-    },
-    "4-gpu-b200": {
-        "install": _CUDA_DEFAULT_INSTALL,
-        "artifact_version": "v6",
-        "install_timeout": "20",
-    },
-    "4-gpu-h100": {
-        "install": _CUDA_DEFAULT_INSTALL,
-        "artifact_version": "v4",
-        "install_timeout": "20",
-    },
-    "8-gpu-h200": {
-        "install": _CUDA_DEFAULT_INSTALL,
-        "artifact_version": "v4",
-        "install_timeout": "20",
-    },
-    "8-gpu-h20": {
-        "install": _CUDA_DEEPEP_INSTALL,
-        "artifact_version": "v4",
-        "install_timeout": "20",
-    },
-    "deepep-4-gpu-h100": {
-        "install": _CUDA_DEEPEP_INSTALL,
-        "artifact_version": "v4",
-        "install_timeout": "20",
-    },
-    "deepep-8-gpu-h200": {
-        "install": _CUDA_DEEPEP_INSTALL,
-        "artifact_version": "v4",
-        "install_timeout": "20",
-    },
-    "dsv4-4-gpu-b200": {
-        "install": _CUDA_DSV4_INSTALL,
-        "artifact_version": "v6",
-        "install_timeout": "30",
-    },
-    "dsv4-8-gpu-h200": {
-        "install": _CUDA_DSV4_INSTALL,
-        "artifact_version": "v4",
-        "install_timeout": "30",
-    },
-}
+_YAML_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "runner_configs.yml"
+)
+
+
+def load() -> dict:
+    with open(_YAML_PATH) as f:
+        return yaml.safe_load(f)["runner_configs"]
 
 
 def main():
@@ -84,11 +30,12 @@ def main():
     parser.add_argument("--runner-config", required=True)
     args = parser.parse_args()
 
-    config = RUNNER_CONFIGS.get(args.runner_config)
+    configs = load()
+    config = configs.get(args.runner_config)
     if config is None:
         print(
             f"error: unknown runner_config {args.runner_config!r}; "
-            f"add it to {__file__}",
+            f"add it to {_YAML_PATH}",
             file=sys.stderr,
         )
         sys.exit(1)
