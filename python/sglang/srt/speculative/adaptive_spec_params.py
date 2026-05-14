@@ -148,26 +148,10 @@ class AdaptiveSpeculativeParams:
         config: dict | None = None,
     ):
         cfg = config or {}
-        # TODO: Wider range of candidate_steps (once lazy init is supported).
-        candidates = set(cfg.get("candidate_steps", [1, 3, 7]))
+        candidates = sorted(set(cfg.get("candidate_steps", [1, 3, 7])))
 
-        # Ensure the worker's initial speculative_num_steps is itself a candidate.
-        # Otherwise AdaptiveController.register() would store the worker's pre-built
-        # runtime state under a key that _activate() never queries, leaking that
-        # state's draft attn backend and cuda graph buffers for the process lifetime.
-        if initial_steps not in candidates:
-            log_info_on_rank0(
-                logger,
-                f"Adding initial speculative_num_steps={initial_steps} to "
-                f"candidate_steps={sorted(candidates)} so the pre-built "
-                f"runtime state is reused.",
-            )
-            candidates.add(initial_steps)
-
-        self.candidate_steps = sorted(candidates)
-        assert (
-            len(self.candidate_steps) >= 1
-        ), "candidate_steps must have at least 1 value"
+        assert len(candidates) >= 1, "candidate_steps must have at least 1 value"
+        self.candidate_steps = candidates
 
         self.min_steps = self.candidate_steps[0]
         self.max_steps = self.candidate_steps[-1]
@@ -177,7 +161,16 @@ class AdaptiveSpeculativeParams:
         self.down_hysteresis = cfg.get("down_hysteresis", -0.25)
         self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
 
-        self.current_steps = initial_steps
+        if initial_steps in self.candidate_steps:
+            self.current_steps = initial_steps
+        else:
+            self.current_steps = self.candidate_steps[len(self.candidate_steps) // 2]
+            log_info_on_rank0(
+                logger,
+                f"initial_steps={initial_steps} not in "
+                f"candidate_steps={self.candidate_steps}, "
+                f"snapping to middle entry {self.current_steps}",
+            )
 
         # Initialize EMA at current steps - 1 (neutral starting point)
         self.ema_accept_len = float(self.current_steps - 1)
