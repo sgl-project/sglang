@@ -495,6 +495,25 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
+def empty_device_cache(device_module: Optional[Any] = None) -> bool:
+    """Release unused cached blocks from the active device allocator.
+
+    This does not clear SGLang KV/radix/request caches and does not free live
+    tensors. It only forwards to the backend allocator's empty_cache hook when
+    one is available.
+    """
+
+    if device_module is None:
+        device_module = torch.get_device_module()
+
+    empty_cache = getattr(device_module, "empty_cache", None)
+    if empty_cache is None:
+        return False
+
+    empty_cache()
+    return True
+
+
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
@@ -513,7 +532,7 @@ def get_available_gpu_memory(
             )
 
         if empty_cache:
-            torch.cuda.empty_cache()
+            empty_device_cache(torch.cuda)
         props = torch.cuda.get_device_properties(gpu_id)
         if props.is_integrated:
             # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
@@ -535,7 +554,7 @@ def get_available_gpu_memory(
             )
 
         if empty_cache:
-            torch.xpu.empty_cache()
+            empty_device_cache(torch.xpu)
         used_memory = torch.xpu.memory_allocated()
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
@@ -567,8 +586,17 @@ def get_available_gpu_memory(
                 "which may cause useless memory allocation for torch NPU context.",
             )
         if empty_cache:
-            torch.npu.empty_cache()
-        free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+            empty_device_cache(torch.npu)
+        if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
+            import zbal
+
+            if not zbal.is_mix_alloc():
+                free_gpu_memory, total_gpu_memory = zbal.zbal_module.mem_get_info()
+            else:
+                # mix mode fall back into npu mem info since gva may not inited yet
+                free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+        else:
+            free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
     elif device == "musa":
         num_gpus = torch.musa.device_count()
         assert gpu_id < num_gpus
@@ -579,7 +607,7 @@ def get_available_gpu_memory(
                 "which may cause useless memory allocation for torch MUSA context.",
             )
         if empty_cache:
-            torch.musa.empty_cache()
+            empty_device_cache(torch.musa)
         props = torch.musa.get_device_properties(gpu_id)
         if props.is_integrated:
             # On these devices, which use sysmem as device mem, torch.musa.mem_get_info()
@@ -1058,7 +1086,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.8.post1")
+        min_version: Minimum version required (e.g., "0.6.11.post1")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1228,6 +1256,11 @@ def configure_logger(server_args, prefix: str = ""):
     # don't inherit the parent's logger state, so this must run here too.
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    if is_flashinfer_available():
+        from flashinfer.jit.core import logger as flashinfer_logger
+
+        flashinfer_logger.setLevel(logging.ERROR)
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
@@ -1665,7 +1698,10 @@ def get_npu_memory_capacity():
     try:
         import torch_npu  # noqa: F401
 
-        return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+        if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
+            return envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get()  # unit: MB
+        else:
+            return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
     except ImportError as e:
         raise ImportError("torch_npu is required when run on npu device.")
 
@@ -2555,7 +2591,7 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         app,
         host=host,
         port=port,
-        timeout_keep_alive=5,
+        timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
         loop="auto",
         log_config=None,
         log_level="warning",
@@ -3502,6 +3538,10 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "k_proj",
     "v_proj",
     "o_proj",
+    "q_a_proj",
+    "kv_a_proj_with_mqa",
+    "q_b_proj",
+    "kv_b_proj",
     "gate_proj",
     "up_proj",
     "down_proj",

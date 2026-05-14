@@ -395,4 +395,4 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     - [x]  ```W4A4_DYNAMIC``` linear with online quantization of activations
     - [x]  ```W8A8``` linear with offline quantization of activations
     - [x]  ```W8A8_DYNAMIC``` linear with online quantization of activations
-    - [ ]  ```mxfp8``` linear in progress
+    - [x]  ```mxfp8``` linear with online/offline MXFP8 quantization (Ascend A5, CANN ≥ 8.0.RC3; see [Ascend NPU quantization](../platforms/ascend/ascend_npu_quantization.md#diffusion-model-quantization-on-ascend-npu))

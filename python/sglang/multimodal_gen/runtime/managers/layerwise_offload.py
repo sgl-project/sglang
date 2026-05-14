@@ -655,10 +655,8 @@ def iter_materialized_weights(module: torch.nn.Module):
 
 
 def is_layerwise_offloaded_module(module: torch.nn.Module) -> bool:
-    return (
-        isinstance(module, LayerwiseOffloadableModuleMixin)
-        and bool(module.layerwise_offload_managers)
-        and any(manager.enabled for manager in module.layerwise_offload_managers)
+    return isinstance(module, LayerwiseOffloadableModuleMixin) and any(
+        manager.enabled for manager in module.layerwise_offload_managers
     )
 
 

@@ -613,6 +613,7 @@ def load_model_from_full_model_state_dict(
         "bias",
         "norm_q",
         "norm_k",
+        "weight_scale",
     ]
     for new_param_name in unused_keys:
         meta_sharded_param = meta_sd.get(new_param_name)

@@ -66,41 +66,6 @@ jobs:
           cd sgl-kernel
           pytest tests/
 
-  sgl-kernel-mla-test:
-    runs-on: 1-gpu-h100
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Cleanup
-        run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/registered/mla
-          python3 test_mla_deepseek_v3.py
-
   sgl-kernel-benchmark-test:
     runs-on: 1-gpu-h100
     timeout-minutes: 240

@@ -18,7 +18,6 @@ from sglang.test.test_utils import (
 register_cuda_ci(
     est_time=1060,
     suite="stage-c-test-4-gpu-b200",
-    disabled="Disabled due to #24268. Should be fixed soon.",
 )
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3.2-NVFP4"

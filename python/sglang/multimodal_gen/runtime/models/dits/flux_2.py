@@ -704,11 +704,7 @@ class Flux2TransformerBlock(nn.Module):
         joint_attention_kwargs = joint_attention_kwargs or {}
 
         # Modulation parameters shape: [1, 1, self.dim]
-        (shift_msa, scale_msa, gate_msa), (
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
-        ) = temb_mod_params_img
+        (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = temb_mod_params_img
         (c_shift_msa, c_scale_msa, c_gate_msa), (
             c_shift_mlp,
             c_scale_mlp,

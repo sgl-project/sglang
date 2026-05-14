@@ -1,27 +1,26 @@
-# SPDX-License-Identifier: Apache-2.0
-from dataclasses import dataclass, field
+"""
+ModelDeploymentConfig provides model-specific config on how to deploy a model optimally
 
+"""
 
-@dataclass(frozen=True)
-class AutoDitLayerwiseOffloadConfig:
-    enabled_by_default: bool = False
-    high_memory_disable_gb: float | None = None
+from dataclasses import dataclass
+from typing import Literal
+
+OffloadComponentName = Literal["dit", "text_encoder", "image_encoder"]
 
 
 @dataclass(frozen=True)
 class ModelDeploymentConfig:
-    auto_dit_layerwise_offload: AutoDitLayerwiseOffloadConfig = field(
-        default_factory=AutoDitLayerwiseOffloadConfig
+    auto_dit_layerwise_offload: bool = False
+    # if the available memory is bigger than this value, keep dit resident instead of apply layerwise-offload
+    auto_dit_layerwise_offload_high_memory_disable_gb: float | None = None
+    auto_disable_component_offload_min_available_memory_gb: float | None = None
+    # keep this explicit because large encoders can OOM even when DiT fits resident
+    auto_disable_component_offload_components: tuple[OffloadComponentName, ...] = (
+        "dit",
+        "text_encoder",
+        "image_encoder",
     )
-
-
-# wan/mova auto layerwise offload is a low-memory default; H200-class GPUs can
-# keep validated 720p workloads resident and ran faster without layerwise offload
-WAN_MOVA_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
-
-WAN_MOVA_MODEL_DEPLOYMENT_CONFIG = ModelDeploymentConfig(
-    auto_dit_layerwise_offload=AutoDitLayerwiseOffloadConfig(
-        enabled_by_default=True,
-        high_memory_disable_gb=WAN_MOVA_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB,
-    )
-)
+    fsdp_auto_min_available_memory_gb: float | None = None
+    fsdp_auto_requires_cfg: bool = True
+    fsdp_auto_requires_default_parallelism: bool = True

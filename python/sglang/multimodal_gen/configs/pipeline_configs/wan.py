@@ -18,8 +18,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.model_deployment import (
-    WAN_MOVA_MODEL_DEPLOYMENT_CONFIG,
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -89,14 +88,15 @@ class WanT2V480PConfig(PipelineConfig):
     vae_precision: str = "fp32"
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
 
-    # WanConfig-specific added parameters
-
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return WAN_MOVA_MODEL_DEPLOYMENT_CONFIG
-
     def __post_init__(self):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            auto_dit_layerwise_offload_high_memory_disable_gb=130,
+        )
 
 
 @dataclass
@@ -142,6 +142,12 @@ class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
     def __post_init__(self) -> None:
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            auto_dit_layerwise_offload_high_memory_disable_gb=130,
+        )
 
 
 @dataclass
