@@ -263,6 +263,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
+        backend: str = "trtllm-gen",
     ):
         super().__init__(
             model_runner,
@@ -286,6 +287,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
         # Runtime parameters
+        self.backend = backend
         self.scaling = config.scaling
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
@@ -298,7 +300,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if global_zero_init_workspace_buffer is None:
             global_zero_init_workspace_buffer = torch.zeros(
                 self.workspace_size,
-                dtype=torch.uint8,
+                dtype=torch.int8,
                 device=model_runner.device,
             )
         self.workspace_buffer = global_zero_init_workspace_buffer
@@ -799,6 +801,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
+        extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
@@ -811,6 +814,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             max_seq_len=max_seq_len,
             bmm1_scale=bmm1_scale,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            **extra_kwargs,
         )
 
     def _run_prefill_kernel(
@@ -1216,7 +1220,11 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
     """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""
 
     def __init__(
-        self, model_runner: "ModelRunner", topk: int, speculative_num_steps: int
+        self,
+        model_runner: "ModelRunner",
+        topk: int,
+        speculative_num_steps: int,
+        backend: str = "trtllm-gen",
     ):
         super().__init__(model_runner, topk, speculative_num_steps)
 
@@ -1226,4 +1234,5 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 skip_prefill=True,
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
+                backend=backend,
             )
