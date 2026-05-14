@@ -1,8 +1,9 @@
 import argparse
 import glob
+import json
 import os
 import sys
-from typing import List
+from typing import Dict, List, Optional
 
 import tabulate
 
@@ -222,6 +223,31 @@ def pretty_print_tests(
     print(msg, flush=True)
 
 
+def load_live_est(
+    partition_model_file: Optional[str], suite: str, repo_root: str
+) -> Optional[Dict[str, float]]:
+    """Build a `CIRegistry.filename -> live est seconds` map from
+    sglang-ci-stats' partition model.json so `auto_partition` LPT uses the
+    same `est` snapshot the dispatcher (compute_partitions.py) used to
+    size this stage. Returns None when the file is missing / unparsable,
+    or when the requested suite has no live entries -- callers fall back
+    to in-source est_time."""
+    if not partition_model_file or not os.path.exists(partition_model_file):
+        return None
+    try:
+        with open(partition_model_file) as f:
+            partition_model = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    suite_est = partition_model.get("est", {}).get(suite)
+    if not suite_est:
+        return None
+    return {
+        os.path.join(repo_root, relpath): float(elapsed)
+        for relpath, elapsed in suite_est.items()
+    }
+
+
 def run_a_suite(args):
     hw = HW_MAPPING[args.hw]
     suite = args.suite
@@ -261,7 +287,23 @@ def run_a_suite(args):
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
 
     if auto_partition_size:
-        ci_tests = auto_partition(ci_tests, auto_partition_id, auto_partition_size)
+        live_est = load_live_est(args.partition_model_file, suite, repo_root)
+        if live_est is not None:
+            print(
+                f"Loaded {len(live_est)} live est entries from "
+                f"{args.partition_model_file} for suite={suite}",
+                flush=True,
+            )
+        else:
+            print(
+                f"No live est available "
+                f"(partition_model_file={args.partition_model_file!r}); "
+                f"LPT falling back to in-source est_time",
+                flush=True,
+            )
+        ci_tests = auto_partition(
+            ci_tests, auto_partition_id, auto_partition_size, live_est=live_est
+        )
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
@@ -342,6 +384,18 @@ def main():
         type=int,
         default=600,
         help="Additional timeout in seconds when retry is enabled (default: 600)",
+    )
+    parser.add_argument(
+        "--partition-model-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to sglang-ci-stats partition model.json. When provided, "
+            "auto_partition uses live `est` (p90 of recent CI elapsed) for "
+            "LPT bucketing so the partition decision matches what "
+            "compute_partitions.py used to size this stage. Missing / "
+            "malformed -> falls back to in-source est_time."
+        ),
     )
     args = parser.parse_args()
 

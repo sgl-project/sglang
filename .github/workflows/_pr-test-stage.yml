@@ -147,6 +147,18 @@ jobs:
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_server.py ${{ inputs.warmup_server_models }}
 
+      - name: Fetch live partition model
+        if: fromJson(inputs.check_changes).partition_model_sha != ''
+        run: |
+          # Same SHA-pinned URL check-changes used, so this shard's LPT
+          # bucketing uses the exact `est` snapshot dispatch sized the stage
+          # with. Soft fail: missing file -> run_suite.py falls back to
+          # in-source est_time for LPT.
+          rm -f /tmp/partition-model.json
+          URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ fromJson(inputs.check_changes).partition_model_sha }}/model.json"
+          curl --fail --silent --show-error --max-time 15 "$URL" -o /tmp/partition-model.json \
+            || echo "::warning::Failed to fetch partition-model.json from $URL; LPT will use in-source est_time"
+
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
@@ -156,6 +168,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite ${{ inputs.self_name }} \
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} \
+            --partition-model-file /tmp/partition-model.json \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
             $CONTINUE_ON_ERROR_FLAG
 

@@ -34,6 +34,8 @@ on:
         value: ${{ jobs.run.outputs.multimodal_gen }}
       partitions:
         value: ${{ jobs.run.outputs.partitions }}
+      partition_model_sha:
+        value: ${{ jobs.run.outputs.partition_model_sha }}
       b200_runner:
         value: ${{ jobs.run.outputs.b200_runner }}
       enable_retry:
@@ -60,6 +62,7 @@ jobs:
       jit_kernel: ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       partitions: ${{ steps.partitions.outputs.partitions }}
+      partition_model_sha: ${{ steps.partition-model-sha.outputs.sha }}
       b200_runner: ${{ steps.set-runner.outputs.b200_runner }}
       enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
@@ -233,6 +236,39 @@ jobs:
           fi
           echo "full=$FULL" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve sglang-ci-stats SHA
+        id: partition-model-sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Pin every shard in this PR run to the same immutable partition
+          # model.json commit, even if the upstream cron commits a new
+          # version mid-flight. Soft fail: empty SHA -> downstream curl is
+          # skipped -> static fallback in both dispatch and runtime.
+          SHA=$(gh api repos/sgl-project/sglang-ci-stats/commits/main --jq '.sha' 2>/dev/null || true)
+          if [[ -n "$SHA" ]]; then
+            echo "Pinned sglang-ci-stats@$SHA"
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not resolve sglang-ci-stats SHA; falling back to in-source est_time everywhere"
+            echo "sha=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch live partition model
+        if: steps.partition-model-sha.outputs.sha != ''
+        run: |
+          # Use the SHA-pinned raw URL so this fetch and every downstream
+          # stage's fetch land on the same immutable file. compute_partitions
+          # treats a missing /tmp/partition-model.json as "fall back to
+          # in-source est_time + (coeff=1, bias=0)".
+          rm -f /tmp/partition-model.json
+          URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ steps.partition-model-sha.outputs.sha }}/model.json"
+          if curl --fail --silent --show-error --max-time 15 "$URL" -o /tmp/partition-model.json; then
+            echo "Fetched partition-model.json ($(wc -c < /tmp/partition-model.json) bytes)"
+          else
+            echo "::warning::Failed to fetch partition-model.json from $URL; compute_partitions will fall back to in-source est_time"
+          fi
+
       - name: Compute partitions
         id: partitions
         run: |
@@ -243,6 +279,7 @@ jobs:
           # See scripts/ci/utils/compute_partitions.py.
           python3 scripts/ci/utils/compute_partitions.py \
             --full-parallel ${{ steps.parallel-mode.outputs.full }} \
+            --partition-model-file /tmp/partition-model.json \
             >> "$GITHUB_OUTPUT"
 
       - name: Set B200 runner tag

@@ -352,13 +352,29 @@ jobs:
         run: |
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
 
+      - name: Fetch live partition model
+        if: needs.check-changes.outputs.partition_model_sha != ''
+        run: |
+          # Same SHA-pinned URL check-changes used, so this shard's LPT
+          # bucketing uses the exact `est` snapshot dispatch sized the
+          # stage with. Soft fail: missing file -> run_suite.py falls back
+          # to in-source est_time for LPT.
+          rm -f /tmp/partition-model.json
+          URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ needs.check-changes.outputs.partition_model_sha }}/model.json"
+          curl --fail --silent --show-error --max-time 15 "$URL" -o /tmp/partition-model.json \
+            || echo "::warning::Failed to fetch partition-model.json from $URL; LPT will use in-source est_time"
+
       - name: Run test
         timeout-minutes: 10
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite stage-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-cpu'].size }} $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite stage-a-test-cpu \
+            --auto-partition-id ${{ matrix.partition }} \
+            --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-cpu'].size }} \
+            --partition-model-file /tmp/partition-model.json \
+            $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
   stage-b-test-1-gpu-small:
