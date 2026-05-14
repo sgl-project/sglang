@@ -20,7 +20,10 @@ from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+from sglang.srt.state_capturer.indexer_topk import (
+    get_global_indexer_capturer,
+    maybe_capture_indexer_topk,
+)
 from sglang.srt.utils import add_prefix, is_hip
 
 if TYPE_CHECKING:
@@ -62,7 +65,7 @@ def fp8_paged_mqa_logits_torch(
     assert weight.shape == (batch_size, num_heads)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
-    assert clean_logits == False
+    assert not clean_logits
 
     logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
     for i in range(batch_size):
@@ -184,6 +187,36 @@ def topk_transform_512_pytorch_vectorized(
             valid_topk, raw_indices, torch.tensor(-1, device=device, dtype=torch.int32)
         )
         out_raw_indices.copy_(raw_indices)
+
+
+def transform_raw_c4_indices_to_page_indices(
+    raw_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    assert raw_indices.shape == out_page_indices.shape
+    assert page_size > 0 and (page_size & (page_size - 1)) == 0
+
+    if seq_lens.dim() == 2:
+        seq_lens = seq_lens.squeeze(-1)
+    assert seq_lens.dim() == 1
+    assert raw_indices.shape[0] == seq_lens.shape[0] == page_table.shape[0]
+
+    page_bits = (page_size - 1).bit_length()
+    page_mask = page_size - 1
+
+    page_idx = raw_indices >> page_bits
+    offset_in_page = raw_indices & page_mask
+    page_idx_clamped = page_idx.clamp(min=0, max=page_table.shape[1] - 1)
+    physical_pages = torch.gather(page_table, dim=1, index=page_idx_clamped.long())
+    page_indices = (physical_pages << page_bits) | offset_in_page
+
+    valid = (raw_indices >= 0) & (raw_indices < seq_lens.unsqueeze(1))
+    valid &= physical_pages >= 0
+    page_indices.masked_fill_(~valid, -1)
+    out_page_indices.copy_(page_indices.to(torch.int32))
 
 
 @triton.jit
@@ -320,9 +353,12 @@ class C4IndexerBackendMixin:
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
-    ) -> None:
+        prev_topk_indices: Optional[torch.Tensor] = None,
+        skip_topk: bool = False,
+        return_topk_indices: bool = False,
+    ) -> Optional[torch.Tensor]:
         if forward_batch.forward_mode.is_idle():
-            return
+            return None
         # PREP_IN_CG lazy upgrade: this runs from MQALayer._forward_prepare,
         # before attn_backend.forward() would trigger the upgrade.
         self._maybe_upgrade_forward_metadata()
@@ -342,6 +378,46 @@ class C4IndexerBackendMixin:
 
         assert isinstance(core_metadata, DSV4AttnMetadata)
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
+
+        indexer_capturer = get_global_indexer_capturer()
+        capture_enabled = indexer_capturer is not None
+
+        hisparse_coordinator = forward_batch.hisparse_coordinator
+        hisparse_decode = (
+            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
+        )
+
+        if skip_topk and prev_topk_indices is not None:
+            compress_layer_id = token_to_kv_pool.layer_mapping[
+                c4_indexer.layer_id
+            ].compress_layer_id
+            raw_indices = maybe_capture_indexer_topk(
+                compress_layer_id, prev_topk_indices
+            )
+            transform_raw_c4_indices_to_page_indices(
+                raw_indices,
+                indexer_metadata.c4_seq_lens,
+                core_metadata.page_table,
+                core_metadata.c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+            )
+            if hisparse_coordinator is not None:
+                if hisparse_decode:
+                    core_metadata.c4_sparse_page_indices = (
+                        hisparse_coordinator.swap_in_selected_pages(
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                            top_k_result=raw_indices,
+                            layer_id=compress_layer_id,
+                        )
+                    )
+                else:
+                    core_metadata.c4_sparse_page_indices = (
+                        token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                            core_metadata.c4_sparse_page_indices
+                        )
+                    )
+            return raw_indices if return_topk_indices else None
 
         if enable_multi_stream:
             q_fp8, weights, c4_indexer_kv_cache = self._forward_prepare_multi_stream(
@@ -402,18 +478,10 @@ class C4IndexerBackendMixin:
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
-            return
-
-        indexer_capturer = get_global_indexer_capturer()
-        capture_enabled = indexer_capturer is not None
-
-        hisparse_coordinator = forward_batch.hisparse_coordinator
-        hisparse_decode = (
-            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
-        )
+            return None
 
         raw_indices = None
-        if capture_enabled:
+        if capture_enabled or return_topk_indices:
             raw_indices = torch.empty_like(core_metadata.c4_sparse_page_indices)
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
@@ -472,6 +540,8 @@ class C4IndexerBackendMixin:
                 c4_indexer.layer_id
             ].compress_layer_id
             indexer_capturer.capture(compress_layer_id, raw_indices)
+
+        return raw_indices if return_topk_indices else None
 
 
 class C4Indexer(nn.Module):
@@ -548,7 +618,10 @@ class C4Indexer(nn.Module):
         forward_batch: ForwardBatch,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
-    ) -> None:
+        prev_topk_indices: Optional[torch.Tensor] = None,
+        skip_topk: bool = False,
+        return_topk_indices: bool = False,
+    ) -> Optional[torch.Tensor]:
         if TYPE_CHECKING:
             assert isinstance(forward_batch.attn_backend, DeepseekV4AttnBackend)
         return forward_batch.attn_backend.forward_c4_indexer(
@@ -559,4 +632,7 @@ class C4Indexer(nn.Module):
             alt_streams=self.alt_streams,
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,
+            prev_topk_indices=prev_topk_indices,
+            skip_topk=skip_topk,
+            return_topk_indices=return_topk_indices,
         )

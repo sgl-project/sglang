@@ -152,6 +152,8 @@ class DeepseekV4ModelNextN(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
 
         pre_hc_head = hidden_states.flatten(1)
 

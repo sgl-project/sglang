@@ -222,6 +222,8 @@ class MQALayer(nn.Module):
 
         self.compressor = None
         self.indexer = None
+        self.skip_topk = None
+        self.next_skip_topk = None
         if self.compress_ratio:
             self.compressor = Compressor(
                 config,
@@ -242,6 +244,20 @@ class MQALayer(nn.Module):
                     prefix=add_prefix("indexer", prefix),
                     alt_streams=self.alt_streams_indexer,
                 )
+                self.index_topk_freq = getattr(config, "index_topk_freq", 1)
+                self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
+                if self.index_topk_pattern is None:
+                    assert self.index_topk_freq > 0
+                    self.skip_topk = max(layer_id - 1, 0) % self.index_topk_freq != 0
+                    self.next_skip_topk = layer_id % self.index_topk_freq != 0
+                else:
+                    self.skip_topk = self.index_topk_pattern[layer_id] == "S"
+                    if layer_id < len(self.index_topk_pattern) - 1:
+                        self.next_skip_topk = (
+                            self.index_topk_pattern[layer_id + 1] == "S"
+                        )
+                    else:
+                        self.next_skip_topk = False
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
@@ -382,7 +398,8 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
 
@@ -406,13 +423,18 @@ class MQALayer(nn.Module):
 
         if self.indexer is not None:
             with torch.cuda.stream(stream_indexer):
-                self.indexer(
+                topk_indices = self.indexer(
                     x=x,
                     q_lora=q_lora,
                     forward_batch=forward_batch,
                     enable_multi_stream=True,
                     q_lora_ready=q_lora_ready,
+                    prev_topk_indices=prev_topk_indices,
+                    skip_topk=self.skip_topk,
+                    return_topk_indices=bool(self.next_skip_topk),
                 )
+        else:
+            topk_indices = None
 
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
@@ -441,7 +463,7 @@ class MQALayer(nn.Module):
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
 
-        return q, kv
+        return q, kv, topk_indices
 
     def _forward_prepare(
         self,
@@ -450,7 +472,8 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x)
             q = qkv_a[..., : self.q_lora_rank]
@@ -493,7 +516,16 @@ class MQALayer(nn.Module):
             )
 
         if self.indexer is not None:
-            self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
+            topk_indices = self.indexer(
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                prev_topk_indices=prev_topk_indices,
+                skip_topk=self.skip_topk,
+                return_topk_indices=bool(self.next_skip_topk),
+            )
+        else:
+            topk_indices = None
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
                 x,
@@ -504,13 +536,14 @@ class MQALayer(nn.Module):
 
         if q_out is not None:
             q_out.copy_(q)
-        return q, kv
+        return q, kv, topk_indices
 
     def forward(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             assert (
@@ -538,12 +571,12 @@ class MQALayer(nn.Module):
             q_out = q_padded[:, tp_slice, :]
 
         if enable_multi_stream:
-            q, kv = self._forward_prepare_multi_stream(
-                x, positions, forward_batch, attn_backend, q_out
+            q, kv, topk_indices = self._forward_prepare_multi_stream(
+                x, positions, forward_batch, attn_backend, q_out, prev_topk_indices
             )
         else:
-            q, kv = self._forward_prepare(
-                x, positions, forward_batch, attn_backend, q_out
+            q, kv, topk_indices = self._forward_prepare(
+                x, positions, forward_batch, attn_backend, q_out, prev_topk_indices
             )
 
         o = attn_backend.forward(
@@ -591,6 +624,8 @@ class MQALayer(nn.Module):
 
         o, _ = self.wo_b(o.flatten(1))
 
+        if self.next_skip_topk is not None:
+            return o, topk_indices if self.next_skip_topk else None
         return o
 
 
@@ -767,6 +802,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states, post, comb, norm_fused = self.hc_pre(
@@ -783,7 +819,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             x=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
+            prev_topk_indices=prev_topk_indices,
         )
+        if isinstance(hidden_states, tuple):
+            hidden_states, topk_indices = hidden_states
+        else:
+            topk_indices = None
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states
@@ -845,6 +886,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
+        if self.self_attn.next_skip_topk is not None:
+            return hidden_states, topk_indices
         return hidden_states
 
 
@@ -948,6 +991,7 @@ class DeepseekV4Model(nn.Module):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
+        topk_indices = None
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states = layer(
@@ -956,7 +1000,12 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
+                prev_topk_indices=topk_indices,
             )
+            if isinstance(hidden_states, tuple):
+                hidden_states, topk_indices = hidden_states
+            else:
+                topk_indices = None
 
         if nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(

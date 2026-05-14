@@ -58,6 +58,8 @@ class DeepSeekV4Config(PretrainedConfig):
     index_head_dim: int = 128
     index_n_heads: int = 64
     index_topk: int = 512
+    index_topk_freq: int = 1
+    index_topk_pattern: Optional[List[str]] = None
     initializer_range: float = 0.02
     intermediate_size: int = 2048
     kv_lora_rank: int = 512
