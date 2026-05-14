@@ -18,10 +18,7 @@ from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
 from sglang.srt.utils import add_prefix
 
 
-class MistralLarge3EagleModel(DeepseekV2Model):
-    """EAGLE draft model with an fc layer that fuses token embeddings and
-    target-model hidden states before passing through transformer layers."""
-
+class MistralLarge3Model(DeepseekV2Model):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -102,14 +99,9 @@ class MistralLarge3ForCausalLMEagle(MistralLarge3ForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        # DeepseekV2ForCausalLM.__init__ hardcodes self.model = DeepseekV2Model.
-        # We let the parent init run (it sets up weight loading attrs, lm_head,
-        # etc.), then replace self.model with MistralLarge3EagleModel which has
-        # the EAGLE fc layer. The discarded 2-layer DeepseekV2Model is tiny.
+        config.quant_config = quant_config
+        self.model_cls = MistralLarge3Model
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        self.model = MistralLarge3EagleModel(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
-        )
 
 
 EntryClass = [MistralLarge3ForCausalLMEagle]

@@ -131,7 +131,6 @@ html_context = {
 
 html_static_path = ["_static"]
 html_css_files = ["css/custom_log.css"]
-html_js_files = ["js/deprecation_banner.js"]
 
 
 def setup(app):

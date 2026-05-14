@@ -8,11 +8,6 @@ on:
         required: true
         type: string
         default: 'pr-test.yml'
-      include_high_priority:
-        description: 'Also cancel runs from high-priority PRs'
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   actions: write   # Needed to cancel runs
@@ -31,7 +26,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           WORKFLOWS: ${{ github.event.inputs.workflows || 'pr-test.yml' }}
-          INCLUDE_HIGH_PRIORITY: ${{ github.event.inputs.include_high_priority || 'false' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -129,17 +123,9 @@ jobs:
                 labels=$(gh pr view "$pr_number" --repo "$REPO" --json labels \
                   | jq -r '.labels[].name' 2>/dev/null || true)
 
-                if echo "$labels" | grep -Fxq "bypass-maintenance"; then
-                  echo "  🛑 Skipping (bypass-maintenance label, never cancelled)"
-                  continue
-                fi
-
                 if echo "$labels" | grep -Fxq "high priority"; then
-                  if [ "$INCLUDE_HIGH_PRIORITY" != "true" ]; then
-                    echo "  🛑 Skipping (high priority label)"
-                    continue
-                  fi
-                  echo "  ⚠️  High priority PR, but include_high_priority is enabled"
+                  echo "  🛑 Skipping (high priority label)"
+                  continue
                 fi
 
                 echo "  🚫 Cancelling..."

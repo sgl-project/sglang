@@ -4,7 +4,6 @@ Test script to verify SGLang config file integration.
 
 import argparse
 import os
-import sys
 import tempfile
 
 import pytest
@@ -32,7 +31,7 @@ def test_server_args_config_parser(merger):
         "tensor-parallel-size": 2,
         "trust-remote-code": False,
         "enable-metrics": True,
-        "incremental-streaming-output": True,
+        "stream-output": True,
         "skip-server-warmup": False,
         "log-requests": True,
         "show-time-cost": True,
@@ -65,7 +64,7 @@ def test_server_args_config_parser(merger):
 
         # Test boolean arguments
         assert "--enable-metrics" in merged_args  # True boolean
-        assert "--incremental-streaming-output" in merged_args  # True boolean
+        assert "--stream-output" in merged_args  # True boolean
         assert "--log-requests" in merged_args  # True boolean
         assert "--show-time-cost" in merged_args  # True boolean
         # False booleans should not be present (only add flag if True)
@@ -163,4 +162,4 @@ def test_error_handling():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

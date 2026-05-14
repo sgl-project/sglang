@@ -2,9 +2,11 @@
 
 use async_trait::async_trait;
 use tracing::debug;
-use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::core::steps::workflow_data::WorkerRemovalWorkflowData;
+use crate::{
+    core::steps::workflow_data::WorkerRemovalWorkflowData,
+    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
+};
 
 /// Step to remove workers from the policy registry.
 ///

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import Request
@@ -20,11 +19,8 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
-    cached_tokens_details_from_dict,
-    process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
-    should_include_usage,
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -99,13 +95,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
-        # Extract routed_dp_rank from header (has higher priority than body)
-        effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
-            raw_request, request.routed_dp_rank
-        )
-
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
+        if lora_path:
+            first_adapter = (
+                lora_path
+                if isinstance(lora_path, str)
+                else next((a for a in lora_path if a), None)
+            )
+            if first_adapter:
+                self._validate_lora_enabled(first_adapter)
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
@@ -119,11 +118,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
-            routed_dp_rank=effective_routed_dp_rank,
-            disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
+            data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
-            routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
@@ -183,25 +180,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
-    ) -> Union[StreamingResponse, ErrorResponse]:
+    ) -> StreamingResponse:
         """Handle streaming completion request"""
-        generator = self._generate_completion_stream(
-            adapted_request, request, raw_request
-        )
-
-        # Kick-start the generator to trigger validation before HTTP 200 is sent.
-        try:
-            first_chunk = await generator.__anext__()
-        except ValueError as e:
-            return self.create_error_response(str(e))
-
-        async def prepend_first_chunk():
-            yield first_chunk
-            async for chunk in generator:
-                yield chunk
-
         return StreamingResponse(
-            prepend_first_chunk(),
+            self._generate_completion_stream(adapted_request, request, raw_request),
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
@@ -216,49 +198,32 @@ class OpenAIServingCompletion(OpenAIServingBase):
         created = int(time.time())
 
         # State tracking for streaming
-        stream_offsets = {}
+        stream_buffers = {}
         n_prev_tokens = {}
 
         # Usage tracking
         prompt_tokens = {}
         completion_tokens = {}
-        reasoning_tokens = {}
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
-        cached_tokens_details = {}
 
-        stream_started = False
         try:
-            include_usage, continuous_usage_stats = should_include_usage(
-                request.stream_options,
-                self.tokenizer_manager.server_args.stream_response_default_include_usage,
-            )
-
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
 
                 text = content["text"]
-                prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
-                completion_tokens[index] = content["meta_info"].get(
-                    "completion_tokens", 0
-                )
-                reasoning_tokens[index] = content["meta_info"].get(
-                    "reasoning_tokens", 0
-                )
+                prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
+                completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
-                cached_tokens_details[index] = content["meta_info"].get(
-                    "cached_tokens_details", None
-                )
 
-                is_first_chunk = index not in stream_offsets
-                offset = stream_offsets.get(index, 0)
+                stream_buffer = stream_buffers.get(index, "")
                 # Handle echo for first chunk
-                if is_first_chunk:  # The first chunk
+                if not stream_buffer:  # The first chunk
                     if request.echo:
                         echo_text = self._get_echo_text(request, index)
                         text = echo_text + text
@@ -267,7 +232,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 logprobs = None
                 if request.logprobs is not None:
                     # The first chunk and echo is enabled.
-                    if is_first_chunk and request.echo:
+                    if not stream_buffer and request.echo:
                         input_token_logprobs = content["meta_info"][
                             "input_token_logprobs"
                         ]
@@ -277,65 +242,45 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         input_top_logprobs = None
 
                     n_prev_token = n_prev_tokens.get(index, 0)
-                    total_output_logprobs = content["meta_info"][
-                        "output_token_logprobs_length"
-                    ]
+                    total_output_logprobs = len(
+                        content["meta_info"]["output_token_logprobs"]
+                    )
+                    output_logprobs_slice = content["meta_info"][
+                        "output_token_logprobs"
+                    ][n_prev_token:]
+                    finish_reason_for_logprobs = content["meta_info"]["finish_reason"]
+
+                    # When finish_reason is set and all logprobs have been sent,
+                    # any remaining text is just buffered text being flushed by the
+                    # detokenizer (it holds back text at word boundaries). Return None
+                    # for logprobs since no new tokens were generated for this text.
                     if (
-                        n_prev_token < total_output_logprobs
-                        or input_token_logprobs is not None
+                        len(output_logprobs_slice) == 0
+                        and finish_reason_for_logprobs is not None
+                        and input_token_logprobs is None
                     ):
-                        output_token_logprobs = content["meta_info"][
-                            "output_token_logprobs"
-                        ]
-                        output_top_logprobs = content["meta_info"].get(
-                            "output_top_logprobs", []
-                        )
-                        if (
-                            not self.tokenizer_manager.server_args.incremental_streaming_output
-                        ):
-                            output_token_logprobs = output_token_logprobs[
-                                n_prev_token:total_output_logprobs
-                            ]
-                            output_top_logprobs = output_top_logprobs[
-                                n_prev_token:total_output_logprobs
-                            ]
+                        logprobs = None
+                    else:
                         logprobs = to_openai_style_logprobs(
                             input_token_logprobs=input_token_logprobs,
                             input_top_logprobs=input_top_logprobs,
-                            output_token_logprobs=output_token_logprobs,
-                            output_top_logprobs=output_top_logprobs,
+                            output_token_logprobs=output_logprobs_slice,
+                            output_top_logprobs=content["meta_info"].get(
+                                "output_top_logprobs", []
+                            )[n_prev_token:],
                         )
                     n_prev_tokens[index] = total_output_logprobs
 
                 # Generate delta
-                delta = text[offset:]
-                stream_offsets[index] = len(content["text"])
-                finish_reason = content["meta_info"].get("finish_reason", None)
-                finish_reason_type = finish_reason["type"] if finish_reason else None
-
-                # Abort with an explicit error status_code is a system error
-                # (timeout, OOM, validation): emit a streaming error chunk.
-                # A graceful abort (no status_code, e.g. user-initiated via
-                # /abort_request or session lifecycle cleanup) falls through
-                # to the normal chunk path, matching the non-stream behavior
-                # in tokenizer_manager._handle_abort_finish_reason.
-                if finish_reason_type == "abort" and isinstance(
-                    finish_reason.get("status_code"), HTTPStatus
-                ):
-                    code = finish_reason["status_code"]
-                    error = self.create_streaming_error_response(
-                        finish_reason.get("message", "Generation aborted."),
-                        code.name,
-                        code.value,
-                    )
-                    yield f"data: {error}\n\n"
-                    break
+                delta = text[len(stream_buffer) :]
+                stream_buffers[index] = stream_buffer + delta
+                finish_reason = content["meta_info"]["finish_reason"]
 
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
                     text=delta,
                     logprobs=logprobs,
-                    finish_reason=finish_reason_type,
+                    finish_reason=finish_reason["type"] if finish_reason else None,
                     matched_stop=(
                         finish_reason["matched"]
                         if finish_reason and "matched" in finish_reason
@@ -351,15 +296,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 )
 
                 # Add usage stats if continuous_usage_stats is enabled
-                if continuous_usage_stats:
+                if (
+                    request.stream_options
+                    and request.stream_options.continuous_usage_stats
+                ):
                     chunk.usage = UsageProcessor.calculate_token_usage(
                         prompt_tokens=prompt_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
-                        reasoning_tokens=reasoning_tokens.get(index, 0),
                     )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
-                stream_started = True
 
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
@@ -385,41 +331,33 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
-            sglext_routed = None
             if request.return_routed_experts and routed_experts:
-                sglext_routed = next(
-                    (v for v in routed_experts.values() if v is not None), None
-                )
-
-            sglext_details = None
-            if request.return_cached_tokens_details and cached_tokens_details:
-                first_details = next(
-                    (v for v in cached_tokens_details.values() if v is not None), None
-                )
-                if first_details is not None:
-                    sglext_details = cached_tokens_details_from_dict(first_details)
-
-            if sglext_routed is not None or sglext_details is not None:
-                sglext_chunk = CompletionStreamResponse(
-                    id=content["meta_info"]["id"],
-                    created=created,
-                    object="text_completion",
-                    choices=[],  # sglext is at response level
-                    model=request.model,
-                    sglext=SglExt(
-                        routed_experts=sglext_routed,
-                        cached_tokens_details=sglext_details,
-                    ),
-                )
-                yield f"data: {sglext_chunk.model_dump_json()}\n\n"
+                for index, choice_routed_experts in routed_experts.items():
+                    if choice_routed_experts is not None:
+                        routed_experts_chunk = CompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=created,
+                            object="text_completion",
+                            choices=[
+                                CompletionResponseStreamChoice(
+                                    index=index,
+                                    text="",
+                                    sgl_ext=SglExt(
+                                        routed_experts=choice_routed_experts
+                                    ),
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield (f"data: {routed_experts_chunk.model_dump_json()}\n\n")
 
             # Handle final usage chunk
-            if include_usage:
+            if request.stream_options and request.stream_options.include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
-                    reasoning_tokens,
                     completion_tokens,
-                    cached_tokens=cached_tokens,
+                    cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
@@ -434,8 +372,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 yield f"data: {final_usage_data}\n\n"
 
         except Exception as e:
-            if not stream_started:
-                raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 
@@ -483,19 +419,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
             echo_prompts = self._prepare_echo_prompts(request)
             echo = True
 
-        # Build sglext at response level (from first ret_item, as these are per-request)
-        first_ret = ret[0]
-        routed_experts = process_routed_experts_from_ret(first_ret, request)
-        cached_tokens_details = process_cached_tokens_details_from_ret(
-            first_ret, request
-        )
-        response_sglext = None
-        if routed_experts or cached_tokens_details:
-            response_sglext = SglExt(
-                routed_experts=routed_experts,
-                cached_tokens_details=cached_tokens_details,
-            )
-
         for idx, ret_item in enumerate(ret):
             text = ret_item["text"]
 
@@ -527,6 +450,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
+            routed_experts = process_routed_experts_from_ret(ret_item, request)
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
 
@@ -541,6 +465,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                sgl_ext=(
+                    SglExt(routed_experts=routed_experts) if routed_experts else None
+                ),
             )
             choices.append(choice_data)
 
@@ -557,7 +484,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
             choices=choices,
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
-            sglext=response_sglext,
         )
 
     def _get_echo_text(self, request: CompletionRequest, index: int) -> str:

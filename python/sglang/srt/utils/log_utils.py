@@ -50,9 +50,7 @@ def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.
     logger.setLevel(logging.INFO)
     logger.propagate = False
     if not logger.handlers:
-        handler.setFormatter(
-            logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
     return logger
 

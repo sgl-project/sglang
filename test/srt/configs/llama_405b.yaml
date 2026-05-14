@@ -1,0 +1,28 @@
+tasks:
+  - name: sglang-8192-1024-concurrency1
+    server_cmd: python3 -m sglang.launch_server --model nvidia/Llama-3.1-405B-Instruct-FP8 --tp 8
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 8192 --random-output-len 1024 --max-concurrency 1 --num-prompts 5 --output-file llama_405b_results.jsonl
+
+  - name: sglang-8192-1024-concurrency2
+    server_cmd: python3 -m sglang.launch_server --model nvidia/Llama-3.1-405B-Instruct-FP8 --tp 8
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 8192 --random-output-len 1024 --max-concurrency 2 --num-prompts 10 --output-file llama_405b_results.jsonl
+
+  - name: sglang-8192-1024-concurrency4
+    server_cmd: python3 -m sglang.launch_server --model nvidia/Llama-3.1-405B-Instruct-FP8 --tp 8
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 8192 --random-output-len 1024 --max-concurrency 4 --num-prompts 20 --output-file llama_405b_results.jsonl
+
+  - name: sglang-8192-1024-concurrency8
+    server_cmd: python3 -m sglang.launch_server --model nvidia/Llama-3.1-405B-Instruct-FP8 --tp 8
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 8192 --random-output-len 1024 --max-concurrency 8 --num-prompts 32 --output-file llama_405b_results.jsonl
+
+  - name: sglang-8192-1024-concurrency16
+    server_cmd: python3 -m sglang.launch_server --model nvidia/Llama-3.1-405B-Instruct-FP8 --tp 8
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 8192 --random-output-len 1024 --max-concurrency 16 --num-prompts 48 --output-file llama_405b_results.jsonl
+
+  - name: sglang-8192-1024-concurrency24
+    server_cmd: python3 -m sglang.launch_server --model nvidia/Llama-3.1-405B-Instruct-FP8 --tp 8
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 8192 --random-output-len 1024 --max-concurrency 24 --num-prompts 72 --output-file llama_405b_results.jsonl
+
+  - name: sglang-8192-1024-concurrency32
+    server_cmd: python3 -m sglang.launch_server --model nvidia/Llama-3.1-405B-Instruct-FP8 --tp 8
+    client_cmd: python3 -m sglang.bench_serving --dataset-name random --random-range-ratio 1 --random-input-len 8192 --random-output-len 1024 --max-concurrency 32 --num-prompts 96 --output-file llama_405b_results.jsonl

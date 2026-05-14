@@ -17,7 +17,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
+#ifndef USE_ROCM
 #include "pytorch_extension_utils.h"
 #else
 #include "pytorch_extension_utils_rocm.h"

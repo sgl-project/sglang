@@ -7,11 +7,18 @@ from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )
-from sglang.multimodal_gen.configs.models.fsdp import (
-    is_embed_tokens,
-    is_final_norm,
-    is_layer,
-)
+
+
+def _is_transformer_layer(n: str, m) -> bool:
+    return "layers" in n and str.isdigit(n.split(".")[-1])
+
+
+def _is_embeddings(n: str, m) -> bool:
+    return n.endswith("embed_tokens")
+
+
+def _is_final_norm(n: str, m) -> bool:
+    return n.endswith("norm")
 
 
 @dataclass
@@ -39,11 +46,6 @@ class QwenImageArchConfig(TextEncoderArchConfig):
     head_dim: int | None = None
     hidden_state_skip_layer: int = 2
     text_len: int = 512
-    vision_start_token_id: int = 151652
-    vision_end_token_id: int = 151653
-    vision_token_id: int = 151654
-    image_token_id: int = 151655
-    video_token_id: int = 151656
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
@@ -56,7 +58,7 @@ class QwenImageArchConfig(TextEncoderArchConfig):
         ]
     )
     _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [is_layer, is_embed_tokens, is_final_norm]
+        default_factory=lambda: [_is_transformer_layer, _is_embeddings, _is_final_norm]
     )
 
 

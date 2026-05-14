@@ -7,8 +7,6 @@ import triton
 import triton.language as tl
 from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
-from sglang.utils import is_in_ci
-
 try:
     from vllm import _custom_ops as ops
 
@@ -17,7 +15,11 @@ except ImportError:
     ops = None
     VLLM_AVAILABLE = False
 
-IS_CI = is_in_ci()
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 USE_RANDOM_PERM = False
 

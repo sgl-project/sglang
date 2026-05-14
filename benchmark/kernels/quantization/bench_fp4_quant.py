@@ -9,7 +9,6 @@ from flashinfer import (
 )
 from sgl_kernel.elementwise import silu_and_mul
 
-from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
 
@@ -76,9 +75,9 @@ def benchmark(M, K, provider):
         dtype=torch.float32,
     )
 
-    quantiles = (0.5, 0.2, 0.8)
+    quantiles = [0.5, 0.2, 0.8]
     if provider == "triton_fp8":
-        ms, min_ms, max_ms = run_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: silu_and_mul_masked_post_quant_fwd(
                 x,
                 fp8_out,
@@ -90,7 +89,7 @@ def benchmark(M, K, provider):
             quantiles=quantiles,
         )
     if provider == "cuda_unfused_fp4":
-        ms, min_ms, max_ms = run_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: scaled_fp4_grouped_quantize(
                 silu_and_mul(x),
                 masks,
@@ -99,7 +98,7 @@ def benchmark(M, K, provider):
             quantiles=quantiles,
         )
     if provider == "cuda_fused_fp4":
-        ms, min_ms, max_ms = run_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: silu_and_mul_scaled_nvfp4_experts_quantize(
                 x,
                 masks,

@@ -2,10 +2,12 @@
 
 use async_trait::async_trait;
 use tracing::debug;
-use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::find_workers_by_url;
-use crate::core::steps::workflow_data::WorkerUpdateWorkflowData;
+use crate::{
+    core::steps::workflow_data::WorkerUpdateWorkflowData,
+    workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
+};
 
 /// Step to find workers to update based on URL.
 ///

@@ -6,4 +6,3 @@ Hierarchical KV Caching (HiCache)
 
    hicache_best_practices.md
    hicache_design.md
-   hicache_storage_runtime_attach_detach.md

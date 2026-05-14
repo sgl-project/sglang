@@ -31,11 +31,9 @@ class TestCPUGraph(CustomTestCase):
             "0.05",
             "--enable-torch-compile",
             "--torch-compile-max-bs",
-            "2",
-            "--cuda-graph-bs",
-            "2",
+            "1",
         ],
-        min_throughput=7,
+        min_throughput=10,
     )
     def test_latency_torch_compile_cpu(self):
         return DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -60,8 +58,8 @@ class TestCPUGraph(CustomTestCase):
                 "--trust-remote-code",
                 "--disable-overlap-schedule",
                 "--enable-torch-compile",
-                "--cuda-graph-bs",
-                "2",
+                "--torch-compile-max-bs",
+                "1",
                 "--tp",
                 f"{n_numa_node}",
             ],

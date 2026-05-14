@@ -360,8 +360,13 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
-    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
-        return TritonMoeQuantInfo(
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        quant_info = TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
             use_int8_w8a8=True,
@@ -371,13 +376,5 @@ class BlockInt8MoEMethod(FusedMoEMethodBase):
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
         )
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
-    ) -> CombineInput:
-
-        quant_info = self.get_triton_quant_info(layer)
 
         return self.runner.run(dispatch_output, quant_info)

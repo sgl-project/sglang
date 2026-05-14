@@ -1,6 +1,5 @@
 import math
 import random
-import sys
 from typing import Optional, Tuple
 
 import pytest
@@ -660,4 +659,4 @@ def test_flash_mla_fp8(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

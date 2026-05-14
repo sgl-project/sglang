@@ -64,14 +64,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use rand::Rng;
-use smg_mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager};
 use tracing::{debug, warn};
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
     CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::core::{Worker, UNKNOWN_MODEL_ID};
+use crate::{
+    core::{Worker, UNKNOWN_MODEL_ID},
+    mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager},
+};
 
 /// Cache-aware routing policy
 ///
@@ -321,7 +323,7 @@ impl CacheAwarePolicy {
 
                 // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
                 if let Some(ref mesh_sync) = self.mesh_sync {
-                    use smg_mesh::tree_ops::TreeInsertOp;
+                    use crate::mesh::tree_ops::TreeInsertOp;
                     let op = TreeOperation::Insert(TreeInsertOp {
                         text: text.to_string(),
                         tenant: worker_url.to_string(),
@@ -425,7 +427,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
                 // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
                 if let Some(ref mesh_sync) = self.mesh_sync {
-                    use smg_mesh::tree_ops::TreeInsertOp;
+                    use crate::mesh::tree_ops::TreeInsertOp;
                     let op = TreeOperation::Insert(TreeInsertOp {
                         text: text.to_string(),
                         tenant: workers[idx].url().to_string(),
@@ -450,7 +452,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
                 // Sync removal to mesh if enabled (no-op if mesh is not enabled)
                 if let Some(ref mesh_sync) = self.mesh_sync {
-                    use smg_mesh::tree_ops::TreeRemoveOp;
+                    use crate::mesh::tree_ops::TreeRemoveOp;
                     let op = TreeOperation::Remove(TreeRemoveOp {
                         tenant: tenant_url.to_string(),
                     });
@@ -678,7 +680,7 @@ mod tests {
     async fn test_cache_aware_sync_tree_operation_to_mesh() {
         use std::sync::Arc;
 
-        use smg_mesh::{stores::StateStores, sync::MeshSyncManager};
+        use crate::mesh::{stores::StateStores, sync::MeshSyncManager};
 
         let stores = Arc::new(StateStores::with_self_name("node1".to_string()));
         let mesh_sync = Arc::new(MeshSyncManager::new(stores, "node1".to_string()));
@@ -722,7 +724,7 @@ mod tests {
     fn test_cache_aware_restore_tree_state_from_mesh() {
         use std::sync::Arc;
 
-        use smg_mesh::{
+        use crate::mesh::{
             stores::StateStores,
             sync::MeshSyncManager,
             tree_ops::{TreeInsertOp, TreeOperation},
@@ -781,7 +783,7 @@ mod tests {
     fn test_cache_aware_apply_remote_tree_operation() {
         use std::sync::Arc;
 
-        use smg_mesh::{
+        use crate::mesh::{
             stores::StateStores,
             sync::MeshSyncManager,
             tree_ops::{TreeInsertOp, TreeOperation},
@@ -814,7 +816,7 @@ mod tests {
     fn test_cache_aware_multi_node_consistency() {
         use std::sync::Arc;
 
-        use smg_mesh::{
+        use crate::mesh::{
             stores::StateStores,
             sync::MeshSyncManager,
             tree_ops::{TreeInsertOp, TreeOperation},

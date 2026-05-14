@@ -12,7 +12,6 @@ from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -184,21 +183,21 @@ class Gemma3nAltUp(nn.Module):
         self.correct_output_scale = nn.Parameter(
             torch.zeros(config.hidden_size, dtype=torch.float32)
         )
-        self.correction_coefs = ReplicatedLinear(
+        self.correction_coefs = ColumnParallelLinear(
             config.altup_num_inputs,
             config.altup_num_inputs,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("correction_coefs", prefix),
         )
-        self.prediction_coefs = ReplicatedLinear(
+        self.prediction_coefs = ColumnParallelLinear(
             config.altup_num_inputs,
             config.altup_num_inputs**2,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("prediction_coefs", prefix),
         )
-        self.modality_router = ReplicatedLinear(
+        self.modality_router = ColumnParallelLinear(
             config.hidden_size,
             config.altup_num_inputs,
             bias=False,
@@ -397,8 +396,8 @@ class Gemma3nAttention(nn.Module):
                 self.head_dim,
                 rotary_dim=self.head_dim,
                 max_position=config.max_position_embeddings,
-                base=config.rope_parameters["rope_theta"],
-                rope_scaling=config.rope_parameters,
+                base=config.rope_theta,
+                rope_scaling=config.rope_scaling,
             )
 
         self.sliding_window = config.sliding_window if self.is_sliding else None
@@ -546,14 +545,14 @@ class Gemma3nDecoderLayer(nn.Module):
             config, quant_config, prefix=add_prefix("laurel", prefix)
         )
 
-        self.per_layer_input_gate = ReplicatedLinear(
+        self.per_layer_input_gate = ColumnParallelLinear(
             self.hidden_size,
             self.hidden_size_per_layer_input,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("per_layer_input_gate", prefix),
         )
-        self.per_layer_projection = ReplicatedLinear(
+        self.per_layer_projection = RowParallelLinear(
             self.hidden_size_per_layer_input,
             self.hidden_size,
             bias=False,
@@ -678,7 +677,6 @@ class Gemma3nTextModel(PreTrainedModel):
             self.hidden_size,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
             bias=False,
-            gather_output=True,
             quant_config=quant_config,
             prefix=add_prefix("per_layer_model_projection", prefix),
         )
@@ -694,7 +692,6 @@ class Gemma3nTextModel(PreTrainedModel):
                 self.hidden_size,
                 self.hidden_size,
                 bias=False,
-                gather_output=True,
                 quant_config=quant_config,
                 prefix=prefix,
             ),
@@ -707,7 +704,6 @@ class Gemma3nTextModel(PreTrainedModel):
                 self.hidden_size,
                 self.hidden_size,
                 bias=False,
-                gather_output=True,
                 quant_config=quant_config,
                 prefix=prefix,
             ),
@@ -786,6 +782,9 @@ class Gemma3nTextModel(PreTrainedModel):
 
         per_layer_inputs = self.project_per_layer_inputs(input_embeds, per_layer_inputs)
 
+        if positions.dim() == 1:
+            positions = positions.unsqueeze(0)
+
         # Expand hidden_states to support per-layer inputs
         target_magnitude = torch.mean(input_embeds**2, dim=-1, keepdim=True) ** 0.5
         epsilon_tensor = torch.tensor(torch.finfo(input_embeds.dtype).min)
@@ -850,7 +849,7 @@ class Gemma3nTextModel(PreTrainedModel):
 class Gemma3nForCausalLM(PreTrainedModel):
     config_class = Gemma3nTextConfig
 
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     config_class = Gemma3nTextConfig

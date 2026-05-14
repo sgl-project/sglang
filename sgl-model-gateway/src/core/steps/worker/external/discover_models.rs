@@ -8,12 +8,14 @@ use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, info};
-use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::core::{
-    model_card::{ModelCard, ProviderType},
-    model_type::ModelType,
-    steps::workflow_data::ExternalWorkerWorkflowData,
+use crate::{
+    core::{
+        model_card::{ModelCard, ProviderType},
+        model_type::ModelType,
+        steps::workflow_data::ExternalWorkerWorkflowData,
+    },
+    workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
 // HTTP client for API calls

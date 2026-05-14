@@ -99,8 +99,7 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
     const torch::Tensor& layout_sfb,
     const torch::Tensor& problem_sizes,
     const torch::Tensor& workspace,
-    cudaStream_t stream,
-    int sm_count) {
+    cudaStream_t stream) {
   using ElementA = typename GemmTraits::ElementA;
   using StrideA = typename GemmTraits::StrideA;
   using ElementB = typename GemmTraits::ElementB;
@@ -129,7 +128,7 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = c10::cuda::current_device();
-  hw_info.sm_count = sm_count;
+  hw_info.sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
   typename GemmKernel::EpilogueArguments epilogue_args{
       {}, nullptr, nullptr, static_cast<ElementD**>(out_ptrs.data_ptr()), static_cast<StrideD*>(stride_d.data_ptr())};
@@ -148,7 +147,7 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
   auto status = gemm_op.initialize(args, workspace.data_ptr(), stream);
   TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to initialize GEMM");
 
-  status = gemm_op.run(stream, nullptr);
+  status = gemm_op.run(stream, nullptr, true);  // Enable PDL
   TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
 }
 
@@ -168,12 +167,8 @@ void es_sm90_fp8_blockwise_scaled_group_mm_distpatch_out_dtype(
     const torch::Tensor& mm_problem_sizes,
     const torch::Tensor& hm_problem_sizes,
     const torch::Tensor& workspace,
-    const torch::Tensor& backup_workspace_0,
-    const torch::Tensor& backup_workspace_1,
     bool is_h20_device,
-    cudaStream_t stream,
-    cudaStream_t backup_stream_0,
-    cudaStream_t backup_stream_1) {
+    cudaStream_t stream) {
   using LowMGemmH20Traits =
       ExpertSpecializationSm90FP8BlockwiseGroupedGemmTraits<OutType, cutlass::layout::ColumnMajor, PerfConfigLowMH20>;
   using LowMGemmHx00Traits =
@@ -190,40 +185,6 @@ void es_sm90_fp8_blockwise_scaled_group_mm_distpatch_out_dtype(
       ExpertSpecializationSm90FP8BlockwiseGroupedGemmTraits<OutType, cutlass::layout::RowMajor, PerfConfigHighMHx00>;
 
   if (!is_h20_device) {
-    launch_sm90_fp8_blockwise_scaled_group_mm<HighMGemmHx00Traits>(
-        out_ptrs,
-        a_ptrs,
-        b_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        stride_a,
-        stride_b,
-        stride_d,
-        layout_sfa,
-        layout_sfb,
-        hm_problem_sizes,
-        workspace,
-        stream,
-        132);
-  } else {
-    launch_sm90_fp8_blockwise_scaled_group_mm<HighMGemmH20Traits>(
-        out_ptrs,
-        a_ptrs,
-        b_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        stride_a,
-        stride_b,
-        stride_d,
-        layout_sfa,
-        layout_sfb,
-        hm_problem_sizes,
-        workspace,
-        stream,
-        78);
-  }
-
-  if (!is_h20_device) {
     launch_sm90_fp8_blockwise_scaled_group_mm<LowMGemmHx00Traits>(
         out_ptrs,
         b_ptrs,
@@ -236,9 +197,8 @@ void es_sm90_fp8_blockwise_scaled_group_mm_distpatch_out_dtype(
         layout_sfb,
         layout_sfa,
         lm_problem_sizes,
-        backup_workspace_1,
-        backup_stream_1,
-        132);
+        workspace,
+        stream);
   } else {
     launch_sm90_fp8_blockwise_scaled_group_mm<LowMGemmH20Traits>(
         out_ptrs,
@@ -252,9 +212,8 @@ void es_sm90_fp8_blockwise_scaled_group_mm_distpatch_out_dtype(
         layout_sfb,
         layout_sfa,
         lm_problem_sizes,
-        backup_workspace_1,
-        backup_stream_1,
-        78);
+        workspace,
+        stream);
   }
 
   if (!is_h20_device) {
@@ -270,9 +229,8 @@ void es_sm90_fp8_blockwise_scaled_group_mm_distpatch_out_dtype(
         layout_sfb,
         layout_sfa,
         mm_problem_sizes,
-        backup_workspace_0,
-        backup_stream_0,
-        132);
+        workspace,
+        stream);
   } else {
     launch_sm90_fp8_blockwise_scaled_group_mm<MiddleMGemmH20Traits>(
         out_ptrs,
@@ -286,9 +244,40 @@ void es_sm90_fp8_blockwise_scaled_group_mm_distpatch_out_dtype(
         layout_sfa,
         layout_sfb,
         mm_problem_sizes,
-        backup_workspace_0,
-        backup_stream_0,
-        78);
+        workspace,
+        stream);
+  }
+
+  if (!is_h20_device) {
+    launch_sm90_fp8_blockwise_scaled_group_mm<HighMGemmHx00Traits>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_d,
+        layout_sfa,
+        layout_sfb,
+        hm_problem_sizes,
+        workspace,
+        stream);
+  } else {
+    launch_sm90_fp8_blockwise_scaled_group_mm<HighMGemmH20Traits>(
+        out_ptrs,
+        a_ptrs,
+        b_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        stride_a,
+        stride_b,
+        stride_d,
+        layout_sfa,
+        layout_sfb,
+        hm_problem_sizes,
+        workspace,
+        stream);
   }
 }
 

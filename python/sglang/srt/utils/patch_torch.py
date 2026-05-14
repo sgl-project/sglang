@@ -14,9 +14,10 @@
 from typing import Callable, Union
 
 import torch
+from packaging import version
 from torch.multiprocessing import reductions
 
-from sglang.srt.utils.common import is_npu, torch_release
+from sglang.srt.utils.common import is_npu
 
 _is_npu = is_npu()
 
@@ -103,7 +104,7 @@ def _modify_tuple(t, index: int, modifier: Callable):
 
 
 def monkey_patch_torch_compile():
-    if torch_release < (2, 8):
+    if version.parse(torch.__version__) < version.parse("2.8.0"):
         # These things are cacheable by torch.compile. torch.compile just doesn't know it.
         # This was fixed in PyTorch 2.8, but until then, we monkey patch.
         import torch._higher_order_ops.auto_functionalize as af
