@@ -339,6 +339,7 @@ class Scheduler(SchedulerDisaggMixin):
         ):
             if len(reqs) == 1 or not allow_dynamic_batching:
                 output_batch = self.worker.execute_forward(reqs)
+                self._set_output_dynamic_batch_metadata(output_batch, reqs)
                 self._batch_admission.record_batch_result(reqs, output_batch)
                 return output_batch
 
@@ -349,6 +350,7 @@ class Scheduler(SchedulerDisaggMixin):
             batch_size = len(reqs)
             try:
                 output_batch = self.worker.execute_forward([merged_req])
+                self._set_output_dynamic_batch_metadata(output_batch, reqs)
                 self._batch_admission.record_batch_result(reqs, output_batch)
                 if output_batch.error:
                     logger.error(
@@ -393,6 +395,9 @@ class Scheduler(SchedulerDisaggMixin):
         outputs = []
         for req in reqs:
             output_batch = self.worker.execute_forward([req])
+            output_batch.dynamic_batch_size = 1
+            output_batch.dynamic_batch_capacity = 1
+            output_batch.dynamic_batch_stop_reason = "sequential_fallback"
             self._batch_admission.record_batch_result([req], output_batch)
             outputs.append(output_batch)
         return outputs
@@ -625,7 +630,48 @@ class Scheduler(SchedulerDisaggMixin):
         error_msg: str,
         is_oom: bool = False,
     ) -> List[OutputBatch]:
-        return [OutputBatch(error=error_msg, is_oom=is_oom) for _ in reqs]
+        batch_size, capacity, stop_reason = self._get_dynamic_batch_metadata(reqs)
+        return [
+            OutputBatch(
+                error=error_msg,
+                is_oom=is_oom,
+                dynamic_batch_size=batch_size,
+                dynamic_batch_capacity=capacity,
+                dynamic_batch_stop_reason=stop_reason,
+            )
+            for _ in reqs
+        ]
+
+    @staticmethod
+    def _set_req_dynamic_batch_metadata(
+        reqs: List[Req],
+        *,
+        batch_size: int,
+        capacity: int,
+        stop_reason: str,
+    ) -> None:
+        for req in reqs:
+            req._dynamic_batch_size = batch_size  # type: ignore[attr-defined]
+            req._dynamic_batch_capacity = capacity  # type: ignore[attr-defined]
+            req._dynamic_batch_stop_reason = stop_reason  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _get_dynamic_batch_metadata(reqs: List[Req]) -> tuple[int, int, str | None]:
+        if not reqs:
+            return 1, 1, None
+        req = reqs[0]
+        batch_size = int(getattr(req, "_dynamic_batch_size", max(1, len(reqs))))
+        capacity = int(getattr(req, "_dynamic_batch_capacity", batch_size))
+        stop_reason = getattr(req, "_dynamic_batch_stop_reason", None)
+        return max(1, batch_size), max(1, capacity), stop_reason
+
+    def _set_output_dynamic_batch_metadata(
+        self, output_batch: OutputBatch, reqs: List[Req]
+    ) -> None:
+        batch_size, capacity, stop_reason = self._get_dynamic_batch_metadata(reqs)
+        output_batch.dynamic_batch_size = batch_size
+        output_batch.dynamic_batch_capacity = capacity
+        output_batch.dynamic_batch_stop_reason = stop_reason
 
     def return_result(
         self,
@@ -801,6 +847,9 @@ class Scheduler(SchedulerDisaggMixin):
                 peak_memory_mb=output_batch.peak_memory_mb,
                 peak_allocated_memory_mb=output_batch.peak_allocated_memory_mb,
                 is_oom=output_batch.is_oom,
+                dynamic_batch_size=output_batch.dynamic_batch_size,
+                dynamic_batch_capacity=output_batch.dynamic_batch_capacity,
+                dynamic_batch_stop_reason=output_batch.dynamic_batch_stop_reason,
             )
             if split.metrics is not None:
                 split.metrics.request_id = req.request_id
@@ -835,6 +884,12 @@ class Scheduler(SchedulerDisaggMixin):
         if not self._dynamic_batching_enabled():
             identity, req, enqueue_time = self.waiting_queue.popleft()
             if isinstance(req, Req):
+                self._set_req_dynamic_batch_metadata(
+                    [req],
+                    batch_size=1,
+                    capacity=1,
+                    stop_reason="dynamic_disabled",
+                )
                 self._record_batch_dispatch_metrics(
                     batch_size=1,
                     queue_wait_ms=(time.monotonic() - enqueue_time) * 1000.0,
@@ -859,12 +914,19 @@ class Scheduler(SchedulerDisaggMixin):
                 reason = self._get_dynamic_batch_reject_reason(req, req)
                 if reason is not None:
                     reject_reasons.append(f"head:{reason}")
+            stop_reason = reject_reasons[0] if reject_reasons else "head_ineligible"
+            self._set_req_dynamic_batch_metadata(
+                [req],
+                batch_size=1,
+                capacity=1,
+                stop_reason=stop_reason,
+            )
             self._record_batch_dispatch_metrics(
                 batch_size=1,
                 queue_wait_ms=(time.monotonic() - head_enqueue_time) * 1000.0,
                 effective_max_batch_size=1,
                 reject_reasons=reject_reasons,
-                stop_reason=reject_reasons[0] if reject_reasons else "head_ineligible",
+                stop_reason=stop_reason,
             )
             return [(identity, req)]
 
@@ -924,12 +986,19 @@ class Scheduler(SchedulerDisaggMixin):
                 stop_reason = "delay"
             else:
                 stop_reason = "ready"
+        effective_max_batch_size = self._batch_admission.get_max_admissible_batch_size(
+            compatible_reqs[0]
+        )
+        self._set_req_dynamic_batch_metadata(
+            compatible_reqs,
+            batch_size=batch_len,
+            capacity=effective_max_batch_size,
+            stop_reason=stop_reason,
+        )
         self._record_batch_dispatch_metrics(
             batch_size=batch_len,
             queue_wait_ms=oldest_wait_s * 1000.0,
-            effective_max_batch_size=(
-                self._batch_admission.get_max_admissible_batch_size(compatible_reqs[0])
-            ),
+            effective_max_batch_size=effective_max_batch_size,
             reject_reasons=reject_reasons,
             stop_reason=stop_reason,
         )

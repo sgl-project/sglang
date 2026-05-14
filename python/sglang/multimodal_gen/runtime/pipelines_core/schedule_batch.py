@@ -402,3 +402,6 @@ class OutputBatch:
     peak_memory_mb: float = 0.0
     peak_allocated_memory_mb: float = 0.0
     is_oom: bool = False
+    dynamic_batch_size: int = 1
+    dynamic_batch_capacity: int = 1
+    dynamic_batch_stop_reason: str | None = None
