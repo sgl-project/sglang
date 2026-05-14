@@ -35,9 +35,9 @@ on:
         type: string
         required: true
       run_timeout_minutes:
-        description: 'timeout-minutes for the Run test step.'
+        description: 'timeout-minutes for the Run test step. Required so compute_partitions.py can read it from pr-test.yml without a duplicated default constant.'
         type: string
-        default: '30'
+        required: true
       timeout_per_file:
         description: 'run_suite.py --timeout-per-file value (empty = unset).'
         type: string

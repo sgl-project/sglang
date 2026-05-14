@@ -43,17 +43,14 @@ _STAGE_A_OVERRIDES = {
 
 _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
 
-# Mirror `_pr-test-stage.yml` `inputs.run_timeout_minutes.default`. Keep
-# in sync if that default ever changes (last touched 2026-05-13).
-_RUN_TIMEOUT_MIN_DEFAULT = 30
-
 
 def load_run_timeouts(pr_test_yml_path: str) -> dict:
     """Map `self_name -> run_timeout_minutes` by reading `pr-test.yml`.
-    Stages without an explicit `run_timeout_minutes:` fall back to
-    `_RUN_TIMEOUT_MIN_DEFAULT`. Stage-a-test-cpu lives inline (not via
-    the reusable workflow) and is skipped here -- it goes through
-    `_STAGE_A_OVERRIDES` and never consults `run_timeouts`."""
+    Every stage that uses `_pr-test-stage.yml` must specify
+    `run_timeout_minutes:` (it's a required reusable-workflow input);
+    KeyError surfaces a missing one. Stage-a-test-cpu lives inline and
+    is skipped here -- it goes through `_STAGE_A_OVERRIDES` and never
+    consults `run_timeouts`."""
     with open(pr_test_yml_path) as f:
         wf = yaml.safe_load(f)
     timeouts = {}
@@ -62,9 +59,7 @@ def load_run_timeouts(pr_test_yml_path: str) -> dict:
             continue
         with_ = job.get("with") or {}
         suite = with_.get("self_name", job_id)
-        timeouts[suite] = int(
-            with_.get("run_timeout_minutes", _RUN_TIMEOUT_MIN_DEFAULT)
-        )
+        timeouts[suite] = int(with_["run_timeout_minutes"])
     if not timeouts:
         raise RuntimeError(
             f"load_run_timeouts: no jobs matched uses={_REUSABLE_STAGE_USES!r} "
