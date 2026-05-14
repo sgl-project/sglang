@@ -108,8 +108,7 @@ fn bench_tracked_mark_completed_drop(c: &mut Criterion) {
         b.iter(|| {
             let worker = make_worker();
             let inner = futures_util::stream::pending::<Result<Bytes, BenchErr>>();
-            let mut tracked =
-                BreakerTrackedStream::new(inner, worker, "http://bench".to_string());
+            let mut tracked = BreakerTrackedStream::new(inner, worker, "http://bench".to_string());
             tracked.mark_completed();
             black_box(&tracked);
             drop(tracked);

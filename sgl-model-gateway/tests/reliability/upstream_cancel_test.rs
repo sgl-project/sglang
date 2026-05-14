@@ -4,8 +4,7 @@
 //! terminates the upstream request to the backend worker promptly
 //! (via the `tokio::select!` / `tx.closed()` mechanism in the router).
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -973,9 +972,12 @@ mod upstream_cancel_tests {
     /// piece.
     #[tokio::test]
     async fn test_tool_interception_streaming_cancel_on_client_disconnect() {
-        use crate::common::mock_mcp_server::MockMCPServer;
-        use crate::common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
         use smg::routers::{RouterFactory, RouterTrait};
+
+        use crate::common::{
+            mock_mcp_server::MockMCPServer,
+            mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+        };
 
         let worker_port = 20263;
         let total_chunks: usize = 20;
@@ -1107,9 +1109,12 @@ mod upstream_cancel_tests {
     /// return `Some(...)`.
     #[tokio::test]
     async fn test_tool_interception_cancel_during_send() {
-        use crate::common::mock_mcp_server::MockMCPServer;
-        use crate::common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
         use smg::routers::{RouterFactory, RouterTrait};
+
+        use crate::common::{
+            mock_mcp_server::MockMCPServer,
+            mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+        };
 
         let worker_port = 20264;
         // slow_stream is configured so that IF the mock ever gets past
@@ -1216,10 +1221,13 @@ mod upstream_cancel_tests {
     /// for the MCP-interception branch (streaming.rs:1023-1033).
     #[tokio::test]
     async fn test_tool_interception_streaming_error_skips_persistence() {
-        use crate::common::mock_mcp_server::MockMCPServer;
-        use crate::common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
         use data_connector::ResponseId;
         use smg::routers::{RouterFactory, RouterTrait};
+
+        use crate::common::{
+            mock_mcp_server::MockMCPServer,
+            mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+        };
 
         let worker_port = 20267;
         let total_chunks: usize = 10;
