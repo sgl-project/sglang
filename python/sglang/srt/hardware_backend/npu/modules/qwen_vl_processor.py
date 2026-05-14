@@ -72,7 +72,6 @@ def npu_wrapper_preprocess(func):
         images: list["torch.Tensor"],
         do_resize: bool,
         size: SizeDict,
-        interpolation: Optional["tvF.InterpolationMode"],
         do_rescale: bool,
         rescale_factor: float,
         do_normalize: bool,
@@ -83,6 +82,7 @@ def npu_wrapper_preprocess(func):
         merge_size: int,
         disable_grouping: bool | None,
         return_tensors: str | TensorType | None,
+        interpolation: Optional["tvF.InterpolationMode"] = None,
         **kwargs,
     ):
         # Group images by size for batched resizing
