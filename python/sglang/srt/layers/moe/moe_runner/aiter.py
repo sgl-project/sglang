@@ -41,6 +41,7 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     doweight_stage1: bool = False
     hidden_pad: int = 0
     intermediate_pad: int = 0
+    swiglu_limit: float = 0.0
 
 
 _AITER_ACTIVATIONS = {"silu": "Silu", "swiglu": "Swiglu"}
@@ -54,6 +55,7 @@ def fused_experts_none_to_aiter(
 ) -> StandardCombineInput:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
+    from aiter.ops.flydsl.moe_common import GateMode
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
@@ -90,5 +92,7 @@ def fused_experts_none_to_aiter(
         doweight_stage1=quant_info.doweight_stage1,
         hidden_pad=quant_info.hidden_pad,
         intermediate_pad=quant_info.intermediate_pad,
+        gate_mode=GateMode.INTERLEAVE.value,
+        swiglu_limit=quant_info.swiglu_limit,
     )
     return StandardCombineInput(hidden_states=output)
