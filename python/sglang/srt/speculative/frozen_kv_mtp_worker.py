@@ -179,9 +179,11 @@ class FrozenKVMTPWorker(TpModelWorker):
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
         self.cuda_graph_runner = None
 
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_cuda_graphs()
 
     @property
@@ -422,9 +424,11 @@ class FrozenKVMTPWorker(TpModelWorker):
                 seq_lens_cpu,
                 can_run_cuda_graph,
             ) = self.forward_target_extend(batch)
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 self.forward_draft_extend(
                     batch,
                     logits_output.hidden_states,
@@ -440,9 +444,11 @@ class FrozenKVMTPWorker(TpModelWorker):
             )
 
         set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             verify_input = self.draft(batch)
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
         set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
@@ -458,9 +464,11 @@ class FrozenKVMTPWorker(TpModelWorker):
                 )
 
         set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             draft_extend_input = verify_output.draft_extend_input
             if (
                 self.server_args.enable_dp_attention

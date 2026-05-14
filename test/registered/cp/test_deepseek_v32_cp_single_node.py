@@ -15,7 +15,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=616,
-    suite="stage-c-test-deepep-8-gpu-h200",
+    stage="stage-c",
+    runner_config="deepep-8-gpu-h200",
 )
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
