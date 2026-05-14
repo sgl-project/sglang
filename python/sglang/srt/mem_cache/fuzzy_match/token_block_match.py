@@ -297,7 +297,17 @@ class TokenBlockMatchProvider(FuzzyMatchProvider):
         
         # Get pool indices from node references
         kv_cache_indices = self.non_prefix_store.resolve_kv_cache(entry, matched_len)
-        
+
+        # Surface the donor's final TreeNode id so RadixCache.match_prefix can
+        # inc_lock_ref it. Without this, the donor's KV-pool slots can be
+        # LRU-evicted while the recipient is still consuming them, tripping
+        # the runtime pool-leak detector (~240 slots leaked on the first
+        # non-trivial fuzzy hit on Qwen-7B-AWQ / A10G, verified 2026-05-14).
+        # The donor lock is released in RadixCache.cache_finished_req.
+        donor_last_node_id = (
+            entry.node_refs[-1].node_id if entry.node_refs else None
+        )
+
         return FuzzyMatchResult(
             cached_token_count=matched_len,
             cached_token_ids=entry.token_ids[:matched_len],
@@ -305,4 +315,5 @@ class TokenBlockMatchProvider(FuzzyMatchProvider):
             kv_cache_indices=kv_cache_indices,
             position_offset=already_matched_len,
             cached_start_pos=entry.start_pos,
+            donor_last_node_id=donor_last_node_id,
         )
