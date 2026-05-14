@@ -51,7 +51,6 @@ GPU_CLEAR_WAIT = 15  # seconds between framework runs
 SERVER_FATAL_ERROR_PATTERNS = (
     "CUDA out of memory",
     "torch.OutOfMemoryError",
-    "OutOfMemoryError",
 )
 
 # Frameworks that need separate installation (conflict with sglang's deps)
