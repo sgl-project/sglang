@@ -8,8 +8,11 @@ shell for tests and future backends that do not need SRT-owned sessions.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from contextlib import asynccontextmanager
+from queue import Queue
+from threading import Thread
 from typing import TYPE_CHECKING, Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request
@@ -79,17 +82,28 @@ def create_app(
 
 
 async def _stream_omni_generate(orchestrator: OmniCoordinator, request: OmniRequest):
-    events: list[dict[str, Any]] = []
-    stream_sink = OmniStreamSink(events.append)
-    try:
-        response, _ = orchestrator.generate_with_context(
-            request,
-            stream_sink=stream_sink,
-        )
-        stream_sink.done(serialize_response(response))
-    except (ValueError, RuntimeError) as exc:
-        stream_sink.error(message=str(exc), status_code=400)
-    for event in events:
+    queue: Queue[dict[str, Any] | None] = Queue()
+
+    def run_generate() -> None:
+        stream_sink = OmniStreamSink(queue.put)
+        try:
+            response, _ = orchestrator.generate_with_context(
+                request,
+                stream_sink=stream_sink,
+            )
+            stream_sink.done(serialize_response(response))
+        except (ValueError, RuntimeError) as exc:
+            stream_sink.error(message=str(exc), status_code=400)
+        finally:
+            queue.put(None)
+
+    Thread(target=run_generate, daemon=True).start()
+    loop = asyncio.get_running_loop()
+    while True:
+        # 1. keep SSE delivery live while synchronous omni generation keeps running
+        event = await loop.run_in_executor(None, queue.get)
+        if event is None:
+            break
         yield _encode_sse_event(event)
     yield b"data: [DONE]\n\n"
 

@@ -17,6 +17,7 @@ from threading import Condition, Event, RLock, Thread, get_ident
 from typing import TYPE_CHECKING, Any, Callable
 
 from sglang.omni.core.protocol import OmniContextBundle
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH
 
 if TYPE_CHECKING:
     from sglang.omni.core.coordinator import OmniCoordinator
@@ -136,9 +137,6 @@ class OmniSchedulerState:
     running_srt_requests: dict[str, OmniSRTExecutionRequest] = field(
         default_factory=dict
     )
-    finished_srt_requests: dict[str, OmniSRTExecutionRequest] = field(
-        default_factory=dict
-    )
     pending_scheduler_thread_calls: Queue[OmniSchedulerThreadCall] = field(
         default_factory=Queue
     )
@@ -171,6 +169,7 @@ class OmniSchedulerState:
             state=state,
         )
         self.pending_srt_requests.put(pending)
+        self.notify_scheduler_progress()
         return pending
 
     def admit_srt_requests(self, scheduler: "Scheduler") -> None:
@@ -231,29 +230,19 @@ class OmniSchedulerState:
             executor.capture_session_token_bindings_after_process(sessions)
 
         for pending in observation.requests:
+            if (
+                not pending.req.finished()
+                and int(pending.req.sampling_params.max_new_tokens or 0) == 0
+            ):
+                # 1. zero-token omni prefill/commit reqs finish after KV/session capture
+                pending.req.finished_reason = FINISH_LENGTH(len(pending.req.output_ids))
             if not pending.req.finished():
                 continue
             self.running_srt_requests.pop(pending.req.rid, None)
-            self.finished_srt_requests[pending.req.rid] = pending
-
-        self.notify_scheduler_progress()
-
-    def retire_finished_srt_requests(self, scheduler: "Scheduler") -> None:
-        if not self.finished_srt_requests:
-            return
-
-        retired: list[str] = []
-        for rid, pending in self.finished_srt_requests.items():
-            if self._scheduler_still_owns_req(scheduler, pending.req):
-                continue
-            retired.append(rid)
-            # 4. wake the omni task only after SRT no longer owns the req
+            # 1. wake the omni worker after scheduler result processing captured session/KV
             pending.finish()
 
-        for rid in retired:
-            self.finished_srt_requests.pop(rid, None)
-        if retired:
-            self.notify_scheduler_progress()
+        self.notify_scheduler_progress()
 
     def start_omni_generate_task(
         self,
@@ -278,6 +267,17 @@ class OmniSchedulerState:
                 outputs.append(self.completed_task_outputs.get_nowait())
             except Empty:
                 return outputs
+
+    def mark_completed_task_output_sent(self) -> None:
+        self.completed_task_outputs.task_done()
+
+    def fail_running_srt_request(self, rid: str, error: BaseException) -> bool:
+        pending = self.running_srt_requests.pop(rid, None)
+        if pending is None:
+            return False
+        pending.fail(error)
+        self.notify_scheduler_progress()
+        return True
 
     def run_on_scheduler_thread(
         self,
@@ -308,10 +308,8 @@ class OmniSchedulerState:
 
     def has_pending_scheduler_side_work(self) -> bool:
         return (
-            self.active_task_count > 0
-            or not self.pending_srt_requests.empty()
+            not self.pending_srt_requests.empty()
             or bool(self.running_srt_requests)
-            or bool(self.finished_srt_requests)
             or not self.pending_scheduler_thread_calls.empty()
             or not self.completed_task_outputs.empty()
             or self.exclusive_waiters > 0
@@ -344,28 +342,6 @@ class OmniSchedulerState:
         with self.scheduler_condition:
             self.scheduler_condition.notify_all()
 
-    def _scheduler_still_owns_req(self, scheduler: "Scheduler", req: "Req") -> bool:
-        if req in scheduler.waiting_queue:
-            return True
-        for batch in (
-            scheduler.cur_batch,
-            scheduler.last_batch,
-            scheduler.running_batch,
-        ):
-            if batch is not None and req in batch.reqs:
-                return True
-        result_queue = getattr(scheduler, "result_queue", None)
-        if result_queue is not None:
-            for batch, _ in result_queue:
-                if req in batch.reqs:
-                    return True
-        running_mbs = getattr(scheduler, "running_mbs", None)
-        if running_mbs is not None:
-            for batch in running_mbs:
-                if batch is not None and req in batch.reqs:
-                    return True
-        return False
-
     def _run_omni_generate_task(
         self, scheduler: "Scheduler", recv_req: "OmniGenerateReqInput"
     ) -> None:
@@ -386,6 +362,8 @@ class OmniSchedulerState:
                 )
             )
             self.notify_scheduler_progress()
+            # 1. stream-visible events must leave the scheduler queue before CPU-heavy media work
+            self.completed_task_outputs.join()
 
         stream_sink = OmniStreamSink(emit_stream_event) if recv_req.stream else None
         try:

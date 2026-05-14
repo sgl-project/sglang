@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from sglang.omni.backends.ar.srt import SRTARBackend
 from sglang.omni.backends.mm_gen.pipeline_forward_backend import (
-    DirectPipelineForwardBackend,
+    LazyDirectPipelineForwardBackend,
 )
 from sglang.omni.core.coordinator import OmniCoordinator
 from sglang.omni.core.protocol import MultimodalGenerationBackend, OmniRequest
@@ -93,15 +93,15 @@ class SenseNovaU1OmniPlugin:
 def build_sensenova_u1_orchestrator(
     *,
     srt_session_adapter: "SRTBackedOmniSessionAdapter",
-    generation_backend: MultimodalGenerationBackend | None = None,
+    mm_generation_backend: MultimodalGenerationBackend | None = None,
     server_args: "SRTServerArgs | None" = None,
 ) -> OmniCoordinator:
-    if generation_backend is None:
-        generation_backend = _build_default_generation_backend(server_args)
+    if mm_generation_backend is None:
+        mm_generation_backend = _build_default_generation_backend(server_args)
     plugin = SenseNovaU1OmniPlugin()
     coordinator = OmniCoordinator(
         ar_backend=SRTARBackend(srt_session_adapter),
-        mm_generation_backend=generation_backend,
+        mm_generation_backend=mm_generation_backend,
         request_adapter=plugin.normalize_request,
         metadata={"model": plugin.model_name},
         max_concurrent_generations=_resolve_omni_max_concurrent_generations(
@@ -129,7 +129,7 @@ def build_sensenova_u1_orchestrator_from_scheduler(
             srt_request_executor=srt_request_executor,
             srt_ar_decode_max_new_tokens=srt_ar_decode_max_new_tokens,
         ),
-        generation_backend=generation_backend,
+        mm_generation_backend=generation_backend,
         server_args=server_args,
     )
 
@@ -213,7 +213,7 @@ def _build_sensenova_sampling_dataclass(
 
 def _build_default_generation_backend(
     srt_server_args: "SRTServerArgs | None",
-) -> DirectPipelineForwardBackend:
+) -> LazyDirectPipelineForwardBackend:
     from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import (
         SenseNovaU1Pipeline,
     )
@@ -232,13 +232,15 @@ def _build_default_generation_backend(
     _validate_diffusion_server_args(pipeline_server_args)
     set_global_server_args(pipeline_server_args)
     # U1 pixel-flow stays same-process because denoising reads live SRT KV handles.
-    pipeline = SenseNovaU1Pipeline(
-        pipeline_server_args.model_path,
-        pipeline_server_args,
-        executor=SyncExecutor(server_args=pipeline_server_args),
-    )
-    return DirectPipelineForwardBackend(
-        pipeline=pipeline,
+    def build_pipeline() -> SenseNovaU1Pipeline:
+        return SenseNovaU1Pipeline(
+            pipeline_server_args.model_path,
+            pipeline_server_args,
+            executor=SyncExecutor(server_args=pipeline_server_args),
+        )
+
+    return LazyDirectPipelineForwardBackend(
+        pipeline_factory=build_pipeline,
         server_args=pipeline_server_args,
     )
 

@@ -7,10 +7,12 @@ from sglang.omni.backends.mm_gen.pipeline_executor_backend import (
 )
 from sglang.omni.backends.mm_gen.pipeline_forward_backend import (
     DirectPipelineForwardBackend,
+    LazyDirectPipelineForwardBackend,
 )
 
 __all__ = [
     "DirectPipelineForwardBackend",
+    "LazyDirectPipelineForwardBackend",
     "PipelineExecutorBackend",
     "UnsupportedGenerationBackend",
 ]

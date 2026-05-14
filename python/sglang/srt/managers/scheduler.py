@@ -2619,6 +2619,16 @@ class Scheduler(
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
+            if self.running_batch.is_empty():
+                for req in list(self.waiting_queue):
+                    if self._fail_unschedulable_omni_srt_req(
+                        req,
+                        message=(
+                            "omni SRT request cannot fit in the current request "
+                            "pool; increase --max-running-requests"
+                        ),
+                    ):
+                        return None
             self.running_batch.batch_is_full = True
             return None
 
@@ -2718,6 +2728,24 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
+                    max_new_tokens = max(
+                        req.sampling_params.max_new_tokens - len(req.output_ids),
+                        0,
+                    )
+                    required_tokens = (
+                        req.extend_input_len + max_new_tokens + self.page_size
+                    )
+                    if self._fail_unschedulable_omni_srt_req(
+                        req,
+                        message=(
+                            "omni SRT request cannot fit in the current KV pool: "
+                            f"required_tokens={required_tokens}, "
+                            "available_tokens="
+                            f"{self.token_to_kv_pool_allocator.available_size()}, "
+                            f"evictable_tokens={self.tree_cache.evictable_size()}"
+                        ),
+                    ):
+                        break
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
                         self.running_batch.batch_is_full = len(
@@ -3529,19 +3557,63 @@ class Scheduler(
         """drain omni work that must complete before scheduler idle checks"""
         # 1. run lifecycle calls owned by the scheduler thread
         had_work = self.omni_scheduler_state.drain_scheduler_thread_calls()
-        # 2. wake omni tasks only after SRT has dropped finished req references
-        self.omni_scheduler_state.retire_finished_srt_requests(self)
+        # 2. drop finished internal prefill refs before admitting the next segment
+        had_work = self._filter_finished_omni_srt_batch_refs() or had_work
         # 3. submit pending omni AR segments as native SRT reqs
         self.omni_scheduler_state.admit_srt_requests(self)
         # 4. return completed omni HTTP responses through the normal tokenizer path
         had_work = self._drain_omni_task_outputs() or had_work
-        return had_work or self.omni_scheduler_state.has_pending_scheduler_side_work()
+        has_side_work = self.omni_scheduler_state.has_pending_scheduler_side_work()
+        if (
+            not had_work
+            and not has_side_work
+            and self.omni_scheduler_state.active_task_count > 0
+        ):
+            # 5. active omni tasks may need Python time before asking for SRT again
+            time.sleep(0)
+        return had_work or has_side_work
+
+    def _fail_unschedulable_omni_srt_req(
+        self,
+        req: Req,
+        *,
+        message: str,
+    ) -> bool:
+        if (
+            self.omni_scheduler_state is None
+            or req.rid not in self.omni_scheduler_state.running_srt_requests
+            or not self.running_batch.is_empty()
+        ):
+            return False
+
+        # 1. no active SRT batch can free KV, so retrying this internal req would spin forever
+        self.waiting_queue = [
+            waiting_req for waiting_req in self.waiting_queue if waiting_req is not req
+        ]
+        self.running_batch.batch_is_full = False
+        return self.omni_scheduler_state.fail_running_srt_request(
+            req.rid,
+            ValueError(f"{message}: rid={req.rid}"),
+        )
+
+    def _filter_finished_omni_srt_batch_refs(self) -> bool:
+        if self.running_batch.is_empty():
+            was_full = self.running_batch.batch_is_full
+            self.running_batch.batch_is_full = False
+            return was_full
+        before = len(self.running_batch.reqs)
+        self.running_batch.filter_batch()
+        if self.running_batch.is_empty():
+            # 1. zero-token omni prefill reqs can leave batch_is_full set after all refs finish
+            self.running_batch.batch_is_full = False
+        return len(self.running_batch.reqs) != before
 
     def _drain_omni_task_outputs(self) -> bool:
         drained = False
         for output, recv_req in self.omni_scheduler_state.pop_completed_task_outputs():
             drained = True
             self.send_to_tokenizer.send_output(output, recv_req)
+            self.omni_scheduler_state.mark_completed_task_output_sent()
         return drained
 
     def abort_request(self, recv_req: AbortReq):

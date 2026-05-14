@@ -34,7 +34,7 @@ class U1OmniUIHandler(BaseHTTPRequestHandler):
                 },
             )
         elif self.path == "/api/health":
-            self._proxy("GET", "/health", None)
+            self._proxy("GET", "/model_info", None)
         else:
             self.send_error(404)
 

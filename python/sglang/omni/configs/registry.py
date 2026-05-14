@@ -48,6 +48,7 @@ def _build_orchestrator_from_scheduler(
     scheduler: "Scheduler",
     model_key: str,
 ) -> "OmniCoordinator":
+    # TODO: make a registry
     if model_key == DEFAULT_OMNI_MODEL_KEY:
         from sglang.omni.configs.sensenova_u1 import (
             build_sensenova_u1_orchestrator_from_scheduler,

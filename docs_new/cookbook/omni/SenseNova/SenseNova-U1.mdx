@@ -44,9 +44,19 @@ SenseNova U1 is an omni model that combines autoregressive text generation with 
   </div>
 </div>
 
+A U1-style request is closer to a transfusion-like interleaving loop than a plain VLM call:
+
+1. The AR path formats the conversation, runs prefill, and decodes text until it reaches an image-generation boundary token.
+2. The generation backend runs the native pixel-flow denoising stages for that boundary.
+3. The generated image is returned as an output segment and its model context is committed back into the live session.
+4. Later AR continuation or later turns can refer to the generated image through the same session context.
+
+This is why SGLang keeps the responsibilities split:
+
 - `srt` handles chat formatting, autoregressive text decoding, sessions, and KV cache.
 - `multimodal_gen` provides the colocated stage pipeline for generated image segments.
-- `omni` coordinates the request, decides when to call each side, and commits generated media back into the conversation context.
+- `sglang.omni` contains the engine-agnostic coordinator, request/response types, HTTP entrypoints, model adapters, and backend adapters.
+- `sglang.srt.omni_session` contains SRT-owned session execution: native SRT `Req` construction, session/KV binding capture, and temporary context forward when media generation needs attention over live SRT KV.
 
 For U1, `omni` is mounted into the SRT deployment. It is not a separate FastAPI server, and it does not start a complete standalone diffusion serving instance. The generation backend runs colocated with the SRT model runner so it can use the live U1 model, session state, and KV-backed context. This is the current execution boundary for sessionful interleaved models; the same orchestrator protocol can later call a standalone diffusion serving runtime for models that do not need live SRT handles.
 
@@ -100,7 +110,7 @@ sglang serve \
 
 `--model-type omni` is intentional. `sglang serve` also supports `--model-type diffusion` for standalone SGLang-Diffusion deployments. The default `auto` mode is a dispatch choice, not a hybrid deployment; with diffusion support installed, it may route registered generation models to a standalone `multimodal_gen` diffusion server instance. SenseNova U1 needs the SRT deployment because omni sessions, chat state, KV cache, `/generate`, `/v1/chat/completions`, and `/v1/omni/generate` all live in the SRT model execution path. For U1, `multimodal_gen` is used as a colocated pipeline/stage backend, not as a separate diffusion server.
 
-For larger GPUs, add the same runtime flags you normally use for SRT, such as `--tp-size`, memory settings, or CUDA graph settings.
+For larger GPUs, add the same runtime flags you normally use for SRT, such as `--tp-size`, memory settings, or CUDA graph settings. `--diffusion-server-args` can pass generation-engine settings for omni backends that consume them, but the current U1 colocated path does not use standalone/disaggregated diffusion serving flags such as `--enable-cfg-parallel`: U1 image generation borrows live SRT model/session/KV state and runs through a colocated `multimodal_gen` pipeline.
 
 Runtime topology for U1:
 
@@ -111,6 +121,19 @@ Runtime topology for U1:
 | Omni orchestrator | Inside the SRT deployment | Calls SRT for text boundaries, calls generation backend for image boundaries, and returns ordered segments |
 | U1 generation backend | Colocated `multimodal_gen` pipeline/stages | Runs native pixel-flow image generation and commits generated image context back to SRT |
 | Standalone diffusion server | Not used for U1 in this path | Used by pure diffusion deployments through `--model-type diffusion` |
+
+Code layout:
+
+| Area | Contents |
+| --- | --- |
+| `sglang.omni.core` | Generic request/response objects, interleaved segment helpers, and the thin coordinator loop |
+| `sglang.omni.backends.ar` | AR backend boundary; the current implementation adapts omni orchestration to SRT sessions |
+| `sglang.omni.backends.mm_gen` | Media-generation backend boundary; U1 currently uses a direct colocated pipeline-forward backend, while an executor-backed backend can drive a future standalone runtime |
+| `sglang.omni.model_adapters.sensenova_u1` | U1-specific prompt grammar, image boundary token handling, thinking mode, CFG condition paths, and generated-image commit rules |
+| `sglang.omni.entrypoints` | `/v1/omni/generate`, `/v1/responses`, streaming serialization, and session-close HTTP wiring |
+| `sglang.omni.runtime` | Serve-time transport and scheduler handoff state for omni endpoints; it does not own SRT KV operations |
+| `sglang.srt.omni_session` | SRT-side session runtime that owns native SRT request execution, session lifecycle, KV bindings, and temporary context forward |
+| `sglang.multimodal_gen` | Native image/video generation stages, sampling parameters, and diffusion-style pipelines |
 
 ## 4. Usage
 

@@ -12,6 +12,8 @@ suppress_noisy_warnings()
 
 logger = logging.getLogger(__name__)
 
+_OMNI_MIN_SRT_SESSION_SLOTS = 4
+
 
 def _extract_model_type_override(extra_argv):
     """Extract and remove --model-type override from argv."""
@@ -52,6 +54,15 @@ def _enable_omni_srt_runtime_defaults(server_args, model_type):
 
     # omni sessions rely on SRT streaming-session slots to keep U KV readable by G
     server_args.enable_streaming_session = True
+    if (
+        server_args.max_running_requests is not None
+        and server_args.max_running_requests < _OMNI_MIN_SRT_SESSION_SLOTS
+    ):
+        requested_max_running_requests = int(server_args.max_running_requests)
+        if server_args.pp_max_micro_batch_size is None:
+            # 1. keep user-visible admission serial while reserving internal session slots
+            server_args.pp_max_micro_batch_size = requested_max_running_requests
+        server_args.max_running_requests = _OMNI_MIN_SRT_SESSION_SLOTS
     return server_args
 
 

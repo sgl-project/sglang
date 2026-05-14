@@ -138,13 +138,11 @@ def test_async_execute_submits_native_req_to_scheduler_state():
         )
         req._finished = True
         scheduler.omni_scheduler_state.finalize_srt_batch_after_process(observation)
-        scheduler.omni_scheduler_state.retire_finished_srt_requests(scheduler)
 
         future.result(timeout=1)
 
     assert req.finished()
     assert not scheduler.omni_scheduler_state.running_srt_requests
-    assert not scheduler.omni_scheduler_state.finished_srt_requests
 
 
 def test_temporary_context_idle_check_skips_cleanup_when_already_idle():

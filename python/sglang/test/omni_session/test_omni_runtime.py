@@ -74,6 +74,8 @@ def test_append_ar_input_tokens_preserves_explicit_positions():
 
     assert handle.context_length == 5
     assert req.origin_input_ids == [101, 102, 10, 10, 123]
+    # 1. session-internal prefix cache must stay reusable for custom-position KV
+    assert req.extra_key is None
     assert req.custom_position_ids == [0, 1, 34, 35, 36]
     assert req.omni_srt_position_count == 37
     assert record.omni_model_state["u1"]["generation_position_start"] == 37
@@ -135,6 +137,7 @@ class _FakeSRTSession:
             output_ids=[],
             multimodal_inputs=recv_req.mm_inputs,
             sampling_params=recv_req.sampling_params,
+            extra_key=recv_req.extra_key,
             to_finish=None,
             custom_position_ids=None,
             omni_srt_position_count=None,
