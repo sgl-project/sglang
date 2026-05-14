@@ -98,6 +98,14 @@ class TestScaledMM(CustomTestCase):
 
                 torch.testing.assert_close(triton_out, ref_out, rtol=rtol, atol=atol)
 
+                scale_b_row = scale_b.T.contiguous()
+                triton_out_row_scale = triton_scaled_mm(
+                    input, weight, scale_a, scale_b_row, out_dtype, bias
+                )
+                torch.testing.assert_close(
+                    triton_out_row_scale, ref_out, rtol=rtol, atol=atol
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
