@@ -897,10 +897,14 @@
                   "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_optimization",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables"
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_faq"
                 ]
               },
               "docs/hardware-platforms/cpu_server",
@@ -1042,6 +1046,7 @@
                   {
                     "group": "InternLM",
                     "pages": [
+                      "cookbook/autoregressive/InternLM/Intern-S2-Preview",
                       "cookbook/autoregressive/InternLM/Intern-S1"
                     ]
                   },
@@ -1089,6 +1094,12 @@
                     "group": "Tencent",
                     "pages": [
                       "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
+                    ]
+                  },
+                  {
+                    "group": "Poolside",
+                    "pages": [
+                      "cookbook/autoregressive/Poolside/Laguna-XS.2"
                     ]
                   }
                 ]
