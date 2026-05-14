@@ -73,7 +73,7 @@ def benchmark(batch_size: int, item_size: int, impl: str):
         FN_MAP[impl],
         input_args=(k, v, k_cache, v_cache, indices),
         graph_clone_args=(0, 1, 4),
-        memory_args=(k, k, v, v, indices),  # at least 2 load + 2 store + 1 index load
+        memory_args=(2 * (k, v), indices),  # k + v load/store, indices load
     )
 
 
