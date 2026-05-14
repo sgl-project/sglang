@@ -68,7 +68,7 @@ def benchmark(batch_size: int, item_size: int, impl: str):
     k_cache = create_empty(CACHE_SIZE, item_size)
     v = create_random(batch_size, item_size)
     v_cache = create_empty(CACHE_SIZE, item_size)
-    indices = torch.randint(0, CACHE_SIZE, (batch_size,), device=DEFAULT_DEVICE)
+    indices = torch.randperm(CACHE_SIZE, device=DEFAULT_DEVICE)[:batch_size]
     return marker.bench_one_function(
         FN_MAP[impl],
         input_args=(k, v, k_cache, v_cache, indices),
