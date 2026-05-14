@@ -17,7 +17,7 @@ on:
         type: string
         required: true
       runs_on:
-        description: 'Physical GHA runner label. Caller selects (e.g. "1-gpu-5090" or `${{ needs.check-changes.outputs.b200_runner }}` for B200).'
+        description: 'Physical GHA runner label, e.g. "1-gpu-5090" or the b200_runner output from check-changes for B200 stages.'
         type: string
         required: true
       target_stage:
@@ -122,9 +122,9 @@ jobs:
           pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
-        env:
-          CUSTOM_BUILD_SGL_KERNEL: ${{ inputs.sgl_kernel }}
-        run: timeout ${{ steps.rc.outputs.install_timeout }}m bash ${{ steps.rc.outputs.install }}
+        timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 
       - name: Warmup DeepGEMM JIT Compilation
         if: inputs.warmup_deep_gemm_models != ''
@@ -144,14 +144,14 @@ jobs:
           python3 scripts/ci/cuda/warmup_server.py ${{ inputs.warmup_server_models }}
 
       - name: Run test
+        timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error_flag }}
-          PARTITION_SIZE: ${{ fromJson(inputs.partitions)[inputs.self_name].size }}
         run: |
           cd test
-          timeout ${{ inputs.run_timeout_minutes }}m python3 run_suite.py \
-            --hw cuda --suite "${{ inputs.self_name }}" \
-            --auto-partition-id "${{ matrix.partition }}" --auto-partition-size "$PARTITION_SIZE" \
+          python3 run_suite.py --hw cuda --suite ${{ inputs.self_name }} \
+            --auto-partition-id ${{ matrix.partition }} \
+            --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
             $CONTINUE_ON_ERROR_FLAG
 
