@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 
 import numpy as np
 import torch
+import queue
 
 import sglang
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
@@ -82,6 +83,32 @@ class NPUGraphRunner(CudaGraphRunner):
         self.model_runner = model_runner
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self._replay_update_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._replay_update_done = threading.Event()
+        self._replay_update_done.set()
+        self._replay_update_error: BaseException | None = None
+        self._replay_update_thread = threading.Thread(
+            target=self._replay_update_worker_loop,
+            name="npu-graph-update",
+            daemon=True,
+        )
+        self._replay_update_thread.start()
+
+    def _replay_update_worker_loop(self):
+        while True:
+            item = self._replay_update_queue.get()
+            if item is None:
+                self._replay_update_done.set()
+                break
+
+            seq_lens = item
+            self._replay_update_error = None
+            try:
+                self._update_inputs(seq_lens)
+            except BaseException as exc:
+                self._replay_update_error = exc
+            finally:
+                self._replay_update_done.set()
 
     def _init_arch_map(self):
         if self.is_dllm:
@@ -196,10 +223,14 @@ class NPUGraphRunner(CudaGraphRunner):
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
-            thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
-            thread.start()
+            self._replay_update_done.clear()
+            self._replay_update_queue.put(seq_lens)
             self.graphs[self.bs].replay()
-            thread.join()
+            self._replay_update_done.wait()
+            if self._replay_update_error is not None:
+                raise RuntimeError("Failed to update npu graph replay inputs") from (
+                    self._replay_update_error
+                )
         else:
             self.graphs[self.bs].replay()
 

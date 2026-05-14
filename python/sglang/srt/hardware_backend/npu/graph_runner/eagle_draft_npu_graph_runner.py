@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Dict, Union
 
 import numpy as np
 import torch
+import queue
 
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -50,6 +51,32 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         self.update_attr_name = None
         self.update_attr_type = None
         self._init_arch_map()
+        self._replay_update_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._replay_update_done = threading.Event()
+        self._replay_update_done.set()
+        self._replay_update_error: BaseException | None = None
+        self._replay_update_thread = threading.Thread(
+            target=self._replay_update_worker_loop,
+            name="eagle-draft-graph-update",
+            daemon=True,
+        )
+        self._replay_update_thread.start()
+
+    def _replay_update_worker_loop(self):
+        while True:
+            item = self._replay_update_queue.get()
+            if item is None:
+                self._replay_update_done.set()
+                break
+
+            seq_lens_for_each_draft_step = item
+            self._replay_update_error = None
+            try:
+                self._replay_update(seq_lens_for_each_draft_step)
+            except BaseException as exc:  # pragma: no cover - surfaced on wait
+                self._replay_update_error = exc
+            finally:
+                self._replay_update_done.set()
 
     def _init_arch_map(self):
         self.attr_name: Dict[str, str] = {
@@ -102,12 +129,14 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
                 seq_lens_cpu = forward_batch.seq_lens_cpu + speculative_step_id + 1
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
                 seq_lens_for_each_draft_step.append(seq_lens)
-            thread = threading.Thread(
-                target=self._replay_update, args=(seq_lens_for_each_draft_step,)
-            )
-            thread.start()
+            self._replay_update_done.clear()
+            self._replay_update_queue.put(seq_lens_for_each_draft_step)
             self.graphs[self.bs].replay()
-            thread.join()
+            self._replay_update_done.wait()
+            if self._replay_update_error is not None:
+                raise RuntimeError(
+                    "Failed to update eagle draft graph replay inputs"
+                ) from self._replay_update_error
         else:
             self.graphs[self.bs].replay()
 
