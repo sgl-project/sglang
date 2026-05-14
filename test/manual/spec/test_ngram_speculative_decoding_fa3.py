@@ -2,12 +2,6 @@
 
 Backend: `--attention-backend fa3`.
 Not registered in any CI suite -- runnable manually only.
-
-Sibling files split out from the same source:
-- test/registered/spec/test_ngram_speculative_decoding.py
-    -> Paged variant (per-commit, stage-b-test-1-gpu-large)
-- test/registered/spec/test_ngram_speculative_decoding_extra.py
-    -> Triton + Flashinfer variants (extra-a-test-1-gpu-large)
 """
 
 import unittest
