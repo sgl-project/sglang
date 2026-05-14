@@ -230,6 +230,11 @@ class DecoupledVerifySpecAlgo(CustomSpecAlgo):
             )
         if int(server_args.decoupled_spec_rank) < 0:
             raise ValueError("--decoupled-spec-rank must be non-negative.")
+        if server_args.page_size is not None and server_args.page_size > 1:
+            raise ValueError(
+                "decoupled drafter currently requires page_size == 1 because "
+                "token rollback is token-granular."
+            )
 
         if server_args.max_running_requests is None:
             server_args.max_running_requests = 64
