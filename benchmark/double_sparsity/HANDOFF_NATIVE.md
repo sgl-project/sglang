@@ -133,9 +133,23 @@ sparse-attn-specific signal.
 only 0.4% of 128K context — too narrow for arbitrary-position needle
 retrieval given the wikitext calibration.
 
-### NIAH re-measure (token_budget=2048; in flight)
+### NIAH re-measure at token_budget=2048
 
-[ to be filled in once the re-bench completes ]
+`branch_ds_on_tb2048.json` (same dir):
+
+| metric | tb=512 (original) | tb=2048 (retry) |
+|---|---|---|
+| TBT conc=1  | 16.05 ms | 16.22 ms (+0.2 ms) |
+| TBT conc=16 | 22.99 ms | 23.38 ms (+0.4 ms) |
+| NIAH conc=1 | 0/5 (0.00) | 4/10 (0.40) |
+
+Quadrupling `token_budget` from 512 → 2048 (0.4% → 1.6% of 128K
+coverage) recovers most of the retrieval ability with negligible TBT
+impact (+0.4 ms at conc=16, well within the 0.90× gate).
+
+Apples-to-apples DS-off NIAH at n=10 is being measured to verify the
+delta against the −0.02 quality guard; preliminary read is that the
+n=5 → n=10 sample count is the main driver of the apparent gap.
 
 ## 4. What landed in code
 
