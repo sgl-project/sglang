@@ -4,7 +4,6 @@ import logging
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.utils import get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
@@ -701,16 +700,18 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
+        dec_lock_params = None
         try:
             result = self.tree_cache.inc_lock_ref(last_node)
-            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                swa_uuid_for_lock = result.swa_uuid_for_lock
+            if self.tree_cache.is_tree_cache():
+                # init_load_back may revive SWA/Mamba tombstones while this
+                # temporary admission lock is held. Release must mirror the
+                # exact nodes skipped at acquire time.
+                dec_lock_params = result.to_dec_params()
             yield None
         finally:
-            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                self.tree_cache.dec_lock_ref(
-                    last_node, DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock)
-                )
+            if dec_lock_params is not None:
+                self.tree_cache.dec_lock_ref(last_node, dec_lock_params)
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
