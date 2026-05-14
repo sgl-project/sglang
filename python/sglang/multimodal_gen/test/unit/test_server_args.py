@@ -497,12 +497,9 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.enable_cfg_parallel)
         self.assertFalse(args.dit_cpu_offload)
         self.assertTrue(args.dit_layerwise_offload)
-        self.assertFalse(args.text_encoder_cpu_offload)
-        self.assertFalse(args.image_encoder_cpu_offload)
-        self.assertEqual(
-            args.layerwise_offload_components,
-            ["default", "text_encoder", "image_encoder"],
-        )
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.image_encoder_cpu_offload)
+        self.assertIsNone(args.layerwise_offload_components)
 
     def test_auto_multi_gpu_qwen_replaces_text_encoder_offload_with_cfg(self):
         args = self._from_dict_with_pipeline_config(
