@@ -23,8 +23,7 @@ runs:
       id: rc
       shell: bash
       run: |
-        python3 scripts/ci/runner_configs.py github_output \
-          --runner-config '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+        python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
 
     - uses: ./.github/actions/check-stage-health
 
