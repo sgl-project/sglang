@@ -277,60 +277,23 @@ jobs:
   # Runs on 5090 (32GB, SM120)
   stage-a-test-1-gpu-small:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-a-test-1-gpu-small') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 1-gpu-5090
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-1-gpu-small'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-1-gpu-small'].arr }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 10
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test/
-          python3 run_suite.py --hw cuda --suite stage-a-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-1-gpu-small'].size }} $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-a-test-1-gpu-small
+      runner_config: 1-gpu-small
+      runs_on: 1-gpu-5090
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      run_timeout_minutes: '10'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   stage-a-test-cpu:
     needs: [check-changes, call-gate]
@@ -406,244 +369,83 @@ jobs:
   # Runs on 5090 (32GB, SM120)
   stage-b-test-1-gpu-small:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-1-gpu-small') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 1-gpu-5090
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-small'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-small'].arr }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-small'].size }} $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-        with:
-          artifact-suffix: ${{ matrix.partition }}
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-b-test-1-gpu-small
+      runner_config: 1-gpu-small
+      runs_on: 1-gpu-5090
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   stage-b-test-1-gpu-large:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-1-gpu-large') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 1-gpu-h100
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-large'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-large'].arr }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-large'].size }} --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-        with:
-          artifact-suffix: ${{ matrix.partition }}
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-b-test-1-gpu-large
+      runner_config: 1-gpu-large
+      runs_on: 1-gpu-h100
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      timeout_per_file: '1800'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   stage-b-test-2-gpu-large:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-2-gpu-large') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 2-gpu-h100
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-2-gpu-large'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-2-gpu-large'].arr }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-2-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-2-gpu-large'].size }} $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-        with:
-          artifact-suffix: ${{ matrix.partition }}
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-b-test-2-gpu-large
+      runner_config: 2-gpu-large
+      runs_on: 2-gpu-h100
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   stage-b-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-b-test-4-gpu-b200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-4-gpu-b200'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-4-gpu-b200'].arr }}
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v6
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 40
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test
-          python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-4-gpu-b200'].size }} $CONTINUE_ON_ERROR_FLAG
-
-      - name: Run FA4 jit_kernel tests (SM100+)
-        timeout-minutes: 10
-        run: |
-          python3 -m pytest -q python/sglang/jit_kernel/tests/test_flash_attention_4.py
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-b-test-4-gpu-b200
+      runner_config: 4-gpu-b200
+      runs_on: ${{ needs.check-changes.outputs.b200_runner }}
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      run_timeout_minutes: '40'
+      extra_pytest_path: 'python/sglang/jit_kernel/tests/test_flash_attention_4.py'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   call-multimodal-gen-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -680,571 +482,170 @@ jobs:
 
   stage-c-test-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-4-gpu-h100') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 4-gpu-h100
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-h100'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-h100'].arr }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-h100 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-h100'].size }} $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-        with:
-          artifact-suffix: ${{ matrix.partition }}
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-c-test-4-gpu-h100
+      runner_config: 4-gpu-h100
+      runs_on: 4-gpu-h100
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   stage-c-test-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-8-gpu-h200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 8-gpu-h200
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h200'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h200'].arr }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Warmup DeepGEMM JIT Compilation
-        # Per-model TP must match the test's launch in test/registered/ — see
-        # FALLBACK_ARGS in scripts/ci/cuda/warmup_deep_gemm.py for extra dp/ep
-        # flags. Only models that actually invoke DeepGEMM kernels at runtime
-        # are listed. Cold-cache ~13 min; warm-cache ≤30 s via marker file.
-        timeout-minutes: 60
-        run: |
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
-          python3 scripts/ci/cuda/warmup_deep_gemm.py \
-            deepseek-ai/DeepSeek-V3-0324:8 \
-            deepseek-ai/DeepSeek-V3.2:8 \
-            zai-org/GLM-5-FP8:8 \
-            XiaomiMiMo/MiMo-V2-Flash:4 \
-            XiaomiMiMo/MiMo-V2.5:8
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h200'].size }} $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-        with:
-          artifact-suffix: ${{ matrix.partition }}
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-c-test-8-gpu-h200
+      runner_config: 8-gpu-h200
+      runs_on: 8-gpu-h200
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      # Per-model TP must match the test's launch in test/registered/ -- see
+      # FALLBACK_ARGS in scripts/ci/cuda/warmup_deep_gemm.py for extra dp/ep
+      # flags. Only models that actually invoke DeepGEMM kernels at runtime
+      # are listed. Cold-cache ~13 min; warm-cache <=30 s via marker file.
+      # Server CUDA Graph warmup is combined into this step (warmup_server_models unset).
+      warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8 zai-org/GLM-5-FP8:8 XiaomiMiMo/MiMo-V2-Flash:4 XiaomiMiMo/MiMo-V2.5:8'
+      warmup_timeout_minutes: '60'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   stage-c-test-8-gpu-h20:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-8-gpu-h20') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 8-gpu-h20
-    timeout-minutes: 240
-    env:
-      SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h20'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h20'].arr }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h20'].size }} $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-c-test-8-gpu-h20
+      runner_config: 8-gpu-h20
+      runs_on: 8-gpu-h20
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   stage-c-test-deepep-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-deepep-4-gpu-h100') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 4-gpu-h100
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-4-gpu-h100'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-4-gpu-h100'].arr }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
-
-      - name: Warmup DeepGEMM JIT Compilation
-        timeout-minutes: 25
-        run: |
-          # Activate venv if available (GITHUB_ENV may have failed to propagate)
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
-          python3 scripts/ci/cuda/warmup_deep_gemm.py \
-            lmsys/sglang-ci-dsv3-test:4
-
-      - name: Warmup Server CUDA Graphs
-        timeout-minutes: 25
-        run: |
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
-          python3 scripts/ci/cuda/warmup_server.py \
-            lmsys/sglang-ci-dsv3-test:4
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu-h100 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-4-gpu-h100'].size }} $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-c-test-deepep-4-gpu-h100
+      runner_config: deepep-4-gpu-h100
+      runs_on: 4-gpu-h100
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4'
+      warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   stage-c-test-deepep-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-deepep-8-gpu-h200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 8-gpu-h200-deepep
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-8-gpu-h200'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-8-gpu-h200'].arr }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
-
-      - name: Warmup DeepGEMM JIT Compilation
-        timeout-minutes: 25
-        run: |
-          # Activate venv if available (GITHUB_ENV may have failed to propagate)
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
-          python3 scripts/ci/cuda/warmup_deep_gemm.py \
-            deepseek-ai/DeepSeek-V3-0324:8 \
-            deepseek-ai/DeepSeek-V3.2:8
-
-      - name: Warmup Server CUDA Graphs
-        timeout-minutes: 25
-        run: |
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
-          python3 scripts/ci/cuda/warmup_server.py \
-            deepseek-ai/DeepSeek-V3-0324:8
-
-      - name: Run test
-        timeout-minutes: 45
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-8-gpu-h200'].size }} $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-c-test-deepep-8-gpu-h200
+      runner_config: deepep-8-gpu-h200
+      runs_on: 8-gpu-h200-deepep
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      run_timeout_minutes: '45'
+      warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8'
+      warmup_server_models: 'deepseek-ai/DeepSeek-V3-0324:8'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   stage-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-4-gpu-b200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-b200'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-b200'].arr }}
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v6
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-b200'].size }} --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-        with:
-          artifact-suffix: ${{ matrix.partition }}
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-c-test-4-gpu-b200
+      runner_config: 4-gpu-b200
+      runs_on: ${{ needs.check-changes.outputs.b200_runner }}
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      timeout_per_file: '1800'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   stage-c-test-dsv4-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-dsv4-4-gpu-b200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-4-gpu-b200'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-4-gpu-b200'].arr }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v6
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 30
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dsv4_dep.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-4-gpu-b200 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-4-gpu-b200'].size }} --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-c-test-dsv4-4-gpu-b200
+      runner_config: dsv4-4-gpu-b200
+      runs_on: ${{ needs.check-changes.outputs.b200_runner }}
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      timeout_per_file: '1800'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   stage-c-test-dsv4-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-dsv4-8-gpu-h200') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: 8-gpu-h200
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-8-gpu-h200'].max_parallel }}
-      matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-8-gpu-h200'].arr }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 30
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dsv4_dep.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-8-gpu-h200 --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-8-gpu-h200'].size }} --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
-
-  # NOTE: GB200 stage temporarily disabled — no company-owned GB200 runner available yet.
-  # Re-enable when a 4-gpu-gb200 runner is provisioned.
-  # stage-c-test-4-gpu-gb200:
-  #   needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
-  #   if: |
-  #     always() &&
-  #     (
-  #       (inputs.target_stage == 'stage-c-test-4-gpu-gb200') ||
-  #       (
-  #         !inputs.target_stage &&
-  #         ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-  #         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-  #       )
-  #     )
-  #   runs-on: 4-gpu-gb200
-  #   timeout-minutes: 240
-  #   strategy:
-  #     fail-fast: false
-  #   steps:
-  #     - uses: ./.github/actions/check-maintenance
-  #       with:
-  #         github-token: ${{ github.token }}
-  #
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
-  #       with:
-  #         ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-  #
-  #     - name: Download artifacts
-  #       if: needs.check-changes.outputs.sgl_kernel == 'true'
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         path: sgl-kernel/dist/
-  #         merge-multiple: true
-  #         pattern: wheel-python3.10-cuda13.0-aarch64
-  #
-  #     - name: Install dependencies
-  #       timeout-minutes: 20
-  #       run: |
-  #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} GRACE_BLACKWELL=1 bash scripts/ci/cuda/ci_install_deepep.sh
-  #
-  #     - name: Run test
-  #       timeout-minutes: 45
-  #       env:
-  #         CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-  #       run: |
-  #         cd test
-  #         python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG
-  #
-  #     - uses: ./.github/actions/upload-cuda-coredumps
-  #       if: failure()
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: stage-c-test-dsv4-8-gpu-h200
+      runner_config: dsv4-8-gpu-h200
+      runs_on: 8-gpu-h200
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      main_package: ${{ needs.check-changes.outputs.main_package }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      timeout_per_file: '1800'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
 
   pr-test-finish:
     needs:
