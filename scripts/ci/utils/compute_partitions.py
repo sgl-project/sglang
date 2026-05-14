@@ -41,19 +41,39 @@ _STAGE_A_OVERRIDES = {
     "stage-a-test-1-gpu-small": 1,
 }
 
-# Default Run-test step timeout (minutes); mirrors `_pr-test-stage.yml`
-# `inputs.run_timeout_minutes.default`. Used when pr-test.yml doesn't
-# explicitly override for a given stage.
-_RUN_TIMEOUT_MIN_DEFAULT = 30
 _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
+_REUSABLE_STAGE_YML = os.path.join(
+    REPO_ROOT, ".github", "workflows", "_pr-test-stage.yml"
+)
+
+
+def load_run_timeout_default(stage_yml_path: str = _REUSABLE_STAGE_YML) -> int:
+    """Read `inputs.run_timeout_minutes.default` from `_pr-test-stage.yml`.
+    Source of truth for the default applied to stages that don't override
+    in pr-test.yml."""
+    with open(stage_yml_path) as f:
+        wf = yaml.safe_load(f)
+    # PyYAML (YAML 1.1) parses the `on:` key as boolean True.
+    on_block = wf.get(True) or wf.get("on") or {}
+    inputs = (on_block.get("workflow_call") or {}).get("inputs") or {}
+    spec = inputs.get("run_timeout_minutes") or {}
+    default = spec.get("default")
+    if default is None:
+        raise RuntimeError(
+            f"run_timeout_minutes.default missing in {stage_yml_path}; "
+            "schema changed?"
+        )
+    return int(default)
 
 
 def load_run_timeouts(pr_test_yml_path: str) -> dict:
     """Map `self_name -> run_timeout_minutes` by reading `pr-test.yml`.
-    Source of truth is the workflow file; missing entries default to
-    `_RUN_TIMEOUT_MIN_DEFAULT`. Stage-a-test-cpu lives inline (not via
-    the reusable workflow) and is skipped here -- it goes through
-    `_STAGE_A_OVERRIDES` and never consults `run_timeouts`."""
+    Source of truth is the workflow file; per-stage missing values
+    fall back to the reusable workflow's `inputs.run_timeout_minutes.default`.
+    Stage-a-test-cpu lives inline (not via the reusable workflow) and is
+    skipped here -- it goes through `_STAGE_A_OVERRIDES` and never
+    consults `run_timeouts`."""
+    default_min = load_run_timeout_default()
     with open(pr_test_yml_path) as f:
         wf = yaml.safe_load(f)
     timeouts = {}
@@ -62,9 +82,7 @@ def load_run_timeouts(pr_test_yml_path: str) -> dict:
             continue
         with_ = job.get("with") or {}
         suite = with_.get("self_name", job_id)
-        timeouts[suite] = int(
-            with_.get("run_timeout_minutes", _RUN_TIMEOUT_MIN_DEFAULT)
-        )
+        timeouts[suite] = int(with_.get("run_timeout_minutes", default_min))
     if not timeouts:
         raise RuntimeError(
             f"load_run_timeouts: no jobs matched uses={_REUSABLE_STAGE_USES!r} "
@@ -78,8 +96,7 @@ def per_shard_target_seconds(suite: str, run_timeouts: dict) -> float:
     """Per-shard wall budget = 0.75 * stage timeout. 0.75 is the inverse
     of LPT's 4/3 worst-case approximation ratio, so the most imbalanced
     LPT shard fills exactly the timeout."""
-    timeout_min = run_timeouts.get(suite, _RUN_TIMEOUT_MIN_DEFAULT)
-    return 0.75 * timeout_min * 60
+    return 0.75 * run_timeouts[suite] * 60
 
 
 def discover_files(repo_root: str) -> list[str]:
