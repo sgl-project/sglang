@@ -41,7 +41,7 @@ def wait_all_ports_release(base_url, timeout_s=60):
     print(f"Warning: some ports still occupied after {timeout_s}s")
 
 
-register_amd_ci(est_time=1200, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 common_args = [
     "--tp-size",
