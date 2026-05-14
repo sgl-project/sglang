@@ -142,8 +142,27 @@ insensitive; sparse attention scales linearly with `total_selected`
 but at bs=1 the kernel is overhead-bound (microbench: selected=512
 and selected=2048 take essentially identical time).
 
-For tb=8192 the conc=16 TBT confirms the perf-quality crossover —
-[ to be filled in once the conc=16 retry completes; in flight ].
+### The Pareto picture across `token_budget`
+
+Both gates (TBT ≤0.90× dense, NIAH ≥ dense −0.02) on the same
+operating point are NOT achievable at the wikitext calibration:
+
+| tb | conc | TBT(on) ms | TBT ratio vs off | NIAH | NIAH delta vs dense |
+|---:|---:|---:|---:|---:|---:|
+| 512  | 16 | 22.99 | **0.82×** PASS | 0.00 (n=5) | −0.60 FAIL |
+| 2048 | 16 | 23.38 | **0.84×** PASS | 0.40 (n=10) | −0.40 FAIL |
+| 8192 | 16 | 27.83 | 0.996× FAIL | **0.90** (n=10) PASS | +0.10 PASS |
+
+Reading the table: at tb=512/2048 the perf gate passes, at tb=8192 the
+quality gate passes, but no single tb passes both. The TBT cost of
+quality is the cost of wider sparse-attention loads — `total_selected`
+grows from 580 → 2116 → 8260 tokens.
+
+The block-the-line is calibration shape, not kernel efficiency. With
+retrieval-style calibration (LongBench / NIAH-shaped passages) the
+heavy channels would learn to flag needle-like K patterns at lower
+budgets, shifting the curve so both gates can land at e.g. tb=2048.
+That's the next iteration's lever.
 
 ### NIAH re-measure at token_budget=2048
 
