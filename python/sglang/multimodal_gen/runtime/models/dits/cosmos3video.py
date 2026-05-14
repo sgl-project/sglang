@@ -7,6 +7,7 @@ cross-attends from noisy visual tokens to that cache at every denoising step.
 """
 
 import math
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import torch
@@ -14,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     sequence_model_parallel_all_gather,
@@ -1310,6 +1312,85 @@ class Cosmos3OmniTransformer(CachableDiT):
                 output = output[:, :seq_len_orig, :]
 
         return self.unpatchify(output, T, H, W)
+
+    def preprocess_loaded_state_dict(
+        self, iterator: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        # ModelOpt FP8 emits a 0-d per-tensor scale per source Linear. Where
+        # sources fuse into a single MergedColumnParallelLinear (Q/K/V into
+        # to_qkv, gate/up into gate_up_proj), the FP8 weights of each shard
+        # are quantized against their own scale. Naively concatenating the
+        # FP8 bytes and applying a single fused scale at runtime yields noise
+        # (the K/V tiles get dequant'd with the wrong factor).
+        #
+        # Fix: per fused Linear, dequant each FP8 shard with its own scale,
+        # pick max as the fused scale, requant each shard against the max,
+        # then concat the requantized FP8 bytes. input_scale is shared across
+        # shards (same activation tensor), so just take max — no requant
+        # needed.
+        mapping_fn = get_param_names_mapping(self.param_names_mapping)
+        pending: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
+        expected_count: dict[str, int] = {}
+
+        def _try_emit(linear_target: str):
+            groups = pending.get(linear_target, {})
+            n = expected_count.get(linear_target)
+            if n is None:
+                return
+            weights = groups.get("weight", {})
+            w_scales = groups.get("weight_scale", {})
+            i_scales = groups.get("input_scale", {})
+            if len(weights) != n or len(w_scales) != n:
+                return
+            saw_input_scale = bool(i_scales)
+            if saw_input_scale and len(i_scales) != n:
+                return
+            scales_t = torch.stack([w_scales[i].reshape(()) for i in range(n)])
+            max_w_scale = scales_t.max()
+            rescaled = []
+            for i in range(n):
+                w_fp8 = weights[i]
+                original_scale = w_scales[i].reshape(()).to(
+                    torch.float32
+                )
+                w_dequant = w_fp8.to(torch.float32) * original_scale
+                w_requant = (
+                    w_dequant / max_w_scale.to(torch.float32)
+                ).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                rescaled.append(w_requant)
+            merged_weight = torch.cat(rescaled, dim=0)
+            pending.pop(linear_target, None)
+            expected_count.pop(linear_target, None)
+            yield linear_target + ".weight", merged_weight
+            yield linear_target + ".weight_scale", max_w_scale
+            if saw_input_scale:
+                in_t = torch.stack(
+                    [i_scales[i].reshape(()) for i in range(n)]
+                )
+                yield linear_target + ".input_scale", in_t.max()
+
+        for name, tensor in iterator:
+            target_name, merge_index, num_to_merge = mapping_fn(name)
+            if num_to_merge is None:
+                yield target_name, tensor
+                continue
+            suffix = None
+            for candidate in ("weight_scale", "input_scale", "weight"):
+                if target_name.endswith("." + candidate):
+                    suffix = candidate
+                    break
+            if suffix is None:
+                yield name, tensor
+                continue
+            if suffix == "weight" and tensor.dtype != torch.float8_e4m3fn:
+                yield name, tensor
+                continue
+            linear_target = target_name[: -(len(suffix) + 1)]
+            pending.setdefault(linear_target, {}).setdefault(suffix, {})[
+                merge_index
+            ] = tensor
+            expected_count[linear_target] = num_to_merge
+            yield from _try_emit(linear_target)
 
     def post_load_weights(self, target_dtype: torch.dtype = torch.bfloat16) -> None:
         """Cast non-quantized parameters to their preferred dtypes and rebuild

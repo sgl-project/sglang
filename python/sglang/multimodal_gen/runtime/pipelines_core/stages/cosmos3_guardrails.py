@@ -156,16 +156,18 @@ def _build_text_guardrail(offload_to_cpu: bool) -> TextGuardrailFn:
 
         def _qwen_check(prompt: str) -> tuple[bool, str]:
             conversations = [{"role": "user", "content": prompt}]
-            input_ids = qwen_tokenizer.apply_chat_template(
+            inputs = qwen_tokenizer.apply_chat_template(
                 conversations,
                 tokenize=True,
                 return_tensors="pt",
                 add_generation_prompt=True,
+                return_dict=True,
             ).to(device)
+            input_len = inputs["input_ids"].shape[1]
             with torch.no_grad():
-                output_ids = qwen_model.generate(input_ids, max_new_tokens=128)
+                output_ids = qwen_model.generate(**inputs, max_new_tokens=128)
             response = qwen_tokenizer.decode(
-                output_ids[0][input_ids.shape[1] :], skip_special_tokens=True
+                output_ids[0][input_len:], skip_special_tokens=True
             )
             if "unsafe" in response.lower():
                 return False, f"Qwen3Guard: {response.strip()}"
@@ -226,12 +228,16 @@ def _build_video_guardrail(offload_to_cpu: bool) -> VideoGuardrailFn:
             unsafe_count = 0
             total = len(frames)
             for frame in frames:
+                if frame.dtype != np.uint8:
+                    frame = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
                 img = Image.fromarray(frame)
                 inputs = siglip_processor(images=img, return_tensors="pt").to(
                     "cuda", dtype=torch.float32
                 )
                 with torch.no_grad():
                     features = siglip_model.get_image_features(**inputs)
+                    if hasattr(features, "pooler_output"):
+                        features = features.pooler_output
                     features = features / features.norm(dim=-1, keepdim=True)
                     logits = classifier(features)
                     pred = logits.argmax(dim=-1).item()
@@ -315,6 +321,8 @@ def _build_video_guardrail(offload_to_cpu: bool) -> VideoGuardrailFn:
 
             for frame in frames:
                 frame_t = torch.from_numpy(frame).to("cuda", dtype=torch.float32)
+                if frame.dtype != np.uint8:
+                    frame_t = frame_t * 255.0
                 frame_t = frame_t.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
                 frame_t = frame_t[:, [2, 1, 0], :, :]  # RGB -> BGR
                 means = torch.tensor(
