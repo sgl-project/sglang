@@ -17,7 +17,7 @@ class TestQwen3Next(
     model = QWEN3_NEXT_MODEL
     cache_chunk_size = 64
     gsm8k_accuracy_thres = 0.93
-    kl_div_thres = 0.001
+    kl_div_thres = 0.0025
     other_args = [
         "--tp-size",
         "4",

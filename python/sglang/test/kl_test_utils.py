@@ -134,7 +134,7 @@ def _generate(
     json_data = {
         "input_ids": input_ids,
         "sampling_params": {
-            "temperature": 0.0,
+            "temperature": 1,
             "max_new_tokens": max_new_tokens,
             "ignore_eos": True,
         },
