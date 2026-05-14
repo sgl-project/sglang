@@ -4,7 +4,8 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.server_fixtures.streaming_session_fixture import TestStreamingSession
+from sglang.test.kits.streaming_session_kit import StreamingSessionKitMixin
+from sglang.test.server_fixtures.streaming_session_fixture import StreamingSessionServerBase
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -17,7 +18,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=691, stage="extra-a", runner_config="1-gpu-large")
 
 
-class TestStreamingSessionRetractMixedChunk(TestStreamingSession):
+class TestStreamingSessionRetractMixedChunk(StreamingSessionServerBase, StreamingSessionKitMixin):
     """Retract + --enable-mixed-chunk."""
 
     @classmethod
@@ -45,7 +46,7 @@ class TestStreamingSessionRetractMixedChunk(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionRetractLargePage(TestStreamingSession):
+class TestStreamingSessionRetractLargePage(StreamingSessionServerBase, StreamingSessionKitMixin):
     """Retract + page=256: exercises page-aligned `_free_tail`. Partial-page
     free would corrupt pages still holding committed tokens."""
 
@@ -75,7 +76,7 @@ class TestStreamingSessionRetractLargePage(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionEagle(TestStreamingSession):
+class TestStreamingSessionEagle(StreamingSessionServerBase, StreamingSessionKitMixin):
     """EAGLE3 spec v1 (overlap disabled); offset=-1 — see base class note."""
 
     kv_inherit_offset = -1
@@ -118,7 +119,7 @@ class TestStreamingSessionEagle(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionEagleV2(TestStreamingSession):
+class TestStreamingSessionEagleV2(StreamingSessionServerBase, StreamingSessionKitMixin):
     """EAGLE3 spec v2 (overlap on)."""
 
     @classmethod
@@ -162,7 +163,7 @@ class TestStreamingSessionEagleV2(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionEagleRetractLargePage(TestStreamingSession):
+class TestStreamingSessionEagleRetractLargePage(StreamingSessionServerBase, StreamingSessionKitMixin):
     """EAGLE3 spec v1 + retract + page=256: max-pressure on `_free_tail`
     (spec tail + retract alloc-commit gap + page alignment)."""
 

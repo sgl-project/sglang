@@ -4,12 +4,15 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.streaming_session_kit import (
+    AbortLeakReproKitMixin,
+    StreamingSessionKitMixin,
+)
 from sglang.test.server_fixtures.streaming_session_fixture import (
     ABORT_REPRO_CHUNKED_PREFILL_SIZE,
     ABORT_REPRO_CONTEXT_LEN,
     ABORT_REPRO_PAGE_SIZE,
-    TestStreamingSession,
-    TestStreamingSessionAbortLeakRepro,
+    StreamingSessionServerBase,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -30,7 +33,7 @@ SWA_COMMON_ARGS = [
 ]
 
 
-class TestStreamingSessionSWA(TestStreamingSession):
+class TestStreamingSessionSWA(StreamingSessionServerBase, StreamingSessionKitMixin):
     """Baseline streaming session on a hybrid-SWA model."""
 
     @classmethod
@@ -56,7 +59,7 @@ class TestStreamingSessionSWA(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionSWARetractLargePage(TestStreamingSession):
+class TestStreamingSessionSWARetractLargePage(StreamingSessionServerBase, StreamingSessionKitMixin):
     """SWA under retract decode with page=256."""
 
     @classmethod
@@ -87,7 +90,7 @@ class TestStreamingSessionSWARetractLargePage(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionSWARetractMixedChunk(TestStreamingSession):
+class TestStreamingSessionSWARetractMixedChunk(StreamingSessionServerBase, StreamingSessionKitMixin):
     """SWA under retract decode with --enable-mixed-chunk."""
 
     @classmethod
@@ -117,7 +120,7 @@ class TestStreamingSessionSWARetractMixedChunk(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionSWAAbortLeakRepro(TestStreamingSessionAbortLeakRepro):
+class TestStreamingSessionSWAAbortLeakRepro(StreamingSessionServerBase, AbortLeakReproKitMixin):
     """SWA abort-heavy chunked prefill leak repro."""
 
     @classmethod
