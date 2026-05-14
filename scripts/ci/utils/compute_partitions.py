@@ -13,6 +13,8 @@ import math
 import os
 from collections import defaultdict
 
+import yaml  # PyYAML; preinstalled on ubuntu-latest GHA runners.
+
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
@@ -39,10 +41,39 @@ _STAGE_A_OVERRIDES = {
     "stage-a-test-1-gpu-small": 1,
 }
 
-# Per-partition wall-clock target. ~20 min avg naive; worst-case LPT 4/3
-# imbalance is ~27 min, still below the 30-min GHA job-level timeout that
-# acts as the real safety net.
-TARGET_SECONDS = 20 * 60
+# Default Run-test step timeout (minutes); mirrors `_pr-test-stage.yml`
+# `inputs.run_timeout_minutes.default`. Used when pr-test.yml doesn't
+# explicitly override for a given stage.
+_RUN_TIMEOUT_MIN_DEFAULT = 30
+_REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
+
+
+def load_run_timeouts(pr_test_yml_path: str) -> dict:
+    """Map `self_name -> run_timeout_minutes` by reading `pr-test.yml`.
+    Source of truth is the workflow file; missing entries default to
+    `_RUN_TIMEOUT_MIN_DEFAULT`. Stage-a-test-cpu lives inline (not via
+    the reusable workflow) and is skipped here -- it goes through
+    `_STAGE_A_OVERRIDES` and never consults `run_timeouts`."""
+    with open(pr_test_yml_path) as f:
+        wf = yaml.safe_load(f)
+    timeouts = {}
+    for job_id, job in (wf.get("jobs") or {}).items():
+        if not isinstance(job, dict) or job.get("uses") != _REUSABLE_STAGE_USES:
+            continue
+        with_ = job.get("with") or {}
+        suite = with_.get("self_name", job_id)
+        timeouts[suite] = int(
+            with_.get("run_timeout_minutes", _RUN_TIMEOUT_MIN_DEFAULT)
+        )
+    return timeouts
+
+
+def per_shard_target_seconds(suite: str, run_timeouts: dict) -> float:
+    """Per-shard wall budget = 0.75 * stage timeout. 0.75 is the inverse
+    of LPT's 4/3 worst-case approximation ratio, so the most imbalanced
+    LPT shard fills exactly the timeout."""
+    timeout_min = run_timeouts.get(suite, _RUN_TIMEOUT_MIN_DEFAULT)
+    return 0.75 * timeout_min * 60
 
 
 def discover_files(repo_root: str) -> list[str]:
@@ -79,8 +110,13 @@ def compute_max_parallel(size: int) -> int:
     return max(size // 4, 1)
 
 
-def compute_partitions(tests, repo_root, partition_model=None, full_parallel=False):
+def compute_partitions(
+    tests, repo_root, run_timeouts, partition_model=None, full_parallel=False
+):
     """Group per-commit tests by suite and emit partition metadata.
+
+    `run_timeouts`: `suite -> run_timeout_minutes`, parsed from pr-test.yml
+    via `load_run_timeouts`. Drives per-shard wall budget.
 
     `partition_model` (optional): sglang-ci-stats `model.json`. Per-file
     `est` and per-suite `(coeff, bias)` fit; either may be missing and
@@ -112,17 +148,17 @@ def compute_partitions(tests, repo_root, partition_model=None, full_parallel=Fal
         coeff = fit["coeff"] if fit else 1.0
         bias = fit["bias"] if fit else 0.0
 
-        # Each shard pays `bias` once, so size >= coeff*total / (TARGET-bias).
+        # Each shard pays `bias` once, so size >= coeff*total / (target-bias).
         if suite in _STAGE_A_OVERRIDES:
             size = _STAGE_A_OVERRIDES[suite]
             max_parallel = size
         else:
-            budget = TARGET_SECONDS - bias
+            target = per_shard_target_seconds(suite, run_timeouts)
+            budget = target - bias
             if budget <= 0:
                 raise RuntimeError(
-                    f"Suite {suite!r}: fit bias={bias}s >= TARGET={TARGET_SECONDS}s. "
-                    "Raise TARGET_SECONDS or investigate why this suite's overhead "
-                    "alone exceeds the per-shard budget."
+                    f"Suite {suite!r}: fit bias={bias}s >= target={target}s. "
+                    "Investigate the fit or raise the stage's run_timeout_minutes."
                 )
             size = max(1, math.ceil(coeff * total / budget))
             max_parallel = size if full_parallel else compute_max_parallel(size)
@@ -154,6 +190,11 @@ def main():
         default=None,
         help="Path to sglang-ci-stats model.json (omit/missing -> static fallback)",
     )
+    parser.add_argument(
+        "--pr-test-yml",
+        default=os.path.join(REPO_ROOT, ".github", "workflows", "pr-test.yml"),
+        help="Path to pr-test.yml; per-stage `run_timeout_minutes` is read from here.",
+    )
     args = parser.parse_args()
 
     files = discover_files(args.repo_root)
@@ -161,10 +202,12 @@ def main():
     # test-execution time with sanity_check=True; dispatch should keep going.
     all_tests = collect_tests(files, sanity_check=False)
     partition_model = load_partition_model(args.partition_model_file)
+    run_timeouts = load_run_timeouts(args.pr_test_yml)
 
     result = compute_partitions(
         all_tests,
         repo_root=args.repo_root,
+        run_timeouts=run_timeouts,
         partition_model=partition_model,
         full_parallel=(args.full_parallel == "true"),
     )
