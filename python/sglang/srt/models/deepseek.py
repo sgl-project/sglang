@@ -66,6 +66,7 @@ if _is_npu:
 else:
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 
+
 class DeepseekMLP(nn.Module):
 
     def __init__(
