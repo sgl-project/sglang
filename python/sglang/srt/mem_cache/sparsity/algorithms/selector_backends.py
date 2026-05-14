@@ -136,10 +136,9 @@ the kernel. Empirically the bound holds independent of ``max_ctx``."""
 # for the DS layers (large perf cost), or a swap to a different
 # fused-topk + page-table-transform kernel.
 #
-# Until then, use ``selector_backend='torch'`` for production. The
-# torch backend already lands both gates at conc=16 / tb=2048 with
-# retrieval-shaped calibration (see SESSION_REPORT_2026-05-14.md
-# section "conc=16 move-left").
+# Until then, use ``selector_backend='torch'`` for production — see
+# ``benchmark/double_sparsity/DESIGN.md`` for the gate-passing recipe
+# (conc=16 / tb=2048 with retrieval-shaped calibration).
 
 
 def _row_to_batch_buffer(bs: int, h_kv: int, device: torch.device) -> torch.Tensor:
@@ -308,8 +307,9 @@ def make_selector(
         )
     if backend == "jit_fused_selector":
         raise NotImplementedError(
-            "jit_fused_selector is gated behind the FlashInfer / SGL "
-            "measurement step in PLAN.md — not implemented yet."
+            "jit_fused_selector: not implemented yet. Reserved for a "
+            "future single-kernel score+topk+physical-translation+"
+            "sink/recent pass."
         )
     raise ValueError(
         f"unsupported selector_backend: {backend!r}; "

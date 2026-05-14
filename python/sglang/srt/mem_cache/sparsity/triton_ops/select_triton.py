@@ -760,9 +760,8 @@ def ds_union_per_batch(
         `H_kv * effective_budget + sink + recent + max_selected`,
         well under 8K total in production configs.
       * Output tensors (`selected_logical`, `valid_lengths`) are
-        preallocated by the caller (M5 wiring); we mutate via
-        `.copy_()` and `index_copy_` only. No torch.unique, no
-        allocate-then-rebind.
+        preallocated by the caller; we mutate via `.copy_()` and
+        `index_copy_` only. No torch.unique, no allocate-then-rebind.
       * `torch.topk` and `torch.sort` on small fixed-shape inputs are
         capture-safe (cuBLAS / cub workspaces, no host syncs).
 

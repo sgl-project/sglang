@@ -13,7 +13,7 @@ Outputs:
 - selected_logical : [bs, max_selected]  int32   logical token positions (padded with -1, ascending order)
 - valid_lengths    : [bs]                int32   number of valid entries per row
 
-Decode self-token invariant (M2/M3 plan):
+Decode self-token invariant:
   K_label for the current decode position is written by attention_end *after*
   attention. Therefore stage-1 scoring covers history positions [0, seq_len-1)
   only; the current position (seq_len-1) is unconditionally retained via the

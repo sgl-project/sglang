@@ -1,8 +1,13 @@
-"""Double Sparsity algorithm — fresh implementation for SGLang.
+"""Double Sparsity algorithm — K-channel sparse decode for long-context LLMs.
 
-Skeleton only; lifecycle (K_label writes), selection kernel, and FA3 metadata
-adaptation arrive in subsequent milestones. See plan in
-`/root/.claude/plans/you-are-claude-code-ethereal-bumblebee.md` for design notes.
+Production decode runs through ``try_native_sparse_decode`` (the native
+Triton pipeline in ``triton_ops/double_sparsity_native_decode.py``); the
+``retrieve_topk`` / FA3-adaptor path below is preserved as a fallback for
+``bs > scratch_max_bs`` callers but is not on the production hot path at
+the benchmark operating point.
+
+See ``benchmark/double_sparsity/DESIGN.md`` for the design rationale, the
+gate definitions, and the production recipe.
 """
 
 from __future__ import annotations
@@ -41,17 +46,19 @@ logger = logging.getLogger(__name__)
 class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
     """K-channel Double Sparsity for decode-heavy long-context inference.
 
-    v1 scope (see plan):
-      - K-channels only.
-      - FA3 backend with per-KV-head scoring + GQA reduction → one page table per batch.
-      - page_size = 1.
-      - Configurable GQA reduction (max_abs / mean / soq), default max_abs.
-      - TP-aware: per-rank slice of a global-indexed calibration JSON.
+    Properties:
+      - K-channels only (V uses the full head_dim at attention time).
+      - Per-KV-head scoring + GQA reduction so all Q heads in a GQA group
+        share one selected set per request.
+      - ``page_size = 1`` (one KV slot per token).
+      - Configurable GQA reduction (``max_abs`` / ``mean`` / ``soq``),
+        default ``max_abs``.
+      - TP-aware: each rank carries a slice of the global-indexed
+        calibration JSON.
 
-    This skeleton wires up:
-      - calibration parsing / TP slicing / runtime-config validation,
-      - per-layer K_label allocation hook (no-op until M2),
-      - retrieve_topk that raises NotImplementedError until the selection kernel lands in M3.
+    Production decode uses the native sparse-decode pipeline
+    (``try_native_sparse_decode``); the ``retrieve_topk`` path remains
+    available as a fallback for ``bs > scratch_max_bs``.
     """
 
     def __init__(
@@ -104,17 +111,15 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
             device=device,
         )
 
-        # Filled in initialize_representation_pool (M2).
+        # Per-layer K_label side cache. Allocated in
+        # initialize_representation_pool once the KV pool is available.
         self.k_label: Dict[int, torch.Tensor] = {}
         self.start_layer: int = 0
         self.end_layer: int = 0
 
-        # Selection-pipeline scratch buffers — allocated once in
-        # initialize_representation_pool (where req_to_token_pool is
-        # available) and reused across decode steps via .narrow(0, 0, bs)
-        # row-slices. The helpers in select_triton.py accept these as
-        # optional kwargs and write in-place, so the production decode
-        # path performs zero output-tensor allocation.
+        # Legacy selection scratch — used by retrieve_topk + FA3 adaptor.
+        # Allocated once in _allocate_selection_scratch and narrowed
+        # per-call to bs.
         self._block_topk_logical: Optional[torch.Tensor] = None
         self._block_topk_scores: Optional[torch.Tensor] = None
         self._merged_logical: Optional[torch.Tensor] = None
@@ -122,16 +127,17 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         self._selected_logical: Optional[torch.Tensor] = None
         self._valid_lengths: Optional[torch.Tensor] = None
 
-        # Native sparse-decode scratch (new path, replaces FA3 page-table).
-        # See `try_native_sparse_decode` and `double_sparsity_native_decode.py`.
+        # Native sparse-decode scratch. Production decode reads/writes
+        # these tensors via .narrow(0, 0, bs) on each call; the captured
+        # CUDA graph references stable device pointers.
         self._native_att_out: Optional[torch.Tensor] = None
         self._native_selected_physical: Optional[torch.Tensor] = None
         self._native_mid_out: Optional[torch.Tensor] = None
         self._native_mid_o_logexpsum: Optional[torch.Tensor] = None
         self._native_output: Optional[torch.Tensor] = None
         self._native_req_to_token_indexed: Optional[torch.Tensor] = None
-        # Cached at first call; identifies the captured forward shape so
-        # subsequent calls can short-circuit the eligibility test.
+        # BLOCK_SEQ for the split-K sparse attention kernel; sized to
+        # match the per-decode-step total_selected.
         self._native_attn_block_seq: int = 128
 
         logger.info(
@@ -582,10 +588,11 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
           * effective_bud = min(token_budget, num_blocks * k_block)
           * scratch_bs    = runtime_config.scratch_max_bs
 
-        Total size is bounded (<<1 MiB at 70B/TP=8/128K, well under any
-        practical KV-budget) — see plan §"Commit 0" for the math. Buffers
-        are threaded through `ds_select_tokens_triton` via .narrow(0, 0,
-        bs) row-slices on each call; the helpers write in-place.
+        Total size is bounded (<1 MiB at 70B/TP=8/128K). Buffers are
+        threaded through ``ds_select_tokens_triton`` via
+        ``.narrow(0, 0, bs)`` row-slices on each call; the helpers write
+        in-place. Used by the legacy retrieve_topk + FA3-adaptor fallback
+        only; the native sparse-decode path has its own scratch.
         """
         rt = self.runtime_config
         max_ctx = self.req_to_token_pool.req_to_token.shape[1]
@@ -738,16 +745,21 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         sparse_mask: torch.Tensor,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Select per-request logical token positions for FA3 to attend to.
+        """Legacy selection path: select per-request logical token positions
+        for the FA3 backend to attend to.
 
-        Returns `(selected_logical[bs, max_selected], valid_lengths[bs])`. The
-        adaptor (M4) maps logical → physical via `req_to_token`, preserves
-        logical order (no physical sort), and writes the FA3 page-table.
+        Returns ``(selected_logical[bs, max_selected], valid_lengths[bs])``.
+        ``DSFlashAttentionAdaptor`` (``backend/ds_flash_attention_adaptor.py``)
+        maps logical → physical via ``req_to_token``, preserves logical
+        order (no physical sort), and writes the FA3 page-table.
 
-        v1.1: CUDA → two-stage block-topk Triton + score-aware torch union
-        (`ds_select_tokens_triton` in select_kernels.py dispatches to the
-        select_triton.py pipeline). CPU → per-request torch reference
-        (oracle only, never on the production path).
+        CUDA path: two-stage block-topk Triton + score-aware torch union
+        (``ds_select_tokens_triton`` dispatches to ``select_triton.py``).
+        CPU path: per-request torch reference (oracle / parity check only,
+        never on the production path).
+
+        Production decode flows through ``try_native_sparse_decode``
+        instead; this is the fallback for ``bs > scratch_max_bs``.
         """
         forward_batch = kwargs.get("forward_batch")
         if forward_batch is None:

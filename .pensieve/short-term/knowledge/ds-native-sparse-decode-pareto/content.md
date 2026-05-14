@@ -12,7 +12,8 @@ tags: [double-sparsity, benchmark, niah, tbt, calibration]
 
 ## Source
 - Bench artifacts: `benchmark/double_sparsity/repro_session/sweep_70b_128k_tbt_win/`
-- Handoff: `benchmark/double_sparsity/HANDOFF_NATIVE.md`
+  and `benchmark/double_sparsity/repro_session/conc16_move_left/`
+- Design + status: `benchmark/double_sparsity/DESIGN.md`
 - Native path: `python/sglang/srt/layers/attention/triton_ops/double_sparsity_native_decode.py`
 
 ## Summary
@@ -20,30 +21,41 @@ At the wikitext calibration baseline, the TBT visible-win gate
 (`tbt_on ≤ 0.90 × tbt_off`) and the NIAH quality-guard gate
 (`niah_on ≥ niah_off − 0.02`) cannot both pass at `concurrency=16` for any
 single `token_budget`; both pass cleanly at `concurrency=32` with
-`token_budget=8192`. This is calibration-bound, not kernel-bound.
+`token_budget=8192`. **Retrieval-shaped calibration unlocks conc=16 /
+tb=2048** — both gates pass (TBT 0.8035×, NIAH +0.20). The kernel
+shape is unchanged; only the K-channel selection differs.
+See [[decisions/2026-05-14-ds-v2-retrieval-shaped-calibration-required-for-low-tb]].
 
 ## Content
 
 ### Bench points (70B/TP=8, 128K ctx, output_len 256–512, FA3 backend)
 
-| tb   | conc | TBT(off) ms | TBT(on) ms | TBT ratio | NIAH(off) | NIAH(on) | NIAH delta |
-|-----:|-----:|------------:|-----------:|----------:|----------:|---------:|-----------:|
-| 512  | 16   | 27.94 | 22.99 | **0.82×** PASS | 0.80 | 0.00 (n=5) | −0.60 FAIL |
-| 2048 | 16   | 27.94 | 23.38 | **0.84×** PASS | 0.80 | 0.40 (n=10) | −0.40 FAIL |
-| 8192 | 16   | 27.94 | 27.83 | 0.996× FAIL | 0.80 | 0.90 (n=10) | **+0.10** PASS |
-| **8192** | **32** | **34.68** | **31.19** | **0.8995×** **PASS** | **0.80** | **0.90** | **+0.10** **PASS** |
+| tb   | conc | calib     | TBT(off) ms | TBT(on) ms | TBT ratio | NIAH(off) | NIAH(on) | NIAH delta |
+|-----:|-----:|-----------|------------:|-----------:|----------:|----------:|---------:|-----------:|
+| 512  | 16   | wikitext  | 27.94 | 22.99 | **0.82×** PASS | 0.80 | 0.00 (n=5) | −0.60 FAIL |
+| 2048 | 16   | wikitext  | 27.94 | 23.38 | **0.84×** PASS | 0.80 | 0.40 (n=10) | −0.40 FAIL |
+| 8192 | 16   | wikitext  | 27.94 | 27.83 | 0.996× FAIL | 0.80 | 0.90 (n=10) | **+0.10** PASS |
+| 8192 | 32   | wikitext  | 34.68 | 31.19 | **0.8995×** PASS | 0.80 | 0.90 (n=10) | **+0.10** PASS |
+| **2048** | **16** | **retrieval** | **27.94** | **22.45** | **0.8035×** **PASS** | **0.80** | **1.00** (n=10) | **+0.20** **PASS** |
+| 8192 (recheck) | 32 | wikitext  | 34.68 | 30.52 | **0.8800×** PASS | 0.80 | 1.00 (n=10) | **+0.20** PASS |
 
-### Why conc=16 cannot pass both gates
+### Why conc=16 needs `tb ≤ 4096` (and therefore retrieval calib)
 
 - Dense decode TBT is **KV-bandwidth-bound** at 128K bs ≥ 4; it scales
   ~linearly with `batch × seq_len` (27.94 ms at conc=16 → 34.68 ms at
   conc=32, +24%).
 - Native DS-on TBT is bounded by `total_selected = top_k + sink + recent`,
-  not by `seq_len`. It grows only +12% from conc=16 → conc=32 (27.83 ms
-  → 31.19 ms), driven by per-batch fixed costs (`_compute_q_label`,
-  `set_kv_buffer`, etc.) not by KV reads.
-- The crossover where DS-on/DS-off ratio drops below 0.90 lives right of
-  conc=16 at `tb=8192`. Conc=32 lands it.
+  not by `seq_len`. From conc=16 to conc=32 it grows only +12% (driven by
+  per-batch fixed costs: `_compute_q_label`, `set_kv_buffer`, etc.).
+- With wikitext calibration, `tb=8192` is the only budget that surfaces
+  enough needle tokens for NIAH at conc=16 — but at that budget
+  `total_selected` is large enough that the TBT ratio bumps up to 0.996×
+  (perf fail).
+- The crossover where DS-on/DS-off TBT ratio drops below 0.90 at
+  `tb=8192` is right of conc=16; conc=32 lands it.
+- With retrieval calibration, `tb=2048` surfaces needle tokens reliably
+  (NIAH 10/10) AND keeps `total_selected` small enough that TBT ratio is
+  0.8035× — both gates pass simultaneously at conc=16.
 
 ### Why narrow `token_budget` breaks NIAH
 

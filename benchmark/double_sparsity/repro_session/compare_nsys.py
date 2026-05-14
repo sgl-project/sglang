@@ -236,7 +236,7 @@ for k, t, i in off_only[:25]:
     print(f"  {k[:78]:80s} {t / 1e9:8.3f} s   {t / tot_off * 100:5.2f}% {i:9d}")
 print()
 
-# Highlight the topk decomposition specifically — PLAN.md called this out.
+# Highlight the torch.topk decomposition specifically — the selector hotspot.
 print("=" * 120)
 print("torch.topk DECOMPOSITION (key selector hotspot)")
 print("=" * 120)

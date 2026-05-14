@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Capture nsys profiles of DS-off vs DS-on at the actual winning bench point.
 #
-# Defaults match the 70B/TP=8/128K both-gates-pass point from
-# benchmark/double_sparsity/SESSION_REPORT_2026-05-14.md §3:
+# Defaults match the 70B/TP=8/128K conc=32 both-gates-pass point
+# documented in benchmark/double_sparsity/DESIGN.md:
 #   CONC=32, OUTPUT_LEN=64 (short trace; the headline bench uses
 #   output_len=256/512), TOKEN_BUDGET=8192, MAX_SELECTED=16384,
 #   BLOCK_T=1024, K_BLOCK=64, RECENT=64, SINK=4, MIN_SEQ_LEN=4096.
