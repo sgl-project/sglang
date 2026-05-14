@@ -970,7 +970,13 @@ class MMEncoder:
             # Get additional video metadata
             if (
                 self.model_type
-                in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
+                in [
+                    "qwen3_vl",
+                    "qwen3_vl_moe",
+                    "qwen3_5",
+                    "qwen3_5_moe",
+                    "intern_s2_preview",
+                ]
                 and video_processor_kwargs.get("video_metadata", None) is not None
             ):
                 # For qwen3-vl/qwen3.5 models, we need to store the video timestamps

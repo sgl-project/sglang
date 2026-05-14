@@ -110,6 +110,11 @@ class DeepEPMoE(FusedMoE):
             quant_config, Fp8Config
         ):
             self.deprecate_flag = True
+        elif (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+        ):
+            self.deprecate_flag = True
         else:
             self.deprecate_flag = False
 
