@@ -1164,10 +1164,6 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
-        # [SWA-DEBUG] Reset counter on new extend (new request)
-        if layer.layer_id == 0:
-            AscendAttnBackend._swa_diag_step = 0
-
         if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO and MLAPROLOG do save kv_cache
             save_kv_cache = False
@@ -2129,10 +2125,6 @@ class AscendAttnBackend(AttentionBackend):
             output = output[:, :, : layer.tp_q_head_num, :]
             return output.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
 
-    # [SWA-DEBUG] Diagnostic counter
-    _swa_diag_step: int = 0
-    _swa_diag_max: int = 20
-
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -2196,61 +2188,6 @@ class AscendAttnBackend(AttentionBackend):
                 paged_seq_lens_cpu_int,
                 paged_seq_lens_cpu_list,
             ) = self._get_paged_attention_inputs(layer, forward_batch)
-
-            # [SWA-DEBUG] Diagnostic logging for SWA layers
-            if self._is_swa_layer(layer) and AscendAttnBackend._swa_diag_step < AscendAttnBackend._swa_diag_max:
-                step = AscendAttnBackend._swa_diag_step
-                is_swa = True
-                seq_lens = self.forward_metadata.seq_lens
-                seq_lens_cpu = self.forward_metadata.seq_lens_cpu_list
-                bt = paged_block_tables
-                if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
-                    req_idx = 0
-                    sl = seq_lens_cpu[req_idx]
-                    sw_size = layer.sliding_window_size
-                    import logging
-                    _log = logging.getLogger("swa_debug")
-                    _log.warning(
-                        f"[SWA-DBG step={step} layer={layer.layer_id} "
-                        f"sw_size={sw_size} seq_len={sl} "
-                        f"bt_shape={list(bt.shape)} "
-                        f"k_cache_shape={list(k_cache.shape)} "
-                        f"v_cache_shape={list(v_cache.shape)} "
-                        f"q_shape={list(q.shape)} "
-                        f"paged_seq_lens={paged_seq_lens_cpu_list} "
-                        f"use_fia={self.use_fia}"
-                    )
-                    # Check full_to_swa mapping for first few positions
-                    if self.full_to_swa_index_mapping is not None and sl > 0:
-                        req_pool = forward_batch.req_pool_indices[req_idx].item()
-                        rt = self.req_to_token[req_pool, :sl]
-                        swa_map = self.full_to_swa_index_mapping[rt]
-                        zero_count = (swa_map == 0).sum().item()
-                        _log.warning(
-                            f"[SWA-DBG step={step} req0: "
-                            f"req_to_token[:5]={rt[:5].tolist()} "
-                            f"swa_map[:5]={swa_map[:5].tolist()} "
-                            f"zero_in_window={zero_count}/{sl} "
-                            f"bt_row0[:8]={bt[req_idx, :min(8, bt.shape[1])].tolist()}"
-                        )
-                        # Verify: first token of each page should map to correct SWA page
-                        page_size = self.page_size
-                        for pg in range(min(3, bt.shape[1])):
-                            pos = pg * page_size
-                            if pos < sl:
-                                full_idx = rt[pos].item()
-                                swa_idx = swa_map[pos].item()
-                                expected_page = swa_idx // page_size
-                                actual_page = bt[req_idx, pg].item()
-                                match = "OK" if expected_page == actual_page else "MISMATCH!"
-                                _log.warning(
-                                    f"[SWA-DBG] page{pg}: pos={pos} full={full_idx} "
-                                    f"swa={swa_idx} exp_page={expected_page} "
-                                    f"got_page={actual_page} {match}"
-                                )
-                # Only increment once per decode step (not per layer)
-                if layer.layer_id == 0:
-                    AscendAttnBackend._swa_diag_step += 1
 
             if sinks is not None:
                 # Use SWA block tables if hybrid SWA is enabled for this layer
