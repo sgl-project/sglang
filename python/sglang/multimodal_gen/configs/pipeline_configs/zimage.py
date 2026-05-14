@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     TextConditioningOutput,
     pad_text_embeddings_with_mask,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     ZImageRolloutPipelineMixin,
 )
@@ -80,6 +83,9 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     PATCH_SIZE: int = 2
     F_PATCH_SIZE: int = 1
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(fsdp_auto_min_available_memory_gb=40)
+
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         rendered_prompts = [
             tokenizer.apply_chat_template(
@@ -90,10 +96,12 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             )
             for prompt in prompts
         ]
+
+        effective_max_length = tok_kwargs.pop("max_length", 512)
         return tokenizer(
             rendered_prompts,
             padding="max_length",
-            max_length=512,  # TODO (yhyang201): set max length according to config
+            max_length=effective_max_length,
             truncation=True,
             return_tensors="pt",
         )

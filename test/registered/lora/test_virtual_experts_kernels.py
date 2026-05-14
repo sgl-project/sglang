@@ -9,16 +9,15 @@ Covers two regression bugs that surface only with `--lora-use-virtual-experts`
   them onto a real virtual-expert slot belonging to another adapter and
   triggered OOB loads in downstream LoRA kernels.
 
-- `_align_block_size_torch` (the `>= 1024`-expert torch.compile fallback)
-  must route `-1` and `>= num_experts` IDs into a sentinel bucket so they
-  don't OOB-index `padded_offsets[sorted_expert_ids]` (negative wrap, or
-  past-end) and don't get assigned to a real expert in the consumer-block
-  table.
+- `_align_block_size_torch` / `_align_block_size_jit` (the `>= 1024`-expert
+  fallback paths) must route `-1` and `>= num_experts` IDs into a sentinel
+  bucket so they don't OOB-index `padded_offsets[sorted_expert_ids]` (negative
+  wrap, or past-end) and don't get assigned to a real expert in the
+  consumer-block table.
 
-Both kernels run on CUDA. The torch-compile fallback is gated on
-`virtual_num_experts > 1024` in production, but we exercise it directly
-here at smaller sizes for cheaper iteration; one test sticks to the >1024
-regime to mirror the production trigger.
+Both kernels run on CUDA. The fallback is gated on `virtual_num_experts >= 1024`
+in production, but we exercise it directly here at smaller sizes for cheaper
+iteration; one test sticks to the >1024 regime to mirror the production trigger.
 
 Usage:
     python -m pytest test/registered/lora/test_virtual_experts_kernels.py -v
@@ -31,11 +30,13 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small")
 
 from sglang.srt.lora.triton_ops.virtual_experts import (
+    _align_block_size_jit,
     _align_block_size_torch,
     _fused_virtual_topk_ids,
+    fused_sanitize_expert_ids,
 )
 
 
@@ -130,17 +131,22 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
         self.assertFalse(bool(mask[0].item()))
 
 
-class TestAlignBlockSizeTorchSentinelBucket(CustomTestCase):
-    """Item C regression: invalid `topk_ids` must not OOB-index
-    `padded_offsets[sorted_expert_ids]`, must not be assigned to any real
-    expert in the consumer-block table, and the function must remain
-    correct on legitimate (all-valid) inputs."""
+class _AlignBlockSizeSentinelBucketBase(CustomTestCase):
+    """Shared tests for both the torch.compile and JIT align_block_size paths.
+
+    Subclasses override ``_align`` to select the concrete implementation.
+    """
 
     @classmethod
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA required")
+        if cls is _AlignBlockSizeSentinelBucketBase:
+            raise unittest.SkipTest("Base class")
         cls.device = "cuda:0"
+
+    def _align(self, topk_ids, block_size, num_experts):
+        raise NotImplementedError
 
     @staticmethod
     def _assigned_experts(expert_ids: torch.Tensor) -> list:
@@ -166,12 +172,10 @@ class TestAlignBlockSizeTorchSentinelBucket(CustomTestCase):
             device=self.device,
         )
 
-        _, expert_ids, _ = _align_block_size_torch(topk_ids, block_size, num_experts)
+        _, expert_ids, _ = self._align(topk_ids, block_size, num_experts)
 
         self._assert_only_real_or_sentinel(expert_ids, num_experts)
         assigned = set(self._assigned_experts(expert_ids))
-        # Every distinct real input expert must be assigned to at least one
-        # block.
         self.assertEqual(assigned, set(range(num_experts)))
 
     def test_negative_ids_routed_to_sentinel(self):
@@ -185,7 +189,7 @@ class TestAlignBlockSizeTorchSentinelBucket(CustomTestCase):
             device=self.device,
         )
 
-        _, expert_ids, _ = _align_block_size_torch(topk_ids, block_size, num_experts)
+        _, expert_ids, _ = self._align(topk_ids, block_size, num_experts)
 
         self._assert_only_real_or_sentinel(expert_ids, num_experts)
         assigned = self._assigned_experts(expert_ids)
@@ -204,20 +208,19 @@ class TestAlignBlockSizeTorchSentinelBucket(CustomTestCase):
             device=self.device,
         )
 
-        _, expert_ids, _ = _align_block_size_torch(topk_ids, block_size, num_experts)
+        _, expert_ids, _ = self._align(topk_ids, block_size, num_experts)
 
         self._assert_only_real_or_sentinel(expert_ids, num_experts)
         assigned = self._assigned_experts(expert_ids)
         for valid_eid in (0, 1, 7, 50):
-            # 50 is OOR (>= 8), should NOT be in assigned.
             if valid_eid >= num_experts:
                 self.assertNotIn(valid_eid, assigned)
             else:
                 self.assertIn(valid_eid, assigned)
 
     def test_mixed_invalid_at_production_size(self):
-        """Mirror the production trigger: `num_experts > 1024` (only path
-        where `_align_block_size_torch` is invoked instead of the native
+        """Mirror the production trigger: `num_experts >= 1024` (only path
+        where the large-expert fallback is invoked instead of the native
         align kernel)."""
         num_experts = 1500
         block_size = 16
@@ -232,7 +235,7 @@ class TestAlignBlockSizeTorchSentinelBucket(CustomTestCase):
             device=self.device,
         )
 
-        _, expert_ids, _ = _align_block_size_torch(topk_ids, block_size, num_experts)
+        _, expert_ids, _ = self._align(topk_ids, block_size, num_experts)
 
         self._assert_only_real_or_sentinel(expert_ids, num_experts)
         assigned = self._assigned_experts(expert_ids)
@@ -246,13 +249,31 @@ class TestAlignBlockSizeTorchSentinelBucket(CustomTestCase):
         block_size = 16
         topk_ids = torch.empty((0, 2), dtype=torch.int32, device=self.device)
 
-        sorted_token_ids, expert_ids, num_post_padded = _align_block_size_torch(
+        sorted_token_ids, expert_ids, num_post_padded = self._align(
             topk_ids, block_size, num_experts
         )
 
         self.assertEqual(num_post_padded.item(), 0)
-        # Whatever expert_ids contains, it must be sentinel only.
         self.assertEqual(self._assigned_experts(expert_ids), [])
+
+
+class TestAlignBlockSizeTorchSentinelBucket(_AlignBlockSizeSentinelBucketBase):
+    """Test the pure-PyTorch torch.compile fallback path (AMD/ROCm compatible)."""
+
+    def _align(self, topk_ids, block_size, num_experts):
+        return _align_block_size_torch(topk_ids, block_size, num_experts)
+
+
+class TestAlignBlockSizeJitSentinelBucket(_AlignBlockSizeSentinelBucketBase):
+    """Test the CUDA JIT kernel path (with fused_sanitize_expert_ids, as in
+    production)."""
+
+    def _align(self, topk_ids, block_size, num_experts):
+        sorted_token_ids, expert_ids, num_tokens_post_padded = _align_block_size_jit(
+            topk_ids, block_size, num_experts
+        )
+        expert_ids = fused_sanitize_expert_ids(expert_ids, num_experts)
+        return sorted_token_ids, expert_ids, num_tokens_post_padded
 
 
 if __name__ == "__main__":

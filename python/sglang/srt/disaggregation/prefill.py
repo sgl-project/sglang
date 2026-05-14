@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -48,14 +49,12 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -177,7 +176,14 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
-        setup_state_kv_args(kv_args, self.token_to_kv_pool, self.draft_token_to_kv_pool)
+        req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
+        setup_state_kv_args(
+            kv_args,
+            self.token_to_kv_pool,
+            self.draft_token_to_kv_pool,
+            self.scheduler.model_config.num_hidden_layers,
+            req_to_token_pool=req_to_token_pool,
+        )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
@@ -613,9 +619,9 @@ class SchedulerDisaggregationPrefillMixin:
                     KVPoll.Success,
                     KVPoll.Failed,
                 ):
-                    logger.warning(
+                    logger.warning_once(
                         f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
-                        f"from consensus; treating as undone"
+                        f"from consensus; treating as undone",
                     )
                     undone_reqs.append(req)
                     continue
@@ -646,9 +652,9 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
-                logger.warning(
+                logger.warning_once(
                     f"Unexpected polling state {poll} for rid {req.rid} in inflight queue; "
-                    f"treating as undone"
+                    f"treating as undone",
                 )
                 undone_reqs.append(req)
 
@@ -771,52 +777,56 @@ class SchedulerDisaggregationPrefillMixin:
             .cpu()
             .numpy()
         )
-        state_indices = None
+        state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
-            # Prepare extra pool indices for hybrid models
-            if isinstance(
-                self.token_to_kv_pool_allocator.get_kvcache(), HybridLinearKVPool
-            ):
-                # Mamba hybrid model: send single mamba state index
-                state_indices = [
+            seq_len = len(req.fill_ids)
+
+            def _mamba_payload():
+                return [
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
                         req.req_pool_idx
                     ]
                     .cpu()
                     .numpy()
                 ]
-            elif isinstance(
-                self.token_to_kv_pool_allocator.get_kvcache(), BaseSWAKVPool
-            ):
-                # SWA hybrid model: send last window KV indices
-                seq_len = len(req.fill_ids)
+
+            def _swa_payload():
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
-
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
                 ]
-
-                # Translate to SWA pool indices
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                         window_kv_indices_full
                     )
                 )
-                state_indices = window_kv_indices_swa.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
-            elif isinstance(
-                self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
-            ):
-                seq_len = len(req.fill_ids)
+                return kv_to_page_indices(
+                    window_kv_indices_swa.cpu().numpy(), page_size
+                )
+
+            def _nsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
-                state_indices = kv_indices_full.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
+                return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+
+            state_types = (
+                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+            )
+            state_indices = []
+            for st in state_types:
+                if st == StateType.MAMBA:
+                    state_indices.append(_mamba_payload())
+                elif st == StateType.SWA:
+                    state_indices.append(_swa_payload())
+                elif st == StateType.NSA:
+                    state_indices.append(_nsa_payload())
+                else:
+                    state_indices.append(None)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
