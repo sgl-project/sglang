@@ -358,10 +358,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite stage-a-test-cpu \
-            --auto-partition-id ${{ matrix.partition }} \
-            --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-cpu'].size }} \
-            $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite stage-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-cpu'].size }} $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
   stage-b-test-1-gpu-small:
