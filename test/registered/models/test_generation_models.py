@@ -161,14 +161,17 @@ class TestGenerationModels(CustomTestCase):
         ) as hf_runner:
             hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
-        with env_ctx, SRTRunner(
-            model_path,
-            tp_size=model_case.tp_size,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            trust_remote_code=model_case.trust_remote_code,
-            attention_backend=model_case.attention_backend,
-        ) as srt_runner:
+        with (
+            env_ctx,
+            SRTRunner(
+                model_path,
+                tp_size=model_case.tp_size,
+                torch_dtype=torch_dtype,
+                model_type="generation",
+                trust_remote_code=model_case.trust_remote_code,
+                attention_backend=model_case.attention_backend,
+            ) as srt_runner,
+        ):
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
         check_close_model_outputs(

@@ -166,9 +166,7 @@ class FullComponent(TreeComponent):
             cd.lock_ref += 1
             self.cache.evictable_device_leaves.discard(cur)
             cur = cur.parent
-        result = IncLockRefResult(
-            delta=delta, swa_uuid_for_lock=result.swa_uuid_for_lock
-        )
+        result.delta = delta
         return result
 
     def release_component_lock(

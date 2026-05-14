@@ -53,12 +53,10 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
         old_value = os.environ.get("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN")
         os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
         try:
-            with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(
-                1
-            ), envs.SGLANG_SPEC_NAN_DETECTION.override(
-                True
-            ), envs.SGLANG_SPEC_OOB_DETECTION.override(
-                True
+            with (
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+                envs.SGLANG_SPEC_NAN_DETECTION.override(True),
+                envs.SGLANG_SPEC_OOB_DETECTION.override(True),
             ):
                 cls.process = popen_launch_server(
                     cls.model,
