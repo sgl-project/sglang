@@ -850,6 +850,9 @@ class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
                 ),
                 peak_memory_mb=output_batch.peak_memory_mb,
                 peak_allocated_memory_mb=output_batch.peak_allocated_memory_mb,
+                pre_forward_reserved_memory_mb=(
+                    output_batch.pre_forward_reserved_memory_mb
+                ),
                 is_oom=output_batch.is_oom,
                 dynamic_batch_size=output_batch.dynamic_batch_size,
                 dynamic_batch_capacity=output_batch.dynamic_batch_capacity,

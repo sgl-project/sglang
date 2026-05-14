@@ -30,7 +30,7 @@ When dynamic batching is enabled, SGLang-Diffusion records peak GPU memory from 
 
 Profiles are keyed by runtime settings and request shape. By default, they are cached under `${SGLANG_DIFFUSION_BATCH_MEMORY_CACHE:-~/.cache/sglang/diffusion_batch_memory}`. Set `--batching-memory-profile-cache none` to disable persistence.
 
-For a new shape, admission starts with a geometric ramp (`1`, `2`, `4`, ...). After enough successful batches are observed, SGLang-Diffusion predicts candidate peak memory from measured peaks and rejects candidates that exceed the current safe GPU memory budget.
+For a new shape, admission starts with a singleton measurement. During cold start, SGLang-Diffusion uses that singleton as a rough estimate to reject candidates that appear too large. After enough successful batches are observed, it predicts candidate peak memory from measured peaks and rejects candidates that exceed the current safe GPU memory budget.
 
 `--batching-memory-reserve-fraction` controls the fraction of total device memory held back from memory-aware batching as allocator and workspace slack. The default is `0.02`. Increase it on shared or memory-volatile GPUs to reduce OOM risk; lower it only for dedicated, calibrated workloads when the reserve is the binding limit. If you override it, use the same value during calibration and serving.
 

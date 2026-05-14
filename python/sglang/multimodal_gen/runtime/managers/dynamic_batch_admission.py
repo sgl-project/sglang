@@ -87,6 +87,9 @@ class MemoryAdmissionPolicy:
     oom_clear_successes: int = 8
     # Minimum allocator slack.
     internal_reserve_min_mb: float = 512.0
+    # Headroom used only by the cold-start rough estimate.
+    rough_headroom_fraction: float = 0.10
+    rough_headroom_min_mb: float = 512.0
 
 
 _MEMORY_POLICY = MemoryAdmissionPolicy()
@@ -208,6 +211,7 @@ class MemoryObservation:
     batch_cost: float
     peak_memory_mb: float
     batch_size: int
+    baseline_memory_mb: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -218,6 +222,7 @@ class MemoryObservation:
             batch_cost=float(data["batch_cost"]),
             peak_memory_mb=float(data["peak_memory_mb"]),
             batch_size=max(1, int(data.get("batch_size", 1))),
+            baseline_memory_mb=_optional_float(data.get("baseline_memory_mb")),
         )
 
 
@@ -243,7 +248,12 @@ class MemoryProfile:
     )
 
     def observe_success(
-        self, batch_cost: float, peak_memory_mb: float, *, batch_size: int
+        self,
+        batch_cost: float,
+        peak_memory_mb: float,
+        *,
+        batch_size: int,
+        baseline_memory_mb: float | None = None,
     ) -> None:
         if batch_cost <= 0.0 or peak_memory_mb <= 0.0:
             return
@@ -267,6 +277,7 @@ class MemoryProfile:
                 batch_cost=float(batch_cost),
                 peak_memory_mb=float(peak_memory_mb),
                 batch_size=max(1, int(batch_size)),
+                baseline_memory_mb=_optional_float(baseline_memory_mb),
             )
         )
         del self.successes[: -_MEMORY_POLICY.history_size]
@@ -291,6 +302,47 @@ class MemoryProfile:
         return max(
             predicted * self._get_residual_ratio(),
             predicted + self._get_residual_mb(),
+        )
+
+    def estimate_rough_peak_memory_mb(self, batch_cost: float) -> float | None:
+        if batch_cost <= 0.0:
+            return None
+        seeds = [
+            obs
+            for obs in self.successes
+            if obs.batch_cost > 0.0
+            and obs.peak_memory_mb > 0.0
+            and obs.baseline_memory_mb is not None
+        ]
+        if not seeds:
+            return None
+
+        lower_or_equal = [obs for obs in seeds if obs.batch_cost <= batch_cost]
+        seed = max(
+            lower_or_equal or seeds,
+            key=lambda obs: obs.batch_cost,
+        )
+        baseline_mb = min(
+            max(0.0, float(seed.baseline_memory_mb or 0.0)),
+            seed.peak_memory_mb,
+        )
+        variable_mb_per_cost = max(0.0, seed.peak_memory_mb - baseline_mb) / max(
+            seed.batch_cost, 1e-9
+        )
+        extra_cost = max(0.0, batch_cost - seed.batch_cost)
+        rough_headroom_mb = (
+            max(
+                _MEMORY_POLICY.rough_headroom_min_mb,
+                variable_mb_per_cost
+                * extra_cost
+                * _MEMORY_POLICY.rough_headroom_fraction,
+            )
+            if extra_cost > 0.0
+            else 0.0
+        )
+        return max(
+            seed.peak_memory_mb,
+            baseline_mb + variable_mb_per_cost * batch_cost + rough_headroom_mb,
         )
 
     def get_num_success_costs(self) -> int:
@@ -338,6 +390,7 @@ class MemoryProfile:
                 obs.batch_cost,
                 obs.peak_memory_mb,
                 batch_size=obs.batch_size,
+                baseline_memory_mb=obs.baseline_memory_mb,
             )
         self.ratio_residuals = replay.ratio_residuals
         self.absolute_residuals_mb = replay.absolute_residuals_mb
@@ -564,6 +617,7 @@ class BatchAdmissionController:
                 batch_cost,
                 output_batch.peak_memory_mb,
                 batch_size=len(reqs),
+                baseline_memory_mb=output_batch.pre_forward_reserved_memory_mb,
             )
             self._memory_profiles_dirty = True
             self._save_memory_profile_cache_if_due()
@@ -637,6 +691,7 @@ class BatchAdmissionController:
             if batch_cost + 1e-9 >= profile.oom_cost:
                 return f"memory_oom:{batch_cost:.0f}>={profile.oom_cost:.0f}"
 
+        rough_predicted_mb = self._estimate_rough_peak_memory_mb(profile, batch_cost)
         calibration_reject = self._get_memory_calibration_reject_reason(
             profile,
             batch_size=batch_size,
@@ -646,13 +701,20 @@ class BatchAdmissionController:
             return calibration_reject
 
         predicted_mb = None
-        if profile is not None:
+        used_rough_prediction = False
+        if profile is not None and profile.get_num_success_costs() >= 2:
             predicted_mb = profile.estimate_peak_memory_mb(batch_cost)
+        elif rough_predicted_mb is not None:
+            predicted_mb = rough_predicted_mb
+            used_rough_prediction = True
         if predicted_mb is None or self._memory_budget_mb is None:
             return None
         if predicted_mb > self._memory_budget_mb:
+            prefix = "memory_rough_budget" if used_rough_prediction else "memory_budget"
             suffix = "_next" if next_batch else ""
-            return f"memory_budget{suffix}:{predicted_mb:.0f}>{self._memory_budget_mb:.0f}MiB"
+            return (
+                f"{prefix}{suffix}:{predicted_mb:.0f}>{self._memory_budget_mb:.0f}MiB"
+            )
         return None
 
     def _get_memory_calibration_reject_reason(
@@ -678,6 +740,13 @@ class BatchAdmissionController:
             return f"memory_uncalibrated:allow={max(2, max_observed_batch)}"
 
         return None
+
+    def _estimate_rough_peak_memory_mb(
+        self, profile: MemoryProfile | None, batch_cost: float
+    ) -> float | None:
+        if profile is None:
+            return None
+        return profile.estimate_rough_peak_memory_mb(batch_cost)
 
     def _get_memory_key(self, req: Req) -> tuple[Any, ...]:
         return (
