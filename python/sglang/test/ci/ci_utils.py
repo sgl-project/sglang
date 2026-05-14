@@ -314,9 +314,10 @@ def run_unittest_files(
 
     # Machine-readable timings block for downstream scrapers/dashboards.
     # One JSON object per executed file (post-retry: only the latest
-    # attempt's elapsed is recorded), followed by a final summary line.
-    # Files skipped via fail-fast (continue_on_error=False) are omitted.
-    # Scrapers distinguish lines by the presence of the "file" key.
+    # attempt's elapsed is recorded). Files skipped via fail-fast
+    # (continue_on_error=False) are omitted. Job wall-clock is read
+    # separately from the GitHub Actions API by consumers, so we don't
+    # emit any aggregate fields here.
     passed_set = set(passed_tests)
     logger.info("========== TIMINGS BEGIN ==========")
     for fname, elapsed in file_elapsed.items():
@@ -329,15 +330,6 @@ def run_unittest_files(
                 }
             )
         )
-    logger.info(
-        json.dumps(
-            {
-                "total_elapsed": round(elapsed_total),
-                "num_files": len(file_elapsed),
-                "num_passed": len(passed_tests),
-            }
-        )
-    )
     logger.info("========== TIMINGS END ==========")
 
     # Write GitHub Step Summary only if retries occurred
