@@ -151,7 +151,13 @@ class RadixAttention(nn.Module):
             try_native = getattr(
                 coordinator.algorithm, "try_native_sparse_decode", None
             )
-            if try_native is not None and not kwargs:
+            # The native sparse-decode path doesn't yet support q_rope /
+            # k_rope / sinks (split-RoPE and sink-token attention). Other
+            # kwargs (e.g. instrumentation tags) pass through harmlessly.
+            _NATIVE_UNSUPPORTED_KWARGS = {"q_rope", "k_rope", "sinks"}
+            if try_native is not None and not (
+                kwargs.keys() & _NATIVE_UNSUPPORTED_KWARGS
+            ):
                 native_out = try_native(
                     q, k, v, self, forward_batch, save_kv_cache=save_kv_cache
                 )

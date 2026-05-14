@@ -410,33 +410,29 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         r2t_indexed = self._native_req_to_token_indexed.narrow(0, 0, bs)
         torch.index_select(req_to_token, 0, req_pool_indices, out=r2t_indexed)
 
-        # Output tensor — preallocate on first call (q dtype now known).
-        if (
-            self._native_output is None
-            or self._native_output.dtype != q_3d.dtype
-            or self._native_output.shape[0] < bs
-        ):
-            self._native_output = torch.zeros(
-                (self._native_att_out.shape[0], self.num_q_heads_local, self.head_dim),
-                dtype=q_3d.dtype,
-                device=self.device,
+        # Output dtype must match the preallocated `_native_output`
+        # (klabel_dtype, bf16 by default). Fail-loud rather than
+        # reallocate — under CUDA-graph capture a lazy reallocation
+        # would land inside the captured region and either silently
+        # break replay or trip `cudaErrorStreamCaptureInvalidated`.
+        # Callers configure the dtype via `--double-sparsity-klabel-dtype`.
+        if self._native_output.dtype != q_3d.dtype:
+            raise RuntimeError(
+                f"q dtype {q_3d.dtype} != preallocated _native_output dtype "
+                f"{self._native_output.dtype} ({self.runtime_config.klabel_dtype}). "
+                f"DS configuration must match the model's q dtype."
             )
-        output = self._native_output.narrow(0, 0, bs)
 
         # Slice scratch to bs. Layout for att_out is [bs, H_kv, max_ctx]
-        # (bs is dim 0); the others have bs at dim 0 too.
+        # (bs is dim 0); the others have bs at dim 0 too. The score
+        # kernel covers all of [0, max_ctx) via `num_blocks =
+        # cdiv(max_ctx, block_t)` programs, so no per-step reset is
+        # needed.
+        output = self._native_output.narrow(0, 0, bs)
         att_out = self._native_att_out.narrow(0, 0, bs)
         sel_phys = self._native_selected_physical.narrow(0, 0, bs)
         mid_out = self._native_mid_out.narrow(0, 0, bs)
         mid_log = self._native_mid_o_logexpsum.narrow(0, 0, bs)
-
-        # Reset score scratch to -inf — the kernel writes [0, max_ctx) but
-        # `torch.topk` over the FULL last dim would otherwise pick stale
-        # values from a previous decode step (where max_ctx slots beyond
-        # the score-kernel grid stayed at whatever they were).
-        # The score kernel covers all [0, max_ctx) via ceil(max_ctx/block_t)
-        # programs, so this is defensive — but cheap (~8 MiB write at 16x128K).
-        # Skip when we cover exactly max_ctx.
 
         ds_native_sparse_decode(
             q=q_3d,

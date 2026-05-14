@@ -33,6 +33,16 @@ tags: [cuda-graph, capture, host-sync, dispatch, kernel-launch]
 - Symptom of host-sync in capture: `cudaErrorStreamCaptureInvalidated`
   during `Capture cuda graph begin` in the model_runner; server then
   shuts down with `RuntimeError: Capture cuda graph failed`.
+- The **allocation form** of this trap: lazy `torch.zeros(...)` /
+  `torch.empty(...)` inside the captured region (typically gated on
+  `tensor.dtype != expected_dtype` or `tensor.shape[0] < bs`). At init
+  time the preallocated tensor matches the common case, the dtype/shape
+  check is False, no allocation. At first real call with a different
+  dtype the allocation fires — sometimes during warmup (silently
+  absorbed by the graph pool), sometimes during capture (fails with
+  the same `cudaErrorStreamCaptureInvalidated`). Fix by **fail-loud
+  validating the input dtype/shape at the eligibility gate** instead
+  of silently reallocating.
 
 ## Boundaries
 

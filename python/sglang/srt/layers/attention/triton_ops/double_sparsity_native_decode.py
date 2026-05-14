@@ -34,8 +34,6 @@ layer L's `attention_begin` must therefore exclude position `seq_len - 1`
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
@@ -589,7 +587,6 @@ def ds_native_sparse_decode(
     score_block_t: int = 128,
     attn_block_seq: int = 128,
     attn_block_n: int = 16,
-    topk_logical_scratch: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Full DS native sparse-decode forward.
 
@@ -633,8 +630,8 @@ def ds_native_sparse_decode(
     )
 
     # 2. Top-k. Sink/recent/oob positions were masked to -inf in step 1.
-    # When `topk_logical_scratch` is provided, write indices into it in
-    # place; otherwise let torch.topk allocate (test/CPU paths).
+    # torch.topk allocates a fresh int64 indices tensor each call; the
+    # CUDA-graph caching allocator handles the routing under capture.
     topk_logical = torch.topk(att_out_approx, top_k, dim=-1, sorted=False).indices
     if topk_logical.dtype != torch.int32:
         # torch.topk returns int64 indices; the build kernel expects int32.
