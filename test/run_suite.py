@@ -23,7 +23,7 @@ HW_MAPPING = {
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["stage-a-test-cpu"],
+    HWBackend.CPU: ["stage-a-test-cpu", "stage-b-test-cpu"],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",
@@ -32,6 +32,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-large-8-gpu-35x-disaggregation-amd",
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
+        "jit-kernel-unit-test-amd",
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
@@ -43,6 +44,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-2-gpu-large",
         "stage-b-test-4-gpu-b200",
         "stage-b-kernel-unit-1-gpu-large",
+        "stage-b-kernel-unit-1-gpu-b200",
         "stage-b-kernel-unit-8-gpu-h200",
         "stage-b-kernel-benchmark-1-gpu-large",
         "stage-c-test-4-gpu-h100",
@@ -53,6 +55,8 @@ PER_COMMIT_SUITES = {
         "stage-c-test-8-gpu-b200",
         "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
+        "stage-c-test-dsv4-4-gpu-b200",
+        "stage-c-test-dsv4-8-gpu-h200",
     ],
     HWBackend.NPU: [
         "stage-a-test-1-gpu-small",
@@ -114,13 +118,54 @@ NIGHTLY_SUITES = {
 }
 
 
+OTHER_SUITES = {
+    HWBackend.CPU: [
+        "default",
+    ],
+    HWBackend.CUDA: [
+        "stress",
+        "weekly-8-gpu-h200",
+    ],
+}
+
+
+_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
+
+
+def _valid_suites_by_backend() -> dict:
+    """Build a mapping from backend to its set of valid suite names."""
+    result = {}
+    for suite_dict in (PER_COMMIT_SUITES, NIGHTLY_SUITES, OTHER_SUITES):
+        for backend, suites in suite_dict.items():
+            if backend not in result:
+                result[backend] = set()
+            result[backend].update(suites)
+    return result
+
+
+def validate_all_suites(all_tests: List[CIRegistry]):
+    """Fail fast if any test is registered to a suite that doesn't belong to its backend."""
+    valid_by_backend = _valid_suites_by_backend()
+    errors = []
+    for t in all_tests:
+        if t.backend not in _SUITE_CHECKED_BACKENDS:
+            continue
+        valid = valid_by_backend.get(t.backend, set())
+        if t.effective_suite not in valid:
+            errors.append(
+                f"  {t.filename}: backend={t.backend.name}, suite='{t.effective_suite}'"
+            )
+    if errors:
+        raise ValueError("Tests registered to invalid suites:\n" + "\n".join(errors))
+
+
 def filter_tests(
     ci_tests: List[CIRegistry], hw: HWBackend, suite: str, nightly: bool = False
 ) -> List[CIRegistry]:
     ci_tests = [
         t
         for t in ci_tests
-        if t.backend == hw and t.suite == suite and t.nightly == nightly
+        if t.backend == hw and t.effective_suite == suite and t.nightly == nightly
     ]
 
     valid_suites = (
@@ -194,7 +239,9 @@ def run_a_suite(args):
         for f in glob.glob(
             os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
         )
-        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
+        if not f.endswith("/conftest.py")
+        and not f.endswith("/__init__.py")
+        and not f.endswith("/cpu/utils.py")
     ]
 
     # JIT kernel tests and benchmarks (live alongside kernel source)
@@ -210,6 +257,7 @@ def run_a_suite(args):
     sanity_check = True
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
+    validate_all_suites(all_tests)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
 
     if auto_partition_size:

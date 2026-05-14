@@ -39,7 +39,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=40,
-    suite="stage-b-test-1-gpu-large",
+    stage="stage-b",
+    runner_config="1-gpu-large",
 )
 
 BASE_MODEL = "Qwen/Qwen3-8B"
@@ -47,11 +48,10 @@ LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-8B"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
 TP_SIZE = 1
-DISABLE_CUDA_GRAPH = True
-PREFILL_ATTENTION_BACKEND = "fa3"
-DECODE_ATTENTION_BACKEND = "fa3"
+PREFILL_ATTENTION_BACKEND = "fa4"
+DECODE_ATTENTION_BACKEND = "fa4"
 
-KL_THRESHOLD = 1e-2
+KL_THRESHOLD = 5e-3
 
 
 def kl_v2(a, b):
@@ -114,11 +114,15 @@ class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
         of internal param names that would break LoRA auto-detection."""
         model = _build_qwen3_mock()
 
-        with patch("sglang.srt.layers.linear.LinearBase", _MockLinearBase), patch(
-            "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", _MockFusedMoE
-        ), patch(
-            "sglang.srt.layers.vocab_parallel_embedding.ParallelLMHead",
-            _MockParallelLMHead,
+        with (
+            patch("sglang.srt.layers.linear.LinearBase", _MockLinearBase),
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", _MockFusedMoE
+            ),
+            patch(
+                "sglang.srt.layers.vocab_parallel_embedding.ParallelLMHead",
+                _MockParallelLMHead,
+            ),
         ):
             detected = auto_detect_lora_target_modules(model)
 
@@ -139,7 +143,6 @@ class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
             lora_paths={"my_lora": adapter_path},
             lora_backend=LORA_BACKEND,
             attention_backend="flashinfer",
-            disable_cuda_graph=DISABLE_CUDA_GRAPH,
             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
             decode_attention_backend=DECODE_ATTENTION_BACKEND,
         )

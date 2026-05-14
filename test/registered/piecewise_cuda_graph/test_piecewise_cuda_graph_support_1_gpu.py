@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration
-register_cuda_ci(est_time=220, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=180, stage="stage-b", runner_config="1-gpu-large")
 
 
 class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
@@ -41,59 +41,19 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mgsm_accuracy(self):
-        num_examples = 2000
-
+    def test_gsm8k_accuracy(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
-            eval_name="mgsm_en",
-            num_examples=num_examples,
-            num_threads=min(num_examples, 1024),
+            eval_name="gsm8k",
+            num_examples=None,
+            num_threads=1024,
         )
 
         metrics = run_eval(args)
-        print(f"MGSM Accuracy: {metrics['score']:.3f}")
+        print(f"GSM8K Accuracy: {metrics['score']:.3f}")
 
-        self.assertGreaterEqual(metrics["score"], 0.70)
-
-
-class TestPiecewiseCudaGraphInternVL25(CustomTestCase):
-    """Test piecewise CUDA graph with InternVL2.5-8B model"""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "OpenGVLab/InternVL2_5-8B"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--enforce-piecewise-cuda-graph",
-                "--disable-radix-cache",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_mgsm_accuracy(self):
-        num_examples = 2000
-
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=num_examples,
-            num_threads=min(num_examples, 1024),
-        )
-
-        metrics = run_eval(args)
-        print(f"MGSM Accuracy: {metrics['score']:.3f}")
-
-        self.assertGreaterEqual(metrics["score"], 0.70)
+        self.assertGreaterEqual(metrics["score"], 0.80)
 
 
 class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):

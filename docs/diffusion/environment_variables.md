@@ -1,10 +1,41 @@
 # Environment Variables
 
-## Apple MPS
+## Runtime
+
+| Environment Variable | Default | Description |
+|----------------------|---------|-------------|
+| `SGLANG_DIFFUSION_TARGET_DEVICE` | `cuda` | Target device for inference (`cuda`, `rocm`, `xpu`, `npu`, `musa`, `mps`, `cpu`) |
+| `SGLANG_DIFFUSION_ATTENTION_BACKEND` | not set | Override attention backend via env var (e.g. `fa`, `torch_sdpa`, `sage_attn`) |
+| `SGLANG_DIFFUSION_ATTENTION_CONFIG` | not set | Path to attention backend configuration file (JSON/YAML) |
+| `SGLANG_DIFFUSION_STAGE_LOGGING` | false | Enable per-stage timing logs |
+| `SGLANG_DIFFUSION_SERVER_DEV_MODE` | false | Enable dev-only HTTP endpoints for debugging |
+| `SGLANG_DIFFUSION_TORCH_PROFILER_DIR` | not set | Directory for torch profiler traces (absolute path). Enables profiling when set |
+| `SGLANG_DIFFUSION_CACHE_ROOT` | `~/.cache/sgl_diffusion` | Root directory for cache files |
+| `SGLANG_DIFFUSION_CONFIG_ROOT` | `~/.config/sgl_diffusion` | Root directory for configuration files |
+| `SGLANG_DIFFUSION_LOGGING_LEVEL` | `INFO` | Default logging level |
+| `SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD` | `fork` | Multiprocess context for workers (`fork` or `spawn`) |
+| `SGLANG_USE_RUNAI_MODEL_STREAMER` | true | Use Run:AI model streamer for model loading |
+
+## Platform-Specific
+
+### Apple MPS
 
 | Environment Variable | Default | Description                                                  |
 |----------------------|---------|--------------------------------------------------------------|
 | `SGLANG_USE_MLX`     | not set | Set to `1` to enable MLX fused Metal kernels for norm ops on MPS |
+
+### ROCm (AMD GPUs)
+
+| Environment Variable | Default | Description |
+|----------------------|---------|-------------|
+| `SGLANG_USE_ROCM_VAE` | false | Use AITer GroupNorm in VAE for improved performance on ROCm |
+| `SGLANG_USE_ROCM_CUDNN_BENCHMARK` | false | Enable MIOpen auto-tuning for VAE conv layers on ROCm |
+
+### Quantization
+
+| Environment Variable | Default | Description |
+|----------------------|---------|-------------|
+| `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND` | not set | FlashInfer FP4 GEMM backend for generic NVFP4 fallback |
 
 ## Caching Acceleration
 
@@ -29,6 +60,20 @@ See [cache-dit documentation](performance/cache/cache_dit.md) for detailed confi
 | `SGLANG_CACHE_DIT_SCM_POLICY`       | dynamic | SCM caching policy                       |
 | `SGLANG_CACHE_DIT_SCM_COMPUTE_BINS` | not set | Custom SCM compute bins                  |
 | `SGLANG_CACHE_DIT_SCM_CACHE_BINS`   | not set | Custom SCM cache bins                    |
+
+### Cache-DiT Secondary Transformer
+
+For dual-transformer models (e.g., Wan2.2 with high/low-noise experts), these variables configure caching for the secondary transformer. Each falls back to its primary counterpart if not set.
+
+| Environment Variable | Default | Description |
+|-------------------------------------|---------|------------------------------------------|
+| `SGLANG_CACHE_DIT_SECONDARY_FN` | (from primary) | First N blocks to always compute |
+| `SGLANG_CACHE_DIT_SECONDARY_BN` | (from primary) | Last N blocks to always compute |
+| `SGLANG_CACHE_DIT_SECONDARY_WARMUP` | (from primary) | Warmup steps before caching |
+| `SGLANG_CACHE_DIT_SECONDARY_RDT` | (from primary) | Residual difference threshold |
+| `SGLANG_CACHE_DIT_SECONDARY_MC` | (from primary) | Max continuous cached steps |
+| `SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER` | (from primary) | Enable TaylorSeer calibrator |
+| `SGLANG_CACHE_DIT_SECONDARY_TS_ORDER` | (from primary) | TaylorSeer order (1 or 2) |
 
 ## Cloud Storage
 

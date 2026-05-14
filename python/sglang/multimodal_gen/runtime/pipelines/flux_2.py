@@ -1,7 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
 
-from diffusers.image_processor import VaeImageProcessor
+from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -45,7 +45,7 @@ class Flux2Pipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        vae_image_processor = VaeImageProcessor(
+        vae_image_processor = Flux2ImageProcessor(
             vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
             * 2
         )

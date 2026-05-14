@@ -26,6 +26,7 @@ except ImportError:
 
 import sglang.multimodal_gen.runtime.managers.forward_context as fc_mod
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
     destroy_model_parallel,
     get_local_torch_device,
     get_tensor_model_parallel_rank,
@@ -149,13 +150,34 @@ def _load_wan_reference_vae(comp_path: str, pipeline_config) -> nn.Module:
     return vae
 
 
+def _load_reference_component_from_local_safetensors(
+    component_cls: type[nn.Module],
+    comp_path: str,
+    component_name: str,
+) -> nn.Module:
+    config = component_cls.load_config(comp_path)
+    component = component_cls.from_config(config)
+    missing_keys, unexpected_keys = load_checkpoint_weights(component, comp_path)
+    if missing_keys:
+        logger.warning(
+            "Reference %s missing keys from local safetensors: %s",
+            component_name,
+            missing_keys,
+        )
+    if unexpected_keys:
+        logger.warning(
+            "Reference %s unexpected keys from local safetensors: %s",
+            component_name,
+            unexpected_keys,
+        )
+    return component
+
+
 def _load_reference_component(
     comp_path: str,
-    source_root: str,
     component: ComponentType,
     hub_id: str,
     pipeline_config,
-    subfolder: str,
 ) -> nn.Module:
     # WAN VAE does not have a clean generic diffusers auto-load path here, and we
     # explicitly need checkpoint-loaded weights for reference-side transfer/parity.
@@ -168,9 +190,14 @@ def _load_reference_component(
         cls = getattr(diffusers, str(class_name), None) if class_name else None
         if cls is None:
             cls = diffusers.AutoencoderKL
+        if cls is not diffusers.AutoencoderKL and os.path.exists(
+            os.path.join(comp_path, "model.safetensors")
+        ):
+            return _load_reference_component_from_local_safetensors(
+                cls, comp_path, component.value
+            )
         return cls.from_pretrained(
-            source_root,
-            subfolder=subfolder,
+            comp_path,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         )
@@ -182,6 +209,14 @@ def _load_reference_component(
             "torch_dtype": torch.bfloat16,
             "trust_remote_code": True,
         }
+        if class_name:
+            maybe_cls = getattr(diffusers, str(class_name), None)
+            if maybe_cls is not None and os.path.exists(
+                os.path.join(comp_path, "model.safetensors")
+            ):
+                return _load_reference_component_from_local_safetensors(
+                    maybe_cls, comp_path, component.value
+                )
         if cfg:
             for k, out_k in [
                 ("in_dim", "in_channels"),
@@ -192,10 +227,8 @@ def _load_reference_component(
                 if k in cfg:
                     load_kwargs[out_k] = cfg[k]
         candidates = [diffusers.AutoModel]
-        if class_name:
-            maybe_cls = getattr(diffusers, str(class_name), None)
-            if maybe_cls is not None:
-                candidates.insert(0, maybe_cls)
+        if class_name and maybe_cls is not None:
+            candidates.insert(0, maybe_cls)
         last_error: Optional[Exception] = None
         for cls in candidates:
             try:
@@ -242,10 +275,29 @@ def _load_reference_component(
 # Public accuracy engine
 class AccuracyEngine:
     @staticmethod
+    def prepare_component_for_release(module: nn.Module) -> None:
+        for submodule in module.modules():
+            reset_teacache_state = getattr(submodule, "reset_teacache_state", None)
+            if callable(reset_teacache_state):
+                reset_teacache_state()
+
+            seen_names: set[str] = set()
+            for cls in type(submodule).__mro__:
+                for name, attr in cls.__dict__.items():
+                    if name in seen_names:
+                        continue
+                    seen_names.add(name)
+
+                    cache_clear = getattr(attr, "cache_clear", None)
+                    if callable(cache_clear):
+                        cache_clear()
+
+    @staticmethod
     def reset_parallel_runtime() -> None:
         if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-        if model_parallel_is_initialized():
+            if torch.distributed.get_world_size() == 1:
+                cleanup_dist_env_and_memory()
+        elif model_parallel_is_initialized():
             destroy_model_parallel()
         gc.collect()
         if torch.cuda.is_available():
@@ -476,6 +528,8 @@ class AccuracyEngine:
             num_gpus,
             component_selection.component_paths,
         )
+        if component == ComponentType.TRANSFORMER and not materialize_sgl_on_device:
+            sgl_args.dit_cpu_offload = True
         initialize_parallel_runtime(sgl_args)
         set_global_server_args(sgl_args)
 
@@ -497,11 +551,9 @@ class AccuracyEngine:
 
         ref_component = _load_reference_component(
             component_selection.source_path,
-            component_selection.source_root,
             component,
             hub_id,
             sgl_args.pipeline_config,
-            component_selection.source_subfolder,
         )
         if materialize_ref_on_device:
             ref_component = ref_component.to(device=device, dtype=torch.bfloat16)

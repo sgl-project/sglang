@@ -3,7 +3,7 @@ import re
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.midashenglm import MiDashengLMModel
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -57,8 +57,10 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             kwargs["videos"] = videos
         if audios:
             kwargs["audio"] = audios
-            kwargs["audio_kwargs"] = {}
+            kwargs.setdefault("audio_kwargs", {})
             kwargs["audio_kwargs"].setdefault("truncation", False)
+            if self.audio_config:
+                kwargs["audio_kwargs"].update(self.audio_config)
 
         processor = self._processor
         result = processor.__call__(
@@ -154,12 +156,12 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             mm_items[0].audio_length = audio_length
             logger.info(f"Set audio_length={audio_length} (fallback, waveform length)")
 
-        result = {
-            "mm_items": mm_items,
-            "input_ids": input_ids.tolist(),
-            "audio_start_id": self.audio_start_id,
-            "audio_token_id": self.audio_token_id,
-            "audio_end_id": self.audio_end_id,
-        }
-        logger.info(f"Returning {len(result['mm_items'])} mm_items")
+        result = MultimodalProcessorOutput(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            audio_start_id=self.audio_start_id,
+            audio_token_id=self.audio_token_id,
+            audio_end_id=self.audio_end_id,
+        )
+        logger.info(f"Returning {len(result.mm_items)} mm_items")
         return result

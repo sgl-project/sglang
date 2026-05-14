@@ -65,6 +65,14 @@ _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
 
 
+if _is_npu:
+    from sgl_kernel_npu.fla.utils import (
+        fused_qkvzba_split_reshape_cat as fused_qkvzba_split_reshape_cat_npu,
+    )
+
+    fused_qkvzba_split_reshape_cat = fused_qkvzba_split_reshape_cat_npu
+
+
 class Qwen3GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -223,11 +231,20 @@ class Qwen3GatedDeltaNet(nn.Module):
         ModelWeightParameter exposes weight_loader as a read-only property
         backed by _weight_loader, while plain parameters store it as a
         regular attribute.  This helper handles both cases."""
-        param = module.weight
-        if hasattr(param, "_weight_loader"):
-            param._weight_loader = new_loader
-        else:
-            param.weight_loader = new_loader
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "input_scale",
+            "weight_offset",
+        ):
+            param = getattr(module, attr_name, None)
+            if param is None:
+                continue
+            if hasattr(param, "_weight_loader"):
+                param._weight_loader = new_loader
+            else:
+                param.weight_loader = new_loader
 
     @staticmethod
     def _make_packed_weight_loader(module):
@@ -245,14 +262,23 @@ class Qwen3GatedDeltaNet(nn.Module):
                 if output_dim is not None and module.tp_size > 1:
                     shard_size = param.data.shape[output_dim]
                     start_idx = module.tp_rank * shard_size
+                    if (
+                        _is_cpu and _is_amx_available
+                    ) and start_idx + shard_size > loaded_weight.shape[output_dim]:
+                        shard_size = loaded_weight.shape[output_dim] - start_idx
                     loaded_weight = loaded_weight.narrow(
                         output_dim, start_idx, shard_size
                     )
-                assert param.data.shape == loaded_weight.shape, (
-                    f"Shape mismatch: param {param.data.shape} vs "
-                    f"loaded {loaded_weight.shape}"
-                )
-                param.data.copy_(loaded_weight)
+                if _is_cpu and _is_amx_available:
+                    slices = tuple(slice(0, s) for s in loaded_weight.shape)
+                    param.data.zero_()
+                    param.data[slices].copy_(loaded_weight)
+                else:
+                    assert param.data.shape == loaded_weight.shape, (
+                        f"Shape mismatch: param {param.data.shape} vs "
+                        f"loaded {loaded_weight.shape}"
+                    )
+                    param.data.copy_(loaded_weight)
             else:
                 # Split checkpoint (int or tuple shard_id) → standard path
                 original_loader(param, loaded_weight, loaded_shard_id)
@@ -419,6 +445,48 @@ class Qwen3GatedDeltaNet(nn.Module):
         return output
 
 
+def _apply_qwen3_next_mlp(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    forward_batch: ForwardBatch,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    hidden_states, residual = layer.layer_communicator.prepare_mlp(
+        hidden_states, residual, forward_batch
+    )
+    use_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
+        forward_batch
+    )
+    should_allreduce_fusion = (
+        layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+            forward_batch
+        )
+    )
+
+    if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+        hidden_states = layer.mlp(
+            hidden_states,
+            forward_batch=forward_batch,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
+        )
+    else:
+        hidden_states = layer.mlp(
+            hidden_states,
+            should_allreduce_fusion=should_allreduce_fusion,
+            use_reduce_scatter=use_reduce_scatter,
+        )
+
+    if should_allreduce_fusion:
+        hidden_states._sglang_needs_allreduce_fusion = True
+    else:
+        hidden_states, residual = layer.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
+    return hidden_states, residual
+
+
 class Qwen3HybridLinearDecoderLayer(nn.Module):
 
     def __init__(
@@ -501,18 +569,8 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_states,
                 forward_batch,
             )
-        # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = _apply_qwen3_next_mlp(
+            self, hidden_states, residual, forward_batch
         )
 
         return hidden_states, residual
@@ -741,17 +799,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = _apply_qwen3_next_mlp(
+            self, hidden_states, residual, forward_batch
         )
 
         return hidden_states, residual
@@ -809,6 +858,11 @@ class Qwen3NextModel(nn.Module):
         self.layers_to_capture = []
 
     def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
@@ -946,6 +1000,9 @@ class Qwen3NextForCausalLM(nn.Module):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
@@ -1126,6 +1183,18 @@ class Qwen3NextForCausalLM(nn.Module):
             )  # Specific layers for EAGLE3 support
         else:
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
 
 EntryClass = Qwen3NextForCausalLM

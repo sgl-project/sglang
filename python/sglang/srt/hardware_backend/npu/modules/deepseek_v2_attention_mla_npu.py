@@ -302,6 +302,7 @@ def forward_dsa_prepare_npu(
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
     layer_scatter_modes,
+    prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
     if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
@@ -358,7 +359,9 @@ def forward_dsa_prepare_npu(
             if q_event is not None:
                 torch.npu.current_stream().wait_event(q_event)
         else:
-            if fused_qkv_a_proj_out.shape[0] < 65535:
+            if fused_qkv_a_proj_out.shape[0] < 65535 and not nsa_use_prefill_cp(
+                forward_batch
+            ):
                 q_lora, k_nope, k_pe = fused_split_qk_norm(
                     fused_qkv_a_proj_out,
                     m.q_a_layernorm,
@@ -401,15 +404,18 @@ def forward_dsa_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
-    topk_indices = m.indexer(
-        hidden_states,
-        q_lora,
-        positions,
-        forward_batch,
-        m.layer_id,
-        layer_scatter_modes,
-        dynamic_scale,
-    )
+    if m.skip_topk:
+        topk_indices = prev_topk_indices
+    else:
+        topk_indices = m.indexer(
+            hidden_states,
+            q_lora,
+            positions,
+            forward_batch,
+            m.layer_id,
+            layer_scatter_modes,
+            dynamic_scale,
+        )
 
     return (
         q_pe,
@@ -472,7 +478,10 @@ def forward_dsa_core_npu(
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
     output, _ = m.o_proj(attn_bmm_output)
-    return output
+    if not m.next_skip_topk:
+        return output, None
+    else:
+        return output, topk_indices
 
 
 def npu_mla_preprocess(

@@ -34,7 +34,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=200,
-    suite="stage-b-test-2-gpu-large",
+    stage="stage-b",
+    runner_config="2-gpu-large",
 )
 
 LOGPROB_THRESHOLD = 5e-04

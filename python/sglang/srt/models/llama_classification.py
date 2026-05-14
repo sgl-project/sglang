@@ -18,7 +18,12 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
+from sglang.srt.layers.pooler import (
+    EmbeddingPoolerOutput,
+    Pooler,
+    PoolingType,
+    score_and_pool,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -59,10 +64,13 @@ class LlamaForClassification(nn.Module):
         ), "LlamaForClassification is only used for embedding. Please add --is-embedding when you launch the server."
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
-        scores = self.classification_head(last_token_hidden)
-
-        return EmbeddingPoolerOutput(scores)
+        return score_and_pool(
+            self.classification_head,
+            self.pooler,
+            hidden_states,
+            forward_batch,
+            input_ids,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())

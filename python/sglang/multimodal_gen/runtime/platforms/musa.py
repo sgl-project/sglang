@@ -72,6 +72,11 @@ class MusaPlatformBase(Platform):
     device_control_env_var: str = "MUSA_VISIBLE_DEVICES"
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def is_float64_supported(cls) -> bool:
+        return False
+
+    @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device(f"musa:{envs.LOCAL_RANK}")
 
@@ -155,6 +160,23 @@ class MusaPlatformBase(Platform):
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+        elif selected_backend == AttentionBackendEnum.SAGE_ATTN:
+            try:
+                from sageattention import sageattn  # noqa: F401
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn import (  # noqa: F401
+                    SageAttentionBackend,
+                )
+
+                logger.info("Using Sage Attention backend")
+
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
+            except ImportError as e:
+                logger.info(e)
+                logger.info(
+                    "Sage Attention backend is not installed (To install it, run `pip install sageattention>=0.1.0`). Falling back to Flash Attention."
+                )
+                target_backend = AttentionBackendEnum.FA
         elif selected_backend in [
             AttentionBackendEnum.FA,
         ]:
@@ -203,7 +225,7 @@ class MusaPlatformBase(Platform):
             logger.info("Using Torch SDPA backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-        logger.info("Using FlashAttention (FA3) backend on MUSA")
+        logger.info("Using FlashAttention (FA3) backend")
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 
     @classmethod
