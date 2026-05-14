@@ -181,9 +181,11 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -457,7 +459,6 @@ class EagleDraftWorker(BaseDraftWorker):
             # Set inputs
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
@@ -477,6 +478,7 @@ class EagleDraftWorker(BaseDraftWorker):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+            forward_batch.positions.add_(1)
 
         # Organize the results
         score_list = torch.cat(score_list, dim=1).flatten(
@@ -622,9 +624,10 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index
         ]
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-            select_index
-        ]
+        if draft_logits_output.hidden_states is not None:
+            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                select_index
+            ]
         probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
         ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
@@ -705,9 +708,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Build adaptive runtime states (must be after draft worker is fully initialized)
         if self.adaptive_controller is not None:
-            with self._draft_worker.draft_tp_context(
-                self._draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self._draft_worker.draft_tp_context(
+                    self._draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 self.adaptive_controller.register(
                     SpecRuntimeState(
                         speculative_num_steps=self.speculative_num_steps,
@@ -740,16 +747,30 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            target_capture_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.FULL
+            )
+            model_worker_batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
 
             # Draft prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            draft_capture_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.LAST
+            )
+            model_worker_batch.capture_hidden_mode = draft_capture_mode
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
                         model_worker_batch,
@@ -761,16 +782,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 return batch_output
         else:
             if model_worker_batch.spec_info is None:
+                capture_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.speculative_algorithm.is_standalone()
+                    else CaptureHiddenMode.LAST
+                )
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
                     hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
                     dtype=EagleDraftInput.dtype_for(self.draft_worker),
                     topk=self.topk,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                    capture_hidden_mode=capture_mode,
                 )
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
@@ -784,9 +814,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self._draft_done_event.record()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
