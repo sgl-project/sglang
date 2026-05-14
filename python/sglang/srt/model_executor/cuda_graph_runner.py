@@ -731,6 +731,7 @@ class CudaGraphRunner:
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
             is_hybrid_swa=model_runner.is_hybrid_swa,
+            dcp_size=self.dcp_size,
         )
         self.buffers.share_buffers()
 

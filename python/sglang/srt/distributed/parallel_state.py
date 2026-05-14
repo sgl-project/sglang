@@ -1874,23 +1874,24 @@ def initialize_model_parallel(
             _TP.pynccl_comm.disabled = False
             _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
 
-    # Build decode context-parallel groups inside each TP group.
+    # Build decode context-parallel groups inside each TP group only when DCP is enabled.
     global _DCP
     assert _DCP is None, "decode context parallel group is already initialized"
-    dcp_group_ranks = []
-    for tp_group in group_ranks:
-        for start in range(0, len(tp_group), decode_context_parallel_size):
-            dcp_group_ranks.append(
-                tp_group[start : start + decode_context_parallel_size]
-            )
-    _DCP = init_model_parallel_group(
-        dcp_group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
-        group_name="dcp",
-        recovered_rank=recovered_rank,
-    )
+    if decode_context_parallel_size > 1:
+        dcp_group_ranks = []
+        for tp_group in group_ranks:
+            for start in range(0, len(tp_group), decode_context_parallel_size):
+                dcp_group_ranks.append(
+                    tp_group[start : start + decode_context_parallel_size]
+                )
+        _DCP = init_model_parallel_group(
+            dcp_group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            group_name="dcp",
+            recovered_rank=recovered_rank,
+        )
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size

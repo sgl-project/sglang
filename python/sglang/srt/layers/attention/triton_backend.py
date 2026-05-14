@@ -126,8 +126,8 @@ class TritonAttnBackend(AttentionBackend):
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
-        self.dcp_size = get_dcp_group().world_size
-        self.dcp_rank = get_dcp_group().rank_in_group
+        self.dcp_size = model_runner.dcp_size
+        self.dcp_rank = model_runner.dcp_rank
         self.dcp_num_head = self.num_head * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
@@ -1502,14 +1502,26 @@ class TritonAttnBackend(AttentionBackend):
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
                     # after this point in decode, so scale in place.
                     k.div_(layer.k_scale)
-                self._set_kv_buffer(
-                    forward_batch, layer, self._kv_cache_loc(forward_batch), k, v
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
                 )
-            else:
+            elif self.dcp_size > 1:
                 self._set_kv_buffer(
                     forward_batch,
                     layer,
                     self._kv_cache_loc(forward_batch),
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
                     k,
                     v,
                     layer.k_scale,
