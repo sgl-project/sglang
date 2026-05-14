@@ -865,20 +865,6 @@ class CPUGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
-        elif self.model_runner.spec_algorithm.is_decoupled_verify():
-            from sglang.srt.speculative.ngram_info import NgramVerifyInput
-
-            spec_info = NgramVerifyInput(
-                draft_token=None,
-                tree_mask=self.custom_mask,
-                positions=None,
-                retrieve_index=None,
-                retrieve_next_token=None,
-                retrieve_next_sibling=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
-            )
-            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
-
         return spec_info
 
 

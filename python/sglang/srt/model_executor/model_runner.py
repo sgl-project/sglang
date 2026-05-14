@@ -2697,18 +2697,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         seq_lens_cpu=None,
                     )
             elif self.spec_algorithm.is_decoupled_verify():
-                from sglang.srt.speculative.ngram_info import NgramVerifyInput
+                from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
-                spec_info = NgramVerifyInput(
+                spec_info = EagleVerifyInput(
                     draft_token=None,
-                    tree_mask=buffers.custom_mask,
+                    custom_mask=buffers.custom_mask,
                     positions=None,
                     retrieve_index=None,
                     retrieve_next_token=None,
                     retrieve_next_sibling=None,
+                    retrieve_cum_len=None,
+                    spec_steps=self.server_args.speculative_num_steps,
+                    topk=self.server_args.speculative_eagle_topk,
                     draft_token_num=num_tokens_per_bs,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    seq_lens_sum=None,
+                    seq_lens_cpu=None,
                 )
-                spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
             elif self.spec_algorithm.is_dflash():
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
