@@ -183,6 +183,10 @@ Nightly-aligned presets come first; skill-only presets stay available after them
 | `hunyuanvideo` | `hunyuanvideo-community/HunyuanVideo` | No | Skill-only extra preset |
 | `mova-720p` | `OpenMOSS-Team/MOVA-720p` | No | Skill-only extra preset |
 | `helios` | `BestWishYsh/Helios-Base` | No | Skill-only extra preset |
+| `joyai-edit` | `jdopensource/JoyAI-Image-Edit-Diffusers` | No | Skill-only JoyAI image-edit preset; uses the cat image, 1024x1024, 40 steps, guidance 4.0, 2-GPU CFG parallel |
+| `firered-edit-1.0` | `FireRedTeam/FireRed-Image-Edit-1.0` | No | Skill-only FireRed 1.0 image-edit preset; QwenImageEditPlus native path; uses 2-GPU CFG parallel |
+| `firered-edit-1.1` | `FireRedTeam/FireRed-Image-Edit-1.1` | No | Skill-only FireRed 1.1 image-edit preset; QwenImageEditPlus native path; uses 2-GPU CFG parallel |
+| `hunyuan3d-shape` | `tencent/Hunyuan3D-2` | No | Skill-only Hunyuan3D shape-generation preset; primary metric is `Hunyuan3DShapeDenoisingStage` |
 
 For Wan2.2 video models, remember the difference between **nightly alignment**
 and **best latency tuning**:
@@ -258,6 +262,65 @@ sglang generate \
 
 This matches the skill-only `ltx23-two-stage` preset. Use it as a
 high-resolution stress target, not as a nightly comparison case.
+
+### Manual command example: JoyAI Image Edit
+
+```bash
+sglang generate \
+  --backend=sglang \
+  --model-path=jdopensource/JoyAI-Image-Edit-Diffusers \
+  --prompt="Make the cat wear a red hat" \
+  --image-path="${ASSET_DIR}/cat.png" \
+  --width=1024 --height=1024 \
+  --num-inference-steps=40 --guidance-scale=4.0 \
+  --num-gpus=2 --enable-cfg-parallel --ulysses-degree=1 \
+  --dit-layerwise-offload false --dit-cpu-offload false \
+  --save-output --enable-torch-compile --warmup
+```
+
+### Manual command example: FireRed Image Edit
+
+```bash
+sglang generate \
+  --backend=sglang \
+  --model-path=FireRedTeam/FireRed-Image-Edit-1.1 \
+  --prompt="Make the cat wear a red hat" \
+  --image-path="${ASSET_DIR}/cat.png" \
+  --width=1024 --height=1024 \
+  --num-inference-steps=40 --guidance-scale=4.0 \
+  --num-gpus=2 --enable-cfg-parallel --ulysses-degree=1 \
+  --dit-layerwise-offload false --dit-cpu-offload false \
+  --save-output --enable-torch-compile --warmup
+```
+
+Use `FireRedTeam/FireRed-Image-Edit-1.0` in the same command when comparing the
+1.0 checkpoint. Both FireRed presets use the native `QwenImageEditPlusPipeline`
+path. On H100, 2-GPU CFG parallel reduced 40-step denoise latency versus the
+otherwise matching 2-GPU Ulysses command: FireRed 1.0 from 13419.15 ms to
+10955.90 ms, and FireRed 1.1 from 13414.72 ms to 10934.21 ms.
+
+### Manual command example: Hunyuan3D Shape
+
+```bash
+OUTPUT_DIR=$(python3 "$ENV_PY" print-output-dir --kind benchmarks --mkdir)
+CONFIG_DIR="${OUTPUT_DIR}/generated_configs"
+mkdir -p "${CONFIG_DIR}"
+printf '{"paint_enable": false}\n' > "${CONFIG_DIR}/hunyuan3d-shape.json"
+
+sglang generate \
+  --backend=sglang \
+  --model-path=tencent/Hunyuan3D-2 \
+  --prompt="generate 3d mesh" \
+  --image-path="${ASSET_DIR}/cat.png" \
+  --config="${CONFIG_DIR}/hunyuan3d-shape.json" \
+  --num-inference-steps=50 --guidance-scale=5.0 \
+  --dit-layerwise-offload false --dit-cpu-offload false \
+  --save-output --enable-torch-compile --warmup
+```
+
+For Hunyuan3D, compare the denoise stage separately from mesh export and paint
+stages. The benchmark helper reports `Hunyuan3DShapeDenoisingStage` as the
+primary denoise metric.
 
 ### Manual command example: Wan2.2-I2V-A14B 720P
 

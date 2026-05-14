@@ -3,7 +3,7 @@
 import contextlib
 from collections import namedtuple
 from collections.abc import Callable
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import torch
 import triton
@@ -934,6 +934,35 @@ def rms_norm_batch_invariant(
     return rms_norm(input, weight, eps=eps)
 
 
+_ONES_CACHE: dict[Tuple, torch.Tensor] = {}
+
+
+def _get_or_make_ones(shape, device, dtype) -> torch.Tensor:
+    key = (tuple(shape), device, dtype)
+    t = _ONES_CACHE.get(key)
+    if t is None:
+        t = torch.ones(shape, device=device, dtype=dtype)
+        _ONES_CACHE[key] = t
+    return t
+
+
+def _rms_norm_aten_compat(input, normalized_shape, weight=None, eps=None):
+    if eps is None:
+        eps = torch.finfo(input.dtype).eps
+    if weight is None:
+        weight = _get_or_make_ones(normalized_shape, input.device, input.dtype)
+    assert tuple(normalized_shape) == (input.shape[-1],), (
+        "rms_norm_batch_invariant only supports last-dim normalization "
+        f"(got normalized_shape={tuple(normalized_shape)}, "
+        f"input.shape={tuple(input.shape)})"
+    )
+    return rms_norm_batch_invariant(input, weight, eps=eps)
+
+
+def _mm_dtype_compat(self, mat2, out_dtype):
+    return matmul_persistent(self.contiguous(), mat2.contiguous()).to(out_dtype)
+
+
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
 _original_torch_bmm = None
@@ -960,6 +989,8 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
         "aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key
     )
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
+    _batch_invariant_LIB.impl("aten::rms_norm", _rms_norm_aten_compat, dispatch_key)
+    _batch_invariant_LIB.impl("aten::mm.dtype", _mm_dtype_compat, dispatch_key)
 
     if enable_bmm:
         _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, dispatch_key)

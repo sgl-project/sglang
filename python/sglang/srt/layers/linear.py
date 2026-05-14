@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/linear.py"""
 
 from __future__ import annotations
@@ -268,7 +270,9 @@ class ReplicatedLinear(LinearBase):
                     param.dtype == loaded_weight.dtype
                 ), "init para dtype and loaded weight dtype should be the same"
 
-        assert param.size() == loaded_weight.size()
+        assert (
+            param.size() == loaded_weight.size()
+        ), f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -428,7 +432,9 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert param_data.shape == loaded_weight.shape
+        assert (
+            param_data.shape == loaded_weight.shape
+        ), f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):

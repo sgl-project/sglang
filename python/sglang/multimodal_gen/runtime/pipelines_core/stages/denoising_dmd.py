@@ -170,10 +170,13 @@ class DmdDenoisingStage(DenoisingStage):
                                 **pos_cond_kwargs,
                             ).permute(0, 2, 1, 3, 4)
 
+                        video_timesteps = t_expand[:, None].expand(
+                            -1, pred_noise.shape[1]
+                        )
                         pred_video = pred_noise_to_pred_video(
                             pred_noise=pred_noise.flatten(0, 1),
                             noise_input_latent=noise_latents.flatten(0, 1),
-                            timestep=t_expand,
+                            timestep=video_timesteps,
                             scheduler=scheduler,
                         ).unflatten(0, pred_noise.shape[:2])
 

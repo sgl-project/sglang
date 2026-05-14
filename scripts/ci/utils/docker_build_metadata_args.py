@@ -3,7 +3,7 @@ import datetime
 import json
 import sys
 
-MOVING_TAGS = {"dev", "dev-cu13", "latest"}
+MOVING_TAGS = {"dev", "dev-cu12", "dev-cu13", "latest"}
 
 
 def render_tag_template(tag: str, version: str, date: str, short_sha: str) -> str:

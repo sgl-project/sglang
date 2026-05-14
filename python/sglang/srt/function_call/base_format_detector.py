@@ -1,13 +1,19 @@
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+try:
+    from xgrammar import StructuralTag, get_model_structural_tag
+except ImportError:
+    StructuralTag = Any
+    get_model_structural_tag = None
+
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -361,3 +367,45 @@ class BaseFormatDetector(ABC):
             A function that takes a tool name (str) and returns StructureInfo
         """
         raise NotImplementedError()
+
+    def get_structural_tag_name(self) -> Optional[str]:
+        """Return the XGrammar model name for native structural tags, if supported."""
+        return None
+
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+    ) -> Optional[StructuralTag]:
+        """
+        Return a model-native XGrammar structural tag when supported.
+
+        Args:
+            tools: List of available tools
+            tool_choice: The tool choice setting from the request
+            thinking_mode: Whether to include the model's reasoning prefix in
+                the returned structural tag. Pass False when SGLang's
+                ReasonerGrammarBackend will own the <think>...</think> prefix
+                (the typical case when --reasoning-parser is configured) so
+                only one layer constrains the reasoning section.
+
+        Returns:
+            StructuralTag if this detector supports model-native tags, otherwise None
+        """
+        structural_tag_name = self.get_structural_tag_name()
+        if not structural_tag_name or get_model_structural_tag is None:
+            return None
+
+        converted_tools = [tool.model_dump() for tool in tools or []]
+        converted_tool_choice = (
+            tool_choice.model_dump()
+            if isinstance(tool_choice, ToolChoice)
+            else tool_choice
+        )
+        return get_model_structural_tag(
+            model=structural_tag_name,
+            tools=converted_tools,
+            tool_choice=converted_tool_choice,
+            reasoning=thinking_mode,
+        )

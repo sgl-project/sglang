@@ -9,7 +9,7 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=6, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=6, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=3, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -18,7 +18,7 @@ class TestBuildEagleTree(unittest.TestCase):
 
     def test_build_tree_kernel_efficient(self):
         """Test the build_tree_kernel_efficient function with known inputs and expected outputs."""
-        verified_id = torch.tensor([29974, 13], device=get_device(), dtype=torch.int32)
+        bonus_tokens = torch.tensor([29974, 13], device=get_device(), dtype=torch.int32)
         score_list = [
             torch.tensor(
                 [
@@ -244,7 +244,7 @@ class TestBuildEagleTree(unittest.TestCase):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            verified_id=verified_id,
+            bonus_tokens=bonus_tokens,
             parent_list=parent_list,
             top_scores_index=top_scores_index,
             draft_tokens=draft_tokens,

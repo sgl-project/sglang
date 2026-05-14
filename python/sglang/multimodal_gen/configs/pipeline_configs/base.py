@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import json
+import math
 import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
@@ -21,8 +22,12 @@ from sglang.multimodal_gen.configs.models import (
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
@@ -101,6 +106,44 @@ def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
     raise NotImplementedError
 
 
+@dataclass(frozen=True)
+class TextConditioningOutput:
+    """Text embeddings and masks aligned to postprocessed sequence length.
+
+    `prompt_embeds_mask` and `prompt_seq_lens` describe real text tokens after
+    model-specific trimming or packing, not the raw tokenizer output.
+    """
+
+    prompt_embeds: torch.Tensor
+    prompt_embeds_mask: torch.Tensor | None = None
+    prompt_seq_lens: list[int] | None = None
+
+
+def pad_text_embeddings_with_mask(
+    text_embeds: list[torch.Tensor],
+) -> TextConditioningOutput:
+    """Pad variable-length text embeddings and return the valid-token mask."""
+    if not text_embeds:
+        raise ValueError("text_embeds must contain at least one tensor")
+
+    max_seq_len = max(e.size(0) for e in text_embeds)
+    prompt_embeds = torch.stack(
+        [
+            torch.cat([e, e.new_zeros(max_seq_len - e.size(0), e.size(1))])
+            for e in text_embeds
+        ]
+    )
+    seq_lens = [int(e.size(0)) for e in text_embeds]
+    seq_lens_tensor = torch.tensor(
+        seq_lens,
+        device=prompt_embeds.device,
+        dtype=torch.long,
+    )
+    positions = torch.arange(max_seq_len, device=prompt_embeds.device).unsqueeze(0)
+    prompt_embeds_mask = positions < seq_lens_tensor.unsqueeze(1)
+    return TextConditioningOutput(prompt_embeds, prompt_embeds_mask, seq_lens)
+
+
 def shard_rotary_emb_for_sp(emb):
     """
     Shard rotary embeddings [S, D] along sequence for SP.
@@ -168,6 +211,7 @@ class PipelineConfig:
     # controls the timestep embedding generation
     should_use_guidance: bool = True
     embedded_cfg_scale: float = 6.0
+    cfg_policy: CFGPolicy = field(default_factory=CFGPolicy)
     generator_device: str | None = None
     flow_shift: float | None = None
     disable_autocast: bool = False
@@ -198,6 +242,9 @@ class PipelineConfig:
 
     # image encoding
     image_encoder_extra_args: dict = field(default_factory=lambda: {})
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig()
 
     def postprocess_image(self, image):
         return image.last_hidden_state
@@ -308,6 +355,13 @@ class PipelineConfig:
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         return tokenizer(prompt, **tok_kwargs)
 
+    def is_flux_v1(self) -> bool:
+        """True if this pipeline is FLUX v1 (dual CLIP + T5 text encoders).
+
+        Used by text encoding (e.g. fixed CLIP context). Other pipelines return False.
+        """
+        return False
+
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio
         width = batch.width // self.vae_config.arch_config.spatial_compression_ratio
@@ -328,6 +382,41 @@ class PipelineConfig:
 
     def allow_set_num_frames(self):
         return False
+
+    def supports_dynamic_batching(self):
+        """Return whether this pipeline can opt in to dynamic batching.
+
+        The scheduler still checks each request before merging it into a batch.
+        """
+        return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
+
+    def estimate_request_cost(self, batch) -> float:
+        """Return the relative cost used for batching admission caps.
+
+        This is compared with `max_cost` from the batching config; it is not a
+        memory estimate. The default cost is latent tokens times frames times
+        outputs; pipelines can override it for model-specific admission.
+        """
+        latent_tokens = float(batch.n_tokens or 0)
+        if latent_tokens <= 0:
+            width = int(batch.width or 0)
+            height = int(batch.height or 0)
+            if width > 0 and height > 0:
+                vae_scale = getattr(
+                    self.vae_config.arch_config, "vae_scale_factor", None
+                )
+                if vae_scale is None and hasattr(
+                    self.vae_config, "get_vae_scale_factor"
+                ):
+                    vae_scale = self.vae_config.get_vae_scale_factor()
+                vae_scale = max(1, int(vae_scale or 1))
+                latent_tokens = math.ceil(width / vae_scale) * math.ceil(
+                    height / vae_scale
+                )
+
+        num_frames = max(1, int(batch.num_frames or 1))
+        num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
+        return latent_tokens * num_frames * num_outputs
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         vae_arch_config = self.vae_config.arch_config
@@ -467,6 +556,92 @@ class PipelineConfig:
         Override to suppress (return None) or modify the mask per model.
         """
         return text_inputs.get("attention_mask")
+
+    def build_text_conditioning_mask(
+        self,
+        text_inputs: dict,
+        text_encoder_attention_mask: "torch.Tensor | None",
+        prompt_embeds: "torch.Tensor",
+        encoder_index: int,
+    ) -> "torch.Tensor":
+        """Return a mask aligned with post-processed prompt embeddings.
+
+        True values mark valid text tokens. Dynamic batching must carry
+        post-processed semantic text lengths explicitly; if a model-specific
+        postprocessor changes the sequence length, it must return
+        TextConditioningOutput with an embedding-aligned mask.
+        """
+        if prompt_embeds.ndim < 2:
+            raise ValueError(
+                "prompt_embeds must have shape [batch, seq, ...] to build text conditioning mask"
+            )
+
+        if prompt_embeds.ndim == 2:
+            batch_size, embed_seq_len = 1, prompt_embeds.shape[0]
+        else:
+            batch_size, embed_seq_len = prompt_embeds.shape[:2]
+        device = prompt_embeds.device
+        if text_encoder_attention_mask is None:
+            return torch.ones(
+                (batch_size, embed_seq_len), dtype=torch.bool, device=device
+            )
+
+        raw_mask = text_encoder_attention_mask.to(device=device).bool()
+        if raw_mask.ndim != 2 or raw_mask.shape[0] != batch_size:
+            raise ValueError(
+                "text attention mask must have shape [batch, seq] matching prompt_embeds batch"
+            )
+
+        if raw_mask.shape[1] == embed_seq_len:
+            return raw_mask
+
+        if prompt_embeds.ndim == 2 and raw_mask.shape[0] == 1:
+            return torch.ones((1, embed_seq_len), dtype=torch.bool, device=device)
+
+        raise ValueError(
+            "text attention mask length does not match postprocessed prompt embeddings. "
+            "Postprocess functions that trim, pack, or otherwise change text sequence "
+            "length must return TextConditioningOutput with an embedding-aligned mask."
+        )
+
+    @staticmethod
+    def seq_lens_from_text_conditioning_mask(mask: "torch.Tensor") -> list[int]:
+        if mask.ndim != 2:
+            raise ValueError("text conditioning mask must have shape [batch, seq]")
+        return torch.count_nonzero(mask, dim=1).tolist()
+
+    def require_text_seq_lens(
+        self,
+        batch,
+        encoder_index: int,
+        *,
+        negative: bool = False,
+        expected_batch_size: int | None = None,
+    ) -> list[int]:
+        """Return postprocessed text lengths captured during text encoding.
+
+        Dynamic batches use these lengths for model masks, RoPE, and cache
+        sizing after text embeddings have been padded.
+        """
+        seq_lens_by_encoder = (
+            batch.negative_prompt_seq_lens if negative else batch.prompt_seq_lens
+        )
+        kind = "negative" if negative else "positive"
+        if seq_lens_by_encoder is None or encoder_index >= len(seq_lens_by_encoder):
+            raise ValueError(
+                f"Missing {kind} prompt_seq_lens for text encoder {encoder_index}; "
+                "dynamic text conditioning requires explicit sequence lengths."
+            )
+
+        seq_lens = [int(x) for x in seq_lens_by_encoder[encoder_index]]
+        if expected_batch_size is not None and len(seq_lens) != int(
+            expected_batch_size
+        ):
+            raise ValueError(
+                f"{kind} prompt_seq_lens for text encoder {encoder_index} has "
+                f"{len(seq_lens)} entries, expected {expected_batch_size}."
+            )
+        return seq_lens
 
     def get_text_encoder_pooler_output(
         self, outputs: "BaseEncoderOutput", encoder_index: int

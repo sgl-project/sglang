@@ -114,13 +114,31 @@ class TimestepEmbedder(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         # Use MergedColumnParallelLinear for gate and up projection (fused)
         self.w13 = MergedColumnParallelLinear(
-            dim, [hidden_dim, hidden_dim], bias=False, gather_output=False
+            dim,
+            [hidden_dim, hidden_dim],
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w13",
         )
-        self.w2 = RowParallelLinear(hidden_dim, dim, bias=False, input_is_parallel=True)
+        self.w2 = RowParallelLinear(
+            hidden_dim,
+            dim,
+            bias=False,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w2",
+        )
         self.act = SiluAndMul()
 
     def forward(self, x):
@@ -159,7 +177,7 @@ class ZImageAttention(nn.Module):
         self.local_num_kv_heads = num_kv_heads // tp_size
 
         kv_dim = self.head_dim * num_kv_heads
-        self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
+        self.use_fused_qkv = True
 
         if self.use_fused_qkv:
             self.to_qkv = MergedColumnParallelLinear(
@@ -409,7 +427,12 @@ class ZImageTransformerBlock(nn.Module):
             if hasattr(self.feed_forward, "net") and len(self.feed_forward.net) > 2:
                 self.feed_forward.net[2].act_unsigned = quant_config.act_unsigned
         else:
-            self.feed_forward = FeedForward(dim=dim, hidden_dim=hidden_dim)
+            self.feed_forward = FeedForward(
+                dim=dim,
+                hidden_dim=hidden_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.feed_forward",
+            )
 
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
@@ -600,6 +623,14 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         ZImageDitConfig().arch_config.reverse_param_names_mapping
     )
 
+    # Maps fused runtime layer names to their checkpoint shard names.
+    # Used by is_layer_skipped() to correctly handle --quantization-ignored-layers
+    # Only list fusions that are unconditional. Conditional fusions (e.g. to_qkv for
+    # Nunchaku) are handled by their own quant path.
+    packed_modules_mapping = {
+        "w13": ["w1", "w3"],
+    }
+
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
         return {
@@ -780,64 +811,122 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         f_patch_size: int,
         image_seq_len_target: int | None = None,
     ):
-        assert len(all_image) == len(all_cap_feats) == 1
+        """Patchify images and pad image/caption tokens to batch targets.
 
-        image = all_image[0]  # C, F, H, W
-        cap_feat = all_cap_feats[0]  # L, D
+        Each image is [C, F, H, W] and has one [L, D] caption. Returned tensors
+        are stacked as [B, S, D], while valid lengths keep track of real tokens
+        before learned pad tokens are restored. `image_seq_len_target`, when
+        set, is the SP-local padded image-token target.
+        """
+        if len(all_image) != len(all_cap_feats):
+            raise ValueError(
+                f"Z-Image expects one caption embedding per image, got {len(all_image)} images and {len(all_cap_feats)} captions"
+            )
+        if not all_image:
+            raise ValueError("Z-Image batch must contain at least one image latent")
+
         pH = pW = patch_size
         pF = f_patch_size
-        device = image.device
         all_image_out = []
         all_image_size = []
         all_cap_feats_out = []
         all_image_valid_lens = []
         all_cap_valid_lens = []
+        image_records = []
 
-        # ------------ Process Caption ------------
-        cap_ori_len = cap_feat.size(0)
-        cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
-
-        # padded feature
-        cap_padded_feat = torch.cat(
-            [cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)],
-            dim=0,
+        cap_seq_len_target = max(
+            self._ceil_to_multiple(cap_feat.size(0), SEQ_MULTI_OF)
+            for cap_feat in all_cap_feats
         )
-        all_cap_feats_out.append(cap_padded_feat)
-        all_cap_valid_lens.append(cap_ori_len)
 
-        # ------------ Process Image ------------
-        C, F, H, W = image.size()
-        all_image_size.append((F, H, W))
+        for cap_feat in all_cap_feats:
+            cap_ori_len = cap_feat.size(0)
+            cap_padding_len = cap_seq_len_target - cap_ori_len
+            cap_padded_feat = torch.cat(
+                [cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)],
+                dim=0,
+            )
+            all_cap_feats_out.append(cap_padded_feat)
+            all_cap_valid_lens.append(cap_ori_len)
 
-        F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
-        image = image.view(C, F_tokens, pF, H_tokens, pH, W_tokens, pW)
-        # "c f pf h ph w pw -> (f h w) (pf ph pw c)"
-        image = image.permute(1, 3, 5, 2, 4, 6, 0).reshape(
-            F_tokens * H_tokens * W_tokens, pF * pH * pW * C
-        )
-        image_ori_len = image.size(0)
-        min_image_seq_len = self._ceil_to_multiple(image_ori_len, SEQ_MULTI_OF)
-        if image_seq_len_target is None:
-            image_seq_len_target = min_image_seq_len
-        else:
-            image_seq_len_target = max(min_image_seq_len, image_seq_len_target)
-        image_padding_len = image_seq_len_target - image_ori_len
+        target_image_seq_len = image_seq_len_target or 0
+        for image in all_image:
+            # ------------ Process Image ------------
+            C, F, H, W = image.size()
+            image_size = (F, H, W)
 
-        # padded feature
-        image_padded_feat = torch.cat(
-            [image, image[-1:].repeat(image_padding_len, 1)],
-            dim=0,
-        )
-        all_image_out.append(image_padded_feat)
-        all_image_valid_lens.append(image_ori_len)
+            F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
+            image = image.view(C, F_tokens, pF, H_tokens, pH, W_tokens, pW)
+            # "c f pf h ph w pw -> (f h w) (pf ph pw c)"
+            image = image.permute(1, 3, 5, 2, 4, 6, 0).reshape(
+                F_tokens * H_tokens * W_tokens, pF * pH * pW * C
+            )
+            image_ori_len = image.size(0)
+            target_image_seq_len = max(
+                target_image_seq_len,
+                self._ceil_to_multiple(image_ori_len, SEQ_MULTI_OF),
+            )
+            image_records.append((image, image_size, image_ori_len))
+
+        for image, image_size, image_ori_len in image_records:
+            image_padding_len = target_image_seq_len - image_ori_len
+            image_padded_feat = torch.cat(
+                [image, image[-1:].repeat(image_padding_len, 1)],
+                dim=0,
+            )
+            all_image_out.append(image_padded_feat)
+            all_image_size.append(image_size)
+            all_image_valid_lens.append(image_ori_len)
 
         return (
-            all_image_out,
-            all_cap_feats_out,
+            torch.stack(all_image_out, dim=0),
+            torch.stack(all_cap_feats_out, dim=0),
             all_image_size,
             all_image_valid_lens,
             all_cap_valid_lens,
         )
+
+    @staticmethod
+    def _as_image_list(hidden_states) -> list[torch.Tensor]:
+        """Normalize 4D/5D image latents into per-sample tensors."""
+        if torch.is_tensor(hidden_states):
+            if hidden_states.dim() == 5:
+                return list(hidden_states.unbind(dim=0))
+            if hidden_states.dim() == 4:
+                return [hidden_states]
+        return list(hidden_states)
+
+    @staticmethod
+    def _as_caption_list(encoder_hidden_states) -> list[torch.Tensor]:
+        """Normalize caption tensors into per-sample tensors."""
+        if torch.is_tensor(encoder_hidden_states):
+            if encoder_hidden_states.dim() == 3:
+                return list(encoder_hidden_states.unbind(dim=0))
+            if encoder_hidden_states.dim() == 2:
+                return [encoder_hidden_states]
+
+        cap_feats = list(encoder_hidden_states)
+        if len(cap_feats) == 1 and torch.is_tensor(cap_feats[0]):
+            if cap_feats[0].dim() == 3:
+                return list(cap_feats[0].unbind(dim=0))
+            if cap_feats[0].dim() == 2:
+                return cap_feats
+        return cap_feats
+
+    @staticmethod
+    def _replace_padding_with_token(
+        tensor: torch.Tensor,
+        valid_lens: list[int],
+        pad_token: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replace padded token rows after each valid sequence length."""
+        positions = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0)
+        lengths = torch.tensor(valid_lens, device=tensor.device).unsqueeze(1)
+        pad_mask = positions >= lengths
+        if pad_mask.any():
+            tensor = tensor.clone()
+            tensor[pad_mask] = pad_token.to(device=tensor.device, dtype=tensor.dtype)
+        return tensor
 
     def forward(
         self,
@@ -854,14 +943,13 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
 
-        x = hidden_states
-        cap_feats = encoder_hidden_states
+        x = self._as_image_list(hidden_states)
+        cap_feats = self._as_caption_list(encoder_hidden_states)
         timestep = 1000.0 - timestep
         t = timestep
-        bsz = 1
         device = x[0].device
         t = self.t_embedder(t)
-        adaln_input = t.type_as(x)
+        adaln_input = t.to(dtype=x[0].dtype)
         (
             x,
             cap_feats,
@@ -876,29 +964,20 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             image_seq_len_target=image_seq_len_target,
         )
 
-        x = torch.cat(x, dim=0)
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
-        if x_valid_lens[0] < x.shape[0]:
-            x[x_valid_lens[0] :] = self.x_pad_token.to(dtype=x.dtype)
+        x = self._replace_padding_with_token(x, x_valid_lens, self.x_pad_token)
         x_freqs_cis = freqs_cis[1]
 
-        x = x.unsqueeze(0)
-        x_freqs_cis = x_freqs_cis
         for layer_id, layer in enumerate(self.noise_refiner):
             x = layer(x, x_freqs_cis, adaln_input)
 
-        cap_feats = torch.cat(cap_feats, dim=0)
-
         cap_feats, _ = self.cap_embedder(cap_feats)
-        if cap_valid_lens[0] < cap_feats.shape[0]:
-            cap_feats[cap_valid_lens[0] :] = self.cap_pad_token.to(
-                dtype=cap_feats.dtype
-            )
+        cap_feats = self._replace_padding_with_token(
+            cap_feats, cap_valid_lens, self.cap_pad_token
+        )
 
         cap_freqs_cis = freqs_cis[0]
 
-        cap_feats = cap_feats.unsqueeze(0)
-        cap_input_dtype = cap_feats.dtype
         for layer_id, layer in enumerate(self.context_refiner):
             cap_feats = layer(
                 cap_feats,

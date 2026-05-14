@@ -6,6 +6,9 @@ on:
       jit_kernel:
         required: true
         type: string
+      sgl_kernel:
+        required: true
+        type: string
       b200_runner:
         required: true
         type: string
@@ -56,10 +59,24 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      - name: Cleanup
+        if: inputs.sgl_kernel == 'true'
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda13.0
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test
         timeout-minutes: 30
@@ -81,10 +98,24 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      - name: Cleanup
+        if: inputs.sgl_kernel == 'true'
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda13.0
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run multi-GPU test
         timeout-minutes: 45
@@ -108,10 +139,24 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      - name: Cleanup
+        if: inputs.sgl_kernel == 'true'
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda13.0
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run benchmark tests
         timeout-minutes: 45
@@ -135,10 +180,24 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      - name: Cleanup
+        if: inputs.sgl_kernel == 'true'
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda13.0
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run B200 diffusion test
         timeout-minutes: 30
