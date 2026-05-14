@@ -84,9 +84,7 @@ class OpenAIUtilsTestCase(unittest.TestCase):
             ),
             [],
         )
-        self.assertIsNone(
-            process_hidden_states_from_ret({"meta_info": {}}, request)
-        )
+        self.assertIsNone(process_hidden_states_from_ret({"meta_info": {}}, request))
 
     def test_process_routed_experts_respects_request_flag(self):
         ret_item = {"meta_info": {"routed_experts": "expert-1"}}
