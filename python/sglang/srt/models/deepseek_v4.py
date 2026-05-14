@@ -229,6 +229,12 @@ class MQALayer(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
+        if _is_hip:
+            cos_cache = freqs_cis.real.to(torch.bfloat16).unsqueeze(-2).unsqueeze(-2)
+            sin_cache = freqs_cis.imag.to(torch.bfloat16).unsqueeze(-2).unsqueeze(-2)
+            self.register_buffer("cos_cache", cos_cache, persistent=False)
+            self.register_buffer("sin_cache", sin_cache, persistent=False)
+
         if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() and alt_streams is not None:
             self.alt_streams = alt_streams[:3]
             self.alt_streams_indexer = alt_streams[-2:]
@@ -339,6 +345,9 @@ class MQALayer(nn.Module):
 
         self.overlap_store_cache = envs.SGLANG_OPT_USE_OVERLAP_STORE_CACHE.get()
         self.use_jit_norm = not _is_hip and envs.SGLANG_OPT_USE_JIT_NORM.get()
+        self.use_fused_qk_norm_rope = (
+            _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
+        )
 
     def _compute_q_a(
         self,
@@ -484,20 +493,57 @@ class MQALayer(nn.Module):
         q = self.q_norm(q)
         q_lora = q
         q, _ = self.wq_b(q)
-        q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.use_jit_norm:
-            q = rmsnorm_self(q, self.eps)
+
+        if self.use_fused_qk_norm_rope and x.shape[0] <= 64:
+            from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
+                fused_reduce_qk_norm_rope_swa_write,
+            )
+
+            q = fused_reduce_qk_norm_rope_swa_write(
+                q=q,
+                kv=kv,
+                q_norm_weight=None,
+                kv_norm_weight=self.kv_norm.weight,
+                q_rms_eps=self.eps,
+                kv_rms_eps=self.eps,
+                rope_head_dim=self.qk_rope_head_dim,
+                cos_cache=self.cos_cache,
+                sin_cache=self.sin_cache,
+                positions=positions,
+                is_neox=False,
+                dtype=x.dtype,
+            )
+        elif self.use_fused_qk_norm_rope:
+            from sglang.srt.layers.fused_qk_norm import fused_qk_norm
+
+            q = q.view(-1, self.n_local_heads, self.head_dim)
+            q, kv_normed = fused_qk_norm(
+                q,
+                kv.unsqueeze(1),
+                q_weight=None,
+                k_weight=self.kv_norm.weight,
+                eps=self.eps,
+            )
+            kv = kv_normed.squeeze(1)
+            fused_rope(
+                q[..., -self.qk_rope_head_dim :],
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                self.freqs_cis,
+                positions=positions,
+            )
         else:
-            q = rms_normalize_triton(q, self.eps)
-
-        kv = self.kv_norm(kv)
-
-        fused_rope(
-            q[..., -self.qk_rope_head_dim :],
-            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-            self.freqs_cis,
-            positions=positions,
-        )
+            q = q.view(-1, self.n_local_heads, self.head_dim)
+            if self.use_jit_norm:
+                q = rmsnorm_self(q, self.eps)
+            else:
+                q = rms_normalize_triton(q, self.eps)
+            kv = self.kv_norm(kv)
+            fused_rope(
+                q[..., -self.qk_rope_head_dim :],
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                self.freqs_cis,
+                positions=positions,
+            )
 
         if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
             kv = cp_all_gather_rerange_output(
