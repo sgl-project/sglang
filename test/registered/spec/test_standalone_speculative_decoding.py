@@ -187,7 +187,11 @@ class TestStandaloneSpeculativeDecodingTriton(TestStandaloneSpeculativeDecodingB
 
     @classmethod
     def get_server_args(cls):
-        return DEFAULT_SERVER_ARGS + ["--attention-backend", "triton"]
+        return DEFAULT_SERVER_ARGS + [
+            "--attention-backend",
+            "triton",
+            "--enable-deterministic-inference",
+        ]
 
 
 class TestStandaloneSpeculativeDecodingFlashinfer(
