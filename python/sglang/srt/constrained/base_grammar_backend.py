@@ -69,12 +69,10 @@ class BaseGrammarObject:
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         raise NotImplementedError()
 
-    @staticmethod
-    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+    def move_vocab_mask(self, vocab_mask: torch.Tensor, device) -> torch.Tensor:
         raise NotImplementedError()
 
-    @staticmethod
-    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+    def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         raise NotImplementedError()
 
     def copy(self) -> "BaseGrammarObject":
