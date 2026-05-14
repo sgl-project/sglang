@@ -268,9 +268,13 @@ class MlxModelRunner:
         sample_attn = getattr(layer_list[0], attn_attr)
         if isinstance(sample_attn, MLXAttentionWrapper):
             sample_attn = sample_attn._inner
-        n_kv_heads = sample_attn.n_kv_heads
+        n_kv_heads = getattr(sample_attn, "n_kv_heads", None) or getattr(sample_attn, "num_k_heads", None)
+        if n_kv_heads is None:
+            raise RuntimeError("Cannot determine n_kv_heads from attention module")
         if hasattr(sample_attn, "head_dim"):
             head_dim = sample_attn.head_dim
+        elif hasattr(sample_attn, "hidden_size") and hasattr(sample_attn, "num_k_heads"):
+            head_dim = sample_attn.hidden_size // sample_attn.num_k_heads
         elif hasattr(sample_attn, "k_proj") and hasattr(sample_attn.k_proj, "weight"):
             head_dim = sample_attn.k_proj.weight.shape[0] // n_kv_heads
         else:

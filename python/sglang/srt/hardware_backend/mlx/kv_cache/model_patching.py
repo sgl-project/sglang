@@ -34,8 +34,13 @@ def patch_model_attention(model: Any) -> int:
     layer_list, attn_attr = find_attention_layers(model)
     patched = 0
     for idx, layer in enumerate(layer_list):
-        attn = getattr(layer, attn_attr)
-        if isinstance(attn, MLXAttentionWrapper):
+        attn = getattr(layer, attn_attr, None)
+        if attn is None:
+            for name, mod in layer.named_modules():
+                if "attn" in name.lower() and not isinstance(mod, MLXAttentionWrapper):
+                    attn = mod
+                    break
+        if attn is None or isinstance(attn, MLXAttentionWrapper):
             continue
         setattr(layer, attn_attr, MLXAttentionWrapper(attn, idx))
         patched += 1
