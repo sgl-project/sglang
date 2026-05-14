@@ -12,6 +12,9 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.attention.triton_ops.double_sparsity_native_decode import (
+    ds_native_sparse_decode,
+)
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.double_sparsity_config import (
     DoubleSparsityCalibration,
@@ -21,9 +24,6 @@ from sglang.srt.mem_cache.sparsity.algorithms.double_sparsity_config import (
     parse_calibration_file,
     torch_dtype_for_klabel,
     validate_against_model,
-)
-from sglang.srt.layers.attention.triton_ops.double_sparsity_native_decode import (
-    ds_native_sparse_decode,
 )
 from sglang.srt.mem_cache.sparsity.triton_ops.k_label_kernels import (
     ds_compute_k_label_torch_ref,
@@ -320,7 +320,13 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         logger.info(
             "DoubleSparsity native scratch allocated: bs=%d h_kv=%d h_q=%d d=%d "
             "max_ctx=%d total_selected=%d max_blocks=%d total=%.2f MiB",
-            bs, h_kv, h_q, d, max_ctx, total_selected, max_num_blocks,
+            bs,
+            h_kv,
+            h_q,
+            d,
+            max_ctx,
+            total_selected,
+            max_num_blocks,
             bytes_total / (1024 * 1024),
         )
 

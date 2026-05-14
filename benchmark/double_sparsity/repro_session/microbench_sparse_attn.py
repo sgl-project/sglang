@@ -52,9 +52,7 @@ def main():
     v_buf = torch.randn(T_pool, h_kv, d, device=device, dtype=torch.bfloat16)
     q = torch.randn(bs, h_q, d, device=device, dtype=torch.bfloat16)
 
-    print(
-        "Sparse-attn microbench  bs=1 H_q=8 H_kv=1 d=128 (70B/TP=8 shape)"
-    )
+    print("Sparse-attn microbench  bs=1 H_q=8 H_kv=1 d=128 (70B/TP=8 shape)")
     print(
         "Headline: per-cell time should be ~constant across rows (i.e. attention "
         "is bounded by `total_selected`, not by seq_len). Per-row jitter > 5% "
@@ -91,18 +89,21 @@ def main():
 
             def f():
                 _launch_sparse_attn(
-                    q=q, k_buffer=k_buf, v_buffer=v_buf,
+                    q=q,
+                    k_buffer=k_buf,
+                    v_buffer=v_buf,
                     selected_physical=sel,
-                    mid_out=mid_out, mid_o_logexpsum=mid_log,
-                    output=output, sm_scale=sm_scale,
-                    block_seq=block_seq, block_n=16,
+                    mid_out=mid_out,
+                    mid_o_logexpsum=mid_log,
+                    output=output,
+                    sm_scale=sm_scale,
+                    block_seq=block_seq,
+                    block_n=16,
                 )
 
             ms = bench(f)
             cells.append(ms)
-        row = "  {:>16d}".format(total) + "".join(
-            f"{c*1000:>9.1f}µs" for c in cells
-        )
+        row = "  {:>16d}".format(total) + "".join(f"{c*1000:>9.1f}µs" for c in cells)
         print(row)
     print()
     print(

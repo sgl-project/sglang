@@ -306,9 +306,7 @@ def _run_workload(
     )
 
 
-def _run_niah(
-    base_url: str, model: str, context_tokens: int, n: int = 5
-) -> float:
+def _run_niah(base_url: str, model: str, context_tokens: int, n: int = 5) -> float:
     """Score `n` NIAH retrieval probes; return accuracy in [0, 1]."""
     import requests
 
@@ -420,8 +418,8 @@ def main():
         type=str,
         default="1",
         help="Concurrency to drive against the server. Single int (e.g. '4') "
-             "or CSV sweep (e.g. '1,2,4,8,16') — sweep mode runs all values "
-             "against the SAME launched server (one model load instead of N).",
+        "or CSV sweep (e.g. '1,2,4,8,16') — sweep mode runs all values "
+        "against the SAME launched server (one model load instead of N).",
     )
     p.add_argument("--niah", action="store_true", help="Run a NIAH retrieval probe.")
     p.add_argument("--niah-context-tokens", type=int, default=32768)
@@ -521,7 +519,9 @@ def main():
     # Parse concurrency CSV sweep.
     concurrencies = [int(x) for x in str(args.concurrency).split(",") if x]
     if not concurrencies:
-        raise SystemExit("--concurrency must be int or CSV of ints, e.g. '4' or '1,2,4'")
+        raise SystemExit(
+            "--concurrency must be int or CSV of ints, e.g. '4' or '1,2,4'"
+        )
 
     # Server's max-context window. Add headroom for generation.
     server_ctx_len = args.context_len + args.output_len + 256
@@ -577,7 +577,9 @@ def main():
                 wl.extra["recent_tokens"] = float(args.recent_tokens)
                 wl.extra["sink_tokens"] = float(args.sink_tokens)
                 wl.extra["min_seq_len"] = float(args.min_seq_len)
-                wl.extra["max_selected_per_request"] = float(args.max_selected_per_request)
+                wl.extra["max_selected_per_request"] = float(
+                    args.max_selected_per_request
+                )
             results.append(wl)
 
     # Output format:

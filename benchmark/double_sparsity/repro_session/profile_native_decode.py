@@ -43,7 +43,9 @@ def main():
     p.add_argument("--d", type=int, default=128, help="head_dim")
     p.add_argument("--s", type=int, default=32, help="heavy channels")
     p.add_argument(
-        "--ctx", type=int, default=int(os.environ.get("CTX", "30720")),
+        "--ctx",
+        type=int,
+        default=int(os.environ.get("CTX", "30720")),
         help="seq_len for the synthetic prompt",
     )
     p.add_argument("--max-ctx", type=int, default=None, help="capacity")
@@ -151,9 +153,7 @@ def main():
         ms = start.elapsed_time(end) / iters
         return ms
 
-    print(
-        f"Native DS sparse-decode profile  bs={bs} h_kv={h_kv} h_q={h_q} d={d} s={s}"
-    )
+    print(f"Native DS sparse-decode profile  bs={bs} h_kv={h_kv} h_q={h_q} d={d} s={s}")
     print(
         f"  ctx={args.ctx}  max_ctx={max_ctx}  top_k={args.top_k}  sink={args.sink}  "
         f"recent={args.recent}  total_selected={total}"
@@ -162,8 +162,11 @@ def main():
         f"  block_t={args.block_t}  block_seq={args.block_seq}  block_n={args.block_n}"
     )
     print()
-    print(f"  {'phase':38s} {'ms/call':>10s} {'µs/call':>10s} {'ms × {} layers'.format(args.layers):>22s}")
+    print(
+        f"  {'phase':38s} {'ms/call':>10s} {'µs/call':>10s} {'ms × {} layers'.format(args.layers):>22s}"
+    )
     print("  " + "-" * 80)
+
     # End-to-end: ds_native_sparse_decode in one call. This is the real
     # path cost (subset of per-op times because the topk output flows
     # into _build_selected_physical without re-allocation).
@@ -194,7 +197,9 @@ def main():
     t_topk = bench("torch.topk", f_topk, args.warmup, args.iters)
     t_build = bench("build_selected_physical", f_build, args.warmup, args.iters)
     t_attn = bench("sparse attn stage2+3 (Triton)", f_attn, args.warmup, args.iters)
-    t_e2e = bench("END-TO-END ds_native_sparse_decode", f_end_to_end, args.warmup, args.iters)
+    t_e2e = bench(
+        "END-TO-END ds_native_sparse_decode", f_end_to_end, args.warmup, args.iters
+    )
     for name, t in [
         ("score (Triton)", t_score),
         ("torch.topk", t_topk),
@@ -208,7 +213,9 @@ def main():
     print(f"  END-TO-END per layer:        {t_e2e*1000:.1f} µs")
     print(f"  END-TO-END per decode step:  {total_ms:.2f} ms  ({args.layers} layers)")
     print()
-    print(f"  Compare: legacy DS-on TBT at 32K was 100.14 ms (this branch, prior session)")
+    print(
+        f"  Compare: legacy DS-on TBT at 32K was 100.14 ms (this branch, prior session)"
+    )
     print(f"           DS-off TBT at 32K was 8.52 ms")
     print(f"           Target for visible win: TBT(on) <= 0.90 * TBT(off) → ≤ 7.7 ms")
 

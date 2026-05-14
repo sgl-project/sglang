@@ -53,7 +53,12 @@ def _fmt(v: Optional[float], spec: str) -> str:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--main", required=False, default=None, help="results_main_dense.json (optional)")
+    p.add_argument(
+        "--main",
+        required=False,
+        default=None,
+        help="results_main_dense.json (optional)",
+    )
     p.add_argument("--branch-off", required=True, help="results_branch_ds_off.json")
     p.add_argument("--branch-on", required=True, help="results_branch_ds_on.json")
     args = p.parse_args()
@@ -118,9 +123,7 @@ def main():
     on_niah = best_on.get("niah_accuracy")
     off_niah = best_off.get("niah_accuracy")
     niah_delta = (
-        on_niah - off_niah
-        if on_niah is not None and off_niah is not None
-        else None
+        on_niah - off_niah if on_niah is not None and off_niah is not None else None
     )
     if niah_delta is None:
         quality_guard_label = "UNKNOWN (NIAH not measured on both legs)"
@@ -130,7 +133,9 @@ def main():
         quality_guard_label = "PASS" if quality_pass else "FAIL"
 
     print("\n## Best concurrency point\n")
-    print(f"BEST_CONCURRENCY:      {best_c}{'  (diagnostic-only is conc=1)' if best_c == 1 else ''}")
+    print(
+        f"BEST_CONCURRENCY:      {best_c}{'  (diagnostic-only is conc=1)' if best_c == 1 else ''}"
+    )
     print(f"VISIBLE_WIN:           {'PASS' if visible_win else 'FAIL'}")
     print(
         f"  decode_tok_s_speedup: {best_speedup:.3f}x  threshold: "
@@ -176,9 +181,7 @@ def main():
     # if a main_dense was provided).
     if main_list:
         main = _by_concurrency(main_list)
-        c_for_sanity = next(
-            (c for c in shared if c in main), None
-        )
+        c_for_sanity = next((c for c in shared if c in main), None)
         if c_for_sanity is not None:
             md = main[c_for_sanity]["decode_tok_per_s"]
             od = off[c_for_sanity]["decode_tok_per_s"]
@@ -191,6 +194,7 @@ def main():
             )
 
     import sys
+
     sys.exit(0 if (visible_win and (niah_delta is None or quality_pass)) else 1)
 
 

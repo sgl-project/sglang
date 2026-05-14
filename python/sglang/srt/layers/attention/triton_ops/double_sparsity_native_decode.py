@@ -50,19 +50,22 @@ NEG_INF = -float("inf")
 
 @triton.jit
 def _ds_native_score_kernel(
-    Q_Label,             # [bs, H_kv, S]                          fp32 / bf16
-    K_Label_Buffer,      # [T_pool, H_kv, S]                      bf16 / fp32
-    Req_to_tokens,       # [bs, max_ctx]                          int32
-    B_Seqlen,            # [bs]                                   int64
-    Att_Out,             # [bs, H_kv, max_ctx]                    fp32
-    stride_qbs, stride_qh,
-    stride_klt, stride_klh,
+    Q_Label,  # [bs, H_kv, S]                          fp32 / bf16
+    K_Label_Buffer,  # [T_pool, H_kv, S]                      bf16 / fp32
+    Req_to_tokens,  # [bs, max_ctx]                          int32
+    B_Seqlen,  # [bs]                                   int64
+    Att_Out,  # [bs, H_kv, max_ctx]                    fp32
+    stride_qbs,
+    stride_qh,
+    stride_klt,
+    stride_klh,
     stride_rt_bs,
-    stride_ab, stride_ah,
+    stride_ab,
+    stride_ah,
     sm_scale,
-    sink_tokens,         # int — runtime; mask [0, sink) to -inf
-    recent_tokens,       # int — runtime; mask [seq - recent, max_ctx) to -inf
-    max_ctx,             # int — runtime
+    sink_tokens,  # int — runtime; mask [0, sink) to -inf
+    recent_tokens,  # int — runtime; mask [seq - recent, max_ctx) to -inf
+    max_ctx,  # int — runtime
     S: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
@@ -79,10 +82,10 @@ def _ds_native_score_kernel(
     kv_idx = tl.program_id(1)
     blk = tl.program_id(2)
 
-    t_offs = blk * BLOCK_T + tl.arange(0, BLOCK_T)         # [BLOCK_T]
+    t_offs = blk * BLOCK_T + tl.arange(0, BLOCK_T)  # [BLOCK_T]
     seq_len = tl.load(B_Seqlen + bs_idx).to(tl.int64)
-    history_len = seq_len - 1                              # exclude current decode pos
-    rec_lo = seq_len - recent_tokens                       # may be negative if seq < recent
+    history_len = seq_len - 1  # exclude current decode pos
+    rec_lo = seq_len - recent_tokens  # may be negative if seq < recent
     rec_lo = tl.maximum(rec_lo, 0)
 
     in_history = t_offs < history_len
@@ -96,17 +99,19 @@ def _ds_native_score_kernel(
 
     s_offs = tl.arange(0, S)
     q_offs = bs_idx * stride_qbs + kv_idx * stride_qh + s_offs
-    q_label = tl.load(Q_Label + q_offs).to(tl.float32)     # [S]
+    q_label = tl.load(Q_Label + q_offs).to(tl.float32)  # [S]
 
     kl_offs = phys[:, None] * stride_klt + kv_idx * stride_klh + s_offs[None, :]
     kl = tl.load(
         K_Label_Buffer + kl_offs,
         mask=in_history[:, None],
         other=0.0,
-    ).to(tl.float32)                                       # [BLOCK_T, S]
+    ).to(
+        tl.float32
+    )  # [BLOCK_T, S]
 
     scores = tl.sum(kl * q_label[None, :], axis=1) * sm_scale
-    scores = tl.where(valid, scores, -float("inf"))        # mask sink/recent/oob → -inf
+    scores = tl.where(valid, scores, -float("inf"))  # mask sink/recent/oob → -inf
 
     out_offs = bs_idx * stride_ab + kv_idx * stride_ah + t_offs
     tl.store(Att_Out + out_offs, scores)
@@ -114,11 +119,11 @@ def _ds_native_score_kernel(
 
 def _launch_score(
     *,
-    q_label: torch.Tensor,         # [bs, H_kv, S]
-    k_label_layer: torch.Tensor,   # [T_pool, H_kv, S]
+    q_label: torch.Tensor,  # [bs, H_kv, S]
+    k_label_layer: torch.Tensor,  # [T_pool, H_kv, S]
     req_to_token_indexed: torch.Tensor,  # [bs, max_ctx]
-    seq_lens: torch.Tensor,        # [bs] int64
-    att_out: torch.Tensor,         # [H_kv, bs, max_ctx] fp32
+    seq_lens: torch.Tensor,  # [bs] int64
+    att_out: torch.Tensor,  # [H_kv, bs, max_ctx] fp32
     sm_scale: float,
     sink_tokens: int,
     recent_tokens: int,
@@ -135,10 +140,13 @@ def _launch_score(
         req_to_token_indexed,
         seq_lens,
         att_out,
-        q_label.stride(0), q_label.stride(1),
-        k_label_layer.stride(0), k_label_layer.stride(1),
+        q_label.stride(0),
+        q_label.stride(1),
+        k_label_layer.stride(0),
+        k_label_layer.stride(1),
         req_to_token_indexed.stride(0),
-        att_out.stride(0), att_out.stride(1),
+        att_out.stride(0),
+        att_out.stride(1),
         sm_scale,
         sink_tokens,
         recent_tokens,
@@ -157,20 +165,22 @@ def _launch_score(
 
 @triton.jit
 def _ds_native_build_selected_physical_kernel(
-    Topk_Logical,        # [bs, H_kv, TOP_K]                       int32
-    Req_to_tokens,       # [bs, max_ctx]                           int32
-    B_Seqlen,            # [bs]                                    int64
-    Out,                 # [bs, H_kv, TOTAL]                       int32
-    stride_tl_b, stride_tl_h,
+    Topk_Logical,  # [bs, H_kv, TOP_K]                       int32
+    Req_to_tokens,  # [bs, max_ctx]                           int32
+    B_Seqlen,  # [bs]                                    int64
+    Out,  # [bs, H_kv, TOTAL]                       int32
+    stride_tl_b,
+    stride_tl_h,
     stride_rt_b,
-    stride_o_b, stride_o_h,
-    sink_tokens,         # runtime int
-    recent_tokens,       # runtime int
-    max_ctx,             # runtime int
+    stride_o_b,
+    stride_o_h,
+    sink_tokens,  # runtime int
+    recent_tokens,  # runtime int
+    max_ctx,  # runtime int
     TOP_K: tl.constexpr,
-    TOP_K_PADDED: tl.constexpr,        # next-pow2(TOP_K)
+    TOP_K_PADDED: tl.constexpr,  # next-pow2(TOP_K)
     TOTAL: tl.constexpr,
-    SINK_RECENT_SLACK: tl.constexpr,   # = TOTAL - TOP_K
+    SINK_RECENT_SLACK: tl.constexpr,  # = TOTAL - TOP_K
     SINK_RECENT_PADDED: tl.constexpr,  # next-pow2(SINK_RECENT_SLACK)
 ):
     """One program per (bs, kv_head). Writes the [TOTAL] row.
@@ -193,7 +203,9 @@ def _ds_native_build_selected_physical_kernel(
     logical = tl.load(Topk_Logical + tl_base + k_offs, mask=k_valid, other=0).to(
         tl.int64
     )
-    logical = tl.maximum(logical, 0)  # defensive: clamp -1 sentinels (none here under v0)
+    logical = tl.maximum(
+        logical, 0
+    )  # defensive: clamp -1 sentinels (none here under v0)
     phys = tl.load(Req_to_tokens + rt_base + logical, mask=k_valid, other=0).to(
         tl.int32
     )
@@ -205,8 +217,8 @@ def _ds_native_build_selected_physical_kernel(
     sr_offs = tl.arange(0, SINK_RECENT_PADDED)
     sr_in_range = sr_offs < SINK_RECENT_SLACK
     is_sink = sr_in_range & (sr_offs < sink_tokens)
-    is_recent = sr_in_range & (sr_offs >= sink_tokens) & (
-        sr_offs < sink_tokens + recent_tokens
+    is_recent = (
+        sr_in_range & (sr_offs >= sink_tokens) & (sr_offs < sink_tokens + recent_tokens)
     )
 
     # Sink logical position = sr_offs (when is_sink).
@@ -219,7 +231,7 @@ def _ds_native_build_selected_physical_kernel(
 
     seq_len = tl.load(B_Seqlen + bs_idx).to(tl.int64)
     rec_lo = tl.maximum(seq_len - recent_tokens, 0)
-    rec_idx = sr_offs - sink_tokens                       # 0..recent (only valid when is_recent)
+    rec_idx = sr_offs - sink_tokens  # 0..recent (only valid when is_recent)
     rec_pos = rec_lo + rec_idx
     rec_phys = tl.load(
         Req_to_tokens + rt_base + rec_pos,
@@ -233,12 +245,12 @@ def _ds_native_build_selected_physical_kernel(
 
 def _build_selected_physical(
     *,
-    topk_logical: torch.Tensor,     # [bs, H_kv, top_k] int32 (from torch.topk)
+    topk_logical: torch.Tensor,  # [bs, H_kv, top_k] int32 (from torch.topk)
     req_to_token_indexed: torch.Tensor,  # [bs, max_ctx] int32
-    seq_lens: torch.Tensor,         # [bs] int64
+    seq_lens: torch.Tensor,  # [bs] int64
     sink_tokens: int,
     recent_tokens: int,
-    out: torch.Tensor,              # [bs, H_kv, total_selected] int32 — preallocated
+    out: torch.Tensor,  # [bs, H_kv, total_selected] int32 — preallocated
 ) -> None:
     """Concatenate top-k physical + sink physical + recent physical, in-place.
 
@@ -282,9 +294,11 @@ def _build_selected_physical(
         req_to_token_indexed,
         seq_lens,
         out,
-        topk_logical.stride(0), topk_logical.stride(1),
+        topk_logical.stride(0),
+        topk_logical.stride(1),
         req_to_token_indexed.stride(0),
-        out.stride(0), out.stride(1),
+        out.stride(0),
+        out.stride(1),
         sink_tokens,
         recent_tokens,
         max_ctx,
@@ -318,9 +332,9 @@ def _build_selected_physical_torch_ref(
 
     # 1. top-k physical: gather req_to_token[b, topk_logical[b, h, k]]
     r2t_expand = req_to_token_indexed.unsqueeze(1).expand(bs, h_kv, max_ctx)
-    topk_phys = torch.gather(
-        r2t_expand, 2, topk_logical.long().clamp_min(0)
-    ).to(torch.int32)
+    topk_phys = torch.gather(r2t_expand, 2, topk_logical.long().clamp_min(0)).to(
+        torch.int32
+    )
     out[:, :, :top_k].copy_(topk_phys)
 
     if sink_tokens > 0:
@@ -332,7 +346,9 @@ def _build_selected_physical_torch_ref(
     if recent_tokens > 0:
         rec_offset = torch.arange(recent_tokens, device=device, dtype=torch.int64)
         rec_pos = (
-            seq_lens.to(device).to(torch.int64).unsqueeze(1) - recent_tokens + rec_offset
+            seq_lens.to(device).to(torch.int64).unsqueeze(1)
+            - recent_tokens
+            + rec_offset
         )
         rec_pos.clamp_(0, max_ctx - 1)
         rec_phys = torch.gather(req_to_token_indexed, 1, rec_pos.to(torch.int64)).to(
@@ -350,20 +366,27 @@ def _build_selected_physical_torch_ref(
 
 @triton.jit
 def _ds_native_sparse_attn_stage2_kernel(
-    Q,                  # [bs, H_q, D]
-    K_Buffer,           # [T_pool, H_kv, D]
-    V_Buffer,           # [T_pool, H_kv, D]
+    Q,  # [bs, H_q, D]
+    K_Buffer,  # [T_pool, H_kv, D]
+    V_Buffer,  # [T_pool, H_kv, D]
     Selected_Physical,  # [bs, H_kv, total_selected]               int32
-    Mid_O,              # [bs, H_q, num_blocks, D]                 fp32
-    Mid_O_LogExpSum,    # [bs, H_q, num_blocks]                    fp32
+    Mid_O,  # [bs, H_q, num_blocks, D]                 fp32
+    Mid_O_LogExpSum,  # [bs, H_q, num_blocks]                    fp32
     sm_scale,
-    stride_qbs, stride_qh,
-    stride_kbs, stride_kh,
-    stride_vbs, stride_vh,
-    stride_sel_bs, stride_sel_h,
-    stride_mob, stride_moh, stride_mos,
-    stride_meb, stride_meh,
-    GQA_GROUP: tl.constexpr,        # H_q // H_kv
+    stride_qbs,
+    stride_qh,
+    stride_kbs,
+    stride_kh,
+    stride_vbs,
+    stride_vh,
+    stride_sel_bs,
+    stride_sel_h,
+    stride_mob,
+    stride_moh,
+    stride_mos,
+    stride_meb,
+    stride_meh,
+    GQA_GROUP: tl.constexpr,  # H_q // H_kv
     TOTAL_SELECTED: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
@@ -380,7 +403,7 @@ def _ds_native_sparse_attn_stage2_kernel(
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     q_off = bs_idx * stride_qbs + q_head * stride_qh + offs_d
-    q = tl.load(Q + q_off).to(tl.float32)                   # [D]
+    q = tl.load(Q + q_off).to(tl.float32)  # [D]
 
     blk_start = seq_blk * BLOCK_SEQ
     blk_end = tl.minimum(blk_start + BLOCK_SEQ, TOTAL_SELECTED)
@@ -392,7 +415,7 @@ def _ds_native_sparse_attn_stage2_kernel(
     acc = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
 
     for n_start in range(blk_start, blk_end, BLOCK_N):
-        n_offs = n_start + tl.arange(0, BLOCK_N)            # [BLOCK_N]
+        n_offs = n_start + tl.arange(0, BLOCK_N)  # [BLOCK_N]
         n_valid = n_offs < blk_end
         phys = tl.load(
             Selected_Physical + sel_base + n_offs,
@@ -404,7 +427,7 @@ def _ds_native_sparse_attn_stage2_kernel(
         k = tl.load(K_Buffer + kv_offs, mask=n_valid[:, None], other=0.0).to(tl.float32)
         v = tl.load(V_Buffer + kv_offs, mask=n_valid[:, None], other=0.0).to(tl.float32)
 
-        att = tl.sum(q[None, :] * k, axis=1) * sm_scale     # [BLOCK_N]
+        att = tl.sum(q[None, :] * k, axis=1) * sm_scale  # [BLOCK_N]
         att = tl.where(n_valid, att, -float("inf"))
 
         cur_max = tl.max(att, axis=0)
@@ -417,9 +440,7 @@ def _ds_native_sparse_attn_stage2_kernel(
 
     # Write partial result. Stage 3 reduces across blocks.
     safe_sum = tl.where(sum_exp > 0, sum_exp, 1.0)
-    mid_off = (
-        bs_idx * stride_mob + q_head * stride_moh + seq_blk * stride_mos + offs_d
-    )
+    mid_off = bs_idx * stride_mob + q_head * stride_moh + seq_blk * stride_mos + offs_d
     log_off = bs_idx * stride_meb + q_head * stride_meh + seq_blk
     tl.store(Mid_O + mid_off, acc / safe_sum)
     tl.store(Mid_O_LogExpSum + log_off, max_logic + tl.log(safe_sum))
@@ -432,12 +453,16 @@ def _ds_native_sparse_attn_stage2_kernel(
 
 @triton.jit
 def _ds_native_sparse_attn_stage3_kernel(
-    Mid_O,              # [bs, H_q, num_blocks, D] fp32
-    Mid_O_LogExpSum,    # [bs, H_q, num_blocks]    fp32
-    O,                  # [bs, H_q, D]
-    stride_mob, stride_moh, stride_mos,
-    stride_meb, stride_meh,
-    stride_obs, stride_oh,
+    Mid_O,  # [bs, H_q, num_blocks, D] fp32
+    Mid_O_LogExpSum,  # [bs, H_q, num_blocks]    fp32
+    O,  # [bs, H_q, D]
+    stride_mob,
+    stride_moh,
+    stride_mos,
+    stride_meb,
+    stride_meh,
+    stride_obs,
+    stride_oh,
     NUM_BLOCKS: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
 ):
@@ -467,13 +492,13 @@ def _ds_native_sparse_attn_stage3_kernel(
 
 def _launch_sparse_attn(
     *,
-    q: torch.Tensor,                     # [bs, H_q, D]
-    k_buffer: torch.Tensor,              # [T_pool, H_kv, D]
-    v_buffer: torch.Tensor,              # [T_pool, H_kv, D]
-    selected_physical: torch.Tensor,     # [bs, H_kv, total_selected] int32
-    mid_out: torch.Tensor,               # [bs, H_q, num_blocks, D]   fp32
-    mid_o_logexpsum: torch.Tensor,       # [bs, H_q, num_blocks]      fp32
-    output: torch.Tensor,                # [bs, H_q, D]
+    q: torch.Tensor,  # [bs, H_q, D]
+    k_buffer: torch.Tensor,  # [T_pool, H_kv, D]
+    v_buffer: torch.Tensor,  # [T_pool, H_kv, D]
+    selected_physical: torch.Tensor,  # [bs, H_kv, total_selected] int32
+    mid_out: torch.Tensor,  # [bs, H_q, num_blocks, D]   fp32
+    mid_o_logexpsum: torch.Tensor,  # [bs, H_q, num_blocks]      fp32
+    output: torch.Tensor,  # [bs, H_q, D]
     sm_scale: float,
     block_seq: int = 128,
     block_n: int = 16,
@@ -483,21 +508,32 @@ def _launch_sparse_attn(
     gqa_group = h_q // h_kv
     total_selected = selected_physical.shape[2]
     num_blocks = triton.cdiv(total_selected, block_seq)
-    assert mid_out.shape[2] >= num_blocks, (
-        f"mid_out scratch has {mid_out.shape[2]} blocks, need {num_blocks}"
-    )
+    assert (
+        mid_out.shape[2] >= num_blocks
+    ), f"mid_out scratch has {mid_out.shape[2]} blocks, need {num_blocks}"
 
     grid2 = (bs, h_q, num_blocks)
     _ds_native_sparse_attn_stage2_kernel[grid2](
-        q, k_buffer, v_buffer, selected_physical,
-        mid_out, mid_o_logexpsum,
+        q,
+        k_buffer,
+        v_buffer,
+        selected_physical,
+        mid_out,
+        mid_o_logexpsum,
         sm_scale,
-        q.stride(0), q.stride(1),
-        k_buffer.stride(0), k_buffer.stride(1),
-        v_buffer.stride(0), v_buffer.stride(1),
-        selected_physical.stride(0), selected_physical.stride(1),
-        mid_out.stride(0), mid_out.stride(1), mid_out.stride(2),
-        mid_o_logexpsum.stride(0), mid_o_logexpsum.stride(1),
+        q.stride(0),
+        q.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        selected_physical.stride(0),
+        selected_physical.stride(1),
+        mid_out.stride(0),
+        mid_out.stride(1),
+        mid_out.stride(2),
+        mid_o_logexpsum.stride(0),
+        mid_o_logexpsum.stride(1),
         GQA_GROUP=gqa_group,
         TOTAL_SELECTED=total_selected,
         BLOCK_DMODEL=d,
@@ -509,10 +545,16 @@ def _launch_sparse_attn(
 
     grid3 = (bs, h_q)
     _ds_native_sparse_attn_stage3_kernel[grid3](
-        mid_out, mid_o_logexpsum, output,
-        mid_out.stride(0), mid_out.stride(1), mid_out.stride(2),
-        mid_o_logexpsum.stride(0), mid_o_logexpsum.stride(1),
-        output.stride(0), output.stride(1),
+        mid_out,
+        mid_o_logexpsum,
+        output,
+        mid_out.stride(0),
+        mid_out.stride(1),
+        mid_out.stride(2),
+        mid_o_logexpsum.stride(0),
+        mid_o_logexpsum.stride(1),
+        output.stride(0),
+        output.stride(1),
         NUM_BLOCKS=num_blocks,
         BLOCK_DMODEL=d,
         num_warps=4,
@@ -527,23 +569,23 @@ def _launch_sparse_attn(
 
 def ds_native_sparse_decode(
     *,
-    q: torch.Tensor,                     # [bs, H_q, D]      query (current decode token)
-    k_buffer: torch.Tensor,              # [T_pool, H_kv, D] KV pool's K (already includes new K)
-    v_buffer: torch.Tensor,              # [T_pool, H_kv, D] KV pool's V (already includes new V)
-    k_label_layer: torch.Tensor,         # [T_pool, H_kv, S] DS side cache (history only)
-    q_label: torch.Tensor,               # [bs, H_kv, S]     pre-computed Q_label (GQA-reduced)
+    q: torch.Tensor,  # [bs, H_q, D]      query (current decode token)
+    k_buffer: torch.Tensor,  # [T_pool, H_kv, D] KV pool's K (already includes new K)
+    v_buffer: torch.Tensor,  # [T_pool, H_kv, D] KV pool's V (already includes new V)
+    k_label_layer: torch.Tensor,  # [T_pool, H_kv, S] DS side cache (history only)
+    q_label: torch.Tensor,  # [bs, H_kv, S]     pre-computed Q_label (GQA-reduced)
     req_to_token_indexed: torch.Tensor,  # [bs, max_ctx]     pre-indexed per request
-    seq_lens: torch.Tensor,              # [bs] int64
-    top_k: int,                          # tokens scored & selected from history
+    seq_lens: torch.Tensor,  # [bs] int64
+    top_k: int,  # tokens scored & selected from history
     sink_tokens: int,
     recent_tokens: int,
     sm_scale: float,
     # preallocated scratch (none allocated inside — caller owns lifecycle)
-    att_out_approx: torch.Tensor,        # [H_kv, bs, max_ctx]              fp32
-    selected_physical: torch.Tensor,     # [bs, H_kv, total_selected]       int32
-    mid_out: torch.Tensor,               # [bs, H_q, max_num_blocks, D]     fp32
-    mid_o_logexpsum: torch.Tensor,       # [bs, H_q, max_num_blocks]        fp32
-    output: torch.Tensor,                # [bs, H_q, D]
+    att_out_approx: torch.Tensor,  # [H_kv, bs, max_ctx]              fp32
+    selected_physical: torch.Tensor,  # [bs, H_kv, total_selected]       int32
+    mid_out: torch.Tensor,  # [bs, H_q, max_num_blocks, D]     fp32
+    mid_o_logexpsum: torch.Tensor,  # [bs, H_q, max_num_blocks]        fp32
+    output: torch.Tensor,  # [bs, H_q, D]
     score_block_t: int = 128,
     attn_block_seq: int = 128,
     attn_block_n: int = 16,

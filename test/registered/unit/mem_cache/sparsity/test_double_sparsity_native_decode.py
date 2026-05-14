@@ -18,7 +18,10 @@ import unittest
 
 import torch
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-small")
 
 
 def _have_cuda() -> bool:
@@ -26,9 +29,9 @@ def _have_cuda() -> bool:
 
 
 def _torch_sparse_attn_ref(
-    q: torch.Tensor,                # [bs, H_q, D]
-    k_buffer: torch.Tensor,         # [T, H_kv, D]
-    v_buffer: torch.Tensor,         # [T, H_kv, D]
+    q: torch.Tensor,  # [bs, H_q, D]
+    k_buffer: torch.Tensor,  # [T, H_kv, D]
+    v_buffer: torch.Tensor,  # [T, H_kv, D]
     selected_physical: torch.Tensor,  # [bs, H_kv, total_selected] int32
     sm_scale: float,
 ) -> torch.Tensor:
@@ -98,9 +101,7 @@ class TestScoreKernelMasking(CustomTestCase):
         self.assertTrue(torch.isneginf(row0[200 - recent_tokens : 200]).all())
         self.assertTrue(torch.isneginf(row0[199:]).all())  # >= history_len
         # Sanity: positions in [sink, history_minus_recent) are finite.
-        self.assertTrue(
-            torch.isfinite(row0[sink_tokens : 200 - recent_tokens]).all()
-        )
+        self.assertTrue(torch.isfinite(row0[sink_tokens : 200 - recent_tokens]).all())
 
         # Row 1: seq=128, history=[0, 127), masked sink + recent.
         row1 = att_out[1, 0]
@@ -138,9 +139,7 @@ class TestBuildSelectedPhysical(CustomTestCase):
         topk_logical = torch.tensor(
             [[[7, 11, 13, 15]]], dtype=torch.int32, device=device
         )
-        out = torch.full(
-            (bs, h_kv, total), -99, dtype=torch.int32, device=device
-        )
+        out = torch.full((bs, h_kv, total), -99, dtype=torch.int32, device=device)
         _build_selected_physical(
             topk_logical=topk_logical,
             req_to_token_indexed=req_to_token,
@@ -222,7 +221,9 @@ class TestSparseAttnAgainstRef(CustomTestCase):
         output = torch.zeros(bs, h_q, d, dtype=torch.bfloat16, device=device)
 
         q_label = _compute_q_label(
-            q, channel_idx, num_kv_heads=h_kv,
+            q,
+            channel_idx,
+            num_kv_heads=h_kv,
             gqa_reduction_id=gqa_reduction_id("max_abs"),
         )
         sm_scale = 1.0 / (d**0.5)
@@ -309,17 +310,28 @@ class TestSparseAttnAgainstRef(CustomTestCase):
         output = torch.zeros(bs, h_q, d, dtype=torch.bfloat16, device=device)
 
         q_label = _compute_q_label(
-            q, channel_idx, num_kv_heads=h_kv,
+            q,
+            channel_idx,
+            num_kv_heads=h_kv,
             gqa_reduction_id=gqa_reduction_id("max_abs"),
         )
         ds_native_sparse_decode(
-            q=q, k_buffer=k_buffer, v_buffer=v_buffer,
-            k_label_layer=k_label, q_label=q_label,
-            req_to_token_indexed=req_to_token, seq_lens=seq_lens,
-            top_k=top_k, sink_tokens=sink_tokens, recent_tokens=recent_tokens,
+            q=q,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            k_label_layer=k_label,
+            q_label=q_label,
+            req_to_token_indexed=req_to_token,
+            seq_lens=seq_lens,
+            top_k=top_k,
+            sink_tokens=sink_tokens,
+            recent_tokens=recent_tokens,
             sm_scale=1.0 / (d**0.5),
-            att_out_approx=att_out, selected_physical=selected_physical,
-            mid_out=mid_out, mid_o_logexpsum=mid_log, output=output,
+            att_out_approx=att_out,
+            selected_physical=selected_physical,
+            mid_out=mid_out,
+            mid_o_logexpsum=mid_log,
+            output=output,
         )
         # Current decode position (seq-1=255) must be in the last `recent`
         # slots of selected_physical.
@@ -354,32 +366,55 @@ class TestAlgorithmNativePathBypassesStage2(CustomTestCase):
             for i in range(num_layers)
         }
         calib = DoubleSparsityCalibration(
-            schema_version=1, model_arch="t", model_name_or_path="",
-            head_dim=head_dim, num_layers=num_layers, num_heads=num_q,
-            num_kv_heads_global=num_kv, heavy_channels=s, channel_type="k",
-            indexing="global_kv_head_id", channels=channels,
+            schema_version=1,
+            model_arch="t",
+            model_name_or_path="",
+            head_dim=head_dim,
+            num_layers=num_layers,
+            num_heads=num_q,
+            num_kv_heads_global=num_kv,
+            heavy_channels=s,
+            channel_type="k",
+            indexing="global_kv_head_id",
+            channels=channels,
         )
         rt = DoubleSparsityRuntimeConfig(
-            heavy_channels=s, token_budget=8, recent_tokens=2, sink_tokens=2,
-            min_seq_len=16, max_selected_per_request=64,
-            gqa_reduction="max_abs", klabel_dtype="bf16",
-            block_t=256, k_block=16, scratch_max_bs=2,
+            heavy_channels=s,
+            token_budget=8,
+            recent_tokens=2,
+            sink_tokens=2,
+            min_seq_len=16,
+            max_selected_per_request=64,
+            gqa_reduction="max_abs",
+            klabel_dtype="bf16",
+            block_t=256,
+            k_block=16,
+            scratch_max_bs=2,
         )
         algo = DoubleSparsityAlgorithm(
-            config=MagicMock(), device=device,
-            runtime_config=rt, calibration=calib,
-            tp_size=1, tp_rank=0,
-            num_kv_heads_local=num_kv, num_q_heads_local=num_q, head_dim=head_dim,
+            config=MagicMock(),
+            device=device,
+            runtime_config=rt,
+            calibration=calib,
+            tp_size=1,
+            tp_rank=0,
+            num_kv_heads_local=num_kv,
+            num_q_heads_local=num_q,
+            head_dim=head_dim,
         )
         # Fake token pool with key/value/k_label buffers we control.
         max_ctx = 64
         T_pool = 128
         token_pool = MagicMock()
         token_pool.get_key_buffer = MagicMock(
-            return_value=torch.randn(T_pool, num_kv, head_dim, device=device, dtype=torch.bfloat16)
+            return_value=torch.randn(
+                T_pool, num_kv, head_dim, device=device, dtype=torch.bfloat16
+            )
         )
         token_pool.get_value_buffer = MagicMock(
-            return_value=torch.randn(T_pool, num_kv, head_dim, device=device, dtype=torch.bfloat16)
+            return_value=torch.randn(
+                T_pool, num_kv, head_dim, device=device, dtype=torch.bfloat16
+            )
         )
         token_pool.set_kv_buffer = MagicMock()
 
@@ -391,8 +426,10 @@ class TestAlgorithmNativePathBypassesStage2(CustomTestCase):
             .contiguous()
         )
         algo.initialize_representation_pool(
-            start_layer=0, end_layer=num_layers,
-            token_to_kv_pool=token_pool, req_to_token_pool=req_to_token_pool,
+            start_layer=0,
+            end_layer=num_layers,
+            token_to_kv_pool=token_pool,
+            req_to_token_pool=req_to_token_pool,
             states=MagicMock(),
         )
 
@@ -401,11 +438,17 @@ class TestAlgorithmNativePathBypassesStage2(CustomTestCase):
         seq_len = 32
         layer = MagicMock()
         layer.layer_id = 0
-        layer.scaling = 1.0 / (head_dim ** 0.5)
+        layer.scaling = 1.0 / (head_dim**0.5)
         forward_batch = MagicMock()
-        forward_batch.seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=device)
-        forward_batch.req_pool_indices = torch.tensor([0], dtype=torch.int64, device=device)
-        forward_batch.out_cache_loc = torch.tensor([seq_len - 1], dtype=torch.int64, device=device)
+        forward_batch.seq_lens = torch.tensor(
+            [seq_len], dtype=torch.int64, device=device
+        )
+        forward_batch.req_pool_indices = torch.tensor(
+            [0], dtype=torch.int64, device=device
+        )
+        forward_batch.out_cache_loc = torch.tensor(
+            [seq_len - 1], dtype=torch.int64, device=device
+        )
         forward_batch.token_to_kv_pool = token_pool
 
         q = torch.randn(bs, num_q * head_dim, device=device, dtype=torch.bfloat16)
