@@ -1,12 +1,9 @@
-"""Archived FA3 NGRAM speculative-decoding test.
+"""NGRAM speculative-decoding test, FA3 attention-backend variant.
 
-Removed from per-commit CI (and not migrated to nightly). Preserved here
-so the FA3 backend test remains runnable manually if needed.
+Backend: `--attention-backend fa3`.
+Not registered in any CI suite -- runnable manually only.
 
-Originally lived in:
-  test/registered/spec/test_ngram_speculative_decoding.py
-
-The remaining classes from that file are split between:
+Sibling files split out from the same source:
 - test/registered/spec/test_ngram_speculative_decoding.py
     -> Paged variant (per-commit, stage-b-test-1-gpu-large)
 - test/registered/spec/test_ngram_speculative_decoding_extra.py

@@ -1,12 +1,9 @@
-"""Archived FP4 (default backend) DeepSeek-V3 4-GPU test.
+"""DeepSeek-V3 FP4 4-GPU test, TRTLLM variant.
 
-Removed from per-commit CI (and not migrated to nightly). Preserved here
-so the test is still runnable manually.
+Backend: `--attention-backend trtllm_mla --moe-runner-backend flashinfer_trtllm`.
+Not registered in any CI suite -- runnable manually only.
 
-Originally lived in:
-  test/registered/quant/test_deepseek_v3_fp4_4gpu.py
-
-The remaining classes from that file are split between:
+Sibling files split out from the same source:
 - test/registered/quant/test_deepseek_v3_fp4_4gpu.py
     -> SymmetricMemory variant (per-commit, stage-c-test-4-gpu-b200)
 - test/registered/quant/test_deepseek_v3_fp4_4gpu_extra.py
