@@ -299,10 +299,7 @@ class GPUWorker:
         save_output_paths: Callable[[OutputBatch], None],
         error_context: str,
     ) -> OutputBatch | Req:
-        """
-        Args:
-            forward_fn: the actual forward function for reqs
-        """
+        """Run a pipeline forward and attach runtime metadata."""
         output_batch = None
         pre_forward_reserved_mb = self._get_current_reserved_memory_mb()
         try:
@@ -311,7 +308,7 @@ class GPUWorker:
 
             start_time = time.monotonic()
 
-            # capture memory baseline for each req in grouped forward on rank-0
+            # Capture request memory baselines for grouped forwards on rank 0.
             request_metrics = [
                 item.metrics for item in log_reqs if item.metrics is not None
             ]
@@ -329,8 +326,7 @@ class GPUWorker:
                     )
                 result = forward_fn()
 
-            # disagg roles return raw Req so callers can keep and transfer intermediate tensors
-            # before converting it to OutputBatch
+            # Disagg roles keep intermediate tensors on Req until transfer finishes.
             if return_req and isinstance(result, Req):
                 return result
 
@@ -407,7 +403,7 @@ class GPUWorker:
                 output_batch,
                 pre_forward_reserved_mb=pre_forward_reserved_mb,
             )
-            # clean cache if OOM
+            # Release cached blocks after failures.
             if torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
         return output_batch
@@ -480,6 +476,7 @@ class GPUWorker:
 
     @staticmethod
     def _get_current_reserved_memory_mb() -> float:
+        """Return current allocator-reserved memory in MiB."""
         if current_platform.is_cpu():
             return 0.0
         try:
@@ -493,6 +490,7 @@ class GPUWorker:
     def _record_output_memory_stats(
         self, output_batch: OutputBatch, *, pre_forward_reserved_mb: float
     ) -> None:
+        """Attach allocator peak stats used by memory-aware admission."""
         if current_platform.is_cpu():
             return
         device_module = torch.get_device_module()

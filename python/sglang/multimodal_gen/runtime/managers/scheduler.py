@@ -340,7 +340,7 @@ class Scheduler(SchedulerDisaggMixin):
             if len(reqs) == 1 or not allow_dynamic_batching:
                 output_batch = self.worker.execute_forward(reqs)
                 self._set_output_dynamic_batch_metadata(output_batch, reqs)
-                self._batch_admission.record_batch_result(reqs, output_batch)
+                self._batch_admission.observe_batch_result(reqs, output_batch)
                 return output_batch
 
             merged_req = self._try_merge_generation_reqs(reqs)
@@ -351,7 +351,7 @@ class Scheduler(SchedulerDisaggMixin):
             try:
                 output_batch = self.worker.execute_forward([merged_req])
                 self._set_output_dynamic_batch_metadata(output_batch, reqs)
-                self._batch_admission.record_batch_result(reqs, output_batch)
+                self._batch_admission.observe_batch_result(reqs, output_batch)
                 if output_batch.error:
                     logger.error(
                         "Dynamic batch execution returned error. Skipping sequential fallback and returning errors: %s",
@@ -398,7 +398,7 @@ class Scheduler(SchedulerDisaggMixin):
             output_batch.dynamic_batch_size = 1
             output_batch.dynamic_batch_capacity = 1
             output_batch.dynamic_batch_stop_reason = "sequential_fallback"
-            self._batch_admission.record_batch_result([req], output_batch)
+            self._batch_admission.observe_batch_result([req], output_batch)
             outputs.append(output_batch)
         return outputs
 
@@ -901,7 +901,7 @@ class Scheduler(SchedulerDisaggMixin):
                 )
             return [(identity, req)]
 
-        self._batch_admission.update_memory_budget()
+        self._batch_admission.refresh_memory_budget()
 
         identity, req, enqueue_time = self.waiting_queue[0]
         if not isinstance(req, Req):
@@ -979,7 +979,7 @@ class Scheduler(SchedulerDisaggMixin):
             item_identity, item_req, _ = self.waiting_queue[idx]
             batch_items[batch_len - 1 - pos] = (item_identity, item_req)
             del self.waiting_queue[idx]
-        stop_reason = self._batch_admission.get_batch_limit_reason(compatible_reqs)
+        stop_reason = self._batch_admission.get_batch_stop_reason(compatible_reqs)
         if stop_reason is None:
             if batch_len >= self._batching_max_size:
                 stop_reason = "max_size"
