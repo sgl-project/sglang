@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = ["."]
+
+[package]
+name = "sgl-router"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Slim KV-aware OpenAI-compatible router for SGLang workers"
+
+[lib]
+name = "sgl_router"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "sgl-router"
+path = "src/main.rs"
+
+[lints.rust]
+unused_qualifications = "warn"
+
+[dependencies]
+# Dynamo crates — see DYNAMO_PIN.md for SHA rationale.
+dynamo-protocols = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb901caeae636131321094090d252c8d6" }
+dynamo-tokenizers = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb901caeae636131321094090d252c8d6" }
+dynamo-parsers = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb901caeae636131321094090d252c8d6" }
+
+# Async runtime + http
+tokio = { version = "1.42", features = ["full"] }
+axum = { version = "0.8", features = ["macros", "tracing"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id"] }
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Utilities
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+futures = "0.3"
+dashmap = "6"
