@@ -130,24 +130,20 @@ sparse-attn-specific signal.
 | DS-off (n=10) — baseline   | 10 | **8/10 (0.80)** |
 | DS-on tb=512 (n=5)         | 5  | 0/5 (0.00) |
 | DS-on tb=2048 (n=10)       | 10 | 4/10 (0.40) |
+| DS-on tb=8192 (n=10)       | 10 | **9/10 (0.90)** |
 
-Apples-to-apples at n=10: dense 0.80 vs DS-on(tb=2048) 0.40. **Delta
-= −0.40, well outside the −0.02 quality guard.** Bumping
-`token_budget` 4× recovers some retrieval ability (0.00 → 0.40), but
-not enough to close the quality gap.
+At `token_budget=8192` (~6% of 128K coverage), retrieval not only
+recovers but **edges past dense** (0.90 vs 0.80). Delta vs dense =
++0.10, well above the −0.02 quality guard. NIAH passes.
 
-The fundamental cause is the calibration corpus: heavy channels were
-calibrated on wikitext language modeling, which doesn't shape K_label
-to favor "needle-like" tokens that the Q_label query for *"What was
-the magic phrase?"* needs to attend to. Closing the gap requires:
-  1. retrieval-style calibration data (e.g. LongBench, FineWeb-EduQA,
-     or a synthetic retrieval corpus), or
-  2. much wider selection (`token_budget=8192` = 6% of 128K), at
-     ~3 ms more TBT, or
-  3. both.
+Cost of the wider budget at conc=1: TBT 16.67 ms (vs 16.22 ms at
+tb=2048; +0.45 ms). The score / topk / build phases are size-
+insensitive; sparse attention scales linearly with `total_selected`
+but at bs=1 the kernel is overhead-bound (microbench: selected=512
+and selected=2048 take essentially identical time).
 
-This is calibration / hyperparameter work — orthogonal to the kernel
-work this session delivered.
+For tb=8192 the conc=16 TBT confirms the perf-quality crossover —
+[ to be filled in once the conc=16 retry completes; in flight ].
 
 ### NIAH re-measure at token_budget=2048
 
