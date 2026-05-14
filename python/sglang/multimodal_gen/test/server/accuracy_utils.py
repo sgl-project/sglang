@@ -14,6 +14,7 @@ from torch.distributed.tensor import distribute_tensor
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     destroy_model_parallel,
+    get_classifier_free_guidance_world_size,
     get_data_parallel_world_size,
     get_sequence_parallel_world_size,
     get_tensor_model_parallel_world_size,
@@ -284,7 +285,7 @@ def initialize_parallel_runtime(sgl_args: ServerArgs) -> None:
     ulysses_degree = sgl_args.ulysses_degree
     ring_degree = sgl_args.ring_degree
     dp_size = sgl_args.dp_size
-    enable_cfg_parallel = bool(sgl_args.enable_cfg_parallel)
+    cfg_degree = sgl_args.cfg_parallel_degree or 1
 
     if (
         tp_size is None
@@ -305,7 +306,13 @@ def initialize_parallel_runtime(sgl_args: ServerArgs) -> None:
         current_tp = get_tensor_model_parallel_world_size()
         current_sp = get_sequence_parallel_world_size()
         current_dp = get_data_parallel_world_size()
-        if current_tp == tp_size and current_sp == sp_degree and current_dp == dp_size:
+        current_cfg = get_classifier_free_guidance_world_size()
+        if (
+            current_tp == tp_size
+            and current_sp == sp_degree
+            and current_dp == dp_size
+            and current_cfg == cfg_degree
+        ):
             return
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -316,7 +323,7 @@ def initialize_parallel_runtime(sgl_args: ServerArgs) -> None:
     maybe_init_distributed_environment_and_model_parallel(
         tp_size=tp_size,
         sp_size=sp_degree,
-        enable_cfg_parallel=enable_cfg_parallel,
+        cfg_degree=cfg_degree,
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
         dp_size=dp_size,

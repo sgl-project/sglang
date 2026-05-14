@@ -7,19 +7,19 @@ ARG BRANCH_TYPE=remote
 ARG GRACE_BLACKWELL=0
 ARG HOPPER_SBO=0
 
-ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.4.2
+ARG SGL_KERNEL_VERSION=0.4.2.post1
 ARG SGL_VERSION
+ARG SGL_DEEP_GEMM_VERSION=0.1.0
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.8.post1
+ARG FLASHINFER_VERSION=0.6.11.post1
 ARG MOONCAKE_VERSION=0.3.10.post2
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
@@ -244,6 +244,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
                torch torchvision torchaudio --force-reinstall; \
+           python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
@@ -257,7 +258,6 @@ FROM torch_deps AS deepep_builder
 ARG CUDA_VERSION
 ARG BUILD_AND_DOWNLOAD_PARALLEL
 ARG GRACE_BLACKWELL
-ARG GRACE_BLACKWELL_DEEPEP_BRANCH
 ARG HOPPER_SBO
 ARG HOPPER_SBO_DEEPEP_COMMIT
 ARG DEEPEP_COMMIT
@@ -268,12 +268,21 @@ WORKDIR /build
 # Clone DeepEP
 RUN set -eux; \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
-      git clone https://github.com/fzyzcjy/DeepEP.git && \
-      cd DeepEP && \
-      git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
-      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-      sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
-      cd .. ; \
+      if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+        git clone https://github.com/fzyzcjy/DeepEP.git && \
+        cd DeepEP && \
+        git checkout gb200_blog_part_2 && \
+        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
+        cd .. ; \
+      else \
+        git clone https://github.com/deepseek-ai/DeepEP.git -b hybrid-ep && \
+        cd DeepEP && \
+        git checkout d28bd676c2120573c9f1425f0c16c39faa4117e6 && \
+        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
+        cd .. ; \
+      fi; \
     elif [ "$HOPPER_SBO" = "1" ]; then \
       git clone https://github.com/deepseek-ai/DeepEP.git -b antgroup-opt && \
       cd DeepEP && \
@@ -539,12 +548,20 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
 # to avoid shipping wrong-CUDA libs on cu13 images.
+# The upstream flash-mla packages are required for running deepseek-v4 models
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nixl nixl-cu12 --no-deps ; \
     python3 -m pip install cuda-python==12.9 ; \
+    cd /sgl-workspace && git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla \
+    && cd flash-mla && git submodule update --init --recursive \
+    && pip install --no-build-isolation -v . ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nixl nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.2.0 ; \
+    cd /sgl-workspace && git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla \
+    && ln -s /usr/local/cuda/include/cccl/cuda /usr/local/cuda/include/cuda \
+    && cd flash-mla && git submodule update --init --recursive \
+    && pip install --no-build-isolation -v . ; \
 fi
 
 # Add yank script

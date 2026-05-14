@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -972,6 +974,8 @@ class NemotronHForCausalLM(nn.Module):
                         continue
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
+                    if name_mapped not in params_dict:
+                        continue
                     param = params_dict[name_mapped]
                     param.weight_loader(
                         param,

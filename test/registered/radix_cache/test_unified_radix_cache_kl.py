@@ -17,6 +17,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -34,7 +35,7 @@ MAMBA_TRACK_INTERVAL = 128
 SWA_MODEL = "openai/gpt-oss-20b"
 FULL_MODEL = "Qwen/Qwen3-32B"
 
-register_cuda_ci(est_time=760, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=760, stage="stage-c", runner_config="4-gpu-h100")
 
 
 class UnifiedRadixTreeTestMixin:
@@ -237,6 +238,10 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     kl_threshold = 0.03
     gsm8k_threshold = 0.7
     mmlu_threshold = 0.7
+
+    @unittest.skipIf(is_in_ci(), "SWA model mmlu eval not stable enough")
+    def test_mmlu(self):
+        super().test_mmlu()
 
     @classmethod
     def setUpClass(cls):

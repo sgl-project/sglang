@@ -17,6 +17,11 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan3d import (
 from sglang.multimodal_gen.runtime.distributed import divide
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNormScaleShift,
+    ScaleResidualLayerNormScaleShift,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
@@ -28,6 +33,12 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _fused_add_gate(
+    residual: torch.Tensor, x: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    return torch.addcmul(residual, x, gate)
 
 
 class MixedRowParallelLinear(RowParallelLinear):
@@ -98,25 +109,42 @@ class _FluxRMSNorm(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.scale = nn.Parameter(torch.ones(dim))
+        self.variance_epsilon = 1e-6
+        self.hidden_size = dim
+
+    @property
+    def weight(self) -> nn.Parameter:
+        # Keep the original checkpoint key (`scale`) while exposing the
+        # interface expected by the fused QK-norm helper.
+        return self.scale
 
     def forward(self, x: torch.Tensor):
         x_dtype = x.dtype
         x = x.float()
-        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+        rrms = torch.rsqrt(
+            torch.mean(x**2, dim=-1, keepdim=True) + self.variance_epsilon
+        )
         return (x * rrms).to(dtype=x_dtype) * self.scale
 
 
 class _FluxQKNorm(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
+        self.dim = dim
         self.query_norm = _FluxRMSNorm(dim)
         self.key_norm = _FluxRMSNorm(dim)
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        q = self.query_norm(q)
-        k = self.key_norm(k)
+        q, k = apply_qk_norm(
+            q=q.contiguous(),
+            k=k.contiguous(),
+            q_norm=self.query_norm,
+            k_norm=self.key_norm,
+            head_dim=self.dim,
+            allow_inplace=True,
+        )
         return q.to(v), k.to(v)
 
 
@@ -212,7 +240,9 @@ class _FluxDoubleStreamBlock(nn.Module):
         self.hidden_size = hidden_size
         self.head_dim = hidden_size // num_heads
         self.img_mod = _FluxModulation(hidden_size, double=True)
-        self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.img_norm1 = LayerNormScaleShift(
+            hidden_size, elementwise_affine=False, eps=1e-6
+        )
         self.img_attn = _FluxSelfAttention(
             dim=hidden_size,
             num_heads=num_heads,
@@ -220,11 +250,15 @@ class _FluxDoubleStreamBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
         )
 
-        self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.img_norm2 = ScaleResidualLayerNormScaleShift(
+            hidden_size, elementwise_affine=False, eps=1e-6
+        )
         self.img_mlp = MLP(hidden_size, mlp_hidden_dim, act_type="gelu_pytorch_tanh")
 
         self.txt_mod = _FluxModulation(hidden_size, double=True)
-        self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.txt_norm1 = LayerNormScaleShift(
+            hidden_size, elementwise_affine=False, eps=1e-6
+        )
         self.txt_attn = _FluxSelfAttention(
             dim=hidden_size,
             num_heads=num_heads,
@@ -232,7 +266,9 @@ class _FluxDoubleStreamBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
         )
 
-        self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.txt_norm2 = ScaleResidualLayerNormScaleShift(
+            hidden_size, elementwise_affine=False, eps=1e-6
+        )
         self.txt_mlp = MLP(hidden_size, mlp_hidden_dim, act_type="gelu_pytorch_tanh")
 
         if supported_attention_backends is None:
@@ -254,8 +290,7 @@ class _FluxDoubleStreamBlock(nn.Module):
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
 
-        img_modulated = self.img_norm1(img)
-        img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
+        img_modulated = self.img_norm1(img, shift=img_mod1.shift, scale=img_mod1.scale)
 
         B, img_L, _ = img_modulated.shape
         img_qkv, _ = self.img_attn.qkv(img_modulated)
@@ -268,8 +303,7 @@ class _FluxDoubleStreamBlock(nn.Module):
         img_q = img_q_t.transpose(1, 2)
         img_k = img_k_t.transpose(1, 2)
 
-        txt_modulated = self.txt_norm1(txt)
-        txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
+        txt_modulated = self.txt_norm1(txt, shift=txt_mod1.shift, scale=txt_mod1.scale)
         txt_L = txt_modulated.shape[1]
         txt_qkv, _ = self.txt_attn.qkv(txt_modulated)
         txt_qkv = txt_qkv.view(B, txt_L, 3, self.local_num_heads, self.head_dim)
@@ -291,16 +325,24 @@ class _FluxDoubleStreamBlock(nn.Module):
         txt_attn, img_attn = attn[:, :txt_L], attn[:, txt_L:]
 
         img_proj, _ = self.img_attn.proj(img_attn)
-        img = img + img_mod1.gate * img_proj
-        img = img + img_mod2.gate * self.img_mlp(
-            (1 + img_mod2.scale) * self.img_norm2(img) + img_mod2.shift
+        img_modulated, img = self.img_norm2(
+            residual=img,
+            x=img_proj,
+            gate=img_mod1.gate,
+            shift=img_mod2.shift,
+            scale=img_mod2.scale,
         )
+        img = _fused_add_gate(img, self.img_mlp(img_modulated), img_mod2.gate)
 
         txt_proj, _ = self.txt_attn.proj(txt_attn)
-        txt = txt + txt_mod1.gate * txt_proj
-        txt = txt + txt_mod2.gate * self.txt_mlp(
-            (1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift
+        txt_modulated, txt = self.txt_norm2(
+            residual=txt,
+            x=txt_proj,
+            gate=txt_mod1.gate,
+            shift=txt_mod2.shift,
+            scale=txt_mod2.scale,
         )
+        txt = _fused_add_gate(txt, self.txt_mlp(txt_modulated), txt_mod2.gate)
         return img, txt
 
 
@@ -344,7 +386,9 @@ class _FluxSingleStreamBlock(nn.Module):
         self.norm = _FluxQKNorm(self.head_dim)
 
         self.hidden_size = hidden_size
-        self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.pre_norm = LayerNormScaleShift(
+            hidden_size, elementwise_affine=False, eps=1e-6
+        )
 
         self.mlp_act = _FluxGELU(approximate="tanh")
         self.modulation = _FluxModulation(hidden_size, double=False)
@@ -366,7 +410,7 @@ class _FluxSingleStreamBlock(nn.Module):
     ) -> torch.Tensor:
         mod, _ = self.modulation(vec)
 
-        x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
+        x_mod = self.pre_norm(x, shift=mod.shift, scale=mod.scale)
         linear1_out, _ = self.linear1(x_mod)
         local_qkv_dim = 3 * self.head_dim * self.local_num_heads
         local_mlp_dim = self.mlp_hidden_dim // self.tp_size
@@ -386,13 +430,15 @@ class _FluxSingleStreamBlock(nn.Module):
         attn = attn.flatten(2)
 
         output, _ = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
-        return x + mod.gate * output
+        return _fused_add_gate(x, output, mod.gate)
 
 
 class _FluxLastLayer(nn.Module):
     def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_final = LayerNormScaleShift(
+            hidden_size, elementwise_affine=False, eps=1e-6
+        )
         self.linear = nn.Linear(
             hidden_size, patch_size * patch_size * out_channels, bias=True
         )
@@ -402,7 +448,7 @@ class _FluxLastLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
         shift, scale = self.adaLN_modulation(vec).chunk(2, dim=1)
-        x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
+        x = self.norm_final(x, shift=shift[:, None, :], scale=scale[:, None, :])
         x = self.linear(x)
         return x
 
