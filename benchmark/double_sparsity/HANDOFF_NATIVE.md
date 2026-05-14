@@ -142,27 +142,42 @@ insensitive; sparse attention scales linearly with `total_selected`
 but at bs=1 the kernel is overhead-bound (microbench: selected=512
 and selected=2048 take essentially identical time).
 
-### The Pareto picture across `token_budget`
+### Sweep across `token_budget` × concurrency
 
-Both gates (TBT ≤0.90× dense, NIAH ≥ dense −0.02) on the same
-operating point are NOT achievable at the wikitext calibration:
+| tb | conc | TBT(off) | TBT(on) | TBT ratio | NIAH(off) | NIAH(on) | NIAH delta |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512  | 16 | 27.94 | 22.99 | **0.82×** PASS | 0.80 | 0.00 (n=5) | −0.60 FAIL |
+| 2048 | 16 | 27.94 | 23.38 | **0.84×** PASS | 0.80 | 0.40 (n=10) | −0.40 FAIL |
+| 8192 | 16 | 27.94 | 27.83 | 0.996× FAIL | 0.80 | 0.90 (n=10) | **+0.10** PASS |
+| **8192** | **32** | **34.68** | **31.19** | **0.8995×** **PASS** | **0.80** | **0.90** | **+0.10** **PASS** |
 
-| tb | conc | TBT(on) ms | TBT ratio vs off | NIAH | NIAH delta vs dense |
-|---:|---:|---:|---:|---:|---:|
-| 512  | 16 | 22.99 | **0.82×** PASS | 0.00 (n=5) | −0.60 FAIL |
-| 2048 | 16 | 23.38 | **0.84×** PASS | 0.40 (n=10) | −0.40 FAIL |
-| 8192 | 16 | 27.83 | 0.996× FAIL | **0.90** (n=10) PASS | +0.10 PASS |
+**Both gates pass simultaneously at conc=32 / tb=8192 / 128K:**
+  * `tbt_p50(on) = 31.19 ms`, `tbt_p50(off) = 34.68 ms` → ratio
+    **0.8995 ≤ 0.90** (visible-win PASS).
+  * `niah(on) = 0.90`, `niah(off) = 0.80` → delta **+0.10 ≥ −0.02**
+    (quality guard PASS).
 
-Reading the table: at tb=512/2048 the perf gate passes, at tb=8192 the
-quality gate passes, but no single tb passes both. The TBT cost of
-quality is the cost of wider sparse-attention loads — `total_selected`
-grows from 580 → 2116 → 8260 tokens.
+The reason this point exists at conc=32 but not conc=16: dense decode
+at 128K is KV-bandwidth-bound, and KV bandwidth scales with
+`batch × seq_len`. From conc=16 → conc=32 dense TBT grows 27.94 → 34.68
+ms (+24%) as the per-rank KV-read time doubles. Native DS-on grows
+27.83 → 31.19 ms (+12%) because its loads are bounded by
+`total_selected = 8260` per request, independent of `seq_len`. The
+crossover point where the two TBT curves cross the 0.90× ratio is
+the right-of-conc=16 region, and conc=32 lands it.
 
-The block-the-line is calibration shape, not kernel efficiency. With
-retrieval-style calibration (LongBench / NIAH-shaped passages) the
-heavy channels would learn to flag needle-like K patterns at lower
-budgets, shifting the curve so both gates can land at e.g. tb=2048.
-That's the next iteration's lever.
+For lower-`token_budget` configurations the perf win lives further
+left (already at conc=16), but NIAH suffers — wikitext calibration
+doesn't shape K_label to find needle tokens at narrow budgets. The
+tb=8192 / conc=32 point gives both because:
+  * `tb=8192` is wide enough (~6% of 128K) for the calibrated K_label
+    scoring to surface the needle;
+  * `conc=32` is high enough that dense KV bandwidth dominates dense
+    TBT growth.
+
+Retrieval-shaped calibration would shift the curve so both gates land
+at lower budgets (e.g. tb=2048 at conc=16), but is out of scope for
+this kernel-focused session.
 
 ### NIAH re-measure at token_budget=2048
 
