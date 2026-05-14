@@ -788,53 +788,81 @@ class Compressor(nn.Module):
         kv_and_score_states_pool = self._get_states(forward_batch)
         req_pool_indices = forward_batch.req_pool_indices
 
-        # NOTE: first, write to the states
         bs = kv_and_scores.kv.size(0)
-        write_pos = (seq_lens - 1) % self.ratio + self.overlap * self.ratio
-        kv_and_score_states_pool[req_pool_indices, write_pos] = kv_and_scores
+        if self.use_hip_fused_compress and self.ratio == 4 and self.overlap:
+            from sglang.srt.layers.attention.compressed.fused_compress_old_triton import (
+                fused_compress_c4_decode_old_triton,
+            )
 
-        # NOTE: need to copy out before modifying overlap states
-        # kv_states: [bs, coff * ratio, coff * head_dim]
-        kv_and_score_to_compress = kv_and_score_states_pool[req_pool_indices]
+            kv_compressed = fused_compress_c4_decode_old_triton(
+                pool_kv=kv_and_score_states_pool.kv,
+                kv_score_input_kv=kv_and_scores.kv,
+                ape=self.ape,
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
+                head_dim=self.head_dim,
+            )
+        elif self.use_hip_fused_compress and self.ratio == 128 and not self.overlap:
+            from sglang.srt.layers.attention.compressed.fused_compress_old_triton import (
+                fused_compress_c128_decode_old_triton,
+            )
 
-        # Shift just compressed kv states left by ratio
-        if self.overlap:
-            should_shift = seq_lens % self.ratio == 0
-            kv_and_score_states_pool[req_pool_indices, : self.ratio] = KVAndScore(
-                kv_score=torch.where(
-                    should_shift[:, None, None],
-                    kv_and_score_to_compress.kv_score[:, self.ratio :],
-                    kv_and_score_to_compress.kv_score[:, : self.ratio],
+            kv_compressed = fused_compress_c128_decode_old_triton(
+                pool_kv=kv_and_score_states_pool.kv,
+                kv_score_input_kv=kv_and_scores.kv,
+                ape=self.ape,
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
+                head_dim=self.head_dim,
+            )
+        else:
+            # NOTE: first, write to the states
+            write_pos = (seq_lens - 1) % self.ratio + self.overlap * self.ratio
+            kv_and_score_states_pool[req_pool_indices, write_pos] = kv_and_scores
+
+            # NOTE: need to copy out before modifying overlap states
+            # kv_states: [bs, coff * ratio, coff * head_dim]
+            kv_and_score_to_compress = kv_and_score_states_pool[req_pool_indices]
+
+            # Shift just compressed kv states left by ratio
+            if self.overlap:
+                should_shift = seq_lens % self.ratio == 0
+                kv_and_score_states_pool[req_pool_indices, : self.ratio] = KVAndScore(
+                    kv_score=torch.where(
+                        should_shift[:, None, None],
+                        kv_and_score_to_compress.kv_score[:, self.ratio :],
+                        kv_and_score_to_compress.kv_score[:, : self.ratio],
+                    )
                 )
-            )
 
-        # shape: [bs * coff, ratio, coff * head_dim]
-        kv_and_score_to_compress = kv_and_score_to_compress.view(
-            -1, self.ratio, self.coff * self.head_dim
-        )
-        kv_and_score_to_compress.score.add_(self.ape.unsqueeze(0))
-
-        if self.overlap:
-            # shape: [bs, coff * ratio, coff * head_dim]
+            # shape: [bs * coff, ratio, coff * head_dim]
             kv_and_score_to_compress = kv_and_score_to_compress.view(
-                bs, self.coff * self.ratio, self.coff * self.head_dim
+                -1, self.ratio, self.coff * self.head_dim
             )
-            kv_and_score_to_compress = KVAndScore.from_kv_score(
-                kv=self.overlap_transform_decode(kv_and_score_to_compress.kv),
-                score=self.overlap_transform_decode(kv_and_score_to_compress.score),
+            kv_and_score_to_compress.score.add_(self.ape.unsqueeze(0))
+
+            if self.overlap:
+                # shape: [bs, coff * ratio, coff * head_dim]
+                kv_and_score_to_compress = kv_and_score_to_compress.view(
+                    bs, self.coff * self.ratio, self.coff * self.head_dim
+                )
+                kv_and_score_to_compress = KVAndScore.from_kv_score(
+                    kv=self.overlap_transform_decode(kv_and_score_to_compress.kv),
+                    score=self.overlap_transform_decode(kv_and_score_to_compress.score),
+                )
+
+            self.print_tensor(kv_and_score_to_compress.kv, "kv_to_compress")
+            self.print_tensor(kv_and_score_to_compress.score, "score_to_compress")
+
+            # kv_to_compress: [bs, ratio * coff, head_dim]
+            kv_and_score_to_compress = kv_and_score_to_compress.view(
+                bs, self.ratio * self.coff, self.head_dim
             )
 
-        self.print_tensor(kv_and_score_to_compress.kv, "kv_to_compress")
-        self.print_tensor(kv_and_score_to_compress.score, "score_to_compress")
-
-        # kv_to_compress: [bs, ratio * coff, head_dim]
-        kv_and_score_to_compress = kv_and_score_to_compress.view(
-            bs, self.ratio * self.coff, self.head_dim
-        )
-
-        kv_compressed = (
-            kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
-        ).sum(dim=1)
+            kv_compressed = (
+                kv_and_score_to_compress.kv
+                * kv_and_score_to_compress.score.softmax(dim=1)
+            ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
             # HIP-only: share the per-step freqs_cis gather across layers.
