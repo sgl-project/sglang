@@ -987,7 +987,7 @@ class CudaGraphRunner:
         # populate_from_forward_batch).
         buffers.num_token_non_padded[...] = num_tokens
         if (
-            enable_num_token_non_padded(self.model_runner.server_args)
+            enable_num_token_non_padded()
             and self.require_gathered_buffer
             and not self.nsa_enable_prefill_cp
         ):
@@ -1255,9 +1255,7 @@ class CudaGraphRunner:
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
-            enable_num_token_non_padded_flag=enable_num_token_non_padded(
-                self.model_runner.server_args
-            ),
+            enable_num_token_non_padded_flag=enable_num_token_non_padded(),
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
@@ -1388,6 +1386,12 @@ class CudaGraphRunner:
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
+
+                capture_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.spec_algorithm.is_standalone()
+                    else CaptureHiddenMode.FULL
+                )
                 spec_info = EagleVerifyInput(
                     draft_token=None,
                     custom_mask=self.buffers.custom_mask,
@@ -1399,7 +1403,7 @@ class CudaGraphRunner:
                     spec_steps=self.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.speculative_num_draft_tokens,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    capture_hidden_mode=capture_mode,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
