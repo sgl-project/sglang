@@ -167,6 +167,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    dispose_tensor,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -827,12 +828,6 @@ class DeepseekV2MoE(nn.Module):
             else None
         )
         if hidden_states.shape[0] > 0:
-            if (
-                not self._fuse_shared_experts_inside_sbo
-            ):  # TODO: check if it supports mtp
-                shared_output = self._forward_shared_experts(
-                    hidden_states, gemm_output_zero_allocator
-                )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_kwargs = (
@@ -893,6 +888,12 @@ class DeepseekV2MoE(nn.Module):
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
+
+        if hidden_states.shape[0] > 0:
+            if not self._fuse_shared_experts_inside_sbo:
+                shared_output = self._forward_shared_experts(
+                    hidden_states, gemm_output_zero_allocator
+                )
 
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
@@ -1922,6 +1923,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        hidden_states_orig = hidden_states
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
@@ -1943,9 +1945,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             topk_indices = None
 
+        get_attn_tp_context().attn_inputs_ = None
+
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+
+        if residual is not hidden_states_orig:
+            dispose_tensor(hidden_states_orig)
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
