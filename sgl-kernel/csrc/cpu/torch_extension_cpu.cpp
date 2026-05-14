@@ -109,17 +109,6 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap);
 
-// flash attention
-at::Tensor flash_attn_varlen_func(
-    const at::Tensor& q,
-    const at::Tensor& k,
-    const at::Tensor& v,
-    const at::Tensor& cu_seqlens_q,
-    const at::Tensor& cu_seqlens_k,
-    int64_t max_seqlen_q,
-    int64_t max_seqlen_k,
-    bool causal);
-
 // linear attention
 std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     const at::Tensor& query,
@@ -151,15 +140,6 @@ at::Tensor fused_linear_sigmoid_mul(
     const std::optional<at::Tensor>& bias,
     bool is_vnni,
     const at::Tensor& post_mul_mat);
-
-at::Tensor fused_linear_gelu_linear(
-    at::Tensor& input,
-    at::Tensor& weight1,
-    at::Tensor& weight2,
-    const std::optional<at::Tensor>& bias1,
-    const std::optional<at::Tensor>& bias2,
-    bool approximate_tanh,
-    bool is_vnni);
 
 // igemm
 at::Tensor int8_scaled_mm_cpu(
@@ -402,12 +382,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
-  // flash attn
-  m.def(
-      "flash_attn_varlen_func(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
-      "int max_seqlen_q, int max_seqlen_k, bool causal) -> Tensor");
-  m.impl("flash_attn_varlen_func", torch::kCPU, &flash_attn_varlen_func);
-
   // linear attn
   m.def(
       "chunk_gated_delta_rule_cpu(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
@@ -431,11 +405,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "fused_linear_sigmoid_mul(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, Tensor post_mul_mat) -> Tensor");
   m.impl("fused_linear_sigmoid_mul", torch::kCPU, &fused_linear_sigmoid_mul);
-
-  m.def(
-      "fused_linear_gelu_linear(Tensor input, Tensor weight1, Tensor weight2, Tensor? bias1, Tensor? bias2, bool "
-      "approximate_tanh, bool is_vnni) -> Tensor");
-  m.impl("fused_linear_gelu_linear", torch::kCPU, &fused_linear_gelu_linear);
 
   // igemm
   m.def(
