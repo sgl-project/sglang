@@ -1276,3 +1276,93 @@ impl Default for MockWorkerConfig {
         }
     }
 }
+
+/// A minimal OpenAI-compatible mock worker that does not implement /server_info or /model_info.
+/// Used to test fallback model name discovery via /v1/models.
+pub struct OpenAiOnlyMockWorker {
+    port: u16,
+    model_name: String,
+    shutdown_handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl OpenAiOnlyMockWorker {
+    pub fn new(model_name: impl Into<String>) -> Self {
+        Self {
+            port: 0,
+            model_name: model_name.into(),
+            shutdown_handle: None,
+            shutdown_tx: None,
+        }
+    }
+
+    pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        self.port = listener.local_addr()?.port();
+        drop(listener);
+
+        let model_name = self.model_name.clone();
+        let port = self.port;
+
+        let app = Router::new()
+            .route("/health", get(|| async { Json(json!({ "status": "healthy" })) }))
+            .route("/health_generate", get(|| async { Json(json!({ "status": "ok" })) }))
+            .route(
+                "/v1/models",
+                get(move || {
+                    let model_name = model_name.clone();
+                    async move {
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        Json(json!({
+                            "object": "list",
+                            "data": [{ "id": model_name, "object": "model", "created": ts, "owned_by": "owner" }]
+                        }))
+                    }
+                }),
+            );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        self.shutdown_tx = Some(shutdown_tx);
+
+        let handle = tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Failed to bind to port {}: {}", port, e);
+                    return;
+                }
+            };
+            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            });
+            if let Err(e) = server.await {
+                eprintln!("Server error: {}", e);
+            }
+        });
+
+        self.shutdown_handle = Some(handle);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        Ok(format!("http://127.0.0.1:{}", self.port))
+    }
+
+    pub async fn stop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(h) = self.shutdown_handle.take() {
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), h).await;
+        }
+    }
+}
+
+impl Drop for OpenAiOnlyMockWorker {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
