@@ -208,6 +208,7 @@ class EagleDraftInputV2Mixin:
         batch: ModelWorkerBatch,
         cuda_graph_runner: EAGLEDraftCudaGraphRunner,
         draft_model_runner: ModelRunner,
+        target_model_runner: ModelRunner,
         topk: int,
         num_steps: int,
     ):
@@ -231,7 +232,7 @@ class EagleDraftInputV2Mixin:
                 num_steps,
             )
             hisparse_coordinator = getattr(
-                draft_model_runner, "hisparse_coordinator", None
+                target_model_runner, "hisparse_coordinator", None
             )
             if (
                 topk == 1
@@ -245,7 +246,7 @@ class EagleDraftInputV2Mixin:
                     batch.req_pool_indices,
                     tokens_per_req_cpu,
                 )
-                draft_model_runner.token_to_kv_pool_allocator.bind_device_mapping(
+                target_model_runner.token_to_kv_pool_allocator.bind_device_mapping(
                     batch.out_cache_loc,
                     device_slots,
                 )

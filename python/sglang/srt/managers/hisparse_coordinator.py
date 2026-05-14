@@ -110,6 +110,9 @@ class HiSparseCoordinator:
         self.req_device_buffer_size = torch.zeros(
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
+        self.req_draft_buffer_size = torch.zeros(
+            max_num_req_slots, dtype=torch.int64, device="cpu"
+        )
         self.req_to_host_pool = torch.full(
             (max_num_req_slots, max_compressed_context_len + self.page_size),
             -1,
@@ -649,16 +652,35 @@ class HiSparseCoordinator:
     def supports_hisparse_draft_slots(self) -> bool:
         return True
 
-    def _ensure_padded_buffer(self, req_pool_indices: torch.Tensor) -> None:
+    def _ensure_draft_buffer(
+        self, req_pool_indices: torch.Tensor, num_tokens: int
+    ) -> None:
+        if num_tokens <= 0:
+            return
+
+        start = self.device_buffer_size + 1
+        end = start + num_tokens
+        if end > self.padded_buffer_size:
+            raise ValueError(
+                f"Requested {num_tokens} draft slots but extra page only "
+                f"has {self.padded_buffer_size - self.device_buffer_size - 1} "
+                f"available (padded_buffer_size={self.padded_buffer_size}, "
+                f"device_buffer_size={self.device_buffer_size})."
+            )
+
         req_indices_cpu = req_pool_indices.cpu().tolist()
         grow_reqs = []
         total_grow = 0
         for req_idx in req_indices_cpu:
-            current_cap = int(self.req_device_buffer_size[req_idx])
-            if current_cap >= self.padded_buffer_size:
+            current_cap = int(self.req_draft_buffer_size[req_idx])
+            existing_device_cap = int(self.req_device_buffer_size[req_idx])
+            if existing_device_cap >= end:
+                self.req_draft_buffer_size[req_idx] = max(current_cap, num_tokens)
+                continue
+            if current_cap >= num_tokens:
                 continue
             grow_reqs.append((req_idx, current_cap))
-            total_grow += self.padded_buffer_size - current_cap
+            total_grow += num_tokens - current_cap
 
         if total_grow == 0:
             return
@@ -673,19 +695,22 @@ class HiSparseCoordinator:
 
         offset = 0
         for req_idx, current_cap in grow_reqs:
-            grow_size = self.padded_buffer_size - current_cap
+            grow_size = num_tokens - current_cap
             chunk = all_new[offset : offset + grow_size]
             offset += grow_size
-            self.req_to_device_buffer[req_idx, current_cap : self.padded_buffer_size] = (
-                chunk
+            slot_start = start + current_cap
+            slot_end = slot_start + grow_size
+            self.req_to_device_buffer[req_idx, slot_start:slot_end] = chunk
+            self.req_device_buffer_tokens[:, req_idx, slot_start:slot_end] = (
+                self._device_buffer_arange_i32[slot_start:slot_end]
             )
-            self.req_device_buffer_tokens[
-                :, req_idx, current_cap : self.padded_buffer_size
-            ] = self._device_buffer_arange_i32[current_cap : self.padded_buffer_size]
-            self.req_device_buffer_token_locs[
-                :, req_idx, current_cap : self.padded_buffer_size
-            ] = chunk
-            self.req_device_buffer_size[req_idx] = self.padded_buffer_size
+            self.req_device_buffer_token_locs[:, req_idx, slot_start:slot_end] = chunk
+            self.req_draft_buffer_size[req_idx] = num_tokens
+
+    def _ensure_padded_buffer(self, req_pool_indices: torch.Tensor) -> None:
+        self._ensure_draft_buffer(
+            req_pool_indices, self.padded_buffer_size - self.device_buffer_size - 1
+        )
 
     def get_draft_device_slots(
         self,
@@ -701,7 +726,7 @@ class HiSparseCoordinator:
                 f"available (padded_buffer_size={self.padded_buffer_size}, "
                 f"device_buffer_size={self.device_buffer_size})."
             )
-        self._ensure_padded_buffer(req_pool_indices)
+        self._ensure_draft_buffer(req_pool_indices, num_tokens_per_req)
         return self.req_to_device_buffer[req_pool_indices, start:end].reshape(-1)
 
     def get_draft_device_slots_variable(
@@ -720,7 +745,7 @@ class HiSparseCoordinator:
                 f"capacity ({self.padded_buffer_size - self.device_buffer_size - 1})."
             )
 
-        self._ensure_padded_buffer(req_pool_indices)
+        self._ensure_draft_buffer(req_pool_indices, max_tokens)
 
         total_slots = int(tokens_per_req_cpu.sum().item())
         if total_slots == 0:
@@ -1096,9 +1121,29 @@ class HiSparseCoordinator:
 
         # release memory -- only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
+        draft_cap = int(self.req_draft_buffer_size[req.req_pool_idx])
         if current_cap > 0:
             side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
+        else:
+            side_buf_hi = torch.empty(0, dtype=torch.int64, device=self.device)
+        if draft_cap > 0:
+            draft_start = self.device_buffer_size + 1
+            draft_end = draft_start + draft_cap
+            draft_buf_hi = self.req_to_device_buffer[
+                req.req_pool_idx, draft_start:draft_end
+            ]
+            all_hi = torch.unique(
+                torch.cat(
+                    [
+                        side_buf_hi[side_buf_hi > 0],
+                        draft_buf_hi[draft_buf_hi > 0],
+                    ]
+                )
+            )
+        else:
             all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
+
+        if current_cap > 0 or draft_cap > 0:
             if all_hi.numel() > 0:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
 
@@ -1119,6 +1164,7 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
+        self.req_draft_buffer_size[req.req_pool_idx] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False

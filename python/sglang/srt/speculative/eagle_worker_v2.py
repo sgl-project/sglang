@@ -341,6 +341,7 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch,
             self.cuda_graph_runner,
             self.draft_runner,
+            self.target_worker.model_runner,
             self.topk,
             self.speculative_num_steps,
         )
