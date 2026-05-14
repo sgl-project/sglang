@@ -22,7 +22,9 @@ class TestCosmos3ParamNamesMapping(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.fn = get_param_names_mapping(_build_cosmos3_param_names_mapping())
+        cls.fn = staticmethod(
+            get_param_names_mapping(_build_cosmos3_param_names_mapping())
+        )
 
     # --- skipped / dropped weights ---
 
