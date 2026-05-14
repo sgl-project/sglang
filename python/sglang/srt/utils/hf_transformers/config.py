@@ -140,7 +140,7 @@ def get_config(
     if config.model_type == "multi_modality":
         _set_architectures(config, "MultiModalityCausalLM")
 
-    if config.model_type == "gemma4":
+    if config.model_type in ("gemma4", "gemma4_assistant"):
         # Gemma4 configs use base attributes for SWA layers and `global_*`
         # variants for full-attention layers.  SGLang expects the opposite:
         # base = full-attention, `swa_*` = sliding-window overrides.
