@@ -25,13 +25,13 @@ from llguidance.torch import (
     allocate_token_bitmask,
     fill_next_token_bitmask,
 )
-from llguidance.torch import (
-    apply_token_bitmask_inplace as apply_token_bitmask_inplace_torch,
-)
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
     InvalidGrammarObject,
+)
+from sglang.srt.constrained.torch_ops.bitmask_ops import (
+    apply_token_bitmask_inplace_torch,
 )
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
@@ -58,7 +58,7 @@ def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         else:
             apply_token_bitmask_inplace_triton(logits, vocab_mask)
     elif logits.device.type in {"cpu", "npu"}:
-        apply_token_bitmask_inplace_torch(logits, vocab_mask)
+        apply_token_bitmask_inplace_torch(logits[..., :cutoff], vocab_mask)
     else:
         raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
