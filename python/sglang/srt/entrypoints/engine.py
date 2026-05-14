@@ -333,6 +333,7 @@ class Engine(EngineScoreMixin, EngineBase):
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        routed_experts_start_len: int = 0,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -369,6 +370,7 @@ class Engine(EngineScoreMixin, EngineBase):
             custom_logit_processor=custom_logit_processor,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
+            routed_experts_start_len=routed_experts_start_len,
             stream=stream,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
@@ -423,6 +425,7 @@ class Engine(EngineScoreMixin, EngineBase):
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        routed_experts_start_len: int = 0,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -458,6 +461,7 @@ class Engine(EngineScoreMixin, EngineBase):
             lora_path=lora_path,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
+            routed_experts_start_len=routed_experts_start_len,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
             bootstrap_host=bootstrap_host,
@@ -617,8 +621,9 @@ class Engine(EngineScoreMixin, EngineBase):
                                 writer,
                             ),
                         )
-                        with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
-                            server_args, gpu_id
+                        with (
+                            memory_saver_adapter.configure_subprocess(),
+                            numa_utils.configure_subprocess(server_args, gpu_id),
                         ):
                             proc.start()
 
@@ -1196,7 +1201,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.8.post1",
+                "0.6.11.post1",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",

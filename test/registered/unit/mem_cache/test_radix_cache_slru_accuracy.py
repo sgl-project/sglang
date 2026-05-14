@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=8, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 
 
