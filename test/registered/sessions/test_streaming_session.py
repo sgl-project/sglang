@@ -62,7 +62,9 @@ class TestStreamingSessionEagleV2RetractLargePage(TestStreamingSession):
     ]
 
 
-class TestStreamingSessionAbortLeakRepro(StreamingSessionServerBase, AbortLeakReproKitMixin):
+class TestStreamingSessionAbortLeakRepro(
+    StreamingSessionServerBase, AbortLeakReproKitMixin
+):
     extra_args = [
         "--chunked-prefill-size",
         str(ABORT_REPRO_CHUNKED_PREFILL_SIZE),

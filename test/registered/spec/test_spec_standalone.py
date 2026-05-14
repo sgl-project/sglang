@@ -17,7 +17,9 @@ class TestStandaloneV2SpeculativeDecodingTriton(StandaloneServerBase, CustomTest
     attention_backend = "triton"
 
 
-class TestStandaloneV2SpeculativeDecodingFlashinfer(StandaloneServerBase, CustomTestCase):
+class TestStandaloneV2SpeculativeDecodingFlashinfer(
+    StandaloneServerBase, CustomTestCase
+):
     attention_backend = "flashinfer"
 
 

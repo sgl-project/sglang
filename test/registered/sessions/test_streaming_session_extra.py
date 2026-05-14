@@ -13,14 +13,18 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=691, stage="extra-a", runner_config="1-gpu-large")
 
 
-class TestStreamingSessionRetractMixedChunk(StreamingSessionServerBase, StreamingSessionKitMixin):
+class TestStreamingSessionRetractMixedChunk(
+    StreamingSessionServerBase, StreamingSessionKitMixin
+):
     """Retract + --enable-mixed-chunk."""
 
     extra_args = ["--chunked-prefill-size", "128", "--enable-mixed-chunk"]
     env_overrides = [("SGLANG_TEST_RETRACT", True)]
 
 
-class TestStreamingSessionRetractLargePage(StreamingSessionServerBase, StreamingSessionKitMixin):
+class TestStreamingSessionRetractLargePage(
+    StreamingSessionServerBase, StreamingSessionKitMixin
+):
     """Retract + page=256: exercises page-aligned `_free_tail`. Partial-page
     free would corrupt pages still holding committed tokens."""
 
@@ -75,7 +79,9 @@ class TestStreamingSessionEagleV2(StreamingSessionServerBase, StreamingSessionKi
     ]
 
 
-class TestStreamingSessionEagleRetractLargePage(StreamingSessionServerBase, StreamingSessionKitMixin):
+class TestStreamingSessionEagleRetractLargePage(
+    StreamingSessionServerBase, StreamingSessionKitMixin
+):
     """EAGLE3 spec v1 + retract + page=256: max-pressure on `_free_tail`
     (spec tail + retract alloc-commit gap + page alignment)."""
 

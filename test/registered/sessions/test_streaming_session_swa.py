@@ -32,7 +32,9 @@ class TestStreamingSessionSWA(StreamingSessionServerBase, StreamingSessionKitMix
     extra_args = ["--chunked-prefill-size", "512", *SWA_COMMON_ARGS]
 
 
-class TestStreamingSessionSWARetractLargePage(StreamingSessionServerBase, StreamingSessionKitMixin):
+class TestStreamingSessionSWARetractLargePage(
+    StreamingSessionServerBase, StreamingSessionKitMixin
+):
     """SWA under retract decode with page=256."""
 
     model = SWA_MODEL
@@ -46,7 +48,9 @@ class TestStreamingSessionSWARetractLargePage(StreamingSessionServerBase, Stream
     env_overrides = [("SGLANG_TEST_RETRACT", True)]
 
 
-class TestStreamingSessionSWARetractMixedChunk(StreamingSessionServerBase, StreamingSessionKitMixin):
+class TestStreamingSessionSWARetractMixedChunk(
+    StreamingSessionServerBase, StreamingSessionKitMixin
+):
     """SWA under retract decode with --enable-mixed-chunk."""
 
     model = SWA_MODEL
@@ -59,7 +63,9 @@ class TestStreamingSessionSWARetractMixedChunk(StreamingSessionServerBase, Strea
     env_overrides = [("SGLANG_TEST_RETRACT", True)]
 
 
-class TestStreamingSessionSWAAbortLeakRepro(StreamingSessionServerBase, AbortLeakReproKitMixin):
+class TestStreamingSessionSWAAbortLeakRepro(
+    StreamingSessionServerBase, AbortLeakReproKitMixin
+):
     """SWA abort-heavy chunked prefill leak repro."""
 
     model = SWA_MODEL
