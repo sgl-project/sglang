@@ -37,15 +37,15 @@ on:
         type: string
         required: true
       sgl_kernel:
-        description: 'check-changes.outputs.sgl_kernel — both gates the run and forwarded to setup-cuda-test-stage for wheel download.'
+        description: 'check-changes.outputs.sgl_kernel — both gates the run and forwarded to the install/download steps.'
         type: string
         required: true
       continue_on_error_flag:
-        description: 'Empty or `--continue-on-error`; forwarded to run-test-cuda-suite.'
+        description: 'Empty or `--continue-on-error`; forwarded to run_suite.py.'
         type: string
         default: ''
       run_timeout_minutes:
-        description: 'Per-suite wall-clock cap (minutes), enforced via bash `timeout` inside run-test-cuda-suite.'
+        description: 'Per-suite wall-clock cap (minutes), enforced via bash `timeout` around run_suite.py.'
         type: string
         default: '30'
       timeout_per_file:
@@ -97,14 +97,37 @@ jobs:
         with:
           ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
 
-      - uses: ./.github/actions/setup-cuda-test-stage
+      - name: Resolve runner_config
+        id: rc
+        run: python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts (v4)
+        if: ${{ inputs.sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v4' }}
+        uses: actions/download-artifact@v4
         with:
-          runner_config: ${{ inputs.runner_config }}
-          sgl_kernel: ${{ inputs.sgl_kernel }}
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda*
+
+      - name: Download artifacts (v6)
+        if: ${{ inputs.sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6' }}
+        uses: actions/download-artifact@v6
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda*
+
+      - name: Install dependencies
+        env:
+          CUSTOM_BUILD_SGL_KERNEL: ${{ inputs.sgl_kernel }}
+        run: timeout ${{ steps.rc.outputs.install_timeout }}m bash ${{ steps.rc.outputs.install }}
 
       - name: Warmup DeepGEMM JIT Compilation
         if: inputs.warmup_deep_gemm_models != ''
-        shell: bash
         timeout-minutes: 25
         run: |
           # Activate venv if available (GITHUB_ENV may have failed to propagate)
@@ -114,27 +137,34 @@ jobs:
 
       - name: Warmup Server CUDA Graphs
         if: inputs.warmup_server_models != ''
-        shell: bash
         timeout-minutes: 25
         run: |
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_server.py ${{ inputs.warmup_server_models }}
 
-      - uses: ./.github/actions/run-test-cuda-suite
-        with:
-          suite_name: ${{ inputs.self_name }}
-          partitions_json: ${{ inputs.partitions }}
-          run_timeout_minutes: ${{ inputs.run_timeout_minutes }}
-          timeout_per_file: ${{ inputs.timeout_per_file }}
-          continue_on_error_flag: ${{ inputs.continue_on_error_flag }}
+      - name: Run test
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error_flag }}
+          PARTITION_SIZE: ${{ fromJson(inputs.partitions)[inputs.self_name].size }}
+        run: |
+          cd test
+          timeout ${{ inputs.run_timeout_minutes }}m python3 run_suite.py \
+            --hw cuda --suite "${{ inputs.self_name }}" \
+            --auto-partition-id "${{ matrix.partition }}" --auto-partition-size "$PARTITION_SIZE" \
+            ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
+            $CONTINUE_ON_ERROR_FLAG
 
       - name: Run extra pytest
         if: inputs.extra_pytest_path != ''
-        shell: bash
         timeout-minutes: 10
         run: python3 -m pytest -q ${{ inputs.extra_pytest_path }}
 
-      - uses: ./.github/actions/teardown-cuda-test-stage
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
         with:
-          artifact_suffix: ${{ matrix.partition }}
+          artifact-suffix: ${{ matrix.partition }}
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
