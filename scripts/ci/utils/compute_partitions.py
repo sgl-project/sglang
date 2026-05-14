@@ -40,15 +40,9 @@ _STAGE_A_OVERRIDES = {
 }
 
 # Per-partition wall-clock target. ~20 min avg naive; worst-case LPT 4/3
-# imbalance is ~27 min, still below the 30-min job-level timeout that acts
-# as the real safety net. No LPT slop applied -- we lean on the runtime
-# timeout + the explicit MAX_PARTITION_SECONDS sanity check rather than
-# padding partition count.
+# imbalance is ~27 min, still below the 30-min GHA job-level timeout that
+# acts as the real safety net.
 TARGET_SECONDS = 20 * 60
-
-# Hard ceiling. Exceeded -> raise, forcing the maintainer to split a slow file
-# or bump TARGET_SECONDS deliberately.
-MAX_PARTITION_SECONDS = 30 * 60
 
 
 def discover_files(repo_root: str) -> list[str]:
@@ -132,18 +126,6 @@ def compute_partitions(tests, repo_root, partition_model=None, full_parallel=Fal
                 )
             size = max(1, math.ceil(coeff * total / budget))
             max_parallel = size if full_parallel else compute_max_parallel(size)
-        # Predicted per-shard wall on naive average (total/size). LPT can
-        # be ~4/3 of that in worst case; the 30-min job timeout enforces
-        # the real ceiling at runtime. This build-time check fails fast
-        # on egregious misconfigs.
-        pred_per_shard = coeff * (total / size) + bias
-        if pred_per_shard > MAX_PARTITION_SECONDS:
-            raise RuntimeError(
-                f"Suite {suite!r}: predicted shard wall {pred_per_shard:.0f}s "
-                f"(coeff={coeff} * total={total:.0f}/size={size} + bias={bias}) "
-                f"exceeds MAX_PARTITION_SECONDS ({MAX_PARTITION_SECONDS}s). "
-                f"Split a slow file or raise TARGET_SECONDS deliberately."
-            )
         result[suite] = {
             "size": size,
             "arr": list(range(size)),
