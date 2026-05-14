@@ -25,8 +25,7 @@ The dependencies required for the NPU runtime environment have been integrated i
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.5.0-a3-openEuler-20260427
 
 #start container
-docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
-  --privileged=true --net=host \
+docker run -itd --shm-size=16g --privileged=true --name ${NAME} --net=host \
   -v /var/queue_schedule:/var/queue_schedule \
   -v /etc/ascend_install.info:/etc/ascend_install.info \
   -v /usr/local/sbin:/usr/local/sbin \
@@ -51,7 +50,7 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
   --device=/dev/davinci_manager:/dev/davinci_manager \
   --device=/dev/hisi_hdc:/dev/hisi_hdc \
   --entrypoint=bash \
-  swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
+  swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.5.0-a3-openEuler-20260427
 ```
 
 ### Best Practices
@@ -167,11 +166,10 @@ export GLOO_SOCKET_IFNAME=xxx
 
 NODES_IP=('your ip1' 'your ip2')
 
-LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
-LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+LOCAL_IPS=$(hostname -I)
 for i in "${!NODES_IP[@]}";
 do
-    if [[ "$LOCAL_HOST1" == "${NODES_IP[$i]}" || "$LOCAL_HOST2" == "${NODES_IP[$i]}" ]];
+    if [[ " $LOCAL_IPS " =~ " ${NODES_IP[$i]} " ]];
     then
         echo "${NODES_IP[$i]}"
         python -m sglang.launch_server \
@@ -223,17 +221,13 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 P_IP=('your prefill ip1' 'your prefill ip2' 'your prefill ip3')
 D_IP=('your decode ip1' 'your decode ip2')
-LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
-LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
-
-echo "${LOCAL_HOST1}"
-echo "${LOCAL_HOST2}"
+LOCAL_IPS=$(hostname -I)
 
 export ASCEND_MF_STORE_URL="tcp://${P_IP[0]}:24669"
 
 for i in "${!P_IP[@]}";
 do
-    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    if [[ " $LOCAL_IPS " =~ " ${P_IP[$i]} " ]];
     then
         echo "Prefill -> ${P_IP[@]}"
 
@@ -256,14 +250,14 @@ do
             --disable-radix-cache \
             --moe-a2a-backend deepep --deepep-mode auto
         NODE_RANK=$i
-        exit 1
+        exit 0
     fi
 done
 
 
 for i in "${!D_IP[@]}";
 do
-    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    if [[ " $LOCAL_IPS " =~ " ${D_IP[$i]} " ]];
     then
         echo "Decode -> ${D_IP[$i]}"
 
@@ -293,7 +287,7 @@ do
             --moe-a2a-backend deepep --deepep-mode auto \
             --cuda-graph-bs 4
         NODE_RANK=$i
-        exit 1
+        exit 0
     fi
 done
 ```
