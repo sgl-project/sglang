@@ -571,6 +571,19 @@ impl Router {
                     worker_url, route, e
                 );
 
+                // For streaming requests the caller skips the eager
+                // `record_outcome` on the assumption that a
+                // `BreakerTrackedStream` will tick the breaker on drop —
+                // but no tracked stream is installed when send() fails
+                // before any response stream exists. Record the failure
+                // here so a worker flapping at the TCP layer doesn't
+                // stay permanently selectable. Non-streaming requests
+                // are already covered by the caller's
+                // `worker.record_outcome(status.is_success())`, so
+                // gating on `is_stream` avoids double-counting.
+                if is_stream {
+                    worker.record_outcome(false);
+                }
                 return convert_reqwest_error(e);
             }
         };

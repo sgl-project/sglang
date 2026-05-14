@@ -19,9 +19,10 @@ use tower::ServiceExt;
 
 use crate::common::{
     mock_worker::{
-        clear_slow_stream_chunks, clear_stream_error_after_chunks, get_stream_tracking_state,
-        reset_stream_tracker, set_slow_stream_chunks, set_stream_error_after_chunks,
-        wait_for_stream_finish, StreamTrackingState, MOCK_STREAM_BUFFER,
+        clear_fail_status_code, clear_slow_stream_chunks, clear_stream_error_after_chunks,
+        get_stream_tracking_state, reset_stream_tracker, set_fail_status_code,
+        set_slow_stream_chunks, set_stream_error_after_chunks, wait_for_stream_finish,
+        StreamTrackingState, MOCK_STREAM_BUFFER,
     },
     AppTestContext, TestRouterConfig, TestWorkerConfig,
 };
@@ -2076,8 +2077,11 @@ mod upstream_cancel_tests {
         .await;
         let app = ctx.create_app().await;
         let decode_url = format!("http://127.0.0.1:{}", decode_port);
+        let prefill_url = format!("http://127.0.0.1:{}", prefill_port);
         let decode = pin_worker(&ctx, &decode_url);
+        let prefill = pin_worker(&ctx, &prefill_url);
         let (s_pre, f_pre) = breaker_counts(&decode);
+        let (_s_pre_prefill, f_pre_prefill) = breaker_counts(&prefill);
 
         let payload = json!({ "text": "x", "stream": true });
         let req = Request::builder()
@@ -2103,6 +2107,115 @@ mod upstream_cancel_tests {
             f_post
         );
 
+        // Healthy prefill must not be penalised when only decode returns
+        // 5xx. The outer dispatcher used to derive prefill's outcome
+        // from the synthetic 5xx response status returned by
+        // `handle_decode_error_response`, falsely failing prefill.
+        let (_s_post_prefill, f_post_prefill) = breaker_counts(&prefill);
+        assert_eq!(
+            f_post_prefill - f_pre_prefill,
+            0,
+            "PD streaming: healthy prefill must not be penalised when only \
+             decode returns 5xx. prefill failures {}→{}",
+            f_pre_prefill,
+            f_post_prefill
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// PD non-streaming, decode 4xx: the decode breaker MUST NOT record a
+    /// failure. 4xx is a client-fault (malformed input, auth, etc.), not a
+    /// worker fault — the old outer dispatcher used `not_error =
+    /// is_success() || is_client_error()` and the streaming path's
+    /// `BreakerTrackedStream` pre-mark in `create_streaming_response`
+    /// still preserves that distinction. The early-record path added
+    /// for prefill misattribution must keep the same semantics for
+    /// decode, otherwise a client sending malformed payloads can open
+    /// the breaker on a healthy worker.
+    #[tokio::test]
+    async fn test_pd_decode_non_streaming_4xx_does_not_penalise_breaker() {
+        let prefill_port = 20313;
+        let decode_port = 20314;
+
+        // Force decode's failure response to 400 (client error) instead
+        // of the default 500.
+        set_fail_status_code(decode_port, 400);
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
+                vec![format!("http://127.0.0.1:{}", decode_port)],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(4313)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![TestWorkerConfig::prefill(prefill_port), {
+                let mut w = TestWorkerConfig::decode(decode_port);
+                w.fail_rate = 1.0;
+                w
+            }],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let decode_url = format!("http://127.0.0.1:{}", decode_port);
+        let prefill_url = format!("http://127.0.0.1:{}", prefill_port);
+        let decode = pin_worker(&ctx, &decode_url);
+        let prefill = pin_worker(&ctx, &prefill_url);
+        let (_s_pre_decode, f_pre_decode) = breaker_counts(&decode);
+        let (_s_pre_prefill, f_pre_prefill) = breaker_counts(&prefill);
+
+        // Non-streaming /generate request.
+        let payload = json!({ "text": "x" });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let _ = resp.into_body().collect().await;
+
+        // Legacy semantics (preserved by the streaming path's
+        // `BreakerTrackedStream` pre-mark and the old outer
+        // `not_error = is_success() || is_client_error()` rule): a 4xx
+        // response is recorded as a non-fault outcome — it must NOT
+        // increment `total_failures`, otherwise repeated client-caused
+        // 400s could open the breaker on a healthy worker. Whether it
+        // increments `total_successes` is incidental; we only pin the
+        // load-bearing invariant (no failure tick).
+        let (_s_post_decode, f_post_decode) = breaker_counts(&decode);
+        assert_eq!(
+            f_post_decode - f_pre_decode,
+            0,
+            "PD decode 4xx is a client fault, not a worker fault — the \
+             decode breaker must not record a failure. failures {}→{}",
+            f_pre_decode,
+            f_post_decode,
+        );
+
+        // Prefill stayed healthy and must also not be penalised by a
+        // client-caused decode 4xx.
+        let (_s_post_prefill, f_post_prefill) = breaker_counts(&prefill);
+        assert_eq!(
+            f_post_prefill - f_pre_prefill,
+            0,
+            "PD prefill must not be penalised by a decode 4xx. \
+             failures {}→{}",
+            f_pre_prefill,
+            f_post_prefill,
+        );
+
+        clear_fail_status_code(decode_port);
         ctx.shutdown().await;
     }
 
@@ -2395,6 +2508,197 @@ mod upstream_cancel_tests {
             s_post_d,
             f_pre_d,
             f_post_d
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// http chat streaming, upstream connect failure BEFORE the
+    /// `BreakerTrackedStream` is constructed: the breaker MUST still record
+    /// a failure. Guards the pre-stream error arm in
+    /// `send_typed_request` — returning `convert_reqwest_error(e)` without
+    /// ticking the worker breaker would let a worker that's flapping at
+    /// the TCP layer remain selectable indefinitely (the streaming branch
+    /// skips the eager `record_outcome` on the assumption that a tracked
+    /// stream will fire on drop, but no tracked stream was ever installed
+    /// on this path).
+    #[tokio::test]
+    async fn test_http_chat_pre_stream_failure_records_breaker_streaming() {
+        use smg::config::RetryConfig;
+
+        let worker_port = 20310;
+
+        // max_retries=1 keeps the assertion exact: one attempt → one
+        // failure tick. Any larger value just multiplies the count.
+        let config = TestRouterConfig::round_robin_with_retry(
+            4310,
+            RetryConfig {
+                max_retries: 1,
+                initial_backoff_ms: 10,
+                max_backoff_ms: 50,
+                backoff_multiplier: 1.0,
+                jitter_factor: 0.0,
+            },
+        );
+        let mut ctx =
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(worker_port)])
+                .await;
+        let app = ctx.create_app().await;
+        let worker_url = format!("http://127.0.0.1:{}", worker_port);
+        let worker = pin_worker(&ctx, &worker_url);
+        let (s_pre, f_pre) = breaker_counts(&worker);
+
+        // Stop the worker AFTER startup health check has marked it
+        // healthy. The periodic health checker isn't spawned in
+        // AppTestContext setups (it's started in `server.rs`), so
+        // `is_healthy()` stays true and the worker remains selectable.
+        // The next streaming request will fail at TCP connect → reqwest
+        // returns Err → `convert_reqwest_error` synthesises a 5xx
+        // Response without any `BreakerTrackedStream` ever wrapping the
+        // body.
+        ctx.workers[0].stop().await;
+
+        let payload = json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "x"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_server_error(),
+            "Expected 5xx after upstream connect failure, got {}",
+            resp.status()
+        );
+        let _ = resp.into_body().collect().await;
+
+        let (s_post, f_post) = breaker_counts(&worker);
+        assert_eq!(
+            (s_post - s_pre, f_post - f_pre),
+            (0, 1),
+            "http chat streaming: pre-stream upstream failure must record \
+             exactly one breaker failure (no tracked stream was installed, \
+             so the deferred-record path doesn't fire). \
+             successes {}→{}, failures {}→{}",
+            s_pre,
+            s_post,
+            f_pre,
+            f_post
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// PD streaming, decode connect failure BEFORE the
+    /// `BreakerTrackedStream` is constructed: decode breaker MUST record
+    /// a failure. Guards `pd_router.rs`'s pre-stream error arm — returning
+    /// `error::bad_gateway` without ticking the decode breaker would let a
+    /// decode worker that's flapping at the TCP layer remain selectable
+    /// indefinitely (the streaming branch skips the eager `record_outcome`
+    /// on the assumption that a tracked stream will fire on drop, but no
+    /// tracked stream was ever installed on this path).
+    #[tokio::test]
+    async fn test_pd_decode_pre_stream_failure_records_breaker_streaming() {
+        use smg::config::RetryConfig;
+
+        let prefill_port = 20311;
+        let decode_port = 20312;
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
+                vec![format!("http://127.0.0.1:{}", decode_port)],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(4311)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .retry_config(RetryConfig {
+                max_retries: 1,
+                initial_backoff_ms: 10,
+                max_backoff_ms: 50,
+                backoff_multiplier: 1.0,
+                jitter_factor: 0.0,
+            })
+            .build_unchecked();
+        let mut ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::prefill(prefill_port),
+                TestWorkerConfig::decode(decode_port),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let decode_url = format!("http://127.0.0.1:{}", decode_port);
+        let prefill_url = format!("http://127.0.0.1:{}", prefill_port);
+        let decode_worker = pin_worker(&ctx, &decode_url);
+        let prefill_worker = pin_worker(&ctx, &prefill_url);
+        let (s_pre_decode, f_pre_decode) = breaker_counts(&decode_worker);
+        let (_s_pre_prefill, f_pre_prefill) = breaker_counts(&prefill_worker);
+
+        // Stop ONLY the decode worker (index 1; prefill was registered
+        // first). Prefill stays up so its half of the tokio::join! send
+        // succeeds — the test specifically exercises the
+        // "decode_result is Err" arm in `execute_dual_dispatch_internal`.
+        ctx.workers[1].stop().await;
+
+        let payload = json!({ "text": "x", "stream": true });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_server_error(),
+            "Expected 5xx after decode connect failure, got {}",
+            resp.status()
+        );
+        let _ = resp.into_body().collect().await;
+
+        let (s_post_decode, f_post_decode) = breaker_counts(&decode_worker);
+        assert!(
+            f_post_decode > f_pre_decode,
+            "PD streaming: pre-stream decode failure must record at least \
+             one breaker failure on the decode worker (no tracked stream \
+             was installed). failures {}→{}",
+            f_pre_decode,
+            f_post_decode
+        );
+        assert_eq!(
+            s_post_decode - s_pre_decode,
+            0,
+            "PD streaming pre-stream decode failure must not record a \
+             success on the decode breaker. successes {}→{}",
+            s_pre_decode,
+            s_post_decode
+        );
+
+        // Prefill stayed up and its `send()` returned 2xx. The decode
+        // connect failure must NOT be misattributed to prefill — the
+        // outer dispatcher used to record `prefill.record_outcome(false)`
+        // based on the final 502 response status, penalising a healthy
+        // worker for its peer's failure.
+        let (_s_post_prefill, f_post_prefill) = breaker_counts(&prefill_worker);
+        assert_eq!(
+            f_post_prefill - f_pre_prefill,
+            0,
+            "PD streaming: healthy prefill must not be penalised when only \
+             decode fails. prefill failures {}→{}",
+            f_pre_prefill,
+            f_post_prefill
         );
 
         ctx.shutdown().await;

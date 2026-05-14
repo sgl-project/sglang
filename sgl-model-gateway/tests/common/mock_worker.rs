@@ -158,6 +158,15 @@ async fn should_fail(config: &MockWorkerConfig) -> bool {
     rand::random::<f32>() < config.fail_rate
 }
 
+/// Pick the HTTP status used when `should_fail` triggers. Defaults to 500
+/// for backwards compatibility; tests can override via
+/// [`set_fail_status_code`] to exercise 4xx/non-5xx failure paths.
+fn fail_status_code(port: u16) -> StatusCode {
+    get_fail_status_code_for_port(port)
+        .and_then(|s| StatusCode::from_u16(s).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn health_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {
     let config = config.read().await;
 
@@ -303,7 +312,7 @@ async fn generate_handler(
 
     if should_fail(&config).await {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            fail_status_code(config.port),
             [("x-worker-id", worker_id)],
             Json(json!({
                 "error": "Random failure for testing"
@@ -1514,6 +1523,36 @@ pub fn clear_stream_error_after_chunks(port: u16) {
 
 fn get_stream_error_after_for_port(port: u16) -> Option<usize> {
     let map = get_stream_error_after_config().lock().unwrap();
+    map.get(&port).copied()
+}
+
+// --- Failure-status override (for breaker attribution tests) ---
+// When set for `port`, `should_fail`-triggered failures return this HTTP
+// status instead of the default 500. Lets a test pin breaker semantics for
+// the 4xx-from-worker case (the gateway treats 4xx as "not a worker fault")
+// without having to fabricate a separate mock worker.
+
+static FAIL_STATUS_CODE: OnceLock<Mutex<HashMap<u16, u16>>> = OnceLock::new();
+
+fn get_fail_status_code_config() -> &'static Mutex<HashMap<u16, u16>> {
+    FAIL_STATUS_CODE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Configure a worker (by port) to return `status` when `fail_rate`
+/// triggers a failure response, instead of the default 500.
+pub fn set_fail_status_code(port: u16, status: u16) {
+    let mut map = get_fail_status_code_config().lock().unwrap();
+    map.insert(port, status);
+}
+
+/// Clear failure-status override for a worker port.
+pub fn clear_fail_status_code(port: u16) {
+    let mut map = get_fail_status_code_config().lock().unwrap();
+    map.remove(&port);
+}
+
+fn get_fail_status_code_for_port(port: u16) -> Option<u16> {
+    let map = get_fail_status_code_config().lock().unwrap();
     map.get(&port).copied()
 }
 
