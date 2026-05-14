@@ -86,7 +86,7 @@ def benchmark(head_dim: int, GQA: int, num_kv_heads: int, batch_size: int, impl:
     return marker.bench_one_function(
         FN_MAP[impl],
         input_args=(q, k, q_weight, k_weight),
-        memory_args="all",
+        memory_args=(q, k, q, k, q_weight, k_weight),
     )
 
 
