@@ -15,6 +15,7 @@
 
 import math
 import re
+from array import array
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Tuple, Type, Union
 
@@ -73,7 +74,7 @@ class LlavaBaseForCausalLM(nn.Module):
             return "pad"
         return "anyres"
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         image_sizes = flatten_nested_list(
             [item.image_sizes for item in image_inputs.mm_items]
         )
@@ -125,9 +126,10 @@ class LlavaBaseForCausalLM(nn.Module):
             except ValueError:
                 offset = 0
             # old_len + pad_len - 1, because we need to remove image_token_id
+            pad_token = pad_values[image_idx % len(pad_values)]
             input_ids = (
                 input_ids[:offset]
-                + [pad_values[image_idx % len(pad_values)]] * new_image_feature_len
+                + array("q", [pad_token]) * new_image_feature_len
                 + input_ids[offset + 1 :]
             )
             offset_list.append(offset)

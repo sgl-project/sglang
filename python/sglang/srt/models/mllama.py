@@ -5,6 +5,7 @@
 """PyTorch Mllama model."""
 
 import math
+from array import array
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -822,9 +823,9 @@ class MllamaForConditionalGeneration(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config.text_config)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pixel_values = torch.cat([item.feature for item in mm_inputs.mm_items], dim=0)
-        pad_values = [item.pad_value for item in mm_inputs.mm_items]
+        pad_values = array("q", (item.pad_value for item in mm_inputs.mm_items))
 
         num_concurrent_media, num_tiles = pixel_values.shape[1:3]
         num_patches = self.vision_model.num_patches
