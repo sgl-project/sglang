@@ -190,6 +190,7 @@ class LMCRadixCache(RadixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
+            best_match_node=last_node,
             host_hit_length=matched - int(value.numel()),
         )
 
@@ -253,6 +254,7 @@ class LMCRadixCache(RadixCache):
             device_indices=torch.cat([value, new_slots]),
             last_device_node=new_node,
             last_host_node=new_node,
+            best_match_node=new_node,
         )
 
     def _alloc_and_load_chunk(

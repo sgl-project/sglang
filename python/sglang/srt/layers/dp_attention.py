@@ -126,8 +126,8 @@ class _DpGatheredBufferWrapper:
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
-    def get_global_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
+    def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._global_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
@@ -136,8 +136,8 @@ class _DpGatheredBufferWrapper:
         return buffer
 
     @classmethod
-    def get_local_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
+    def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._local_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
@@ -193,12 +193,12 @@ def set_dp_buffer_len(
     )
 
 
-def get_global_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_global_dp_buffer()
+def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_global_dp_buffer(group=group)
 
 
-def get_local_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer()
+def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
 
 
 def get_global_dp_buffer_len() -> int:
@@ -400,6 +400,23 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
         forward_batch.dp_local_num_tokens = local_num_tokens
 
     return forward_batch.dp_local_start_pos, forward_batch.dp_local_num_tokens
+
+
+def get_dp_local_slice_cpu(
+    forward_batch: ForwardBatch,
+    can_run_graph: bool,
+    cuda_graph_batch: Optional[int],
+) -> Tuple[int, int]:
+    # CPU (start, length) slice for DP-local data in a rank-padded buffer.
+    # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
+    global_num_tokens = forward_batch.global_num_tokens_cpu
+    dp_rank = get_attention_dp_rank()
+    local_num_tokens = global_num_tokens[dp_rank]
+    if can_run_graph:
+        local_start_pos = dp_rank * cuda_graph_batch
+    else:
+        local_start_pos = sum(global_num_tokens[:dp_rank])
+    return local_start_pos, local_num_tokens
 
 
 @triton.jit

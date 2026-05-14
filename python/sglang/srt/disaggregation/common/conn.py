@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import requests
+import torch.distributed as dist
 import zmq
 from aiohttp import web
 
@@ -22,9 +23,10 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVArgs,
     KVPoll,
+    KVTransferMetric,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -94,6 +96,8 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.kv_item_lens_sum = sum(args.kv_item_lens)
+        self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
@@ -139,8 +143,16 @@ class CommonKVManager(BaseKVManager):
                 and self.attn_cp_size > 1
                 and self.attn_cp_rank != 0
             )
+            # Sync the leader's bootstrap port to every rank before
+            # registering: in multi-node prefill, registration targets
+            # `dist_init_addr` (rank 0) but each rank's local port may
+            # differ when the launcher auto-reserves a free port per host.
+            self.bootstrap_port = self._sync_bootstrap_port_across_nodes(
+                self.bootstrap_port
+            )
             self.register_to_bootstrap()
             self.transfer_infos = {}
+            self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
             # If a timeout happens on the prefill side, it means prefill instances
@@ -180,6 +192,12 @@ class CommonKVManager(BaseKVManager):
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         if bootstrap_room not in self.request_status:
+            # Do not resurrect a cleared entry with Failed: once clear() has
+            # popped the room from request_status, any late update_status(Failed)
+            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
+            # pollute a future request that reuses the same bootstrap_room.
+            if status == KVPoll.Failed:
+                return
             self.request_status[bootstrap_room] = status
         else:
             if status == KVPoll.Failed:
@@ -325,6 +343,36 @@ class CommonKVManager(BaseKVManager):
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
 
+    def _sync_bootstrap_port_across_nodes(self, local_port: int) -> int:
+        """Broadcast world-rank-0's bootstrap port to all prefill ranks.
+
+        Required for multi-node prefill when the launcher auto-reserves a
+        free port per host (e.g. Dynamo's
+        `_reserve_disaggregation_bootstrap_port`): without sync, non-leader
+        ranks register to `<leader_ip>:<their_local_port>`, hit
+        `Connection refused`, and the leader's `prefill_port_table` ends
+        up missing rows.
+        """
+        if not self.dist_init_addr or self.server_args.nnodes == 1:
+            return local_port
+
+        if not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError(
+                "torch.distributed must be initialised before "
+                "CommonKVManager registers to the bootstrap server in "
+                "multi-node prefill mode."
+            )
+
+        world_group = get_world_group()
+        synced_port = world_group.broadcast_object(local_port, src=0)
+        if synced_port != local_port:
+            logger.info(
+                f"Synced disaggregation bootstrap port from leader: "
+                f"local={local_port} -> leader={synced_port} "
+                f"(world_rank={world_group.rank_in_group})"
+            )
+        return synced_port
+
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP POST."""
         if self.dist_init_addr:
@@ -435,6 +483,10 @@ class CommonKVSender(BaseKVSender):
         self.bootstrap_room = bootstrap_room
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
+        self.conclude_state: Optional[KVPoll] = None
+        self._transfer_metric = KVTransferMetric()
+        self._transfer_num_kv_indices = 0
+        self._transfer_num_state_indices = 0
         # inner state
         self.curr_idx = 0
         if self.kv_mgr.is_dummy_cp_rank:
@@ -489,10 +541,35 @@ class CommonKVSender(BaseKVSender):
             f"CommonKVSender init with num_kv_indices: {num_kv_indices} and aux_index: {aux_index}"
         )
 
+    def pop_decode_prefix_len(self) -> int:
+        return 0
+
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0
+
+    def get_transfer_metric(self) -> KVTransferMetric:
+        total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
+        total_bytes += (
+            self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
+        )
+        self._transfer_metric.transfer_total_bytes = total_bytes
+        return self._transfer_metric
+
+    def _record_transfer_indices(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List],
+    ):
+        self._transfer_num_kv_indices += len(kv_indices)
+        if state_indices:
+            for component_indices in state_indices:
+                if component_indices is not None:
+                    self._transfer_num_state_indices += len(component_indices)
+
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         pass
 
@@ -502,12 +579,19 @@ class CommonKVSender(BaseKVSender):
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
 
+    def clear(self) -> None:
+        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
+            self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "transfer_infos"):
+            self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+
     def abort(self):
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",
         )
-        # Explicitly set the status to failure since this request has been aborted
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
 
 
@@ -564,6 +648,8 @@ class CommonKVReceiver(BaseKVReceiver):
 
         self.prefill_dp_rank = prefill_dp_rank
         self._setup_bootstrap_infos()
+        if self.conclude_state == KVPoll.Failed:
+            return
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def _setup_bootstrap_infos(self):
@@ -606,6 +692,7 @@ class CommonKVReceiver(BaseKVReceiver):
                             self.kv_mgr.update_status(
                                 self.bootstrap_room, KVPoll.Failed
                             )
+                            self.bootstrap_infos = None
                             return
 
                 self.bootstrap_infos = bootstrap_infos
@@ -697,12 +784,17 @@ class CommonKVReceiver(BaseKVReceiver):
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
 
+    def clear(self) -> None:
+        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
+        self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+
     def abort(self):
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",
         )
-        # Explicitly set the status to failure since this request has been aborted
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
 
 

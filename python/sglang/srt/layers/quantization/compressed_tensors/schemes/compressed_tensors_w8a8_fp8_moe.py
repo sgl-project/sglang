@@ -13,6 +13,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
     get_moe_runner_backend,
     get_moe_weight_sizes,
 )
@@ -41,8 +42,6 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
 
@@ -347,8 +346,25 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
-            moe_runner_backend = MoeRunnerBackend.TRITON
-        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            if (
+                _use_aiter
+                and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+                and get_moe_a2a_backend().is_none()
+            ):
+                moe_runner_backend = MoeRunnerBackend.AITER
+            else:
+                moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if (
+            moe_runner_backend.is_aiter()
+            or moe_runner_backend.is_triton()
+            or moe_runner_backend.is_flashinfer_trtllm()
+            or moe_runner_backend.is_flashinfer_trtllm_routed()
+        ):
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            # TODO(cwan): refactor other backends
+            pass
 
     def apply_weights(
         self,
@@ -356,46 +372,28 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
 
-        if _use_aiter and self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
+        if self.runner.runner_backend.is_aiter():
+            from sglang.srt.layers.moe.moe_runner.aiter import (
+                AiterMoeQuantInfo,
+                AiterQuantType,
+            )
+
             assert not moe_runner_config.no_combine, "unsupported"
-            topk_weights, topk_ids, _ = topk_output
-            if moe_runner_config.apply_router_weight_on_input:
-                assert (
-                    topk_weights.dim() == 2
-                ), "`topk_weights` should be in shape (num_tokens, topk)"
-                _, topk = topk_weights.shape
-                assert (
-                    topk == 1
-                ), "Only support topk=1 when `apply_router_weight_on_input` is True"
-                x = x * topk_weights.to(x.dtype)
-                topk_weights = torch.ones_like(
-                    topk_weights, dtype=torch.float32
-                )  # topk_weights must be FP32 (float32)
-            output = fused_moe(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                activation=(
-                    ActivationType.Silu
-                    if moe_runner_config.activation == "silu"
-                    else ActivationType.Gelu
-                ),
-                quant_type=QuantType.per_Token,
-                w1_scale=layer.w13_weight_scale,
+            quant_info = AiterMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                quant_type=AiterQuantType.PER_TOKEN,
+                w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
-                a1_scale=layer.w13_input_scale,
+                a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
             )
-            return StandardCombineInput(hidden_states=output)
+            return self.runner.run(dispatch_output, quant_info)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
             if self.use_flashinfer_trtllm:
                 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (

@@ -29,6 +29,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
+    MEGAMOE = "megamoe"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -61,6 +62,9 @@ class MoeA2ABackend(Enum):
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
+    def is_megamoe(self):
+        return self == MoeA2ABackend.MEGAMOE
+
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
 
@@ -78,6 +82,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
+    AITER = "aiter"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -111,6 +116,9 @@ class MoeRunnerBackend(Enum):
 
     def is_marlin(self):
         return self == MoeRunnerBackend.MARLIN
+
+    def is_aiter(self):
+        return self == MoeRunnerBackend.AITER
 
 
 class DeepEPMode(Enum):
