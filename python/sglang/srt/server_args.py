@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.true_on_policy import (
-    should_disable_flashinfer_allreduce_fusion,
+    resolve_true_on_policy_runtime_policy,
     validate_true_on_policy_contract,
 )
 from sglang.srt.utils.common import (
@@ -3485,7 +3485,9 @@ class ServerArgs:
             os.environ["SGLANG_VLM_CACHE_SIZE_MB"] = "0"
 
             if (
-                should_disable_flashinfer_allreduce_fusion(self)
+                resolve_true_on_policy_runtime_policy(
+                    self
+                ).disable_flashinfer_allreduce_fusion
                 and self.enable_flashinfer_allreduce_fusion
             ):
                 self.enable_flashinfer_allreduce_fusion = False

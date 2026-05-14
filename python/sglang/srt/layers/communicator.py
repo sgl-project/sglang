@@ -22,7 +22,6 @@ import torch
 
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
-    attention_tensor_model_parallel_tree_all_reduce,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -64,7 +63,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.true_on_policy import (
     should_disable_mlp_allreduce_fusion_for_on_policy,
     should_disable_reduce_scatter_for_on_policy,
-    should_use_tp_invariant_tree_all_reduce,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -895,14 +893,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
-                if should_use_tp_invariant_tree_all_reduce():
-                    hidden_states = attention_tensor_model_parallel_tree_all_reduce(
-                        hidden_states
-                    )
-                else:
-                    hidden_states = attention_tensor_model_parallel_all_reduce(
-                        hidden_states
-                    )
+                hidden_states = attention_tensor_model_parallel_all_reduce(
+                    hidden_states
+                )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)

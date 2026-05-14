@@ -12,6 +12,7 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
+    attention_tensor_model_parallel_all_reduce,
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -19,13 +20,11 @@ from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
-    tensor_model_parallel_tree_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
     is_allocation_symmetric,
 )
 from sglang.srt.layers.parameter import (
@@ -38,10 +37,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.true_on_policy import (
-    should_use_tp_invariant_row_linear,
-    should_use_tp_invariant_tree_all_reduce,
-)
+from sglang.srt.true_on_policy import should_use_tp_invariant_row_linear
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -1521,10 +1517,8 @@ class RowParallelLinear(LinearBase):
                 )
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
-            if should_use_tp_invariant_tree_all_reduce():
-                output = tensor_model_parallel_tree_all_reduce(output_parallel)
-            elif self.use_dp_attention_reduce:
-                output = get_attention_tp_group().all_reduce(output_parallel)
+            if self.use_dp_attention_reduce:
+                output = attention_tensor_model_parallel_all_reduce(output_parallel)
             else:
                 output = tensor_model_parallel_all_reduce(output_parallel)
         else:

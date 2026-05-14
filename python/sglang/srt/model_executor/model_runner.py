@@ -632,7 +632,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
-        if is_tp_invariant_target(server_args):
+        if is_tp_invariant_target():
             from sglang.srt.tp_invariant_ops import enable_tp_invariant_mode
 
             enable_tp_invariant_mode()

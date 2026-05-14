@@ -101,7 +101,10 @@ def matmul_kernel_tp_persistent(
     S = tl.zeros((NEXT_POWER_OF_REMAIN_LEVEL, BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
 
     S_mask = tl.arange(0, NEXT_POWER_OF_REMAIN_LEVEL)[:, None, None]
+    level_ids = tl.arange(0, NEXT_POWER_OF_LEVEL)
 
+    base_offs_m = tl.arange(0, BLOCK_M)
+    base_offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
     offs_k = tl.max_contiguous(tl.multiple_of(offs_k, BLOCK_K), BLOCK_K)
 
@@ -113,12 +116,12 @@ def matmul_kernel_tp_persistent(
         start_m = pid_m * BLOCK_M
         start_n = pid_n * BLOCK_N
 
-        offs_am = start_m + tl.arange(0, BLOCK_M)
+        offs_am = start_m + base_offs_m
         if A_LARGE:
             offs_am = offs_am.to(tl.int64)
         offs_am = tl.where(offs_am < M, offs_am, 0)
 
-        offs_bn = start_n + tl.arange(0, BLOCK_N)
+        offs_bn = start_n + base_offs_n
         if B_LARGE:
             offs_bn = offs_bn.to(tl.int64)
         offs_bn = tl.where(offs_bn < N, offs_bn, 0)
@@ -152,7 +155,7 @@ def matmul_kernel_tp_persistent(
             break_flag = 0
             for level in range(LEVEL_K):
                 if break_flag == 0:
-                    idx_mask = tl.arange(0, NEXT_POWER_OF_LEVEL) == level
+                    idx_mask = level_ids == level
 
                     count_value_added = tl.sum(count * idx_mask) + 1
 
@@ -189,8 +192,8 @@ def matmul_kernel_tp_persistent(
                             S = tl.where(tmp_acc_mask, acc[None, :, :], S)
 
         c_ptr = C_ptr + (offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn)
-        offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_cm = start_m + base_offs_m
+        offs_cn = start_n + base_offs_n
         if C_LARGE:
             offs_cm = offs_cm.to(tl.int64)
             offs_cn = offs_cn.to(tl.int64)

@@ -5,95 +5,75 @@ from typing import Any, Iterator, Optional
 
 import torch
 
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
 ROW_LINEAR_INV_BLOCK_K = 128
 
 
-def _get_server_args(server_args: Optional[Any] = None) -> Any:
-    if server_args is not None:
-        return server_args
-
-    from sglang.srt.server_args import get_global_server_args
-
-    return get_global_server_args()
+def get_rl_on_policy_target() -> Optional[str]:
+    return getattr(get_global_server_args(), "rl_on_policy_target", None)
 
 
-def get_rl_on_policy_target(server_args: Optional[Any] = None) -> Optional[str]:
-    return getattr(_get_server_args(server_args), "rl_on_policy_target", None)
+def is_true_on_policy_enabled() -> bool:
+    return resolve_true_on_policy_runtime_policy(get_global_server_args()).enabled
 
 
-def is_true_on_policy_enabled(server_args: Optional[Any] = None) -> bool:
-    return resolve_true_on_policy_runtime_policy(_get_server_args(server_args)).enabled
-
-
-def is_tp_invariant_target(server_args: Optional[Any] = None) -> bool:
+def is_tp_invariant_target() -> bool:
     return resolve_true_on_policy_runtime_policy(
-        _get_server_args(server_args)
+        get_global_server_args()
     ).tp_invariant_row_linear
 
 
-def should_disable_reduce_scatter_for_on_policy(
-    server_args: Optional[Any] = None,
-) -> bool:
+def should_disable_reduce_scatter_for_on_policy() -> bool:
     return resolve_true_on_policy_runtime_policy(
-        _get_server_args(server_args)
+        get_global_server_args()
     ).disable_reduce_scatter
 
 
-def should_disable_mlp_allreduce_fusion_for_on_policy(
-    server_args: Optional[Any] = None,
-) -> bool:
+def should_disable_mlp_allreduce_fusion_for_on_policy() -> bool:
     return resolve_true_on_policy_runtime_policy(
-        _get_server_args(server_args)
+        get_global_server_args()
     ).disable_mlp_allreduce_fusion
 
 
-def should_disable_flashinfer_allreduce_fusion(
-    server_args: Optional[Any] = None,
-) -> bool:
+def should_disable_flashinfer_allreduce_fusion() -> bool:
     return resolve_true_on_policy_runtime_policy(
-        _get_server_args(server_args)
+        get_global_server_args()
     ).disable_flashinfer_allreduce_fusion
 
 
-def should_force_bfloat16_dense_tensor_math(
-    server_args: Optional[Any] = None,
-) -> bool:
+def should_force_bfloat16_dense_tensor_math() -> bool:
     return resolve_true_on_policy_runtime_policy(
-        _get_server_args(server_args)
+        get_global_server_args()
     ).force_bfloat16_dense_tensor_math
 
 
 def should_force_bfloat16_lm_head(
     *,
-    server_args: Optional[Any] = None,
     use_fp32_lm_head: bool = False,
 ) -> bool:
     return (
         resolve_true_on_policy_runtime_policy(
-            _get_server_args(server_args)
+            get_global_server_args()
         ).force_bfloat16_lm_head
         and not use_fp32_lm_head
     )
 
 
-def should_disable_fused_qk_norm_mrope(
-    server_args: Optional[Any] = None,
-) -> bool:
+def should_disable_fused_qk_norm_mrope() -> bool:
     return resolve_true_on_policy_runtime_policy(
-        _get_server_args(server_args)
+        get_global_server_args()
     ).disable_fused_qk_norm_mrope
 
 
 def get_on_policy_rms_norm_kwargs(
-    server_args: Optional[Any] = None,
     *,
     weight_dtype: Optional[torch.dtype] = None,
     override_orig_dtype: Optional[torch.dtype] = None,
     fp32_residual: bool = False,
 ) -> dict[str, Any]:
-    if not is_true_on_policy_enabled(server_args):
+    if not is_true_on_policy_enabled():
         return {}
 
     kwargs: dict[str, Any] = {
@@ -109,11 +89,10 @@ def get_on_policy_rms_norm_kwargs(
 
 def should_use_tp_invariant_row_linear(
     k_size: int,
-    server_args: Optional[Any] = None,
     row_linear_enable_inv: Optional[bool] = None,
 ) -> bool:
     policy_enabled = resolve_true_on_policy_runtime_policy(
-        _get_server_args(server_args)
+        get_global_server_args()
     ).tp_invariant_row_linear
     if row_linear_enable_inv is not None:
         policy_enabled = policy_enabled and row_linear_enable_inv
@@ -126,11 +105,10 @@ def should_use_tp_invariant_row_linear(
 
 
 def should_use_tp_invariant_tree_all_reduce(
-    server_args: Optional[Any] = None,
     accl_binary_tree_enabled: Optional[bool] = None,
 ) -> bool:
     policy_enabled = resolve_true_on_policy_runtime_policy(
-        _get_server_args(server_args)
+        get_global_server_args()
     ).deterministic_tree_all_reduce
     if accl_binary_tree_enabled is not None:
         policy_enabled = policy_enabled and not accl_binary_tree_enabled
@@ -143,7 +121,6 @@ def patch_prefill_only_deterministic_inference_for_cuda_graph(
     server_args: Any,
     *,
     attn_backend: Optional[Any] = None,
-    global_server_args: Optional[Any] = None,
     dvr_target_verify_cuda_graph: bool = False,
 ) -> Iterator[bool]:
     enabled = (

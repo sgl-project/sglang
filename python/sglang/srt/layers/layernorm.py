@@ -165,21 +165,19 @@ class RMSNorm(MultiPlatformOp):
         true_on_policy_fp32_residual: bool = False,
     ) -> None:
         super().__init__()
-        if (
-            weight_dtype is None
-            and override_orig_dtype is None
-            and not cast_x_before_out_mul
-        ):
-            true_on_policy_kwargs = get_on_policy_rms_norm_kwargs(
-                weight_dtype=true_on_policy_weight_dtype,
-                override_orig_dtype=true_on_policy_override_orig_dtype,
-                fp32_residual=true_on_policy_fp32_residual,
-            )
+        true_on_policy_kwargs = get_on_policy_rms_norm_kwargs(
+            weight_dtype=true_on_policy_weight_dtype,
+            override_orig_dtype=true_on_policy_override_orig_dtype,
+            fp32_residual=true_on_policy_fp32_residual,
+        )
+        if not cast_x_before_out_mul:
             cast_x_before_out_mul = true_on_policy_kwargs.get(
                 "cast_x_before_out_mul", cast_x_before_out_mul
             )
-            fp32_residual = true_on_policy_kwargs.get("fp32_residual", fp32_residual)
+        fp32_residual = true_on_policy_kwargs.get("fp32_residual", fp32_residual)
+        if weight_dtype is None:
             weight_dtype = true_on_policy_kwargs.get("weight_dtype", weight_dtype)
+        if override_orig_dtype is None:
             override_orig_dtype = true_on_policy_kwargs.get(
                 "override_orig_dtype", override_orig_dtype
             )

@@ -65,7 +65,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.true_on_policy import (
     patch_prefill_only_deterministic_inference_for_cuda_graph,
 )
@@ -806,15 +805,9 @@ class CudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        try:
-            global_server_args = get_global_server_args()
-        except ValueError:
-            global_server_args = None
-
         with patch_prefill_only_deterministic_inference_for_cuda_graph(
             self.model_runner.server_args,
             attn_backend=getattr(self.model_runner, "attn_backend", None),
-            global_server_args=global_server_args,
             dvr_target_verify_cuda_graph=getattr(
                 self.model_runner, "enable_dvr_target_verify_cuda_graph", False
             ),
