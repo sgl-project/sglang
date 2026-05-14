@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -22,7 +23,10 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph_setup,
+)
 from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -31,6 +35,9 @@ from sglang.srt.model_executor.breakable_cuda_graph.context import (
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils.custom_op import register_custom_op
+
+logger = logging.getLogger(__name__)
+_pcg_attention_setup_skip_logged = False
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -92,12 +99,12 @@ class RadixAttention(nn.Module):
         self.k_scale_float = None
         self.v_scale_float = None
         self.quant_method = None
+        self.attn_type = attn_type
 
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if self.quant_method is not None:
             self.quant_method.create_weights(self)
-        self.attn_type = attn_type
 
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
@@ -192,6 +199,23 @@ def unified_attention_with_output(
         kwargs["llama_4_scaling"] = llama_4_scaling
     if topk_indices is not None:
         kwargs["topk_indices"] = topk_indices[:real_num_tokens]
+
+    if is_in_piecewise_cuda_graph_setup():
+        global _pcg_attention_setup_skip_logged
+        if not _pcg_attention_setup_skip_logged:
+            logger.warning(
+                "PCG setup skips real attention; layer_id=%s, output_shape=%s",
+                layer_id,
+                tuple(output.shape),
+            )
+            print(
+                f"[SGLANG-PCG] setup skips real attention at layer {layer_id}, "
+                f"output_shape={tuple(output.shape)}",
+                flush=True,
+            )
+            _pcg_attention_setup_skip_logged = True
+        output.zero_()
+        return
 
     original_out_cache_loc = forward_batch.out_cache_loc
     # Keep the original ForwardBatch object and only narrow cache locations for

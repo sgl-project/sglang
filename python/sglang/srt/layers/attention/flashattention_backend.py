@@ -715,8 +715,8 @@ class FlashAttentionBackend(AttentionBackend):
         ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                k_descale = layer.k_scale.expand(descale_shape)
-                v_descale = layer.v_scale.expand(descale_shape)
+                k_descale = layer.k_scale.reshape(-1).expand(descale_shape)
+                v_descale = layer.v_scale.reshape(-1).expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
@@ -1186,8 +1186,8 @@ class FlashAttentionBackend(AttentionBackend):
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                k_descale = layer.k_scale.expand(descale_shape)
-                v_descale = layer.v_scale.expand(descale_shape)
+                k_descale = layer.k_scale.reshape(-1).expand(descale_shape)
+                v_descale = layer.v_scale.reshape(-1).expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None

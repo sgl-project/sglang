@@ -81,6 +81,16 @@ _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
+_FP8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dtype is not None
+)
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -1068,9 +1078,23 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
+                if (
+                    isinstance(k_scale, torch.Tensor)
+                    and k_scale.numel() == cache_k.shape[1]
+                ):
+                    k_scale = k_scale.view(1, -1, 1)
                 cache_k.div_(k_scale)
             if v_scale is not None:
+                if (
+                    isinstance(v_scale, torch.Tensor)
+                    and v_scale.numel() == cache_v.shape[1]
+                ):
+                    v_scale = v_scale.view(1, -1, 1)
                 cache_v.div_(v_scale)
+            if self.dtype in _FP8_DTYPES:
+                fp8_max = torch.finfo(self.dtype).max
+                cache_k.clamp_(min=-fp8_max, max=fp8_max)
+                cache_v.clamp_(min=-fp8_max, max=fp8_max)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 

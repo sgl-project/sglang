@@ -163,6 +163,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+        from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
             # If linear_fp8_config is set, use FP8 for linear layers
@@ -188,7 +190,17 @@ class CompressedTensorsConfig(QuantizationConfig):
                     use_triton_kernels, use_flashinfer_trtllm_moe, use_deep_gemm
                 )
             return CompressedTensorsFusedMoEMethod(self)
+        if isinstance(layer, RadixAttention) and self._has_fp8_kv_cache_scheme():
+            return BaseKVCacheMethod(self)
         return None
+
+    def _has_fp8_kv_cache_scheme(self) -> bool:
+        kv_cache_scheme = self.kv_cache_scheme
+        return (
+            isinstance(kv_cache_scheme, dict)
+            and kv_cache_scheme.get("type") == "float"
+            and kv_cache_scheme.get("num_bits") == 8
+        )
 
     def _add_fused_moe_to_target_scheme_map(self):
         """
@@ -247,6 +259,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             quant_format=quant_format,
             sparsity_scheme_map=sparsity_scheme_map,
             sparsity_ignore_list=sparsity_ignore_list,
+            kv_cache_scheme=config.get("kv_cache_scheme"),
             config=config,
             packed_modules_mapping=packed_modules_mapping,
             linear_fp8_config=linear_fp8_config,
