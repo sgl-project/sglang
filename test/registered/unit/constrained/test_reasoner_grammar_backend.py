@@ -193,6 +193,13 @@ class TestReasonerGrammarBackend(CustomTestCase):
         self.assertEqual(mask.shape, (1, 3))
         self.assertEqual(_allowed_token_ids(mask, [0, 1, 2, 3, 4, 7]), [2])
 
+        logits = torch.zeros(1, 100, dtype=torch.float32)
+        obj.apply_vocab_mask(logits, mask)
+
+        self.assertEqual(logits[0, 2].item(), 0)
+        self.assertTrue(torch.all(torch.isneginf(logits[0, :2])))
+        self.assertTrue(torch.all(torch.isneginf(logits[0, 3:])))
+
     def test_init_strict_reasoning_grammar_supports_outlines_masks(self):
         from sglang.srt.constrained import outlines_backend
 
@@ -212,10 +219,17 @@ class TestReasonerGrammarBackend(CustomTestCase):
         )
 
         obj = reasoner.init_strict_reasoning_grammar(reasoning=True)
-        mask = obj.allocate_vocab_mask(8, 1, "cpu")
+        mask = obj.allocate_vocab_mask(100, 1, "cpu")
         obj.fill_vocab_mask(mask, 0)
 
         self.assertEqual(_allowed_dense_token_ids(mask, [0, 1, 2, 3, 4, 7]), [2])
+
+        logits = torch.zeros(1, 100, dtype=torch.float32)
+        obj.apply_vocab_mask(logits, mask)
+
+        self.assertEqual(logits[0, 2].item(), 0)
+        self.assertTrue(torch.all(torch.isneginf(logits[0, :2])))
+        self.assertTrue(torch.all(torch.isneginf(logits[0, 3:])))
 
     def test_init_strict_reasoning_grammar_none_when_strict_disabled(self):
         backend = _DummyGrammarBackend(support_token_filter=True)
