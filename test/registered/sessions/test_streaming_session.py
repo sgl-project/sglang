@@ -3,7 +3,7 @@
 Only TestStreamingSessionEagleV2RetractLargePage and
 TestStreamingSessionAbortLeakRepro stay per-commit. Everything else
 (base + Retract* + Eagle*/EagleV2 + EagleRetractLargePage) lives in
-the sibling test_streaming_session_nightly.py.
+the sibling test_streaming_session_extra.py.
 """
 
 import asyncio
@@ -32,15 +32,15 @@ from sglang.test.test_utils import (
 # importable when this file is run as a script via `python3 <path>`.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from test_streaming_session_nightly import (  # noqa: E402
+from test_streaming_session_extra import (  # noqa: E402
     ABORT_REPRO_CHUNKED_PREFILL_SIZE,
     ABORT_REPRO_CONTEXT_LEN,
     ABORT_REPRO_PAGE_SIZE,
 )
-from test_streaming_session_nightly import (  # noqa: E402
+from test_streaming_session_extra import (  # noqa: E402
     TestStreamingSession as _StreamingSessionBase,
 )
-from test_streaming_session_nightly import (  # noqa: E402
+from test_streaming_session_extra import (  # noqa: E402
     _abort_repro_run_all,
 )
 

@@ -22,7 +22,7 @@ from test_streaming_session import (  # noqa: E402
     ABORT_REPRO_PAGE_SIZE,
     TestStreamingSessionAbortLeakRepro,
 )
-from test_streaming_session_nightly import (  # noqa: E402
+from test_streaming_session_extra import (  # noqa: E402
     TestStreamingSession as _StreamingSessionBase,
 )
 
