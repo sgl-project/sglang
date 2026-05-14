@@ -175,15 +175,21 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
     Automatically choose the dispatch output dtype for DeepEP.
 
     The decision follows several checks in priority order:
-    0. Parse deprecated environment variables.
-    1. Parse server argument.
+    0. Parse server argument.
+    1. Parse deprecated environment variables.
     2. If quant_config contains input_global_scale → NVFP4 path.
     3. Parse quant config
     4. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
     5. Otherwise default for NPU → BF16 (the default for NPU).
     6. Otherwise → FP8 (the default for most models like DeepSeek-V3).
     """
-    # 0. Parse deprecated environment variables.
+
+    # 0. Parse server argument.
+    server_args = get_global_server_args()
+    if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
+        return DeepEPOutputDtype(server_args.deepep_dispatcher_output_dtype)
+
+    # 1. Parse deprecated environment variables.
     if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
         logger.warning_once(
             "Warning: The env variable SGLANG_DEEPEP_BF16_DISPATCH deprecated "
@@ -191,11 +197,6 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
             "`--deepep-dispatcher-output-dtype bf16` argument instead."
         )
         return DeepEPOutputDtype.BF16
-
-    # 1. Parse server argument.
-    server_args = get_global_server_args()
-    if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
-        return DeepEPOutputDtype(server_args.deepep_dispatcher_output_dtype)
 
     # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
     if self.quant_config is not None:
