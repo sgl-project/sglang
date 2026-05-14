@@ -40,16 +40,16 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 RUN uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-RUN uv pip install --no-cache-dir torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
-
 WORKDIR /sgl-workspace
+
+RUN pip install --no-cache-dir torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
 
 RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
-    uv pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu && \
-    uv pip install --no-cache-dir --no-deps xgrammar==0.1.33 && \
-    uv pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore
+    pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu && \
+    pip install --no-cache-dir --no-deps xgrammar==0.1.33 && \
+    pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore
 
 CMD ["bash", "-c", "source /opt/intel/oneapi/setvars.sh && exec bash"]
