@@ -26,36 +26,19 @@ from math import ceil
 from pathlib import Path
 from typing import Dict, List
 
-# Marker dir for short-circuiting the (slow) fallback path on a warm machine.
-# After `sglang.compile_deep_gemm` succeeds for a (model, tp, extra_args) tuple
-# we drop a marker; the next CI run skips that fallback entirely. The marker
-# filename includes a hash of extra_args + a version_key over Python/Triton/Torch
-# so the marker auto-invalidates when FALLBACK_ARGS or the toolchain changes.
-# Note: clearing /root/.cache/deep_gemm without also clearing this directory
-# WILL cause a false-positive skip → in-test JIT compile. If you wipe the
-# DeepGEMM cache, also wipe ~/.cache/sglang/warmup_markers/deepgemm_fallback_*.
+# Shared with warmup_server.py. Wipe alongside /root/.cache/deep_gemm if you
+# clear the DeepGEMM JIT cache — a stale marker → in-test JIT compile.
 MARKER_DIR = os.path.join(os.path.expanduser("~"), ".cache", "sglang", "warmup_markers")
 
-# Per-model fallback timeout. Outer cap: if a subprocess wedges for any reason
-# the crash-marker watcher can't see, kill it after this many seconds. Even
-# the largest cold-cache fallbacks observed (GLM-5-FP8, ~3 min) finish well
-# under this. Crashes that emit a CRASH_MARKERS line abort in seconds via the
-# watcher and don't wait for this timeout.
+# Outer cap for stuck fallback subprocesses; CRASH_MARKERS abort sooner.
 FALLBACK_TIMEOUT_SEC = 600
 
-# Per-model extra args passed to `sglang.compile_deep_gemm` so the populated
-# DeepGEMM cache shapes match how each model is actually launched in its test.
-# DeepGEMM cache key = (kernel_type, N, K, num_groups); per-rank N/K depend on
-# tp/dp/ep, so a warmup at the wrong parallelism config populates shapes the
-# test never asks for and the test still pays cold-JIT cost on a fresh runner.
-#
-# Keep these in sync with each model's `other_args` in test/registered/. If the
-# model isn't listed here, only `--tp` is passed.
+# Per-model launch flags forwarded to `sglang.compile_deep_gemm`. DeepGEMM
+# cache key includes per-rank N/K (depends on tp/dp/ep) — must match each
+# model's `other_args` in test/registered/ or warmed shapes won't be hit.
 FALLBACK_ARGS: Dict[str, List[str]] = {
-    # test_dsa_models_basic.py / _mtp.py / _hisparse.py
     "deepseek-ai/DeepSeek-V3.2": ["--dp", "8", "--enable-dp-attention"],
     "zai-org/GLM-5-FP8": ["--dp", "8", "--enable-dp-attention"],
-    # test_mimo_models.py — note: workflow argv must use ":4", not ":8".
     "XiaomiMiMo/MiMo-V2-Flash": [
         "--dp",
         "2",
@@ -63,13 +46,8 @@ FALLBACK_ARGS: Dict[str, List[str]] = {
         "--attention-backend",
         "fa3",
     ],
-    # MiMo-V2.5 is multimodal. Without --mm-enable-dp-encoder, the vision
-    # encoder runs on DP0 only; DP1 enters forward_idle and the two desync
-    # at the next collective, deadlocking the warmup batch (observed in run
-    # 25408125444 — server came up, JIT events emitted, then /generate hung
-    # 600s in vision attn .item() sync). Match the test launch in
-    # test_mimo_models.py TestMiMoV2 so both DP groups participate
-    # symmetrically through the encoder.
+    # --mm-enable-dp-encoder is required: without it DP0 runs the vision
+    # encoder alone and DP1 deadlocks at the next collective.
     "XiaomiMiMo/MiMo-V2.5": [
         "--dp",
         "2",
@@ -82,10 +60,8 @@ FALLBACK_ARGS: Dict[str, List[str]] = {
     ],
 }
 
-# Output substrings that signal a fatal child-rank crash. compile_deep_gemm's
-# parent process keeps polling /v1/models for ~timeout seconds even after one
-# TP rank dies, so without this we'd burn the whole FALLBACK_TIMEOUT_SEC on
-# every crashing model.
+# compile_deep_gemm polls /v1/models for the full timeout even after a TP rank
+# dies; the watcher uses these to kill the group within seconds instead.
 CRASH_MARKERS = (
     "Scheduler hit an exception",
     "Received sigquit from a child",

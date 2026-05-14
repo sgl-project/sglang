@@ -780,32 +780,14 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Warmup DeepGEMM JIT Compilation
-        # Bottleneck is the JIT-compile-on-fallback for non-DeepSeek arches
-        # (each unique arch loads a model and compiles all its shapes).
-        # Cold-cache cumulative for ~7 unique archs is up to ~45 min;
-        # subsequent runs hit warm /root/.cache/deep_gemm and finish in <5 min.
-        # See sglang-ops/ci-machines-overview.md "H200 Pre-cached Models" for
-        # the canonical per-commit model list — keep these in sync.
+        # Per-model TP must match the test's launch in test/registered/ — see
+        # FALLBACK_ARGS in scripts/ci/cuda/warmup_deep_gemm.py for extra dp/ep
+        # flags. Only models that actually invoke DeepGEMM kernels at runtime
+        # are listed. Cold-cache ~13 min; warm-cache ≤30 s via marker file.
         timeout-minutes: 60
         run: |
-          # Activate venv if available (GITHUB_ENV may have failed to propagate)
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
-          # Per-model TP must match how each model is launched in test/registered/
-          # — see FALLBACK_ARGS in scripts/ci/cuda/warmup_deep_gemm.py for the
-          # extra dp/ep/dp-attention flags layered on top. Cache key includes
-          # per-rank N/K, so a mismatched TP populates shapes the test never asks
-          # for and the test still pays cold-JIT cost on a fresh runner.
-          #
-          # Only models whose runtime path actually invokes DeepGEMM kernels
-          # are listed. Verified empirically on run 25354167665 by counting
-          # "Try DeepGEMM JIT Compiling" events on rank 0:
-          #   - DeepSeek-V3-0324 / V3.2 / GLM-5-FP8 / MiMo-V2-Flash / MiMo-V2.5: emit JITs ✓
-          #   - Nemotron-3-Super-BF16 / MiniMax-M2.5 / Step-3.5-Flash / Qwen3-Next: 0 JITs in
-          #     either warmup or actual test — they use cutlass/triton/per-tensor
-          #     FP8 instead of DeepGEMM (or are BF16). Loading them only wastes
-          #     time. Re-add if a future change makes one of them block-FP8 +
-          #     auto runner backend.
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
             deepseek-ai/DeepSeek-V3.2:8 \
