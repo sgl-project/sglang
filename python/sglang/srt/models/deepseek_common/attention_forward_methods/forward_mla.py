@@ -690,7 +690,7 @@ class DeepseekMLAForwardMixin:
             ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
 
         return (
-            self.current_attention_backend == "trtllm_mla"
+            self.current_attention_backend in ("trtllm_mla", "tokenspeed_mla")
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
