@@ -352,14 +352,6 @@ jobs:
         run: |
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
 
-      - name: Fetch live partition model
-        if: needs.check-changes.outputs.partition_model_sha != ''
-        run: |
-          rm -f /tmp/partition-model.json
-          URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ needs.check-changes.outputs.partition_model_sha }}/model.json"
-          curl --fail --silent --show-error --max-time 15 "$URL" -o /tmp/partition-model.json \
-            || echo "::warning::Failed to fetch $URL; LPT will use in-source est_time"
-
       - name: Run test
         timeout-minutes: 10
         env:
@@ -369,7 +361,6 @@ jobs:
           python3 run_suite.py --hw cpu --suite stage-a-test-cpu \
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-cpu'].size }} \
-            --partition-model-file /tmp/partition-model.json \
             $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
