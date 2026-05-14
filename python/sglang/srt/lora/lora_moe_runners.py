@@ -193,6 +193,22 @@ class LoRAInfo:
     # ``build_lora_hooks`` to gate the eager-mode ``fused_moe_lora`` launch.
     has_active_lora: bool = True
 
+    # When set, the kernel reads/writes its input/output via
+    # ``c_map[pair_idx]`` instead of ``pair_idx`` — letting callers keep
+    # tensors in expert-sorted layout and skip the ``shuffle_rows`` round
+    # trips that bridge between expert-sorted GEMM output and token-major
+    # hook contract. Populated by ``CutlassFp4LoraRunnerCore`` (which has
+    # the maps from ``prepare_moe_input``); other runners leave it ``None``
+    # and get the existing token-major behavior.
+    c_map: torch.Tensor | None = None
+
+    # When ``c_map`` is set AND this flag is True, ``_add_lora_down_delta``
+    # passes ``mul_routed_weight=False`` to the kernel — the caller is
+    # responsible for applying router weights after the LoRA delta is
+    # accumulated, so the kernel doesn't pre-weight (which would double the
+    # weighting under sorted-layout reordering).
+    sorted_layout: bool = False
+
 
 @dataclass
 class LoRAHooks:
@@ -426,6 +442,7 @@ def _add_lora_gate_up_delta(
             expand_num_stages=2,
             expand_split_k=1,
             fully_sharded=lora_info.fully_sharded,
+            c_map=lora_info.c_map,
         )
 
 
@@ -480,6 +497,11 @@ def _add_lora_down_delta(
         )
     else:
         blk = _get_moe_lora_block_config(lora_info.max_lora_rank)
+        # Sorted-layout callers apply router weights *after* the LoRA delta is
+        # accumulated into the expert-sorted output; running mul_routed_weight
+        # inside the kernel here would double-weight (Bug 4 reborn under the
+        # new layout). Token-major callers keep the existing single-weighting.
+        kernel_mul_routed_weight = not lora_info.sorted_layout
         fused_moe_lora(
             output=intermediate_cache,
             qcurr_hidden_states=intermediate_input,
@@ -507,9 +529,10 @@ def _add_lora_down_delta(
             expand_num_warps=4,
             expand_num_stages=2,
             expand_split_k=1,
-            mul_routed_weight=True,
+            mul_routed_weight=kernel_mul_routed_weight,
             fully_sharded=lora_info.fully_sharded,
             offset=offset,
+            c_map=lora_info.c_map,
         )
 
 
