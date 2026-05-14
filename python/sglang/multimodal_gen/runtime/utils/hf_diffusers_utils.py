@@ -385,8 +385,8 @@ def get_diffusers_component_config(
 
     quant_config = combined_config.get("quantization_config")
     if quant_config is not None:
-        combined_config["quantization_config"] = (
-            normalize_flat_modelopt_quant_config(quant_config)
+        combined_config["quantization_config"] = normalize_flat_modelopt_quant_config(
+            quant_config
         )
 
     _clean_hf_config_inplace(combined_config)

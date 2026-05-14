@@ -15,7 +15,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
-from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     sequence_model_parallel_all_gather,
@@ -39,6 +38,7 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embed
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
@@ -1350,13 +1350,13 @@ class Cosmos3OmniTransformer(CachableDiT):
             rescaled = []
             for i in range(n):
                 w_fp8 = weights[i]
-                original_scale = w_scales[i].reshape(()).to(
-                    torch.float32
-                )
+                original_scale = w_scales[i].reshape(()).to(torch.float32)
                 w_dequant = w_fp8.to(torch.float32) * original_scale
                 w_requant = (
-                    w_dequant / max_w_scale.to(torch.float32)
-                ).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                    (w_dequant / max_w_scale.to(torch.float32))
+                    .clamp(-448.0, 448.0)
+                    .to(torch.float8_e4m3fn)
+                )
                 rescaled.append(w_requant)
             merged_weight = torch.cat(rescaled, dim=0)
             pending.pop(linear_target, None)
@@ -1364,9 +1364,7 @@ class Cosmos3OmniTransformer(CachableDiT):
             yield linear_target + ".weight", merged_weight
             yield linear_target + ".weight_scale", max_w_scale
             if saw_input_scale:
-                in_t = torch.stack(
-                    [i_scales[i].reshape(()) for i in range(n)]
-                )
+                in_t = torch.stack([i_scales[i].reshape(()) for i in range(n)])
                 yield linear_target + ".input_scale", in_t.max()
 
         for name, tensor in iterator:
