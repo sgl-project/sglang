@@ -16,9 +16,8 @@ __all__ = [
     "ut_parse_one_file",
 ]
 
-# Positional argument order. `suite` stays in slot 2 for backward compat with
-# `register_cpu_ci(1.0, "stage-a-test-cpu")` style positional calls. New
-# fields (`stage`, `runner_config`) are kwarg-only.
+# `suite` stays in positional slot 2 for backward compat; new fields are
+# kwarg-only.
 _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
 _KWARG_ONLY = ("stage", "runner_config")
 _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
@@ -36,23 +35,15 @@ class HWBackend(Enum):
 class CIRegistry:
     backend: HWBackend
     filename: str
-    # Estimated time to run the test in seconds.
     est_time: float
-    # New-style fields. Mutually exclusive with `suite` below.
-    #   stage="stage-b", runner_config="1-gpu-small" → effective_suite "stage-b-test-1-gpu-small"
     stage: Optional[str] = None
     runner_config: Optional[str] = None
-    # Legacy single-string suite name. Held for nightly suites + AMD/NPU
-    # per-commit suites that haven't migrated yet.
     suite: Optional[str] = None
-    # Whether the test is a nightly test.
     nightly: bool = False
-    # Reason for disabling the test. None = enabled, string = disabled with reason.
     disabled: Optional[str] = None
 
     @property
     def effective_suite(self) -> str:
-        """Single suite-name string, regardless of how the test was registered."""
         if self.stage is not None and self.runner_config is not None:
             return f"{self.stage}-test-{self.runner_config}"
         return self.suite
