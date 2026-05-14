@@ -4,10 +4,11 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 
 
 def is_layers(n: str, m) -> bool:
-    return "layers" in n or "gen_layers" in n
+    return is_module_list_entry_in(n, ("layers", "gen_layers"))
 
 
 def _build_cosmos3_param_names_mapping() -> dict:
