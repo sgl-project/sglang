@@ -282,7 +282,6 @@ jobs:
     with:
       self_name: stage-a-test-1-gpu-small
       runner_config: 1-gpu-small
-      runs_on: 1-gpu-5090
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -368,7 +367,6 @@ jobs:
     with:
       self_name: stage-b-test-1-gpu-small
       runner_config: 1-gpu-small
-      runs_on: 1-gpu-5090
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -382,7 +380,6 @@ jobs:
     with:
       self_name: stage-b-test-1-gpu-large
       runner_config: 1-gpu-large
-      runs_on: 1-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -396,7 +393,6 @@ jobs:
     with:
       self_name: stage-b-test-2-gpu-large
       runner_config: 2-gpu-large
-      runs_on: 2-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -409,7 +405,6 @@ jobs:
     with:
       self_name: stage-b-test-4-gpu-b200
       runner_config: 4-gpu-b200
-      runs_on: ${{ needs.check-changes.outputs.b200_runner }}
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -457,7 +452,6 @@ jobs:
     with:
       self_name: stage-c-test-4-gpu-h100
       runner_config: 4-gpu-h100
-      runs_on: 4-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -470,7 +464,6 @@ jobs:
     with:
       self_name: stage-c-test-8-gpu-h200
       runner_config: 8-gpu-h200
-      runs_on: 8-gpu-h200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -490,7 +483,6 @@ jobs:
     with:
       self_name: stage-c-test-8-gpu-h20
       runner_config: 8-gpu-h20
-      runs_on: 8-gpu-h20
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -503,7 +495,6 @@ jobs:
     with:
       self_name: stage-c-test-deepep-4-gpu-h100
       runner_config: deepep-4-gpu-h100
-      runs_on: 4-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -518,7 +509,6 @@ jobs:
     with:
       self_name: stage-c-test-deepep-8-gpu-h200
       runner_config: deepep-8-gpu-h200
-      runs_on: 8-gpu-h200-deepep
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -534,7 +524,6 @@ jobs:
     with:
       self_name: stage-c-test-4-gpu-b200
       runner_config: 4-gpu-b200
-      runs_on: ${{ needs.check-changes.outputs.b200_runner }}
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -548,7 +537,6 @@ jobs:
     with:
       self_name: stage-c-test-dsv4-4-gpu-b200
       runner_config: dsv4-4-gpu-b200
-      runs_on: ${{ needs.check-changes.outputs.b200_runner }}
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -562,7 +550,6 @@ jobs:
     with:
       self_name: stage-c-test-dsv4-8-gpu-h200
       runner_config: dsv4-8-gpu-h200
-      runs_on: 8-gpu-h200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
