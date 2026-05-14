@@ -35,6 +35,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_all_tests:
+        description: "Run all tests (mirrors the scheduled cron's behavior — combine with test_parallel_dispatch for full sim)"
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       git_ref:
@@ -91,6 +96,13 @@ jobs:
       include_wheel_build: ${{ inputs.include_wheel_build == true }}
       run_all_tests: ${{ inputs.run_all_tests == true }}
       force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
+    secrets: inherit
+
+  call-pr-test-extra:
+    if: github.event_name == 'schedule' || inputs.test_parallel_dispatch == true
+    uses: ./.github/workflows/pr-test-extra.yml
+    with:
+      run_all_tests: true
     secrets: inherit
 
   # =============================================== Wait Jobs for Sequential PR Execution ====================================================
