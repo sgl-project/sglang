@@ -152,6 +152,7 @@ class EmbeddingData:
             self.shape = embedding_shape
         else:
             self.shape = list(embedding.shape) if embedding is not None else None
+        self.cached_embedding = None
         self.error_msg = error_msg
         self.error_code = error_code
         # Store additional metadata (e.g., video_timestamps for qwen3_vl)
@@ -719,39 +720,8 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 for r in encode_requests
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for i, resp in enumerate(responses):
-                if isinstance(resp, asyncio.TimeoutError):
-                    timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
-                    logger.error(
-                        f"Encoder /encode timeout ({timeout_val}s) for rid={self.rid} "
-                        f"(request {i})"
-                    )
-                    self.status = WaitingImageRequestStatus.FAIL
-                    self.error_msg = f"Encoder /encode timeout ({timeout_val}s)"
-                    self.recv_socket.close()
-                    return
-                elif isinstance(resp, Exception):
-                    logger.error(
-                        f"Encoder /encode failed for rid={self.rid} (request {i}): {resp}",
-                        exc_info=resp,
-                    )
-                    self.status = WaitingImageRequestStatus.FAIL
-                    self.error_msg = str(resp)
-                    self.recv_socket.close()
-                    return
-            for resp in responses:
-                if resp.status != 200:
-                    try:
-                        err = await resp.json()
-                        msg = err.get("message", "Unknown error")
-                    except Exception:
-                        msg = await resp.text()
-                    logger.error(f"Encoder returned error {resp.status}: {msg}")
-                    self.status = WaitingImageRequestStatus.FAIL
-                    self.error_msg = msg
-                    self.recv_socket.close()
-                    return
+            if not await self._check_encoder_responses(responses, "/encode"):
+                return
 
             response_json_list = [await r.json() for r in responses]
 
@@ -804,20 +774,50 @@ class WaitingImageRDMARequest(WaitingImageRequest):
 
             # Phase 3: Wait for RDMA transfers to complete
             send_responses = await asyncio.gather(*send_tasks, return_exceptions=True)
-            for resp in send_responses:
-                if resp.status != 200:
-                    try:
-                        err = await resp.json()
-                        msg = err.get("message", "Unknown error")
-                    except Exception:
-                        msg = await resp.text()
-                    logger.error(f"Encoder /send returned error {resp.status}: {msg}")
-                    self.status = WaitingImageRequestStatus.FAIL
-                    self.error_msg = msg
-                    self._cleanup_gpu_buffer()
-                    self.recv_socket.close()
-                    return
+            if not await self._check_encoder_responses(
+                send_responses, "/send", on_error=self._cleanup_gpu_buffer
+            ):
+                return
             logger.info(f"RDMA transfers completed for rid={self.rid}")
+
+    async def _check_encoder_responses(self, responses, endpoint: str, on_error=None):
+        """Validate gathered HTTP responses from the encoder.
+
+        Marks the request as FAIL and closes the recv socket on the first error,
+        invoking ``on_error`` (e.g. GPU buffer cleanup) before closing.
+        Returns True if all responses succeeded.
+        """
+        for i, resp in enumerate(responses):
+            msg = None
+            if isinstance(resp, asyncio.TimeoutError):
+                timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+                logger.error(
+                    f"Encoder {endpoint} timeout ({timeout_val}s) for rid={self.rid} "
+                    f"(request {i})"
+                )
+                msg = f"Encoder {endpoint} timeout ({timeout_val}s)"
+            elif isinstance(resp, Exception):
+                logger.error(
+                    f"Encoder {endpoint} failed for rid={self.rid} (request {i}): {resp}",
+                    exc_info=resp,
+                )
+                msg = str(resp)
+            elif resp.status != 200:
+                try:
+                    err = await resp.json()
+                    msg = err.get("message", "Unknown error")
+                except Exception:
+                    msg = await resp.text()
+                logger.error(f"Encoder {endpoint} returned error {resp.status}: {msg}")
+
+            if msg is not None:
+                self.status = WaitingImageRequestStatus.FAIL
+                self.error_msg = msg
+                if on_error is not None:
+                    on_error()
+                self.recv_socket.close()
+                return False
+        return True
 
     def _try_recv_mm_data(self):
         """Extract embedding from GPU buffer after RDMA transfer."""
@@ -842,6 +842,12 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             # Extract original req_id
             part_req_id = recv_obj.req_id
             original_req_id = extract_original_req_id(part_req_id)
+            if original_req_id != self.recv_req.rid:
+                logger.warning(
+                    f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
+                    f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
+                )
+                continue
             recv_obj.req_id = original_req_id
 
             # Embedding was written directly into pre-registered GPU buffer by encode server
@@ -1451,6 +1457,34 @@ class MMReceiverHTTP(MMReceiverBase):
             )
         return self._process_waiting_requests(recv_reqs, WaitingImageRequest)
 
+    async def _check_encoder_responses(self, responses, encode_requests, req_id):
+        """Validate gathered HTTP responses. Returns True if all OK."""
+        for i, response in enumerate(responses):
+            if isinstance(response, asyncio.TimeoutError):
+                timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+                logger.error(
+                    f"Encoder HTTP request timeout ({timeout_val}s) for req_id={req_id} "
+                    f"(request {i}), "
+                    f"encoder={self.encode_urls[encode_requests[i]['encoder_idx']]}"
+                )
+                return False
+            elif isinstance(response, Exception):
+                logger.error(
+                    f"Encoder HTTP request failed for req_id={req_id} (request {i}): {response}",
+                    exc_info=response,
+                )
+                return False
+        for response in responses:
+            if response.status != 200:
+                try:
+                    err_data = await response.json()
+                    msg = err_data.get("message", "Unknown encoder error")
+                except Exception:
+                    msg = await response.text()
+                logger.error(f"Encoder returned error {response.status}: {msg}")
+                return False
+        return True
+
     async def encode(
         self,
         req_id,
@@ -1529,31 +1563,10 @@ class MMReceiverHTTP(MMReceiverBase):
 
             responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-            for i, response in enumerate(responses):
-                if isinstance(response, asyncio.TimeoutError):
-                    timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
-                    logger.error(
-                        f"Encoder HTTP request timeout ({timeout_val}s) for req_id={req_id} "
-                        f"(request {i}), "
-                        f"encoder={self.encode_urls[encode_requests[i]['encoder_idx']]}"
-                    )
-                    return
-                elif isinstance(response, Exception):
-                    logger.error(
-                        f"Encoder HTTP request failed for req_id={req_id} (request {i}): {response}",
-                        exc_info=response,
-                    )
-                    return
-            for response in responses:
-                if response.status != 200:
-                    try:
-                        err_data = await response.json()
-                        msg = err_data.get("message", "Unknown encoder error")
-                    except:
-                        msg = await response.text()
-
-                    logger.error(f"Encoder returned error {response.status}: {msg}")
-                    return
+            if not await self._check_encoder_responses(
+                responses, encode_requests, req_id
+            ):
+                return
             response_json_list_unsort = [
                 await response.json() for response in responses
             ]
