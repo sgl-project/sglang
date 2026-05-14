@@ -1171,6 +1171,7 @@ mod tests {
     /// `CacheAwarePolicy` instances seeded with the matching pool's workers, then
     /// return the registry, the per-pool policy handles (for tree inspection), and
     /// representative workers from each pool.
+    #[allow(clippy::type_complexity)]
     fn pd_registry_with_cache_aware_pools() -> (
         Arc<crate::policies::PolicyRegistry>,
         Arc<CacheAwarePolicy>,
