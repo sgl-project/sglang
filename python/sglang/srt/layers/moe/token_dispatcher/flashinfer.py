@@ -149,9 +149,18 @@ class FlashinferDispatcher(BaseDispatcher):
             mnnvl_config=MnnvlConfig(comm_backend=TorchDistributedCommBackend(group)),
         )
 
-        # Note: dummy tensors for the old dummy-token approach have been removed.
-        # We now pass 0-size tensors directly to the alltoall kernel, which
-        # handles local_num_tokens=0 natively (same as TRT-LLM).
+        self.dummy_topk_ids = torch.full(
+            (1, self.router_topk), self.num_experts, dtype=torch.int32, device="cuda"
+        )
+        self.dummy_topk_ids_current_rank = torch.full(
+            (1, self.router_topk),
+            self.ep_rank * self.num_local_experts,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.dummy_topk_weights = torch.zeros(
+            (1, self.router_topk), dtype=torch.float32, device="cuda"
+        )
 
     @debug_kernel_api
     def dispatch(
@@ -163,21 +172,15 @@ class FlashinferDispatcher(BaseDispatcher):
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
 
-        # Unlike the old dummy-token approach, we pass 0-size tensors directly
-        # to the alltoall kernel, which handles local_num_tokens=0 natively
-        # (same as TRT-LLM). The kernel keeps 1 thread alive for sync.
+        self.has_dummy_token = x.shape[0] == 0
+        if self.has_dummy_token:
+            x = hidden_states.new_zeros((1, self.hidden_size))
+            topk_ids = self.dummy_topk_ids
+            topk_weights = self.dummy_topk_weights
 
         global_scale = self.quant_config.get("input_global_scale", None)
         if global_scale is not None:
-            if x.shape[0] > 0:
-                x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
-            else:
-                x = torch.zeros(
-                    0, self.hidden_size // 2, dtype=torch.uint8, device=x.device
-                )
-                x_sf = torch.zeros(
-                    0, self.hidden_size // 16, dtype=torch.uint8, device=x.device
-                )
+            x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
 
         payloads = []
         payloads.append(x)
@@ -189,11 +192,15 @@ class FlashinferDispatcher(BaseDispatcher):
         payloads.append(topk_ids)
         payloads.append(topk_weights)
 
+        dp_global_num_tokens = get_dp_global_num_tokens()
         self.runtime_max_tokens_per_rank = (
-            max(get_dp_global_num_tokens())
-            if get_dp_global_num_tokens() is not None
+            max(dp_global_num_tokens)
+            if dp_global_num_tokens is not None
             else x.shape[0]
         )
+        if self.has_dummy_token:
+            self.runtime_max_tokens_per_rank = max(self.runtime_max_tokens_per_rank, 1)
+
         # Passing topk_ids + invalid_token_expert_id triggers the sanitize step
         # inside moe_a2a. The recv buffer has shape
         # [ep_size, max_tokens_per_rank, ...], so any rank below max leaves
@@ -201,7 +208,7 @@ class FlashinferDispatcher(BaseDispatcher):
         # and waste downstream MoE compute. Sanitizing the padding to a
         # sentinel id is structural, not optional.
         recv_tensors = self.moe_a2a.dispatch(
-            topk_ids,
+            self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
             invalid_token_expert_id=self.num_experts,
@@ -244,5 +251,9 @@ class FlashinferDispatcher(BaseDispatcher):
             payload_in_workspace=self.payload_in_workspace,
         )
 
+        if self.has_dummy_token:
+            hidden_states = hidden_states[1:, :]
+
         del self.runtime_max_tokens_per_rank
+        del self.has_dummy_token
         return hidden_states
