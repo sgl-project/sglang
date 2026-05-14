@@ -60,7 +60,9 @@ def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.T
     init_shape = inp.shape
     n = hadamard_matrix.shape[0]
     flat = inp.reshape(-1, n)
-    return (flat.matmul(hadamard_matrix) * (n**-0.5)).view(init_shape).to(torch.bfloat16)
+    return (
+        (flat.matmul(hadamard_matrix) * (n**-0.5)).view(init_shape).to(torch.bfloat16)
+    )
 
 
 if TYPE_CHECKING:
@@ -543,10 +545,8 @@ class Compressor(nn.Module):
                 raw_kv_loc = forward_batch.out_cache_loc[
                     seqlen_offset : seqlen_offset + seqlen
                 ]
-                out_cache_loc = (
-                    token_to_kv_pool.translate_kv_loc_to_compress_state_loc(
-                        raw_kv_loc, ratio
-                    )
+                out_cache_loc = token_to_kv_pool.translate_kv_loc_to_compress_state_loc(
+                    raw_kv_loc, ratio
                 )
                 remainder = seqlen % ratio
                 cutoff = seqlen - remainder
@@ -570,9 +570,7 @@ class Compressor(nn.Module):
                     kv_cut, kv_rem = kv.split([cutoff, remainder], dim=0)
                     score_cut, score_rem = score.split([cutoff, remainder], dim=0)
                     kv_state_to_be_cached.append(kv_rem)
-                    score_state_to_be_cached.append(
-                        score_rem + self.ape[:remainder]
-                    )
+                    score_state_to_be_cached.append(score_rem + self.ape[:remainder])
                     state_loc_list.append(out_cache_loc[-remainder:])
                     kv = kv_cut
                     score = score_cut
@@ -647,9 +645,9 @@ class Compressor(nn.Module):
                             [score_state[:ratio, :d], score_state[ratio:, d:]],
                             dim=0,
                         )
-                        kv_compressed = (
-                            kv_state * score_state.softmax(dim=0)
-                        ).sum(dim=0, keepdim=True)
+                        kv_compressed = (kv_state * score_state.softmax(dim=0)).sum(
+                            dim=0, keepdim=True
+                        )
                     else:
                         kv_indices = _get_kv_indices(
                             forward_batch, ratio, page_table, idx, seqlen
@@ -670,9 +668,7 @@ class Compressor(nn.Module):
                         torch.tensor([idx], dtype=torch.int64, device=device)
                     )
                     write_pos_in_req.append(
-                        torch.tensor(
-                            [decode_pos], dtype=torch.int64, device=device
-                        )
+                        torch.tensor([decode_pos], dtype=torch.int64, device=device)
                     )
 
         # Flush the prefill state stash to the pool in one shot.
@@ -712,17 +708,13 @@ class Compressor(nn.Module):
             offset = pos_in_req_flat % kernel_page_size
             pages_table = token_to_kv_pool.get_req_to_token_c_pages(ratio)
             kernel_page = pages_table[req_pool_flat.to(torch.int64), page_seq]
-            write_locs = (
-                kernel_page.to(torch.int64) * kernel_page_size + offset
-            ).to(torch.int32)
-            self._compressor_epilog_npu(
-                kv_out, forward_batch, override_loc=write_locs
+            write_locs = (kernel_page.to(torch.int64) * kernel_page_size + offset).to(
+                torch.int32
             )
+            self._compressor_epilog_npu(kv_out, forward_batch, override_loc=write_locs)
         return None
 
-    def _overlap_transform(
-        self, tensor: torch.Tensor, value: float
-    ) -> torch.Tensor:
+    def _overlap_transform(self, tensor: torch.Tensor, value: float) -> torch.Tensor:
         # Overlap layout from iforgetmyname Compressor.overlap_transform:
         # given (n_chunks, ratio, coff*d), build (n_chunks, 2*ratio, d) where
         # the first ratio rows hold the current chunk's left half (..., :d)

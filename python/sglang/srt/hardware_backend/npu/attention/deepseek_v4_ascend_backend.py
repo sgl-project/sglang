@@ -130,7 +130,7 @@ def _compute_c4_q_npu(
         positions,
     )
     H = _build_hadamard_matrix(c4_indexer.head_dim, torch.float32, q.device)
-    scale = c4_indexer.head_dim ** -0.5
+    scale = c4_indexer.head_dim**-0.5
     q_f32 = q.to(torch.float32)
     q_rotated = torch.matmul(q_f32, H) * scale
     return q_rotated.to(torch.bfloat16)
@@ -172,17 +172,13 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_index_head_dim = getattr(hf, "index_head_dim", 128)
         self._dsv4_compress_ratios = getattr(hf, "compress_ratios", None)
         self._dsv4_has_c4 = (
-            self._dsv4_compress_ratios is not None
-            and 4 in self._dsv4_compress_ratios
+            self._dsv4_compress_ratios is not None and 4 in self._dsv4_compress_ratios
         )
         self._dsv4_has_c128 = (
-            self._dsv4_compress_ratios is not None
-            and 128 in self._dsv4_compress_ratios
+            self._dsv4_compress_ratios is not None and 128 in self._dsv4_compress_ratios
         )
         self._dsv4_sliding_window_size = (
-            cfg.sliding_window_size
-            if cfg.sliding_window_size is not None
-            else 128
+            cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
 
     # ------------------------------------------------------------------
@@ -236,6 +232,7 @@ class DeepseekV4AscendAttnBackend(
         ):
             B = forward_batch.batch_size
             from sglang.srt.utils.common import get_global_server_args
+
             n_draft = get_global_server_args().speculative_num_draft_tokens or 1
             actual_q = torch.arange(
                 n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
@@ -400,9 +397,7 @@ class DeepseekV4AscendAttnBackend(
             # State page table — translate each (bs, n_pages) raw kv slot to a
             # state-buffer page id. translate_kv_loc_to_compress_state_loc gives
             # the flat state slot; divide by page_size for the page id.
-            state_loc_2d = pool.translate_kv_loc_to_compress_state_loc(
-                raw_loc, ratio
-            )
+            state_loc_2d = pool.translate_kv_loc_to_compress_state_loc(raw_loc, ratio)
             state_page_2d = (state_loc_2d // self.page_size).to(torch.int32)
 
             # State loc — single state-buffer slot for the new decode token.
@@ -425,9 +420,9 @@ class DeepseekV4AscendAttnBackend(
                 k_seq = (seq_lens.to(torch.int64) // ratio - 1).clamp(min=0)
                 page_seq = (k_seq // self.page_size).to(torch.int64)
                 offset = (k_seq % self.page_size).to(torch.int64)
-                kernel_page = pages_table[
-                    req_pool.to(torch.int64), page_seq
-                ].to(torch.int64)
+                kernel_page = pages_table[req_pool.to(torch.int64), page_seq].to(
+                    torch.int64
+                )
                 compress_out_loc = (kernel_page * self.page_size + offset).to(
                     torch.int32
                 )
@@ -504,7 +499,9 @@ class DeepseekV4AscendAttnBackend(
         # the previous code silently dropped the write — decode then read an
         # unwritten swa_kv_pool and produced garbage. Always respect the flag.
         if save_kv_cache:
-            self.store_cache(layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch)
+            self.store_cache(
+                layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
+            )
         if compress_ratio in (0, 1):
             return self._forward_dense(q, layer, forward_batch, attn_sink)
         # ratio 4 / 128 routing — TWO independent gates:
@@ -665,9 +662,7 @@ class DeepseekV4AscendAttnBackend(
             if topk is None:
                 topk = self._seed_c4_topk_indices(forward_batch)
                 fm.c4_topk_indices = topk
-            attn_kwargs["cmp_sparse_indices"] = topk.view(
-                -1, 1, topk.shape[-1]
-            )
+            attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)

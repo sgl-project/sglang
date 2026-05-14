@@ -105,8 +105,10 @@ def _v4_rope_inplace_npu(
     fallback some prompts (those with marginal argmax decisions) flip
     tokens vs iforgetmyname.
     """
-    if _is_npu and hasattr(torch.ops, "custom") and hasattr(
-        torch.ops.custom, "inplace_partial_rotary_mul"
+    if (
+        _is_npu
+        and hasattr(torch.ops, "custom")
+        and hasattr(torch.ops.custom, "inplace_partial_rotary_mul")
     ):
         # Build cos/sin caches in the layout the kernel expects:
         # (T, 1, 1, rope_dim) with each freq pair value repeated twice for
@@ -124,7 +126,9 @@ def _v4_rope_inplace_npu(
         # kv_rope: (T, 1, rope_dim) → (T, 1, 1, rope_dim) view
         q_view = q_rope.unsqueeze(1)
         torch.ops.custom.inplace_partial_rotary_mul(
-            q_view, cos4, sin4,
+            q_view,
+            cos4,
+            sin4,
             rotary_mode="interleave",
             partial_slice=[0, rope_dim],
         )
@@ -134,7 +138,9 @@ def _v4_rope_inplace_npu(
             else:
                 kv_view = kv_rope.view(-1, 1, 1, rope_dim)
             torch.ops.custom.inplace_partial_rotary_mul(
-                kv_view, cos4, sin4,
+                kv_view,
+                cos4,
+                sin4,
                 rotary_mode="interleave",
                 partial_slice=[0, rope_dim],
             )
@@ -272,9 +278,12 @@ class MQALayer(nn.Module):
         # addition to the {0, 4, 128} the original V4 model ships. Treat 0
         # and 1 the same throughout: neither has a Compressor/C4Indexer and
         # neither uses the compress_rope_theta / yarn original_seq_len.
-        assert compress_ratio in (0, 1, 4, 128), (
-            f"V4 compress_ratio: expected one of (0, 1, 4, 128), got {compress_ratio}"
-        )
+        assert compress_ratio in (
+            0,
+            1,
+            4,
+            128,
+        ), f"V4 compress_ratio: expected one of (0, 1, 4, 128), got {compress_ratio}"
         self.compress_ratio: Literal[0, 1, 4, 128] = compress_ratio
 
         assert self.head_dim == config.head_dim
@@ -465,6 +474,7 @@ class MQALayer(nn.Module):
             # layers of cascade, that 1-2% per-layer drift flips argmax in
             # tokens 5+. Match exact iforgetmyname behavior here.
             import torch_npu
+
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
         elif self.use_jit_norm:
@@ -600,6 +610,7 @@ class MQALayer(nn.Module):
             # layers of cascade, that 1-2% per-layer drift flips argmax in
             # tokens 5+. Match exact iforgetmyname behavior here.
             import torch_npu
+
             _dummy = q.new_ones(q.shape[-1])
             q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
         elif self.use_jit_norm:

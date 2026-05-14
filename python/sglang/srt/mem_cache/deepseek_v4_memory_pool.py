@@ -331,12 +331,11 @@ class DeepSeekV4IndexerPool(KVCache):
         # ONLY allocate when SGLANG_DSV4_NPU_REAL_COMPRESSOR is on — these
         # buffers add ~570 MB total which would otherwise eat into the KV
         # pool budget for Tier 1 baseline launches.
-        from sglang.srt.utils import is_npu as _is_npu_check
         from sglang.srt.environ import envs as _envs
+        from sglang.srt.utils import is_npu as _is_npu_check
 
         self._npu_buffers_present = (
-            _is_npu_check()
-            and _envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get()
+            _is_npu_check() and _envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get()
         )
         if self._npu_buffers_present:
             # NPU buffer uses GLOBAL kernel_page_size (= 256), not the
@@ -344,7 +343,9 @@ class DeepSeekV4IndexerPool(KVCache):
             # makes cmp_kv.shape[1] match ori_kv.shape[1] = global page_size,
             # which aclnnSparseAttnSharedkv / npu_quant_lightning_indexer
             # require. num_pages is recomputed for the kernel page size.
-            npu_num_pages = (self.size + self.kernel_page_size + 1) // self.kernel_page_size
+            npu_num_pages = (
+                self.size + self.kernel_page_size + 1
+            ) // self.kernel_page_size
             self.npu_index_k_buffer = [
                 torch.zeros(
                     npu_num_pages,
@@ -592,9 +593,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             .to(device)
         )
         self.req_to_token_c128_pages = (
-            torch.arange(
-                max_num_reqs * self.max_pages_c128_per_req, dtype=torch.int32
-            )
+            torch.arange(max_num_reqs * self.max_pages_c128_per_req, dtype=torch.int32)
             .view(max_num_reqs, self.max_pages_c128_per_req)
             .to(device)
         )
@@ -1079,12 +1078,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 # output (kv: int8 [T, dim], kv_scale: float16 [T, 1]).
                 import torch_npu  # local: NPU only
 
-                assert self.c4_indexer_kv_pool.npu_index_k_buffer is not None, (
-                    "NPU index buffers not allocated — pool was init'd on CUDA?"
-                )
-                k_buf = self.c4_indexer_kv_pool.npu_index_k_buffer[
-                    compress_layer_id
-                ]
+                assert (
+                    self.c4_indexer_kv_pool.npu_index_k_buffer is not None
+                ), "NPU index buffers not allocated — pool was init'd on CUDA?"
+                k_buf = self.c4_indexer_kv_pool.npu_index_k_buffer[compress_layer_id]
                 scale_buf = self.c4_indexer_kv_pool.npu_index_scale_buffer[
                     compress_layer_id
                 ]
@@ -1105,17 +1102,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     )
                 return
             if kv_scale is None:
-                self.c4_indexer_kv_pool.set_index_fused(
-                    compress_layer_id, loc, kv
-                )
+                self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, kv)
                 return
             self.c4_indexer_kv_pool.set_index_k_scale_buffer(
                 compress_layer_id, loc, kv, kv_scale
             )
             return
-        compress_pool = (
-            self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
-        )
+        compress_pool = self.c4_kv_pool if ratio == 4 else self.c128_kv_pool
         if device_type == "npu":
             # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,
             # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`
@@ -1157,9 +1150,5 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert from_indexer, "only indexer compress pool has dequant scale"
         compress_layer_id = self.layer_mapping[layer_id].compress_layer_id
         if self.c4_indexer_kv_pool.npu_index_scale_buffer is not None:
-            return self.c4_indexer_kv_pool.npu_index_scale_buffer[
-                compress_layer_id
-            ]
-        return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(
-            compress_layer_id
-        )
+            return self.c4_indexer_kv_pool.npu_index_scale_buffer[compress_layer_id]
+        return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(compress_layer_id)
