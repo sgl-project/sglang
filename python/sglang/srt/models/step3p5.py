@@ -168,7 +168,11 @@ class Step3p5MoEMLP(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
             gemm1_clamp_limit=self.limit,
-            **({"activation": config.hidden_act} if _is_npu and self.limit is not None else {}),
+            **(
+                {"activation": config.hidden_act}
+                if _is_npu and self.limit is not None
+                else {}
+            ),
         )
 
         self.gate = ReplicatedLinear(
