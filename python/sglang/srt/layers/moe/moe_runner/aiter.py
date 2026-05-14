@@ -74,14 +74,23 @@ def fused_experts_none_to_aiter(
         topk_weights = torch.ones_like(topk_weights)
 
     activation = runner_config.activation
+    quant_type = getattr(QuantType, quant_info.quant_type.value)
+    activation = getattr(ActivationType, _AITER_ACTIVATIONS.get(activation, "Gelu"))
+
+    gate_mode = (
+        GateMode.INTERLEAVE.value
+        if quant_info.swiglu_limit > 0
+        else GateMode.SEPARATED.value
+    )
+
     output = fused_moe(
         hidden_states=hidden_states,
         w1=quant_info.w13_weight,
         w2=quant_info.w2_weight,
         topk_weight=topk_weights,
         topk_ids=topk_ids.to(torch.int32),
-        quant_type=getattr(QuantType, quant_info.quant_type.value),
-        activation=getattr(ActivationType, _AITER_ACTIVATIONS.get(activation, "Gelu")),
+        quant_type=quant_type,
+        activation=activation,
         w1_scale=quant_info.w13_scale,
         w2_scale=quant_info.w2_scale,
         a1_scale=quant_info.a13_scale,
@@ -92,7 +101,7 @@ def fused_experts_none_to_aiter(
         doweight_stage1=quant_info.doweight_stage1,
         hidden_pad=quant_info.hidden_pad,
         intermediate_pad=quant_info.intermediate_pad,
-        gate_mode=GateMode.INTERLEAVE.value,
+        gate_mode=gate_mode,
         swiglu_limit=quant_info.swiglu_limit,
     )
     return StandardCombineInput(hidden_states=output)
