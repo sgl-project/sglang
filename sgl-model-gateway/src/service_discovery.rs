@@ -948,6 +948,33 @@ mod tests {
     }
 
     #[test]
+    fn test_should_include_regular_pod_in_pd_igw_mode() {
+        let mut config = create_pd_config();
+        config.igw_mode = true;
+        config
+            .selector
+            .insert("app".to_string(), "regular-worker".to_string());
+
+        let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.0.5");
+        assert!(PodInfo::should_include(&regular_pod, &config));
+
+        let pod_info = PodInfo::from_pod(&regular_pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.pod_type, Some(PodType::Regular));
+    }
+
+    #[test]
+    fn test_should_exclude_regular_pod_in_pd_mode_without_igw() {
+        let mut config = create_pd_config();
+        config.igw_mode = false;
+        config
+            .selector
+            .insert("app".to_string(), "regular-worker".to_string());
+
+        let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.0.5");
+        assert!(!PodInfo::should_include(&regular_pod, &config));
+    }
+
+    #[test]
     fn test_service_discovery_config_default() {
         let config = ServiceDiscoveryConfig::default();
         assert!(!config.enabled);
