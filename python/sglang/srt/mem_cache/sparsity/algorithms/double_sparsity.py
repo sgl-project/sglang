@@ -296,10 +296,13 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
             dtype=torch.float32,
             device=device,
         )
-        # Output preallocated in the algorithm's compute dtype (fp16/bf16).
-        # Inferred from k_label dtype isn't right — output dtype must match
-        # the query dtype; we'll set this lazily on the first call.
-        self._native_output = None  # set in try_native_sparse_decode
+        # Output tensor. Allocated in bf16 (the Llama family's compute dtype
+        # and the K_label dtype default). If a future caller passes fp16 q,
+        # `try_native_sparse_decode` reallocates — but pre-warming here means
+        # the *normal* case sees zero allocation under capture.
+        self._native_output = torch.zeros(
+            (bs, h_q, d), dtype=self.klabel_dtype, device=device
+        )
 
         # req_to_token indexed per-batch. Re-gathered on first call per step
         # in try_native_sparse_decode (cached only if shape matches).
@@ -346,22 +349,23 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         if self._native_att_out is None:
             return None
 
-        # Eligibility gate. `seq_lens.min().item()` triggers a host sync —
-        # tolerable while CUDA-graph capture is disabled for DS. A
-        # capture-safe gate can replace this once we wire DS into the
-        # captured-graph path (out of scope for v0).
         rt = self.runtime_config
-        total_selected = rt.token_budget + rt.sink_tokens + rt.recent_tokens
         seq_lens = forward_batch.seq_lens
         if not seq_lens.is_cuda:
             return None
-        try:
-            seq_min = int(seq_lens.min().item())
-        except Exception:
-            return None
-        if seq_min < max(rt.min_seq_len, total_selected):
-            return None
 
+        # Eligibility gate is intentionally Python-static — NO host sync on
+        # `seq_lens`. The capture path traces the kernel launches we make
+        # here, and any host-sync-based Python branch during capture would
+        # freeze the captured path to that branch's choice forever (the
+        # captured graph cannot re-evaluate at replay time).
+        #
+        # We trust the caller (the bench, or production server admission)
+        # to only invoke DS-on when seq_lens are >= min_seq_len for every
+        # active row. Outside that contract, the score kernel masks the
+        # out-of-history tail to -inf and torch.topk picks junk indices
+        # — output is computed against garbage K/V (no crash). A
+        # capture-safe per-request fallback is post-v0 work.
         bs = q.shape[0]
         if bs > self._native_att_out.shape[0]:  # [bs, H_kv, max_ctx] layout
             return None
