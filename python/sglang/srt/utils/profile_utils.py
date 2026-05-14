@@ -39,9 +39,15 @@ def profile_startup_region(label: str, snapshot_path: str, enabled: bool):
     autotune, symmetric memory pre-allocation, ...) can be inspected with the
     same tooling.
 
-    When ``enabled`` is ``False`` this is a zero-overhead no-op.
+    On exit, this dumps a CUDA memory history pickle (open at
+    https://pytorch.org/memory_viz) and logs four ranked tables: top ops by
+    ``self_cuda_memory_usage`` and ``self_cpu_memory_usage`` (primary signal
+    for workspace regions), followed by ``cuda_time_total`` and
+    ``cpu_time_total`` (secondary signal for kernel-bound regions like
+    autotune). Memory tables are populated by passing ``profile_memory=True``
+    to the underlying ``torch.profiler.profile``.
 
-    The snapshot file can be opened at https://pytorch.org/memory_viz.
+    When ``enabled`` is ``False`` this is a zero-overhead no-op.
 
     Args:
         label: Short identifier used in the log header (e.g.
@@ -64,18 +70,25 @@ def profile_startup_region(label: str, snapshot_path: str, enabled: bool):
                 torch.profiler.ProfilerActivity.CUDA,
             ],
             record_shapes=True,
+            profile_memory=True,
         ) as prof:
             yield
         torch.cuda.memory._dump_snapshot(snapshot_path)
+        # Memory-sorted views are the primary signal for workspace allocations;
+        # time-sorted views are kept as a secondary signal (useful for
+        # kernel-bound regions like FlashInfer autotune). row_limit is bumped
+        # to 15 because workspace regions tend to have a long tail of small
+        # allocations worth seeing.
+        avgs = prof.key_averages(group_by_input_shape=True)
         log_message = (
-            f"[{label}] Sorted by CUDA Time:\n"
-            + prof.key_averages(group_by_input_shape=True).table(
-                sort_by="cuda_time_total", row_limit=10
-            )
+            f"[{label}] Sorted by Self CUDA Memory Usage:\n"
+            + avgs.table(sort_by="self_cuda_memory_usage", row_limit=15)
+            + f"\n\n[{label}] Sorted by Self CPU Memory Usage:\n"
+            + avgs.table(sort_by="self_cpu_memory_usage", row_limit=15)
+            + f"\n\n[{label}] Sorted by CUDA Time:\n"
+            + avgs.table(sort_by="cuda_time_total", row_limit=10)
             + f"\n\n[{label}] Sorted by CPU Time:\n"
-            + prof.key_averages(group_by_input_shape=True).table(
-                sort_by="cpu_time_total", row_limit=10
-            )
+            + avgs.table(sort_by="cpu_time_total", row_limit=10)
             + f"\n\n[{label}] Memory snapshot saved to {snapshot_path}\n"
         )
         logger.info(log_message)
