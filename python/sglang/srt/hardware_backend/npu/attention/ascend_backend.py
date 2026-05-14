@@ -1074,10 +1074,10 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                if self.use_fia and sinks is None:
+                if self.use_fia:
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     block_size = 128
-                    attn_out, _ = torch_npu.npu_fused_infer_attention_score(
+                    attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
                         query=q,
                         key=k_cache.view(
                             -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
@@ -1097,15 +1097,15 @@ class AscendAttnBackend(AttentionBackend):
                         block_table=block_tables,
                         input_layout="TND",
                         block_size=block_size,
-                        num_heads=layer.tp_q_head_num,
+                        num_query_heads=layer.tp_q_head_num,
                         num_key_value_heads=layer.tp_k_head_num,
-                        actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
-                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
-                        scale=layer.scaling,
+                        actual_seq_qlen=self.forward_metadata.seq_lens_list_cumsum,
+                        actual_seq_kvlen=self.forward_metadata.seq_lens_cpu_int,
+                        softmax_scale=layer.scaling,
                         sparse_mode=4 if layer.sliding_window_size != -1 else 3,
+                        learnable_sinks=sinks,
                     )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-                    return attn_out
                 else:
                     attn_out = attention_sinks_prefill_triton(
                         q,
@@ -1120,7 +1120,7 @@ class AscendAttnBackend(AttentionBackend):
                         layer.tp_q_head_num,
                         layer.tp_k_head_num,
                     )
-                    return attn_out
+                return attn_out
 
             if is_cp_mode:
                 if self.use_fia:
@@ -2035,14 +2035,13 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                if self.use_fia and sinks is None:
-                    q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                if self.use_fia:
                     block_size = 128
                     max_model_len = block_tables.shape[-1] * block_size
                     swa_mask = self.ascend_attn_mask_builder.get_swa_mask(
                         self.forward_metadata.seq_lens, max_model_len
                     )
-                    attn_out, _ = torch_npu.npu_fused_infer_attention_score(
+                    attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
                         q.view(
                             forward_batch.batch_size,
                             -1,
@@ -2055,19 +2054,19 @@ class AscendAttnBackend(AttentionBackend):
                         v_cache.view(
                             -1, self.page_size, layer.tp_v_head_num * layer.qk_head_dim
                         ),
-                        num_heads=layer.tp_q_head_num,
+                        num_query_heads=layer.tp_q_head_num,
                         num_key_value_heads=layer.tp_k_head_num,
                         input_layout="BSND",
                         block_size=128,
                         atten_mask=swa_mask,
-                        sparse_mode=0,
-                        scale=layer.scaling,
+                        sparse_mode=4,
+                        softmax_scale=layer.scaling,
                         block_table=block_tables,
-                        actual_seq_lengths=[1] * len(self.forward_metadata.seq_lens),
-                        actual_seq_lengths_kv=self.forward_metadata.seq_lens,
+                        actual_seq_qlen=[1] * len(self.forward_metadata.seq_lens),
+                        actual_seq_kvlen=self.forward_metadata.seq_lens,
+                        learnable_sinks=sinks,
                     )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-                    return attn_out
                 else:
                     attn_out = attention_sinks_triton(
                         q,
@@ -2081,7 +2080,7 @@ class AscendAttnBackend(AttentionBackend):
                         layer.tp_q_head_num,
                         layer.tp_k_head_num,
                     )
-                    return attn_out
+                return attn_out
 
             if self.use_fia:
                 if self.forward_metadata.seq_lens_cpu_int is None:
