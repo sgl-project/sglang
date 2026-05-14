@@ -803,9 +803,7 @@ def get_clip_model() -> tuple[Any, Any]:
 
         # ci server tests keep the generation server alive while consistency runs
         device = (
-            "cpu"
-            if is_in_ci()
-            else ("cuda" if torch.cuda.is_available() else "cpu")
+            "cpu" if is_in_ci() else ("cuda" if torch.cuda.is_available() else "cpu")
         )
         model = model.to(device)
         model.eval()
