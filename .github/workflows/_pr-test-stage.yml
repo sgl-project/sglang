@@ -64,6 +64,30 @@ on:
         description: 'Optional pytest path to run after the suite (stage-b-test-4-gpu-b200 uses this for FA4 jit_kernel tests). Empty = skip.'
         type: string
         default: ''
+      pr_head_sha:
+        description: 'Forwarded from pr-test.yml inputs.pr_head_sha (for /rerun-stage on fork PRs).'
+        type: string
+        default: ''
+      git_ref:
+        description: 'Forwarded from pr-test.yml inputs.git_ref (for workflow_call from main).'
+        type: string
+        default: ''
+      skip_stage_health_check:
+        description: 'Forwarded from pr-test.yml inputs.skip_stage_health_check (release branch cut bypass).'
+        type: boolean
+        default: false
+
+# Mirror pr-test.yml top-level env. Reusable workflows do NOT inherit caller's
+# workflow-level env across the workflow_call boundary, so anything pr-test.yml
+# defines must be redeclared here for the called job to see the same context.
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check && 'true' || 'false' }}
+  FORCE_REBUILD_DEEPEP: '1'
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  USE_VENV: false
 
 jobs:
   run:
@@ -95,7 +119,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - name: Resolve runner_config
         id: rc

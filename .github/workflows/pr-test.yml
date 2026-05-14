@@ -73,9 +73,6 @@ env:
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
-  # Forwarded to composite actions (setup-cuda-test-stage reads env.PR_HEAD_SHA / env.GIT_REF for checkout ref).
-  PR_HEAD_SHA: ${{ inputs.pr_head_sha || '' }}
-  GIT_REF: ${{ inputs.git_ref || '' }}
 
 permissions:
   actions: write
@@ -293,6 +290,9 @@ jobs:
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       run_timeout_minutes: '10'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-a-test-cpu:
@@ -381,6 +381,9 @@ jobs:
       main_package: ${{ needs.check-changes.outputs.main_package }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
@@ -399,6 +402,9 @@ jobs:
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       timeout_per_file: '1800'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-b-test-2-gpu-large:
@@ -415,6 +421,9 @@ jobs:
       main_package: ${{ needs.check-changes.outputs.main_package }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-b-test-4-gpu-b200:
@@ -433,6 +442,9 @@ jobs:
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       run_timeout_minutes: '40'
       extra_pytest_path: 'python/sglang/jit_kernel/tests/test_flash_attention_4.py'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   call-multimodal-gen-tests:
@@ -482,6 +494,9 @@ jobs:
       main_package: ${{ needs.check-changes.outputs.main_package }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-8-gpu-h200:
@@ -500,6 +515,9 @@ jobs:
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2-Exp:8'
       warmup_server_models: 'deepseek-ai/DeepSeek-V3-0324:8 inclusionAI/Ring-2.5-1T:8'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-8-gpu-h20:
@@ -516,6 +534,9 @@ jobs:
       main_package: ${{ needs.check-changes.outputs.main_package }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-deepep-4-gpu-h100:
@@ -534,6 +555,9 @@ jobs:
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4'
       warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-deepep-8-gpu-h200:
@@ -553,6 +577,9 @@ jobs:
       run_timeout_minutes: '45'
       warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2-Exp:8'
       warmup_server_models: 'deepseek-ai/DeepSeek-V3-0324:8'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-4-gpu-b200:
@@ -570,6 +597,9 @@ jobs:
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       timeout_per_file: '1800'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-dsv4-4-gpu-b200:
@@ -587,6 +617,9 @@ jobs:
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       timeout_per_file: '1800'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-dsv4-8-gpu-h200:
@@ -604,6 +637,9 @@ jobs:
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       timeout_per_file: '1800'
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   pr-test-finish:
