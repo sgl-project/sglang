@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from array import array
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.managers.io_struct import (
@@ -185,6 +186,8 @@ class Session:
                                 (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
                             ]
 
+            req_input_ids_arr = array("q", req.input_ids)
+
             input_ids = (
                 last_req.origin_input_ids
                 + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
@@ -194,9 +197,9 @@ class Session:
                 input_ids = last_req.origin_input_ids[:]
 
             if session_params.offset and session_params.offset != 0:
-                input_ids = input_ids[: session_params.offset] + req.input_ids
+                input_ids = input_ids[: session_params.offset] + req_input_ids_arr
             else:
-                input_ids += req.input_ids
+                input_ids += req_input_ids_arr
 
             input_ids_unpadded = (
                 last_req.origin_input_ids_unpadded
@@ -207,10 +210,10 @@ class Session:
 
             if session_params.offset and session_params.offset != 0:
                 input_ids_unpadded = (
-                    input_ids_unpadded[: session_params.offset] + req.input_ids
+                    input_ids_unpadded[: session_params.offset] + req_input_ids_arr
                 )
             else:
-                input_ids_unpadded += req.input_ids
+                input_ids_unpadded += req_input_ids_arr
         else:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
