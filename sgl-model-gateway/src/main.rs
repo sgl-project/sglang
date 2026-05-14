@@ -1089,9 +1089,19 @@ impl CliArgs {
                 })
                 .unwrap_or_else(|| (HashMap::new(), "sglang.ai/mesh-port".to_string()));
 
+            let selector = Self::parse_selector(&self.selector);
+
+            if self.pd_disaggregation && !self.enable_igw && !selector.is_empty() {
+                tracing::warn!(
+                    "--selector is set in PD mode without --enable-igw; \
+                    regular worker discovery alongside PD workers requires IGW mode, \
+                    selector will be ignored"
+                );
+            }
+
             Some(ServiceDiscoveryConfig {
                 enabled: true,
-                selector: Self::parse_selector(&self.selector),
+                selector,
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
@@ -1101,6 +1111,7 @@ impl CliArgs {
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                 router_selector,
                 router_mesh_port_annotation,
+                igw_mode: self.enable_igw,
             })
         } else {
             None

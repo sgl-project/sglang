@@ -45,6 +45,8 @@ pub struct ServiceDiscoveryConfig {
     // Router node discovery for mesh
     pub router_selector: HashMap<String, String>,
     pub router_mesh_port_annotation: String,
+    // When true (IGW mode), also discover selector pods as Regular workers alongside PD workers
+    pub igw_mode: bool,
 }
 
 impl Default for ServiceDiscoveryConfig {
@@ -61,6 +63,7 @@ impl Default for ServiceDiscoveryConfig {
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
+            igw_mode: false,
         }
     }
 }
@@ -102,8 +105,13 @@ impl PodInfo {
                 warn!("PD mode enabled but both prefill_selector and decode_selector are empty");
                 return false;
             }
-            Self::matches_selector(pod, &config.prefill_selector)
-                || Self::matches_selector(pod, &config.decode_selector)
+            let matches_pd = Self::matches_selector(pod, &config.prefill_selector)
+                || Self::matches_selector(pod, &config.decode_selector);
+            // In IGW mode, also discover regular workers via the selector field
+            let matches_regular = config.igw_mode
+                && !config.selector.is_empty()
+                && Self::matches_selector(pod, &config.selector);
+            matches_pd || matches_regular
         } else {
             if config.selector.is_empty() {
                 warn!("Regular mode enabled but selector is empty");
@@ -884,6 +892,35 @@ mod tests {
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
+            igw_mode: false,
+        }
+    }
+
+    fn create_regular_k8s_pod(name: &str, ip: &str) -> Pod {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("app".to_string(), "regular-worker".to_string());
+
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                labels: Some(labels),
+                ..Default::default()
+            },
+            spec: Some(PodSpec::default()),
+            status: Some(PodStatus {
+                pod_ip: Some(ip.to_string()),
+                phase: Some("Running".to_string()),
+                conditions: Some(vec![PodCondition {
+                    type_: "Ready".to_string(),
+                    status: "True".to_string(),
+                    last_probe_time: None,
+                    last_transition_time: None,
+                    message: None,
+                    reason: None,
+                    observed_generation: None,
+                }]),
+                ..Default::default()
+            }),
         }
     }
 
@@ -1440,5 +1477,72 @@ mod tests {
 
         // Pod should be removed from tracking
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+    }
+
+    #[test]
+    fn test_should_include_mixed_pd_igw_regular_pod_included() {
+        let mut regular_selector = HashMap::new();
+        regular_selector.insert("app".to_string(), "regular-worker".to_string());
+
+        let mut prefill_selector = HashMap::new();
+        prefill_selector.insert("app".to_string(), "sglang".to_string());
+        prefill_selector.insert("component".to_string(), "prefill".to_string());
+
+        let mut decode_selector = HashMap::new();
+        decode_selector.insert("app".to_string(), "sglang".to_string());
+        decode_selector.insert("component".to_string(), "decode".to_string());
+
+        let config = ServiceDiscoveryConfig {
+            enabled: true,
+            selector: regular_selector,
+            check_interval: Duration::from_secs(60),
+            port: 8080,
+            namespace: None,
+            pd_mode: true,
+            prefill_selector,
+            decode_selector,
+            bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            router_selector: HashMap::new(),
+            router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
+            igw_mode: true,
+        };
+
+        let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.1.1");
+        assert!(PodInfo::should_include(&regular_pod, &config));
+
+        let pod_info = PodInfo::from_pod(&regular_pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.pod_type, Some(PodType::Regular));
+    }
+
+    #[test]
+    fn test_should_include_mixed_pd_no_igw_regular_pod_excluded() {
+        let mut regular_selector = HashMap::new();
+        regular_selector.insert("app".to_string(), "regular-worker".to_string());
+
+        let mut prefill_selector = HashMap::new();
+        prefill_selector.insert("app".to_string(), "sglang".to_string());
+        prefill_selector.insert("component".to_string(), "prefill".to_string());
+
+        let mut decode_selector = HashMap::new();
+        decode_selector.insert("app".to_string(), "sglang".to_string());
+        decode_selector.insert("component".to_string(), "decode".to_string());
+
+        let config = ServiceDiscoveryConfig {
+            enabled: true,
+            selector: regular_selector,
+            check_interval: Duration::from_secs(60),
+            port: 8080,
+            namespace: None,
+            pd_mode: true,
+            prefill_selector,
+            decode_selector,
+            bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            router_selector: HashMap::new(),
+            router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
+            igw_mode: false,
+        };
+
+        let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.1.1");
+        assert!(!PodInfo::should_include(&regular_pod, &config));
     }
 }

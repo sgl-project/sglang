@@ -985,6 +985,7 @@ impl Router {
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
                 router_selector: HashMap::new(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
+                igw_mode: self.enable_igw,
             })
         } else {
             None
