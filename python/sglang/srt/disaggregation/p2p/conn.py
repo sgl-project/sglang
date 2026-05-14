@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import concurrent.futures
+import ctypes
 import dataclasses
 import logging
 import os
-import time
-import threading
-import ctypes
 import struct
+import threading
+import time
+from collections import defaultdict
+from typing import Dict, List, Optional, Union
+
 import numpy as np
 import numpy.typing as npt
-
-from collections import defaultdict
-from typing import Dict, List, Optional, Union, Set
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -25,7 +25,7 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
 )
-from sglang.srt.disaggregation.p2p.transfer_engine import P2PTransferEngine, CompositeTransferHandle
+from sglang.srt.disaggregation.p2p.transfer_engine import P2PTransferEngine
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -126,7 +126,7 @@ class KVArgsRegisterInfo:
                 f"handle_size={handle_size}"
             )
         dst_kv_ptrs = [
-            kv_handles_bytes[i * handle_size:(i + 1) * handle_size]
+            kv_handles_bytes[i * handle_size : (i + 1) * handle_size]
             for i in range(len(kv_handles_bytes) // handle_size)
         ]
 
@@ -137,7 +137,7 @@ class KVArgsRegisterInfo:
                 f"handle_size={handle_size}"
             )
         dst_state_data_ptrs = [
-            state_handles_bytes[i * handle_size:(i + 1) * handle_size]
+            state_handles_bytes[i * handle_size : (i + 1) * handle_size]
             for i in range(len(state_handles_bytes) // handle_size)
         ]
 
@@ -277,7 +277,6 @@ class P2PKVManager(CommonKVManager):
 
         # State handles
         state_ptrs = getattr(self.kv_args, "state_data_ptrs", []) or []
-        state_lens = getattr(self.kv_args, "state_data_lens", []) or []
 
         if not state_ptrs:
             return
@@ -305,7 +304,6 @@ class P2PKVManager(CommonKVManager):
             for ptr, handle in zip(registered_state_ptrs, self.state_handles)
         ]
 
-
     def _execute_batch_transfer(
         self,
         transfer_blocks: List[dict],
@@ -314,12 +312,12 @@ class P2PKVManager(CommonKVManager):
         if not transfer_blocks:
             return 0
 
-        batch_src_ptrs = [b['src_ptr'] for b in transfer_blocks]
-        batch_src_devs = [b['src_dev'] for b in transfer_blocks]
-        batch_dst_handles = [b['dst_handle'] for b in transfer_blocks]
-        batch_dst_devs = [b['dst_dev'] for b in transfer_blocks]
-        batch_offsets = [b['dst_offset'] for b in transfer_blocks]
-        batch_lengths = [b['length'] for b in transfer_blocks]
+        batch_src_ptrs = [b["src_ptr"] for b in transfer_blocks]
+        batch_src_devs = [b["src_dev"] for b in transfer_blocks]
+        batch_dst_handles = [b["dst_handle"] for b in transfer_blocks]
+        batch_dst_devs = [b["dst_dev"] for b in transfer_blocks]
+        batch_offsets = [b["dst_offset"] for b in transfer_blocks]
+        batch_lengths = [b["length"] for b in transfer_blocks]
 
         batch_limit = self.p2p_batch_limit
         timeout_s = self.transfer_timeout
@@ -526,7 +524,9 @@ class P2PKVManager(CommonKVManager):
         data = msg[5]
 
         if len(data) != data_length:
-            logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}: expected {data_length}, got {len(data)}")
+            logger.error(
+                f"AUX_DATA length mismatch for bootstrap_room {room}: expected {data_length}, got {len(data)}"
+            )
             return
         AuxDataCodec.deserialize_data_to_buffer(
             self.kv_args, buffer_index, aux_index, data
@@ -586,9 +586,11 @@ class P2PKVManager(CommonKVManager):
                     req,
                     prefill_state_indices,
                     dst_state_handles,
-                    target_rank_registration_info.dst_state_item_lens
-                    if target_rank_registration_info is not None
-                    else None,
+                    (
+                        target_rank_registration_info.dst_state_item_lens
+                        if target_rank_registration_info is not None
+                        else None
+                    ),
                     dst_state_base_offsets,
                 )
 
@@ -636,7 +638,9 @@ class P2PKVManager(CommonKVManager):
         pre_idx = int(prefill_state_indices[0])
         dst_idx = int(req.dst_state_indices[0])
 
-        src_physical_gpu_id, dst_physical_gpu_id = self._get_physical_gpu_ids(req.p2p_session_id)
+        src_physical_gpu_id, dst_physical_gpu_id = self._get_physical_gpu_ids(
+            req.p2p_session_id
+        )
 
         transfer_blocks = []
 
@@ -654,7 +658,8 @@ class P2PKVManager(CommonKVManager):
             src_ptr = int(self.kv_args.state_data_ptrs[i]) + pre_idx * src_item_len
             dst_base_off = (
                 int(dst_state_base_offsets[i])
-                if dst_state_base_offsets is not None and i < len(dst_state_base_offsets)
+                if dst_state_base_offsets is not None
+                and i < len(dst_state_base_offsets)
                 else 0
             )
             dst_offset = dst_base_off + dst_idx * dst_item_len
@@ -690,7 +695,9 @@ class P2PKVManager(CommonKVManager):
         )
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
 
-        src_physical_gpu_id, dst_physical_gpu_id = self._get_physical_gpu_ids(req.p2p_session_id)
+        src_physical_gpu_id, dst_physical_gpu_id = self._get_physical_gpu_ids(
+            req.p2p_session_id
+        )
 
         prefill_state_data_ptrs = self.kv_args.state_data_ptrs
         prefill_state_item_lens = self.kv_args.state_item_lens
@@ -719,22 +726,14 @@ class P2PKVManager(CommonKVManager):
                 dst_state_item_lens[i] if i < len(dst_state_item_lens) else src_item_len
             )
             src_dim = (
-                src_state_dim_per_tensor[i]
-                if i < len(src_state_dim_per_tensor)
-                else 1
+                src_state_dim_per_tensor[i] if i < len(src_state_dim_per_tensor) else 1
             )
             dst_dim = (
-                dst_state_dim_per_tensor[i]
-                if i < len(dst_state_dim_per_tensor)
-                else 1
+                dst_state_dim_per_tensor[i] if i < len(dst_state_dim_per_tensor) else 1
             )
 
-            src_bytes_per_dim = (
-                src_item_len // src_dim if src_dim > 0 else src_item_len
-            )
-            dst_bytes_per_dim = (
-                dst_item_len // dst_dim if dst_dim > 0 else dst_item_len
-            )
+            src_bytes_per_dim = src_item_len // src_dim if src_dim > 0 else src_item_len
+            dst_bytes_per_dim = dst_item_len // dst_dim if dst_dim > 0 else dst_item_len
 
             if self.attn_tp_size > dst_attn_tp_size:
                 # Multiple prefill ranks -> 1 decode rank
@@ -761,7 +760,8 @@ class P2PKVManager(CommonKVManager):
 
             dst_base_off = (
                 int(dst_state_base_offsets[i])
-                if dst_state_base_offsets is not None and i < len(dst_state_base_offsets)
+                if dst_state_base_offsets is not None
+                and i < len(dst_state_base_offsets)
                 else 0
             )
             dst_offset = (
@@ -862,7 +862,9 @@ class P2PKVManager(CommonKVManager):
 
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
 
-                        if len(chunked_dst_kv_indice) < len(kv_chunk.prefill_kv_indices):
+                        if len(chunked_dst_kv_indice) < len(
+                            kv_chunk.prefill_kv_indices
+                        ):
                             kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
                                 : len(chunked_dst_kv_indice)
                             ]
@@ -1039,13 +1041,13 @@ class P2PKVManager(CommonKVManager):
 
                     num_kv_handles = len(handles_bytes) // self.handle_size
                     dst_kv_ptrs = [
-                        handles_bytes[i * self.handle_size:(i + 1) * self.handle_size]
+                        handles_bytes[i * self.handle_size : (i + 1) * self.handle_size]
                         for i in range(num_kv_handles)
                     ]
 
                     for kv_handle in dst_kv_ptrs:
                         try:
-                            result = self.engine.register_d_handle(kv_handle)
+                            self.engine.register_d_handle(kv_handle)
                         except Exception as e:
                             logger.exception(f"register_d_handle failed: {e}")
 
@@ -1069,9 +1071,13 @@ class P2PKVManager(CommonKVManager):
                                 f"(handle_size={self.handle_size})"
                             )
                         else:
-                            num_state_handles = len(state_handles_bytes) // self.handle_size
+                            num_state_handles = (
+                                len(state_handles_bytes) // self.handle_size
+                            )
                             dst_state_ptrs = [
-                                state_handles_bytes[i * self.handle_size:(i + 1) * self.handle_size]
+                                state_handles_bytes[
+                                    i * self.handle_size : (i + 1) * self.handle_size
+                                ]
                                 for i in range(num_state_handles)
                             ]
 
@@ -1105,18 +1111,36 @@ class P2PKVManager(CommonKVManager):
                     )
 
                     dst_state_item_lens = (
-                        list(struct.unpack(f"{len(waiting_req_bytes[11])//4}I", waiting_req_bytes[11]))
-                        if len(waiting_req_bytes) > 11 and len(waiting_req_bytes[11]) > 0
+                        list(
+                            struct.unpack(
+                                f"{len(waiting_req_bytes[11])//4}I",
+                                waiting_req_bytes[11],
+                            )
+                        )
+                        if len(waiting_req_bytes) > 11
+                        and len(waiting_req_bytes[11]) > 0
                         else []
                     )
                     dst_state_dim_per_tensor = (
-                        list(struct.unpack(f"{len(waiting_req_bytes[12])//4}I", waiting_req_bytes[12]))
-                        if len(waiting_req_bytes) > 12 and len(waiting_req_bytes[12]) > 0
+                        list(
+                            struct.unpack(
+                                f"{len(waiting_req_bytes[12])//4}I",
+                                waiting_req_bytes[12],
+                            )
+                        )
+                        if len(waiting_req_bytes) > 12
+                        and len(waiting_req_bytes[12]) > 0
                         else []
                     )
                     dst_state_base_offsets = (
-                        list(struct.unpack(f"{len(waiting_req_bytes[13])//8}Q", waiting_req_bytes[13]))
-                        if len(waiting_req_bytes) > 13 and len(waiting_req_bytes[13]) > 0
+                        list(
+                            struct.unpack(
+                                f"{len(waiting_req_bytes[13])//8}Q",
+                                waiting_req_bytes[13],
+                            )
+                        )
+                        if len(waiting_req_bytes) > 13
+                        and len(waiting_req_bytes[13]) > 0
                         else []
                     )
 
@@ -1151,9 +1175,7 @@ class P2PKVManager(CommonKVManager):
                         if p2p_session_id in self.session_failures:
                             del self.session_failures[p2p_session_id]
 
-                    logger.debug(
-                        f"Register KVArgs from {p2p_session_id} successfully"
-                    )
+                    logger.debug(f"Register KVArgs from {p2p_session_id} successfully")
                     continue
 
                 else:
@@ -1178,7 +1200,7 @@ class P2PKVManager(CommonKVManager):
                     self._handle_aux_data(msg)
                     continue
 
-                (bootstrap_room, status, prefill_rank) = msg
+                bootstrap_room, status, prefill_rank = msg
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
@@ -1197,7 +1219,7 @@ class P2PKVManager(CommonKVManager):
                 elif status == KVPoll.Failed:
                     self.record_failure(
                         bootstrap_room,
-                        f"Failed to get kvcache from prefill instance, it might be dead",
+                        "Failed to get kvcache from prefill instance, it might be dead",
                     )
                 self.update_status(bootstrap_room, status)
 
@@ -1371,10 +1393,7 @@ class P2PKVSender(CommonKVSender):
 
         if not is_last:
             self.kv_mgr.add_transfer_request(
-                self.bootstrap_room,
-                kv_indices,
-                index_slice,
-                False
+                self.bootstrap_room, kv_indices, index_slice, False
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -1424,8 +1443,7 @@ class P2PKVSender(CommonKVSender):
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(
-                self.bootstrap_room,
-                "P2P transfer failed due to an unknown reason"
+                self.bootstrap_room, "P2P transfer failed due to an unknown reason"
             )
         raise P2PTransferError(self.bootstrap_room, failure_reason)
 
@@ -1443,7 +1461,7 @@ class P2PKVReceiver(CommonKVReceiver):
         self,
         mgr: P2PKVManager,
         bootstrap_addr: str,
-        bootstrap_room: Optional[int] = None
+        bootstrap_room: Optional[int] = None,
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
@@ -1628,4 +1646,3 @@ class P2PKVReceiver(CommonKVReceiver):
 
 class P2PKVBootstrapServer(CommonKVBootstrapServer):
     pass
-
