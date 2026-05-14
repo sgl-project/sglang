@@ -56,9 +56,7 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
 
     if is_sm120_supported() and server_args.moe_runner_backend == "auto":
         server_args.moe_runner_backend = "marlin"
-        logger.info(
-            "Use marlin as MoE runner backend on SM120 for DeepSeekV4"
-        )
+        logger.info("Use marlin as MoE runner backend on SM120 for DeepSeekV4")
 
     if server_args.disaggregation_mode != "null" and server_args.pp_size > 1:
         # get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized

@@ -20,8 +20,6 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
     _is_sm120,
 )
-from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
-from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
@@ -65,7 +63,9 @@ def fp8_paged_mqa_logits_torch(
     device = q_fp8.device
 
     assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
-    assert block_size == 64, "Vectorized torch impl hardcodes block_size=64 cache layout"
+    assert (
+        block_size == 64
+    ), "Vectorized torch impl hardcodes block_size=64 cache layout"
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
