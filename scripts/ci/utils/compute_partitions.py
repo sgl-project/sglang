@@ -109,7 +109,7 @@ def load_partition_model(path):
 
 
 def compute_max_parallel(size: int) -> int:
-    return max(size // 4, 1)
+    return max(size // 3, 1)
 
 
 def compute_partitions(
@@ -251,7 +251,7 @@ def main():
                 )
             f.write(
                 f"`full_parallel={args.full_parallel}` "
-                f"(`size//4` throttle is lifted when true); {src_note}\n\n"
+                f"(`size//3` throttle is lifted when true); {src_note}\n\n"
             )
             f.write("| Suite | size | max_parallel |\n")
             f.write("|---|---:|---:|\n")
