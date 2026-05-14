@@ -125,11 +125,18 @@ def compute_partitions(
     `full_parallel=True` (scheduled cron or `high priority` PR) sets
     max_parallel = size, lifting the matrix-fanout throttle.
     """
+    # Only emit partitions for suites pr-test.yml actually dispatches.
+    # `run_timeouts` covers reusable stages; `_STAGE_A_OVERRIDES` covers
+    # the inline stage-a jobs. Stress / weekly / nightly-* suites have
+    # tests in test/registered/ but aren't run by pr-test.yml.
+    dispatched_suites = set(run_timeouts) | set(_STAGE_A_OVERRIDES)
     suite_tests = defaultdict(list)
     for t in tests:
         if t.backend not in _TARGET_BACKENDS:
             continue
         if t.nightly or t.disabled is not None:
+            continue
+        if t.effective_suite not in dispatched_suites:
             continue
         suite_tests[t.effective_suite].append(t)
 
@@ -160,7 +167,19 @@ def compute_partitions(
                     f"Suite {suite!r}: fit bias={bias}s >= target={target}s. "
                     "Investigate the fit or raise the stage's run_timeout_minutes."
                 )
-            size = max(1, math.ceil(coeff * total / budget))
+            ideal_size = math.ceil(coeff * total / budget)
+            # size > len(group) means at least one shard would be empty --
+            # the slowest single file alone is bigger than the per-shard
+            # budget. Either split that file, raise the stage's
+            # run_timeout_minutes, or update its in-source est_time if
+            # the live model already shows a smaller value.
+            if ideal_size > len(group):
+                raise RuntimeError(
+                    f"Suite {suite!r}: needs {ideal_size} shards but has only "
+                    f"{len(group)} test file(s). target={target:.0f}s, "
+                    f"coeff={coeff}, bias={bias}s, total_est={total:.0f}s."
+                )
+            size = max(1, ideal_size)
             max_parallel = size if full_parallel else compute_max_parallel(size)
         result[suite] = {
             "size": size,
