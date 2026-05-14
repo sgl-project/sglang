@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -143,15 +144,40 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.req_pool_indices,
                 prefix_lens,
             )
-            batch.out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                prefix_lens,
-                prefix_lens_cpu,
-                end_offset,
-                end_offset_cpu,
-                last_loc,
-                len(batch.input_ids),
-            )
+            hisparse_coordinator = batch.hisparse_coordinator
+            if (
+                self.topk == 1
+                and hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+            ):
+                allocator = batch.tree_cache.token_to_kv_pool_allocator
+                evict_from_tree_cache(
+                    batch.tree_cache,
+                    len(batch.input_ids) + len(prefix_lens_cpu) * allocator.page_size,
+                )
+                device_slots = hisparse_coordinator.get_draft_device_slots(
+                    batch.req_pool_indices,
+                    self.draft_token_num,
+                )
+                batch.out_cache_loc = allocator.alloc_extend_with_device_mapping(
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    len(batch.input_ids),
+                    device_slots,
+                )
+            else:
+                batch.out_cache_loc = alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    len(batch.input_ids),
+                )
 
         bs = batch.batch_size()
         assign_req_to_token_pool_func(
@@ -481,6 +507,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # try to unify the tensor representation and list representation
         num_correct_drafts_list = num_correct_drafts_cpu.tolist()
         num_accept_tokens_list = num_accept_tokens_cpu.tolist()
+
+        hisparse_coordinator = batch.hisparse_coordinator
+        if (
+            self.topk == 1
+            and hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            hisparse_coordinator.finalize_accepted_tokens(
+                batch.req_pool_indices,
+                batch.out_cache_loc[accept_index],
+                batch.out_cache_loc,
+                num_correct_drafts,
+                num_correct_drafts_cpu,
+                batch.seq_lens + num_accept_tokens_cpu.to(batch.seq_lens.device),
+            )
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.

@@ -77,7 +77,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     perl \
     patchelf \
     ccache \
-    git-lfs \
+    git \
     # MPI and NUMA
     libopenmpi-dev \
     libnuma1 \
@@ -139,8 +139,8 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
         https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
     && tar -xzf v${GDRCOPY_VERSION}.tar.gz && rm v${GDRCOPY_VERSION}.tar.gz \
     && cd gdrcopy-${GDRCOPY_VERSION}/packages \
-    && CUDA=/usr/local/cuda ./build-deb-packages.sh \
-    && dpkg -i gdrdrv-dkms_*.deb libgdrapi_*.deb gdrcopy-tests_*.deb gdrcopy_*.deb \
+    && CUDA=/usr/local/cuda ./build-deb-packages.sh -t \
+    && dpkg -i gdrdrv-dkms_*.deb libgdrapi_*.deb \
     && cd / && rm -rf /tmp/gdrcopy
 
 # Fix DeepEP IBGDA symlink

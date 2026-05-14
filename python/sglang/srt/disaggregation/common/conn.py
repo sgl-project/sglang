@@ -45,6 +45,34 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 
+def _count_nested_indices(indices) -> int:
+    if indices is None:
+        return 0
+    if isinstance(indices, np.ndarray):
+        return len(indices)
+    if isinstance(indices, (list, tuple)):
+        if not indices:
+            return 0
+        if isinstance(indices[0], (list, tuple, np.ndarray)):
+            return sum(_count_nested_indices(component) for component in indices)
+        return len(indices)
+    return 1
+
+
+def _sum_nested_ints(values) -> int:
+    if values is None:
+        return 0
+    if isinstance(values, np.ndarray):
+        return int(values.sum())
+    if isinstance(values, (list, tuple)):
+        if not values:
+            return 0
+        if isinstance(values[0], (list, tuple, np.ndarray)):
+            return sum(_sum_nested_ints(component) for component in values)
+        return sum(int(value) for value in values)
+    return int(values)
+
+
 @dataclasses.dataclass
 class PrefillServerInfo:
     # Topology fields (fetched from bootstrap server)
@@ -96,7 +124,7 @@ class CommonKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.kv_item_lens_sum = sum(args.kv_item_lens)
-        self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
+        self.state_item_lens_sum = _sum_nested_ints(args.state_item_lens)
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
@@ -515,10 +543,7 @@ class CommonKVSender(BaseKVSender):
         state_indices: Optional[List],
     ):
         self._transfer_num_kv_indices += len(kv_indices)
-        if state_indices:
-            for component_indices in state_indices:
-                if component_indices is not None:
-                    self._transfer_num_state_indices += len(component_indices)
+        self._transfer_num_state_indices += _count_nested_indices(state_indices)
 
     def send(
         self,

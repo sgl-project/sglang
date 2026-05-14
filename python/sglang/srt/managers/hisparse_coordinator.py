@@ -150,7 +150,7 @@ class HiSparseCoordinator:
             .contiguous()
         )
         self._device_buffer_arange_i32 = torch.arange(
-            self.device_buffer_size, dtype=torch.int32, device=device
+            self.padded_buffer_size, dtype=torch.int32, device=device
         )
 
         # Pre-allocated output buffer for swap_in_selected_pages (CUDA-graph safe)
@@ -381,9 +381,9 @@ class HiSparseCoordinator:
         self.req_to_device_buffer[req.req_pool_idx, :alloc_size] = buffer_indices
         self.req_device_buffer_size[req.req_pool_idx] = alloc_size
 
-        self.req_device_buffer_tokens[
-            :, req.req_pool_idx, : self.device_buffer_size
-        ] = self._device_buffer_arange_i32
+        self.req_device_buffer_tokens[:, req.req_pool_idx, :alloc_size] = (
+            self._device_buffer_arange_i32[:alloc_size]
+        )
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
@@ -645,6 +645,316 @@ class HiSparseCoordinator:
             return
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
+
+    def supports_hisparse_draft_slots(self) -> bool:
+        return True
+
+    def _ensure_padded_buffer(self, req_pool_indices: torch.Tensor) -> None:
+        req_indices_cpu = req_pool_indices.cpu().tolist()
+        grow_reqs = []
+        total_grow = 0
+        for req_idx in req_indices_cpu:
+            current_cap = int(self.req_device_buffer_size[req_idx])
+            if current_cap >= self.padded_buffer_size:
+                continue
+            grow_reqs.append((req_idx, current_cap))
+            total_grow += self.padded_buffer_size - current_cap
+
+        if total_grow == 0:
+            return
+
+        all_new = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+            total_grow
+        )
+        if all_new is None:
+            raise RuntimeError(
+                f"HiSparse: failed to grow buffers for draft slots (need {total_grow})"
+            )
+
+        offset = 0
+        for req_idx, current_cap in grow_reqs:
+            grow_size = self.padded_buffer_size - current_cap
+            chunk = all_new[offset : offset + grow_size]
+            offset += grow_size
+            self.req_to_device_buffer[req_idx, current_cap : self.padded_buffer_size] = (
+                chunk
+            )
+            self.req_device_buffer_tokens[
+                :, req_idx, current_cap : self.padded_buffer_size
+            ] = self._device_buffer_arange_i32[current_cap : self.padded_buffer_size]
+            self.req_device_buffer_token_locs[
+                :, req_idx, current_cap : self.padded_buffer_size
+            ] = chunk
+            self.req_device_buffer_size[req_idx] = self.padded_buffer_size
+
+    def get_draft_device_slots(
+        self,
+        req_pool_indices: torch.Tensor,
+        num_tokens_per_req: int,
+    ) -> torch.Tensor:
+        start = self.device_buffer_size + 1
+        end = start + num_tokens_per_req
+        if end > self.padded_buffer_size:
+            raise ValueError(
+                f"Requested {num_tokens_per_req} draft slots but extra page only "
+                f"has {self.padded_buffer_size - self.device_buffer_size - 1} "
+                f"available (padded_buffer_size={self.padded_buffer_size}, "
+                f"device_buffer_size={self.device_buffer_size})."
+            )
+        self._ensure_padded_buffer(req_pool_indices)
+        return self.req_to_device_buffer[req_pool_indices, start:end].reshape(-1)
+
+    def get_draft_device_slots_variable(
+        self,
+        req_pool_indices: torch.Tensor,
+        tokens_per_req_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        if tokens_per_req_cpu.numel() == 0:
+            return torch.empty(0, dtype=torch.int64, device=req_pool_indices.device)
+
+        start = self.device_buffer_size + 1
+        max_tokens = int(tokens_per_req_cpu.max().item())
+        if start + max_tokens > self.padded_buffer_size:
+            raise ValueError(
+                f"Max per-request draft slots ({max_tokens}) exceeds extra page "
+                f"capacity ({self.padded_buffer_size - self.device_buffer_size - 1})."
+            )
+
+        self._ensure_padded_buffer(req_pool_indices)
+
+        total_slots = int(tokens_per_req_cpu.sum().item())
+        if total_slots == 0:
+            return torch.empty(0, dtype=torch.int64, device=req_pool_indices.device)
+
+        tokens_per_req = tokens_per_req_cpu.to(
+            device=req_pool_indices.device, dtype=torch.int64
+        )
+        row_indices = torch.repeat_interleave(req_pool_indices, tokens_per_req)
+        offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64, device=tokens_per_req.device),
+                tokens_per_req.cumsum(0),
+            ]
+        )
+        pos_in_segment = torch.arange(total_slots, device=tokens_per_req.device) - (
+            torch.repeat_interleave(offsets[:-1], tokens_per_req)
+        )
+        col_indices = start + pos_in_segment
+
+        return self.req_to_device_buffer[row_indices, col_indices]
+
+    def finalize_accepted_tokens(
+        self,
+        req_pool_indices: torch.Tensor,
+        accepted_cache_locs: torch.Tensor,
+        draft_cache_locs: torch.Tensor,
+        num_correct_drafts: torch.Tensor,
+        num_correct_drafts_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        if accepted_cache_locs.numel() == 0:
+            return
+
+        if self.is_dsv4_hisparse:
+            self._finalize_accepted_tokens_dsv4(
+                req_pool_indices,
+                accepted_cache_locs,
+                draft_cache_locs,
+                num_correct_drafts,
+                num_correct_drafts_cpu,
+                seq_lens,
+            )
+            return
+
+        counts = num_correct_drafts.to(torch.int64) + 1
+        counts_cpu = num_correct_drafts_cpu.to(torch.int64) + 1
+        total_accepted = int(counts_cpu.sum().item())
+        if total_accepted != accepted_cache_locs.numel():
+            raise ValueError(
+                "HiSparse accepted token bookkeeping mismatch: "
+                f"expected {total_accepted} cache locs, got {accepted_cache_locs.numel()}."
+            )
+
+        all_device_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
+            accepted_cache_locs
+        )
+        full_to_device_mapping = (
+            self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        )
+        draft_mapping_snapshot = full_to_device_mapping[draft_cache_locs].clone()
+
+        offsets = torch.cat(
+            [torch.zeros(1, dtype=torch.int64, device=counts.device), counts.cumsum(0)]
+        )
+        starts = seq_lens - counts
+        all_indices = torch.arange(total_accepted, device=counts.device)
+        req_indices_expanded = torch.repeat_interleave(req_pool_indices, counts)
+        pos_in_segment = all_indices - torch.repeat_interleave(offsets[:-1], counts)
+        col_indices = torch.repeat_interleave(starts, counts) + pos_in_segment
+
+        col_indices_cpu = col_indices.cpu()
+        req_indices_cpu = req_indices_expanded.cpu()
+        host_locs = torch.cat(
+            [
+                self.ensure_host_slots(int(req_idx), int(col_idx), 1)
+                for req_idx, col_idx in zip(req_indices_cpu, col_indices_cpu)
+            ]
+        )
+        if host_locs.numel() != total_accepted:
+            full_to_device_mapping[draft_cache_locs] = draft_mapping_snapshot
+            raise RuntimeError("HiSparse host slot allocation mismatch for draft accept")
+
+        full_to_device_mapping[draft_cache_locs] = 0
+
+        with device_module.stream(self.decode_backup_stream):
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                all_device_locs.contiguous(),
+                io_backend="kernel",
+            )
+            if host_locs.is_cuda:
+                host_locs.record_stream(self.decode_backup_stream)
+            if all_device_locs.is_cuda:
+                all_device_locs.record_stream(self.decode_backup_stream)
+        event = device_module.Event()
+        event.record(self.decode_backup_stream)
+        device_module.current_stream().wait_event(event)
+
+        newest_slots = self.req_to_device_buffer[
+            req_pool_indices, self.device_buffer_size
+        ]
+        for idx in req_pool_indices.tolist():
+            self._skip_first_backup[idx] = True
+
+        last_offsets = offsets[1:] - 1
+        last_logical = accepted_cache_locs[last_offsets]
+        last_device = all_device_locs[last_offsets]
+        full_to_device_mapping[last_logical] = newest_slots
+        self.mem_pool_device.transfer_values_on_device(
+            dst_indices=newest_slots,
+            src_indices=last_device,
+        )
+
+    def _finalize_accepted_tokens_dsv4(
+        self,
+        req_pool_indices: torch.Tensor,
+        accepted_cache_locs: torch.Tensor,
+        draft_cache_locs: torch.Tensor,
+        num_correct_drafts: torch.Tensor,
+        num_correct_drafts_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        counts = num_correct_drafts.to(torch.int64) + 1
+        counts_cpu = num_correct_drafts_cpu.to(torch.int64) + 1
+        total_accepted = int(counts_cpu.sum().item())
+        if total_accepted != accepted_cache_locs.numel():
+            raise ValueError(
+                "DeepSeek V4 HiSparse accepted token bookkeeping mismatch: "
+                f"expected {total_accepted} cache locs, got {accepted_cache_locs.numel()}."
+            )
+
+        offsets = torch.cat(
+            [torch.zeros(1, dtype=torch.int64, device=counts.device), counts.cumsum(0)]
+        )
+        all_indices = torch.arange(total_accepted, device=counts.device)
+        pos_in_segment = all_indices - torch.repeat_interleave(offsets[:-1], counts)
+        starts = seq_lens - counts
+        full_positions = torch.repeat_interleave(starts, counts) + pos_in_segment
+        compressed_mask = (accepted_cache_locs + 1) % self.compress_ratio == 0
+
+        full_to_device_mapping = (
+            self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        )
+        draft_compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
+            draft_cache_locs
+        )
+        draft_mapping_snapshot = full_to_device_mapping[draft_compressed_locs].clone()
+
+        if not torch.any(compressed_mask):
+            full_to_device_mapping[draft_compressed_locs] = 0
+            return
+
+        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
+            accepted_cache_locs
+        )
+        device_locs = full_to_device_mapping[compressed_locs]
+
+        req_indices_expanded = torch.repeat_interleave(req_pool_indices, counts)
+        compressed_req_indices = req_indices_expanded[compressed_mask]
+        compressed_positions = full_positions[compressed_mask] // self.compress_ratio
+        if compressed_locs.numel() != compressed_req_indices.numel():
+            full_to_device_mapping[draft_compressed_locs] = draft_mapping_snapshot
+            raise RuntimeError(
+                "DeepSeek V4 HiSparse compressed draft bookkeeping mismatch: "
+                f"{compressed_locs.numel()} compressed locs vs "
+                f"{compressed_req_indices.numel()} compressed positions."
+            )
+
+        compressed_req_indices_cpu = compressed_req_indices.cpu()
+        compressed_positions_cpu = compressed_positions.cpu()
+        host_locs = torch.cat(
+            [
+                self.ensure_host_slots(int(req_idx), int(pos), 1)
+                for req_idx, pos in zip(
+                    compressed_req_indices_cpu, compressed_positions_cpu
+                )
+            ]
+        )
+        if host_locs.numel() != compressed_locs.numel():
+            full_to_device_mapping[draft_compressed_locs] = draft_mapping_snapshot
+            raise RuntimeError(
+                "DeepSeek V4 HiSparse host slot allocation mismatch for draft accept"
+            )
+
+        full_to_device_mapping[draft_compressed_locs] = 0
+
+        with device_module.stream(self.decode_backup_stream):
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs.contiguous(),
+                io_backend="kernel",
+            )
+            if host_locs.is_cuda:
+                host_locs.record_stream(self.decode_backup_stream)
+            if device_locs.is_cuda:
+                device_locs.record_stream(self.decode_backup_stream)
+        event = device_module.Event()
+        event.record(self.decode_backup_stream)
+        device_module.current_stream().wait_event(event)
+
+        newest_slots = self.req_to_device_buffer[
+            req_pool_indices, self.device_buffer_size
+        ]
+        for idx in req_pool_indices.tolist():
+            self._skip_first_backup[idx] = True
+
+        compressed_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64, device=counts.device),
+                torch.cumsum(
+                    torch.bincount(
+                        compressed_req_indices,
+                        minlength=self.req_to_device_buffer.shape[0],
+                    )[req_pool_indices].to(torch.int64),
+                    dim=0,
+                ),
+            ]
+        )
+        has_compressed = compressed_offsets[1:] > compressed_offsets[:-1]
+        if not torch.any(has_compressed):
+            return
+
+        active_newest_slots = newest_slots[has_compressed]
+        last_compressed_offsets = compressed_offsets[1:][has_compressed] - 1
+        last_compressed_locs = compressed_locs[last_compressed_offsets]
+        last_device_locs = device_locs[last_compressed_offsets]
+        full_to_device_mapping[last_compressed_locs] = active_newest_slots
+        self.mem_pool_device.transfer_values_on_device(
+            dst_indices=active_newest_slots,
+            src_indices=last_device_locs,
+        )
 
     def naive_load_topk(
         self,

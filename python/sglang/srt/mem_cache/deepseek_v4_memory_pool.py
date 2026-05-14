@@ -232,6 +232,43 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         loc = self.translate_loc_to_hisparse_device(loc)
         return super().set_key_buffer_fused(layer_id, loc, cache_k)
 
+    def transfer_values_on_device(
+        self, dst_indices: torch.Tensor, src_indices: torch.Tensor
+    ) -> None:
+        if dst_indices.numel() == 0:
+            return
+        if dst_indices.numel() != src_indices.numel():
+            raise RuntimeError(
+                "HiSparseC4DevicePool device transfer mismatch: "
+                f"{dst_indices.numel()} dst indices vs {src_indices.numel()} src indices."
+            )
+
+        dst_indices = dst_indices.to(device=self.device, dtype=torch.int64)
+        src_indices = src_indices.to(device=self.device, dtype=torch.int64)
+
+        bytes_per_token = self.get_bytes_per_token()
+        byte_offsets = torch.arange(bytes_per_token, device=self.device)
+
+        src_pages = src_indices // self.page_size
+        dst_pages = dst_indices // self.page_size
+        src_offsets = (src_indices % self.page_size) * bytes_per_token
+        dst_offsets = (dst_indices % self.page_size) * bytes_per_token
+
+        src_flat_indices = (
+            src_pages[:, None] * self.bytes_per_page_padded
+            + src_offsets[:, None]
+            + byte_offsets[None, :]
+        ).reshape(-1)
+        dst_flat_indices = (
+            dst_pages[:, None] * self.bytes_per_page_padded
+            + dst_offsets[:, None]
+            + byte_offsets[None, :]
+        ).reshape(-1)
+
+        for buf in self.kv_buffer:
+            flat = buf.reshape(-1)
+            flat[dst_flat_indices] = flat[src_flat_indices].clone()
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
 
