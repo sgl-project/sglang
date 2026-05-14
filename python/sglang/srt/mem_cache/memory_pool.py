@@ -45,6 +45,7 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
@@ -2026,9 +2027,14 @@ class NSATokenToKVPool(MLATokenToKVPool):
         assert index_head_dim == 128
 
         if _is_hip:
-            assert (
-                self.page_size % 16 == 0
-            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+            if aiter_can_use_preshuffle_paged_mqa():
+                assert (
+                    self.page_size % 16 == 0
+                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+            else:
+                assert (
+                    self.page_size == 1
+                ), f"HIP legacy NSA path requires page_size == 1, got {self.page_size}"
         else:
             assert self.page_size == 64
         with (

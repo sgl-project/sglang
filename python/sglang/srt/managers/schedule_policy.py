@@ -105,11 +105,13 @@ def match_prefix_for_req(
         req.prefix_indices,
         req.last_node,
         req.last_host_node,
+        req.best_match_node,
         req.host_hit_length,
     ) = (
         match_result.device_indices,
         match_result.last_device_node,
         match_result.last_host_node,
+        match_result.best_match_node,
         match_result.host_hit_length,
     )
     if match_result.mamba_branching_seqlen is not None:
@@ -877,7 +879,7 @@ class PrefillAdder:
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
-                        last_host_node=req.last_host_node,
+                        best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
