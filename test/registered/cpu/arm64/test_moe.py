@@ -5,6 +5,10 @@ on Arm64 via aarch64/moe.cpp (PR #16045). Additional quantization paths
 (BF16, INT4) will be added here as Arm kernels land.
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="per-commit-cpu-arm64")
+
 import itertools
 import math
 import os
