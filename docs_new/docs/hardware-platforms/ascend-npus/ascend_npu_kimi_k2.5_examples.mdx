@@ -229,7 +229,7 @@ for i in "${!P_IP[@]}";
 do
     if [[ " $LOCAL_IPS " =~ " ${P_IP[$i]} " ]];
     then
-        echo "Prefill -> ${P_IP[@]}"
+        echo "Prefill -> ${P_IP[$i]}"
 
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
