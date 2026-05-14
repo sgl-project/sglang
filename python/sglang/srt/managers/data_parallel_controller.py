@@ -89,25 +89,35 @@ class LoadBalanceMethod(Enum):
 class DPBudget:
     def __init__(self, dp_size: int):
         self.dp_size = dp_size
+        self._tie_breaker = 0
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
+
+    def _choose_min_rank(self, key_fn: Callable[[int], object]):
+        min_key = min(key_fn(i) for i in range(self.dp_size))
+        for offset in range(self.dp_size):
+            dp_rank = (self._tie_breaker + offset) % self.dp_size
+            if key_fn(dp_rank) == min_key:
+                self._tie_breaker = (dp_rank + 1) % self.dp_size
+                return dp_rank
+        raise RuntimeError("No data parallel rank is available for dispatch.")
 
     def update_budget(self, load_update: WatchLoadUpdateReq):
         """Update the budget."""
         for load in load_update.loads:
-            self.total_requests[load.dp_rank] = (
+            dp_rank = load.dp_rank
+            self.total_requests[dp_rank] = (
                 load.num_running_reqs + load.num_waiting_reqs
             )
-            self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.total_tokens[dp_rank] = load.num_total_tokens
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
-            target_rank = self.total_requests.index(min(self.total_requests))
+            target_rank = self._choose_min_rank(lambda i: self.total_requests[i])
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
             # Use total_requests as a tie-breaker when total_tokens are equal
-            target_rank = min(
-                range(self.dp_size),
-                key=lambda i: (self.total_tokens[i], self.total_requests[i]),
+            target_rank = self._choose_min_rank(
+                lambda i: (self.total_tokens[i], self.total_requests[i])
             )
         else:
             return None
