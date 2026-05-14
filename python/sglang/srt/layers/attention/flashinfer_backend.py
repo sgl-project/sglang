@@ -50,6 +50,7 @@ if is_flashinfer_available():
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
+        MultiLevelCascadeAttentionWrapper,
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
@@ -93,7 +94,7 @@ class MultiItemScoringParams:
 @dataclass
 class DecodeMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
-
+    cascade_decode_wrapper: Optional[MultiLevelCascadeAttentionWrapper] = None
 
 @dataclass
 class PrefillMetadata:
@@ -121,6 +122,7 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         init_new_workspace: bool = False,
+        enable_cascade: bool = False
     ):
         super().__init__()
         self.prefill_backend = "fa2"
@@ -232,6 +234,11 @@ class FlashInferAttnBackend(AttentionBackend):
             assert self.num_wrappers == 1
             self.kv_last_page_len = kv_last_page_len_buf
 
+        self.cascade_unique_kv_indptr = torch.zeros((max_bs + 1,), dtype=torch.int32, device=model_runner.device)
+        self.cascade_shared_kv_indptr = torch.zeros(2, dtype=torch.int32, device=model_runner.device)
+        self.cascade_unique_qo_indptr = torch.arange(max_bs + 1, dtype=torch.int32, device=model_runner.device)
+        self.cascade_shared_qo_indptr = torch.zeros(2, dtype=torch.int32, device=model_runner.device)
+
         if not self.skip_prefill:
             self.qo_indptr = [
                 torch.zeros(
@@ -286,6 +293,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
 
+        self.cascade_decode_wrapper: Optional[MultiLevelCascadeAttentionWrapper] = (
+            MultiLevelCascadeAttentionWrapper(
+                2,
+                self.workspace_buffer,
+                "NHD",
+            )
+            if enable_cascade
+            else None
+        )
+
         # Create indices updater
         if not skip_prefill:
             self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(
@@ -297,8 +314,10 @@ class FlashInferAttnBackend(AttentionBackend):
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
 
         self.decode_cuda_graph_metadata = {}
+        self.decode_cuda_graph_cascade_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+        self.enable_cascade = enable_cascade
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -432,7 +451,11 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        prefix_lens: Optional[torch.Tensor] = None,
+    ):
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -440,12 +463,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
                 decode_wrappers=self.decode_wrappers,
+                cascade_decode_wrapper=self.cascade_decode_wrapper,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
+                prefix_lens=prefix_lens,
             )
-            self.forward_metadata = DecodeMetadata(self.decode_wrappers)
+            self.forward_metadata = DecodeMetadata(
+                self.decode_wrappers,
+                self.cascade_decode_wrapper,
+            )
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -585,6 +613,11 @@ class FlashInferAttnBackend(AttentionBackend):
                         ],
                     )
                 )
+            cascade_decode_wrapper = (
+                MultiLevelCascadeAttentionWrapper(2, self.workspace_buffer, "NHD")
+                if self.enable_cascade
+                else None
+            )
             seq_lens_sum = seq_lens.sum().item()
             self.indices_updater_decode.update(
                 req_pool_indices,
@@ -592,13 +625,15 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
                 decode_wrappers=decode_wrappers,
+                cascade_decode_wrapper=cascade_decode_wrapper,
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
-            self.forward_metadata = DecodeMetadata(decode_wrappers)
+            self.decode_cuda_graph_cascade_metadata[bs] = cascade_decode_wrapper
+            self.forward_metadata = DecodeMetadata(decode_wrappers, cascade_decode_wrapper)
             for i in range(self.num_wrappers):
                 decode_wrappers[i].begin_forward = partial(
                     fast_decode_plan, decode_wrappers[i]
@@ -729,6 +764,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 decode_wrappers=self.decode_cuda_graph_metadata[bs],
+                cascade_decode_wrapper=self.decode_cuda_graph_cascade_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
                 fixed_split_size=None,
@@ -916,16 +952,37 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        # Call the wrapped function
-        o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        cascade_wrapper = self.forward_metadata.cascade_decode_wrapper
+        if cascade_wrapper is not None:
+            prefill_wrappers = cascade_wrapper._batch_prefill_wrappers
+            o, lse = prefill_wrappers[-1].run(
+                q_view, kv_cache,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+                return_lse=True,
+            )
+            for w in prefill_wrappers[:-1]:
+                o_i, lse_i = w.run(
+                    q_view, kv_cache,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                    return_lse=True,
+                )
+                o, lse = merge_state(o, lse, o_i, lse_i)
+
+        else:
+            o = decode_wrapper.forward(
+                q_view,
+                kv_cache,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -955,12 +1012,17 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.sm_scale = 1.0 / (self.head_dim ** 0.5)
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        self.cascade_unique_kv_indptr = attn_backend.cascade_unique_kv_indptr
+        self.cascade_shared_kv_indptr = attn_backend.cascade_shared_kv_indptr
+        self.cascade_unique_qo_indptr = attn_backend.cascade_unique_qo_indptr
+        self.cascade_shared_qo_indptr = attn_backend.cascade_shared_qo_indptr
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -978,10 +1040,12 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
+        cascade_decode_wrapper: Optional[MultiLevelCascadeAttentionWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        prefix_lens: Optional[torch.Tensor] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -993,10 +1057,12 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
+        cascade_decode_wrapper: Optional[MultiLevelCascadeAttentionWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        prefix_lens: Optional[torch.Tensor] = None,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
@@ -1011,6 +1077,14 @@ class FlashInferIndicesUpdaterDecode:
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
+        cascade = cascade_decode_wrapper or self.attn_backend.cascade_decode_wrapper
+        if cascade is not None and prefix_lens is not None:
+            self.call_cascade_begin_forward(
+                cascade,
+                req_pool_indices,
+                seq_lens,
+                prefix_lens,
+            )
 
     def update_sliding_window(
         self,
@@ -1202,6 +1276,65 @@ class FlashInferIndicesUpdaterDecode:
 
         if locally_override:
             global_override_indptr_cpu = None
+
+    def call_cascade_begin_forward(
+        self,
+        wrapper: MultiLevelCascadeAttentionWrapper,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+    ):
+        bs = len(req_pool_indices)
+        unique_lens = seq_lens - prefix_lens
+
+        shared_qo_indptr = self.cascade_shared_qo_indptr   # [0, 0] pre-allocated
+        shared_qo_indptr[1] = bs                            # in-place, no CPU sync
+
+        shared_kv_indptr = self.cascade_shared_kv_indptr   # [0, 0] pre-allocated
+        shared_kv_indptr[1] = prefix_lens[0]               # in-place, no CPU sync
+
+        # CPU sync: Python slice notation requires an int, not a GPU tensor.
+        shared_prefix_len = prefix_lens[0].item()
+        shared_kv_indices = self.req_to_token[req_pool_indices[0], :shared_prefix_len].int()
+        shared_kv_last_page_len = torch.ones(1, dtype=torch.int32, device="cuda")
+
+        # Unique level: each request attends to its own tail tokens.
+        unique_qo_indptr = self.cascade_unique_qo_indptr[: bs + 1]    # pre-allocated arange slice
+        unique_kv_indptr = self.cascade_unique_kv_indptr              # pre-allocated, update in-place
+        unique_kv_indptr[0] = 0
+        unique_kv_indptr[1 : bs + 1] = torch.cumsum(unique_lens, dim=0).to(torch.int32)
+        unique_kv_indptr_view = unique_kv_indptr[: bs + 1]
+
+        # CPU sync: tensor allocation size must be a Python int.
+        unique_kv_indices = torch.empty(
+            unique_lens.sum().item(), dtype=torch.int32, device="cuda"
+        )
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            req_pool_indices,
+            unique_lens,
+            unique_kv_indptr_view,
+            prefix_lens,
+            unique_kv_indices,
+            self.req_to_token.shape[1],
+        )
+        unique_kv_last_page_len = self.kv_last_page_len[:bs]
+
+        wrapper.plan(
+            qo_indptr_arr=[shared_qo_indptr, unique_qo_indptr],
+            paged_kv_indptr_arr=[shared_kv_indptr, unique_kv_indptr_view],
+            paged_kv_indices_arr=[shared_kv_indices, unique_kv_indices],
+            paged_kv_last_page_len=[shared_kv_last_page_len, unique_kv_last_page_len],
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            page_size=1,
+            causal=False,
+            sm_scale=self.sm_scale,
+            logits_soft_cap=None,
+            q_data_type=self.q_data_type,
+            kv_data_type=self.data_type,
+        )
 
 
 class FlashInferIndicesUpdaterPrefill:

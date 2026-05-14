@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -11,7 +12,13 @@ from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBack
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.utils import is_flashinfer_available
 from sglang.test.test_utils import CustomTestCase
+
+if is_flashinfer_available():
+    from flashinfer import MultiLevelCascadeAttentionWrapper
+
+    from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
 
 class MockModelRunner:
@@ -553,6 +560,163 @@ class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
         )
         self.assertTrue(torch.equal(cache_seqlens_int32, expected_cache_seqlens))
         self.assertTrue(torch.equal(page_table, expected_page_table))
+
+
+class MockModelRunnerFlashInfer:
+    def __init__(self, num_heads=4, head_dim=64):
+        self.device = "cuda"
+        self.dtype = torch.float16
+        self.kv_cache_dtype = torch.float16
+        self.sliding_window_size = None
+        self.page_size = 1
+        max_batch_size = 64
+        max_context_len = 1024
+
+        self.model_config = type(
+            "ModelConfig",
+            (),
+            {
+                "context_len": max_context_len,
+                "is_multimodal": False,
+                "is_encoder_decoder": False,
+                "num_attention_heads": num_heads,
+                "head_dim": head_dim,
+                "hf_config": type(
+                    "HFConfig", (), {"architectures": ["LlamaForCausalLM"]}
+                )(),
+                "get_num_kv_heads": lambda self, tp: num_heads,
+            },
+        )()
+
+        self.server_args = type(
+            "ServerArgs",
+            (),
+            {
+                "multi_item_scoring_delimiter": None,
+                "enable_deterministic_inference": False,
+                "dllm_algorithm": None,
+            },
+        )()
+
+        self.req_to_token_pool = type(
+            "TokenPool",
+            (),
+            {
+                "size": max_batch_size,
+                "req_to_token": torch.zeros(
+                    max_batch_size, max_context_len, dtype=torch.int32, device="cuda"
+                ),
+            },
+        )()
+
+        self.token_to_kv_pool = MHATokenToKVPool(
+            size=max_batch_size * max_context_len,
+            page_size=1,
+            dtype=self.dtype,
+            head_num=num_heads,
+            head_dim=head_dim,
+            layer_num=1,
+            device="cuda",
+            enable_memory_saver=False,
+        )
+
+        self.token_to_kv_pool_allocator = type("Allocator", (), {})()
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+@unittest.skipIf(not is_flashinfer_available(), "Test requires flashinfer")
+class TestFlashInferCascadeBackend(CustomTestCase):
+    def setUp(self):
+        self._tp_patch = patch(
+            "sglang.srt.layers.attention.flashinfer_backend.get_attention_tp_size",
+            return_value=1,
+        )
+        self._tp_patch.start()
+        self.batch_size = 4
+        self.prefix_len = 64
+        self.unique_len = 32
+        self.num_heads = 4
+        self.head_dim = 64
+        self.device = "cuda"
+        self.dtype = torch.float16
+
+    def tearDown(self):
+        self._tp_patch.stop()
+
+    def _make_runner(self):
+        return MockModelRunnerFlashInfer(self.num_heads, self.head_dim)
+
+    def _make_layer(self):
+        return RadixAttention(
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            scaling=self.head_dim**-0.5,
+            num_kv_heads=self.num_heads,
+            layer_id=0,
+        )
+
+    def _make_shared_prefix_batch(self, runner, backend, prefix_len, unique_len):
+        bs = self.batch_size
+        seq_len = prefix_len + unique_len
+        total_kv = prefix_len + bs * unique_len
+        req_to_token = runner.req_to_token_pool.req_to_token
+        for i in range(bs):
+            req_to_token[i, :prefix_len] = torch.arange(
+                prefix_len, dtype=torch.int32, device=self.device
+            )
+            req_to_token[i, prefix_len:seq_len] = torch.arange(
+                prefix_len + i * unique_len,
+                prefix_len + (i + 1) * unique_len,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        seq_lens_t = torch.tensor([seq_len] * bs, dtype=torch.int32, device=self.device)
+        batch = ForwardBatch(
+            batch_size=bs,
+            input_ids=torch.zeros(bs, dtype=torch.int64, device=self.device),
+            out_cache_loc=torch.zeros(bs, dtype=torch.int32, device=self.device),
+            seq_lens_sum=bs * seq_len,
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=torch.arange(bs, dtype=torch.int32, device=self.device),
+            seq_lens=seq_lens_t,
+            seq_lens_cpu=torch.tensor([seq_len] * bs, dtype=torch.int32),
+            attn_backend=backend,
+        )
+        batch.req_to_token_pool = runner.req_to_token_pool
+        batch.token_to_kv_pool = runner.token_to_kv_pool
+        return batch, total_kv
+
+    def test_cascade_output_matches_regular_decode(self):
+        bs = self.batch_size
+        prefix_len = self.prefix_len
+        unique_len = self.unique_len
+
+        runner = self._make_runner()
+        layer = self._make_layer()
+
+        backend_ref = FlashInferAttnBackend(runner, enable_cascade=False)
+        batch_ref, total_kv = self._make_shared_prefix_batch(runner, backend_ref, prefix_len, unique_len)
+
+        k = torch.randn(total_kv, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
+        v = torch.randn(total_kv, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
+        runner.token_to_kv_pool.set_kv_buffer(
+            layer, torch.arange(total_kv, device=self.device), k, v, layer.k_scale, layer.v_scale
+        )
+        backend_ref.init_forward_metadata(batch_ref)
+
+        backend_cas = FlashInferAttnBackend(runner, enable_cascade=True)
+        batch_cas, _ = self._make_shared_prefix_batch(runner, backend_cas, prefix_len, unique_len)
+        prefix_lens = torch.tensor([prefix_len] * bs, dtype=torch.int32, device=self.device)
+        backend_cas.init_forward_metadata(batch_cas, prefix_lens=prefix_lens)
+
+        q = torch.randn(bs, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
+        out_ref = backend_ref.forward_decode(q, None, None, layer, batch_ref, save_kv_cache=False)
+        out_cas = backend_cas.forward_decode(q, None, None, layer, batch_cas, save_kv_cache=False)
+
+        self.assertTrue(
+            torch.allclose(out_ref, out_cas, atol=1e-2, rtol=0),
+            f"max diff: {(out_ref - out_cas).abs().max().item():.4f}",
+        )
 
 
 if __name__ == "__main__":
