@@ -448,7 +448,7 @@ When using EvalScope commands without specifying a dataset or model path, it wil
   File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/adapters.py", line 676, in send
     raise SSLError(e, request=request)
 requests.exceptions.SSLError: HTTPSConnectionPool(host='www.modelscope.cn', port=443): Max retries exceeded with url: /api/v1/datasets/AI-ModelScope/gsm8k (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1016)')))
-[ERROR] 2026-05-13-02:20:01 (PID:876, Device:-1, RankID:-1) ERR99999 UNKNOWN applicaiton exception
+[ERROR] 2026-05-13-02:20:01 (PID:876, Device:-1, RankID:-1) ERR99999 UNKNOWN application exception
 ```
 You can navigate to `/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py`, find the `class Session` definition, and set `self.verify` to `False` to resolve this.
 

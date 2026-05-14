@@ -138,7 +138,50 @@ The `alloc_extend_kernel` operator appears to have a memory allocation issue. Pe
 
 Modify `sglang/srt/hardware_backend/npu/allocator_npu.py` to comment out the affected branch and use the else branch instead.
 
-![Workaround](/images/ascend_npu_workaround.png)
+```text highlight=15-36
+    def alloc_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        num_new_pages: int = None,
+    ):
+        ...
+        if num_new_pages_item > len(self.free_pages):
+            return None
+
+        # if num_new_pages_item < 200:
+        #     from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
+
+        #     out_indices = torch.empty(
+        #         (extend_num_tokens,),
+        #         dtype=torch.int64,
+        #         device=self.device,
+        #     )
+        #     max_num_extend_tokens = next_power_of_2(extend_num_tokens)
+        #     bs = prefix_lens.shape[0]
+        #     alloc_extend_kernel[(bs,)](
+        #         prefix_lens,
+        #         seq_lens,
+        #         last_loc,
+        #         self.free_pages,
+        #         out_indices,
+        #         next_power_of_2(bs),
+        #         self.page_size,
+        #         max_num_extend_tokens,
+        #     )
+
+        # else:
+            out_indices = torch.empty(
+                (extend_num_tokens,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        ...
+```
 
 ## 4. Out of NPU memory
 
