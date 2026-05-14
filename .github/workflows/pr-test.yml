@@ -283,16 +283,10 @@ jobs:
       self_name: stage-a-test-1-gpu-small
       runner_config: 1-gpu-small
       runs_on: 1-gpu-5090
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       run_timeout_minutes: '10'
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-a-test-cpu:
@@ -375,15 +369,9 @@ jobs:
       self_name: stage-b-test-1-gpu-small
       runner_config: 1-gpu-small
       runs_on: 1-gpu-5090
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
@@ -395,16 +383,10 @@ jobs:
       self_name: stage-b-test-1-gpu-large
       runner_config: 1-gpu-large
       runs_on: 1-gpu-h100
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       timeout_per_file: '1800'
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-b-test-2-gpu-large:
@@ -415,15 +397,9 @@ jobs:
       self_name: stage-b-test-2-gpu-large
       runner_config: 2-gpu-large
       runs_on: 2-gpu-h100
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-b-test-4-gpu-b200:
@@ -434,17 +410,11 @@ jobs:
       self_name: stage-b-test-4-gpu-b200
       runner_config: 4-gpu-b200
       runs_on: ${{ needs.check-changes.outputs.b200_runner }}
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       run_timeout_minutes: '40'
       extra_pytest_path: 'python/sglang/jit_kernel/tests/test_flash_attention_4.py'
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   call-multimodal-gen-tests:
@@ -488,15 +458,9 @@ jobs:
       self_name: stage-c-test-4-gpu-h100
       runner_config: 4-gpu-h100
       runs_on: 4-gpu-h100
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-8-gpu-h200:
@@ -507,12 +471,9 @@ jobs:
       self_name: stage-c-test-8-gpu-h200
       runner_config: 8-gpu-h200
       runs_on: 8-gpu-h200
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       # Per-model TP must match the test's launch in test/registered/ -- see
       # FALLBACK_ARGS in scripts/ci/cuda/warmup_deep_gemm.py for extra dp/ep
       # flags. Only models that actually invoke DeepGEMM kernels at runtime
@@ -520,9 +481,6 @@ jobs:
       # Server CUDA Graph warmup is combined into this step (warmup_server_models unset).
       warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8 zai-org/GLM-5-FP8:8 XiaomiMiMo/MiMo-V2-Flash:4 XiaomiMiMo/MiMo-V2.5:8'
       warmup_timeout_minutes: '60'
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-8-gpu-h20:
@@ -533,15 +491,9 @@ jobs:
       self_name: stage-c-test-8-gpu-h20
       runner_config: 8-gpu-h20
       runs_on: 8-gpu-h20
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-deepep-4-gpu-h100:
@@ -552,17 +504,11 @@ jobs:
       self_name: stage-c-test-deepep-4-gpu-h100
       runner_config: deepep-4-gpu-h100
       runs_on: 4-gpu-h100
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4'
       warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-deepep-8-gpu-h200:
@@ -573,18 +519,12 @@ jobs:
       self_name: stage-c-test-deepep-8-gpu-h200
       runner_config: deepep-8-gpu-h200
       runs_on: 8-gpu-h200-deepep
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       run_timeout_minutes: '45'
       warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8'
       warmup_server_models: 'deepseek-ai/DeepSeek-V3-0324:8'
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-4-gpu-b200:
@@ -595,16 +535,10 @@ jobs:
       self_name: stage-c-test-4-gpu-b200
       runner_config: 4-gpu-b200
       runs_on: ${{ needs.check-changes.outputs.b200_runner }}
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       timeout_per_file: '1800'
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-dsv4-4-gpu-b200:
@@ -615,16 +549,10 @@ jobs:
       self_name: stage-c-test-dsv4-4-gpu-b200
       runner_config: dsv4-4-gpu-b200
       runs_on: ${{ needs.check-changes.outputs.b200_runner }}
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       timeout_per_file: '1800'
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   stage-c-test-dsv4-8-gpu-h200:
@@ -635,16 +563,10 @@ jobs:
       self_name: stage-c-test-dsv4-8-gpu-h200
       runner_config: dsv4-8-gpu-h200
       runs_on: 8-gpu-h200
-      target_stage: ${{ inputs.target_stage || '' }}
-      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      main_package: ${{ needs.check-changes.outputs.main_package }}
-      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       timeout_per_file: '1800'
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-      git_ref: ${{ inputs.git_ref || '' }}
-      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   pr-test-finish:
