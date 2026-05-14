@@ -295,8 +295,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 prefix=add_prefix("shared_expert", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if (get_moe_a2a_backend().is_deepep()
-                        or get_moe_a2a_backend().is_flashinfer())
+                    if (
+                        get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_flashinfer()
+                    )
                     else {}
                 ),
             )
@@ -477,10 +479,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
             final_hidden_states = self.experts(hidden_states, topk_output)
-        elif (
-            self.alt_stream is not None
-            and get_is_capture_mode()
-        ):
+        elif self.alt_stream is not None and get_is_capture_mode():
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states
             )
