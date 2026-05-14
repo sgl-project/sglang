@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from array import array
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
@@ -71,7 +72,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         # Set fields
         self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int32, device=self.device
+            sum(input_ids, array("q")), dtype=torch.int32, device=self.device
         )
         self.req_pool_indices = torch.tensor(
             req_pool_indices, dtype=torch.int64, device=self.device
