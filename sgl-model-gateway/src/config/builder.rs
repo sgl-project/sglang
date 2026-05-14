@@ -1,11 +1,9 @@
-use smg_mcp::McpConfig;
-
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
     HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
     RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
 };
-use crate::core::ConnectionMode;
+use crate::{core::ConnectionMode, mcp::McpConfig};
 
 /// Builder for RouterConfig that wraps the config itself
 /// This eliminates field duplication and stays in sync automatically
@@ -184,26 +182,6 @@ impl RouterConfigBuilder {
 
     pub fn worker_startup_check_interval_secs(mut self, interval: u64) -> Self {
         self.config.worker_startup_check_interval_secs = interval;
-        self
-    }
-
-    pub fn pool_idle_timeout_secs(mut self, timeout: u64) -> Self {
-        self.config.pool_idle_timeout_secs = timeout;
-        self
-    }
-
-    pub fn connect_timeout_secs(mut self, timeout: u64) -> Self {
-        self.config.connect_timeout_secs = timeout;
-        self
-    }
-
-    pub fn pool_max_idle_per_host(mut self, max: usize) -> Self {
-        self.config.pool_max_idle_per_host = max;
-        self
-    }
-
-    pub fn tcp_keepalive_secs(mut self, timeout: u64) -> Self {
-        self.config.tcp_keepalive_secs = timeout;
         self
     }
 

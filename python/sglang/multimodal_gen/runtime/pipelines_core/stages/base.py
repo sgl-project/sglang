@@ -9,17 +9,11 @@ composed to create complete diffusion pipelines.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import replace
 from enum import Enum, auto
 
 import torch
 
-from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.dedup import StageDedupMixin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
@@ -46,7 +40,7 @@ class StageVerificationError(Exception):
     pass
 
 
-class PipelineStage(StageDedupMixin, ABC):
+class PipelineStage(ABC):
     """
     Abstract base class for all pipeline stages.
 
@@ -57,7 +51,6 @@ class PipelineStage(StageDedupMixin, ABC):
 
     def __init__(self):
         self.server_args = get_global_server_args()
-        self._component_residency_manager = None
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
@@ -109,86 +102,6 @@ class PipelineStage(StageDedupMixin, ABC):
         Offload the model for the stage.
         """
         pass
-
-    def set_component_residency_manager(self, manager) -> None:
-        self._component_residency_manager = manager
-
-    def _component_stage_name(self, stage_name: str | None = None) -> str:
-        return stage_name or self.__class__.__name__
-
-    def _active_component_stage_name(self) -> str:
-        manager = self._component_residency_manager
-        if manager is not None and manager.state.stage_name is not None:
-            return manager.state.stage_name
-        return self.__class__.__name__
-
-    def _finish_active_component_use(self) -> None:
-        if self._component_residency_manager is not None:
-            self._component_residency_manager.finish_active_use()
-
-    @contextmanager
-    def _use_component(
-        self,
-        use: ComponentUse,
-        module=None,
-    ) -> Iterator[object | None]:
-        if self._component_residency_manager is None:
-            yield module
-            return
-        with self._component_residency_manager.use_component(use, module) as component:
-            yield component
-
-    def _declared_component_use(
-        self,
-        *,
-        component_name: str,
-        phase: str | None = None,
-        target_dtype: torch.dtype | None = None,
-    ) -> ComponentUse:
-        manager = self._component_residency_manager
-        stage_name = self._active_component_stage_name()
-        server_args = manager.server_args if manager is not None else self.server_args
-        for use in self.component_uses(server_args, stage_name):
-            if use.component_name != component_name:
-                continue
-            if phase is not None and use.phase != phase:
-                continue
-            if target_dtype is not None:
-                return replace(use, target_dtype=target_dtype)
-            return use
-        raise ValueError(
-            f"{self.__class__.__name__} did not declare component use: "
-            f"{component_name}"
-        )
-
-    @contextmanager
-    def use_declared_component(
-        self,
-        *,
-        component_name: str,
-        module=None,
-        phase: str | None = None,
-        target_dtype: torch.dtype | None = None,
-    ) -> Iterator[object | None]:
-        """reference a component already declared in `component_uses`"""
-        use = self._declared_component_use(
-            component_name=component_name,
-            phase=phase,
-            target_dtype=target_dtype,
-        )
-        with self._use_component(use, module) as component:
-            yield component
-
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        """Declares component uses of current stage for unified residency scheduling."""
-        return []
-
-    # Default role affinity: ENCODER. Override in subclasses for DENOISING/DECODER.
-    @property
-    def role_affinity(self) -> RoleType:
-        return RoleType.ENCODER
 
     # execute on all ranks by default
     @property
@@ -262,6 +175,8 @@ class PipelineStage(StageDedupMixin, ABC):
         Execute the stage's processing on the batch with optional verification and logging.
         Should not be overridden by subclasses.
 
+
+
         Returns:
             The updated batch information after this stage's processing.
         """
@@ -280,10 +195,10 @@ class PipelineStage(StageDedupMixin, ABC):
         with StageProfiler(
             stage_name,
             logger=logger,
-            metrics=batch.metrics,
+            timings=batch.timings,
+            perf_dump_path_provided=batch.perf_dump_path is not None,
             log_stage_start_end=not batch.is_warmup
             and not (self.server_args and self.server_args.comfyui_mode),
-            perf_dump_path_provided=batch.perf_dump_path is not None,
         ):
             result = self.forward(batch, server_args)
 

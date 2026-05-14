@@ -77,7 +77,7 @@ class TestOpenAIMLLMServerBase(CustomTestCase):
         os.makedirs(cache_dir, exist_ok=True)
 
         if not os.path.exists(file_path):
-            response = requests.get(url, timeout=30)
+            response = requests.get(url)
             response.raise_for_status()
 
             with open(file_path, "wb") as f:
@@ -378,16 +378,20 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
         # the memory consumed by the Vision Attention varies a lot, e.g. blocked qkv vs full-sequence sdpa
         # the size of the video embeds differs from the `modality` argument when preprocessed
 
-        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+        # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
+        # The following import order will cause Segmentation fault.
+        # import decord
+        # from transformers import AutoTokenizer
+        from decord import VideoReader, cpu
 
         max_frames_num = 10
-        decoder = VideoDecoderWrapper(video_path)
-        total_frame_num = len(decoder)
+        vr = VideoReader(video_path, ctx=cpu(0))
+        total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(
             0, total_frame_num - 1, max_frames_num, dtype=int
         )
         frame_idx = uniform_sampled_frames.tolist()
-        frames = decoder.get_frames_at(frame_idx)
+        frames = vr.get_batch(frame_idx).asnumpy()
 
         base64_frames = []
         for frame in frames:

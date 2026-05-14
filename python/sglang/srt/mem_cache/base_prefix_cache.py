@@ -17,7 +17,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
+from sglang.srt.metrics.collector import RadixCacheMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -47,7 +47,7 @@ class MatchPrefixParams:
 class InsertParams:
     """Unified parameters for insert across different cache types"""
 
-    key: Optional[RadixKey] = None
+    key: RadixKey
     value: Optional[torch.Tensor] = None
 
     # Mamba specific
@@ -74,7 +74,7 @@ class InsertResult:
 class EvictParams:
     """Unified parameters for evict across different cache types"""
 
-    num_tokens: int = 0
+    num_tokens: int
     swa_num_tokens: int = 0
     mamba_num: int = 0
 
@@ -88,42 +88,6 @@ class EvictResult:
     mamba_num_evicted: int = 0
 
 
-@dataclasses.dataclass
-class IncLockRefResult:
-    """Result of an inc_lock_ref operation."""
-
-    delta: Optional[int] = None
-    swa_uuid_for_lock: Optional[int] = None
-
-    def to_dec_params(self) -> "DecLockRefParams":
-        """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
-        return DecLockRefParams(swa_uuid_for_lock=self.swa_uuid_for_lock)
-
-
-@dataclasses.dataclass
-class DecLockRefParams:
-    """Parameters for dec_lock_ref operation."""
-
-    swa_uuid_for_lock: Optional[int] = None
-
-
-@dataclasses.dataclass
-class DecLockRefResult:
-    """Result of an dec_lock_ref operation."""
-
-    delta: Optional[int] = None
-
-
-@dataclasses.dataclass
-class InitLoadBackParams:
-    """Unified parameters for init_load_back across different cache types"""
-
-    last_host_node: Any
-    host_hit_length: int
-    mem_quota: Optional[int] = None
-    req: Optional[Req] = None
-
-
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
@@ -133,10 +97,7 @@ class MatchResult(NamedTuple):
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
                             this **must** be the same as `last_device_node`.
-        host_hit_length :   Length of the host cache hit. For pure-KV caches this is the
-                            number of evicted KV tokens on CPU. For hybrid Mamba models this
-                            is max(kv_host_tokens, 1-if-mamba-on-host) so that a mamba-only
-                            host hit still triggers load-back without adding a separate field.
+        host_hit_length :   Length of the KV cache hit on the host, if applicable.
                             0 if HiCache is not enabled.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
@@ -148,25 +109,6 @@ class MatchResult(NamedTuple):
     last_host_node: Any
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
-    cache_protected_len: Optional[int] = None
-
-
-def zero_match_result(tree_cache, match_result: "MatchResult") -> "MatchResult":
-    root = getattr(tree_cache, "root_node", None)
-    if root is None:
-        raise RuntimeError(
-            f"SGLANG_RADIX_FORCE_MISS is not supported by {type(tree_cache).__name__} "
-            "(no `root_node` attribute). Disable the flag or use a cache backend "
-            "that exposes a tree root."
-        )
-    return match_result._replace(
-        # [:0] keeps dtype and device of the original tensor (e.g. CUDA int64)
-        # without allocating a fresh empty tensor.
-        device_indices=match_result.device_indices[:0],
-        last_device_node=root,
-        last_host_node=root,
-        host_hit_length=0,
-    )
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):
@@ -177,13 +119,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     )
 
     def init_metrics_collector(self):
-        from sglang.srt.server_args import get_global_server_args
-
-        server_args = get_global_server_args()
-        labels = {"cache_type": self.__class__.__name__}
-        if server_args.extra_metric_labels:
-            labels.update(server_args.extra_metric_labels)
-        self.metrics_collector = RadixCacheMetricsCollector(labels=labels)
+        self.metrics_collector = RadixCacheMetricsCollector(
+            labels={"cache_type": self.__class__.__name__}
+        )
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:
@@ -213,13 +151,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
+    def inc_lock_ref(self, node: Any):
         pass
 
     @abstractmethod
-    def dec_lock_ref(
-        self, node: Any, params: Optional[DecLockRefParams] = None
-    ) -> DecLockRefResult:
+    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
         pass
 
     def evictable_size(self):
@@ -248,7 +184,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def init_load_back(
         self,
-        params: InitLoadBackParams,
+        last_host_node: Any,
+        host_hit_length: int,
     ) -> Tuple[torch.Tensor, Any]:
         """
         Preparing KV cache loading from host to device.
@@ -260,14 +197,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Notify the cache controller to start the KV cache loading
         """
         raise NotImplementedError()
-
-    def flush_write_through_acks(self) -> None:
-        """Release lock_ref on radix-tree nodes whose write-through has completed.
-
-        Lightweight operation that only processes finished write acks.
-        No-op for caches without hierarchical write-through support.
-        """
-        pass
 
     def check_hicache_events(self) -> Any:
         """
@@ -284,34 +213,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_mamba(self) -> bool:
         return False
 
-    def supports_streaming_session(self) -> bool:
-        return False
-
-    def release_session(self, session_id: str) -> None:
-        pass
-
-    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
-    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
-        return 0
-
     def is_chunk_cache(self) -> bool:
         return False
 
     def is_tree_cache(self) -> bool:
         return not self.is_chunk_cache()
-
-    def available_and_evictable_str(self) -> str:
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.evictable_size()
-        return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"

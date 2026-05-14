@@ -37,15 +37,12 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
-    is_blackwell,
-    is_cuda,
-    is_xpu,
+    is_port_available,
     kill_process_tree,
     retry,
 )
-from sglang.srt.utils.network import is_port_available
 from sglang.test.run_eval import run_eval
-from sglang.utils import get_exception_traceback, normalize_base_url
+from sglang.utils import get_exception_traceback
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -107,10 +104,6 @@ DEFAULT_DRAFT_MODEL_EAGLE = "lmsys/sglang-EAGLE-llama2-chat-7B"
 DEFAULT_TARGET_MODEL_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
 
-# DFLASH model
-DEFAULT_TARGET_MODEL_DFLASH = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_DRAFT_MODEL_DFLASH = "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat"
-
 # EAGLE2 with DP-Attention models
 DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
 DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN = "Tengyunw/qwen3_30b_moe_eagle3"
@@ -133,7 +126,6 @@ DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
-DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN = "lmsys/DeepSeek-V3-NextN"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
@@ -183,8 +175,8 @@ def is_in_amd_ci():
 
 
 def is_blackwell_system():
-    """Same CUDA capability + toolkit semantics as ``sglang.srt.utils.is_blackwell``."""
-    return is_blackwell()
+    """Return whether it is running on a Blackwell (B200) system."""
+    return envs.IS_BLACKWELL.get()
 
 
 def is_h200_system():
@@ -382,7 +374,7 @@ def call_select_guidance(context, choices, model=None):
 
 def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
-    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument(
         "--backend",
@@ -431,7 +423,7 @@ def auto_config_device() -> str:
 
 def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
-    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--backend", type=str, default="srt")
     parser.add_argument(
@@ -455,7 +447,7 @@ def select_sglang_backend(args: argparse.Namespace):
     if args.backend.startswith("srt"):
         if args.backend == "srt-no-parallel":
             global_config.enable_parallel_encoding = False
-        backend = RuntimeEndpoint(normalize_base_url(args.host, args.port))
+        backend = RuntimeEndpoint(f"{args.host}:{args.port}")
     elif args.backend.startswith("gpt-"):
         backend = OpenAI(args.backend)
     else:
@@ -464,15 +456,14 @@ def select_sglang_backend(args: argparse.Namespace):
 
 
 def _get_call_generate(args: argparse.Namespace):
-    base_url = normalize_base_url(args.host, args.port)
     if args.backend == "lightllm":
-        return partial(call_generate_lightllm, url=f"{base_url}/generate")
+        return partial(call_generate_lightllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "vllm":
-        return partial(call_generate_vllm, url=f"{base_url}/generate")
+        return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "srt-raw":
-        return partial(call_generate_srt_raw, url=f"{base_url}/generate")
+        return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "outlines":
-        return partial(call_generate_outlines, url=f"{base_url}/generate")
+        return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "guidance":
         from guidance import models
 
@@ -485,11 +476,10 @@ def _get_call_generate(args: argparse.Namespace):
 
 
 def _get_call_select(args: argparse.Namespace):
-    base_url = normalize_base_url(args.host, args.port)
     if args.backend == "lightllm":
-        return partial(call_select_lightllm, url=f"{base_url}/generate")
+        return partial(call_select_lightllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "vllm":
-        return partial(call_select_vllm, url=f"{base_url}/generate")
+        return partial(call_select_vllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "guidance":
         from guidance import models
 
@@ -553,21 +543,21 @@ def try_cached_model(model_repo: str):
     return model_dir if model_dir else model_repo
 
 
-def popen_with_error_check(command: list[str]):
-    process = subprocess.Popen(command, stdout=None, stderr=None)
+def popen_with_error_check(command: list[str], allow_exit: bool = False):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def _run_and_check():
-        process.wait()
+        stdout, stderr = process.communicate()
 
-        if process.returncode == -9:
-            return
+        while process.poll() is None:
+            time.sleep(5)
 
-        if process.returncode != 0:
+        if not allow_exit or process.returncode != 0:
             raise Exception(
-                f"{shlex.join(command)} exited with code {process.returncode}"
+                f"{command} exited with code {process.returncode}\n{stdout=}\n{stderr=}"
             )
 
-    t = threading.Thread(target=_run_and_check, daemon=True)
+    t = threading.Thread(target=_run_and_check)
     t.start()
     return process
 
@@ -862,9 +852,7 @@ def popen_launch_server(
     if env is None:
         env = os.environ.copy()
     else:
-        merged = os.environ.copy()
-        merged.update(env)
-        env = merged
+        env = env.copy()
 
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
@@ -884,22 +872,18 @@ def popen_launch_server(
 
     use_mixed_pd_engine = not pd_separated and num_replicas is not None
     if pd_separated or use_mixed_pd_engine:
-        command = [
-            "python3",
-            "-m",
-            "sglang.launch_pd_server",
-            "--model-path",
-            model,
-            *[str(x) for x in other_args],
-        ]
+        command = "sglang.launch_pd_server"
     else:
-        command = [
-            "sglang",
-            "serve",
-            "--model-path",
-            model,
-            *[str(x) for x in other_args],
-        ]
+        command = "sglang.launch_server"
+
+    command = [
+        "python3",
+        "-m",
+        command,
+        "--model-path",
+        model,
+        *[str(x) for x in other_args],
+    ]
 
     if pd_separated or use_mixed_pd_engine:
         command.extend(["--lb-host", host, "--lb-port", port])
@@ -1016,12 +1000,6 @@ def popen_launch_pd_server(
 
     print(f"command={' '.join(command)}")
 
-    # Merge with os.environ so caller-supplied env adds to (not replaces)
-    # PATH / PYTHONPATH / HF_HOME / etc. When env is None, Popen inherits
-    # parent's environment automatically.
-    if env is not None:
-        env = {**os.environ, **env}
-
     process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     return process
@@ -1058,7 +1036,6 @@ def get_benchmark_args(
     gsp_output_len=32,
     gsp_num_turns=1,
     header=None,
-    max_concurrency=None,
 ):
     return SimpleNamespace(
         backend=backend,
@@ -1100,8 +1077,6 @@ def get_benchmark_args(
         gsp_output_len=gsp_output_len,
         gsp_num_turns=gsp_num_turns,
         header=header,
-        max_concurrency=max_concurrency,
-        ready_check_timeout_sec=0,
     )
 
 
@@ -1135,26 +1110,12 @@ def run_bench_serving(
         other_args=other_server_args,
     )
 
-    # Resolve tokenizer to local snapshot path when available, so the benchmark
-    # client's AutoTokenizer.from_pretrained uses the local path directly instead
-    # of calling the HF Hub API (which can stall for minutes in CI).
-    bench_tokenizer = tokenizer
-    if bench_tokenizer is None:
-        try:
-            from sglang.srt.utils import find_local_repo_dir
-
-            local_dir = find_local_repo_dir(model, revision=None)
-            if local_dir and os.path.isdir(local_dir):
-                bench_tokenizer = local_dir
-        except Exception:
-            pass
-
     # Run benchmark
     args = get_benchmark_args(
         base_url=base_url,
         dataset_name=dataset_name,
         dataset_path=dataset_path,
-        tokenizer=bench_tokenizer,
+        tokenizer=tokenizer,
         num_prompts=num_prompts,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
@@ -1338,7 +1299,7 @@ def run_score_benchmark(
                         json=warmup_data,
                         timeout=aiohttp.ClientTimeout(total=30),
                     )
-                except Exception:
+                except:
                     pass  # Ignore warmup errors
 
         test_requests = []
@@ -1406,9 +1367,17 @@ def run_embeddings_benchmark(
 
     async def _run_benchmark():
 
+        # Load tokenizer for generating test data
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+        tokenizer = get_tokenizer(model)
+
         def generate_text_with_token_count(num_tokens):
             """Generate text with precise token count using special tokens."""
+            # Use a token that reliably produces 1 token
             special_token = "<|im_start|>"
+            # Verify it's a single token
+            test_tokens = tokenizer.encode(special_token, add_special_tokens=False)
             text = special_token * num_tokens
             return text
 
@@ -1428,7 +1397,7 @@ def run_embeddings_benchmark(
                         json=warmup_data,
                         timeout=aiohttp.ClientTimeout(total=30),
                     )
-                except Exception:
+                except:
                     pass  # Ignore warmup errors
 
         test_requests = []
@@ -1693,7 +1662,6 @@ def run_and_check_memory_leak(
     disable_overlap,
     chunked_prefill_size,
     assert_has_abort,
-    api_key: Optional[str] = None,
 ):
     other_args = [
         "--chunked-prefill-size",
@@ -1721,7 +1689,6 @@ def run_and_check_memory_leak(
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_args,
         return_stdout_stderr=(stdout, stderr),
-        api_key=api_key,
     )
 
     # Launch a thread to stream the output
@@ -1844,7 +1811,7 @@ def run_mulit_request_test(
                     },
                 },
             )
-            response.json()
+            ret = response.json()
 
         with ThreadPoolExecutor(2) as executor:
             list(executor.map(run_one, list(range(4))))
@@ -2030,125 +1997,7 @@ async def send_concurrent_generate_requests_with_custom_params(
     return await asyncio.gather(*tasks)
 
 
-def run_distributed_test(func, world_size=2, backend="nccl", **kwargs):
-    """Spawn ``world_size`` processes, initialise torch.distributed in each,
-    run *func(rank, **kwargs)*, and propagate any worker exception to the caller.
-    """
-    import torch.multiprocessing as mp
-
-    ctx = mp.get_context("spawn")
-    result_queue = ctx.Queue()
-    port = find_available_port(29500)
-
-    processes = []
-    for rank in range(world_size):
-        p = ctx.Process(
-            target=_distributed_worker,
-            args=(rank, world_size, backend, port, func, result_queue, kwargs),
-        )
-        p.start()
-        processes.append(p)
-
-    for p in processes:
-        p.join()
-
-    errors = [result_queue.get() for _ in range(world_size)]
-    errors = [e for e in errors if e]
-    if errors:
-        raise AssertionError("\n".join(errors))
-
-
-def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwargs):
-    import traceback
-
-    import torch.distributed as dist
-
-    if backend == "nccl":
-        torch.cuda.set_device(rank)
-    dist.init_process_group(
-        backend=backend,
-        init_method=f"tcp://127.0.0.1:{port}",
-        world_size=world_size,
-        rank=rank,
-    )
-    try:
-        func(rank, **kwargs)
-        result_queue.put(None)
-    except Exception as e:
-        result_queue.put(f"Rank {rank}: {e}\n{traceback.format_exc()}")
-    finally:
-        dist.destroy_process_group()
-
-
-def maybe_stub_sgl_kernel():
-    """Stub sgl_kernel if it cannot be imported (e.g. no GPU).
-
-    Must be called before any import that transitively depends on sgl_kernel.
-    On machines with a working sgl_kernel this is a no-op.
-    """
-    try:
-        import sgl_kernel  # noqa: F401
-
-        return
-    except (ImportError, OSError):
-        pass
-
-    import importlib.abc
-    import importlib.machinery
-
-    class _SglKernelLoader(importlib.abc.Loader):
-        def create_module(self, spec):
-            return None
-
-        def exec_module(self, module):
-            from unittest.mock import MagicMock
-
-            module.__getattr__ = lambda name: MagicMock()
-
-    class _SglKernelFinder(importlib.abc.MetaPathFinder):
-        def find_spec(self, fullname, path, target=None):
-            if fullname == "sgl_kernel" or fullname.startswith("sgl_kernel."):
-                return importlib.machinery.ModuleSpec(
-                    fullname,
-                    _SglKernelLoader(),
-                    is_package=True,
-                )
-            return None
-
-    sys.meta_path.insert(0, _SglKernelFinder())
-
-
 class CustomTestCase(unittest.TestCase):
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-
-        # Wrap the effective setUpClass so that tearDownClass is called
-        # even when setUpClass fails. Python's unittest skips tearDownClass
-        # if setUpClass raises, which can leak resources (ports, processes).
-        setup = cls.setUpClass
-        if getattr(setup, "_safe_setup_wrapped", False):
-            return
-
-        orig_func = setup.__func__
-
-        def safe_setUpClass(klass):
-            try:
-                orig_func(klass)
-            except Exception:
-                # Best-effort cleanup; suppress teardown errors so the
-                # original setUpClass exception propagates clearly.
-                try:
-                    klass.tearDownClass()
-                except Exception:
-                    pass
-                raise
-
-        # Set sentinel on the raw function so that bound method attribute
-        # lookup (which delegates to __func__) can detect it in subclasses.
-        safe_setUpClass._safe_setup_wrapped = True
-        cls.setUpClass = classmethod(safe_setUpClass)
-
     def _callTestMethod(self, method):
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
         if max_retry is None:
@@ -2205,14 +2054,12 @@ class ModelLaunchSettings:
         extra_args: Optional[List[str]] = None,
         env: Optional[dict] = None,
         variant: Optional[str] = None,
-        launch_timeout: Optional[float] = None,
     ):
         self.model_path = model_path
         self.tp_size = tp_size
         self.extra_args = list(extra_args) if extra_args else []
         self.env = env
         self.variant = variant
-        self.launch_timeout = launch_timeout
 
         if self.tp_size > 1 and "--tp" not in self.extra_args:
             self.extra_args.extend(["--tp", str(self.tp_size)])
@@ -2391,44 +2238,6 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
         return wrapper
 
     return decorator
-
-
-def get_gpu_count():
-    if get_device() == "cpu":
-        gpu_count = 0
-    else:
-        gpu_count = torch.accelerator.device_count()
-    return gpu_count
-
-
-def empty_gpu_cache():
-    """
-    Unified empty_cache for PyTorch 2.8 (no torch.accelerator)
-    and PyTorch 2.9+ (where torch.accelerator.empty_cache() exists).
-    """
-    if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "empty_cache"):
-        return torch.accelerator.empty_cache()
-
-    # CUDA
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        return
-
-    # XPU (Intel)
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        torch.xpu.empty_cache()
-        return
-
-    return
-
-
-def get_gpu_memory_gb():
-    if is_cuda():
-        return torch.cuda.device_memory_used() / 1024**3
-    elif is_xpu():
-        return torch.xpu.memory_allocated() / 1024**3
-    else:
-        return 0
 
 
 def run_doctests(obj: Callable[..., Any] | ModuleType):

@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+package sglang.mesh.gossip;
+
+service Gossip {
+  rpc PingServer(GossipMessage) returns (NodeUpdate);
+  // Bidirectional streaming for state synchronization
+  rpc SyncStream(stream StreamMessage) returns (stream StreamMessage);
+}
+
+enum NodeStatus {
+  INIT = 0;
+  ALIVE = 1;
+  SUSPECTED = 2;
+  DOWN = 3;
+  LEAVING = 4;
+}
+
+message NodeState {
+  string name = 1;
+  string address = 2;
+  NodeStatus status = 3;
+  uint64 version = 4;
+  map<string, bytes> metadata = 5;
+}
+
+
+message StateSync {
+  repeated NodeState nodes = 1;
+}
+
+message Ping {
+  StateSync state_sync = 1;
+}
+
+message PingReq {
+  NodeState node = 1;
+}
+
+message Ack {
+  uint64 timestamp = 1;
+}
+
+message NodeUpdate {
+  string name = 1;
+  string address = 2;
+  NodeStatus status = 3;
+}
+
+message GossipMessage {
+  oneof payload {
+    Ping ping = 1;
+    PingReq ping_req = 2;
+  }
+}
+
+// Stream message types for bidirectional streaming
+enum StreamMessageType {
+  INCREMENTAL_UPDATE = 0;
+  SNAPSHOT_REQUEST = 1;
+  SNAPSHOT_CHUNK = 2;
+  SNAPSHOT_COMPLETE = 3;
+  ACK = 4;
+  NACK = 5;
+  HEARTBEAT = 6;
+}
+
+message StreamMessage {
+  StreamMessageType message_type = 1;
+  oneof payload {
+    IncrementalUpdate incremental = 2;
+    SnapshotRequest snapshot_request = 3;
+    SnapshotChunk snapshot_chunk = 4;
+    StreamAck ack = 5;
+  }
+  uint64 sequence = 6; // Sequence number for ordering
+  string peer_id = 7;   // Sender peer ID
+}
+
+// Incremental state update (steady-state)
+message IncrementalUpdate {
+  StoreType store = 1;
+  repeated StateUpdate updates = 2;
+  uint64 version = 3;
+}
+
+message StateUpdate {
+  string key = 1;
+  bytes value = 2;      // Serialized state value
+  uint64 version = 3;
+  string actor = 4;
+  uint64 timestamp = 5;
+}
+
+// Snapshot request (on gap or new join)
+message SnapshotRequest {
+  StoreType store = 1;
+  uint64 from_version = 2; // Request snapshot from this version
+}
+
+// Snapshot chunk (per-store chunking)
+message SnapshotChunk {
+  StoreType store = 1;
+  uint64 chunk_index = 2;
+  uint64 total_chunks = 3;
+  repeated StateUpdate entries = 4;
+  bytes checksum = 5; // For integrity verification
+}
+
+message StreamAck {
+  uint64 sequence = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+enum StoreType {
+  MEMBERSHIP = 0;
+  APP = 1;
+  WORKER = 2;
+  POLICY = 3;
+  RATE_LIMIT = 4;
+}

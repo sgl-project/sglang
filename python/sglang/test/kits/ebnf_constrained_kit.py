@@ -3,8 +3,7 @@ import json
 import requests
 
 
-class EBNFConstrainedMixin:
-
+class TestEBNFConstrainedMixin:
     ebnf_grammar = 'root ::= "test"'  # Default grammar
 
     def _run_decode_ebnf(

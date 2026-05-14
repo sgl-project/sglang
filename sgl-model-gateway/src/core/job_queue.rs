@@ -10,10 +10,8 @@ use std::{
 };
 
 use dashmap::DashMap;
-use smg_mcp::McpConfig;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
-use wfaas::WorkflowId;
 
 use crate::{
     app_context::AppContext,
@@ -26,7 +24,9 @@ use crate::{
         McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
         WasmModuleConfigRequest, WasmModuleRemovalRequest,
     },
+    mcp::McpConfig,
     protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
+    workflow::WorkflowId,
 };
 
 /// Job types for control plane operations
@@ -112,7 +112,7 @@ impl Default for JobQueueConfig {
     fn default() -> Self {
         Self {
             queue_capacity: 1000,
-            max_concurrent_jobs: 200,
+            max_concurrent_jobs: 10,
         }
     }
 }

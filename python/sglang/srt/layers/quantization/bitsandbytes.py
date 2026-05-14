@@ -15,8 +15,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import set_weight_attrs
-from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils import direct_register_custom_op, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -393,8 +392,7 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
         return out
 
 
-@register_custom_op(mutates_args=["out"])
-def apply_bnb_4bit(
+def _apply_bnb_4bit(
     x: torch.Tensor,
     weight: torch.Tensor,
     offsets: torch.Tensor,
@@ -415,6 +413,28 @@ def apply_bnb_4bit(
             x, weight[offsets[i] : offsets[i + 1]].t(), quant_states[i]
         )
         current_index += output_size
+
+
+def _apply_bnb_4bit_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    offsets: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    return
+
+
+try:
+    direct_register_custom_op(
+        op_name="apply_bnb_4bit",
+        op_func=_apply_bnb_4bit,
+        mutates_args=["out"],
+        fake_impl=_apply_bnb_4bit_fake,
+    )
+    apply_bnb_4bit = torch.ops.sglang.apply_bnb_4bit
+
+except AttributeError as error:
+    raise error
 
 
 class BitsAndBytesMoEMethod(FusedMoEMethodBase):
@@ -475,7 +495,7 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states

@@ -90,27 +90,19 @@ class MistralDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=combined_normal, calls=calls)
 
         # Compact: `[TOOL_CALLS]tool_name[ARGS]{...}`
-        # Loop to extract all consecutive compact tool calls.
-        all_calls: list = []
-        remaining = tool_part
-        while remaining:
-            parsed = self._try_parse_compact_args_format(remaining)
-            if not parsed:
-                break
-            func_name, args_obj, consumed = parsed
-            new_calls = self.parse_base_json(
-                {"name": func_name, "arguments": args_obj}, tools
-            )
-            all_calls.extend(new_calls)
-            remaining = remaining[consumed:].strip()
-
-        if not all_calls:
+        parsed = self._try_parse_compact_args_format(tool_part)
+        if not parsed:
             return StreamingParseResult(normal_text=normal_text, calls=[])
+        func_name, args_obj, consumed = parsed
 
+        calls = self.parse_base_json({"name": func_name, "arguments": args_obj}, tools)
+        trailing_text = tool_part[consumed:].strip()
         combined_normal = (
-            (normal_text + " " + remaining).strip() if remaining else normal_text
+            (normal_text + " " + trailing_text).strip()
+            if trailing_text
+            else normal_text
         )
-        return StreamingParseResult(normal_text=combined_normal, calls=all_calls)
+        return StreamingParseResult(normal_text=combined_normal, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]

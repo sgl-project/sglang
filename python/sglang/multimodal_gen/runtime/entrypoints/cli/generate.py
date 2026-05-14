@@ -18,43 +18,15 @@ from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcomman
 from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
     RaiseNotImplementedAction,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import GenerationResult
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
-    MemorySnapshot,
     PerformanceLogger,
-    RequestMetrics,
+    RequestTimings,
 )
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
-
-
-def _resolve_cli_sampling_params_cls(server_args: ServerArgs) -> type[SamplingParams]:
-    pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
-    if pipeline_class_name:
-        from sglang.multimodal_gen.registry import get_pipeline_config_classes
-
-        config_classes = get_pipeline_config_classes(pipeline_class_name)
-        if config_classes is not None:
-            _, sampling_params_cls = config_classes
-            return sampling_params_cls
-
-    try:
-        from sglang.multimodal_gen.registry import get_model_info
-
-        model_info = get_model_info(
-            server_args.model_path,
-            backend=server_args.backend,
-            model_id=server_args.model_id,
-        )
-        if model_info is not None:
-            return model_info.sampling_param_cls
-    except Exception as exc:
-        logger.debug("Falling back to base SamplingParams for CLI parsing: %s", exc)
-
-    return SamplingParams
 
 
 def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
@@ -73,13 +45,6 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
         required=False,
         help="Path to dump the performance metrics (JSON) for the run.",
     )
-    parser.add_argument(
-        "--output-file-path",
-        type=str,
-        default=None,
-        required=False,
-        help="Convenience alias that sets both --output-path and --output-file-name.",
-    )
 
     parser = ServerArgs.add_cli_args(parser)
     parser = SamplingParams.add_cli_args(parser)
@@ -93,56 +58,28 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
     return parser
 
 
-def _apply_output_file_path_override(
-    args: argparse.Namespace, sampling_params_kwargs: dict
-):
-    output_file_path = args.output_file_path
-    if not output_file_path:
-        return
-
-    output_path = os.path.dirname(output_file_path) or "."
-    sampling_params_kwargs["output_path"] = output_path
-    sampling_params_kwargs["output_file_name"] = os.path.basename(output_file_path)
-
-
-def maybe_dump_performance(
-    args: argparse.Namespace,
-    server_args,
-    prompt: str,
-    results: GenerationResult | list[GenerationResult] | None,
-):
+def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, results):
     """dump performance if necessary"""
     if not (args.perf_dump_path and results):
         return
 
     if isinstance(results, list):
-        result = results[0] if results else None
+        result = results[0] if results else {}
     else:
         result = results
 
-    metrics_dict = result.metrics
-    if not (args.perf_dump_path and metrics_dict):
+    timings_dict = result.get("timings")
+    if not (args.perf_dump_path and timings_dict):
         return
 
-    metrics = RequestMetrics(request_id=metrics_dict.get("request_id"))
-    metrics.stages = metrics_dict.get("stages", {})
-    metrics.steps = metrics_dict.get("steps", [])
-    metrics.total_duration_ms = metrics_dict.get("total_duration_ms", 0)
-
-    # restore memory snapshots from serialized dict
-    memory_snapshots_dict = metrics_dict.get("memory_snapshots", {})
-    for checkpoint_name, snapshot_dict in memory_snapshots_dict.items():
-        snapshot = MemorySnapshot(
-            allocated_mb=snapshot_dict.get("allocated_mb", 0.0),
-            reserved_mb=snapshot_dict.get("reserved_mb", 0.0),
-            peak_allocated_mb=snapshot_dict.get("peak_allocated_mb", 0.0),
-            peak_reserved_mb=snapshot_dict.get("peak_reserved_mb", 0.0),
-        )
-        metrics.memory_snapshots[checkpoint_name] = snapshot
+    timings = RequestTimings(request_id=timings_dict.get("request_id"))
+    timings.stages = timings_dict.get("stages", {})
+    timings.steps = timings_dict.get("steps", [])
+    timings.total_duration_ms = timings_dict.get("total_duration_ms", 0)
 
     PerformanceLogger.dump_benchmark_report(
         file_path=args.perf_dump_path,
-        metrics=metrics,
+        timings=timings,
         meta={
             "prompt": prompt,
             "model": server_args.model_path,
@@ -151,31 +88,13 @@ def maybe_dump_performance(
     )
 
 
-def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
+def generate_cmd(args: argparse.Namespace):
     """The entry point for the generate command."""
     args.request_id = "mocked_fake_id_for_offline_generate"
 
-    server_args = ServerArgs.from_cli_args(args, unknown_args)
-    sampling_params_cls = _resolve_cli_sampling_params_cls(server_args)
+    server_args = ServerArgs.from_cli_args(args)
 
-    sampling_params_kwargs = {}
-    config_file = getattr(args, "config", None)
-    # respect config file by overriding args with args parsed from it
-    if config_file:
-        config_args = ServerArgs.load_config_file(config_file) or {}
-        sampling_param_fields = {
-            field.name for field in dataclasses.fields(sampling_params_cls)
-        }
-        sampling_params_kwargs.update(
-            {
-                key: value
-                for key, value in config_args.items()
-                if key in sampling_param_fields and value is not None
-            }
-        )
-
-    sampling_params_kwargs.update(sampling_params_cls.get_cli_args(args))
-    _apply_output_file_path_override(args, sampling_params_kwargs)
+    sampling_params_kwargs = SamplingParams.get_cli_args(args)
     sampling_params_kwargs["request_id"] = generate_request_id()
 
     # Handle diffusers-specific kwargs passed via CLI
@@ -221,10 +140,8 @@ class GenerateSubcommand(CLISubcommand):
         """Get names of arguments for generate_video method"""
         return [field.name for field in dataclasses.fields(SamplingParams)]
 
-    def cmd(
-        self, args: argparse.Namespace, unknown_args: list[str] | None = None
-    ) -> None:
-        generate_cmd(args, unknown_args)
+    def cmd(self, args: argparse.Namespace) -> None:
+        generate_cmd(args)
 
     def validate(self, args: argparse.Namespace) -> None:
         """Validate the arguments for this command"""
@@ -240,7 +157,7 @@ class GenerateSubcommand(CLISubcommand):
         generate_parser = subparsers.add_parser(
             "generate",
             help="Run inference on a model",
-            usage="sglang generate (--model-path MODEL_PATH_OR_ID --prompt PROMPT) | --config CONFIG_FILE [OPTIONS]",
+            usage="sgl_diffusion generate (--model-path MODEL_PATH_OR_ID --prompt PROMPT) | --config CONFIG_FILE [OPTIONS]",
         )
 
         generate_parser = add_multimodal_gen_generate_args(generate_parser)

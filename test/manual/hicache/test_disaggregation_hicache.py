@@ -1,12 +1,13 @@
 import os
 import random
 import tempfile
+import time
 import unittest
 from typing import Dict
 
 import requests
 
-from sglang.benchmark.utils import get_tokenizer
+from sglang.bench_serving import get_tokenizer
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -32,8 +33,8 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
         cls.start_decode()
 
         # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
-        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+        cls.wait_server_ready(cls.prefill_url + "/health")
+        cls.wait_server_ready(cls.decode_url + "/health")
 
         cls.launch_lb()
 
@@ -113,13 +114,9 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
         # Trigger offloading
         self.send_request(self.gen_prompt(1), max_tokens=150)
 
-        # Flush device cache to force remote storage access.
-        res = requests.post(
-            f"{self.prefill_url}/flush_cache",
-            params={"timeout": 30},
-            timeout=40,
-        )
-        res.raise_for_status()
+        # Flush device cache to force remote storage access
+        time.sleep(2)
+        requests.post(self.prefill_url + "/flush_cache")
 
 
 class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):

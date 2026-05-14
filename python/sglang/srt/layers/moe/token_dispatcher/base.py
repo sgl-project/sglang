@@ -262,7 +262,7 @@ class BaseDispatcher(ABC):
     """Base class for dispatchers."""
 
     def __init__(self):
-        self.quant_config: dict = {}
+        self.quant_config: Optional[dict] = None
 
         # Overlap args
         self.overlap_args: Optional[CombineOverlapArgs] = None

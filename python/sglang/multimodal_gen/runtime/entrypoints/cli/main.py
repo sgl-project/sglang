@@ -30,12 +30,12 @@ def main() -> None:
     for cmd in cmd_init():
         cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
         cmds[cmd.name] = cmd
-    args, unknown_args = parser.parse_known_args()
+    args = parser.parse_args()
     if args.subparser in cmds:
         cmds[args.subparser].validate(args)
 
     if hasattr(args, "dispatch_function"):
-        args.dispatch_function(args, unknown_args=unknown_args)
+        args.dispatch_function(args)
     else:
         parser.print_help()
 

@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.jit_kernel.utils import load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
+@functools.cache
 def _jit_add_constant_module(constant: int) -> Module:
-    args = make_cpp_args(constant)
+    args = make_cpp_args(constant)  # pass all the template argument
     return load_jit(
         "add_constant",
         *args,

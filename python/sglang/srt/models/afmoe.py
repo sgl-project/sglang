@@ -46,8 +46,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton import fused_moe
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -58,16 +58,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_npu
-
-_is_npu = is_npu()
-
-if not _is_npu:
-    from sglang.srt.layers.moe.fused_moe_triton import fused_moe
-else:
-    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-        fused_moe_npu as fused_moe,
-    )
+from sglang.srt.utils import add_prefix
 
 
 def get_attention_sliding_window_size(config: PretrainedConfig) -> Optional[int]:
@@ -209,7 +200,6 @@ class AfmoeMoE(nn.Module):
                 for idx in range(self.n_routed_experts)
             ]
         )
-
         self.pack_params()
 
         if self.num_shared_experts:
@@ -226,7 +216,7 @@ class AfmoeMoE(nn.Module):
             self.shared_experts = None
 
         custom_routing_fn = None
-        correction_bias = None if not _is_npu else self.expert_bias
+        correction_bias = None
         if self.use_grouped_topk:
             correction_bias = self.expert_bias
         elif self.score_func == "sigmoid":
@@ -236,9 +226,7 @@ class AfmoeMoE(nn.Module):
                 expert_bias=self.expert_bias,
             )
 
-        renormalize = (
-            self.route_norm if self.score_func == "sigmoid" and not _is_npu else False
-        )
+        renormalize = self.route_norm if self.score_func == "sigmoid" else False
         self.topk = TopK(
             top_k=self.top_k,
             renormalize=renormalize,
@@ -248,7 +236,6 @@ class AfmoeMoE(nn.Module):
             custom_routing_function=custom_routing_fn,
             correction_bias=correction_bias,
             routed_scaling_factor=self.route_scale,
-            **({"scoring_func": self.score_func} if _is_npu else {}),
         )
 
     def pack_params(self) -> None:
@@ -279,7 +266,7 @@ class AfmoeMoE(nn.Module):
 
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = fused_moe(
+        final_hidden_states = fused_moe.fused_moe(
             hidden_states,
             w1=self.w1,
             w2=self.w2,
@@ -327,8 +314,8 @@ class AfmoeAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.rotary_dim = int(self.head_dim * partial_rotary_factor)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)

@@ -1,7 +1,9 @@
 """Start bootstrap/kv-store-related server"""
 
 import os
+from typing import Type
 
+from sglang.srt.disaggregation.base import BaseKVBootstrapServer
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -20,10 +22,10 @@ def start_disagg_service(
 
     if disagg_mode == DisaggregationMode.PREFILL:
         # only start bootstrap server on prefill tm
-        kv_bootstrap_server_class = get_kv_class(
+        kv_bootstrap_server_class: Type[BaseKVBootstrapServer] = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER
         )
-        bootstrap_server = kv_bootstrap_server_class(
+        bootstrap_server: BaseKVBootstrapServer = kv_bootstrap_server_class(
             host=server_args.host,
             port=server_args.disaggregation_bootstrap_port,
         )

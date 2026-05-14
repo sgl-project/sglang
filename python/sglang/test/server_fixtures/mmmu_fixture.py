@@ -22,8 +22,6 @@ class MMMUServerBase(CustomTestCase):
     This fixture handles server lifecycle for single-model MMMU tests.
     For multi-model tests that need to start/stop servers within test methods,
     use MMMUMultiModelTestBase instead.
-    Set server_api_key = None to launch without auth when sharing the server
-    with mixins whose clients do not send API keys.
     """
 
     model = None
@@ -31,7 +29,6 @@ class MMMUServerBase(CustomTestCase):
     timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     other_args: list[str] = []
     mem_fraction_static: float = DEFAULT_MEM_FRACTION_STATIC
-    server_api_key = "sk-123456"
 
     @classmethod
     def setUpClass(cls):
@@ -56,7 +53,7 @@ class MMMUServerBase(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=cls.timeout,
-            api_key=cls.server_api_key,
+            api_key=cls.api_key,
             other_args=server_args,
             env=process_env,
         )
@@ -65,7 +62,7 @@ class MMMUServerBase(CustomTestCase):
     def tearDownClass(cls):
         if cls.process is not None and cls.process.poll() is None:
             try:
-                kill_process_tree(cls.process.pid, wait_timeout=60)
+                kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error killing process: {e}")
         time.sleep(2)

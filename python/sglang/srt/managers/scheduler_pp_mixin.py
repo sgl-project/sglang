@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -13,14 +13,13 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import DisaggregationMode, poll_and_all_reduce
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     is_dp_attention_enabled,
-    set_is_extend_in_batch,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -29,10 +28,8 @@ from sglang.srt.managers.utils import (
     get_logprob_from_pp_outputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -131,23 +128,20 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
+                        torch.cuda.current_stream().wait_event(self.launch_event)
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
                         ):
                             self.send_proxy_work = self._pp_send_dict_to_next_stage(
                                 result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
-                                msg_type="proxy",
                             )
 
                 self.pp_outputs = next_pp_outputs
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
-                self.on_idle()
+                self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -230,7 +224,7 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
-                batch = self.maybe_prepare_mlp_sync_batch(batch)
+                batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -308,13 +302,10 @@ class SchedulerPPMixin:
                         transferred_rids, async_send=True
                     )
                     if self.cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
+                        torch.cuda.current_stream().wait_event(self.launch_event)
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
-                            msg_type="proxy",
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -325,7 +316,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
-                self.on_idle()
+                self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -491,13 +482,10 @@ class SchedulerPPMixin:
                         transferred_rids, async_send=True
                     )
                     if self.cur_batch and not self.cur_batch.forward_mode.is_prebuilt():
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
+                        torch.cuda.current_stream().wait_event(self.launch_event)
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
-                            msg_type="proxy",
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -517,7 +505,7 @@ class SchedulerPPMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             if server_is_idle and queue_size == 0:
-                self.on_idle()
+                self.self_check_during_idle()
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
@@ -533,15 +521,14 @@ class SchedulerPPMixin:
         ]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
-        self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
+        self.last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]] = (
+            deque()
+        )
 
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
-        self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
-            defaultdict(deque)
-        )
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -617,35 +604,34 @@ class SchedulerPPMixin:
                     "hidden_states": torch.zeros(
                         (current_seq_len, model_config.hidden_size),
                         dtype=model_config.dtype,
-                        device=self.device,
+                        device="cuda",
                     ),
                     "residual": torch.zeros(
                         (current_seq_len, model_config.hidden_size),
                         dtype=model_config.dtype,
-                        device=self.device,
+                        device="cuda",
                     ),
                 }
 
                 pp_proxy = PPProxyTensors(proxy_tensors)
 
-                # Measure latency with device synchronization for accurate timing
-                device_module = get_device_module()
+                # Measure latency with CUDA synchronization for accurate timing
                 # Synchronize before starting timing to ensure clean measurement
-                device_module.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
                 start = time.perf_counter()
                 batch.prepare_for_extend()
                 model_worker_batch = batch.get_model_worker_batch()
 
                 forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
-                set_is_extend_in_batch(batch.forward_mode.is_extend())
-
                 _ = model_runner.forward(
                     forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
                 )
 
                 # Synchronize after forward to ensure GPU operations complete
-                device_module.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
                 latency_seconds = time.perf_counter() - start
                 latency_ms = latency_seconds * 1e3  # Convert to milliseconds
@@ -658,7 +644,7 @@ class SchedulerPPMixin:
                         req.req_pool_idx, : len(req.fill_ids)
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
-                    self.req_to_token_pool.free(req)
+                    self.req_to_token_pool.free(req.req_pool_idx)
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
@@ -674,15 +660,6 @@ class SchedulerPPMixin:
                     src=self.attn_tp_group.ranks[0],
                 )
                 seq_lens, latencies = data_to_sync_tp
-
-            if self.attn_cp_size > 1:
-                data_to_sync_tp = [seq_lens, latencies]
-                data_to_sync_tp = broadcast_pyobj(
-                    data_to_sync_tp,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
 
         # Broadcast data to all ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -863,11 +840,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         next_first_rank_mb_id: int,
         next_mb_id: int,
-    ) -> Tuple[
-        Optional[PPProxyTensors],
-        Optional[GenerationBatchResult],
-        Optional[torch.Event],
-    ]:
+    ) -> Tuple[PPProxyTensors, GenerationBatchResult, torch.cuda.Event]:
         self._pp_commit_comm_work(work=self.send_output_work)
         (
             next_pp_outputs,
@@ -886,7 +859,7 @@ class SchedulerPPMixin:
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
-        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+        if self.attn_tp_rank == 0:
             dp_offset = self.attn_dp_rank * self.attn_tp_size
             p2p_work = point_to_point_pyobj(
                 data,
@@ -899,7 +872,7 @@ class SchedulerPPMixin:
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
-        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+        if self.attn_tp_rank == 0:
             dp_offset = self.attn_dp_rank * self.attn_tp_size
             data = point_to_point_pyobj(
                 [],
@@ -917,14 +890,6 @@ class SchedulerPPMixin:
                 self.attn_tp_group.rank,
                 self.attn_tp_cpu_group,
                 src=self.attn_tp_group.ranks[0],
-            )
-
-        if self.attn_cp_size > 1:
-            data = broadcast_pyobj(
-                data,
-                self.attn_cp_group.rank,
-                self.attn_cp_cpu_group,
-                src=self.attn_cp_group.ranks[0],
             )
 
         return data
@@ -948,15 +913,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
-        msg_type: str = "default",
     ):
-        # Warn once if using default untyped messages
-        if msg_type == "default":
-            logger.warning_once(
-                "PP send: using default untyped message. "
-                "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
-            )
-        tensor_dict["__msg_type__"] = msg_type
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -969,48 +926,14 @@ class SchedulerPPMixin:
         )
         return p2p_work
 
-    def _pp_recv_typed_dict(
-        self: Scheduler,
-        expected_kind: str = "default",
-        all_gather_group: Optional = None,
-    ) -> Dict[str, torch.Tensor]:
-        """Receive a typed tensor dict, demultiplexing by msg_type.
-
-        If a message of the wrong kind is received, it's stashed in the queue
-        and we continue receiving until we get the expected kind.
-        """
-        if expected_kind in self._pp_tensor_dict_inbox:
-            inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
-            if inbox_queue:
-                return inbox_queue.popleft()
-
-        while True:
-            tensor_dict = self.pp_group.recv_tensor_dict(
-                all_gather_group=all_gather_group
-            )
-            received_kind = tensor_dict.get("__msg_type__", "default")
-            if received_kind == expected_kind:
-                if received_kind == "default":
-                    logger.warning_once(
-                        f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
-                        "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
-                    )
-                return tensor_dict
-            else:
-                logger.debug(
-                    f"PP recv: expected {expected_kind}, got {received_kind}, stashing"
-                )
-                self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
-
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             pp_proxy_tensors = PPProxyTensors(
-                self._pp_recv_typed_dict(
-                    expected_kind="proxy",
+                self.pp_group.recv_tensor_dict(
                     all_gather_group=(
                         self.attn_tp_group if self.require_attn_tp_allgather else None
-                    ),
+                    )
                 )
             )
         return pp_proxy_tensors
@@ -1018,12 +941,12 @@ class SchedulerPPMixin:
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
     ) -> Dict[str, torch.Tensor]:
-        return self._pp_recv_typed_dict(
-            expected_kind="output",
+        res = self.pp_group.recv_tensor_dict(
             all_gather_group=(
                 self.attn_tp_group if self.require_attn_tp_allgather else None
             ),
         )
+        return res
 
     def _pp_prep_batch_result(
         self: Scheduler,
@@ -1057,13 +980,16 @@ class SchedulerPPMixin:
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
-        self.process_batch_result(batch, output_result)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.process_batch_result_disagg_prefill(batch, output_result)
+        else:
+            self.process_batch_result(batch, output_result)
 
     def _pp_send_output_to_next_stage(
         self: Scheduler,
         next_first_rank_mb_id: int,
         mbs: List[ScheduleBatch],
-        last_rank_comm_queue: deque,
+        last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
         pp_outputs: PPProxyTensors | None,
     ) -> List[P2PWork]:
         send_output_work = []
@@ -1072,12 +998,11 @@ class SchedulerPPMixin:
             if mbs[next_first_rank_mb_id] is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if not mbs[next_first_rank_mb_id].forward_mode.is_prebuilt():
-                    self.device_module.current_stream().wait_event(q_event)
+                    torch.cuda.current_stream().wait_event(q_event)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
                             async_send=True,
-                            msg_type="output",
                         )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
@@ -1086,7 +1011,6 @@ class SchedulerPPMixin:
                     send_output_work = self._pp_send_dict_to_next_stage(
                         pp_outputs.tensors,
                         async_send=True,
-                        msg_type="output",
                     )
         return send_output_work
 
@@ -1096,60 +1020,34 @@ class SchedulerPPMixin:
         next_mb_id: int,
         mbs: List[ScheduleBatch],
         mb_metadata: List[PPBatchMetadata],
-        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
+        last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
         pp_outputs: PPProxyTensors | None,
-    ) -> Tuple[
-        Optional[PPProxyTensors],
-        Optional[GenerationBatchResult],
-        Optional[torch.Event],
-        List[P2PWork],
-    ]:
+    ) -> Tuple[PPProxyTensors, List[P2PWork], torch.cuda.Event]:
         next_pp_outputs = None
         d2h_event = None
         batch_result = None
-        send_output_work = []
+        send_output_work = self._pp_send_output_to_next_stage(
+            next_first_rank_mb_id,
+            mbs,
+            last_rank_comm_queue,
+            pp_outputs,
+        )
 
-        # On CUDA, isend is async: it enqueues to the stream and returns,
-        # so every rank can send first safely. On some backends isend is
-        # effectively blocking and does not return until the peer posts a
-        # matching recv; if every PP rank sends first, all ranks block
-        # waiting for a receiver and the ring deadlocks. Order send/recv
-        # by pp_rank parity (even: send->recv, odd: recv->send) so each
-        # adjacent pair has one sender and one receiver posted at the
-        # same time.
-
-        # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.pp_rank % 2) == 0)
-
-        def _do_send():
-            return self._pp_send_output_to_next_stage(
-                next_first_rank_mb_id,
-                mbs,
-                last_rank_comm_queue,
-                pp_outputs,
-            )
-
-        def _do_recv():
-            nonlocal next_pp_outputs, batch_result, d2h_event
-            if mbs[next_mb_id] is None or mbs[next_mb_id].forward_mode.is_prebuilt():
-                return
+        if mbs[next_mb_id] is not None:
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
-            with self.copy_stream_ctx:
-                self.copy_stream.wait_stream(self.schedule_stream)
-                batch_result = self._pp_prep_batch_result(
-                    mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
-                )
-                d2h_event = self.device_module.Event()
-                d2h_event.record(self.device_module.current_stream())
-
-        if send_first:
-            send_output_work = _do_send()
-            _do_recv()
-        else:
-            _do_recv()
-            send_output_work = _do_send()
+                next_pp_outputs = None
+                if not mbs[next_mb_id].forward_mode.is_prebuilt():
+                    next_pp_outputs = PPProxyTensors(
+                        self._pp_recv_dict_from_prev_stage()
+                    )
+            if not mbs[next_mb_id].forward_mode.is_prebuilt():
+                with self.copy_stream_ctx:
+                    self.copy_stream.wait_stream(self.default_stream)
+                    batch_result = self._pp_prep_batch_result(
+                        mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
+                    )
+                    d2h_event = torch.cuda.Event()
+                    d2h_event.record(torch.cuda.current_stream())
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
@@ -1158,28 +1056,17 @@ class SchedulerPPMixin:
         mb_id: int,
         pp_proxy_tensors: PPProxyTensors,
         mb_metadata: List[Optional[PPBatchMetadata]],
-        last_rank_comm_queue: deque,
+        last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
     ):
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
-                self.forward_stream.wait_stream(self.schedule_stream)
-                set_time_batch(
-                    self.cur_batch.reqs,
-                    "set_run_batch_cpu_start_time",
-                    trace_only=True,
-                )
+                self.forward_stream.wait_stream(self.default_stream)
                 result = self.run_batch(self.cur_batch, pp_proxy_tensors)
-                set_time_batch(
-                    self.cur_batch.reqs,
-                    "set_run_batch_cpu_end_time",
-                    trace_only=True,
-                    attrs={"pp_mb_id": mb_id},
-                )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                 )
-                event = self.device_module.Event()
-                event.record(self.device_module.current_stream())
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream())
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(
@@ -1198,9 +1085,8 @@ class SchedulerPPMixin:
         """
         Used by PP, get the required rids with the given poll statuses.
         """
-        polls = poll_and_all_reduce_attn_cp_tp_group(
+        polls = poll_and_all_reduce(
             [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
-            self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
         rids: List = []
@@ -1346,9 +1232,8 @@ class ChunkSizePredictor:
 
     def fit(self, seq_lens: List[int], latencies: List[float]):
         """Fit quadratic coefficients f(l) = al^2 + bl + c from data points."""
-        # Skip the first data point to reduce fitting bias, as the first run is slower without warmup
-        L = np.array(seq_lens[1:], dtype=np.float64)
-        T = np.array(latencies[1:], dtype=np.float64)
+        L = np.array(seq_lens, dtype=np.float64)
+        T = np.array(latencies, dtype=np.float64)
 
         if len(L) < 8:
             raise ValueError(

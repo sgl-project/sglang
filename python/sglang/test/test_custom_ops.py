@@ -1,7 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/8ca7a71df787ad711ad3ac70a5bd2eb2bb398938/tests/quantization/test_fp8.py
 
-import sys
-
 import pytest
 import torch
 
@@ -147,4 +145,4 @@ if _is_cuda or _is_hip:
 
 if __name__ == "__main__":
     # Run the specific test function directly
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

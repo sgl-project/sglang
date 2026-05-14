@@ -39,7 +39,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaMLP as LoopCoderMLP
 from sglang.srt.utils import add_prefix, make_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +166,8 @@ class LoopCoderAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        rope_theta, rope_scaling = get_rope_config(config)
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(
             config, "max_position_embeddings", max_position
         )

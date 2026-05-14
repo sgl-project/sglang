@@ -40,10 +40,7 @@ class MathEval(Eval):
         num_examples: Optional[int],
         num_threads: int,
     ):
-        if "://" in filename:
-            df = pandas.read_csv(filename, storage_options={"timeout": 30})
-        else:
-            df = pandas.read_csv(filename)
+        df = pandas.read_csv(filename)
         examples = [row.to_dict() for _, row in df.iterrows()]
         if num_examples:
             examples = random.Random(0).sample(examples, num_examples)

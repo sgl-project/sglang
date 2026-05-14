@@ -2,7 +2,6 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
 use serde_json;
-use smg_mesh::OptionalMeshSyncManager;
 use tracing::{debug, info, warn};
 
 /// Policy Registry for managing model-to-policy mappings
@@ -12,7 +11,7 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
-use crate::{config::types::PolicyConfig, core::Worker};
+use crate::{config::types::PolicyConfig, core::Worker, mesh::OptionalMeshSyncManager};
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -392,7 +391,7 @@ impl PolicyRegistry {
     pub fn apply_remote_tree_operation(
         &self,
         model_id: &str,
-        operation: &smg_mesh::tree_ops::TreeOperation,
+        operation: &crate::mesh::tree_ops::TreeOperation,
     ) {
         // Try to find the policy for this model
         if let Some(policy) = self.get_policy(model_id) {

@@ -12,9 +12,12 @@ from functools import wraps
 
 import aiohttp
 
-from sglang.bench_serving import RequestFuncOutput
-from sglang.benchmark.datasets.random import sample_random_requests
-from sglang.benchmark.utils import get_tokenizer, remove_prefix
+from sglang.bench_serving import (
+    RequestFuncOutput,
+    get_tokenizer,
+    remove_prefix,
+    sample_random_requests,
+)
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -426,13 +429,11 @@ class WorkloadGenerator:
 
     def request_sender(self):
         async def request_loop():
-            tasks = []
             while True:
                 if self.sent_requests - self.completed_requests < self.max_parallel:
                     new_request = self.user_generator.pop()
                     if new_request:
-                        task = asyncio.create_task(self.handle_request(new_request))
-                        tasks.append(task)
+                        asyncio.create_task(self.handle_request(new_request))
                         self.sent_requests += 1
                 else:
                     await asyncio.sleep(0.05)
@@ -441,11 +442,6 @@ class WorkloadGenerator:
                 if time.perf_counter() - self.start_time > self.duration:
                     self.done = True
                     break
-
-            # Cancel all pending tasks and wait for them to finish
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
