@@ -1,4 +1,5 @@
 import json
+import re
 import tempfile
 import threading
 import time
@@ -24,6 +25,9 @@ register_amd_ci(est_time=300, suite="nightly-amd-1-gpu", nightly=True)
 
 MODEL = "Qwen/Qwen3-0.6B"
 NUM_CONVERSATIONS, NUM_TURNS = 4, 3
+
+# Strip the "[YYYY-MM-DD HH:MM:SS] " prefix added by _create_logger_with_handler.
+_LOG_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ")
 
 
 class TestBenchServingFunctionality(CustomTestCase):
@@ -74,6 +78,7 @@ class TestBenchServingFunctionality(CustomTestCase):
     def _verify_multi_turn_logs(self, content: str):
         reqs = []
         for line in content.splitlines():
+            line = _LOG_PREFIX_RE.sub("", line)
             if not line.startswith("{"):
                 continue
             obj = json.loads(line)
