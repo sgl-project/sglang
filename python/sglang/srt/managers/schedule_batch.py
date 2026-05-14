@@ -945,16 +945,36 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
+    # TODO(Jialin): clean up callers that still assign list[int] to
+    # origin_input_ids / output_ids / fill_ids, and we should
+    # drop the property and setter eventually
     @property
     def origin_input_ids(self) -> array:
         return self._origin_input_ids
 
-    # Auto-coerce list[int] -> array.array('q')
     @origin_input_ids.setter
     def origin_input_ids(self, value: Union[List[int], array]) -> None:
         self._origin_input_ids: array = (
             value if isinstance(value, array) else array("q", value)
         )
+
+    @property
+    def output_ids(self) -> array:
+        return self._output_ids
+
+    @output_ids.setter
+    def output_ids(self, value: Union[List[int], array]) -> None:
+        self._output_ids: array = (
+            value if isinstance(value, array) else array("q", value)
+        )
+
+    @property
+    def fill_ids(self) -> array:
+        return self._fill_ids
+
+    @fill_ids.setter
+    def fill_ids(self, value: Union[List[int], array]) -> None:
+        self._fill_ids: array = value if isinstance(value, array) else array("q", value)
 
     @property
     def seqlen(self) -> int:
