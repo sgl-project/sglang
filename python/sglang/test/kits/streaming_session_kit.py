@@ -14,7 +14,11 @@ import time
 
 import requests
 
-from sglang.test.server_fixtures.streaming_session_fixture import _abort_repro_run_all
+from sglang.test.server_fixtures.streaming_session_fixture import (
+    _abort_repro_run_all,
+    _concurrent_logprob_run,
+    _stress_run_all,
+)
 
 
 class StreamingSessionKitMixin:
