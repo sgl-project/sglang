@@ -34,7 +34,9 @@ try:
 except ImportError:
     rt = None
 
-from sglang.srt.model_executor.breakable_cuda_graph.cuda_utils import checkCudaErrors
+from sglang.srt.model_executor.cuda_graph_backend_utils.breakable_cuda_graph.cuda_utils import (
+    checkCudaErrors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +157,7 @@ def _weak_ref_if_tensor(x):
 
     ``weak_ref_tensors`` is imported lazily: the module hard-raises on
     non-CUDA/NPU platforms, and we only reach this code during an active
-    BCG capture (which can't happen on CPU-only runners anyway)."""
+    Breakable capture (which can't happen on CPU-only runners anyway)."""
     if torch.is_tensor(x):
         from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 

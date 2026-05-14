@@ -7,6 +7,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_mode import Backend, Phase
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -79,8 +80,8 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
+        backup_decode_mode = server_args.cuda_graph_mode[Phase.DECODE]
+        server_args.cuda_graph_mode[Phase.DECODE] = Backend.DISABLED
 
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
@@ -112,7 +113,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.init_lm_head()
 
         # Init attention backend and cuda graphs
-        self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
+        self.draft_runner.server_args.cuda_graph_mode[Phase.DECODE] = backup_decode_mode
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )

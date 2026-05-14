@@ -11,27 +11,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Run the model with npu graph and torch.compile."""
+"""Run the model with NPU graph and torch.compile.
+
+``NPUGraphRunner`` is a thin subclass of ``DecodeCudaGraphRunner``: the
+factory returns ``NPUCudaGraphBackend`` for NPU devices, so all
+capture/replay mechanics live in the backend. This class adds:
+  - NPU-specific ``patch_model`` monkey-patch for the decode-Full +
+    torch.compile path.
+  - Profile context override (NPU profiler emits to disk, not in-mem).
+  - Replay override that issues an async ``NPUGraph.update`` for
+    seq_lens before replay (skipped for deepseek-nsa).
+  - Smaller ``cache_loc`` dtype (int32 instead of int64).
+"""
 
 from __future__ import annotations
 
 import logging
 import os
-import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
-import numpy as np
 import torch
 
-import sglang
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.cuda_graph_runner import DecodeCudaGraphRunner
 from sglang.srt.utils import (
-    empty_context,
     get_bool_env_var,
     get_compiler_backend,
     is_npu,
@@ -71,15 +78,16 @@ def patch_model_npu(
         yield model.forward
 
 
-class NPUGraphRunner(CudaGraphRunner):
-    """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
+class NPUGraphRunner(DecodeCudaGraphRunner):
+    """A NPUGraphRunner runs the forward pass of a model with NPU graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
-        sglang.srt.model_executor.cuda_graph_runner.patch_model = patch_model_npu
+        # NPU patch_model override: monkey-patch torch_compile_decoration's
+        # patch_model with the NPU-specific version.
+        from sglang.srt.compilation import torch_compile_decoration
+
+        torch_compile_decoration.patch_model = patch_model_npu
         super().__init__(model_runner)
-        self.update_attr_name = None
-        self.update_attr_type = None
-        self.model_runner = model_runner
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
 
@@ -98,41 +106,6 @@ class NPUGraphRunner(CudaGraphRunner):
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
         }
-
-    def _create_device_graph(self):
-        return torch.npu.NPUGraph()
-
-    def _capture_graph(self, graph, pool, stream, run_once_fn):
-        if self.enable_torch_compile:
-            skip_guard_context = torch.compiler.set_stance(skip_guard_eval_unsafe=True)
-        else:
-            skip_guard_context = empty_context()
-
-        with (
-            skip_guard_context,
-            torch.npu.graph(
-                graph,
-                pool=pool,
-                stream=stream,
-                auto_dispatch_capture=True,
-            ),
-        ):
-            out = run_once_fn()
-        return out
-
-    def _get_update_attr_name(self):
-        return self.attr_name[AttentionArch.MLA]
-
-    def _get_update_attr_type(self):
-        return self.attr_type[AttentionArch.MLA]
-
-    def _update_inputs(self, seq_lens):
-        if isinstance(self.update_attr_type, torch.Tensor):
-            seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
-
-        self.graphs[self.bs].update(
-            cpu_update_input=[{self.update_attr_name: seq_lens}]
-        )
 
     def _cache_loc_dtype(self):
         return torch.int32
@@ -185,9 +158,8 @@ class NPUGraphRunner(CudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
-        self.update_attr_name = self._get_update_attr_name()
-        self.update_attr_type = self._get_update_attr_type()
-        # Replay
+        graph_key = self._make_graph_key(self.bs)
+
         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
             if forward_batch.forward_mode.is_target_verify():
                 seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_bs
@@ -196,14 +168,15 @@ class NPUGraphRunner(CudaGraphRunner):
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
-            thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
-            thread.start()
-            self.graphs[self.bs].replay()
-            thread.join()
+            output = self.backend.replay_with_input_update(
+                graph_key,
+                seq_lens=seq_lens,
+                attr_name=self.attr_name[AttentionArch.MLA],
+                attr_type=self.attr_type[AttentionArch.MLA],
+            )
         else:
-            self.graphs[self.bs].replay()
+            output = self.backend.replay(graph_key, forward_batch)
 
-        output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None

@@ -13,13 +13,15 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -316,7 +318,7 @@ class CustomAllreduce:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph
                 # but _IS_CAPTURING is still True. We need to do real all-reduce.
-                if is_in_piecewise_cuda_graph():
+                if is_in_tc_piecewise_cuda_graph():
                     # Split op execution - do real all-reduce
                     return self._all_reduce_impl(input, registered=False)
                 else:

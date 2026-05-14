@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -21,6 +20,9 @@ from sglang.srt.lora.deepseek_mla_correction import (
 )
 from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
+)
+from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
@@ -642,7 +644,7 @@ class DeepseekMLAForwardMixin:
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
-            if is_in_piecewise_cuda_graph():
+            if is_in_tc_piecewise_cuda_graph():
                 # torch dynamo requires out= op was called where output tensor was non-contiguous
                 attn_bmm_output = (
                     torch.bmm(attn_output.transpose(0, 1), self.w_vc)

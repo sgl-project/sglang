@@ -25,7 +25,12 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.cuda_graph_mode import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
+from sglang.srt.model_executor.cuda_graph_runner import DecodeCudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -127,8 +132,8 @@ class EAGLEWorker(TpModelWorker):
 
         # Do not capture cuda graph in `super().__init__()`
         # It will be captured later.
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
+        backup_decode_mode = server_args.cuda_graph_mode[Phase.DECODE]
+        server_args.cuda_graph_mode[Phase.DECODE] = Backend.DISABLED
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -203,8 +208,8 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         # Init attention backend and cuda graphs
-        self.draft_model_runner.server_args.disable_cuda_graph = (
-            backup_disable_cuda_graph
+        self.draft_model_runner.server_args.cuda_graph_mode[Phase.DECODE] = (
+            backup_decode_mode
         )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
@@ -233,7 +238,7 @@ class EAGLEWorker(TpModelWorker):
                         draft_attn_backend=self.draft_attn_backend,
                         cuda_graph_runner=self.cuda_graph_runner,
                         target_attn_backend=self.target_worker.model_runner.attn_backend,
-                        target_graph_runner=self.target_worker.model_runner.graph_runner,
+                        target_graph_runner=self.target_worker.model_runner.decode_cuda_graph_runner,
                         draft_extend_attn_backend=self.draft_extend_attn_backend,
                         cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
                     )
@@ -270,7 +275,7 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
         Device2DraftCudaGraphRunner = {
@@ -333,7 +338,9 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = state.cuda_graph_runner
         # Verify stage
         self.target_worker.model_runner.attn_backend = state.target_attn_backend
-        self.target_worker.model_runner.graph_runner = state.target_graph_runner
+        self.target_worker.model_runner.decode_cuda_graph_runner = (
+            state.target_graph_runner
+        )
         # Extend stage
         self.draft_extend_attn_backend = state.draft_extend_attn_backend
         self.cuda_graph_runner_for_draft_extend = (
@@ -370,8 +377,8 @@ class EAGLEWorker(TpModelWorker):
                 target_model_runner.init_new_workspace = backup_init
 
             target_graph_runner = None
-            if not self.server_args.disable_cuda_graph:
-                target_graph_runner = CudaGraphRunner(
+            if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+                target_graph_runner = DecodeCudaGraphRunner(
                     target_model_runner,
                     attn_backend=target_attn_backend,
                     speculative_num_steps=speculative_num_steps,

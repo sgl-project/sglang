@@ -33,7 +33,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
+    get_forward_context,
+)
 
 try:
     from vllm import _custom_ops as ops

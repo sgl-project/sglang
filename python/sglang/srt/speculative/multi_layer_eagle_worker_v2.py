@@ -28,6 +28,11 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_mode import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -112,8 +117,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
+        backup_decode_mode = server_args.cuda_graph_mode[Phase.DECODE]
+        server_args.cuda_graph_mode[Phase.DECODE] = Backend.DISABLED
 
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
@@ -166,9 +171,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Init attention backend and cuda graphs
         for i in range(self.speculative_num_steps):
-            self.draft_runner_list[i].server_args.disable_cuda_graph = (
-                backup_disable_cuda_graph
-            )
+            self.draft_runner_list[i].server_args.cuda_graph_mode[
+                Phase.DECODE
+            ] = backup_decode_mode
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -214,7 +219,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
         self.cuda_graph_runner_for_draft_extend = (
@@ -753,7 +758,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
                 verify_input,
                 (
-                    self.target_worker.model_runner.graph_runner.bs
+                    self.target_worker.model_runner.decode_cuda_graph_runner.bs
                     if can_run_cuda_graph
                     else None
                 ),

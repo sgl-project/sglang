@@ -163,7 +163,7 @@ class MlxModelRunnerStub(ModelRunner):
         )
 
         # No CUDA graphs, no attention backend
-        self.graph_runner = None
+        self.decode_cuda_graph_runner = None
         self.graph_mem_usage = 0
         self.attn_backend = None
 

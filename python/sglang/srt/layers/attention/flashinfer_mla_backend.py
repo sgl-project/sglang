@@ -15,13 +15,15 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
@@ -324,7 +326,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 not get_global_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
                 # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
-                and not is_in_piecewise_cuda_graph()
+                and not is_in_tc_piecewise_cuda_graph()
             )
 
             self.indices_updater_prefill.update(

@@ -53,7 +53,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         except ImportError:
             raise unittest.SkipTest("cuda-python not installed")
 
-        from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+        from sglang.srt.model_executor.cuda_graph_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             BreakableCUDAGraph,
             BreakableCUDAGraphCapture,
             eager_on_graph,
@@ -199,7 +199,7 @@ class TestCopyOutput(CustomTestCase):
         except ImportError:
             raise unittest.SkipTest("cuda-python not installed")
 
-        from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+        from sglang.srt.model_executor.cuda_graph_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             _copy_output,
         )
 
@@ -261,7 +261,7 @@ class TestBreakGraphHelper(CustomTestCase):
         except ImportError:
             raise unittest.SkipTest("cuda-python not installed")
 
-        from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+        from sglang.srt.model_executor.cuda_graph_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             BreakableCUDAGraph,
             BreakableCUDAGraphCapture,
             break_graph,
