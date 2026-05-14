@@ -2976,11 +2976,19 @@ def load_json_config(data: str):
         return orjson.loads(Path(data).read_text())
 
 
+_DISPOSE_CLEAR_ALIAS_MIN_BYTES = 16 * 1024 * 1024
+
+
 def dispose_tensor(x: torch.Tensor):
     """
     Dispose a tensor by freeing its memory.
     During piecewise CUDA graph capture/replay, we skip disposal to avoid
     interfering with torch.compile's memory tracking and graph recording.
+
+    For large tensors (>= 16 MiB), also clear any aliased Python tensors that
+    share the same UntypedStorage. Some workspace/communication paths keep a
+    Python tensor pointing at the same data_ptr; without clearing it, x.set_()
+    alone does not free the underlying storage.
     """
 
     # Skip disposal during piecewise CUDA graph to avoid torch.compile issues
@@ -2991,6 +2999,41 @@ def dispose_tensor(x: torch.Tensor):
 
     if is_in_piecewise_cuda_graph():
         return
+
+    try:
+        nbytes = x.untyped_storage().nbytes()
+    except Exception:
+        nbytes = 0
+
+    if nbytes >= _DISPOSE_CLEAR_ALIAS_MIN_BYTES:
+        import gc
+
+        try:
+            from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+                is_tensor_in_symmetric_mempool,
+            )
+        except Exception:
+            is_tensor_in_symmetric_mempool = lambda _t: False
+
+        # NCCL symmetric-memory-registered tensors must stay live for collectives;
+        # skip them.
+        if is_tensor_in_symmetric_mempool(x):
+            x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
+            return
+
+        data_ptr = x.untyped_storage().data_ptr()
+        empty = torch.empty((0,), device=x.device, dtype=x.dtype)
+        for obj in gc.get_objects():
+            try:
+                if (
+                    isinstance(obj, torch.Tensor)
+                    and obj is not x
+                    and obj.untyped_storage().data_ptr() == data_ptr
+                    and not is_tensor_in_symmetric_mempool(obj)
+                ):
+                    obj.set_(empty)
+            except Exception:
+                pass
 
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
 
