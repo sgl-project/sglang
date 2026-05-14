@@ -305,8 +305,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-a-test-1-gpu-small
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-1-gpu-small'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           run_timeout_minutes: '10'
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -414,8 +413,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-b-test-1-gpu-small
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-small'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
       - uses: ./.github/actions/teardown-cuda-test-stage
@@ -453,8 +451,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-b-test-1-gpu-large
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-large'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           timeout_per_file: '1800'
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -492,8 +489,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-b-test-2-gpu-large
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-2-gpu-large'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
       - uses: ./.github/actions/teardown-cuda-test-stage
@@ -531,8 +527,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-b-test-4-gpu-b200
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-4-gpu-b200'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           run_timeout_minutes: '40'
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -606,8 +601,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-c-test-4-gpu-h100
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-h100'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
       - uses: ./.github/actions/teardown-cuda-test-stage
@@ -663,8 +657,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-c-test-8-gpu-h200
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h200'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
       - uses: ./.github/actions/teardown-cuda-test-stage
@@ -703,8 +696,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-c-test-8-gpu-h20
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h20'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
       - uses: ./.github/actions/teardown-cuda-test-stage
@@ -756,8 +748,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-c-test-deepep-4-gpu-h100
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-4-gpu-h100'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
       - uses: ./.github/actions/teardown-cuda-test-stage
@@ -810,8 +801,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-c-test-deepep-8-gpu-h200
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-8-gpu-h200'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           run_timeout_minutes: '45'
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -848,8 +838,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-c-test-4-gpu-b200
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-b200'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           timeout_per_file: '1800'
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -889,8 +878,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-c-test-dsv4-4-gpu-b200
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-4-gpu-b200'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           timeout_per_file: '1800'
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -927,8 +915,7 @@ jobs:
       - uses: ./.github/actions/run-test-cuda-suite
         with:
           suite_name: stage-c-test-dsv4-8-gpu-h200
-          partition_id: ${{ matrix.partition }}
-          partition_size: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-8-gpu-h200'].size }}
+          partitions_json: ${{ needs.check-changes.outputs.partitions }}
           timeout_per_file: '1800'
           continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 

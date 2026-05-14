@@ -1,26 +1,22 @@
 name: Run CUDA Test Suite
 description: >-
-  Runs `run_suite.py` for one CUDA test stage. Wraps the parameterised
-  invocation that every stage shares (cd test, run_suite.py with hw=cuda,
-  suite name, optional partition flags, optional --timeout-per-file, and the
-  continue-on-error flag). Composite-action steps cannot use timeout-minutes
-  natively, so the per-suite wall-clock cap is enforced via bash `timeout`
-  (SIGTERM then SIGKILL after a short grace period -- same signal pair as
-  GitHub Actions' native step timeout).
+  Runs `run_suite.py` for one CUDA test stage. Partition id is read from the
+  matrix context; partition size is looked up from the `partitions` JSON
+  (check-changes.outputs.partitions) keyed by suite name. Composite-action
+  steps cannot use `timeout-minutes` natively, so the per-suite wall-clock cap
+  is enforced via bash `timeout` (SIGTERM then SIGKILL after a short grace
+  period -- the same signal pair GitHub Actions uses for its native step
+  timeout).
 inputs:
   suite_name:
     description: 'Suite name passed via --suite (e.g. stage-b-test-1-gpu-small).'
     required: true
-  partition_size:
+  partitions_json:
     description: >-
-      Value passed to --auto-partition-size. Empty (default) omits both
-      partition flags entirely, matching the non-partitioned stages.
-    default: ''
-  partition_id:
-    description: >-
-      Value passed to --auto-partition-id. Typically ${{ matrix.partition }}
-      or ${{ matrix.part }}. Ignored when partition_size is empty.
-    default: ''
+      The full `partitions` JSON output from check-changes
+      (`needs.check-changes.outputs.partitions`). Looked up by `suite_name`
+      to derive --auto-partition-size.
+    required: true
   run_timeout_minutes:
     description: 'Wall-clock cap (in minutes) for the run_suite.py invocation, enforced via bash `timeout`.'
     default: '30'
@@ -42,10 +38,13 @@ runs:
       shell: bash
       env:
         CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error_flag }}
+        SUITE: ${{ inputs.suite_name }}
+        PARTITION_ID: ${{ matrix.partition }}
+        PARTITION_SIZE: ${{ fromJson(inputs.partitions_json)[inputs.suite_name].size }}
       run: |
         cd test
         timeout ${{ inputs.run_timeout_minutes }}m python3 run_suite.py \
-          --hw cuda --suite ${{ inputs.suite_name }} \
-          ${{ inputs.partition_size && format('--auto-partition-id {0} --auto-partition-size {1}', inputs.partition_id, inputs.partition_size) || '' }} \
+          --hw cuda --suite "$SUITE" \
+          --auto-partition-id "$PARTITION_ID" --auto-partition-size "$PARTITION_SIZE" \
           ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
           $CONTINUE_ON_ERROR_FLAG
