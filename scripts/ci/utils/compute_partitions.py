@@ -44,24 +44,23 @@ _STAGE_A_OVERRIDES = {
 _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
 
 
-def load_run_timeouts(pr_test_yml_paths: list[str]) -> dict:
-    """Map `self_name -> run_timeout_minutes` across one or more pr-test*.yml.
-    The input is required in `_pr-test-stage.yml` -- KeyError surfaces missing.
+def load_run_timeouts(pr_test_yml_path: str) -> dict:
+    """Map `self_name -> run_timeout_minutes` from one pr-test*.yml. The input
+    is required in `_pr-test-stage.yml` -- KeyError surfaces missing.
     Inline stage-a-test-cpu is skipped (uses `_STAGE_A_OVERRIDES`)."""
+    with open(pr_test_yml_path) as f:
+        wf = yaml.safe_load(f)
     timeouts = {}
-    for pr_test_yml_path in pr_test_yml_paths:
-        with open(pr_test_yml_path) as f:
-            wf = yaml.safe_load(f)
-        for job_id, job in (wf.get("jobs") or {}).items():
-            if not isinstance(job, dict) or job.get("uses") != _REUSABLE_STAGE_USES:
-                continue
-            with_ = job.get("with") or {}
-            suite = with_.get("self_name", job_id)
-            timeouts[suite] = int(with_["run_timeout_minutes"])
+    for job_id, job in (wf.get("jobs") or {}).items():
+        if not isinstance(job, dict) or job.get("uses") != _REUSABLE_STAGE_USES:
+            continue
+        with_ = job.get("with") or {}
+        suite = with_.get("self_name", job_id)
+        timeouts[suite] = int(with_["run_timeout_minutes"])
     if not timeouts:
         raise RuntimeError(
             f"load_run_timeouts: no jobs matched uses={_REUSABLE_STAGE_USES!r} "
-            f"in {pr_test_yml_paths}. The reusable workflow path likely "
+            f"in {pr_test_yml_path}. The reusable workflow path likely "
             "changed -- update _REUSABLE_STAGE_USES."
         )
     return timeouts
@@ -202,9 +201,8 @@ def main():
     )
     parser.add_argument(
         "--pr-test-yml",
-        nargs="+",
-        default=[os.path.join(REPO_ROOT, ".github", "workflows", "pr-test.yml")],
-        help="Path(s) to pr-test*.yml; per-stage `run_timeout_minutes` is read from each.",
+        default=os.path.join(REPO_ROOT, ".github", "workflows", "pr-test.yml"),
+        help="Path to pr-test*.yml; per-stage `run_timeout_minutes` is read from here.",
     )
     args = parser.parse_args()
 
