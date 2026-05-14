@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=691, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=691, stage="stage-b", runner_config="1-gpu-large")
 
 LOGPROB_PROMPTS = [
     "The quick brown fox jumps over the lazy dog.",
@@ -796,9 +796,10 @@ class TestStreamingSessionRetractMixedChunk(TestStreamingSession):
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_TEST_RETRACT.override(
-            True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+        with (
+            envs.SGLANG_TEST_RETRACT.override(True),
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2),
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -825,9 +826,10 @@ class TestStreamingSessionRetractLargePage(TestStreamingSession):
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_TEST_RETRACT.override(
-            True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+        with (
+            envs.SGLANG_TEST_RETRACT.override(True),
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2),
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -856,9 +858,10 @@ class TestStreamingSessionEagle(TestStreamingSession):
     def setUpClass(cls):
         cls.model = DEFAULT_TARGET_MODEL_EAGLE3
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(
-            2
-        ), envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True):
+        with (
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2),
+            envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True),
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -897,12 +900,10 @@ class TestStreamingSessionEagleV2(TestStreamingSession):
     def setUpClass(cls):
         cls.model = DEFAULT_TARGET_MODEL_EAGLE3
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_SPEC_V2.override(
-            True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(
-            2
-        ), envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(
-            True
+        with (
+            envs.SGLANG_ENABLE_SPEC_V2.override(True),
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2),
+            envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True),
         ):
             cls.process = popen_launch_server(
                 cls.model,
@@ -944,12 +945,10 @@ class TestStreamingSessionEagleRetractLargePage(TestStreamingSession):
     def setUpClass(cls):
         cls.model = DEFAULT_TARGET_MODEL_EAGLE3
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_TEST_RETRACT.override(
-            True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(
-            2
-        ), envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(
-            True
+        with (
+            envs.SGLANG_TEST_RETRACT.override(True),
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2),
+            envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True),
         ):
             cls.process = popen_launch_server(
                 cls.model,
@@ -991,14 +990,11 @@ class TestStreamingSessionEagleV2RetractLargePage(TestStreamingSession):
     def setUpClass(cls):
         cls.model = DEFAULT_TARGET_MODEL_EAGLE3
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_SPEC_V2.override(
-            True
-        ), envs.SGLANG_TEST_RETRACT.override(
-            True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(
-            2
-        ), envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(
-            True
+        with (
+            envs.SGLANG_ENABLE_SPEC_V2.override(True),
+            envs.SGLANG_TEST_RETRACT.override(True),
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2),
+            envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True),
         ):
             cls.process = popen_launch_server(
                 cls.model,
