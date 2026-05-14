@@ -781,22 +781,49 @@ def biased_topk_jit_kernel_impl(
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
+    if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
+        from aiter import topk_gating
 
-    topk_weights, topk_ids = moe_fused_gate(
-        gating_output,
-        correction_bias,
-        topk=topk,
-        scoring_func=scoring_func,
-        num_fused_shared_experts=num_fused_shared_experts,
-        renormalize=renormalize,
-        routed_scaling_factor=routed_scaling_factor,
-        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-    )
-    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-    return topk_weights, topk_ids
+        num_tokens = gating_output.shape[0]
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+        )
+        topk_ids = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+        )
+
+        topk_gating(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            correction_bias,
+            renormalize,
+            routed_scaling_factor,
+            score_func="sqrtsoftplus",
+        )
+
+        return topk_weights, topk_ids
+
+    else:
+
+        from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
+
+        topk_weights, topk_ids = moe_fused_gate(
+            gating_output,
+            correction_bias,
+            topk=topk,
+            scoring_func=scoring_func,
+            num_fused_shared_experts=num_fused_shared_experts,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
+        topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(
+            torch.int32
+        )
+        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        return topk_weights, topk_ids
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
