@@ -50,6 +50,14 @@ STOP_REASON_MAP = {
     "tool_calls": "tool_use",
 }
 
+ANTHROPIC_TO_OPENAI_REASONING_EFFORT = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+
 
 def _wrap_sse_event(data: str, event_type: str) -> str:
     """Format an Anthropic SSE event with event type and data lines."""
@@ -192,6 +200,7 @@ class AnthropicServing:
             openai_msg = {"role": msg.role}
             content_parts = []
             tool_calls = []
+            reasoning_parts = []
 
             for block in msg.content:
                 if block.type == "text" and block.text:
@@ -240,6 +249,16 @@ class AnthropicServing:
                             }
                         )
 
+                elif block.type == "thinking" and block.thinking:
+                    reasoning_parts.append(block.thinking)
+
+                elif block.type == "redacted_thinking" and block.data:
+                    reasoning_parts.append(block.data)
+
+            # Attach reasoning content to assistant messages
+            if reasoning_parts and msg.role == "assistant":
+                openai_msg["reasoning_content"] = "\n".join(reasoning_parts)
+
             # Attach tool calls to assistant messages
             if tool_calls:
                 openai_msg["tool_calls"] = tool_calls
@@ -250,7 +269,7 @@ class AnthropicServing:
                     openai_msg["content"] = content_parts[0]["text"]
                 else:
                     openai_msg["content"] = content_parts
-            elif not tool_calls:
+            elif not tool_calls and not reasoning_parts:
                 continue
 
             openai_messages.append(openai_msg)
@@ -262,6 +281,8 @@ class AnthropicServing:
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
         }
+        chat_template_kwargs = {}
+        custom_params = {}
 
         if anthropic_request.temperature is not None:
             request_data["temperature"] = anthropic_request.temperature
@@ -271,6 +292,47 @@ class AnthropicServing:
             request_data["top_k"] = anthropic_request.top_k
         if anthropic_request.stop_sequences is not None:
             request_data["stop"] = anthropic_request.stop_sequences
+
+        if anthropic_request.thinking is not None:
+            thinking = anthropic_request.thinking
+            if thinking.type == "disabled":
+                request_data["reasoning_effort"] = "none"
+                chat_template_kwargs.setdefault("thinking", False)
+                chat_template_kwargs.setdefault("enable_thinking", False)
+            else:
+                chat_template_kwargs.setdefault("thinking", True)
+                chat_template_kwargs.setdefault("enable_thinking", True)
+                if thinking.budget_tokens is not None:
+                    custom_params["thinking_budget"] = thinking.budget_tokens
+                # Anthropic adaptive/enabled thinking should enable reasoning even
+                # when no explicit output_config.effort is provided.
+                request_data.setdefault("reasoning_effort", "high")
+                if thinking.display == "omitted":
+                    request_data["stream_reasoning"] = False
+
+        if anthropic_request.output_config is not None:
+            output_config = anthropic_request.output_config
+            thinking_disabled = (
+                anthropic_request.thinking is not None
+                and anthropic_request.thinking.type == "disabled"
+            )
+            if output_config.effort is not None and not thinking_disabled:
+                request_data["reasoning_effort"] = ANTHROPIC_TO_OPENAI_REASONING_EFFORT[
+                    output_config.effort
+                ]
+                chat_template_kwargs.setdefault("thinking", True)
+                chat_template_kwargs.setdefault("enable_thinking", True)
+            if output_config.task_budget is not None:
+                custom_params["task_budget"] = output_config.task_budget.model_dump(
+                    exclude_none=True
+                )
+
+        if anthropic_request.betas is not None:
+            custom_params["anthropic_betas"] = anthropic_request.betas
+        if chat_template_kwargs:
+            request_data["chat_template_kwargs"] = chat_template_kwargs
+        if custom_params:
+            request_data["custom_params"] = custom_params
 
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
@@ -370,7 +432,7 @@ class AnthropicServing:
             )
 
         # Convert to Anthropic response
-        anthropic_response = self._convert_response(response)
+        anthropic_response = self._convert_response(response, anthropic_request)
         return JSONResponse(content=anthropic_response.model_dump(exclude_none=True))
 
     async def _handle_streaming(
@@ -439,6 +501,7 @@ class AnthropicServing:
         first_chunk = True
         content_block_index = 0
         content_block_open = False
+        content_block_type: Optional[str] = None
         finish_reason: Optional[str] = None
         usage_info: Optional[dict] = None
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -551,6 +614,54 @@ class AnthropicServing:
 
             delta = choice.delta
 
+            # Handle reasoning deltas as Anthropic thinking blocks.
+            if (
+                delta.reasoning_content is not None
+                and delta.reasoning_content != ""
+                and self._should_emit_thinking(anthropic_request)
+            ):
+                if content_block_open and content_block_type != "thinking":
+                    stop_event = AnthropicStreamEvent(
+                        type="content_block_stop",
+                        index=content_block_index,
+                    )
+                    yield _wrap_sse_event(
+                        stop_event.model_dump_json(exclude_none=True),
+                        "content_block_stop",
+                    )
+                    content_block_index += 1
+                    content_block_open = False
+                    content_block_type = None
+
+                if not content_block_open:
+                    start_event = AnthropicStreamEvent(
+                        type="content_block_start",
+                        index=content_block_index,
+                        content_block=AnthropicContentBlock(
+                            type="thinking", thinking="", signature=""
+                        ),
+                    )
+                    yield _wrap_sse_event(
+                        start_event.model_dump_json(exclude_none=True),
+                        "content_block_start",
+                    )
+                    content_block_open = True
+                    content_block_type = "thinking"
+
+                if not self._should_omit_thinking(anthropic_request):
+                    delta_event = AnthropicStreamEvent(
+                        type="content_block_delta",
+                        index=content_block_index,
+                        delta=AnthropicDelta(
+                            type="thinking_delta",
+                            thinking=delta.reasoning_content,
+                        ),
+                    )
+                    yield _wrap_sse_event(
+                        delta_event.model_dump_json(exclude_none=True),
+                        "content_block_delta",
+                    )
+
             # Handle tool call deltas
             if delta.tool_calls:
                 for tc in delta.tool_calls:
@@ -570,6 +681,8 @@ class AnthropicServing:
                                 "content_block_stop",
                             )
                             content_block_index += 1
+                            content_block_open = False
+                            content_block_type = None
 
                         # Start tool_use content block
                         start_event = AnthropicStreamEvent(
@@ -587,6 +700,7 @@ class AnthropicServing:
                             "content_block_start",
                         )
                         content_block_open = True
+                        content_block_type = "tool_use"
 
                         # Stream initial arguments if present
                         if tc_func.arguments:
@@ -621,6 +735,19 @@ class AnthropicServing:
 
             # Handle text content deltas
             if delta.content is not None and delta.content != "":
+                if content_block_open and content_block_type != "text":
+                    stop_event = AnthropicStreamEvent(
+                        type="content_block_stop",
+                        index=content_block_index,
+                    )
+                    yield _wrap_sse_event(
+                        stop_event.model_dump_json(exclude_none=True),
+                        "content_block_stop",
+                    )
+                    content_block_index += 1
+                    content_block_open = False
+                    content_block_type = None
+
                 # Start a text content block if needed
                 if not content_block_open:
                     start_event = AnthropicStreamEvent(
@@ -633,6 +760,7 @@ class AnthropicServing:
                         "content_block_start",
                     )
                     content_block_open = True
+                    content_block_type = "text"
 
                 # Emit text delta
                 delta_event = AnthropicStreamEvent(
@@ -648,8 +776,30 @@ class AnthropicServing:
                     "content_block_delta",
                 )
 
+    def _should_emit_thinking(
+        self, anthropic_request: AnthropicMessagesRequest
+    ) -> bool:
+        return (
+            anthropic_request.thinking is not None
+            and anthropic_request.thinking.type != "disabled"
+        )
+
+    def _should_omit_thinking(
+        self, anthropic_request: AnthropicMessagesRequest
+    ) -> bool:
+        if not self._should_emit_thinking(anthropic_request):
+            return True
+        thinking = anthropic_request.thinking
+        if thinking.display == "omitted":
+            return True
+        # Claude 4.7 adaptive thinking defaults to omitted unless summarized is
+        # explicitly requested.
+        return thinking.type == "adaptive" and thinking.display is None
+
     def _convert_response(
-        self, response: ChatCompletionResponse
+        self,
+        response: ChatCompletionResponse,
+        anthropic_request: AnthropicMessagesRequest,
     ) -> AnthropicMessagesResponse:
         """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
         if not response.choices:
@@ -662,6 +812,23 @@ class AnthropicServing:
 
         choice = response.choices[0]
         content: list[AnthropicContentBlock] = []
+
+        # Add thinking content when requested.
+        if (
+            self._should_emit_thinking(anthropic_request)
+            and choice.message.reasoning_content
+        ):
+            content.append(
+                AnthropicContentBlock(
+                    type="thinking",
+                    thinking=(
+                        ""
+                        if self._should_omit_thinking(anthropic_request)
+                        else choice.message.reasoning_content
+                    ),
+                    signature="",
+                )
+            )
 
         # Add text content
         if choice.message.content:
@@ -734,6 +901,9 @@ class AnthropicServing:
                 system=request.system,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                thinking=request.thinking,
+                output_config=request.output_config,
+                betas=request.betas,
             )
             chat_request = self._convert_to_chat_completion_request(messages_request)
         except Exception as e:
