@@ -1,9 +1,17 @@
 name: PR Test Stage
 # Reusable workflow that owns one CUDA test stage. Caller (pr-test.yml) passes
-# (self_name, runner_config, runs_on, partitions, ...) and the
-# per-commit/target_stage gating + matrix fanout + setup/run/teardown all live
-# here. Only stage-a-test-cpu still lives inline in pr-test.yml (bespoke
+# (self_name, runner_config, runs_on, partitions, check_changes JSON, caller_inputs JSON)
+# and the per-commit/target_stage gating + matrix fanout + setup/run/teardown all
+# live here. Only stage-a-test-cpu still lives inline in pr-test.yml (bespoke
 # uv pip / protoc / rust-cache install path).
+#
+# `check_changes` = ${{ toJson(needs.check-changes.outputs) }} forwarded as-is.
+# `caller_inputs` = ${{ toJson(inputs) }} forwarded as-is.
+# `partitions` is kept as its own input (rather than read from check_changes)
+# so accessing it needs only one fromJson — the value itself is a JSON string,
+# which inside `check_changes` would become a JSON-escaped string requiring
+# nested fromJson. `partitions` is referenced 3x in job-level strategy/matrix
+# where step-resolution isn't available, so the inline expressions stay short.
 
 on:
   workflow_call:
@@ -20,30 +28,18 @@ on:
         description: 'Physical GHA runner label, e.g. "1-gpu-5090" or the b200_runner output from check-changes for B200 stages.'
         type: string
         required: true
-      target_stage:
-        description: 'Forwarded from pr-test.yml inputs.target_stage (used by /rerun-stage to skip everything except the targeted stage).'
+      check_changes:
+        description: 'JSON-encoded `needs.check-changes.outputs` bundle. Use fromJson(...) to read main_package / sgl_kernel / continue_on_error etc.'
         type: string
-        default: ''
-      test_parallel_dispatch:
-        description: 'Forwarded from pr-test.yml inputs.test_parallel_dispatch.'
+        required: true
+      caller_inputs:
+        description: 'JSON-encoded pr-test.yml workflow inputs bundle (toJson(inputs)). Reads target_stage / test_parallel_dispatch / pr_head_sha / git_ref / skip_stage_health_check.'
         type: string
-        default: 'false'
+        required: true
       partitions:
-        description: 'JSON from check-changes (size, arr, max_parallel per suite).'
+        description: 'JSON from check-changes (size, arr, max_parallel per suite). Passed as its own input so single-level fromJson suffices in matrix expressions.'
         type: string
         required: true
-      main_package:
-        description: 'check-changes.outputs.main_package — gates the default per-commit run.'
-        type: string
-        required: true
-      sgl_kernel:
-        description: 'check-changes.outputs.sgl_kernel — both gates the run and forwarded to the install/download steps.'
-        type: string
-        required: true
-      continue_on_error_flag:
-        description: 'Empty or `--continue-on-error`; forwarded to run_suite.py.'
-        type: string
-        default: ''
       run_timeout_minutes:
         description: 'Per-suite wall-clock cap (minutes), enforced via bash `timeout` around run_suite.py.'
         type: string
@@ -68,18 +64,6 @@ on:
         description: 'Optional pytest path to run after the suite (stage-b-test-4-gpu-b200 uses this for FA4 jit_kernel tests). Empty = skip.'
         type: string
         default: ''
-      pr_head_sha:
-        description: 'Forwarded from pr-test.yml inputs.pr_head_sha (for /rerun-stage on fork PRs).'
-        type: string
-        default: ''
-      git_ref:
-        description: 'Forwarded from pr-test.yml inputs.git_ref (for workflow_call from main).'
-        type: string
-        default: ''
-      skip_stage_health_check:
-        description: 'Forwarded from pr-test.yml inputs.skip_stage_health_check (release branch cut bypass).'
-        type: boolean
-        default: false
 
 # Mirror pr-test.yml top-level env. Reusable workflows do NOT inherit caller's
 # workflow-level env across the workflow_call boundary, so anything pr-test.yml
@@ -88,7 +72,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check && 'true' || 'false' }}
+  SKIP_STAGE_HEALTH_CHECK: ${{ fromJson(inputs.caller_inputs).skip_stage_health_check && 'true' || 'false' }}
   FORCE_REBUILD_DEEPEP: '1'
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -102,11 +86,11 @@ jobs:
     if: |
       always() &&
       (
-        (inputs.target_stage == inputs.self_name) ||
+        (fromJson(inputs.caller_inputs).target_stage == inputs.self_name) ||
         (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (!failure() && !cancelled())) &&
-          (inputs.main_package == 'true' || inputs.sgl_kernel == 'true')
+          !fromJson(inputs.caller_inputs).target_stage &&
+          ((github.event_name == 'schedule' || fromJson(inputs.caller_inputs).test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true')
         )
       )
     runs-on: ${{ inputs.runs_on }}
@@ -123,7 +107,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ fromJson(inputs.caller_inputs).pr_head_sha || fromJson(inputs.caller_inputs).git_ref || github.sha }}
 
       - name: Resolve runner_config
         id: rc
@@ -134,7 +118,7 @@ jobs:
       - uses: ./.github/actions/check-maintenance
 
       - name: Download artifacts (v4)
-        if: ${{ inputs.sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v4' }}
+        if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v4' }}
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
@@ -142,7 +126,7 @@ jobs:
           pattern: wheel-python3.10-cuda*
 
       - name: Download artifacts (v6)
-        if: ${{ inputs.sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6' }}
+        if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6' }}
         uses: actions/download-artifact@v6
         with:
           path: sgl-kernel/dist/
@@ -152,7 +136,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash ${{ steps.rc.outputs.install }}
+          CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 
       - name: Warmup DeepGEMM JIT Compilation
         if: inputs.warmup_deep_gemm_models != ''
@@ -174,7 +158,7 @@ jobs:
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
-          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error_flag }}
+          CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite ${{ inputs.self_name }} \
