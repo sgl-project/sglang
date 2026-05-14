@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1800, suite="stage-c-test-dsv4-4-gpu-b200")
+register_cuda_ci(est_time=1800, stage="stage-c", runner_config="dsv4-4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600

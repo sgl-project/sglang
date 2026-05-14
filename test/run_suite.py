@@ -32,6 +32,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-large-8-gpu-35x-disaggregation-amd",
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
+        "jit-kernel-unit-test-amd",
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
@@ -150,9 +151,9 @@ def validate_all_suites(all_tests: List[CIRegistry]):
         if t.backend not in _SUITE_CHECKED_BACKENDS:
             continue
         valid = valid_by_backend.get(t.backend, set())
-        if t.suite not in valid:
+        if t.effective_suite not in valid:
             errors.append(
-                f"  {t.filename}: backend={t.backend.name}, suite='{t.suite}'"
+                f"  {t.filename}: backend={t.backend.name}, suite='{t.effective_suite}'"
             )
     if errors:
         raise ValueError("Tests registered to invalid suites:\n" + "\n".join(errors))
@@ -164,7 +165,7 @@ def filter_tests(
     ci_tests = [
         t
         for t in ci_tests
-        if t.backend == hw and t.suite == suite and t.nightly == nightly
+        if t.backend == hw and t.effective_suite == suite and t.nightly == nightly
     ]
 
     valid_suites = (

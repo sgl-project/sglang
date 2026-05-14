@@ -87,6 +87,9 @@ class FluxPipelineConfig(ImagePipelineConfig):
         ]
     )
 
+    def is_flux_v1(self) -> bool:
+        return True
+
     def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
         # Flux v1 does not use attention masks for text encoders.
         return None
@@ -472,6 +475,9 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         ]
     )
 
+    def is_flux_v1(self) -> bool:
+        return False
+
     def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
         # Flux2 uses standard attention masks (unlike Flux v1).
         return text_inputs.get("attention_mask")
@@ -490,6 +496,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         messages = build_flux2_text_messages(prompts)
+        effective_max_length = tok_kwargs.pop("max_length", 512)
         inputs = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=False,
@@ -499,7 +506,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             padding="max_length",
             truncation=True,
             # 2048 from official github repo, 512 from diffusers
-            max_length=512,
+            max_length=effective_max_length,
         )
 
         return inputs
