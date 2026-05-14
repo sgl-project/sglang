@@ -3661,7 +3661,11 @@ class ConcurrentCounter:
 
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
-    return importlib.util.find_spec("triton_kernels") is not None
+    triton_kernels_spec = importlib.util.find_spec("triton_kernels")
+    ragged_metadata_spec = importlib.util.find_spec(
+        "triton_kernels.tensor_details.ragged_tensor"
+    )
+    return triton_kernels_spec is not None and ragged_metadata_spec is not None
 
 
 @lru_cache(maxsize=1)
