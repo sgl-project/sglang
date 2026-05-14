@@ -353,7 +353,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
-def chunk_gated_delta_rule_fwd_kkt_solve_kernel_xpu(
+def chunk_gated_delta_rule_fwd_kkt_solve_kernel_low_reg(
     k,
     g,
     beta,
@@ -371,7 +371,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel_xpu(
     IS_VARLEN: tl.constexpr,
 ):
     """
-    XPU version: one [BC,BC] accumulator at a time to minimise register pressure.
+    Low-reg version: one [BC,BC] accumulator at a time to minimise register pressure.
 
     Pass 1: loop over 4 diagonal blocks (tl.static_range unrolls to 4 K-loops).
     Pass 2: nested loop over off-diagonal distance d=1,2,3 and column j.
@@ -612,7 +612,7 @@ def chunk_gated_delta_rule_fwd_intra(
     # Step 1: fused kkt + solve_tril
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
     kernel = (
-        chunk_gated_delta_rule_fwd_kkt_solve_kernel_xpu
+        chunk_gated_delta_rule_fwd_kkt_solve_kernel_low_reg
         if is_intel
         else chunk_gated_delta_rule_fwd_kkt_solve_kernel
     )
