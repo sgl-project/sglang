@@ -96,14 +96,16 @@ def discover_files(repo_root: str) -> list[str]:
 
 
 def load_partition_model(path):
-    """Read sglang-ci-stats' model.json; None on missing/unparsable."""
+    """Read sglang-ci-stats' model.json; None on missing/unparsable.
+    Cross-repo schema -- guard against non-dict top-level."""
     if not path or not os.path.exists(path):
         return None
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 def compute_max_parallel(size: int) -> int:
@@ -151,9 +153,9 @@ def compute_partitions(
             relpath = os.path.relpath(t.filename, repo_root)
             total += live_est.get(relpath, t.est_time)
 
-        fit = fit_table.get(suite)
-        coeff = fit["coeff"] if fit else 1.0
-        bias = fit["bias"] if fit else 0.0
+        fit = fit_table.get(suite) or {}
+        coeff = fit.get("coeff", 1.0)
+        bias = fit.get("bias", 0.0)
 
         # Each shard pays `bias` once, so size >= coeff*total / (target-bias).
         if suite in _STAGE_A_OVERRIDES:

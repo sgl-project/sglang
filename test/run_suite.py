@@ -236,8 +236,10 @@ def load_live_est(
             partition_model = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(partition_model, dict):
+        return None
     suite_est = partition_model.get("est", {}).get(suite)
-    if not suite_est:
+    if not isinstance(suite_est, dict) or not suite_est:
         return None
     return {
         os.path.join(repo_root, relpath): float(elapsed)
