@@ -530,6 +530,7 @@ class Envs:
     SGLANG_HANDLE_C128_PREFILL_KERNEL = EnvBool(False)
     SGLANG_HACK_DEBUG_DUMP_CREATE_PAGED_COMPRESS_DATA = EnvStr("")
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
 
     # Dangerous untested flagas
     SGLANG_OPT_USE_FAST_MASK_EP = EnvBool(False)

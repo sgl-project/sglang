@@ -139,6 +139,50 @@ def _jit_compress_module(
         extra_cuda_cflags=["-use_fast_math"],
     )
 
+@cache_once
+def _jit_compress4_module(
+    head_dim: int,
+    dtype_buffer: torch.dtype,
+    dtype_input: torch.dtype,
+    dtype_out: torch.dtype,
+) -> Module:
+    args = make_cpp_args(
+        head_dim, dtype_buffer, dtype_input, dtype_out, is_arch_support_pdl()
+    )
+    kernel_class = f"FlashCompress4Kernel<{args}>"
+    return load_jit(
+        make_name("compress_4_mixed"),
+        *args,
+        cuda_files=["deepseek_v4/c4.cuh"],
+        cuda_wrappers=[
+            ("decode", f"{kernel_class}::run_decode"),
+            ("prefill", f"{kernel_class}::run_prefill"),
+        ],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
+def _jit_compress128_module(
+    head_dim: int,
+    dtype_buffer: torch.dtype,
+    dtype_input: torch.dtype,
+    dtype_out: torch.dtype,
+) -> Module:
+    args = make_cpp_args(
+        head_dim, dtype_buffer, dtype_input, dtype_out, is_arch_support_pdl()
+    )
+    kernel_class = f"FlashCompress128Kernel<{args}>"
+    return load_jit(
+        make_name("compress_128_mixed"),
+        *args,
+        cuda_files=["deepseek_v4/c128.cuh"],
+        cuda_wrappers=[
+            ("decode", f"{kernel_class}::run_decode"),
+            ("prefill", f"{kernel_class}::run_prefill"),
+        ],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
 
 @cache_once
 def _jit_compress_module_v2_defensive(
@@ -596,12 +640,27 @@ def compress_forward(
         F = online_module.decode if plan.is_decode else online_module.prefill
         F(kv_score_buffer, kv_score_input, out, ape, indices, *plan[1:], extra_data)
         return out
-    module = _jit_compress_module(
-        head_dim,
-        kv_score_input.dtype,
-        out.dtype,
-        compress_ratio,
-    )
+    if compress_ratio == 4:
+        module = _jit_compress4_module(
+            head_dim,
+            kv_score_buffer.dtype,
+            kv_score_input.dtype,
+            out.dtype,
+        )
+    elif compress_ratio == 128:
+        module = _jit_compress128_module(
+            head_dim,
+            kv_score_buffer.dtype,
+            kv_score_input.dtype,
+            out.dtype,
+        )
+    else:
+        module = _jit_compress_module(
+            head_dim,
+            kv_score_input.dtype,
+            out.dtype,
+            compress_ratio,
+        )
     if plan.is_decode:
         F = module.decode
     elif compress_ratio == 128 and _should_use_c128_prefill_defensive():
