@@ -31,6 +31,8 @@ Profiles are keyed by runtime settings and request shape. By default, they are c
 
 For a new shape, admission starts with a geometric ramp (`1`, `2`, `4`, ...). After enough successful batches are observed, SGLang-Diffusion predicts candidate peak memory from measured peaks and rejects candidates that exceed the current safe GPU memory budget.
 
+`--batching-memory-reserve-fraction` controls the fraction of total device memory held back from memory-aware batching as allocator and workspace slack. The default is `0.02`. Increase it on shared or memory-volatile GPUs to reduce OOM risk; lower it only for dedicated, calibrated workloads when the reserve is the binding limit. If you override it, use the same value during calibration and serving.
+
 This is measured runtime prediction, not exact byte-level tensor accounting. It reduces OOM risk for repeated shapes, but first-time shapes and backend/runtime changes can still require calibration.
 
 ## Calibration
