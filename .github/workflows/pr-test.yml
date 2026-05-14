@@ -372,6 +372,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
     secrets: inherit
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
@@ -386,6 +387,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
       timeout_per_file: '1800'
     secrets: inherit
 
@@ -400,6 +402,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
     secrets: inherit
 
   stage-b-test-4-gpu-b200:
@@ -461,6 +464,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
     secrets: inherit
 
   stage-c-test-8-gpu-h200:
@@ -474,6 +478,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
       # Per-model TP must match the test's launch in test/registered/ -- see
       # FALLBACK_ARGS in scripts/ci/cuda/warmup_deep_gemm.py for extra dp/ep
       # flags. Only models that actually invoke DeepGEMM kernels at runtime
@@ -494,6 +499,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
     secrets: inherit
 
   stage-c-test-deepep-4-gpu-h100:
@@ -507,6 +513,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
       warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4'
       warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
     secrets: inherit
@@ -538,6 +545,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
       timeout_per_file: '1800'
     secrets: inherit
 
@@ -552,6 +560,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '45'
       timeout_per_file: '1800'
     secrets: inherit
 
@@ -566,6 +575,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '30'
       timeout_per_file: '1800'
     secrets: inherit
 

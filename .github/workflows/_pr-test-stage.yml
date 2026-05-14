@@ -35,9 +35,9 @@ on:
         type: string
         required: true
       run_timeout_minutes:
-        description: 'timeout-minutes for the Run test step.'
+        description: 'timeout-minutes for the Run test step. Required so compute_partitions.py can read it from pr-test.yml without a duplicated default constant.'
         type: string
-        default: '30'
+        required: true
       timeout_per_file:
         description: 'run_suite.py --timeout-per-file value (empty = unset).'
         type: string
@@ -147,6 +147,16 @@ jobs:
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_server.py ${{ inputs.warmup_server_models }}
 
+      - name: Fetch live partition model
+        if: fromJson(inputs.check_changes).partition_model_sha != ''
+        run: |
+          # SHA resolved by check-changes -> require fetch (curl --retry)
+          # so all shards stay on the same snapshot.
+          rm -f /tmp/partition-model.json
+          URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ fromJson(inputs.check_changes).partition_model_sha }}/model.json"
+          curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
+            "$URL" -o /tmp/partition-model.json
+
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
@@ -156,6 +166,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite ${{ inputs.self_name }} \
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} \
+            --partition-model-file /tmp/partition-model.json \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
             $CONTINUE_ON_ERROR_FLAG
 
