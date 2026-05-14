@@ -7,7 +7,7 @@ from sglang.test.server_fixtures.dsa_mtp_fixture import DsaMtpServerBase
 
 register_cuda_ci(
     est_time=600,
-    stage="stage-c",
+    stage="extra-b",
     runner_config="8-gpu-h200",
 )
 
