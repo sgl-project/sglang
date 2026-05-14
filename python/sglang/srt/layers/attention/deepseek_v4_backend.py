@@ -44,8 +44,17 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, cpu_has_amx_support, is_cpu
 
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
+
+if _is_cpu and _cpu_amx:
+    from sglang.srt.layers.attention.dsv4.metadata_kernel import (
+        init_compression_metadata_torch,
+    )
+
+    _init_compression_metadata_triton = init_compression_metadata_torch
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
@@ -71,9 +80,12 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    import flash_mla
+    try:
+        import flash_mla
 
-    return flash_mla.get_mla_metadata()[0]
+        return flash_mla.get_mla_metadata()[0]
+    except:
+        return None
 
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
@@ -895,7 +907,21 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         raw_loc = forward_batch.out_cache_loc
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+
+        if _is_cpu and _cpu_amx:
+            from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
+                NopeFp8RopeBf16Pack,
+            )
+
+            swa_k_pack = NopeFp8RopeBf16Pack(
+                *torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(swa_k)
+            )
+            self.token_to_kv_pool.set_swa_key_buffer_radix(
+                layer_id=layer_id,
+                raw_loc=raw_loc,
+                cache_nope_fp8_rope_bf16_pack=swa_k_pack,
+            )
+        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
                 raw_loc=raw_loc,
@@ -1020,25 +1046,45 @@ class DeepseekV4AttnBackend(
                 assert (
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
+            if _is_cpu and _cpu_amx:
+                from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu
 
-            import flash_mla
+                o = flash_mla_with_kvcache_cpu(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    block_table=None,
+                    cache_seqlens=None,
+                    head_dim_v=self.head_dim_v,
+                    tile_scheduler_metadata=flashmla_metadata,
+                    softmax_scale=self.softmax_scale,
+                    is_fp8_kvcache=True,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
+            else:
 
-            o = flash_mla.flash_mla_with_kvcache(
-                q=q,
-                k_cache=swa_k_cache,
-                head_dim_v=self.head_dim_v,
-                block_table=None,
-                cache_seqlens=None,
-                tile_scheduler_metadata=flashmla_metadata,
-                softmax_scale=self.softmax_scale,
-                is_fp8_kvcache=True,
-                indices=swa_page_indices,
-                topk_length=swa_topk_lengths,
-                attn_sink=attn_sink,
-                extra_k_cache=extra_k_cache,
-                extra_indices_in_kvcache=extra_indices,
-                extra_topk_length=extra_topk_lengths,
-            )[0]
+                import flash_mla
+
+                o = flash_mla.flash_mla_with_kvcache(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    block_table=None,
+                    cache_seqlens=None,
+                    tile_scheduler_metadata=flashmla_metadata,
+                    softmax_scale=self.softmax_scale,
+                    is_fp8_kvcache=True,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
 
             o = o.squeeze(1)
             return o

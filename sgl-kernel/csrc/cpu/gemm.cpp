@@ -161,6 +161,21 @@ inline void copy_add_stub(
   }
 }
 
+inline void
+copy_add_stub(float* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
+  using fVec = at::vec::Vectorized<float>;
+
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - fVec::size(); d += fVec::size()) {
+    fVec data = fVec::loadu(input + d) + fVec::loadu(bias + d);
+    data.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = input[d] + bias[d];
+  }
+}
+
 template <typename scalar_t, bool has_bias>
 inline void scalar_sigmoid_and_mul(
     scalar_t* __restrict__ out,
@@ -581,6 +596,66 @@ void weight_packed_linear_kernel_impl(
   });
 }
 
+// bf16/fp16 input, bf16/fp16 weight (vnni packed) -> fp32 output
+template <typename scalar_t>
+void weight_packed_linear_fp32_out_kernel_impl(
+    float* __restrict__ out,
+    const scalar_t* __restrict__ mat1,
+    const scalar_t* __restrict__ mat2,
+    const float* __restrict__ bias,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t mat1_strideM,
+    int64_t out_strideM) {
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+  const int64_t MB = div_up(M, BLOCK_M);
+  const int64_t NB = div_up(N, BLOCK_N);
+
+  AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
+    parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+      alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
+
+      loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+        int64_t mb_start = mb * BLOCK_M;
+        int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+        int64_t nb_start = nb * BLOCK_N;
+        int64_t nb_size = std::min(N - nb_start, BLOCK_N);
+
+        // bf16 * bf16 -> fp32 accumulation via brgemm
+        at::native::cpublas::brgemm(
+            mb_size,
+            nb_size,
+            K,
+            mat1_strideM,
+            nb_size,
+            BLOCK_N,
+            /* add_C */ false,
+            mat1 + mb_start * mat1_strideM,
+            mat2 + nb_start * K,
+            Ctmp);
+
+        // copy Ctmp (fp32) directly to fp32 output
+        for (int64_t m = 0; m < mb_size; ++m) {
+          if constexpr (has_bias) {
+            copy_add_stub(
+                out + mb_start * out_strideM + nb_start + m * out_strideM,
+                Ctmp + m * BLOCK_N,
+                bias + nb_start,
+                nb_size);
+          } else {
+            std::memcpy(
+                out + mb_start * out_strideM + nb_start + m * out_strideM, Ctmp + m * BLOCK_N, nb_size * sizeof(float));
+          }
+        }
+      });
+
+      at::native::cpublas::brgemm_release();
+    });
+  });
+}
+
 }  // anonymous namespace
 
 // tinygemm interface
@@ -727,8 +802,12 @@ at::Tensor convert_scale_packed(at::Tensor& scale) {
 // bias : [N]
 // out  : [M, N]
 //
-at::Tensor
-weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni) {
+at::Tensor weight_packed_linear(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    const std::optional<at::Tensor>& bias,
+    bool is_vnni,
+    std::optional<at::ScalarType> out_dtype) {
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
   bool use_fma_gemm = false;
   if (packed_w.scalar_type() == at::kFloat) {
@@ -748,7 +827,10 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
   }
 
   auto dispatch_type = mat1.scalar_type();
-  auto out = at::empty({M, N}, mat1.options());
+  auto out_scalar_type = out_dtype.value_or(dispatch_type);
+  bool fp32_out = (out_scalar_type == at::kFloat) && (dispatch_type != at::kFloat);
+
+  auto out = at::empty({M, N}, mat1.options().dtype(out_scalar_type));
   // strides
   int64_t out_strideM = out.stride(0);
   int64_t mat1_strideM = mat1.stride(0);
@@ -760,22 +842,10 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
     bias_data = bias.value().data_ptr<float>();
   }
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(dispatch_type, "weight_packed_linear_kernel_impl", [&] {
-    if (use_fma_gemm) {
-      weight_packed_linear_kernel_impl<scalar_t>(
-          out.data_ptr<scalar_t>(),
-          mat1.data_ptr<scalar_t>(),
-          packed_w.data_ptr<float>(),
-          bias_data,
-          nullptr,
-          M,
-          N,
-          K,
-          mat1_strideM,
-          out_strideM);
-    } else {
-      weight_packed_linear_kernel_impl<scalar_t>(
-          out.data_ptr<scalar_t>(),
+  if (fp32_out && !use_fma_gemm) {
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(dispatch_type, "weight_packed_linear_fp32_out", [&] {
+      weight_packed_linear_fp32_out_kernel_impl<scalar_t>(
+          out.data_ptr<float>(),
           mat1.data_ptr<scalar_t>(),
           packed_w.data_ptr<scalar_t>(),
           bias_data,
@@ -784,8 +854,35 @@ weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at:
           K,
           mat1_strideM,
           out_strideM);
-    }
-  });
+    });
+  } else {
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(dispatch_type, "weight_packed_linear_kernel_impl", [&] {
+      if (use_fma_gemm) {
+        weight_packed_linear_kernel_impl<scalar_t>(
+            out.data_ptr<scalar_t>(),
+            mat1.data_ptr<scalar_t>(),
+            packed_w.data_ptr<float>(),
+            bias_data,
+            nullptr,
+            M,
+            N,
+            K,
+            mat1_strideM,
+            out_strideM);
+      } else {
+        weight_packed_linear_kernel_impl<scalar_t>(
+            out.data_ptr<scalar_t>(),
+            mat1.data_ptr<scalar_t>(),
+            packed_w.data_ptr<scalar_t>(),
+            bias_data,
+            M,
+            N,
+            K,
+            mat1_strideM,
+            out_strideM);
+      }
+    });
+  }
 
   return out;
 }

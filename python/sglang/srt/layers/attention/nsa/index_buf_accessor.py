@@ -5,11 +5,12 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_hip
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
-
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
@@ -199,7 +200,15 @@ class GetKAndS:
 class SetK:
     @classmethod
     def execute(cls, *args, buf, **kwargs):
-        return cls.torch_fast(*args, **kwargs, buf=buf)
+        if _is_cpu and _cpu_amx:
+            pool = args[0] if args else kwargs["pool"]
+            loc = args[1] if len(args) > 1 else kwargs["loc"]
+            index_k = args[2] if len(args) > 2 else kwargs["index_k"]
+            torch.ops.sgl_kernel.set_k_cpu(
+                buf, loc, index_k, pool.page_size, pool.index_head_dim
+            )
+        else:
+            return cls.torch_fast(*args, **kwargs, buf=buf)
 
     @classmethod
     def slow(
@@ -249,7 +258,15 @@ class SetK:
 class SetS:
     @classmethod
     def execute(cls, *args, buf, **kwargs):
-        return cls.torch_fast(*args, **kwargs, buf=buf)
+        if _is_cpu and _cpu_amx:
+            pool = args[0] if args else kwargs["pool"]
+            loc = args[1] if len(args) > 1 else kwargs["loc"]
+            index_k_scale = args[2] if len(args) > 2 else kwargs["index_k_scale"]
+            torch.ops.sgl_kernel.set_s_cpu(
+                buf, loc, index_k_scale, pool.page_size, pool.index_head_dim
+            )
+        else:
+            return cls.torch_fast(*args, **kwargs, buf=buf)
 
     @classmethod
     def slow(
@@ -317,8 +334,10 @@ class SetKAndS:
                 buf == buf_cloned
             ), f"{buf=} {buf_cloned=} {kwargs['loc'].to_list()=}"
             return
-
-        cls.triton(*args, **kwargs, buf=buf)
+        if _is_cpu and _cpu_amx:
+            cls.vanilla(*args, **kwargs, buf=buf)
+        else:
+            cls.triton(*args, **kwargs, buf=buf)
 
     @classmethod
     def vanilla(cls, pool, buf, loc, index_k, index_k_scale):
