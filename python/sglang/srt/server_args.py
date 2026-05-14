@@ -3192,6 +3192,16 @@ class ServerArgs:
             )
             self.moe_a2a_backend = "deepep"
 
+        if (
+            envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
+            and self.moe_a2a_backend != "megamoe"
+        ):
+            self.moe_a2a_backend = "megamoe"
+            logger.info(
+                "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
+                "auto-configuring --moe-a2a-backend megamoe."
+            )
+
         if self.moe_a2a_backend == "megamoe":
             self.ep_size = self.tp_size
             if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():

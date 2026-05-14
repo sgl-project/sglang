@@ -598,6 +598,7 @@ class Envs:
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
 
     # DeepGemm Mega MoE
+    SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
 
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
