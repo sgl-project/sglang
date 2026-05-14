@@ -5,6 +5,7 @@ offloading under UnifiedRadixTree, verifying multi-turn cache correctness
 via KL divergence.
 """
 
+import os
 import unittest
 
 from test_unified_radix_cache_kl import UnifiedRadixTreeTestMixin
@@ -27,7 +28,10 @@ MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
 MAMBA_CHUNK_SIZE = 64
 MAMBA_TRACK_INTERVAL = 128
 
-DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
+DSV4_FLASH_MODEL = os.getenv(
+    "SGLANG_TEST_DSV4_FLASH_MODEL",
+    "sgl-project/DeepSeek-V4-Flash-FP8",
+)
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
 DSV32_MODEL = "deepseek-ai/DeepSeek-V3.2"
@@ -99,6 +103,8 @@ def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
 class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """DeepSeek V4 Flash FP8 + HiCache + UnifiedRadixCache."""
 
+    hicache_io_backend = "direct"
+    hicache_mem_layout = "layer_first"
     kl_threshold = 0.0035
     sampling_temperature = 0
     decode_cache_assert = staticmethod(_assert_dsv4_decode_cached_tokens)
@@ -136,9 +142,9 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
                 "--hicache-write-policy",
                 "write_through",
                 "--hicache-io-backend",
-                "direct",
+                cls.hicache_io_backend,
                 "--hicache-mem-layout",
-                "page_first_direct",
+                cls.hicache_mem_layout,
                 "--swa-full-tokens-ratio",
                 "0.25",
                 "--max-total-tokens",
@@ -156,6 +162,33 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+
+class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
+    TestUnifiedDeepSeekV4FlashHiCache
+):
+    """DeepSeek V4 Flash HiCache layout smoke: page_first_direct + direct."""
+
+    hicache_io_backend = "direct"
+    hicache_mem_layout = "page_first_direct"
+
+
+class TestUnifiedDeepSeekV4FlashHiCacheLayerFirstKernel(
+    TestUnifiedDeepSeekV4FlashHiCache
+):
+    """DeepSeek V4 Flash HiCache layout smoke: layer_first + kernel."""
+
+    hicache_io_backend = "kernel"
+    hicache_mem_layout = "layer_first"
+
+
+class TestUnifiedDeepSeekV4FlashHiCachePageFirstKernel(
+    TestUnifiedDeepSeekV4FlashHiCache
+):
+    """DeepSeek V4 Flash HiCache layout smoke: page_first + kernel."""
+
+    hicache_io_backend = "kernel"
+    hicache_mem_layout = "page_first"
 
 
 if __name__ == "__main__":
