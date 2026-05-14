@@ -120,7 +120,7 @@ class EventPublisher(ABC):
     """
 
     def __init__(self, attn_dp_rank: int = 0):
-        self._attn_dp_rank = attn_dp_rank
+        pass
 
     @abstractmethod
     def publish(self, events: EventBatch) -> None:

@@ -67,7 +67,7 @@ class OpenAIServingScore(OpenAIServingBase):
                 else None
             )
 
-            result = await self.tokenizer_manager.score_request(
+            result = await self.tokenizer_manager.score_request_handler.score_request(
                 query=request.query,
                 items=request.items,
                 label_token_ids=request.label_token_ids,

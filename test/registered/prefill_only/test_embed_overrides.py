@@ -3,9 +3,9 @@
 Covers:
 - PositionalEmbeds dataclass (embed_types.py)
 - convert_embeds_to_tensors (utils.py)
-- TokenizerManager._resolve_embed_overrides (tokenizer_manager.py)
+- TokenizedRequestBuilder._resolve_embed_overrides (tokenizer_manager.py)
 - positional_embed_overrides on GenerateReqInput/EmbeddingReqInput (io_struct.py)
-- Score mixin override resolution (tokenizer_manager_score_mixin.py)
+- ScoreRequestHandler override resolution (score_request_handler.py)
 """
 
 import unittest
@@ -16,9 +16,11 @@ import torch
 from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.managers.tokenizer_manager_score_mixin import (
-    TokenizerManagerScoreMixin,
+from sglang.srt.managers.tokenizer_manager_components.score_request_handler import (
+    ScoreRequestHandler,
+)
+from sglang.srt.managers.tokenizer_manager_components.tokenized_request_builder import (
+    TokenizedRequestBuilder,
 )
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -106,14 +108,14 @@ class TestConvertEmbedsToTensors(CustomTestCase):
 
 
 # ========================================================================
-# TokenizerManager._resolve_embed_overrides
+# TokenizedRequestBuilder._resolve_embed_overrides
 # ========================================================================
 
 
 class TestResolveEmbedOverrides(CustomTestCase):
     def test_basic_resolution(self):
         embeds = [_vec(1), _vec(2)]
-        pe = TokenizerManager._resolve_embed_overrides(
+        pe = TokenizedRequestBuilder._resolve_embed_overrides(
             input_ids=[10, 50, 20, 50, 30],
             token_id=50,
             embeds=embeds,
@@ -124,7 +126,7 @@ class TestResolveEmbedOverrides(CustomTestCase):
 
     def test_no_placeholders_raises(self):
         with self.assertRaises(ValueError):
-            TokenizerManager._resolve_embed_overrides(
+            TokenizedRequestBuilder._resolve_embed_overrides(
                 input_ids=[10, 20, 30],
                 token_id=50,
                 embeds=[_vec()],
@@ -132,7 +134,7 @@ class TestResolveEmbedOverrides(CustomTestCase):
 
     def test_count_mismatch_raises(self):
         with self.assertRaises(ValueError):
-            TokenizerManager._resolve_embed_overrides(
+            TokenizedRequestBuilder._resolve_embed_overrides(
                 input_ids=[10, 50, 20],
                 token_id=50,
                 embeds=[_vec(1), _vec(2)],
@@ -210,7 +212,7 @@ class _FakeServerArgs:
         self.enable_mis = enable_mis
 
 
-class _FakeMixin(TokenizerManagerScoreMixin):
+class _FakeMixin:
     """Minimal stub to call mixin methods without a full TokenizerManager."""
 
     def __init__(self, enable_mis=False):
@@ -224,7 +226,8 @@ class TestResolveOverridesForSequence(CustomTestCase):
         self.mixin = _FakeMixin()
 
     def test_none_embeds_returns_empty(self):
-        embeds, positions = self.mixin._resolve_overrides_for_sequence(
+        embeds, positions = ScoreRequestHandler._resolve_overrides_for_sequence(
+            self.mixin,
             token_ids=[10, 50, 20],
             embeds=None,
             embed_override_token_id=50,
@@ -234,7 +237,8 @@ class TestResolveOverridesForSequence(CustomTestCase):
 
     def test_basic_resolution(self):
         e1, e2 = _vec(1), _vec(2)
-        embeds, positions = self.mixin._resolve_overrides_for_sequence(
+        embeds, positions = ScoreRequestHandler._resolve_overrides_for_sequence(
+            self.mixin,
             token_ids=[50, 10, 50],
             embeds=[e1, e2],
             embed_override_token_id=50,
@@ -243,7 +247,8 @@ class TestResolveOverridesForSequence(CustomTestCase):
         self.assertEqual(positions, [0, 2])
 
     def test_with_offset(self):
-        embeds, positions = self.mixin._resolve_overrides_for_sequence(
+        embeds, positions = ScoreRequestHandler._resolve_overrides_for_sequence(
+            self.mixin,
             token_ids=[10, 50],
             embeds=[_vec()],
             embed_override_token_id=50,
@@ -253,7 +258,8 @@ class TestResolveOverridesForSequence(CustomTestCase):
 
     def test_empty_embeds_list(self):
         """Empty embeds list with no placeholders succeeds."""
-        embeds, positions = self.mixin._resolve_overrides_for_sequence(
+        embeds, positions = ScoreRequestHandler._resolve_overrides_for_sequence(
+            self.mixin,
             token_ids=[10, 20],
             embeds=[],
             embed_override_token_id=50,
@@ -263,7 +269,8 @@ class TestResolveOverridesForSequence(CustomTestCase):
 
     def test_count_mismatch_raises(self):
         with self.assertRaises(ValueError):
-            self.mixin._resolve_overrides_for_sequence(
+            ScoreRequestHandler._resolve_overrides_for_sequence(
+                self.mixin,
                 token_ids=[50, 50],
                 embeds=[_vec()],
                 embed_override_token_id=50,
@@ -280,7 +287,8 @@ class TestResolveEmbedOverridesForRequest(CustomTestCase):
         self.mixin = _FakeMixin()
 
     def test_no_overrides_returns_none(self):
-        result = self.mixin._resolve_embed_overrides_for_request(
+        result = ScoreRequestHandler._resolve_embed_overrides_for_request(
+            self.mixin,
             query=[10, 20],
             item=[30, 40],
             embed_override_token_id=50,
@@ -292,7 +300,8 @@ class TestResolveEmbedOverridesForRequest(CustomTestCase):
         self.assertIsNone(result)
 
     def test_query_only_overrides(self):
-        pe = self.mixin._resolve_embed_overrides_for_request(
+        pe = ScoreRequestHandler._resolve_embed_overrides_for_request(
+            self.mixin,
             query=[50, 20],
             item=[30, 40],
             embed_override_token_id=50,
@@ -306,7 +315,8 @@ class TestResolveEmbedOverridesForRequest(CustomTestCase):
         self.assertEqual(pe.embeds.shape, (1, HIDDEN_DIM))
 
     def test_item_only_overrides(self):
-        pe = self.mixin._resolve_embed_overrides_for_request(
+        pe = ScoreRequestHandler._resolve_embed_overrides_for_request(
+            self.mixin,
             query=[10, 20],
             item=[50, 40],
             embed_override_token_id=50,
@@ -318,7 +328,8 @@ class TestResolveEmbedOverridesForRequest(CustomTestCase):
         self.assertEqual(pe.positions, [2])  # offset applied
 
     def test_query_and_item_overrides(self):
-        pe = self.mixin._resolve_embed_overrides_for_request(
+        pe = ScoreRequestHandler._resolve_embed_overrides_for_request(
+            self.mixin,
             query=[50, 20],
             item=[30, 50],
             embed_override_token_id=50,
@@ -345,27 +356,33 @@ class TestBuildTokenIdInputs(CustomTestCase):
     # --- single-item mode, no embeds ---
 
     def test_single_item_no_embeds(self):
-        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
-            query=[1, 2],
-            items=[[3, 4], [5, 6]],
-            item_first=False,
-            use_multi_item_scoring=False,
-            embed_override_token_id=None,
-            query_embed_overrides=None,
-            item_embed_overrides=None,
+        _, input_ids, positional_embed_overrides, _ = (
+            ScoreRequestHandler._build_token_id_inputs(
+                self.mixin,
+                query=[1, 2],
+                items=[[3, 4], [5, 6]],
+                item_first=False,
+                use_multi_item_scoring=False,
+                embed_override_token_id=None,
+                query_embed_overrides=None,
+                item_embed_overrides=None,
+            )
         )
         self.assertEqual(input_ids, [[1, 2, 3, 4], [1, 2, 5, 6]])
         self.assertIsNone(positional_embed_overrides)
 
     def test_single_item_no_embeds_item_first(self):
-        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
-            query=[1, 2],
-            items=[[3, 4]],
-            item_first=True,
-            use_multi_item_scoring=False,
-            embed_override_token_id=None,
-            query_embed_overrides=None,
-            item_embed_overrides=None,
+        _, input_ids, positional_embed_overrides, _ = (
+            ScoreRequestHandler._build_token_id_inputs(
+                self.mixin,
+                query=[1, 2],
+                items=[[3, 4]],
+                item_first=True,
+                use_multi_item_scoring=False,
+                embed_override_token_id=None,
+                query_embed_overrides=None,
+                item_embed_overrides=None,
+            )
         )
         self.assertEqual(input_ids, [[3, 4, 1, 2]])
         self.assertIsNone(positional_embed_overrides)
@@ -373,14 +390,17 @@ class TestBuildTokenIdInputs(CustomTestCase):
     # --- multi-item mode, no embeds ---
 
     def test_multi_item_no_embeds(self):
-        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
-            query=[1, 2],
-            items=[[3, 4], [5, 6]],
-            item_first=False,
-            use_multi_item_scoring=True,
-            embed_override_token_id=None,
-            query_embed_overrides=None,
-            item_embed_overrides=None,
+        _, input_ids, positional_embed_overrides, _ = (
+            ScoreRequestHandler._build_token_id_inputs(
+                self.mixin,
+                query=[1, 2],
+                items=[[3, 4], [5, 6]],
+                item_first=False,
+                use_multi_item_scoring=True,
+                embed_override_token_id=None,
+                query_embed_overrides=None,
+                item_embed_overrides=None,
+            )
         )
         # query<D>item1<D>item2<D>
         self.assertEqual(
@@ -392,14 +412,17 @@ class TestBuildTokenIdInputs(CustomTestCase):
 
     def test_single_item_query_embeds(self):
         """Query placeholder overrides are resolved per item."""
-        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
-            query=[50, 10],
-            items=[[20, 30], [40, 50]],
-            item_first=False,
-            use_multi_item_scoring=False,
-            embed_override_token_id=50,
-            query_embed_overrides=[_vec(1)],
-            item_embed_overrides=None,
+        _, input_ids, positional_embed_overrides, _ = (
+            ScoreRequestHandler._build_token_id_inputs(
+                self.mixin,
+                query=[50, 10],
+                items=[[20, 30], [40, 50]],
+                item_first=False,
+                use_multi_item_scoring=False,
+                embed_override_token_id=50,
+                query_embed_overrides=[_vec(1)],
+                item_embed_overrides=None,
+            )
         )
         self.assertEqual(input_ids, [[50, 10, 20, 30], [50, 10, 40, 50]])
         self.assertIsNotNone(positional_embed_overrides)
@@ -410,14 +433,17 @@ class TestBuildTokenIdInputs(CustomTestCase):
 
     def test_single_item_item_embeds(self):
         """Per-item overrides with correct position offsets."""
-        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
-            query=[10, 20],
-            items=[[50, 30]],
-            item_first=False,
-            use_multi_item_scoring=False,
-            embed_override_token_id=50,
-            query_embed_overrides=None,
-            item_embed_overrides=[[_vec(2)]],
+        _, input_ids, positional_embed_overrides, _ = (
+            ScoreRequestHandler._build_token_id_inputs(
+                self.mixin,
+                query=[10, 20],
+                items=[[50, 30]],
+                item_first=False,
+                use_multi_item_scoring=False,
+                embed_override_token_id=50,
+                query_embed_overrides=None,
+                item_embed_overrides=[[_vec(2)]],
+            )
         )
         self.assertEqual(input_ids, [[10, 20, 50, 30]])
         self.assertIsNotNone(positional_embed_overrides)
@@ -426,27 +452,33 @@ class TestBuildTokenIdInputs(CustomTestCase):
 
     def test_single_item_no_override_positions_returns_none_injection(self):
         """When no items have placeholders, positional_embed_overrides should be None."""
-        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
-            query=[10, 20],
-            items=[[30, 40]],
-            item_first=False,
-            use_multi_item_scoring=False,
-            embed_override_token_id=50,
-            query_embed_overrides=None,
-            item_embed_overrides=[None],
+        _, input_ids, positional_embed_overrides, _ = (
+            ScoreRequestHandler._build_token_id_inputs(
+                self.mixin,
+                query=[10, 20],
+                items=[[30, 40]],
+                item_first=False,
+                use_multi_item_scoring=False,
+                embed_override_token_id=50,
+                query_embed_overrides=None,
+                item_embed_overrides=[None],
+            )
         )
         self.assertIsNone(positional_embed_overrides)
 
     def test_single_item_query_and_item_embeds(self):
         """Single-item mode with both query and item overrides in one request."""
-        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
-            query=[50, 10],
-            items=[[20, 50]],
-            item_first=False,
-            use_multi_item_scoring=False,
-            embed_override_token_id=50,
-            query_embed_overrides=[_vec(1)],
-            item_embed_overrides=[[_vec(2)]],
+        _, input_ids, positional_embed_overrides, _ = (
+            ScoreRequestHandler._build_token_id_inputs(
+                self.mixin,
+                query=[50, 10],
+                items=[[20, 50]],
+                item_first=False,
+                use_multi_item_scoring=False,
+                embed_override_token_id=50,
+                query_embed_overrides=[_vec(1)],
+                item_embed_overrides=[[_vec(2)]],
+            )
         )
         self.assertEqual(input_ids, [[50, 10, 20, 50]])
         self.assertIsNotNone(positional_embed_overrides)
@@ -457,14 +489,17 @@ class TestBuildTokenIdInputs(CustomTestCase):
 
     def test_single_item_empty_query(self):
         """Empty query with item-only overrides (valid from score_prompts)."""
-        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
-            query=[],
-            items=[[50, 10]],
-            item_first=False,
-            use_multi_item_scoring=False,
-            embed_override_token_id=50,
-            query_embed_overrides=None,
-            item_embed_overrides=[[_vec(1)]],
+        _, input_ids, positional_embed_overrides, _ = (
+            ScoreRequestHandler._build_token_id_inputs(
+                self.mixin,
+                query=[],
+                items=[[50, 10]],
+                item_first=False,
+                use_multi_item_scoring=False,
+                embed_override_token_id=50,
+                query_embed_overrides=None,
+                item_embed_overrides=[[_vec(1)]],
+            )
         )
         self.assertEqual(input_ids, [[50, 10]])
         self.assertIsNotNone(positional_embed_overrides)
@@ -475,14 +510,17 @@ class TestBuildTokenIdInputs(CustomTestCase):
 
     def test_multi_item_with_query_and_item_embeds(self):
         """Multi-item mode resolves query overrides once and item overrides per item."""
-        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
-            query=[50, 10],
-            items=[[20, 50], [30, 40]],
-            item_first=False,
-            use_multi_item_scoring=True,
-            embed_override_token_id=50,
-            query_embed_overrides=[_vec(1)],
-            item_embed_overrides=[[_vec(2)], None],
+        _, input_ids, positional_embed_overrides, _ = (
+            ScoreRequestHandler._build_token_id_inputs(
+                self.mixin,
+                query=[50, 10],
+                items=[[20, 50], [30, 40]],
+                item_first=False,
+                use_multi_item_scoring=True,
+                embed_override_token_id=50,
+                query_embed_overrides=[_vec(1)],
+                item_embed_overrides=[[_vec(2)], None],
+            )
         )
         # query<D>item1<D>item2<D> = [50,10, DELIM, 20,50, DELIM, 30,40, DELIM]
         self.assertEqual(len(input_ids), 1)
@@ -512,7 +550,7 @@ class TestScoreRequestValidation(CustomTestCase):
         """Wrapper to call score_request synchronously."""
         import asyncio
 
-        return asyncio.run(self.mixin.score_request(**kwargs))
+        return asyncio.run(ScoreRequestHandler.score_request(self.mixin, **kwargs))
 
     def test_generation_requires_label_token_ids(self):
         self.mixin.is_generation = True

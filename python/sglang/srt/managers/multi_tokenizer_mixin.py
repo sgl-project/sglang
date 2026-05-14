@@ -34,7 +34,6 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
-from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -440,10 +439,6 @@ class TokenizerWorker(TokenizerManager):
         self.disaggregation_transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
-        # Communicator
-        self.register_multi_tokenizer_communicator = FanOutCommunicator(
-            self.send_to_scheduler, 2
-        )
 
         # Register this worker with the router for pause/continue broadcasting
         reg = TokenizerWorkerRegistration(worker_ipc_name=self.tokenizer_ipc_name)
@@ -525,7 +520,9 @@ async def print_exception_wrapper(func):
         if hasattr(func, "__self__") and isinstance(
             func.__self__, MultiTokenizerRouter
         ):
-            func.__self__.dump_requests_before_crash()
+            func.__self__.request_log_manager.dump_requests_before_crash(
+                rid_to_state=func.__self__.rid_to_state,
+            )
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
 
