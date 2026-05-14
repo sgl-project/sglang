@@ -241,7 +241,22 @@ class SchedulerOutputProcessorMixin:
                     # decode req in mixed batch or retracted req
                     continue
 
-                if req.pending_middle_outputs <= 0:
+                # Decrement-first semantics: pending_middle_outputs is the number
+                # of forwards launched for this req that have not yet been output-
+                # processed. After decrement, this is the LAST pending forward iff
+                # the counter hits zero AND no more chunks are coming
+                # (has_pending_chunk is cleared by add_one_req's last-chunk path).
+                # In PP, a sibling mb may hold a mid-chunk forward in its pipeline
+                # whose result has yet to be processed — we must not finalize the
+                # prefill until pmo reaches zero.
+                is_last_chunk_output = True
+                if req.pending_middle_outputs > 0:
+                    req.pending_middle_outputs -= 1
+                    is_last_chunk_output = (
+                        req.pending_middle_outputs == 0 and not req.has_pending_chunk
+                    )
+
+                if is_last_chunk_output:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
@@ -313,11 +328,9 @@ class SchedulerOutputProcessorMixin:
                         req.grammar.finished = req.finished()
 
                 else:
-                    # being chunked reqs' prefill is not finished
-                    req.pending_middle_outputs -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
+                    # Middle chunk forward (or non-last forward in PP pipeline):
+                    # prefill not yet finalized; counter already decremented above.
+                    # We don't want to stream the request currently being chunked.
                     skip_stream_req = req
 
                     # Incrementally update input logprobs.
@@ -380,7 +393,17 @@ class SchedulerOutputProcessorMixin:
                 req.embedding = embeddings[i]
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
-                if req.pending_middle_outputs <= 0:
+
+                # Decrement-first; mirrors the generation-model branch above.
+                # See that branch for the PP rationale.
+                is_last_chunk_output = True
+                if req.pending_middle_outputs > 0:
+                    req.pending_middle_outputs -= 1
+                    is_last_chunk_output = (
+                        req.pending_middle_outputs == 0 and not req.has_pending_chunk
+                    )
+
+                if is_last_chunk_output:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
@@ -392,8 +415,6 @@ class SchedulerOutputProcessorMixin:
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                 else:
-                    # being chunked reqs' prefill is not finished
-                    req.pending_middle_outputs -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)

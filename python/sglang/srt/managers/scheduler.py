@@ -2824,18 +2824,29 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        # Bump pending_middle_outputs (the pending_middle_outputs counter) for every
-        # admitted req that's still mid-prefill — output processor uses this
-        # to know its forward's sample is garbage. Counter semantics needed
-        # for PP, where multiple microbatches may admit the same req.
-        chunked_in_batch = [r for r in can_run_list if r.has_pending_chunk]
+        # Bump pending_middle_outputs for every admitted req whose admission is
+        # part of a multi-chunk prefill — both mid-chunk admits (has_pending_chunk
+        # stays True after this admit) AND the last-chunk admit of a previously
+        # chunked-resume req (kv_committed_len > 0 means a prior chunk's prepare
+        # already wrote to its row, so this req has been chunk-prefilled before).
+        # The counter is the number of forwards launched but not yet output-
+        # processed. Output processor decrements first, then checks whether
+        # this was the last pending forward; required for PP, where the LAST
+        # chunk's forward result may not be the last forward in flight for the
+        # req (a sibling mb may hold a mid-chunk forward still pipelined).
+        # kv_committed_len here reflects the PRIOR iter's prepare_for_extend;
+        # this iter's prepare_for_extend has not yet run.
+        chunk_admits = [
+            r for r in can_run_list if r.has_pending_chunk or r.kv_committed_len > 0
+        ]
         assert (
-            len(chunked_in_batch) <= 1
-        ), "single-flight invariant: at most one chunked-resume req per batch"
+            sum(1 for r in chunk_admits if r.has_pending_chunk) <= 1
+        ), "single-flight invariant: at most one mid-chunk admit per batch"
         chunk_deduct = 0
-        for r in chunked_in_batch:
+        for r in chunk_admits:
             r.pending_middle_outputs += 1
-            chunk_deduct = r.extend_input_len
+            if r.has_pending_chunk:
+                chunk_deduct = r.extend_input_len
 
         # Record for logging prefill stats after forward
         self.adder = adder
