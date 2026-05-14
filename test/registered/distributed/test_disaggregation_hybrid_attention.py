@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=695, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=695, stage="stage-c", runner_config="8-gpu-h200")
 
 
 @unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")

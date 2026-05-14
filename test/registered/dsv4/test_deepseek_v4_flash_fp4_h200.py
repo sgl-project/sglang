@@ -21,7 +21,19 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-8-gpu-h200")
+register_cuda_ci(est_time=1800, stage="stage-c", runner_config="dsv4-8-gpu-h200")
+
+
+def _flashinfer_has_sm90_cutlass_mxfp4() -> bool:
+    try:
+        from flashinfer.fused_moe import (  # noqa: F401
+            interleave_moe_weights_for_sm90_mixed_gemm,
+        )
+
+        return True
+    except ImportError:
+        return False
+
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
@@ -54,6 +66,8 @@ class TestDSV4FlashFP4H200(ServerSanityMixin, CustomTestCase):
                 "1",
                 "--speculative-num-draft-tokens",
                 "4",
+                "--watchdog-timeout",
+                "900",
             ],
         )
 
@@ -74,6 +88,63 @@ class TestDSV4FlashFP4H200(ServerSanityMixin, CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"[DSV4 Flash FP4 Marlin H200] GSM8K {metrics=}")
+        self.assertGreater(metrics["score"], 0.93)
+
+
+@unittest.skipUnless(
+    _flashinfer_has_sm90_cutlass_mxfp4(),
+    "FlashInfer build lacks SM90 mixed-input MXFP4 helpers (PR #3084, >= 0.6.11)",
+)
+class TestDSV4FlashFP4H200FlashInferCutlass(ServerSanityMixin, CustomTestCase):
+    """FlashInfer SM90 mixed-input cutlass MXFP4 backend (this PR): TP=4 + EAGLE.
+
+    Mirrors :class:`TestDSV4FlashFP4H200` but swaps `--moe-runner-backend marlin`
+    for `flashinfer_mxfp4`, exercising the SM90 cutlass path from FlashInfer PR
+    #3084 end-to-end on a real DSv4-Flash checkpoint.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--moe-runner-backend",
+                "flashinfer_mxfp4",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"[DSV4 Flash FP4 FlashInfer Cutlass H200] GSM8K {metrics=}")
         self.assertGreater(metrics["score"], 0.93)
 
 
