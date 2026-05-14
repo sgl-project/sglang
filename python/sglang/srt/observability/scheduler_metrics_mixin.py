@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import tempfile
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
@@ -18,7 +19,7 @@ from sglang.srt.managers.io_struct import (
     QueueMetrics,
     SpeculativeMetrics,
 )
-from sglang.srt.managers.scheduler import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
@@ -86,6 +87,8 @@ class KvMetrics:
 
 
 class SchedulerMetricsMixin:
+    enable_fpm: bool = False
+
     def init_metrics(
         self: Scheduler, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
     ):
@@ -175,6 +178,8 @@ class SchedulerMetricsMixin:
 
         self.init_kv_events(self.server_args.kv_events_config)
 
+        self._init_fpm()
+
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
         )
@@ -201,6 +206,128 @@ class SchedulerMetricsMixin:
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config, self.attn_dp_rank
             )
+
+    def _init_fpm(self: Scheduler):
+        """Initialize Forward Pass Metrics (FPM) publisher if configured."""
+        self.enable_fpm = False
+        if (
+            self.server_args.enable_forward_pass_metrics
+            and self.attn_tp_rank == 0
+            and self.pp_rank == self.pp_size - 1
+        ):
+            from sglang.srt.observability.forward_pass_metrics import (
+                _FpmPublisherThread,
+            )
+
+            self._fpm_dp_rank = self.dp_rank if self.dp_rank is not None else 0
+            self._fpm_worker_id = self.server_args.forward_pass_metrics_worker_id
+            base_endpoint = self.server_args.forward_pass_metrics_ipc_name
+            if base_endpoint is None:
+                ipc_path = tempfile.NamedTemporaryFile(delete=False).name
+                base_endpoint = f"ipc://{ipc_path}"
+                self.server_args.forward_pass_metrics_ipc_name = base_endpoint
+            endpoint = f"{base_endpoint}.{self._fpm_dp_rank}"
+            self._fpm_publisher = _FpmPublisherThread(
+                endpoint,
+                worker_id=self._fpm_worker_id,
+                dp_rank=self._fpm_dp_rank,
+            )
+            self._fpm_gpu_time_acc = 0.0
+
+            def _fpm_device_timer_reporter(t, **_kwargs):
+                self._fpm_gpu_time_acc += t
+
+            if hasattr(self, "forward_pass_device_timer"):
+                self.forward_pass_device_timer.add_reporter(_fpm_device_timer_reporter)
+            else:
+                self.forward_pass_device_timer = DeviceTimer(
+                    reporter=_fpm_device_timer_reporter,
+                )
+            self._fpm_uses_device_timer = True
+            self.enable_fpm = True
+            logger.info(
+                "FPM: ZMQ PUB bound on %s (dp_rank=%d, device_timer=%s)",
+                endpoint,
+                self._fpm_dp_rank,
+                self._fpm_uses_device_timer,
+            )
+
+    def _build_scheduled_request_metrics(self: Scheduler, batch: ScheduleBatch):
+        from sglang.srt.observability.forward_pass_metrics import (
+            ScheduledRequestMetrics,
+            WelfordAccumulator,
+        )
+
+        num_prefill_requests = 0
+        sum_prefill_tokens = 0
+        sum_prefill_kv_tokens = 0
+        prefill_lengths = WelfordAccumulator()
+
+        if batch.forward_mode.is_mixed():
+            decode_req_ids = {id(req) for req in batch.decoding_reqs or []}
+            prefill_reqs = [req for req in batch.reqs if id(req) not in decode_req_ids]
+        elif batch.forward_mode.is_extend():
+            prefill_reqs = batch.reqs
+        else:
+            prefill_reqs = []
+
+        if prefill_reqs:
+            stats = batch.prefill_stats
+            for req in prefill_reqs:
+                prefill_lengths.add(len(req.origin_input_ids))
+            num_prefill_requests = stats.num_new_seqs if stats else len(prefill_reqs)
+            sum_prefill_tokens = stats.log_input_tokens if stats else 0
+            sum_prefill_kv_tokens = sum(len(req.prefix_indices) for req in prefill_reqs)
+
+        decode_kv = WelfordAccumulator()
+        if batch.forward_mode.is_mixed():
+            for req in batch.decoding_reqs or []:
+                decode_kv.add(req.seqlen)
+        elif batch.forward_mode.is_decode():
+            for sl in batch.seq_lens_cpu:
+                decode_kv.add(int(sl))
+
+        return ScheduledRequestMetrics(
+            num_prefill_requests=num_prefill_requests,
+            sum_prefill_tokens=sum_prefill_tokens,
+            var_prefill_length=prefill_lengths.variance(),
+            sum_prefill_kv_tokens=sum_prefill_kv_tokens,
+            num_decode_requests=decode_kv.count,
+            sum_decode_kv_tokens=decode_kv.total,
+            var_decode_kv_tokens=decode_kv.variance(),
+        )
+
+    def _build_queued_request_metrics(self: Scheduler):
+        from sglang.srt.observability.forward_pass_metrics import (
+            QueuedRequestMetrics,
+            WelfordAccumulator,
+        )
+
+        prefill_q = WelfordAccumulator()
+        decode_q = WelfordAccumulator()
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in self.disagg_prefill_bootstrap_queue.queue:
+                prefill_q.add(len(req.origin_input_ids))
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            for req in self.disagg_decode_prealloc_queue.queue:
+                decode_q.add(req.seqlen)
+            for req in self.disagg_decode_transfer_queue.queue:
+                decode_q.add(req.seqlen)
+        else:
+            for req in self.waiting_queue:
+                if len(req.output_ids) > 0:
+                    decode_q.add(req.seqlen)
+                else:
+                    prefill_q.add(len(req.origin_input_ids))
+
+        return QueuedRequestMetrics(
+            num_prefill_requests=prefill_q.count,
+            sum_prefill_tokens=prefill_q.total,
+            var_prefill_length=prefill_q.variance(),
+            num_decode_requests=decode_q.count,
+            sum_decode_kv_tokens=decode_q.total,
+            var_decode_kv_tokens=decode_q.variance(),
+        )
 
     def update_spec_metrics(self: Scheduler, bs: int, num_correct_drafts: int):
         self.spec_num_accept_tokens += num_correct_drafts + bs
@@ -718,6 +845,47 @@ class SchedulerMetricsMixin:
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
+
+    def _emit_forward_pass_metrics(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result=None,
+    ):
+        """Emit per-iteration ForwardPassMetrics over ZMQ PUB.
+
+        Prefers GPU-accurate timing from DeviceTimer (which wraps
+        model_runner.forward / cuda_graph.replay via PR #24197).
+        Falls back to monotonic clock when DeviceTimer is not enabled.
+        """
+        if not self.enable_fpm:
+            return
+
+        from sglang.srt.observability.forward_pass_metrics import (
+            ForwardPassMetrics,
+        )
+
+        if self._fpm_uses_device_timer:
+            self.forward_pass_device_timer._report()
+            wall_time = self._fpm_gpu_time_acc
+            self._fpm_gpu_time_acc = 0.0
+            if wall_time == 0.0:
+                return
+        else:
+            wall_time = max(0.0, time.monotonic() - batch.fpm_start_time)
+
+        fpm = ForwardPassMetrics(
+            worker_id=self._fpm_worker_id,
+            dp_rank=self._fpm_dp_rank,
+            wall_time=wall_time,
+            scheduled_requests=self._build_scheduled_request_metrics(batch),
+            queued_requests=self._build_queued_request_metrics(),
+        )
+        self._fpm_publisher.publish(fpm)
+
+    def _shutdown_fpm(self: Scheduler):
+        """Shut down the FPM publisher thread."""
+        if self.enable_fpm:
+            self._fpm_publisher.shutdown()
 
     def _log_hicache_stats(self: Scheduler):
         """Populate HiCache host-tier stats on self.stats.
