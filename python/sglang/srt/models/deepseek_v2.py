@@ -1012,16 +1012,6 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-            if is_deepep_class_backend() and self.num_fused_shared_experts > 0:
-                n = self.num_fused_shared_experts
-                topk_output = topk_output._replace(
-                    topk_ids=topk_output.topk_ids.new_empty(
-                        (0, topk_output.topk_ids.shape[-1] + n)
-                    ),
-                    topk_weights=topk_output.topk_weights.new_empty(
-                        (0, topk_output.topk_weights.shape[-1] + n)
-                    ),
-                )
 
         if sbo_overlap_dispatch_flag:
             shared_output = None
@@ -2415,19 +2405,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if server_args.disable_shared_experts_fusion:
             return
 
-        # DeepEP + enforce: the only path that enables fusion under DeepEP.
-        if is_deepep_class_backend() and server_args.enforce_shared_experts_fusion:
-            log_info_on_rank0(
-                logger,
-                "DeepEP shared expert fusion: fusing shared expert into MoE kernel "
-                "at home EP rank local slot (--enforce-shared-experts-fusion).",
-            )
-            self.num_fused_shared_experts = self.config.n_shared_experts
-            return
-
-        # Check all conditions that disable fusion.
         disable_reason = None
-        if is_sbo_enabled() or is_tbo_enabled():
+        if server_args.enforce_shared_experts_fusion:
+            pass
+        elif is_sbo_enabled() or is_tbo_enabled():
             disable_reason = "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."
         elif is_deepep_class_backend():
             disable_reason = "DeepEP: fusion off by default (use --enforce-shared-experts-fusion to enable)."
