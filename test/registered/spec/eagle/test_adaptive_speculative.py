@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=76, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=76, stage="stage-b", runner_config="1-gpu-large")
 
 HIGH_ACCEPT_PROMPT = (
     "Output exactly 128 new lines. "

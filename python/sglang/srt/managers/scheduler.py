@@ -1865,13 +1865,24 @@ class Scheduler(
             self.external_corpus_manager.check_pending_load()
 
     def init_req_max_new_tokens(self, req):
-        req.sampling_params.max_new_tokens = min(
-            (
-                req.sampling_params.max_new_tokens
-                if req.sampling_params.max_new_tokens is not None
-                else 1 << 30
+        input_len = len(req.origin_input_ids)
+        # Keep this bound consistent with PrefillAdder's admission budget:
+        # ceil_page(input_len) + max_new_tokens + page_size must be strictly
+        # smaller than max_total_num_tokens. Otherwise a request can be accepted
+        # into the waiting queue but can never be scheduled, blocking the queue
+        # and eventually making health checks fail.
+        paged_input_len = -(-input_len // self.page_size) * self.page_size
+        req.sampling_params.max_new_tokens = max(
+            0,
+            min(
+                (
+                    req.sampling_params.max_new_tokens
+                    if req.sampling_params.max_new_tokens is not None
+                    else 1 << 30
+                ),
+                self.max_req_len - input_len - 1,
+                self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
-            self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
     def _process_and_broadcast_mm_inputs(
@@ -3033,7 +3044,10 @@ class Scheduler(
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                        batch_result.copy_to_cpu(
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
+                        )
                     else:
                         batch_result.future_indices = future_indices
 
@@ -3138,7 +3152,10 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
-            batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
+            batch_result.copy_to_cpu(
+                return_logprob=self.cur_batch.return_logprob,
+                return_hidden_states=self.cur_batch.return_hidden_states,
+            )
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
