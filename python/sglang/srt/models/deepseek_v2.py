@@ -270,12 +270,18 @@ class DeepseekV2MLP(nn.Module):
 
         gate_up, _ = self.gate_up_proj(x)
         if self.swiglu_limit is not None:
-            _g, _u = gate_up.chunk(2, dim=-1)
-            _lim = float(self.swiglu_limit)
-            gate_up = torch.cat(
-                [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
-            )
-        x = self.act_fn(gate_up)
+            if _use_aiter:
+                # HIP+AITER: fused clamp inside aiter silu_and_mul kernel.
+                x = self.act_fn(gate_up, limit=self.swiglu_limit)
+            else:
+                _g, _u = gate_up.chunk(2, dim=-1)
+                _lim = float(self.swiglu_limit)
+                gate_up = torch.cat(
+                    [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+                )
+                x = self.act_fn(gate_up)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
