@@ -442,7 +442,6 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             can_run_cuda_graph=can_run_cuda_graph,
-            model_forward_mode=str(forward_batch.forward_mode),
         )
 
     def forward_batch_generation(
@@ -479,8 +478,6 @@ class TpModelWorker(BaseTpWorker):
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
-                model_forward_mode=str(forward_batch.forward_mode),
-                model_forward_timings=out.model_forward_timings,
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
@@ -538,8 +535,6 @@ class TpModelWorker(BaseTpWorker):
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
-                model_forward_mode=str(forward_batch.forward_mode),
-                model_forward_timings=out.model_forward_timings,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
 

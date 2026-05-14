@@ -30,9 +30,6 @@ class GenerationBatchResult:
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
-    model_forward_mode: Optional[str] = None
-    model_forward_timings: Optional[dict] = None
-    decoupled_verify_timings: Optional[dict] = None
 
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None

@@ -315,7 +315,6 @@ class RankZeroFilter(logging.Filter):
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
-    model_forward_timings: Optional[dict] = None
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
@@ -3372,13 +3371,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-            return ModelRunnerOutput(
-                logits_output=ret,
-                can_run_graph=can_run_graph,
-                model_forward_timings=getattr(
-                    self.graph_runner, "last_replay_timings", None
-                ),
-            )
+            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import time
 from typing import Optional, Tuple
 
 import torch
@@ -46,26 +45,6 @@ if is_cuda() or is_musa():
     )
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
-
-
-def _trace_timestamp_ns(timings: Optional[dict]) -> int | None:
-    if timings is None:
-        return None
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    return time.perf_counter_ns()
-
-
-def _record_elapsed_ms(
-    timings: Optional[dict],
-    name: str,
-    start_ns: int | None,
-) -> None:
-    if timings is None or start_ns is None:
-        return
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    timings[name] = (time.perf_counter_ns() - start_ns) / 1_000_000
 
 
 @dataclass
@@ -414,14 +393,9 @@ class NgramVerifyInput(SpecInput):
         logits_output: LogitsProcessorOutput,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
-        timings: Optional[dict] = None,
     ) -> torch.Tensor:
-        start_ns = _trace_timestamp_ns(timings)
         bs = self.retrieve_index.shape[0]
         sampling_info = batch.sampling_info
-        if timings is not None:
-            timings["ngram_logits_numel"] = int(logits_output.next_token_logits.numel())
-            timings["ngram_vocab_size"] = int(logits_output.next_token_logits.shape[-1])
 
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
@@ -429,20 +403,16 @@ class NgramVerifyInput(SpecInput):
             sampling_info.filter_batch(
                 self.retrieve_index.tolist(), self.retrieve_index
             )
-        _record_elapsed_ms(timings, "ngram_sampling_info_ms", start_ns)
 
         # Apply the custom logit processors if registered in the sampling info.
-        start_ns = _trace_timestamp_ns(timings)
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(
                 logits_output.next_token_logits,
                 sampling_info,
                 num_tokens_in_batch=self.draft_token_num,
             )
-        _record_elapsed_ms(timings, "ngram_custom_processor_ms", start_ns)
 
         # Apply penalty
-        start_ns = _trace_timestamp_ns(timings)
         if (
             sampling_info.penalizer_orchestrator.is_required
             or sampling_info.logit_bias is not None
@@ -457,48 +427,32 @@ class NgramVerifyInput(SpecInput):
                         sampling_info.logit_bias, self.draft_token_num, dim=0
                     )
                 )
-        _record_elapsed_ms(timings, "ngram_penalty_ms", start_ns)
 
         # Apply grammar mask
-        start_ns = _trace_timestamp_ns(timings)
         if vocab_mask is not None:
             assert self.grammar is not None
             self.grammar.apply_vocab_mask(
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
-        _record_elapsed_ms(timings, "ngram_grammar_mask_ms", start_ns)
 
         # Sample tokens. Force greedy sampling on AMD
         is_all_greedy = (
             sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
         )
-        if timings is not None:
-            timings["ngram_is_greedy"] = bool(
-                is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE
-            )
-            timings["ngram_need_top_p_sampling"] = bool(
-                sampling_info.need_top_p_sampling
-            )
-            timings["ngram_page_size"] = int(page_size)
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
             logger.warning(
                 "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
                 "Falling back to greedy verification."
             )
 
-        start_ns = _trace_timestamp_ns(timings)
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             self._greedy_verify(batch, logits_output)
         else:
             # NOTE: Compared with greedy_verify, the performance of _sampling_verify is relatively poor.
             self._sampling_verify(batch, logits_output, sampling_info)
-        _record_elapsed_ms(timings, "ngram_verify_kernel_ms", start_ns)
 
-        start_ns = _trace_timestamp_ns(timings)
         self._fill_requests(batch, logits_output)
-        _record_elapsed_ms(timings, "ngram_fill_requests_ms", start_ns)
 
-        start_ns = _trace_timestamp_ns(timings)
         # Sync the bonus-included view after the kernel + `_fill_requests`
         # finalize `num_correct_drafts`.
         self.num_accept_tokens = self.num_correct_drafts + 1
@@ -506,16 +460,11 @@ class NgramVerifyInput(SpecInput):
         num_correct_drafts_cpu = self.num_correct_drafts.cpu()
         num_accept_tokens_cpu = num_correct_drafts_cpu + 1
         num_correct_drafts = num_correct_drafts_cpu.sum().item()
-        _record_elapsed_ms(timings, "ngram_accept_sync_ms", start_ns)
 
-        start_ns = _trace_timestamp_ns(timings)
         self._free_cache(batch, page_size, num_correct_drafts_cpu)
-        _record_elapsed_ms(timings, "ngram_free_cache_ms", start_ns)
 
-        start_ns = _trace_timestamp_ns(timings)
         batch.seq_lens.add_(self.num_accept_tokens)
         batch.seq_lens_cpu.add_(num_accept_tokens_cpu)
-        _record_elapsed_ms(timings, "ngram_seq_lens_update_ms", start_ns)
 
         return logits_output, self.accept_tokens, num_correct_drafts
 

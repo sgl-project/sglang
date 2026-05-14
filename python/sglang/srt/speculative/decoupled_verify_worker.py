@@ -397,8 +397,6 @@ class VerifyWorker:
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
-        if batch_result.model_forward_timings:
-            timings.update(batch_result.model_forward_timings)
 
         vocab_mask = None
         if batch.has_grammar:
@@ -506,7 +504,6 @@ class VerifyWorker:
             num_correct_drafts=num_correct_drafts,
             num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=reported_can_run_cuda_graph,
-            model_forward_mode=str(ForwardMode.TARGET_VERIFY),
         )
         if self.trace_timing_enabled:
             if torch.is_tensor(accepted_tokens):
@@ -514,7 +511,6 @@ class VerifyWorker:
             else:
                 accepted_tokens_num = len(accepted_tokens or [])
             timings.update(
-                model_forward_mode=str(ForwardMode.TARGET_VERIFY),
                 batch_size=batch.batch_size(),
                 draft_token_num=int(spec_info.draft_token_num),
                 num_input_tokens=int(spec_info.draft_token.numel()),

@@ -416,13 +416,7 @@ class Scheduler(
                 self.attn_cp_size,
             )
         )
-        self.decoupled_spec_tracer = None
-        if getattr(server_args, "decoupled_spec_trace_dir", None) and (
-            self.spec_algorithm.is_decoupled_verify()
-            or self.spec_algorithm.is_decoupled_draft()
-            or self.spec_algorithm.is_none()
-        ):
-            self.decoupled_spec_tracer = self.create_spec_tracer()
+        self.decoupled_spec_tracer = self.create_spec_tracer()
 
         self.enable_kv_cache_events = bool(
             server_args.kv_events_config and self.attn_tp_rank == 0
@@ -1683,6 +1677,7 @@ class Scheduler(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+
         if self.recv_skipper is not None:
             last_forward_mode = (
                 self.last_batch.forward_mode if self.last_batch is not None else None
@@ -3033,17 +3028,7 @@ class Scheduler(
         if self.spec_algorithm.is_decoupled_verify():
             self.prepare_verify_inputs(batch)
 
-        should_trace_decoupled_spec_forward = bool(
-            getattr(self.decoupled_spec_tracer, "enabled", False)
-            and (
-                self.spec_algorithm.is_decoupled_verify()
-                or self.spec_algorithm.is_decoupled_draft()
-                or self.spec_algorithm.is_none()
-            )
-        )
-        decoupled_trace_forward_start_ns = None
-        if should_trace_decoupled_spec_forward:
-            decoupled_trace_forward_start_ns = self.start_forward_timer(batch)
+        decoupled_forward_start_ns = self.start_forward_timer(batch)
 
         # Run forward
         if self.is_generation:
@@ -3157,8 +3142,9 @@ class Scheduler(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                 )
-        if should_trace_decoupled_spec_forward:
-            self.record_forward_latency(batch, decoupled_trace_forward_start_ns, ret)
+
+        if decoupled_forward_start_ns is not None:
+            self.record_forward_latency(batch, decoupled_forward_start_ns, ret)
 
         if (
             self.server_args.enable_dp_attention

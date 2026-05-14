@@ -21,7 +21,6 @@ import gc
 import inspect
 import logging
 import os
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -633,7 +632,6 @@ class CudaGraphRunner:
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        self.last_replay_timings: Optional[dict] = None
         self.num_tokens_per_bs = 1
         if (
             model_runner.spec_algorithm.is_speculative()
@@ -1318,27 +1316,7 @@ class CudaGraphRunner:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         self.deepep_adapter.replay()
-        trace_timing_enabled = bool(
-            getattr(self.model_runner.server_args, "decoupled_spec_trace_dir", None)
-            and self.capture_forward_mode.is_target_verify()
-        )
-        self.last_replay_timings = None
 
-        def trace_timestamp_ns() -> Optional[int]:
-            if not trace_timing_enabled:
-                return None
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            return time.perf_counter_ns()
-
-        def trace_elapsed_ms(start_ns: Optional[int]) -> float:
-            if start_ns is None:
-                return 0.0
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            return (time.perf_counter_ns() - start_ns) / 1_000_000
-
-        start_ns = trace_timestamp_ns()
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
@@ -1353,7 +1331,6 @@ class CudaGraphRunner:
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
-        cuda_graph_replay_prepare_ms = trace_elapsed_ms(start_ns)
 
         # Replay
         variant_label = self._resolve_lora_variant(forward_batch)
@@ -1368,15 +1345,8 @@ class CudaGraphRunner:
             if self.model_runner.device_timer
             else contextlib.nullcontext()
         )
-        start_ns = trace_timestamp_ns()
         with ctx:
             self.graphs[graph_key].replay()
-        cuda_graph_replay_ms = trace_elapsed_ms(start_ns)
-        if trace_timing_enabled:
-            self.last_replay_timings = {
-                "cuda_graph_replay_prepare_ms": cuda_graph_replay_prepare_ms,
-                "cuda_graph_replay_ms": cuda_graph_replay_ms,
-            }
 
         output = self.output_buffers[graph_key]
 
