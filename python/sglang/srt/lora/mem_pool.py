@@ -55,6 +55,20 @@ class EmptySlot:
 EMPTY_SLOT = EmptySlot()
 
 
+def append_cache_key_suffix(
+    cache_keys: Optional[Union[str, Dict[int, str]]],
+    suffix: str,
+) -> Union[str, Dict[int, str]]:
+    assert cache_keys is not None
+    assert not suffix.startswith("#")
+    if isinstance(cache_keys, dict):
+        return {
+            expert_id: f"{cache_key}#{suffix}"
+            for expert_id, cache_key in cache_keys.items()
+        }
+    return f"{cache_keys}#{suffix}"
+
+
 def _get_moe_ep_context() -> Tuple[int, int]:
     """Return `(moe_ep_size, moe_ep_rank)`, or `(1, 0)` if the MoE EP group
     is not initialized (hermetic tests or pure-TP launches)."""
@@ -285,7 +299,11 @@ class LoRAMemoryPool:
             else:
                 start, count = 0, total
             for i in range(count):
-                yield i, weights[start + i], f"{cache_keys}#expert{start + i}"
+                yield (
+                    i,
+                    weights[start + i],
+                    append_cache_key_suffix(cache_keys, f"expert{start + i}"),
+                )
             return
 
         raise TypeError(
@@ -720,18 +738,6 @@ class LoRAMemoryPool:
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
-        def append_cache_key_suffix(
-            cache_keys: Optional[Union[str, Dict[int, str]]],
-            suffix: str,
-        ) -> Union[str, Dict[int, str]]:
-            assert cache_keys is not None
-            if isinstance(cache_keys, dict):
-                return {
-                    expert_id: f"{cache_key}{suffix}"
-                    for expert_id, cache_key in cache_keys.items()
-                }
-            return f"{cache_keys}{suffix}"
-
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor,
             weight: Optional[torch.Tensor],
@@ -890,7 +896,7 @@ class LoRAMemoryPool:
                             )
                             temp_A_cache_keys[target_module] = append_cache_key_suffix(
                                 temp_A_cache_keys[target_module],
-                                f"#moe_tp{self.moe_tp_rank}",
+                                f"moe_tp{self.moe_tp_rank}",
                             )
                         if temp_B_buffer.get(target_module) is not None:
                             temp_B_buffer[target_module] = (
@@ -902,7 +908,7 @@ class LoRAMemoryPool:
                             )
                             temp_B_cache_keys[target_module] = append_cache_key_suffix(
                                 temp_B_cache_keys[target_module],
-                                f"#moe_tp{self.moe_tp_rank}",
+                                f"moe_tp{self.moe_tp_rank}",
                             )
 
                     continue
@@ -925,7 +931,7 @@ class LoRAMemoryPool:
                 )
                 temp_A_cache_keys[target_module] = append_cache_key_suffix(
                     temp_A_cache_keys[target_module],
-                    f"#tp{self.tp_rank}",
+                    f"tp{self.tp_rank}",
                 )
 
                 temp_B_buffer[target_module] = module.slice_lora_b_weights(
@@ -933,7 +939,7 @@ class LoRAMemoryPool:
                 )
                 temp_B_cache_keys[target_module] = append_cache_key_suffix(
                     temp_B_cache_keys[target_module],
-                    f"#tp{self.tp_rank}",
+                    f"tp{self.tp_rank}",
                 )
 
             for name, weights in temp_A_buffer.items():
@@ -1080,7 +1086,9 @@ class LoRAMemoryPool:
                                 w = w * lora_adapter.scaling
                                 w = self._get_maybe_cached_weight_for_transfer(
                                     pinned_layer_weights,
-                                    f"{weights_cache_key}#expert0",
+                                    append_cache_key_suffix(
+                                        weights_cache_key, "expert0"
+                                    ),
                                     w,
                                 )
                             load_lora_weight_tensor(buffer_view, w)
@@ -1235,7 +1243,7 @@ class LoRAMemoryPool:
                         lora_b_weights = lora_lm_head_module.slice_lora_b_weights(
                             lora_b_weights, self.tp_rank
                         )
-                        cache_key = f"{name}#tp{self.tp_rank}"
+                        cache_key = append_cache_key_suffix(name, f"tp{self.tp_rank}")
                     else:
                         cache_key = name
 
