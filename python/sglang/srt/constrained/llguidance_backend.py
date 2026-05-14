@@ -25,6 +25,7 @@ from llguidance.torch import (
     allocate_token_bitmask,
     fill_next_token_bitmask,
 )
+
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
