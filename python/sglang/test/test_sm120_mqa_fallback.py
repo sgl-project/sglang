@@ -7,6 +7,8 @@ that replace DeepGEMM's fp8_paged_mqa_logits and fp8_mqa_logits on SM120.
 Run: python -m pytest python/sglang/test/test_sm120_mqa_fallback.py -v
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -276,4 +278,4 @@ class TestContiguousMQALogits:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))
