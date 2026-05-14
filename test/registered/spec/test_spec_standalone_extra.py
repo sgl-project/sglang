@@ -1,122 +1,33 @@
 import unittest
-from types import SimpleNamespace
 
-import requests
-
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_STANDALONE,
-    DEFAULT_TARGET_MODEL_STANDALONE,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
+from sglang.test.server_fixtures.standalone_fixture import StandaloneServerBase
+from sglang.test.test_utils import CustomTestCase
 
 # Non-V2 standalone speculative decoding tests (FA3, Triton, FlashInfer
 # backends). Sibling V2 classes stay per-commit in test_spec_standalone.py.
 register_cuda_ci(est_time=406, stage="extra-a", runner_config="1-gpu-large")
 
-GSM_DATASET_PATH = None
 
-# Default server arguments shared across all non-V2 tests
-DEFAULT_SERVER_ARGS = [
-    "--trust-remote-code",
-    "--cuda-graph-max-bs",
-    "8",
-    "--speculative-algorithm",
-    "STANDALONE",
-    "--speculative-draft-model-path",
-    DEFAULT_DRAFT_MODEL_STANDALONE,
-    "--speculative-num-steps",
-    "4",
-    "--speculative-eagle-topk",
-    "2",
-    "--speculative-num-draft-tokens",
-    "7",
-    "--mem-fraction-static",
-    0.7,
-]
+class TestStandaloneSpeculativeDecodingBase(StandaloneServerBase, CustomTestCase):
+    attention_backend = "fa3"
+    speculative_eagle_topk = 2
+    speculative_num_draft_tokens = 7
+    enable_spec_v2 = False
 
 
-class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
-
-    model = DEFAULT_TARGET_MODEL_STANDALONE
-    draft_model = DEFAULT_DRAFT_MODEL_STANDALONE
-    base_url = DEFAULT_URL_FOR_TEST
-    accuracy_threshold = 0.69  # derived tests need to override this
-    spec_decode_threshold = 3.6  # derived spec decoding tests need to override this
-
-    @classmethod
-    def get_server_args(cls):
-        """Return the arguments for the server launch. Override in subclasses."""
-        return DEFAULT_SERVER_ARGS + ["--attention-backend", "fa3"]
-
-    @classmethod
-    def setUpClass(cls):
-        # disable deep gemm precompile to make launch server faster
-        # please don't do this if you want to make your inference workload faster
-        envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
-        model = cls.model
-        cls.process = popen_launch_server(
-            model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=cls.get_server_args(),
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-        envs.SGLANG_ENABLE_SPEC_V2.clear()
-
-    def test_gsm8k(self):
-        requests.get(self.base_url + "/flush_cache")
-
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=100,
-            num_threads=128,
-            num_shots=4,
-            gsm8k_data_path=GSM_DATASET_PATH,
-        )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-
-        # Use the appropriate metric key based on the test class
-        metric_key = "score"
-        self.assertGreaterEqual(metrics[metric_key], self.accuracy_threshold)
-
-        server_info = requests.get(self.base_url + "/server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, self.spec_decode_threshold)
+class TestStandaloneSpeculativeDecodingTriton(StandaloneServerBase, CustomTestCase):
+    attention_backend = "triton"
+    speculative_eagle_topk = 2
+    speculative_num_draft_tokens = 7
+    enable_spec_v2 = False
 
 
-class TestStandaloneSpeculativeDecodingTriton(TestStandaloneSpeculativeDecodingBase):
-
-    @classmethod
-    def get_server_args(cls):
-        return DEFAULT_SERVER_ARGS + ["--attention-backend", "triton"]
-
-
-class TestStandaloneSpeculativeDecodingFlashinfer(
-    TestStandaloneSpeculativeDecodingBase
-):
-    @classmethod
-    def get_server_args(cls):
-        return DEFAULT_SERVER_ARGS + ["--attention-backend", "flashinfer"]
+class TestStandaloneSpeculativeDecodingFlashinfer(StandaloneServerBase, CustomTestCase):
+    attention_backend = "flashinfer"
+    speculative_eagle_topk = 2
+    speculative_num_draft_tokens = 7
+    enable_spec_v2 = False
 
 
 if __name__ == "__main__":
