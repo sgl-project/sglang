@@ -9,7 +9,8 @@ import json
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -27,6 +28,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_CACHE_ENV = "SGLANG_DIFFUSION_BATCH_MEMORY_CACHE"
+
 
 @dataclass
 class CalibrationRecord:
@@ -40,6 +43,9 @@ class CalibrationRecord:
     peak_memory_mb: float
     peak_allocated_memory_mb: float
     duration_s: float
+    realized_batch_sizes: list[int]
+    realized_stop_reasons: list[str | None]
+    fully_realized: bool
     errors: list[str]
 
 
@@ -55,6 +61,7 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
     shapes = _parse_calibration_shapes(args.shapes)
     requested_batch_sizes = _parse_calibration_batch_sizes(args.batch_sizes)
     batch_sizes = _add_geometric_ramp(requested_batch_sizes)
+    profile_cache = _get_profile_cache_source(args.batching_memory_profile_cache)
 
     max_batch_size = max(batch_sizes)
     server_args = ServerArgs.from_kwargs(
@@ -86,6 +93,13 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
                     batch_size=batch_size,
                     timeout_s=args.per_batch_timeout_s,
                 )
+                if record.success_count and not record.fully_realized:
+                    logger.warning(
+                        "Requested calibration batch_size=%d but observed scheduler dispatch sizes=%s stop_reasons=%s",
+                        batch_size,
+                        record.realized_batch_sizes or ["unknown"],
+                        record.realized_stop_reasons or ["unknown"],
+                    )
                 records.append(record)
                 if args.stop_on_oom and record.oom_count:
                     break
@@ -95,13 +109,12 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "schema_version": 1,
         "model_path": args.model_path,
-        "profile_cache": args.batching_memory_profile_cache,
+        "profile_cache": profile_cache,
+        "requested_batch_sizes": requested_batch_sizes,
+        "executed_batch_sizes": batch_sizes,
         "records": [asdict(record) for record in records],
         "profiles": [
-            asdict(record)
-            for record in _read_profile_cache_summary(
-                args.batching_memory_profile_cache
-            )
+            asdict(record) for record in _read_profile_cache_summary(profile_cache)
         ],
     }
     if args.output_json:
@@ -152,20 +165,32 @@ def _run_calibration_batch(
     errors = []
     with ThreadPoolExecutor(max_workers=batch_size) as executor:
         futures = [executor.submit(send_one, idx) for idx in range(batch_size)]
-        for future in as_completed(futures, timeout=timeout_s * max(1, batch_size)):
-            try:
-                outputs.append(future.result(timeout=timeout_s))
-            except Exception as exc:
-                errors.append(str(exc))
+        try:
+            for future in as_completed(futures, timeout=timeout_s * max(1, batch_size)):
+                try:
+                    outputs.append(future.result(timeout=timeout_s))
+                except Exception as exc:
+                    errors.append(str(exc))
+        except TimeoutError as exc:
+            errors.append(f"timeout waiting for calibration batch: {exc}")
+            for future in futures:
+                future.cancel()
 
     output_errors = [out.error for out in outputs if getattr(out, "error", None)]
     errors.extend(str(error) for error in output_errors)
-    oom_count = sum(1 for out in outputs if getattr(out, "is_oom", False))
+    typed_oom_count = sum(1 for out in outputs if getattr(out, "is_oom", False))
+    oom_count = max(
+        typed_oom_count,
+        sum(1 for error in errors if _is_oom_error_message(error)),
+    )
     success_count = sum(
         1
         for out in outputs
         if getattr(out, "error", None) is None and not getattr(out, "is_oom", False)
     )
+    realized_batches = _get_realized_batches(outputs)
+    realized_batch_sizes = [item[0] for item in realized_batches]
+    realized_stop_reasons = [item[1] for item in realized_batches]
     return CalibrationRecord(
         width=width,
         height=height,
@@ -173,7 +198,7 @@ def _run_calibration_batch(
         batch_size=batch_size,
         success_count=success_count,
         oom_count=oom_count,
-        error_count=len(errors) - oom_count,
+        error_count=max(0, len(errors) - oom_count),
         peak_memory_mb=max(
             (getattr(out, "peak_memory_mb", 0.0) for out in outputs), default=0.0
         ),
@@ -182,6 +207,9 @@ def _run_calibration_batch(
             default=0.0,
         ),
         duration_s=time.monotonic() - start,
+        realized_batch_sizes=realized_batch_sizes,
+        realized_stop_reasons=realized_stop_reasons,
+        fully_realized=realized_batch_sizes == [batch_size],
         errors=errors,
     )
 
@@ -224,6 +252,40 @@ def _add_geometric_ramp(batch_sizes: list[int]) -> list[int]:
             current = min(target, current * 2)
             expanded.add(current)
     return sorted(expanded)
+
+
+def _get_realized_batches(outputs: list[Any]) -> list[tuple[int, str | None]]:
+    counts: Counter[tuple[int, str | None]] = Counter(
+        (
+            max(1, int(getattr(out, "dynamic_batch_size", 1) or 1)),
+            getattr(out, "dynamic_batch_stop_reason", None),
+        )
+        for out in outputs
+    )
+    realized = []
+    for (batch_size, stop_reason), output_count in counts.items():
+        dispatch_count = output_count // batch_size if output_count else 0
+        realized.extend([(batch_size, stop_reason)] * max(1, dispatch_count))
+    return sorted(realized, key=lambda item: (item[0], item[1] or ""))
+
+
+def _is_oom_error_message(error: str) -> bool:
+    lowered = error.lower()
+    return "out of memory" in lowered or "cuda oom" in lowered or "hip oom" in lowered
+
+
+def _get_profile_cache_source(configured: str | None) -> str | None:
+    path = configured or os.getenv(_CACHE_ENV)
+    if path is None:
+        path = os.path.join(
+            os.path.expanduser("~"),
+            ".cache",
+            "sglang",
+            "diffusion_batch_memory",
+        )
+    if str(path).lower() in ("", "none", "off", "false"):
+        return None
+    return os.path.expanduser(path)
 
 
 def _read_profile_cache_summary(
