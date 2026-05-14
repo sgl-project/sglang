@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
+from sglang.srt.session.session_controller import SessionController
 
 import torch
 
@@ -41,15 +42,15 @@ class OmniSegmentState(str, Enum):
     AR_DECODE may also stay in AR_DECODE after text-only output, or move to DONE.
     """
 
-    # 1. triggered by a new user turn; next action is committing prepared inputs to SRT KV
+    # triggered by a new user turn; next action: committing prepared inputs to SRT KV
     AR_PREFILL = "ar_prefill"
-    # 2. triggered after prefill/image append; next action is AR decode to text/media boundary
+    # triggered after prefill/image append; next action: AR decode to text/media boundary
     AR_DECODE = "ar_decode"
-    # 3. triggered when AR emits an image boundary; next action is multimodal generation
+    # triggered when AR emits an image boundary; next action: multimodal generation
     GENERATE = "generate"
-    # 4. triggered after image generation; next action is committing the generated image to SRT KV
+    # triggered after image generation; next action: committing the generated image to SRT KV
     APPEND_IMAGE = "append_image"
-    # 5. triggered by EOS/close; next action is returning final output or accepting a later user turn
+    # triggered by EOS/close; next action: returning final output or accepting a later user turn
     DONE = "done"
 
 
@@ -258,7 +259,7 @@ class OmniSessionRuntime:
         next_context_version = record.context_version + 1
         next_anchor_request_id = f"{session_id}:ar{next_context_version}"
         record.anchor_request_id = next_anchor_request_id
-        self._execute_srt_session_req(
+        self._commit_generated_image_to_srt_session_kv(
             record,
             messages,
             request_id=next_anchor_request_id,
@@ -477,8 +478,8 @@ class OmniSessionRuntime:
         next_context_version = record.context_version + 1
         next_anchor_request_id = f"{record.session_id}:ar{next_context_version}"
         record.anchor_request_id = next_anchor_request_id
-        # 1. generated image is a new assistant media segment, not a replay of the whole turn
-        self._execute_srt_session_req(
+        # 1. commit the generated image back to srt session
+        self._commit_generated_image_to_srt_session_kv(
             record,
             [OmniInterleavedMessage(type="image", content=image)],
             request_id=next_anchor_request_id,
@@ -639,13 +640,14 @@ class OmniSessionRuntime:
                 )
         return record
 
-    def _execute_srt_session_req(
+    def _commit_generated_image_to_srt_session_kv(
         self,
         record: OmniSessionRecord,
         messages: list[OmniInterleavedMessage],
         *,
         request_id: str,
     ) -> None:
+        """materialize the generated content into SRT session by build and execute a special req with max_new_tokens=0"""
         if self.session_controller is None or not hasattr(
             self.session_controller, "get"
         ):
@@ -673,6 +675,7 @@ class OmniSessionRuntime:
             input_ids = prepared.input_ids
             input_text = prepared.input_text
             mm_inputs = prepared.mm_inputs
+            # create and adjust a special req:
             req, recv_req = self._create_srt_session_req(
                 record,
                 request_id=segment_request_id,
@@ -700,6 +703,10 @@ class OmniSessionRuntime:
             self._attach_srt_request_overrides(
                 req, srt_request_metadata=srt_request_metadata
             )
+
+            # execute the special req, but with max_new_tokens=0, no new tokens will be generated, just to:
+            # 1. write image context into KV cache by prefilling on the image input
+            # 2. capture token binding: OmniSRTKVTokenBinding
             self._execute_srt_req(record, req, state=record.state)
 
     def _append_condition_path_request(
@@ -750,7 +757,6 @@ class OmniSessionRuntime:
             max_new_tokens=0,
         )
         if prepared.mm_inputs is not None:
-            from sglang.srt.session.session_controller import SessionController
 
             SessionController.adjust_mm_offsets(recv_req, req, prepared.mm_inputs)
             self._pad_srt_multimodal_input_ids(req, prepared.mm_inputs)
@@ -791,6 +797,9 @@ class OmniSessionRuntime:
         *,
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput]:
+        """
+            image -> [IMG_START?] + IMG_CONTEXT_TOKEN * N + [IMG_END]
+        """
         session_view = self._model_session_view(record)
         custom_inputs = self.model_policy.prepare_srt_ar_interleaved_inputs(
             session=session_view, messages=messages, state=state
