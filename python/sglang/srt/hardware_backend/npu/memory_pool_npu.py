@@ -208,9 +208,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         torch.npu.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
-        for layer_id in range(self.layer_num):
-            k_layer = self.k_buffer[layer_id].view(-1, self.head_num, self.head_dim)
-            v_layer = self.v_buffer[layer_id].view(-1, self.head_num, self.head_dim)
+        for local_layer_id in range(self.layer_num):
+            k_layer = self.k_buffer[local_layer_id].view(-1, self.head_num, self.head_dim)
+            v_layer = self.v_buffer[local_layer_id].view(-1, self.head_num, self.head_dim)
             layer_chunks = []
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
@@ -224,14 +224,14 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
     def load_cpu_copy(self, kv_cache_cpu, indices):
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
-        for layer_id in range(self.layer_num):
-            k_layer = self.k_buffer[layer_id].view(-1, self.head_num, self.head_dim)
-            v_layer = self.v_buffer[layer_id].view(-1, self.head_num, self.head_dim)
+        for local_layer_id in range(self.layer_num):
+            k_layer = self.k_buffer[local_layer_id].view(-1, self.head_num, self.head_dim)
+            v_layer = self.v_buffer[local_layer_id].view(-1, self.head_num, self.head_dim)
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 k_cpu, v_cpu = (
-                    kv_cache_cpu[layer_id][i // chunk_size][0],
-                    kv_cache_cpu[layer_id][i // chunk_size][1],
+                    kv_cache_cpu[local_layer_id][i // chunk_size][0],
+                    kv_cache_cpu[local_layer_id][i // chunk_size][1],
                 )
                 assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
                 k_layer[chunk_indices] = k_cpu.to(k_layer.device, non_blocking=True)
@@ -462,9 +462,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 v_cpu = v_layer[chunk_indices].to("cpu", non_blocking=True)
                 if has_ik:
                     ik_cpu = ik_layer[chunk_indices].to("cpu", non_blocking=True)
-                    layer_chunks.append((k_cpu, v_cpu, ik_cpu))
+                    layer_chunks.append([k_cpu, v_cpu, ik_cpu])
                 else:
-                    layer_chunks.append((k_cpu, v_cpu))
+                    layer_chunks.append([k_cpu, v_cpu])
             kv_cache_cpu.append(layer_chunks)
         torch.npu.synchronize()
         return kv_cache_cpu
