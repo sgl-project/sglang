@@ -22,12 +22,6 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_cpu
-
-if not is_cpu():
-    from sglang.srt.layers.attention.fla.chunk_delta_h import (
-        CHUNK_SIZE as FLA_CHUNK_SIZE,
-    )
 
 logger = logging.getLogger(__name__)
 
