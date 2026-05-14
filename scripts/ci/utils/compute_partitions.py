@@ -65,6 +65,12 @@ def load_run_timeouts(pr_test_yml_path: str) -> dict:
         timeouts[suite] = int(
             with_.get("run_timeout_minutes", _RUN_TIMEOUT_MIN_DEFAULT)
         )
+    if not timeouts:
+        raise RuntimeError(
+            f"load_run_timeouts: no jobs matched uses={_REUSABLE_STAGE_USES!r} "
+            f"in {pr_test_yml_path}. The reusable workflow path likely "
+            "changed -- update _REUSABLE_STAGE_USES."
+        )
     return timeouts
 
 
