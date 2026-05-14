@@ -408,6 +408,8 @@ class StreamingSession(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
 
+        self._free_slot_mamba(slot)
+
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total KV tokens held by session slots, not tracked by the tree.
 
@@ -453,6 +455,38 @@ class StreamingSession(BasePrefixCache):
             return s.is_holding_kv and not in_batch
 
         return sum(_owned(s) for s in self.slots.values())
+
+    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
+        """Total mamba_pool entries held by session slots (mamba_pool_idx +
+        mamba_ping_pong_track_buffer). Excludes slots whose owning req is
+        currently in the batch -- those slots are counted via the normal
+        alloc/free paths (same convention as the sibling ``session_held_*``
+        accessors).
+        """
+        total = 0
+        for slot in self.slots.values():
+            in_batch = (
+                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
+            )
+            if in_batch:
+                continue
+            if slot.mamba_pool_idx is not None:
+                total += slot.mamba_pool_idx.numel()
+            if slot.mamba_ping_pong_track_buffer is not None:
+                total += slot.mamba_ping_pong_track_buffer.numel()
+        return total
+
+    def _free_slot_mamba(self, slot: SessionSlot) -> None:
+        """Return a session slot's mamba pool state to the allocator."""
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            return
+        if slot.mamba_pool_idx is not None:
+            mamba_pool.free(slot.mamba_pool_idx.unsqueeze(0))
+            slot.mamba_pool_idx = None
+        if slot.mamba_ping_pong_track_buffer is not None:
+            mamba_pool.free(slot.mamba_ping_pong_track_buffer)
+            slot.mamba_ping_pong_track_buffer = None
 
     # -- Internal helpers (streaming body bits) --
 

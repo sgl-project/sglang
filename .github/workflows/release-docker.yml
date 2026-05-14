@@ -1,8 +1,8 @@
 name: Release Docker Images
 #
 # Builds and publishes framework Docker images (full development environment):
-#   - lmsysorg/sglang:v{version}, lmsysorg/sglang:latest
-#   - lmsysorg/sglang:v{version}-cu130, lmsysorg/sglang:latest-cu130
+#   - lmsysorg/sglang:v{version}, lmsysorg/sglang:latest (cuda 13)
+#   - lmsysorg/sglang:v{version}-cu129, lmsysorg/sglang:latest-cu129
 #
 on:
   push:
@@ -49,7 +49,7 @@ jobs:
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
       tag_config: |
         [
-          {"cuda": "cu129", "tags": ["v${{ needs.resolve-version.outputs.version }}", "latest"]},
-          {"cuda": "cu130", "tags": ["v${{ needs.resolve-version.outputs.version }}-cu130", "latest-cu130"]}
+          {"cuda": "cu130", "tags": ["v${{ needs.resolve-version.outputs.version }}", "latest", "v${{ needs.resolve-version.outputs.version }}-cu130", "latest-cu130"]},
+          {"cuda": "cu129", "tags": ["v${{ needs.resolve-version.outputs.version }}-cu129", "latest-cu129"]}
         ]
     secrets: inherit

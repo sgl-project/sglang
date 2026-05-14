@@ -118,8 +118,13 @@ def compare_kl_divergence(
 
 
 # Common request helpers
-def _flush_cache(base_url):
-    requests.post(base_url + "/flush_cache")
+def _flush_cache(base_url, timeout_s=30):
+    response = requests.post(
+        base_url + "/flush_cache",
+        params={"timeout": timeout_s},
+        timeout=timeout_s + 10,
+    )
+    response.raise_for_status()
 
 
 def _generate(

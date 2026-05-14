@@ -266,6 +266,9 @@ class Lfm2ShortConv(nn.Module):
         layer_cache = forward_batch.req_to_token_pool.mamba2_layer_cache(self.layer_idx)
         conv_state = layer_cache.conv[0]
         req_pool_indices = forward_batch.req_pool_indices
+        mamba_indices = forward_batch.req_to_token_pool.get_mamba_indices(
+            req_pool_indices
+        )
 
         # Project and split into gates: B (pre-conv), C (post-conv), x (input)
         proj, _ = self.in_proj(hidden_states)
@@ -280,7 +283,7 @@ class Lfm2ShortConv(nn.Module):
                 self.conv_weight,
                 self.conv_bias,
                 activation=None,
-                conv_state_indices=req_pool_indices.to(torch.int32),
+                conv_state_indices=mamba_indices.to(torch.int32),
             )
         else:
             # Prefill: multiple tokens, use varlen kernel
@@ -298,12 +301,12 @@ class Lfm2ShortConv(nn.Module):
                         ),
                     ]
                 )
-                cache_indices = req_pool_indices.to(torch.int32)
+                cache_indices = mamba_indices.to(torch.int32)
             else:
                 query_start_loc = torch.tensor(
                     [0, T], dtype=torch.int32, device=hidden_states.device
                 )
-                cache_indices = req_pool_indices[:1].to(torch.int32)
+                cache_indices = mamba_indices[:1].to(torch.int32)
 
             conv_out = causal_conv1d_fn(
                 Bx_t,

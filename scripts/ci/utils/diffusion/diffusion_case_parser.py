@@ -106,6 +106,12 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
         if not isinstance(target, ast.Name) or not isinstance(op, ast.Add):
             return
 
+        if isinstance(value, ast.Name):
+            target_suite = CASE_LIST_TO_SUITE.get(target.id)
+            value_suite = CASE_LIST_TO_SUITE.get(value.id)
+            if target_suite and value_suite and target_suite != value_suite:
+                return
+
         rhs_case_ids = self._extract_case_ids(value)
         if rhs_case_ids is None:
             return
@@ -152,9 +158,11 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
         if not isinstance(node, ast.Call):
             return None
 
-        # Check if it's a DiffusionTestCase call
-        if isinstance(node.func, ast.Name) and node.func.id == "DiffusionTestCase":
-            # First positional argument is the case_id
+        # First positional argument is the case_id.
+        if isinstance(node.func, ast.Name) and node.func.id in {
+            "DiffusionTestCase",
+            "_make_modelopt_ci_case",
+        }:
             if node.args and isinstance(node.args[0], ast.Constant):
                 return node.args[0].value
 

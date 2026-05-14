@@ -55,6 +55,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
+    JoyImageEditPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
@@ -97,8 +100,12 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
+from sglang.multimodal_gen.configs.sample.joy_image import (
+    JoyImageEditSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
+    LTX23HQSamplingParams,
     LTX23SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.mova import (
@@ -632,6 +639,11 @@ def _register_configs():
             lambda path: "ltx-2.3" in path.lower(),
         ],
     )
+    # register dedicated sampling params for LTX2TwoStageHQPipeline
+    _PIPELINE_CONFIG_REGISTRY.setdefault(
+        "LTX2TwoStageHQPipeline",
+        (LTX2PipelineConfig, LTX23HQSamplingParams),
+    )
 
     # Hunyuan
     register_configs(
@@ -953,6 +965,18 @@ def _register_configs():
         ],
         model_detectors=[
             lambda hf_id: "ernie-image" in hf_id.lower(),
+        ],
+    )
+
+    # JoyAI
+    register_configs(
+        sampling_param_cls=JoyImageEditSamplingParams,
+        pipeline_config_cls=JoyImageEditPipelineConfig,
+        hf_model_paths=[
+            "jdopensource/JoyAI-Image-Edit-Diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: "joyai-image-edit" in hf_id.lower(),
         ],
     )
 

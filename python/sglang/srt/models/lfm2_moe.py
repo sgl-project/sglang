@@ -329,6 +329,9 @@ class Lfm2MoeShortConv(nn.Module):
         layer_cache = forward_batch.req_to_token_pool.mamba2_layer_cache(self.layer_idx)
         conv_state = layer_cache.conv[0]
         req_pool_indices = forward_batch.req_pool_indices
+        mamba_indices = forward_batch.req_to_token_pool.get_mamba_indices(
+            req_pool_indices
+        )
 
         proj, _ = self.in_proj(hidden_states)
         B_gate, C_gate, x = proj.chunk(3, dim=-1)
@@ -341,7 +344,7 @@ class Lfm2MoeShortConv(nn.Module):
                 self.conv_weight,
                 self.conv_bias,
                 activation=None,
-                conv_state_indices=req_pool_indices.to(torch.int32),
+                conv_state_indices=mamba_indices.to(torch.int32),
             )
         else:
             T = hidden_states.shape[0]
@@ -356,11 +359,11 @@ class Lfm2MoeShortConv(nn.Module):
                 query_start_loc = extend_start_loc.new_empty(len(extend_start_loc) + 1)
                 query_start_loc[:-1] = extend_start_loc
                 query_start_loc[-1] = T
-                cache_indices = req_pool_indices.to(torch.int32)
+                cache_indices = mamba_indices.to(torch.int32)
             else:
                 # Single sequence: [0, T]
                 query_start_loc = hidden_states.new_tensor([0, T], dtype=torch.int32)
-                cache_indices = req_pool_indices[:1].to(torch.int32)
+                cache_indices = mamba_indices[:1].to(torch.int32)
 
             conv_out = causal_conv1d_fn(
                 Bx_t,

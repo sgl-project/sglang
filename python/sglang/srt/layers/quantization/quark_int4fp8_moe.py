@@ -11,7 +11,7 @@ from sglang.srt.layers.int4fp8_utils import (
     quantize_fp8_scale_tensorwise,
     quantize_int4_scale_columnwise,
 )
-from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -27,8 +27,6 @@ _is_hip = is_hip()
 
 
 if _is_hip:
-    from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
@@ -405,18 +403,32 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+
         self.moe_runner_config = moe_runner_config
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto() and get_moe_a2a_backend().is_none():
+            moe_runner_backend = MoeRunnerBackend.AITER
+
+        if moe_runner_backend.is_aiter():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            # TODO(cwan): refactor other backends
+            pass
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: "DispatchOutput",
     ) -> torch.Tensor:
-        # TODO: fix circular imports issues in sglang forcing us to import here instead of at
-        # the top of file.
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            AiterMoeQuantInfo,
+            AiterQuantType,
+        )
 
-        topk_output = dispatch_output.topk_output
         moe_runner_config = self.moe_runner_config
 
         # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")
@@ -424,20 +436,11 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
             not moe_runner_config.no_combine
         ), f"no_combine={moe_runner_config.no_combine} is not supported."
 
-        output = fused_moe(
-            dispatch_output.hidden_states,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_output.topk_weights,
-            topk_output.topk_ids,
-            quant_type=QuantType.per_Token,
-            w1_scale=layer.w13_int4_scale,
+        quant_info = AiterMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            quant_type=AiterQuantType.PER_TOKEN,
+            w13_scale=layer.w13_int4_scale,
             w2_scale=layer.w2_int4_scale,
-            activation=(
-                ActivationType.Silu
-                if moe_runner_config.activation == "silu"
-                else ActivationType.Gelu
-            ),
         )
-
-        return StandardCombineInput(hidden_states=output)
+        return self.runner.run(dispatch_output, quant_info)
