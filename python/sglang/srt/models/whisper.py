@@ -1,5 +1,5 @@
 from array import array
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple
 
 import torch
 from transformers import WhisperConfig
