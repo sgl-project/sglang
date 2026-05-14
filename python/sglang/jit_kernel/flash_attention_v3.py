@@ -208,9 +208,39 @@ def flash_attn_varlen_func(
 ):
 
     if not _is_fa3_supported():
-        raise NotImplementedError(
-            "flash_attn at sgl-kernel is only supported on sm90 and above"
-        )
+        # Fall back to flash_attn package (FA2) on platforms without sgl-kernel FA3
+        # (e.g. ROCm, or CUDA < sm90)
+        if cu_seqlens_q is not None:
+            from flash_attn import flash_attn_varlen_func as fa2_flash_attn_varlen_func
+
+            return fa2_flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                return_attn_probs=return_softmax_lse,
+            )
+        else:
+            # 4D inputs (batch, seqlen, nheads, headdim) without cu_seqlens
+            from flash_attn import flash_attn_func as fa2_flash_attn_func
+
+            return fa2_flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                return_attn_probs=return_softmax_lse,
+            )
 
     return _call_fa3_kernel(
         _load_fa3_kernels()["flash_attn_varlen_func"],

@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=400, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=400, stage="stage-c", runner_config="4-gpu-h100")
 
 # FP8 variant of Qwen3-30B-A3B: required because DeepEP normal/LL fast paths in
 # ep_moe/layer.py only run for {Fp8Config (via deep_gemm), W4AFp8Config, aiter,

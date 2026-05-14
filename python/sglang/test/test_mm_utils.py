@@ -30,12 +30,12 @@ class TestMultimodalInputsFromDict(unittest.TestCase):
             model_specific_data={"image_grid_thw": [[1, 1, 1], [1, 1, 1]]},
         )
 
-        with patch.object(
-            schedule_batch.torch.cuda, "is_available", return_value=True
-        ), patch.object(
-            schedule_batch.torch.cuda, "current_device", return_value=0
-        ), patch.object(
-            schedule_batch.envs.SGLANG_MM_BUFFER_SIZE_MB, "get", return_value=0
+        with (
+            patch.object(schedule_batch.torch.cuda, "is_available", return_value=True),
+            patch.object(schedule_batch.torch.cuda, "current_device", return_value=0),
+            patch.object(
+                schedule_batch.envs.SGLANG_MM_BUFFER_SIZE_MB, "get", return_value=0
+            ),
         ):
             mm_inputs = MultimodalInputs.from_dict({"mm_items": [mm_item]})
 
