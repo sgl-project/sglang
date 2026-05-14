@@ -475,17 +475,28 @@ class MQALayer(nn.Module):
         q = self._compute_q_b(q_lora, positions, q_out)
 
         use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
-        kv: Optional[torch.Tensor]
-        if use_cp:
-            # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
-            # write to the FlashMLA cache after gather.
-            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-            kv = cp_all_gather_rerange_output(
-                kv.contiguous(),
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
+        use_no_prefix_bf16 = (
+            envs.SGLANG_DSV4_USE_BF16_SPARSE_PREFILL.get()
+            and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and getattr(
+                attn_backend.forward_metadata.core_metadata,
+                "no_prefix_ragged_prefill",
+                False,
             )
+        )
+        kv: Optional[torch.Tensor]
+        if use_cp or use_no_prefix_bf16:
+            # NSA CP and no-prefix ragged prefill both need bf16 KV before
+            # writing the FlashMLA cache.
+            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+            if use_cp:
+                kv = cp_all_gather_rerange_output(
+                    kv.contiguous(),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
                 swa_k=kv,
@@ -531,6 +542,11 @@ class MQALayer(nn.Module):
             and get_is_capture_mode()
             and x.shape[0] <= self._multi_stream_bs_limit
             and not (self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch))
+            and not (
+                envs.SGLANG_DSV4_USE_BF16_SPARSE_PREFILL.get()
+                and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get()
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            )
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None

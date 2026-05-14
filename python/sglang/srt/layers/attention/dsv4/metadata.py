@@ -159,6 +159,20 @@ class PagedIndexerMetadata:
         )
 
 
+@dataclass
+class RaggedIndexerMetadata:
+    c4_k_start: torch.Tensor
+    c4_k_finish: torch.Tensor
+
+    def copy_(self, other: "RaggedIndexerMetadata") -> None:
+        copy_metadata(
+            src=other,
+            dst=self,
+            check_eq_fields=[],
+            copy_fields=["c4_k_start", "c4_k_finish"],
+        )
+
+
 def maybe_copy_inplace(dst, *, src) -> None:
     assert type(src) == type(dst)
     if dst is not None:

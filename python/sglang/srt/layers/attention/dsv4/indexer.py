@@ -16,7 +16,10 @@ from sglang.jit_kernel.deepseek_v4 import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
-from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+from sglang.srt.layers.attention.dsv4.metadata import (
+    PagedIndexerMetadata,
+    RaggedIndexerMetadata,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
@@ -184,6 +187,70 @@ def topk_transform_512_pytorch_vectorized(
         out_raw_indices.copy_(raw_indices)
 
 
+def topk_transform_ragged_pytorch_vectorized(
+    scores: torch.Tensor,
+    row_starts: torch.Tensor,
+    lengths: torch.Tensor,
+    out_indices: torch.Tensor,
+    *,
+    topk: int,
+) -> None:
+    batch_size, total_k = scores.shape
+    device = scores.device
+    needs_sequential = lengths <= topk
+    out_indices.fill_(-1)
+
+    if needs_sequential.any():
+        sequential = row_starts.unsqueeze(1) + torch.arange(
+            topk, device=device, dtype=torch.int32
+        ).unsqueeze(0)
+        ends = (row_starts + lengths).unsqueeze(1)
+        sequential_valid = sequential < ends
+        sequential = torch.where(
+            sequential_valid,
+            sequential,
+            torch.tensor(-1, device=device, dtype=torch.int32),
+        )
+        out_indices[needs_sequential] = sequential[needs_sequential]
+
+    nonseq_mask = ~needs_sequential
+    if not nonseq_mask.any():
+        return
+
+    scores_nonseq = scores[nonseq_mask].clone()
+    starts_nonseq = row_starts[nonseq_mask]
+    lengths_nonseq = lengths[nonseq_mask]
+    ends_nonseq = starts_nonseq + lengths_nonseq
+
+    actual_k = min(topk, total_k)
+    positions = torch.arange(total_k, device=device).unsqueeze(0)
+    valid_mask = (positions >= starts_nonseq.unsqueeze(1)) & (
+        positions < ends_nonseq.unsqueeze(1)
+    )
+    scores_nonseq.masked_fill_(~valid_mask, float("-inf"))
+
+    _, raw_indices = torch.topk(
+        scores_nonseq, k=actual_k, dim=1, largest=True, sorted=False
+    )
+    raw_indices = raw_indices.to(torch.int32)
+
+    if actual_k < topk:
+        raw_indices = torch.cat(
+            [
+                raw_indices,
+                torch.full(
+                    (raw_indices.shape[0], topk - actual_k),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            ],
+            dim=1,
+        )
+
+    out_indices[nonseq_mask] = raw_indices
+
+
 @triton.jit
 def _fused_scale_kernel(
     weight_ptr,
@@ -337,7 +404,7 @@ class C4IndexerBackendMixin:
         )
 
         assert isinstance(core_metadata, DSV4AttnMetadata)
-        assert isinstance(indexer_metadata, PagedIndexerMetadata)
+        assert isinstance(indexer_metadata, (PagedIndexerMetadata, RaggedIndexerMetadata))
 
         if enable_multi_stream:
             q_fp8, weights, c4_indexer_kv_cache = self._forward_prepare_multi_stream(
@@ -363,6 +430,40 @@ class C4IndexerBackendMixin:
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)
+        assert len(weights.shape) == 3
+        weights = weights.squeeze(2)
+
+        if isinstance(indexer_metadata, RaggedIndexerMetadata):
+            k_fp8 = self._current_ragged_indexer_kv_fp8
+            k_scale = self._current_ragged_indexer_kv_scale
+            assert k_fp8 is not None and k_scale is not None
+            if k_scale.ndim > 1:
+                k_scale = k_scale.squeeze(-1)
+            total_k = k_fp8.shape[0]
+            if total_k == 0:
+                core_metadata.c4_sparse_page_indices.fill_(-1)
+                return
+
+            import deep_gemm
+
+            logits = deep_gemm.fp8_mqa_logits(
+                q_fp8,
+                (k_fp8, k_scale),
+                weights,
+                indexer_metadata.c4_k_start,
+                indexer_metadata.c4_k_finish,
+                clean_logits=False,
+            )
+            lengths = indexer_metadata.c4_k_finish - indexer_metadata.c4_k_start
+            topk_transform_ragged_pytorch_vectorized(
+                logits,
+                indexer_metadata.c4_k_start,
+                lengths,
+                core_metadata.c4_sparse_page_indices,
+                topk=core_metadata.c4_sparse_topk,
+            )
+            return
+
         assert len(c4_indexer_kv_cache.shape) == 2
         block_kv = 64
         num_heads_kv = 1
@@ -371,8 +472,6 @@ class C4IndexerBackendMixin:
         c4_indexer_kv_cache = c4_indexer_kv_cache.view(
             c4_indexer_kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
         )
-        assert len(weights.shape) == 3
-        weights = weights.squeeze(2)
         if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
