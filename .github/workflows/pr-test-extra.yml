@@ -2,7 +2,7 @@ name: PR Test Extra
 # Label-gated CI for nightly-class tests opted into a per-PR run.
 #
 # Adds runtime to a PR only when the author asks for it: pull_request
-# events bail unless the PR carries the `run-extra` label. The same job
+# events bail unless the PR carries the `run-ci-extra` label. The same job
 # graph runs unconditionally on workflow_dispatch / workflow_call so it
 # can be triggered manually or chained from another workflow.
 #
@@ -81,8 +81,8 @@ permissions:
 jobs:
   # =============================================== check changes ====================================================
   # Label gate: pull_request events only proceed when the PR carries BOTH
-  # `run-ci` and `run-extra` labels — `run-ci` is the basic-CI prerequisite
-  # (matching pr-test.yml's pr-gate `require-run-ci`) and `run-extra` is the
+  # `run-ci` and `run-ci-extra` labels — `run-ci` is the basic-CI prerequisite
+  # (matching pr-test.yml's pr-gate `require-run-ci`) and `run-ci-extra` is the
   # explicit opt-in to this workflow. Other event types
   # (workflow_dispatch / workflow_call) always run. When this job is
   # skipped by the gate, every downstream caller stub naturally skips
@@ -92,7 +92,7 @@ jobs:
       github.event_name != 'pull_request' ||
       (
         contains(github.event.pull_request.labels.*.name, 'run-ci') &&
-        contains(github.event.pull_request.labels.*.name, 'run-extra')
+        contains(github.event.pull_request.labels.*.name, 'run-ci-extra')
       )
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
