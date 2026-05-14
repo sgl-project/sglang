@@ -334,7 +334,7 @@ class GPUWorker:
                 return result
 
             output_batch = self._to_output_batch(result)
-            self._record_output_peak_memory(output_batch)
+            self._record_output_memory_stats(output_batch)
 
             output_metrics = self._iter_output_metrics(output_batch)
             if self.rank == 0 and output_metrics and not current_platform.is_cpu():
@@ -392,12 +392,14 @@ class GPUWorker:
                 f"Error executing {error_context}: {e}",
                 exc_info=True,
             )
-            if isinstance(e, _oom_exceptions()):
+            is_oom = isinstance(e, _oom_exceptions())
+            if is_oom:
                 logger.warning(OOM_MSG)
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
-            self._record_output_peak_memory(output_batch)
+            output_batch.is_oom = is_oom
+            self._record_output_memory_stats(output_batch)
             # clean cache if OOM
             if torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
@@ -469,11 +471,37 @@ class GPUWorker:
         )
         return np.asarray(frames)
 
-    def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
-        if self.rank != 0 or current_platform.is_cpu():
+    def _record_output_memory_stats(self, output_batch: OutputBatch) -> None:
+        if current_platform.is_cpu():
             return
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        device_module = torch.get_device_module()
+        peak_reserved_mb = float(device_module.max_memory_reserved()) / (1024**2)
+        peak_allocated_mb = float(device_module.max_memory_allocated()) / (1024**2)
+
+        # Avoid collectives on error paths; failed ranks may not reach this point.
+        if (
+            output_batch.error is None
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            device_type = (
+                "cuda"
+                if current_platform.is_cuda() or current_platform.is_rocm()
+                else current_platform.device_name.lower()
+            )
+            peaks = torch.tensor(
+                [peak_reserved_mb, peak_allocated_mb],
+                dtype=torch.float32,
+                device=f"{device_type}:{device_module.current_device()}",
+            )
+            torch.distributed.all_reduce(peaks, op=torch.distributed.ReduceOp.MAX)
+            peak_reserved_mb = float(peaks[0].item())
+            peak_allocated_mb = float(peaks[1].item())
+
+        if self.rank != 0:
+            return
+        output_batch.peak_memory_mb = peak_reserved_mb
+        output_batch.peak_allocated_memory_mb = peak_allocated_mb
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None
@@ -500,10 +528,15 @@ class GPUWorker:
             dynamic_output_paths = None
 
         if dynamic_output_paths is not None:
-            build_output_path = lambda idx: dynamic_output_paths[idx]
+
+            def build_output_path(idx):
+                return dynamic_output_paths[idx]
+
         else:
             num_outputs = len(output_batch.output)
-            build_output_path = lambda idx: req.output_file_path(num_outputs, idx)
+
+            def build_output_path(idx):
+                return req.output_file_path(num_outputs, idx)
 
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
@@ -642,7 +675,12 @@ class GPUWorker:
     ) -> None:
         if output_batch.error is not None and merged.error is None:
             merged.error = output_batch.error
+        merged.is_oom = merged.is_oom or output_batch.is_oom
         merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
+        merged.peak_allocated_memory_mb = max(
+            merged.peak_allocated_memory_mb,
+            output_batch.peak_allocated_memory_mb,
+        )
         if (
             merged.trajectory_timesteps is None
             and output_batch.trajectory_timesteps is not None

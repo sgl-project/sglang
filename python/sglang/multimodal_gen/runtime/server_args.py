@@ -251,6 +251,7 @@ class ServerArgs(DisaggArgsMixin):
     batching_max_size: int = 1
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
+    batching_memory_profile_cache: str | None = None
     enable_batching_metrics: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
@@ -1351,6 +1352,15 @@ class ServerArgs(DisaggArgsMixin):
                 "Optional JSON file with {'schema_version': 1, 'rules': [...]} "
                 "batching admission rules that can cap model/resolution shapes "
                 "below --batching-max-size."
+            ),
+        )
+        parser.add_argument(
+            "--batching-memory-profile-cache",
+            type=str,
+            default=ServerArgs.batching_memory_profile_cache,
+            help=(
+                "Path or directory for the diffusion batching memory profile cache. "
+                "Use 'none' to disable persistence."
             ),
         )
         parser.add_argument(
