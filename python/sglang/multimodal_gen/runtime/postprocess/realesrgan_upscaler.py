@@ -315,9 +315,7 @@ class UpscalerModel:
 
                 tile = img_t[..., in_y0:in_y1, in_x0:in_x1]
                 out_tile = self.net(tile)
-                out_tile = out_tile[
-                    ..., crop_y0:crop_y1, crop_x0:crop_x1
-                ].float()
+                out_tile = out_tile[..., crop_y0:crop_y1, crop_x0:crop_x1].float()
                 output[..., out_y0:out_y1, out_x0:out_x1].copy_(out_tile.cpu())
 
         return output
