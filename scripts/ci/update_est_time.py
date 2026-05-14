@@ -108,7 +108,9 @@ def update_files(model, dry_run=False):
 
 def is_significant(old, new):
     delta = abs(new - old)
-    return delta >= SIGNIFICANT_ABS_DELTA and delta / old >= SIGNIFICANT_REL_DELTA
+    return (
+        delta >= SIGNIFICANT_ABS_DELTA and delta / max(old, 1) >= SIGNIFICANT_REL_DELTA
+    )
 
 
 def write_summary(changes, summary_file):
@@ -128,7 +130,7 @@ def write_summary(changes, summary_file):
         for relpath, suite, old, new in sig:
             delta = new - old
             sign = "+" if delta > 0 else ""
-            pct = round(delta / old * 100)
+            pct = round(delta / max(old, 1) * 100)
             lines.append(
                 f"| `{Path(relpath).name}` | `{suite}` | "
                 f"{old} | {new} | {sign}{delta} ({sign}{pct}%) |"
