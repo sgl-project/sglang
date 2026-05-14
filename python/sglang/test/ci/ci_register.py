@@ -18,9 +18,9 @@ __all__ = [
 
 # Positional argument order. `suite` stays in slot 2 for backward compat with
 # `register_cpu_ci(1.0, "stage-a-test-cpu")` style positional calls. New
-# fields (`stage`, `runner`) are kwarg-only.
+# fields (`stage`, `runner_config`) are kwarg-only.
 _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
-_KWARG_ONLY = ("stage", "runner")
+_KWARG_ONLY = ("stage", "runner_config")
 _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
 
@@ -39,9 +39,9 @@ class CIRegistry:
     # Estimated time to run the test in seconds.
     est_time: float
     # New-style fields. Mutually exclusive with `suite` below.
-    #   stage="stage-b", runner="1-gpu-small"  →  effective_suite "stage-b-test-1-gpu-small"
+    #   stage="stage-b", runner_config="1-gpu-small" → effective_suite "stage-b-test-1-gpu-small"
     stage: Optional[str] = None
-    runner: Optional[str] = None
+    runner_config: Optional[str] = None
     # Legacy single-string suite name. Held for nightly suites + AMD/NPU
     # per-commit suites that haven't migrated yet.
     suite: Optional[str] = None
@@ -53,8 +53,8 @@ class CIRegistry:
     @property
     def effective_suite(self) -> str:
         """Single suite-name string, regardless of how the test was registered."""
-        if self.stage is not None and self.runner is not None:
-            return f"{self.stage}-test-{self.runner}"
+        if self.stage is not None and self.runner_config is not None:
+            return f"{self.stage}-test-{self.runner_config}"
         return self.suite
 
 
@@ -65,7 +65,7 @@ def register_cpu_ci(
     disabled: Optional[str] = None,
     *,
     stage: Optional[str] = None,
-    runner: Optional[str] = None,
+    runner_config: Optional[str] = None,
 ):
     """Marker for CPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -78,7 +78,7 @@ def register_cuda_ci(
     disabled: Optional[str] = None,
     *,
     stage: Optional[str] = None,
-    runner: Optional[str] = None,
+    runner_config: Optional[str] = None,
 ):
     """Marker for CUDA CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -91,7 +91,7 @@ def register_amd_ci(
     disabled: Optional[str] = None,
     *,
     stage: Optional[str] = None,
-    runner: Optional[str] = None,
+    runner_config: Optional[str] = None,
 ):
     """Marker for AMD CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -104,7 +104,7 @@ def register_npu_ci(
     disabled: Optional[str] = None,
     *,
     stage: Optional[str] = None,
-    runner: Optional[str] = None,
+    runner_config: Optional[str] = None,
 ):
     """Marker for NPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -167,20 +167,20 @@ class RegistryVisitor(ast.NodeVisitor):
                 f"{self.filename}: est_time is a required constant in {func_call.func.id}()"
             )
 
-        # Exactly one of (stage+runner) pair or `suite` must be specified.
-        has_pair = args["stage"] is not _UNSET and args["runner"] is not _UNSET
+        # Exactly one of (stage+runner_config) pair or `suite` must be specified.
+        has_pair = args["stage"] is not _UNSET and args["runner_config"] is not _UNSET
         has_suite = args["suite"] is not _UNSET
         if has_pair and has_suite:
             raise ValueError(
-                f"{self.filename}: cannot mix (stage, runner) and suite in {func_call.func.id}()"
+                f"{self.filename}: cannot mix (stage, runner_config) and suite in {func_call.func.id}()"
             )
         if not has_pair and not has_suite:
             raise ValueError(
-                f"{self.filename}: must specify either (stage, runner) or suite in {func_call.func.id}()"
+                f"{self.filename}: must specify either (stage, runner_config) or suite in {func_call.func.id}()"
             )
-        if (args["stage"] is _UNSET) != (args["runner"] is _UNSET):
+        if (args["stage"] is _UNSET) != (args["runner_config"] is _UNSET):
             raise ValueError(
-                f"{self.filename}: stage and runner must be set together in {func_call.func.id}()"
+                f"{self.filename}: stage and runner_config must be set together in {func_call.func.id}()"
             )
 
         est_time = args["est_time"]
@@ -196,8 +196,8 @@ class RegistryVisitor(ast.NodeVisitor):
             )
 
         stage = args["stage"] if has_pair else None
-        runner = args["runner"] if has_pair else None
-        for name, value in (("stage", stage), ("runner", runner)):
+        runner_config = args["runner_config"] if has_pair else None
+        for name, value in (("stage", stage), ("runner_config", runner_config)):
             if value is not None and not isinstance(value, str):
                 raise ValueError(
                     f"{self.filename}: {name} must be a string in {func_call.func.id}()"
@@ -222,7 +222,7 @@ class RegistryVisitor(ast.NodeVisitor):
         return {
             "est_time": float(est_time),
             "stage": stage,
-            "runner": runner,
+            "runner_config": runner_config,
             "suite": suite,
             "nightly": nightly,
             "disabled": disabled,

@@ -7,7 +7,7 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 register_cuda_ci(
     est_time=190,
     stage="stage-b",
-    runner="2-gpu-large",
+    runner_config="2-gpu-large",
 )
 
 NEMOTRON_3_NANO_THINKING_ARGS = [

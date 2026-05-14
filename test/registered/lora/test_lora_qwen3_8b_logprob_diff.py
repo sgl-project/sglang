@@ -40,7 +40,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(
     est_time=40,
     stage="stage-b",
-    runner="1-gpu-large",
+    runner_config="1-gpu-large",
 )
 
 BASE_MODEL = "Qwen/Qwen3-8B"

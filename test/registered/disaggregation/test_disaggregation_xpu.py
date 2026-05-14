@@ -27,7 +27,7 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 register_cuda_ci(
     est_time=300,
     stage="stage-a",
-    runner="1-gpu-small",
+    runner_config="1-gpu-small",
     disabled="Intel XPU only — not available in standard CUDA CI",
 )
 

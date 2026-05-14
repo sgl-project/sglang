@@ -9,7 +9,7 @@ from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 register_cuda_ci(
     est_time=200,
     stage="stage-b",
-    runner="1-gpu-small",
+    runner_config="1-gpu-small",
     disabled="Temporarily disabled",
 )
 

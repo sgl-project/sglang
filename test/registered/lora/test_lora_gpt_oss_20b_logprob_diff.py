@@ -37,7 +37,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(
     est_time=300,
     stage="stage-c",
-    runner="4-gpu-b200",
+    runner_config="4-gpu-b200",
 )
 
 BASE_MODEL = "lmsys/gpt-oss-20b-bf16"

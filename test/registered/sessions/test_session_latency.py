@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(
     est_time=122,
     stage="stage-b",
-    runner="1-gpu-large",
+    runner_config="1-gpu-large",
 )
 
 NUM_TURNS = 150

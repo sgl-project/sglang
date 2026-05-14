@@ -9,7 +9,7 @@ from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 register_cuda_ci(
     est_time=200,
     stage="stage-b",
-    runner="2-gpu-large",
+    runner_config="2-gpu-large",
 )
 
 MODEL = "mistralai/Mistral-Small-4-119B-2603"

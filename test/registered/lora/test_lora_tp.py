@@ -32,7 +32,7 @@ from sglang.test.test_utils import CustomTestCase, is_in_ci
 register_cuda_ci(
     est_time=190,
     stage="stage-c",
-    runner="8-gpu-h200",
+    runner_config="8-gpu-h200",
 )
 register_amd_ci(
     est_time=116,
