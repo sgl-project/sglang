@@ -1,65 +1,117 @@
-DS-off total GPU time:  1207.90 s   (125 unique kernels)
-DS-on  total GPU time:  2550.23 s   (42 unique kernels)
+NOTE: nsys cuda_gpu_kern_sum is per-stream kernel time, not wall-clock.
+      Use this for STRUCTURAL evidence (which kernels ran, how often).
+      Do not attribute wall-clock TBT differences to GPU-time deltas here.
+
+DS-off total GPU time:  1207.90 s   (143 unique kernels)
+DS-on  total GPU time:  2550.23 s   (67 unique kernels)
 DS-on  / DS-off total:     2.11x
 
-==============================================================================================================
+========================================================================================================================
 KERNELS EXCLUSIVE TO DS-ON (pure DS overhead — would not exist without DS)
-==============================================================================================================
-  Kernel                                                                     GPU time    % on    inst
-  _ds_k_label_write_kernel                                                  0.985 s     0.0%  326502
-  _ds_native_sparse_attn_stage2_kernel                                      0.471 s     0.0%   10240
-  _ds_native_score_kernel                                                   0.179 s     0.0%   10240
-  at                                                                        0.133 s     0.0%   40960
-  _ds_native_sparse_attn_stage3_kernel                                      0.055 s     0.0%   10240
-  _ds_native_build_selected_physical_kernel                                 0.055 s     0.0%   10240
-  ... ALL DS-only kernels                                                   1.877 s     0.1%
+========================================================================================================================
+  Kernel                                                                               GPU time    % on      inst
+  _ds_k_label_write_kernel                                                            0.985 s    0.04%    326502
+  _ds_native_sparse_attn_stage2_kernel                                                0.471 s    0.02%     10240
+  at::native::mbtopk::computeBlockDigitCounts                                         0.198 s    0.01%     40960
+  _ds_native_score_kernel                                                             0.179 s    0.01%     10240
+  at::native::mbtopk::computeDigitCumSum                                              0.133 s    0.01%     40960
+  at::native::mbtopk::gatherTopK                                                      0.103 s    0.00%     10240
+  at::native::mbtopk::computeBlockwiseWithinKCounts                                   0.101 s    0.00%     40960
+  at_cuda_detail::cub::detail::scan_by_key::DeviceScanByKeyKernel                     0.065 s    0.00%     20480
+  at::native::_scatter_gather_elementwise_kernel                                      0.060 s    0.00%     20480
+  _ds_native_sparse_attn_stage3_kernel                                                0.055 s    0.00%     10240
+  _ds_native_build_selected_physical_kernel                                           0.055 s    0.00%     10240
+  at::native::mbtopk::computeBlockwiseKthCounts                                       0.019 s    0.00%     10240
+  at_cuda_detail::cub::detail::scan_by_key::DeviceScanByKeyInitKernel                 0.015 s    0.00%     20480
+  at::native::mbtopk::fill                                                            0.007 s    0.00%     10240
+  ... ALL DS-only kernels                                                             2.446 s    0.10%
 
-==============================================================================================================
-SHARED KERNELS (run in both modes; expected to be nearly identical wall-clock)
-==============================================================================================================
-  Kernel                                               off time    on time   ratio off inst  on inst
-  void cutlass                                       1076.724 s   1154.294 s    1.07x   445037   316263
-  ncclDevKernel_AllReduce_Sum_bf16_RING_LL           23.531 s   495.103 s   21.04x    52808   633899
-  nvjet_sm90_tst_256x128_64x4_1x2_h_bz_coopA_TNT     11.947 s   388.976 s   32.56x    45440   314979
-  nvjet_sm90_tst_320x128_64x3_1x2_h_bz_coopB_TNT      6.590 s   343.198 s   52.08x    23680   944943
-  void                                               48.499 s   52.980 s    1.09x   717035  1012467
-  kernel_cutlass_kernel_flashinfernormkernelsfused    2.512 s   89.023 s   35.44x    21760   652996
-  kernel_cutlass_kernel_flashinfernormkernelsrmsno    6.241 s   11.597 s    1.86x      136     4085
-  void at                                             6.776 s   10.179 s    1.50x   570466   898576
-  void flash                                          1.447 s    1.207 s    0.83x   406008   316911
-  ncclDevKernel_AllGather_RING_LL                     1.205 s    0.265 s    0.22x     5184     4077
-  nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT             0.364 s    0.291 s    0.80x     5120     4013
-  write_req_to_token_pool_triton                      0.273 s    0.267 s    0.98x     3664     3957
-  nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT       0.265 s    0.211 s    0.79x     8320     6400
-  nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT              0.196 s    0.150 s    0.77x    16640    12800
-  nvjet_sm90_tst_64x16_64x16_2x1_v_bz_splitK_TNT      0.170 s    0.094 s    0.55x     5120     2560
-  nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT             0.123 s    0.062 s    0.51x    10240     5120
-  void cublasLt                                       0.135 s    0.046 s    0.34x    57600    21760
-  nvjet_sm90_tst_64x24_64x16_2x1_v_bz_splitK_TNT      0.129 s    0.047 s    0.37x     3840     1280
-  void at_cuda_detail                                 0.032 s    0.108 s    3.42x    26272    64286
-  nvjet_sm90_tst_64x32_64x16_4x1_v_bz_TNT             0.083 s    0.047 s    0.57x     2560     1280
-  ... ALL shared kernels                             1187.242 s   2548.146 s    2.15x
+========================================================================================================================
+SHARED KERNELS (run in both modes)
+========================================================================================================================
+  Kernel                                                                   off time    on time   ratio  off inst   on inst
+  cutlass::device_kernel:FlashAttnFwd                                    1076.724 s   1154.294 s    1.07x    445037    316263
+  ncclDevKernel_AllReduce_Sum_bf16_RING_LL                               23.531 s   495.103 s   21.04x     52808    633899
+  nvjet_sm90_tst_256x128_64x4_1x2_h_bz_coopA_TNT                         11.947 s   388.976 s   32.56x     45440    314979
+  nvjet_sm90_tst_320x128_64x3_1x2_h_bz_coopB_TNT                          6.590 s   343.198 s   52.08x     23680    944943
+  kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAdd    2.512 s   89.023 s   35.44x     21760    652996
+  ::all_reduce_two_shot_kernel                                           36.016 s   19.737 s    0.55x    103040     10304
+  ::all_reduce_one_shot_push_kernel                                       9.895 s   16.362 s    1.65x     16744     12880
+  kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel         6.241 s   11.597 s    1.86x       136      4085
+  ::act_and_mul_kernel                                                    0.690 s   12.410 s   17.98x     85760    326499
+  at::native::elementwise_kernel                                          6.175 s    6.679 s    1.08x    414890    319844
+  ::fused_rope_kernel                                                     0.287 s    3.184 s   11.08x     85760    326503
+  ::store_kvcache                                                         1.589 s    1.272 s    0.80x    415603    326503
+  flash::prepare_varlen_num_blocks_kernel                                 1.447 s    1.207 s    0.83x    406008    316911
+  at::native::vectorized_gather_kernel                                    0.008 s    2.272 s   289.64x       904    331115
+  ncclDevKernel_AllGather_RING_LL                                         1.205 s    0.265 s    0.22x      5184      4077
+  at::native::vectorized_elementwise_kernel                               0.355 s    0.330 s    0.93x    111184     36721
+  nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT                                 0.364 s    0.291 s    0.80x      5120      4013
+  write_req_to_token_pool_triton                                          0.273 s    0.267 s    0.98x      3664      3957
+  nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT                           0.265 s    0.211 s    0.79x      8320      6400
+  at::native::reduce_kernel                                               0.131 s    0.226 s    1.72x      4368     14901
+  nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT                                  0.196 s    0.150 s    0.77x     16640     12800
+  nvjet_sm90_tst_64x16_64x16_2x1_v_bz_splitK_TNT                          0.170 s    0.094 s    0.55x      5120      2560
+  nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT                                 0.123 s    0.062 s    0.51x     10240      5120
+  cublasLt::splitKreduce_kernel                                           0.135 s    0.046 s    0.34x     57600     21760
+  nvjet_sm90_tst_64x24_64x16_2x1_v_bz_splitK_TNT                          0.129 s    0.047 s    0.37x      3840      1280
+  at::native::unrolled_elementwise_kernel                                 0.056 s    0.088 s    1.57x     25840     41673
+  nvjet_sm90_tst_64x32_64x16_4x1_v_bz_TNT                                 0.083 s    0.047 s    0.57x      2560      1280
+  nvjet_sm90_tst_64x24_64x16_2x1_v_bz_TNT                                 0.092 s    0.032 s    0.35x      7680      2560
+  nvjet_sm90_tst_64x32_64x16_2x1_v_bz_TNT                                 0.092 s    0.033 s    0.36x      7680      2560
+  nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT                           0.070 s    0.053 s    0.77x      8320      6400
+  ... ALL shared kernels                                                 1187.392 s   2547.558 s    2.15x
 
-==============================================================================================================
-KERNELS EXCLUSIVE TO DS-OFF (likely just FA3 variants the sparse path doesn't trigger)
-==============================================================================================================
-  void flashinfer                                                           5.390 s     0.4%  150696
-  nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN                            3.907 s     0.3%   16640
-  nvjet_sm90_tst_192x128_64x5_1x2_h_bz_coopB_TNT                            1.788 s     0.1%    3840
-  nvjet_sm90_tst_176x128_64x5_1x2_h_bz_TNN                                  1.725 s     0.1%    5120
-  nvjet_sm90_tst_128x192_64x5_2x1_v_bz_coopB_TNN                            0.748 s     0.1%   12800
-  nvjet_sm90_tst_168x128_64x5_1x2_h_bz_TNN                                  0.599 s     0.0%    3840
-  nvjet_sm90_tst_192x192_64x4_1x2_h_bz_coopB_TNN                            0.542 s     0.0%    1280
-  nvjet_sm90_tst_144x128_64x6_1x2_h_bz_TNN                                  0.436 s     0.0%    3840
-  nvjet_sm90_tst_320x128_64x3_2x4_h_bz_coopB_TNT                            0.379 s     0.0%    2560
-  nvjet_sm90_tst_112x128_64x7_2x1_v_bz_TNN                                  0.284 s     0.0%    5120
+========================================================================================================================
+KERNELS EXCLUSIVE TO DS-OFF (FA3 variants the sparse path doesn't trigger)
+========================================================================================================================
+  Kernel                                                                               GPU time   % off      inst
+  flashinfer::norm::FusedAddRMSNormKernel                                             5.365 s    0.44%    149760
+  nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN                                      3.907 s    0.32%     16640
+  nvjet_sm90_tst_192x128_64x5_1x2_h_bz_coopB_TNT                                      1.788 s    0.15%      3840
+  nvjet_sm90_tst_176x128_64x5_1x2_h_bz_TNN                                            1.725 s    0.14%      5120
+  nvjet_sm90_tst_128x192_64x5_2x1_v_bz_coopB_TNN                                      0.748 s    0.06%     12800
+  nvjet_sm90_tst_168x128_64x5_1x2_h_bz_TNN                                            0.599 s    0.05%      3840
+  nvjet_sm90_tst_192x192_64x4_1x2_h_bz_coopB_TNN                                      0.542 s    0.04%      1280
+  nvjet_sm90_tst_144x128_64x6_1x2_h_bz_TNN                                            0.436 s    0.04%      3840
+  nvjet_sm90_tst_320x128_64x3_2x4_h_bz_coopB_TNT                                      0.379 s    0.03%      2560
+  nvjet_sm90_tst_112x128_64x7_2x1_v_bz_TNN                                            0.284 s    0.02%      5120
+  nvjet_sm90_tst_128x160_64x5_4x2_h_bz_TNT                                            0.258 s    0.02%      2560
+  nvjet_sm90_tst_256x128_64x4_2x1_v_bz_coopA_TNT                                      0.247 s    0.02%      5120
+  nvjet_sm90_tst_128x160_64x5_2x1_v_bz_TNT                                            0.225 s    0.02%      6400
+  nvjet_sm90_tst_256x128_64x4_1x4_h_bz_coopA_TNT                                      0.207 s    0.02%      2560
+  nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT                                            0.203 s    0.02%      3840
+  nvjet_sm90_tst_256x96_64x4_2x1_v_bz_coopA_TNT                                       0.164 s    0.01%      1280
+  nvjet_sm90_tst_168x128_64x5_2x1_v_bz_TNN                                            0.153 s    0.01%      2560
+  nvjet_sm90_tst_144x128_64x6_2x1_v_bz_TNN                                            0.132 s    0.01%      1280
+  nvjet_sm90_tst_320x128_64x3_4x2_h_bz_coopB_TNT                                      0.130 s    0.01%      1280
+  nvjet_sm90_tst_192x192_64x4_4x1_v_bz_coopB_TNN                                      0.126 s    0.01%      1280
+  nvjet_sm90_tst_448x64_64x3_1x2_h_bz_coopB_TNN                                       0.110 s    0.01%      1280
+  nvjet_sm90_tst_256x128_64x4_2x4_h_bz_coopA_TNT                                      0.103 s    0.01%      1280
+  nvjet_sm90_tst_128x64_64x8_2x4_h_bz_TNT                                             0.099 s    0.01%      3840
+  nvjet_sm90_tst_192x160_64x4_4x1_v_bz_coopB_TNT                                      0.098 s    0.01%      1280
+  nvjet_sm90_tst_128x224_64x4_4x2_h_bz_coopA_TNT                                      0.091 s    0.01%      1280
 
-==============================================================================================================
+========================================================================================================================
+torch.topk DECOMPOSITION (key selector hotspot)
+========================================================================================================================
+  at::native::mbtopk::computeBlockDigitCounts                                         0.198 s    0.01%     40960
+  at::native::mbtopk::computeDigitCumSum                                              0.133 s    0.01%     40960
+  at::native::mbtopk::gatherTopK                                                      0.103 s    0.00%     10240
+  at::native::mbtopk::computeBlockwiseWithinKCounts                                   0.101 s    0.00%     40960
+  at_cuda_detail::cub::detail::scan_by_key::DeviceScanByKeyKernel                     0.065 s    0.00%     20480
+  at::native::mbtopk::computeBlockwiseKthCounts                                       0.019 s    0.00%     10240
+  at_cuda_detail::cub::detail::scan_by_key::DeviceScanByKeyInitKernel                 0.015 s    0.00%     20480
+  at::native::mbtopk::fill                                                            0.007 s    0.00%     10240
+  topk-related total (DS-on)                                                          0.641 s    0.03% of DS-on GPU-time
+
+========================================================================================================================
 SUMMARY
-==============================================================================================================
+========================================================================================================================
   DS-off total GPU time:           1207.90 s
   DS-on  total GPU time:           2550.23 s
-  Shared workload (matmuls, FA3):  off=1187.24s, on=2548.15s  (delta=+1356251942872ns)
-  Pure DS overhead (DS-only):         1.88 s   (0.1% of DS-on GPU time)
-  Excess GPU time (DS-on - DS-off):1342.33 s
-  → DS-only kernels explain        0.1% of the GPU-time gap
+  Pure DS-only kernels:               2.45 s   (0.10% of DS-on GPU time)
+  torch.topk decomposition (on):      0.64 s   (0.03% of DS-on GPU time)
+
+Reminder: these are summed per-stream kernel times. Wall-clock TBT for
+this workload is reported in the bench-decode JSON, not here.

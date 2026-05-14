@@ -160,14 +160,42 @@ stay outside the repo at `/workspace/nsys_reports/`.
 |---|---:|---:|---:|
 | `_ds_k_label_write_kernel`                  | 0.985 s | 326,502 | 0.04% |
 | `_ds_native_sparse_attn_stage2_kernel`      | 0.471 s |  10,240 | 0.02% |
-| `_ds_native_score_kernel`                   | 0.179 s |  10,240 | 0.01% |
+| `_ds_native_score_kernel`                   | 0.179 s |  10,240 | <0.01% |
 | `_ds_native_sparse_attn_stage3_kernel`      | 0.055 s |  10,240 | <0.01% |
 | `_ds_native_build_selected_physical_kernel` | 0.055 s |  10,240 | <0.01% |
-| **DS-only kernels total**                   | **1.88 s** |  — | **0.1%** |
+| Native Triton subtotal                      | 1.745 s |  — | 0.07% |
 
 (Instances = 80 layers × 64 decode steps × 2 graph captures = 10,240
 per Triton kernel. K_label fires per-layer per-request through prefill
 and decode.)
+
+**`torch.topk` decomposes into 8 CUB / mbtopk kernels** (surfaced by
+re-running `compare_nsys.py` with namespace-preserving aggregation
+this session — previously hidden behind a `void at` bucket):
+
+| kernel | GPU time | instances |
+|---|---:|---:|
+| `at::native::mbtopk::computeBlockDigitCounts`         | 0.198 s | 40,960 |
+| `at::native::mbtopk::computeDigitCumSum`              | 0.133 s | 40,960 |
+| `at::native::mbtopk::gatherTopK`                      | 0.103 s | 10,240 |
+| `at::native::mbtopk::computeBlockwiseWithinKCounts`   | 0.101 s | 40,960 |
+| `at_cuda_detail::cub::detail::scan_by_key::DeviceScanByKeyKernel`     | 0.065 s | 20,480 |
+| `at::native::mbtopk::computeBlockwiseKthCounts`       | 0.019 s | 10,240 |
+| `at_cuda_detail::cub::detail::scan_by_key::DeviceScanByKeyInitKernel` | 0.015 s | 20,480 |
+| `at::native::mbtopk::fill`                            | 0.007 s | 10,240 |
+| **topk subtotal**                                     | **0.641 s** | — |
+
+This is the chief selector hotspot in DS-on by stream-time. The
+40,960-instance kernels run **4×** per (layer × step × capture) due
+to the radix-select digit passes — a structural target for the
+`flashinfer.top_k_page_table_transform` and `sgl_fast_topk_transform`
+selector-backend experiments queued for the next session. Replacing
+`torch.topk` with a backend that fuses selection into a single kernel
+launch should shave 80 launches × O(50 µs) of inter-op overhead per
+decode step.
+
+DS-only grand total (native + topk + a few scratch elementwise
+kernels): **2.45 s** = 0.10% of DS-on summed stream-time.
 
 **Legacy kernels absent**: `_ds_select_stage2_merge_kernel` (the prior-
 session 32K hotspot at 51.3%) and `_ds_select_stage1_block_topk_kernel`
@@ -180,6 +208,18 @@ extend, as designed.
 ≤ 0.16% on both legs — the visible-win gate (0.8999× without
 profiling) holds, and the kernel mix observed under nsys is
 representative of production.
+
+**Important attribution caveat**: `nsys cuda_gpu_kern_sum` totals
+stream-time per kernel, not wall-clock. The DS-on / DS-off summed-GPU
+ratio is 2.11× yet wall-clock TBT(on) / TBT(off) = 0.90× — these are
+not contradictory because (a) with TP=8 + multi-stream graph replay,
+summed stream-time can exceed wall-clock by the same factor and (b)
+DS-on issues additional small kernels per layer (act_and_mul, RoPE,
+RMSNorm) at higher invocation counts per the larger
+`max_running_requests`. Treat the diff as **structural** evidence —
+"the legacy stage-2 kernel did not run", "`torch.topk` decomposes
+into 8 CUB kernels" — and rely on bench-decode JSONs (TBT p50) for
+wall-clock gating.
 
 ## 5. What went wrong / what was learned
 
@@ -287,7 +327,7 @@ Bench harness:
 * **NEW** `benchmark/double_sparsity/run_70b_sweep.sh` — 64K/128K driver via `CTX=` env
 * **NEW** `benchmark/double_sparsity/repro_session/profile_native_decode.py` — per-phase synthetic
 * **NEW** `benchmark/double_sparsity/repro_session/microbench_sparse_attn.py` — flatness microbench
-* **NEW** `benchmark/double_sparsity/repro_session/run_nsys_at_winning_point.sh` — nsys runner (not yet executed at the winning point)
+* **NEW** `benchmark/double_sparsity/repro_session/run_nsys_at_winning_point.sh` — nsys runner; defaults now match the actual winning point (CONC=32 / OUTPUT_LEN=64 / TB=8192 / MAX_SELECTED=16384). Executed for `compare_c32.txt`; trivially repointable at conc=16 follow-on via env vars.
 * **NEW** `benchmark/double_sparsity/repro_session/run_70b_smoke_sweep.sh` — 16K validation driver
 
 Pensieve / docs / CI:
@@ -373,20 +413,29 @@ pytest test/registered/unit/mem_cache/sparsity/ -q   # → 120 passed
 ## 11. Open work
 
 ### Near-term (next session)
-1. **W1 refactor**: pack `ds_native_sparse_decode`'s 19 keyword params
-   into `NativeScratch` + `NativeKernelConfig` dataclasses (taste fix,
-   not correctness).
-2. **nsys at the winning point**: `run_nsys_at_winning_point.sh` is
-   wired but never executed at 128K/conc=32/tb=8192 — would
-   independently verify the kernel mix matches the synthetic profile.
-3. **Per-step `index_select` caching**: at decode the
-   `req_to_token[req_pool_indices]` index is recomputed per layer —
-   should be once per step, saving ~1–2 ms. (Was stashed, not in
-   production path.)
-4. **Inline Q_label gather into score kernel**: stashed
-   (`uncommitted-inline-qlabel-change`) after synthetic showed neutral
-   to slight regression. Worth a careful re-test now that the rest
-   of the pipeline has changed.
+1. **Move the win left to conc=16** (primary goal of the follow-on
+   session). Two levers compose: per-step `index_select` caching
+   (#3 below) and selector-backend replacement of `torch.topk`
+   (FlashInfer `top_k_page_table_transform` or a fused JIT kernel).
+   The conc=16 / tb=8192 point is TBT ratio 0.996× today (perf FAIL
+   despite quality PASS); conc=16 / tb≤2048 is the reverse. The
+   selector hotspot (~0.64 s of `at::native::mbtopk::*` +
+   `scan_by_key::DeviceScan*` in the nsys trace) is the cleanest
+   target.
+2. **W1 refactor**: pack `ds_native_sparse_decode`'s 19 keyword
+   params into `NativeScratch` + `NativeKernelConfig` dataclasses
+   (taste fix, not correctness).
+3. **Per-step `index_select` caching**: `req_to_token[req_pool_indices]`
+   is recomputed every layer; should be once per decode step via
+   `SparseCoordinator.forward_begin(forward_batch)` from
+   `ModelRunner.forward_decode`. ~1–2 ms saved at bs=16.
+4. **Retrieval-shaped calibration**: see Medium-term #5 — promoted to
+   near-term because it unlocks tb≤4096 quality, which is the only
+   way to land both gates at conc=16.
+5. **Inline Q_label gather into score kernel**: stashed
+   (`uncommitted-inline-qlabel-change`) after synthetic showed
+   neutral to slight regression. Worth a careful re-test now that
+   the rest of the pipeline has changed.
 
 ### Medium-term
 5. **Retrieval-shaped calibration**: wikitext-calibrated K_label

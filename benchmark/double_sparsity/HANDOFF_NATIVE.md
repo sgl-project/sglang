@@ -204,21 +204,59 @@ End-to-end CUDA-graph replay confirmed at 70B/TP=8/128K/conc=32/tb=8192
 `repro_session/sweep_70b_128k_tbt_win/nsys/`; full nsys-rep + sqlite
 live outside the repo at `/workspace/nsys_reports/`.
 
-### Native kernels — present in DS-on, absent from DS-off
+### DS-only kernels (present in DS-on, absent from DS-off)
+
+Native pipeline (Triton):
 
 | kernel | GPU time | instances | % of DS-on |
 |---|---:|---:|---:|
 | `_ds_k_label_write_kernel`              | 0.985 s | 326,502 | 0.04% |
 | `_ds_native_sparse_attn_stage2_kernel`  | 0.471 s |  10,240 | 0.02% |
-| `_ds_native_score_kernel`               | 0.179 s |  10,240 | 0.01% |
+| `_ds_native_score_kernel`               | 0.179 s |  10,240 | <0.01% |
 | `_ds_native_sparse_attn_stage3_kernel`  | 0.055 s |  10,240 | <0.01% |
 | `_ds_native_build_selected_physical_kernel` | 0.055 s | 10,240 | <0.01% |
-| **DS-only kernels total**               | **1.88 s** | — | **0.1%** of DS-on |
 
-All four ported kernels show up in the trace with the expected
-invocation count (`80 layers × 64 decode steps × 2 graph captures =
-10,240`). K_label write fires per request per layer
+`torch.topk` decomposition (CUB / multi-block topk — invoked from the
+orchestrator, but absent in DS-off because the dense path doesn't
+need top-k selection):
+
+| kernel | GPU time | instances |
+|---|---:|---:|
+| `at::native::mbtopk::computeBlockDigitCounts`             | 0.198 s | 40,960 |
+| `at::native::mbtopk::computeDigitCumSum`                  | 0.133 s | 40,960 |
+| `at::native::mbtopk::gatherTopK`                          | 0.103 s | 10,240 |
+| `at::native::mbtopk::computeBlockwiseWithinKCounts`       | 0.101 s | 40,960 |
+| `at_cuda_detail::cub::detail::scan_by_key::DeviceScanByKeyKernel` | 0.065 s | 20,480 |
+| `at::native::mbtopk::computeBlockwiseKthCounts`           | 0.019 s | 10,240 |
+| `at_cuda_detail::cub::detail::scan_by_key::DeviceScanByKeyInitKernel` | 0.015 s | 20,480 |
+| `at::native::mbtopk::fill`                                | 0.007 s | 10,240 |
+| **topk subtotal**                                         | **0.641 s** | — |
+
+Plus a smaller `at::native::_scatter_gather_elementwise_kernel`
+(0.060 s × 20,480) and a few build/score scratch elementwise ops.
+
+| | GPU time | % of DS-on |
+|---|---:|---:|
+| Native Triton kernels                                     | 1.745 s | 0.07% |
+| `torch.topk` decomposition                                | 0.641 s | 0.03% |
+| Misc DS-only elementwise                                  | 0.060 s | <0.01% |
+| **DS-only total (8 mbtopk + 2 scan_by_key + 5 native + misc)** | **2.45 s** | **0.10%** of DS-on |
+
+Invocation counts match expectation: `80 layers × 64 decode steps ×
+2 graph captures = 10,240` for the per-layer-per-step kernels, ×4
+for the `mbtopk` digit-pass kernels (radix select has 4 passes for
+fp32 keys). K_label write fires per request per layer
 (`32 reqs × 80 layers × ~127 timesteps`).
+
+### Attribution caveat
+
+`nsys cuda_gpu_kern_sum` totals **stream-time** per kernel, not
+wall-clock. With 8 GPUs and multiple CUDA streams under graph replay,
+summed GPU time across streams can exceed wall-clock even when the
+workload runs faster. Use this diff for **structural** evidence —
+"did kernel X run", "how does `torch.topk` decompose into N CUB
+kernels" — and rely on the bench-decode JSONs (TBT p50) for the
+wall-clock claim.
 
 ### Legacy kernels — absent from DS-on
 
@@ -262,16 +300,23 @@ and the per-step picture matches the headline measurement.
 
 ## 5. Open work
 
-1. **NIAH at token_budget=2048** — verify quality recovers; re-run TBT
-   gate at the new budget. If still failing, calibration corpus is the
-   next lever (wikitext is language-modeling; retrieval calibration
-   would teach the K_label scoring to attend to needles).
-2. **CUDA-graph capture is on, host-sync removed**; but per-step
-   `index_select` caching, q_label inline (synthetic neutral, stashed),
-   and a fused score+topk+build kernel are the remaining ~3-4 ms of
-   per-step Python+kernel-launch overhead the synthetic profile shows.
-3. **nsys diff at winning point** — `run_nsys_at_winning_point.sh`
-   wired but not yet executed at 128K/conc=16.
+1. **Move the win left to conc=16.** Headline lives at conc=32/tb=8192.
+   At conc=16/tb=8192 the TBT ratio is 0.996× (perf FAIL); at conc=16/
+   tb≤2048 perf passes but NIAH fails (wikitext-calibrated K_label
+   doesn't surface needles at narrow budgets). Two levers: (a)
+   selector overhead — `at::native::mbtopk::*` + scan_by_key kernels
+   sum to ~0.64 s in the nsys trace, a candidate target for a
+   FlashInfer `top_k_page_table_transform` or fused-JIT replacement;
+   (b) retrieval-shaped calibration to make tb=2048/4096 pass quality.
+2. **Per-step `req_to_token[req_pool_indices]` caching.** Currently
+   re-indexed in every layer; should be once per decode step. Plumb
+   through `SparseCoordinator.forward_begin(forward_batch)` invoked
+   from `ModelRunner.forward_decode`. ~1–2 ms expected at bs=16.
+3. **nsys at the conc=16 win.** The runner
+   (`run_nsys_at_winning_point.sh`) defaults to conc=32 today; rerun
+   with `CONC=16 TOKEN_BUDGET=2048` once a candidate conc=16 point
+   exists to confirm the captured graph really replays the lighter
+   selection pipeline.
 4. **Legacy v2 path** (stage-2 merge + union) is still present as
    fallback for `bs > scratch_max_bs`. Could be removed entirely once
    we accept native as canonical.
