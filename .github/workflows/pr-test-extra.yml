@@ -96,6 +96,7 @@ jobs:
       include_wheel_build: ${{ inputs.include_wheel_build == true }}
       run_all_tests: ${{ inputs.run_all_tests == true }}
       force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
+      pr_test_yml: '.github/workflows/pr-test-extra.yml'
     secrets: inherit
 
   # =============================================== sgl-kernel ====================================================

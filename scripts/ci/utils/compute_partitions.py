@@ -203,10 +203,7 @@ def main():
     parser.add_argument(
         "--pr-test-yml",
         nargs="+",
-        default=[
-            os.path.join(REPO_ROOT, ".github", "workflows", "pr-test.yml"),
-            os.path.join(REPO_ROOT, ".github", "workflows", "pr-test-extra.yml"),
-        ],
+        default=[os.path.join(REPO_ROOT, ".github", "workflows", "pr-test.yml")],
         help="Path(s) to pr-test*.yml; per-stage `run_timeout_minutes` is read from each.",
     )
     args = parser.parse_args()
