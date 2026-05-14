@@ -65,6 +65,9 @@ class ForwardMetadata:
     actual_seq_lengths_q: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
 
+    # swa attention mask for graph mode decode
+    swa_mask: Optional[torch.Tensor] = None
+
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
@@ -310,6 +313,7 @@ class AscendAttnBackend(AttentionBackend):
             self.full_to_swa_index_mapping = (
                 model_runner.token_to_kv_pool.full_to_swa_index_mapping
             )
+            self.sliding_window_size = model_runner.sliding_window_size
 
         # head num padding
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -597,6 +601,19 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
+            # SWA mask: True = masked out (don't attend), False = attend.
+            # Pre-allocated at max size, sliced per batch size during capture,
+            # content updated via copy_() during replay.
+            self.graph_metadata["swa_mask"] = torch.ones(
+                (max_bs, 1, total_context_len),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            # Pre-allocated index buffer for mask generation during replay,
+            # avoids torch.arange allocation on every replay step.
+            self.graph_metadata["swa_indices"] = torch.arange(
+                total_context_len, device=self.device, dtype=torch.int32
+            )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -627,6 +644,7 @@ class AscendAttnBackend(AttentionBackend):
 
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
+            metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
         if (
@@ -722,6 +740,20 @@ class AscendAttnBackend(AttentionBackend):
             )
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
             metadata.block_tables_swa[bs:, :].fill_(0)
+
+            # Update SWA mask: True = masked out (don't attend), False = attend
+            seq_lens_int = seq_lens_cpu[:bs].int()
+            starts = torch.clamp(
+                seq_lens_int - self.sliding_window_size, min=0
+            )
+            indices = self.graph_metadata["swa_indices"]
+            start_exp = starts.unsqueeze(1).to(self.device)
+            seq_exp = seq_lens_int.unsqueeze(1).to(self.device)
+            mask = (indices.unsqueeze(0) < start_exp) | (
+                indices.unsqueeze(0) >= seq_exp
+            )
+            metadata.swa_mask[:bs, 0, :].copy_(mask)
+            metadata.swa_mask[bs:, :, :].fill_(True)
         metadata.block_tables[:bs, :max_seq_pages].copy_(
             self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
             // self.page_size
@@ -1949,6 +1981,7 @@ class AscendAttnBackend(AttentionBackend):
                 paged_block_tables = self.forward_metadata.block_tables_swa
                 paged_seq_lens_cpu_int = self.forward_metadata.seq_lens_cpu_int
                 paged_seq_lens_cpu_list = self.forward_metadata.seq_lens_cpu_list
+                paged_attn_mask = self.forward_metadata.swa_mask
             else:
                 (
                     paged_block_tables,
@@ -1956,6 +1989,7 @@ class AscendAttnBackend(AttentionBackend):
                     paged_seq_lens_cpu_int,
                     paged_seq_lens_cpu_list,
                 ) = self._get_paged_attention_inputs(layer, forward_batch)
+                paged_attn_mask = None
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                 layer.layer_id
             ).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
@@ -1981,6 +2015,8 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
+                atten_mask=paged_attn_mask,
+                sparse_mode=0,
             )
             output = torch.empty(
                 (num_tokens, 1, layer.tp_q_head_num * layer.v_head_dim),
@@ -1999,6 +2035,8 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
+                atten_mask=paged_attn_mask,
+                sparse_mode=0,
                 workspace=workspace,
                 out=[output, softmax_lse],
             )
