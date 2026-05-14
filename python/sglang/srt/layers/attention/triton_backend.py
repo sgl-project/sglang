@@ -1028,6 +1028,7 @@ class TritonAttnBackend(AttentionBackend):
         Both prefix and extend KV are accessed through unified kv_indices.
         """
         bs = forward_batch.batch_size
+        cache_loc_swa = forward_batch.out_cache_loc_swa
 
         # Determine sliding window settings
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
