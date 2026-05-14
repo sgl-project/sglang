@@ -45,9 +45,6 @@ Usage Example:
 """
 
 from sglang.srt.mem_cache.fuzzy_match.config import FuzzyMatchConfig
-from sglang.srt.mem_cache.fuzzy_match.donor_injection import (
-    inject_donor_match_block_kv,
-)
 from sglang.srt.mem_cache.fuzzy_match.fuzzy_match_provider import (
     FuzzyMatchProvider,
     FuzzyMatchResult,
@@ -75,5 +72,4 @@ __all__ = [
     "as_long_tensor",
     "copy_kv_with_rope_correction",
     "create_fuzzy_match_provider",
-    "inject_donor_match_block_kv",
 ]

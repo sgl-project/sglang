@@ -107,26 +107,6 @@ class FuzzyMatchConfig:
     # realization path.
     discovery_only: bool = False
 
-    # ----------------------------------------------------------------
-    # match_block discovery tuning (SemanticEmbeddingProvider only)
-    # ----------------------------------------------------------------
-    # See semblend.integration.sglang.config for full semantics. These
-    # control the substring-based contiguous-run finder that surfaces
-    # a single FuzzyMatchBlock to the model_runner's two-pass extend.
-
-    # Minimum block length (tokens) below which a discovered block is
-    # dropped. Shorter blocks don't beat the two-pass orchestration
-    # overhead.
-    fuzzy_match_block_min_length: int = 4
-
-    # Upper bound on the n-gram anchor size for the substring donor
-    # index. Clamped to the shorter of donor / target token length.
-    fuzzy_match_block_max_anchor: int = 8
-
-    # Per-anchor candidate cap; protects against pathological repetition
-    # in templated / structured inputs.
-    fuzzy_match_block_max_candidates_per_anchor: int = 256
-
     def __post_init__(self):
         """Validate configuration values."""
         if self.fuzzy_min_match_length < 1:
@@ -192,13 +172,4 @@ class FuzzyMatchConfig:
                 server_args, 'quality_gate_ppl_threshold', 1.065,
             ),
             discovery_only=getattr(server_args, 'fuzzy_discovery_only', False),
-            fuzzy_match_block_min_length=getattr(
-                server_args, 'fuzzy_match_block_min_length', 4,
-            ),
-            fuzzy_match_block_max_anchor=getattr(
-                server_args, 'fuzzy_match_block_max_anchor', 8,
-            ),
-            fuzzy_match_block_max_candidates_per_anchor=getattr(
-                server_args, 'fuzzy_match_block_max_candidates_per_anchor', 256,
-            ),
         )

@@ -445,16 +445,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Optional per-layer recomputation mask; element ``i`` True means layer
     # ``i`` recomputes the matched tokens instead of reusing donor KV.
     fuzzy_layer_recompute_mask: Optional[list] = None
-    # Per-request non-prefix-anchored fuzzy match blocks (semantic
-    # provider extension to Chenxin's |exact|fuzzy|miss| decomposition).
-    # List of FuzzyMatchBlock or None, in the same order as ``reqs``.
-    # When at least one entry is non-None, ``forward_extend`` switches
-    # to a two-pass schedule: pass 1 covers per-request lead-in tokens
-    # [exact..target_start-1]; the donor block is placed via reverse+apply
-    # RoPE at [target_start..target_start+L-1]; pass 2 covers per-request
-    # trailing tokens [target_start+L..seq_len-1] and produces the
-    # sampling logits.
-    fuzzy_match_blocks: Optional[list] = None
     # Reference to req objects (for fuzzy realization flag propagation)
     reqs: Optional[list] = None
 
@@ -528,27 +518,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ret.fuzzy_layer_recompute_mask = getattr(
                         fuzzy_match_result, 'layer_recompute_mask', None,
                     )
-
-            # Collect per-request non-prefix-anchored match_block info.
-            # A request has a match_block iff its provider returned one
-            # AND it survived the match-prefix path (realized_locs
-            # allocated, donor lock acquired). Non-fuzzy requests
-            # contribute None at their batch slot so the two-pass
-            # orchestration can index by batch position.
-            any_match_block = False
-            blocks_per_req = []
-            for req in batch.reqs:
-                fmr = getattr(req, 'fuzzy_match_result', None)
-                block = getattr(fmr, 'match_block', None) if fmr is not None else None
-                # Only honor the block if realized_locs was successfully
-                # allocated (radix_cache_fuzzy_match_block sets both together
-                # or neither).
-                if block is not None and getattr(req, 'fuzzy_realized_locs', None) is None:
-                    block = None
-                blocks_per_req.append(block)
-                if block is not None:
-                    any_match_block = True
-            ret.fuzzy_match_blocks = blocks_per_req if any_match_block else None
 
 
         if batch.extend_input_logprob_token_ids is not None:

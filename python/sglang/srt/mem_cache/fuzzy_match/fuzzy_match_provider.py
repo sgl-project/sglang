@@ -88,61 +88,6 @@ class FuzzyMatchSegment:
 
 
 @dataclass
-class FuzzyMatchBlock:
-    """A single contiguous span of donor KV reuse at a non-prefix target
-    position.
-
-    Chenxin's draft (``Draft_Prefix_Matching.md`` § 2.1) decomposes a
-    prompt into three contiguous regions::
-
-        | exact_matched_len | fuzzy_matched_len | miss_len |
-
-    The fuzzy region is contiguous with the exact prefix; the model
-    executor relocates the donor's KV at ``cached_start_pos`` to
-    recipient positions ``[exact_matched_len .. exact_matched_len + L - 1]``
-    via RoPE correction. This shape is sufficient for ``TokenBlockMatch``
-    where a token-equal sub-segment of the cached sequence is matched
-    starting at ``exact_matched_len`` in the recipient.
-
-    ``FuzzyMatchBlock`` is an additive extension for semantic providers
-    where the cached region sits at an absolute target position OTHER
-    than ``exact_matched_len`` -- typical of paraphrased instructions
-    over a shared context, where the divergent prefix forces a lead-in.
-    When the field is set on ``FuzzyMatchResult``, the model executor
-    runs a two-pass forward_extend: cold-prefill the lead-in tokens
-    before the block, place the donor KV at the block's positions via
-    reverse+apply RoPE, then cold-prefill the trailing tokens that
-    produce the sampling logits.
-
-    ``TokenBlockMatchProvider`` never sets this field; legacy behavior is
-    unchanged when it is ``None``.
-
-    Attributes:
-        target_start_in_prompt: Absolute position in the recipient's
-            full prompt where the reused block begins.
-        length: Number of tokens covered by the block.
-        donor_start: Absolute position in the donor's prompt where the
-            corresponding KV was originally computed; the source
-            position for reverse-RoPE so each token's K vector can be
-            rotated to its new logical position in the recipient.
-        donor_kv_indices: KV-pool slot indices, one per block position,
-            referring to the donor's stored K,V at
-            ``[donor_start .. donor_start + length - 1]``.
-
-    Invariants:
-        ``len(donor_kv_indices) == length``.
-        ``target_start_in_prompt + length < seq_len`` (the trailing
-        extend needs at least one token so the model produces sampling
-        logits for the recipient's last position).
-    """
-
-    target_start_in_prompt: int
-    length: int
-    donor_start: int
-    donor_kv_indices: torch.Tensor
-
-
-@dataclass
 class QualitySignals:
     """Provider-visible quality signals attached to a fuzzy match.
 
@@ -213,20 +158,6 @@ class FuzzyMatchResult:
     # "pool memory leak detected!" assertion to fire (~19k slots leaked per
     # ~50-75 fuzzy-mode requests on Qwen-1.5B / A10G).
     donor_last_node_id: Optional[int] = None
-    # Optional extension to Chenxin's |exact|fuzzy|miss| decomposition
-    # for semantic providers whose match isn't prefix-anchored. When set,
-    # ``model_runner.forward_extend`` switches to a two-pass schedule:
-    #   pass 1: standard extend on [exact_matched_len .. target_start - 1]
-    #           (lead-in tokens that diverge between donor and recipient,
-    #           e.g. a paraphrased instruction prefix)
-    #   then  : place donor KV at [target_start .. target_start + L - 1]
-    #           via reverse+apply RoPE (shift = donor_start - target_start)
-    #   pass 2: standard extend on [target_start + L .. seq_len - 1]
-    #           (trailing tokens; produces the sampling logits)
-    # ``segments`` and ``match_block`` are mutually exclusive: providers
-    # surfacing a match_block set ``segments = None``. ``TokenBlockMatch``
-    # never sets this field.
-    match_block: Optional[FuzzyMatchBlock] = None
     # Free-form provider-private payload (avoid name collisions with future fields).
     _match_entry: Any = None
 

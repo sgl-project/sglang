@@ -2972,24 +2972,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Tuple[
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
     ]:
-        # Delegate the non-prefix-anchored fuzzy match path to its own
-        # module (see mem_cache/fuzzy_match/two_pass_runner.py). Keeps the
-        # model executor's forward path free of fuzzy-match-specific
-        # branching; reviewers who don't care about fuzzy match can skip
-        # that module entirely. v1 is single-block, batch_size==1.
-        if (
-            forward_batch.fuzzy_match_blocks is not None
-            and forward_batch.batch_size == 1
-            and forward_batch.fuzzy_match_blocks[0] is not None
-        ):
-            from sglang.srt.mem_cache.fuzzy_match.two_pass_runner import (
-                run_two_pass_extend,
-            )
-
-            return run_two_pass_extend(
-                self, forward_batch, skip_attn_backend_init, pp_proxy_tensors
-            )
-
         # Correct RoPE on fuzzy-matched K values by allocating new pool slots
         self._correct_fuzzy_kv_rope(forward_batch)
 
