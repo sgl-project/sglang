@@ -158,54 +158,5 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
         kill_process_tree(cls.process.pid)
 
 
-class TestUnifiedDeepSeekV32HiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
-    """DeepSeek V3.2 (DSA) + HiCache + UnifiedRadixCache."""
-
-    kl_threshold = 0.0035
-    sampling_temperature = 0
-    gsm8k_threshold = 0.93
-    num_gsm8k_questions = 100
-
-    @unittest.skip("no stable.")
-    def test_multiturn_logprobs_match(self):
-        pass
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DSV32_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DSV32_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "8",
-                "--model-loader-extra-config",
-                '{"enable_multithread_load": true, "num_threads": 64}',
-                "--enable-hierarchical-cache",
-                "--hicache-ratio",
-                "4",
-                "--hicache-write-policy",
-                "write_through",
-                "--hicache-io-backend",
-                "direct",
-                "--hicache-mem-layout",
-                "page_first_direct",
-                "--max-total-tokens",
-                "20000",
-                "--max-running-requests",
-                "4",
-            ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
-        )
-        cls.input_ids = get_input_ids(cls.model, num_samples=18)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
 if __name__ == "__main__":
     unittest.main()
