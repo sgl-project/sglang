@@ -1,0 +1,69 @@
+name: Setup CUDA Test Stage
+description: >-
+  Boilerplate run at the start of every CUDA test stage in pr-test.yml:
+  checkout the PR ref, run the stage-health and maintenance gates, download
+  the sgl-kernel wheel artifact (when the PR has kernel changes), and install
+  the CUDA dependencies. Install script is selected from `runner_config` by
+  scripts/ci/runner_configs.py (single source of truth shared with CIRegistry
+  validation).
+inputs:
+  runner_config:
+    description: >-
+      The runner-config string declared by register_cuda_ci(stage=..., runner_config=...).
+      Drives the install-script lookup.
+    required: true
+  sgl_kernel:
+    description: 'check-changes.outputs.sgl_kernel value ("true" or "false").'
+    required: true
+  download_artifact_version:
+    description: 'actions/download-artifact major version. "v4" by default; "v6" for B200 stages.'
+    default: 'v4'
+  install_timeout_minutes:
+    description: >-
+      Wall-clock cap (in minutes) for the install step. Composite-action
+      steps cannot use timeout-minutes natively; enforced via bash `timeout`.
+      On timeout, the underlying script receives SIGTERM (then SIGKILL after
+      a short grace period), the same signal pair GitHub Actions uses for
+      its native step timeout.
+    default: '20'
+  pr_head_sha:
+    description: 'PR head SHA to check out (forwarded from caller workflow inputs).'
+    default: ''
+  git_ref:
+    description: 'Git ref to check out (forwarded from caller workflow inputs).'
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+    - uses: ./.github/actions/check-stage-health
+
+    - uses: ./.github/actions/check-maintenance
+
+    - name: Download artifacts (v4)
+      if: ${{ inputs.sgl_kernel == 'true' && inputs.download_artifact_version == 'v4' }}
+      uses: actions/download-artifact@v4
+      with:
+        path: sgl-kernel/dist/
+        merge-multiple: true
+        pattern: wheel-python3.10-cuda*
+
+    - name: Download artifacts (v6)
+      if: ${{ inputs.sgl_kernel == 'true' && inputs.download_artifact_version == 'v6' }}
+      uses: actions/download-artifact@v6
+      with:
+        path: sgl-kernel/dist/
+        merge-multiple: true
+        pattern: wheel-python3.10-cuda*
+
+    - name: Install dependencies
+      shell: bash
+      env:
+        CUSTOM_BUILD_SGL_KERNEL: ${{ inputs.sgl_kernel }}
+      run: |
+        INSTALL_SCRIPT=$(python3 scripts/ci/runner_configs.py install --runner-config '${{ inputs.runner_config }}')
+        timeout ${{ inputs.install_timeout_minutes }}m bash "$INSTALL_SCRIPT"
