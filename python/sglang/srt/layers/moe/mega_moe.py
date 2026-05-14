@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -24,6 +25,7 @@ from sglang.jit_kernel.deepseek_v4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
 if TYPE_CHECKING:
@@ -34,6 +36,26 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_MEGA_MOE_DG_ENV_APPLIED = False
+
+
+def _apply_mega_moe_dg_env() -> None:
+    """Forward sglang's FP4/MXF4 opt-in flags to DeepGEMM via env vars.
+
+    DeepGEMM reads `DG_USE_FP4_ACTS` (and `DG_USE_MXF4_KIND`) at host-function
+    call time — both `get_symm_buffer_for_mega_moe` and `fp8_fp4_mega_moe`.
+    Forwarding once at first use is sufficient (these are static config
+    flags, not per-request state) and matches the `setdefault` pattern so
+    explicit `DG_USE_*` overrides from outside still win.
+    """
+    global _MEGA_MOE_DG_ENV_APPLIED
+    if _MEGA_MOE_DG_ENV_APPLIED:
+        return
+    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
+        os.environ.setdefault("DG_USE_FP4_ACTS", "1")
+    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get():
+        os.environ.setdefault("DG_USE_MXF4_KIND", "1")
+    _MEGA_MOE_DG_ENV_APPLIED = True
 
 
 def _get_mega_moe_symm_buffer(
@@ -45,6 +67,8 @@ def _get_mega_moe_symm_buffer(
     intermediate_hidden: int,
 ) -> SymmBuffer:
     import deep_gemm
+
+    _apply_mega_moe_dg_env()
 
     key = (
         id(group),
@@ -71,7 +95,7 @@ def _get_mega_moe_symm_buffer(
 
 
 def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bool:
-    if not envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
+    if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
@@ -188,16 +212,35 @@ def _run_mega_routed(
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
-    mega_moe_pre_dispatch(
-        hidden_states,
-        topk_ids_in,
-        topk_weights_in,
-        buf.x,
-        buf.x_sf,
-        buf.topk_idx,
-        buf.topk_weights,
-        quant_group_size=32,
-    )
+
+    use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
+    if use_fp4_acts:
+        # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
+        # handles the E2M1 packing variant. The jit implementation
+        # only emits FP8.
+        deep_gemm.mega_moe_pre_dispatch(
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            num_tokens=num_tokens,
+            group_size=32,
+            use_fp4_acts=True,
+        )
+    else:
+        mega_moe_pre_dispatch(
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            quant_group_size=32,
+        )
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
