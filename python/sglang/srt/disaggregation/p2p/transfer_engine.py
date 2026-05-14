@@ -1,4 +1,5 @@
 import sys
+import time
 import logging
 from typing import List, Any
 import cuda_p2p_transfer

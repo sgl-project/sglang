@@ -20,8 +20,9 @@ enum ErrorCode {
 do { \
     cudaError_t err = (call); \
     if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA Error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(1); \
+        throw std::runtime_error( \
+            std::string("CUDA Error ") + __FILE__ + ":" + std::to_string(__LINE__) + \
+            ": " + cudaGetErrorString(err)); \
     } \
 } while(0)
 
