@@ -80,22 +80,17 @@ class OmniModelPolicy:
             )
         )
 
-    def decode_next_segment(self, *, session: OmniModelSessionView) -> OmniDecodeResult:
-        """decode the next interleaved boundary: text, image marker, or done"""
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not support segment decode"
-        )
-
     def decode_next_segment_with_runtime(
         self,
         *,
         runtime: OmniSessionRuntime,
         session: OmniModelSessionView,
         stream_sink: Any | None = None,
-    ) -> OmniDecodeResult | None:
-        """decode until a new segment is generated
-        override boundary decode when the model needs live SRT runtime access"""
-        return None
+    ) -> OmniDecodeResult:
+        """decode with live runtime access until the next text/media boundary"""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support segment decode"
+        )
 
     def decode_vlm_text(
         self,

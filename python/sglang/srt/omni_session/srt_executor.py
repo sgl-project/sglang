@@ -16,8 +16,8 @@ from sglang.srt.omni_session.runtime_types import OmniSRTKVTokenBinding
 
 if TYPE_CHECKING:
     from sglang.omni.runtime.srt_scheduler_state import OmniSchedulerExclusiveLease
-    from sglang.srt.managers.io_struct import OpenSessionReqInput, OpenSessionReqOutput
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.managers.io_struct import OpenSessionReqInput, OpenSessionReqOutput
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -443,8 +443,7 @@ class OmniSRTSchedulerExecutor:
             return self._run_scheduler_thread_call(
                 callback=run_forward,
                 description=(
-                    "run temporary omni context forward "
-                    f"{prepared.srt_session_id}"
+                    "run temporary omni context forward " f"{prepared.srt_session_id}"
                 ),
             )
         finally:

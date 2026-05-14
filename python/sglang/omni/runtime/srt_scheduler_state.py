@@ -26,8 +26,7 @@ if TYPE_CHECKING:
         OmniGenerateReqOutput,
         OmniGenerateStreamOutput,
     )
-    from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.omni_session.runtime import (
         OmniSessionRecord as SRTOmniSessionRecord,
@@ -345,10 +344,10 @@ class OmniSchedulerState:
     def _run_omni_generate_task(
         self, scheduler: "Scheduler", recv_req: "OmniGenerateReqInput"
     ) -> None:
+        from sglang.omni.entrypoints.streaming import OmniStreamSink
         from sglang.omni.runtime.srt_transport import (
             handle_omni_generate_with_omni_coordinator,
         )
-        from sglang.omni.entrypoints.streaming import OmniStreamSink
         from sglang.srt.managers.io_struct import (
             OmniGenerateReqOutput,
             OmniGenerateStreamOutput,

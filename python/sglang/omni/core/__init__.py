@@ -5,4 +5,3 @@
 objects, interleaved AR/media boundaries, and the coordinator loop. It must not
 own SRT scheduler state, HTTP transport details, or model-specific token grammar.
 """
-

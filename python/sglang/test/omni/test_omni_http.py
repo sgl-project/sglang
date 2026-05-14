@@ -6,13 +6,13 @@ import unittest
 from fastapi.testclient import TestClient
 
 from sglang.omni.core.coordinator import OmniCoordinator
-from sglang.omni.entrypoints.http_server import create_app
 from sglang.omni.core.protocol import (
     GeneratedSegment,
     OmniBoundary,
     OmniContextBundle,
     OmniContextRef,
 )
+from sglang.omni.entrypoints.http_server import create_app
 
 
 class _ScriptedARBackend:

@@ -10,12 +10,12 @@ import torch
 
 from sglang.omni.core.protocol import TemporaryForwardPrepared
 from sglang.omni.runtime.srt_scheduler_state import OmniSchedulerState
+from sglang.srt.managers.schedule_batch import (
+    _normalize_custom_position_ids_for_batch,
+)
 from sglang.srt.omni_session.srt_executor import (
     OmniSRTSchedulerExecutor,
     OmniSRTSchedulerExecutorError,
-)
-from sglang.srt.managers.schedule_batch import (
-    _normalize_custom_position_ids_for_batch,
 )
 
 
@@ -104,9 +104,7 @@ def test_request_token_indices_for_active_req_reads_tree_cache_session_slot():
 
 
 def test_custom_position_ids_promote_text_positions_for_mrope_batching():
-    positions = _normalize_custom_position_ids_for_batch(
-        [0, [1, 0, 0], 2, [3, 4, 5]]
-    )
+    positions = _normalize_custom_position_ids_for_batch([0, [1, 0, 0], 2, [3, 4, 5]])
 
     assert positions == [[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 4, 5]]
 
@@ -182,8 +180,7 @@ def test_temporary_context_forward_runs_on_scheduler_thread_and_releases():
             forward=lambda forward_batch: forward_batch,
         )
         _wait_until(
-            lambda: not scheduler.omni_scheduler_state
-            .pending_scheduler_thread_calls.empty()
+            lambda: not scheduler.omni_scheduler_state.pending_scheduler_thread_calls.empty()
         )
 
         scheduler.omni_scheduler_state.drain_scheduler_thread_calls()
@@ -191,8 +188,7 @@ def test_temporary_context_forward_runs_on_scheduler_thread_and_releases():
         assert future.result(timeout=1) == "temporary-batch"
 
     assert (
-        executor.build_thread_id
-        == scheduler.omni_scheduler_state.scheduler_thread_id
+        executor.build_thread_id == scheduler.omni_scheduler_state.scheduler_thread_id
     )
     assert executor.received_scheduler_exclusive_lease is not None
     assert scheduler.omni_scheduler_state.exclusive_active == 0

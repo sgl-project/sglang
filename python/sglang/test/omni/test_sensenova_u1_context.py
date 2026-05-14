@@ -13,11 +13,10 @@ from sglang.omni.core.interleaved import (
     INTERLEAVED_BOUNDARY_TOKEN_ID_KEY,
     INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
 )
-from sglang.omni.model_adapters.sensenova_u1.session_adapter import U1OmniSessionModelPolicy
 from sglang.omni.model_adapters.sensenova_u1.context import (
+    U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
     U1_SPECIAL_TOKENS,
     U1SpecialTokens,
-    U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
     build_u1_interleave_prompt,
     build_u1_native_edit_img_condition_prepared_input,
     build_u1_native_edit_prepared_input,
@@ -29,6 +28,9 @@ from sglang.omni.model_adapters.sensenova_u1.context import (
     build_u1_t2i_prompt,
     build_u1_vlm_prompt,
     load_u1_native_image,
+)
+from sglang.omni.model_adapters.sensenova_u1.session_adapter import (
+    U1OmniSessionModelPolicy,
 )
 from sglang.srt.omni_session.runtime import (
     OmniInterleavedMessage,
@@ -54,9 +56,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
         prompt = build_u1_interleave_prompt(prompt="draw a cube")
 
         self.assertTrue(
-            prompt.startswith(
-                "<|im_start|>system\nYou are a multimodal assistant"
-            )
+            prompt.startswith("<|im_start|>system\nYou are a multimodal assistant")
         )
 
     def test_u1_special_tokens_are_model_local_contract(self):
@@ -75,7 +75,9 @@ class TestSenseNovaU1Context(unittest.TestCase):
     def test_interleave_non_think_mode_injects_official_empty_think_stub(self):
         prompt = build_u1_interleave_prompt(prompt="hi", think_mode=False)
 
-        self.assertTrue(prompt.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"))
+        self.assertTrue(
+            prompt.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        )
 
     def test_t2i_think_mode_matches_official_open_think_prefix(self):
         prompt = build_u1_t2i_prompt(prompt="draw a cube", think_mode=True)
@@ -166,9 +168,7 @@ class TestSenseNovaU1Context(unittest.TestCase):
 
         self.assertTrue(prepared.policy_metadata["u1"]["think_mode"])
         self.assertTrue(
-            prepared.policy_metadata["omni_model_state_updates"]["u1"][
-                "t2i_think_mode"
-            ]
+            prepared.policy_metadata["omni_model_state_updates"]["u1"]["t2i_think_mode"]
         )
 
     def test_edit_prepared_input_records_think_mode_without_open_image_marker(self):
@@ -439,7 +439,7 @@ class _DecodeRuntime:
         self.committed_tokens = []
         self.model_state_updates = []
 
-    def decode_one_step(
+    def decode(
         self,
         session,
         *,
@@ -488,7 +488,7 @@ class _NativeThinkRuntime:
     def get_model_state(self, session, *, namespace):
         return {"t2i_think_mode": True}
 
-    def decode_one_step(
+    def decode(
         self,
         session,
         *,

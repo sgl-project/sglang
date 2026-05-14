@@ -722,9 +722,13 @@ class NEOQwen3Attention(Qwen3Attention):
             scale=self.scaling,
         )
         # 3. return the normal flattened SRT attention output layout
-        return attn_output.squeeze(0).transpose(0, 1).reshape(
-            extend_num_tokens,
-            self.q_size,
+        return (
+            attn_output.squeeze(0)
+            .transpose(0, 1)
+            .reshape(
+                extend_num_tokens,
+                self.q_size,
+            )
         )
 
     @staticmethod
@@ -876,7 +880,7 @@ class NEOQwen3Model(Qwen2Model):
         if not self.pp_group.is_first_rank or not self.pp_group.is_last_rank:
             raise NotImplementedError(
                 "SenseNova U1 pixel-flow G forward is currently single-stage PP only"
-        )
+            )
 
         hidden_states = input_embeds
         residual = None

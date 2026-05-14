@@ -266,7 +266,7 @@ class OmniSessionRuntime:
         *,
         stream_sink: "OmniStreamSink | None" = None,
     ) -> OmniDecodeResult:
-        """decode until next segment with model_policy"""
+        """advance an AR session until model policy returns the next segment boundary"""
         record = self._record_for(handle)
         if record.state != OmniSegmentState.AR_DECODE:
             raise ValueError(
@@ -278,12 +278,6 @@ class OmniSessionRuntime:
             session=self._model_session_view(record),
             stream_sink=stream_sink,
         )
-        if result is None:
-            if self.srt_ar_decode_max_new_tokens > 0:
-                self._execute_srt_ar_decode_request(record, greedy=True)
-            result = self.model_policy.decode_next_segment(
-                session=self._model_session_view(record)
-            )
         record.decode_count += 1
         if result.type == "image_marker":
             record.state = OmniSegmentState.GENERATE
@@ -293,7 +287,7 @@ class OmniSessionRuntime:
             record.state = OmniSegmentState.AR_DECODE
         return result
 
-    def decode_one_step(
+    def decode(
         self,
         handle: OmniSessionHandle,
         *,
@@ -305,7 +299,7 @@ class OmniSessionRuntime:
         greedy: bool = False,
         model_state_updates: dict[str, Any] | None = None,
     ) -> OmniTextDecodeResult:
-        """performs a single decode"""
+        """performs decode on a request"""
         record = self._record_for(handle)
         if record.state != OmniSegmentState.AR_DECODE:
             raise ValueError(

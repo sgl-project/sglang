@@ -23,7 +23,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.omni.core.protocol import ContextOps, GeneratedSegment, TemporaryForwardPrepared
+from sglang.omni.core.protocol import (
+    ContextOps,
+    GeneratedSegment,
+    TemporaryForwardPrepared,
+)
 
 _U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
 _U1_INTERLEAVE_TEXT_UNCONDITION_ROLE = "u1_interleave_text_uncondition"
@@ -859,7 +863,9 @@ def _require_temporary_forward_runner(context_ops: ContextOps) -> Any:
     return context_ops.run_temporary_forward
 
 
-def _should_apply_cfg_value(cfg: SenseNovaU1PixelFlowCFG, timestep_value: float) -> bool:
+def _should_apply_cfg_value(
+    cfg: SenseNovaU1PixelFlowCFG, timestep_value: float
+) -> bool:
     if cfg.start == 0.0:
         return 0.0 <= timestep_value < cfg.end
     return cfg.start < timestep_value < cfg.end

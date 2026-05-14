@@ -9,9 +9,10 @@ returned prepared inputs remain SRT-owned runtime objects.
 
 import math
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
+from sglang.omni.core.interleaved import INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY
 from sglang.srt.omni_session.runtime import (
     OmniInterleavedMessage,
     OmniSRTPreparedInput,
@@ -44,6 +45,131 @@ U1_INTERLEAVE_TEXT_UNCONDITION_ROLE = "u1_interleave_text_uncondition"
 U1_EDIT_IMG_CONDITION_ROLE = "u1_edit_img_condition"
 U1_EDIT_UNCONDITION_ROLE = "u1_edit_uncondition"
 _U1_ATTENTION_MATH_MODE: str | None = None
+U1_MODEL_STATE_NAMESPACE = "u1"
+
+
+@dataclass(frozen=True, slots=True)
+class U1GeneratedImageSegmentState:
+    """generated image token span committed back into the U1 session state"""
+
+    token_indices: tuple[int, ...]
+    image_grid_hw: tuple[tuple[int, ...], ...]
+    omit_image_start: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        token_indices = list(self.token_indices)
+        return {
+            "segment_type": "image",
+            "source": "native_generated_image_commit",
+            "token_indices": token_indices,
+            "attention_rows": [
+                {
+                    "kind": "image",
+                    "attention": "hybrid",
+                    "start": min(token_indices) if token_indices else 0,
+                    "end": (max(token_indices) + 1) if token_indices else 0,
+                }
+            ],
+            "generated_image_commit": True,
+            "native_generated_image_commit": True,
+            "omit_image_start": self.omit_image_start,
+            "image_grid_hw": [list(row) for row in self.image_grid_hw],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class U1ModelStateUpdate:
+    """partial U1 state update; none means keep the existing session value"""
+
+    # source flags select the next model-specific decode / generation branch
+    last_segment_type: str | None = None
+    last_source: str | None = None
+    native_vlm_prompt: bool | None = None
+    native_interleave_prompt: bool | None = None
+    native_interleave_text_uncondition_prompt: bool | None = None
+    native_t2i_prompt: bool | None = None
+    native_edit_prompt: bool | None = None
+    # boundary flags track whether AR has already opened the next image segment
+    open_image_marker: bool | None = None
+    interleave_pending_image_marker: bool | None = None
+    interleave_image_count: int | None = None
+    # u1 m-rope positions are logical positions, not always raw srt token count
+    generation_position_start: int | None = None
+    t2i_think_mode: bool | None = None
+    edit_think_mode: bool | None = None
+    last_generated_image_commit: bool | None = None
+    native_generated_image_commit: bool | None = None
+    segments: tuple[U1GeneratedImageSegmentState | dict[str, Any], ...] | None = None
+    session_id: str | None = None
+    generation_boundary_metadata: dict[str, Any] | None = None
+
+    def with_context(
+        self,
+        *,
+        generation_position_start: int | None,
+        session_id: str | None,
+    ) -> "U1ModelStateUpdate":
+        return replace(
+            self,
+            generation_position_start=generation_position_start,
+            session_id=session_id,
+        )
+
+    def to_state_dict(self) -> dict[str, Any]:
+        state: dict[str, Any] = {}
+        if self.last_segment_type is not None:
+            state["last_segment_type"] = self.last_segment_type
+        if self.last_source is not None:
+            state["last_source"] = self.last_source
+        if self.native_vlm_prompt is not None:
+            state["native_vlm_prompt"] = self.native_vlm_prompt
+        if self.native_interleave_prompt is not None:
+            state["native_interleave_prompt"] = self.native_interleave_prompt
+        if self.native_interleave_text_uncondition_prompt is not None:
+            state["native_interleave_text_uncondition_prompt"] = (
+                self.native_interleave_text_uncondition_prompt
+            )
+        if self.native_t2i_prompt is not None:
+            state["native_t2i_prompt"] = self.native_t2i_prompt
+        if self.native_edit_prompt is not None:
+            state["native_edit_prompt"] = self.native_edit_prompt
+        if self.open_image_marker is not None:
+            state["open_image_marker"] = self.open_image_marker
+        if self.interleave_pending_image_marker is not None:
+            state["interleave_pending_image_marker"] = (
+                self.interleave_pending_image_marker
+            )
+        if self.interleave_image_count is not None:
+            state["interleave_image_count"] = self.interleave_image_count
+        if self.generation_position_start is not None:
+            state["generation_position_start"] = self.generation_position_start
+        if self.t2i_think_mode is not None:
+            state["t2i_think_mode"] = self.t2i_think_mode
+        if self.edit_think_mode is not None:
+            state["edit_think_mode"] = self.edit_think_mode
+        if self.last_generated_image_commit is not None:
+            state["last_generated_image_commit"] = self.last_generated_image_commit
+        if self.native_generated_image_commit is not None:
+            state["native_generated_image_commit"] = (
+                self.native_generated_image_commit
+            )
+        if self.session_id is not None:
+            state["session_id"] = self.session_id
+        if self.segments is not None:
+            state["segments"] = [
+                segment.to_dict()
+                if isinstance(segment, U1GeneratedImageSegmentState)
+                else dict(segment)
+                for segment in self.segments
+            ]
+        if self.generation_boundary_metadata is not None:
+            state[INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY] = dict(
+                self.generation_boundary_metadata
+            )
+        return state
+
+    def to_model_state_updates(self) -> dict[str, Any]:
+        return {U1_MODEL_STATE_NAMESPACE: self.to_state_dict()}
 
 
 def _u1_policy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -110,10 +236,10 @@ def _u1_multimodal_inputs(
     precomputed_hash: int | None = None,
 ) -> Any:
     from sglang.srt.managers.schedule_batch import (
-        _compute_pad_value,
         Modality,
         MultimodalDataItem,
         MultimodalInputs,
+        _compute_pad_value,
     )
 
     item = MultimodalDataItem(
@@ -173,14 +299,12 @@ def build_u1_native_vlm_prepared_input(
                     "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
                     "image_offsets": list(image_offsets),
                 },
-                "omni_model_state_updates": {
-                    "u1": {
-                        "last_segment_type": "vlm",
-                        "last_source": "native_vlm_input",
-                        "native_vlm_prompt": True,
-                        "session_id": _u1_session_id(session),
-                    }
-                },
+                "omni_model_state_updates": U1ModelStateUpdate(
+                    last_segment_type="vlm",
+                    last_source="native_vlm_input",
+                    native_vlm_prompt=True,
+                    session_id=_u1_session_id(session),
+                ).to_model_state_updates(),
             }
         ),
     )
@@ -212,14 +336,14 @@ def build_u1_native_interleave_prepared_input(
         role=None,
         source="native_interleave_prompt",
         segment_type="interleave",
-        model_state_updates={
-            "last_segment_type": "interleave",
-            "last_source": "native_interleave_prompt",
-            "native_interleave_prompt": True,
-            "open_image_marker": False,
-            "interleave_pending_image_marker": False,
-            "interleave_image_count": 0,
-        },
+        model_state_updates=U1ModelStateUpdate(
+            last_segment_type="interleave",
+            last_source="native_interleave_prompt",
+            native_interleave_prompt=True,
+            open_image_marker=False,
+            interleave_pending_image_marker=False,
+            interleave_image_count=0,
+        ),
     )
 
 
@@ -240,12 +364,12 @@ def build_u1_native_interleave_text_uncondition_prepared_input(
         role=U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
         source="native_interleave_text_uncondition_prompt",
         segment_type="interleave_text_uncondition",
-        model_state_updates={
-            "last_segment_type": "interleave_text_uncondition",
-            "last_source": "native_interleave_text_uncondition_prompt",
-            "native_interleave_text_uncondition_prompt": True,
-            "open_image_marker": False,
-        },
+        model_state_updates=U1ModelStateUpdate(
+            last_segment_type="interleave_text_uncondition",
+            last_source="native_interleave_text_uncondition_prompt",
+            native_interleave_text_uncondition_prompt=True,
+            open_image_marker=False,
+        ),
     )
 
 
@@ -274,16 +398,14 @@ def build_u1_native_interleave_text_uncondition_marker_prepared_input(
                     "source": "native_interleave_text_uncondition_image_marker",
                     "generation_position_start": next_position,
                 },
-                "omni_model_state_updates": {
-                    "u1": {
-                        "last_segment_type": "interleave_text_uncondition",
-                        "last_source": "native_interleave_text_uncondition_image_marker",
-                        "native_interleave_text_uncondition_prompt": True,
-                        "open_image_marker": True,
-                        "generation_position_start": next_position,
-                        "session_id": _u1_session_id(session),
-                    }
-                },
+                "omni_model_state_updates": U1ModelStateUpdate(
+                    last_segment_type="interleave_text_uncondition",
+                    last_source="native_interleave_text_uncondition_image_marker",
+                    native_interleave_text_uncondition_prompt=True,
+                    open_image_marker=True,
+                    generation_position_start=next_position,
+                    session_id=_u1_session_id(session),
+                ).to_model_state_updates(),
             }
         ),
     )
@@ -299,7 +421,7 @@ def _build_u1_native_interleave_like_prepared_input(
     role: str | None,
     source: str,
     segment_type: str,
-    model_state_updates: dict[str, Any] | None,
+    model_state_updates: U1ModelStateUpdate | None,
 ) -> OmniSRTPreparedInput:
     mm_inputs = None
     image_offsets: list[tuple[int, int]] = []
@@ -381,10 +503,12 @@ def _build_u1_native_interleave_like_prepared_input(
     policy_metadata = _u1_policy_metadata({"u1": u1_metadata})
     policy_metadata["omni_srt_position_count"] = generation_position_start
     if model_state_updates is not None:
-        state_updates = dict(model_state_updates)
-        state_updates["generation_position_start"] = generation_position_start
-        state_updates["session_id"] = session_id
-        policy_metadata["omni_model_state_updates"] = {"u1": state_updates}
+        policy_metadata["omni_model_state_updates"] = (
+            model_state_updates.with_context(
+                generation_position_start=generation_position_start,
+                session_id=session_id,
+            ).to_model_state_updates()
+        )
     return OmniSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
@@ -428,16 +552,14 @@ def build_u1_native_t2i_prepared_input(
                     "prompt_ends_with_image_marker": input_ids[-1] == img_start_id,
                     "think_mode": bool(think_mode),
                 },
-                "omni_model_state_updates": {
-                    "u1": {
-                        "last_segment_type": "t2i",
-                        "last_source": "native_t2i_prompt",
-                        "native_t2i_prompt": True,
-                        "open_image_marker": input_ids[-1] == img_start_id,
-                        "t2i_think_mode": bool(think_mode),
-                        "session_id": _u1_session_id(session),
-                    }
-                },
+                "omni_model_state_updates": U1ModelStateUpdate(
+                    last_segment_type="t2i",
+                    last_source="native_t2i_prompt",
+                    native_t2i_prompt=True,
+                    open_image_marker=input_ids[-1] == img_start_id,
+                    t2i_think_mode=bool(think_mode),
+                    session_id=_u1_session_id(session),
+                ).to_model_state_updates(),
             }
         ),
     )
@@ -510,18 +632,16 @@ def build_u1_native_edit_prepared_input(
                     "generation_position_start": generation_position_start,
                     "think_mode": bool(think_mode),
                 },
-                "omni_model_state_updates": {
-                    "u1": {
-                        "last_segment_type": "edit",
-                        "last_source": "native_edit_prompt",
-                        "native_edit_prompt": True,
-                        "generation_position_start": generation_position_start,
-                        "edit_think_mode": bool(think_mode),
-                        "open_image_marker": (not think_mode)
-                        and input_ids[-1] == img_start_id,
-                        "session_id": _u1_session_id(session),
-                    }
-                },
+                "omni_model_state_updates": U1ModelStateUpdate(
+                    last_segment_type="edit",
+                    last_source="native_edit_prompt",
+                    native_edit_prompt=True,
+                    generation_position_start=generation_position_start,
+                    edit_think_mode=bool(think_mode),
+                    open_image_marker=(not think_mode)
+                    and input_ids[-1] == img_start_id,
+                    session_id=_u1_session_id(session),
+                ).to_model_state_updates(),
             }
         ),
     )
@@ -634,7 +754,7 @@ def _build_u1_native_image_condition_path_prepared_input(
                     "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
                     "image_offsets": image_offsets,
                     "generation_position_start": generation_position_start,
-                }
+                },
             }
         ),
     )
@@ -1052,8 +1172,8 @@ def load_u1_native_image(
 
 
 def _load_u1_pil_image(image: Any):
-    from io import BytesIO
     import base64
+    from io import BytesIO
 
     from PIL import Image
 
@@ -1221,36 +1341,29 @@ def _u1_generated_image_commit_metadata(
     previous_segments = [
         dict(segment) for segment in previous_state.get("segments", [])
     ]
-    u1_segment = {
-        "segment_type": "image",
-        "source": "native_generated_image_commit",
-        "token_indices": list(token_indices),
-        "attention_rows": [
-            {
-                "kind": "image",
-                "attention": "hybrid",
-                "start": min(token_indices) if token_indices else 0,
-                "end": (max(token_indices) + 1) if token_indices else 0,
-            }
-        ],
-        "generated_image_commit": True,
-        "native_generated_image_commit": True,
-        "omit_image_start": bool(omit_start),
-        "image_grid_hw": [list(map(int, row)) for row in grid_hw.tolist()],
-    }
-    u1_state = {
-        "segments": previous_segments + [u1_segment],
-        "last_segment_type": "image",
-        "last_source": "native_generated_image_commit",
-        "last_generated_image_commit": True,
-        "native_generated_image_commit": True,
-        "open_image_marker": False,
-    }
-    if generation_position_start is not None:
-        u1_state["generation_position_start"] = int(generation_position_start)
+    u1_segment = U1GeneratedImageSegmentState(
+        token_indices=tuple(int(index) for index in token_indices),
+        image_grid_hw=tuple(
+            tuple(map(int, row)) for row in grid_hw.tolist()
+        ),
+        omit_image_start=bool(omit_start),
+    )
+    state_patch = U1ModelStateUpdate(
+        segments=tuple(previous_segments + [u1_segment]),
+        last_segment_type="image",
+        last_source="native_generated_image_commit",
+        last_generated_image_commit=True,
+        native_generated_image_commit=True,
+        open_image_marker=False,
+        generation_position_start=(
+            int(generation_position_start)
+            if generation_position_start is not None
+            else None
+        ),
+    )
     return {
-        "u1": u1_segment,
-        "omni_model_state_updates": {"u1": u1_state},
+        "u1": u1_segment.to_dict(),
+        "omni_model_state_updates": state_patch.to_model_state_updates(),
     }
 
 

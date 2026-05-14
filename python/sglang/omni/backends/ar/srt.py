@@ -30,15 +30,17 @@ from sglang.omni.core.protocol import (
     OmniRequest,
     TemporaryForwardPrepared,
 )
-from sglang.srt.omni_session.session_adapter import SRTBackedOmniSessionAdapter
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniVLMTextGenerationResult,
 )
 from sglang.srt.omni_session.runtime_types import (
     OmniContextBundle as SRTOmniContextBundle,
+)
+from sglang.srt.omni_session.runtime_types import (
     OmniContextHandle as SRTOmniContextHandle,
 )
+from sglang.srt.omni_session.session_adapter import SRTBackedOmniSessionAdapter
 
 if TYPE_CHECKING:
     from sglang.omni.entrypoints.streaming import OmniStreamSink
@@ -82,11 +84,9 @@ class SRTBackedContextOps(ContextOps):
         *,
         condition_path_role: str | None = None,
     ) -> int | None:
-        return (
-            self.session_adapter.runtime.srt_request_executor.get_latest_session_position_count(
-                self.session_id,
-                condition_path_role=condition_path_role,
-            )
+        return self.session_adapter.runtime.srt_request_executor.get_latest_session_position_count(
+            self.session_id,
+            condition_path_role=condition_path_role,
         )
 
     def run_temporary_forward(
@@ -298,9 +298,9 @@ def _record_generation_boundary(
     context.metadata[INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY] = metadata
     backend_context = context.backend_context
     if isinstance(backend_context, SRTOmniContextBundle):
-        backend_context.full.metadata[
-            INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY
-        ] = metadata
+        backend_context.full.metadata[INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY] = (
+            metadata
+        )
     return OmniBoundary(
         type=boundary.type,
         text=boundary.text,
@@ -439,11 +439,9 @@ def _pre_image_segments_to_boundaries(
             boundaries.append(_pre_image_segment_to_boundary(segment))
             continue
         boundary = _pre_image_segment_to_boundary(segment)
-        if (
-            text_parts
-            and text_metadata.get(STREAMED_TEXT_METADATA_KEY)
-            != boundary.metadata.get(STREAMED_TEXT_METADATA_KEY)
-        ):
+        if text_parts and text_metadata.get(
+            STREAMED_TEXT_METADATA_KEY
+        ) != boundary.metadata.get(STREAMED_TEXT_METADATA_KEY):
             flush_text()
         text_parts.append(boundary.text or "")
         text_token_ids.extend(int(token_id) for token_id in boundary.token_ids)

@@ -5,4 +5,3 @@ Adapters map a model's token grammar, prompts, condition paths, and commit rules
 onto the generic core/backends contracts. They are not ARBackend or
 MultimodalGenerationBackend implementations.
 """
-

@@ -232,9 +232,7 @@ class TestSenseNovaU1E2EBehavior(unittest.TestCase):
             "height": _env_int("SGLANG_OMNI_U1_QUALITY_HEIGHT", 1024),
             "num_steps": _env_int("SGLANG_OMNI_U1_QUALITY_STEPS", 50),
             "seed": _env_int("SGLANG_OMNI_U1_QUALITY_SEED", 223),
-            "cfg_text_scale": _env_float(
-                "SGLANG_OMNI_U1_QUALITY_CFG_TEXT_SCALE", 4.0
-            ),
+            "cfg_text_scale": _env_float("SGLANG_OMNI_U1_QUALITY_CFG_TEXT_SCALE", 4.0),
             "cfg_img_scale": _env_float("SGLANG_OMNI_U1_QUALITY_CFG_IMG_SCALE", 1.0),
             "cfg_interval": [0.0, 1.0],
             "cfg_renorm_type": "none",
@@ -272,7 +270,9 @@ class TestSenseNovaU1E2EBehavior(unittest.TestCase):
             "height": _env_int("SGLANG_OMNI_U1_T2I_THINK_HEIGHT", 512),
             "num_steps": _env_int("SGLANG_OMNI_U1_T2I_THINK_STEPS", 24),
             "seed": _env_int("SGLANG_OMNI_U1_T2I_THINK_SEED", 223),
-            "cfg_text_scale": _env_float("SGLANG_OMNI_U1_T2I_THINK_CFG_TEXT_SCALE", 1.0),
+            "cfg_text_scale": _env_float(
+                "SGLANG_OMNI_U1_T2I_THINK_CFG_TEXT_SCALE", 1.0
+            ),
             "cfg_img_scale": _env_float("SGLANG_OMNI_U1_T2I_THINK_CFG_IMG_SCALE", 1.0),
             "cfg_interval": [0.0, 1.0],
             "cfg_renorm_type": "none",
@@ -547,9 +547,9 @@ def _assert_reference_match(
     metric_prefix: str,
 ) -> None:
     actual = _last_image(payload)
-    reference = Image.open(_path_from_env(reference_env, default_reference_path)).convert(
-        "RGB"
-    )
+    reference = Image.open(
+        _path_from_env(reference_env, default_reference_path)
+    ).convert("RGB")
     metrics = _compare_images(actual, reference)
 
     output_path = os.getenv(output_env)

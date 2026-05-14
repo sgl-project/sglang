@@ -231,6 +231,7 @@ def _build_default_generation_backend(
     pipeline_server_args = DiffusionServerArgs.from_kwargs(**diffusion_server_kwargs)
     _validate_diffusion_server_args(pipeline_server_args)
     set_global_server_args(pipeline_server_args)
+
     # U1 pixel-flow stays same-process because denoising reads live SRT KV handles.
     def build_pipeline() -> SenseNovaU1Pipeline:
         return SenseNovaU1Pipeline(
@@ -258,8 +259,7 @@ def _resolve_omni_max_concurrent_generations(
     value = int(value)
     if value <= 0:
         raise ValueError(
-            "omni_max_concurrent_generations must be positive, got "
-            f"{value}"
+            "omni_max_concurrent_generations must be positive, got " f"{value}"
         )
     return value
 

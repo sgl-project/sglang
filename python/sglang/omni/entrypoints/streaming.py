@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from sglang.omni.core.interleaved import STREAMED_TEXT_METADATA_KEY
 from sglang.omni.entrypoints.serialization import serialize_image
 
 

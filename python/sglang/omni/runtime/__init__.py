@@ -6,4 +6,3 @@ tokenizer-manager transport, scheduler-thread task state, and persistent omni
 session records. It does not own ModelRunner KV/session execution; that lives in
 `sglang.srt.omni_session.runtime`.
 """
-

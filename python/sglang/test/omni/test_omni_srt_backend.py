@@ -19,6 +19,8 @@ from sglang.omni.core.interleaved import (
 from sglang.omni.core.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
 from sglang.srt.omni_session.runtime_types import (
     OmniContextBundle as SRTOmniContextBundle,
+)
+from sglang.srt.omni_session.runtime_types import (
     OmniContextHandle,
     OmniSessionHandle,
 )
