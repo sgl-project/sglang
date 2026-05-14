@@ -38,16 +38,22 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-# custom_ops registers torch.ops.custom.npu_* via side-effect on import.
-# It's installed in the cann image at /usr/local/python*/site-packages/custom_ops.
-# Without this import the npu_sparse_attn_sharedkv_metadata op isn't visible
-# the first time we touch torch.ops.custom (lazy namespace population).
+# custom_ops registers torch.ops.custom.npu_sparse_attn_sharedkv_metadata,
+# npu_sparse_attn_sharedkv, npu_quant_lightning_indexer and friends. The
+# V4 ascend backend has no pure-torch fallback for those ops, so if the
+# import fails we must fail fast with a clear message rather than crash
+# later with an opaque AttributeError on torch.ops.custom.<name>.
 try:
     import custom_ops  # noqa: F401
-except ImportError:
-    logging.getLogger(__name__).warning(
-        "custom_ops package not importable — V4 ascend attention will fall back."
-    )
+except ImportError as e:
+    raise ImportError(
+        "DeepSeek-V4 ascend attention backend requires the `custom_ops` "
+        "wheel that ships with the Ascend cann-8.5.0-a3 image (registers "
+        "torch.ops.custom.npu_sparse_attn_sharedkv_*, "
+        "npu_quant_lightning_indexer, npu_hc_pre/post, etc.). The package "
+        "is normally at /usr/local/python*/site-packages/custom_ops. "
+        f"Original ImportError: {e}"
+    ) from e
 
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
@@ -580,14 +586,16 @@ class DeepseekV4AscendAttnBackend(
         cmp_kv = pool.get_compress_buffer(layer.layer_id, False)
 
         if metadata is None or cmp_kv is None:
-            # No metadata or no compress pool for this layer — likely means
-            # the layer is dense (ratio 0/1) but the model dispatched here
-            # by mistake, or the model has fewer compressed layers than the
-            # config implies. Return zeros to avoid crashing the forward.
-            T = q.shape[0]
-            n_heads = q.shape[1] if q.ndim >= 2 else 1
-            head_dim_v = getattr(layer, "v_head_dim", q.shape[-1])
-            return q.new_zeros((T, n_heads, head_dim_v))
+            raise RuntimeError(
+                "DeepseekV4AscendAttnBackend._forward_compressed: missing "
+                f"required state for layer_id={layer.layer_id} "
+                f"compress_ratio={compress_ratio}. "
+                f"metadata({'present' if metadata is not None else 'MISSING'}), "
+                f"cmp_kv({'present' if cmp_kv is not None else 'MISSING'}). "
+                f"Available kernel_metadata keys: {list(fm.kernel_metadata.keys())}. "
+                "This indicates a configuration / pool-init bug — silently "
+                "returning zeros would corrupt model output."
+            )
 
         ori_kv = pool.get_swa_buffer(layer.layer_id)
 

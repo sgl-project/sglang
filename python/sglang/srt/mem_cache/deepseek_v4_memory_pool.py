@@ -18,7 +18,9 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import ceil_div
+from sglang.srt.utils import ceil_div, is_npu
+
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +107,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         # That's the shape npu_sparse_attn_sharedkv expects with
         # layout_kv="PA_ND". The CUDA fp8-packed-bytes layout is preserved
         # for non-NPU paths.
-        is_npu_bf16 = self.store_dtype == torch.bfloat16
+        is_npu_bf16 = _is_npu and self.store_dtype == torch.bfloat16
         if is_npu_bf16:
             kv_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
             self.kv_cache_total_dim = kv_dim
@@ -561,8 +563,27 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c4_n_pages_kernel = c4_size // page_size  # kernel-view num pages
         c128_n_pages_kernel = c128_size // page_size
         # Cap per-req max pages so all max_num_reqs reqs fit; round down.
+        # NOTE: this is an *average* slab size. A single request whose
+        # compressed token count exceeds max_pages_c{N}_per_req * page_size
+        # will overflow its slab and corrupt or OOB-read neighbour slabs.
+        # This is safe in the current sizing (c4_size / c128_size are
+        # provisioned so that even at max concurrency a max-context req
+        # fits), but low-concurrency long-context workloads (e.g.
+        # max_num_reqs=1 with context_length close to swa_size) need a
+        # real per-req allocator. Logged below + asserted at write time
+        # so the failure mode is loud rather than silent corruption.
         self.max_pages_c4_per_req = max(1, c4_n_pages_kernel // max_num_reqs)
         self.max_pages_c128_per_req = max(1, c128_n_pages_kernel // max_num_reqs)
+        logger.info(
+            "DeepSeekV4TokenToKVPool per-req compressed-slab caps: "
+            f"c4={self.max_pages_c4_per_req} pages "
+            f"(={self.max_pages_c4_per_req * page_size} c4 tokens, "
+            f"≈{self.max_pages_c4_per_req * page_size * 4} raw tokens), "
+            f"c128={self.max_pages_c128_per_req} pages "
+            f"(={self.max_pages_c128_per_req * page_size} c128 tokens, "
+            f"≈{self.max_pages_c128_per_req * page_size * 128} raw tokens). "
+            "A single request exceeding these limits will overflow its slab."
+        )
         # req_to_token_c{N}_pages[req_idx, k] = kernel-view page index in
         # c{N}_kv_pool for the k-th compressed-token-page of request `req_idx`.
         self.req_to_token_c4_pages = (

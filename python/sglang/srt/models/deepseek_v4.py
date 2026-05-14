@@ -862,7 +862,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=self.rms_norm_eps,
                 hc_eps=self.hc_eps,
             )
-            return y.to(dtype), post, comb
+            # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
+            # not fold input_layernorm. Return norm_fused=False so the caller
+            # applies the layernorm itself, matching the deepgemm/torch paths.
+            return y.to(dtype), post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre

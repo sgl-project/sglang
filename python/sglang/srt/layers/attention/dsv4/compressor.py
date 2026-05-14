@@ -55,9 +55,12 @@ _walsh_hadamard_matrix._cache = {}  # type: ignore[attr-defined]
 
 
 def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.Tensor:
+    # Match rotate_activation()'s scale=hidden_size**-0.5 so the indexer's
+    # dot products are on the same magnitude scale as the CUDA reference.
     init_shape = inp.shape
-    flat = inp.reshape(-1, hadamard_matrix.shape[0])
-    return flat.matmul(hadamard_matrix).view(init_shape).to(torch.bfloat16)
+    n = hadamard_matrix.shape[0]
+    flat = inp.reshape(-1, n)
+    return (flat.matmul(hadamard_matrix) * (n**-0.5)).view(init_shape).to(torch.bfloat16)
 
 
 if TYPE_CHECKING:
