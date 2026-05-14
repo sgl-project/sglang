@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
 
 # Standalone speculative decoding tests (FA3, Triton, FlashInfer backends)
 register_cuda_ci(est_time=406, stage="stage-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=406, stage="stage-b", runner_config="1-gpu-large-amd")
 
 GSM_DATASET_PATH = None
 
@@ -76,6 +77,12 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        attention_backend = cls.get_server_args()[-1]
+        if is_hip() and attention_backend in ("fa3", "flashinfer"):
+            raise unittest.SkipTest(
+                f"{attention_backend} attention backend is not supported on ROCm"
+            )
+
         # disable deep gemm precompile to make launch server faster
         # please don't do this if you want to make your inference workload faster
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
@@ -138,6 +145,12 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        attention_backend = cls.get_server_args()[-1]
+        if is_hip() and attention_backend in ("fa3", "flashinfer"):
+            raise unittest.SkipTest(
+                f"{attention_backend} attention backend is not supported on ROCm"
+            )
+
         # disable deep gemm precompile to make launch server faster
         # please don't do this if you want to make your inference workload faster
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
