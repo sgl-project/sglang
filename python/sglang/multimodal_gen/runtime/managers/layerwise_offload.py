@@ -7,6 +7,7 @@ from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.runtime.managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+    layerwise_component_matches_selection,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -687,7 +688,16 @@ def configure_layerwise_offload_modules(
         explicit_component_names = selected_component_names - {
             LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS
         }
-        missing_component_names = explicit_component_names - set(modules)
+        missing_component_names = [
+            selected_component_name
+            for selected_component_name in explicit_component_names
+            if not any(
+                layerwise_component_matches_selection(
+                    component_name, selected_component_name
+                )
+                for component_name in modules
+            )
+        ]
         if missing_component_names:
             logger.warning(
                 "Layerwise offload components are not currently loaded: %s. "
@@ -698,7 +708,13 @@ def configure_layerwise_offload_modules(
 
         unsupported_component_names = [
             component_name
-            for component_name in explicit_component_names & set(modules)
+            for component_name in modules
+            if any(
+                layerwise_component_matches_selection(
+                    component_name, selected_component_name
+                )
+                for selected_component_name in explicit_component_names
+            )
             if not isinstance(modules[component_name], LayerwiseOffloadableModuleMixin)
         ]
         if unsupported_component_names:
@@ -715,7 +731,12 @@ def configure_layerwise_offload_modules(
                 continue
         elif (
             not select_all
-            and component_name not in selected_component_names
+            and not any(
+                layerwise_component_matches_selection(
+                    component_name, selected_component_name
+                )
+                for selected_component_name in selected_component_names
+            )
             and not (select_default and module.layerwise_offload_default_enabled)
         ):
             continue

@@ -48,6 +48,17 @@ def is_vae_component_name(component_name: str) -> bool:
     return component_name in VAE_COMPONENT_NAMES
 
 
+def layerwise_component_matches_selection(
+    component_name: str,
+    selected_component_name: str,
+) -> bool:
+    if selected_component_name == "text_encoder":
+        return is_text_encoder_component_name(component_name)
+    if selected_component_name == "vae":
+        return is_vae_component_name(component_name)
+    return component_name == selected_component_name
+
+
 def cpu_offload_flags_for_layerwise_components(
     component_names: Sequence[str],
 ) -> tuple[str, ...]:

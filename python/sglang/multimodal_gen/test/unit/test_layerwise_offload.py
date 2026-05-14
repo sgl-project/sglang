@@ -278,22 +278,38 @@ def test_layerwise_configuration_default_marker_extends_legacy_defaults(monkeypa
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
     text_encoder = _NestedEncoderDummyModel()
+    text_encoder_2 = _NestedEncoderDummyModel()
     transformer = _NestedDummyModel()
     vae = _NestedEncoderDummyModel()
+    audio_vae = _NestedEncoderDummyModel()
+    condition_image_encoder = _NestedEncoderDummyModel()
     modules = {
         "text_encoder": text_encoder,
+        "text_encoder_2": text_encoder_2,
         "transformer": transformer,
         "vae": vae,
+        "audio_vae": audio_vae,
+        "condition_image_encoder": condition_image_encoder,
     }
 
     configured = configure_layerwise_offload_modules(
-        modules, _server_args(), component_names=["default", "text_encoder"]
+        modules, _server_args(), component_names=["default", "text_encoder", "vae"]
     )
 
-    assert configured == ["text_encoder", "transformer"]
+    assert configured == [
+        "text_encoder",
+        "text_encoder_2",
+        "transformer",
+        "vae",
+        "audio_vae",
+        "condition_image_encoder",
+    ]
     assert is_layerwise_offloaded_module(text_encoder)
+    assert is_layerwise_offloaded_module(text_encoder_2)
     assert is_layerwise_offloaded_module(transformer)
-    assert not is_layerwise_offloaded_module(vae)
+    assert is_layerwise_offloaded_module(vae)
+    assert is_layerwise_offloaded_module(audio_vae)
+    assert is_layerwise_offloaded_module(condition_image_encoder)
 
 
 def test_layerwise_configuration_all_selects_every_capable_component(monkeypatch):
