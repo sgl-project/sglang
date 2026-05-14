@@ -77,27 +77,24 @@ class LayerTransferCounter:
 
     The KV pool calls `wait_until(layer_id)` after finishing a layer, which we
     translate into a `load_kv_layerwise(layer_id)` call on the LMCache connector
-    within the provided device stream (when available).
+    within the provided device stream.
     """
 
     def __init__(
         self,
         num_layers: int,
-        load_stream: torch.Stream,
-        load_stream_ctx: torch.Stream,
+        load_stream: torch.cuda.Stream,
         lmc_connector: LMCacheLayerwiseConnector,
         printable: bool = False,
     ):
         self.num_layers = num_layers
         self.load_stream = load_stream
         self.lmc_connector = lmc_connector
-        self.load_stream_ctx = load_stream_ctx or nullcontext()
 
     def wait_until(self, layer_id: int):
         # Ensure ordering of the async loads wrt compute stream(s).
-        if self.load_stream is not None:
-            self.load_stream.synchronize()
-        with self.load_stream_ctx:
+        self.load_stream.synchronize()
+        with self.load_stream:
             self.lmc_connector.load_kv_layerwise(layer_id)
 
 
@@ -150,17 +147,8 @@ class LMCRadixCache(RadixCache):
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
 
-        device_module = torch.get_device_module(self.device)
-        if hasattr(device_module, "Stream") and hasattr(device_module, "stream"):
-            self.load_stream = device_module.Stream()
-            self.store_stream = device_module.Stream()
-            self.load_stream_ctx = device_module.stream(self.load_stream)
-            self.store_stream_ctx = device_module.stream(self.store_stream)
-        else:
-            self.load_stream = None
-            self.store_stream = None
-            self.load_stream_ctx = nullcontext()
-            self.store_stream_ctx = nullcontext()
+        self.load_stream = _create_device_stream(self.device)
+        self.store_stream = _create_device_stream(self.device)
 
         # MP is the default. To use the in-process layerwise connector,
         # set ``self._mode = LMCacheMode.IP`` here.
@@ -188,7 +176,6 @@ class LMCRadixCache(RadixCache):
                     model_config.num_hidden_layers if model_config is not None else 0
                 ),
                 load_stream=self.load_stream,
-                load_stream_ctx=self.load_stream_ctx,
                 lmc_connector=self.lmcache_connector,
             )
             kvcache.register_layer_transfer_counter(self.layer_done_executor)
@@ -377,7 +364,7 @@ class LMCRadixCache(RadixCache):
         slot_mapping[value_numel:].copy_(token_slots)
 
 
-        with self.load_stream_ctx:
+        with _device_stream_context(self.load_stream):
             num_retrieved = self.lmcache_connector.start_load_kv(
                 LoadMetadata(
                     token_ids=key.token_ids,  # full page-aligned key
@@ -501,9 +488,6 @@ class LMCRadixCache(RadixCache):
             offset=0,
             request_id=req.rid,
         )
-
-        with self.store_stream_ctx:
-            self.lmcache_connector.store_kv(store_md)
         if self._mode is LMCacheMode.MP:
             # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
             self._mp_load_back_markers.pop(req.rid, None)
@@ -519,8 +503,7 @@ class LMCRadixCache(RadixCache):
         if self.disable:
             return EvictResult()
 
-        if self.store_stream is not None:
-            self.store_stream.synchronize()
+        self.store_stream.synchronize()
         with self._node_lock:
             for node in self._in_flight_nodes:
                 self.dec_lock_ref(node)
