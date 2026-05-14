@@ -536,6 +536,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             return self.mha_chunk_kv_cache.forward(q, k, v, layer, forward_batch)
 
         cache_loc = forward_batch.out_cache_loc
+        cache_loc_swa = forward_batch.out_cache_loc_swa
         logits_soft_cap = layer.logit_cap
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
 
@@ -548,7 +549,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                         layer, cache_loc, k, k_rope
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        loc_swa=cache_loc_swa,
+                    )
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -606,6 +613,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     ):
         decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = forward_batch.out_cache_loc
+        cache_loc_swa = forward_batch.out_cache_loc_swa
 
         if k is not None:
             assert v is not None
@@ -623,6 +631,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                         cache_loc,
                         k,
                         v,
+                        loc_swa=cache_loc_swa,
                     )
 
         # Reshape inputs

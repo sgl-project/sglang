@@ -356,6 +356,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             -1, self.page_size, layer.tp_v_head_num, layer.head_dim
         )
 
+        cache_loc_swa = forward_batch.out_cache_loc_swa
         if key is not None and value is not None:
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -365,6 +366,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     value,
                     layer.k_scale,
                     layer.v_scale,
+                    loc_swa=cache_loc_swa,
                 )
 
         if not save_kv_cache:
@@ -452,6 +454,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             -1, self.page_size, layer.tp_v_head_num, layer.head_dim
         )
 
+        cache_loc_swa = forward_batch.out_cache_loc_swa
         if key is not None and value is not None:
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -461,6 +464,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
                     value,
                     layer.k_scale,
                     layer.v_scale,
+                    loc_swa=cache_loc_swa,
                 )
 
         # apply DCA scaling

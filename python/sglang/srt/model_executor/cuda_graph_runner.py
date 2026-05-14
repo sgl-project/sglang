@@ -182,7 +182,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
             out_cache_loc_swa = (
-                torch.zeros((max_num_token,), dtype=torch.int32)
+                torch.zeros((max_num_token,), dtype=cache_loc_dtype)
                 if is_hybrid_swa
                 else None
             )
@@ -371,7 +371,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 dsts.append(buf[:dim])
                 srcs.append(src)
 
-        # SWA cache location (int32, separate from the int64 batch above).
+        # SWA cache location.
         if (
             self.out_cache_loc_swa is not None
             and forward_batch.out_cache_loc_swa is not None
@@ -1069,6 +1069,12 @@ class CudaGraphRunner:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
+        out_cache_loc_swa = (
+            self.buffers.out_cache_loc_swa[:num_tokens]
+            if self.buffers.out_cache_loc_swa is not None
+            else None
+        )
+
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -1082,6 +1088,7 @@ class CudaGraphRunner:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=attn_backend,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
             seq_lens_sum=seq_lens.sum().item(),
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
@@ -1161,15 +1168,6 @@ class CudaGraphRunner:
             return logits_output_or_pp_proxy_tensors
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
-
-        # swa_loc must be set before capture so that set_kv_buffer's
-        # Python branch (if self.swa_loc is not None) takes the fast path,
-        # and the graph records GPU ops using this buffer instead of the
-        # per-layer translate_loc_from_full_to_swa fallback.
-        if self.buffers.out_cache_loc_swa is not None:
-            self.model_runner.token_to_kv_pool.set_swa_loc(
-                self.buffers.out_cache_loc_swa[:num_tokens]
-            )
 
         for _ in range(2):
             self.device_module.synchronize()

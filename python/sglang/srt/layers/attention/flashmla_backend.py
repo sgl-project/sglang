@@ -406,6 +406,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         save_kv_cache: bool = True,
     ):
         cache_loc = forward_batch.out_cache_loc
+        cache_loc_swa = forward_batch.out_cache_loc_swa
 
         if k is not None:
             assert v is not None
@@ -415,6 +416,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     cache_loc,
                     k,
                     v,
+                    loc_swa=cache_loc_swa,
                 )
         bs = forward_batch.batch_size
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -484,11 +486,18 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
         else:
             cache_loc = forward_batch.out_cache_loc
+            cache_loc_swa = forward_batch.out_cache_loc_swa
 
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        loc_swa=cache_loc_swa,
+                    )
 
             bs = forward_batch.batch_size
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)

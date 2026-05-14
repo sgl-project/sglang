@@ -708,6 +708,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
+        cache_loc_swa = forward_batch.out_cache_loc_swa
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
@@ -726,7 +727,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                    loc_swa=cache_loc_swa,
                 )
 
         # For XQA, q_dtype should be bf16
@@ -794,6 +801,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ):
         cache_loc = forward_batch.out_cache_loc
+        cache_loc_swa = forward_batch.out_cache_loc_swa
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
@@ -812,7 +820,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                    loc_swa=cache_loc_swa,
                 )
 
         if self.data_type == torch.float8_e4m3fn:

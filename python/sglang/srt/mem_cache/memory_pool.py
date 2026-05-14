@@ -770,6 +770,7 @@ class KVCache(abc.ABC):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        loc_swa: Optional[torch.Tensor] = None,
     ) -> None:
         raise NotImplementedError()
 
@@ -1053,6 +1054,7 @@ class MHATokenToKVPool(KVCache):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        loc_swa: Optional[torch.Tensor] = None,
     ):
         if layer_id_override is not None:
             layer_id = layer_id_override
@@ -1341,6 +1343,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        loc_swa: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
@@ -1551,6 +1554,7 @@ class HybridLinearKVPool(KVCache):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        loc_swa: Optional[torch.Tensor] = None,
     ):
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         if not self.use_mla:
@@ -1734,6 +1738,7 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        loc_swa: Optional[torch.Tensor] = None,
     ):
         layer_id = layer.layer_id
         assert not self.nsa_kv_cache_store_fp8
@@ -1913,6 +1918,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
+        loc_swa: Optional[torch.Tensor] = None,
     ):
         layer_id = layer.layer_id
         assert not self.nsa_kv_cache_store_fp8

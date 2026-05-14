@@ -55,7 +55,6 @@ class SWAKVPool(BaseSWAKVPool):
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
         self.start_layer = 0
         self.page_size = page_size
-        self.swa_loc = None
         self.layer_transfer_counter = None
 
         kwargs["page_size"] = page_size
@@ -159,9 +158,6 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
-    def set_swa_loc(self, loc: torch.Tensor):
-        self.swa_loc = loc
-
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
 
@@ -177,16 +173,16 @@ class SWAKVPool(BaseSWAKVPool):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        loc_swa: torch.Tensor = None,
     ):
 
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            if self.swa_loc is not None:
-                loc = self.swa_loc
-            else:
-                if self.full_to_swa_index_mapping is not None:
-                    loc = self.translate_loc_from_full_to_swa(loc)
+            if loc_swa is not None:
+                loc = loc_swa
+            elif self.full_to_swa_index_mapping is not None:
+                loc = self.translate_loc_from_full_to_swa(loc)
 
             self.swa_kv_pool.set_kv_buffer(
                 None,

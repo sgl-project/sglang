@@ -903,6 +903,7 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        cache_loc_swa = forward_batch.out_cache_loc_swa
         if k is None and v is None:
             pool = forward_batch.token_to_kv_pool
             cache_loc = forward_batch.out_cache_loc
@@ -922,6 +923,7 @@ class TritonAttnBackend(AttentionBackend):
                         forward_batch.out_cache_loc,
                         k,
                         v,
+                        loc_swa=cache_loc_swa,
                     )
                 elif self.use_mla:
                     # For MLA, scale K manually before storing since MLATokenToKVPool
@@ -933,6 +935,7 @@ class TritonAttnBackend(AttentionBackend):
                         forward_batch.out_cache_loc,
                         k_scaled,
                         v,
+                        loc_swa=cache_loc_swa,
                     )
                 else:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -942,6 +945,7 @@ class TritonAttnBackend(AttentionBackend):
                         v.clone(),
                         layer.k_scale,
                         layer.v_scale,
+                        loc_swa=cache_loc_swa,
                     )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
@@ -1057,9 +1061,6 @@ class TritonAttnBackend(AttentionBackend):
             prefix_kv_indices = self.forward_metadata.kv_indices
             window_start_pos = None
 
-        # For SWA layers, mirror SWAKVPool.set_kv_buffer: read from the
-        # precomputed pool.swa_loc. Translate out_cache_loc to SWA-pool index space
-        # as a fallback when pool.swa_loc is not pre-populated.
         extend_kv_indices = forward_batch.out_cache_loc
         pool = forward_batch.token_to_kv_pool
         if (
@@ -1068,8 +1069,8 @@ class TritonAttnBackend(AttentionBackend):
             and isinstance(pool, SWAKVPool)
             and pool.layers_mapping[layer.layer_id][1]
         ):
-            if pool.swa_loc is not None:
-                extend_kv_indices = pool.swa_loc
+            if cache_loc_swa is not None:
+                extend_kv_indices = cache_loc_swa
             else:
                 extend_kv_indices = pool.translate_loc_from_full_to_swa(
                     extend_kv_indices
@@ -1164,6 +1165,7 @@ class TritonAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
+        cache_loc_swa = forward_batch.out_cache_loc_swa
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -1187,6 +1189,7 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.out_cache_loc,
                     k,
                     v,
+                    loc_swa=cache_loc_swa,
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -1196,6 +1199,7 @@ class TritonAttnBackend(AttentionBackend):
                     v,
                     layer.k_scale,
                     layer.v_scale,
+                    loc_swa=cache_loc_swa,
                 )
 
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:

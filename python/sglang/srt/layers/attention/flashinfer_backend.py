@@ -794,6 +794,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        cache_loc_swa = forward_batch.out_cache_loc_swa
 
         logits_soft_cap = layer.logit_cap
 
@@ -803,7 +804,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
+                        loc_swa=cache_loc_swa,
                     )
 
             causal = (
@@ -885,7 +892,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                    loc_swa=cache_loc_swa,
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -908,12 +921,19 @@ class FlashInferAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        cache_loc_swa = forward_batch.out_cache_loc_swa
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                    loc_swa=cache_loc_swa,
                 )
 
         # Call the wrapped function
