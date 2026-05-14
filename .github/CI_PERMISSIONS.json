@@ -475,6 +475,13 @@
         "cooldown_interval_minutes": 0,
         "reason": "top contributor"
     },
+    "charlotte12l": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
+    },
     "chenxu214": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -686,6 +693,13 @@
         "reason": "top contributor"
     },
     "jason-fxz": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
+    },
+    "jasonjk-park": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "can_rerun_stage": true,
