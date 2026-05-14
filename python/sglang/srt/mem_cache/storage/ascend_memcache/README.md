@@ -11,8 +11,8 @@
 
 
 ## 安装SGLang
-```
-git clone https://github.com/nbbb24/sglang.git
+```bash
+git clone https://github.com/sgl-project/sglang.git
 ```
 [ascend安装指南](https://github.com/nbbb24/sglang/blob/main/docs/platforms/ascend/ascend_npu.md)
 
@@ -282,35 +282,21 @@ python python/sglang/srt/mem_cache/storage/ascend_memcache/start_local_store.py 
 ```
 
 
-## 运行Ascend_memcache backend
+## 运行Ascend_memcache as L3 backend
 
 
 
-#### Shell 1: 启动 master
+#### Shell 1: 启动 meta service
 
-```
-docker start -ai sglang_a3_service
-```
-```
-source /usr/local/memfabric_hybrid/set_env.sh
-source /usr/local/memcache_hybrid/set_env.sh
-```
-```
-cd /home/sxy/sglang
-```
 ```
 python python/sglang/srt/mem_cache/storage/ascend_memcache/start_meta_service.py \
   --config_path python/sglang/srt/mem_cache/storage/ascend_memcache/metaservice_config.json
   ```
  
   
-#### Shell2: sglang
-```
-docker exec -it sglang_a3_service bash
-```
-```
-cd /home/sxy/sglang
-```
+#### Shell2: 启动 SGLang Server
+
+运行
 ```
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/memfabric_hybrid/set_env.sh
@@ -319,40 +305,19 @@ source /usr/local/memcache_hybrid/set_env.sh
 export SGLANG_HICACHE_MEMCACHE_CONFIG_PATH=/home/sxy/sglang/python/sglang/srt/mem_cache/storage/ascend_memcache/localservice_config.json
 export MMC_LOCAL_CONFIG_PATH=/usr/local/memcache_hybrid/latest/config/mmc-local.conf
 export PYTHONPATH=/home/sxy/sglang/python:$PYTHONPATH
-```
-运行
-```
+
+export ASCEND_RT_VISIBLE_DEVICES=13
 python -m sglang.launch_server \
   --model-path /home/data/weights/DeepSeek-V2-Lite-Chat \
   --attention-backend ascend \
   --enable-hierarchical-cache \
   --hicache-storage-backend ascend_memcache \
+  --hicache-io-backend kernel_ascend \
+  --hicache-mem-layout page_first_kv_split \
+  --max-total-tokens 4096 \
+  --hicache-ratio 1.01 \
+  --page-size 16 \
+  --hicache-storage-backend-extra-config '{"prefetch_threshold":2}' \
   --host 0.0.0.0 \
   --port 30000
-```
-
-测试
-```
-curl -X POST http://localhost:30000/generate \
-    -H "Content-Type: application/json" \
-    -d '{
-        "text": "The capital of France is",
-        "sampling_params": {
-            "temperature": 0,
-            "max_new_tokens": 16
-        }
-    }'
-```
-
-```
-curl -X POST http://localhost:30000/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "You are a careful assistant. Read the following long context and then answer.\n\n[Document Start]\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\n[Document End]\n\nQuestion: Where is the capital of France? What is it famous for? Is it in Asia?",
-    "sampling_params": {
-      "temperature": 0,
-      "max_new_tokens": 100
-    }
-  }'
-
 ```
