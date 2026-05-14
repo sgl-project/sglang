@@ -141,6 +141,26 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             }
         }
 
+        // Initialize PD global cache-aware policies (prefill/decode OnceLock instances).
+        // These are separate from per-model policies and must be updated whenever workers
+        // are registered, because factory.rs creates the CacheAwarePolicy with an empty
+        // tree and never calls init_pd_cache_aware_policies() afterwards.
+        let decode_workers = app_context.worker_registry.get_decode_workers();
+        {
+            let prefill_policy = app_context.policy_registry.get_prefill_policy();
+            let decode_policy = app_context.policy_registry.get_decode_policy();
+            if prefill_policy.name() == "cache_aware" || decode_policy.name() == "cache_aware" {
+                app_context
+                    .policy_registry
+                    .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+                debug!(
+                    "Updated PD cache-aware policies: {} prefill workers, {} decode workers",
+                    prefill_workers.len(),
+                    decode_workers.len()
+                );
+            }
+        }
+
         debug!(
             "Updated policies for {} workers across {} models",
             workers.len(),
