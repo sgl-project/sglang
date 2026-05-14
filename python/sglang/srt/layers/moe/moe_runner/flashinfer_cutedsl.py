@@ -259,12 +259,12 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_tokens: int = 0) -> None:
     use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
 
     # Buffer size must cover the worst-case token count the MoE layer can see.
-    # - A2A path: bounded by the dispatcher's workspace allocation.
+    # - A2A path: dispatch returns tensors flattened from
+    #   [ep_size, max_tokens_per_rank, ...].
     # - Standard allgather path: dp_size * max local tokens per rank.
     dispatcher = getattr(layer, "dispatcher", None)
     if hasattr(dispatcher, "max_num_tokens"):
-        # A2A path: bounded by the dispatcher's workspace allocation.
-        max_num_tokens = dispatcher.max_num_tokens
+        max_num_tokens = dispatcher.max_num_tokens * getattr(dispatcher, "ep_size", 1)
     else:
         # Standard allgather path: num_tokens from the first forward is
         # req_to_token_pool.size * dp_size (the autotune dummy run's batch),
