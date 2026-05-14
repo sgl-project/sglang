@@ -515,7 +515,7 @@ class NativeSparseAttnBackend(
                     page_table, repeats=self.speculative_num_draft_tokens, dim=0
                 )
             else:
-                # DRAFT_EXTEND (v1): V1 worker extends by (num_accepted_drafts + 1) per request
+                # DRAFT_EXTEND (v1): V1 worker extends by (num_correct_drafts + 1) per request
                 # after verification. Lengths vary per request based on how many tokens
                 # were accepted.
                 page_table = torch.repeat_interleave(
@@ -1053,7 +1053,7 @@ class NativeSparseAttnBackend(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
 
-            extend_seq_lens = spec_info.num_accepted_tokens[:bs]
+            extend_seq_lens = spec_info.num_accept_tokens[:bs]
             extend_seq_lens_cpu = extend_seq_lens.tolist()
 
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
@@ -1594,7 +1594,13 @@ class NativeSparseAttnBackend(
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
+            # Caller passed split q_nope / q_rope; we'll need to concat below if
+            # the chosen impl wants q_all.
+            q_all = None
         else:
+            # Caller passed already-concatenated q (q_all = q). Reuse it directly
+            # via a zero-copy view; the impl-specific blocks below will skip the
+            # otherwise redundant concat_mla_absorb_q_general call.
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
@@ -1643,7 +1649,11 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif self.nsa_decode_impl == "tilelang":
-            if q_rope is not None:
+            # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
+            # has already been set to a zero-copy view of q in the else branch
+            # above and we can reuse it directly. The `not _is_hip` clause keeps
+            # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
+            if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
@@ -1668,7 +1678,7 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
         elif self.nsa_decode_impl == "aiter":
-            if q_rope is not None:
+            if q_all is None or not _is_hip:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
             return self._forward_aiter(
                 q_all=q_all,

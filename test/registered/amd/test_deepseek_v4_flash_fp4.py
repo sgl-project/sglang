@@ -1,6 +1,6 @@
-"""MI35x DeepSeek-V4-Flash FP8 Test (8-GPU)
+"""MI35x DeepSeek-V4-Flash FP4 Test (8-GPU)
 
-Combined accuracy + performance test for DeepSeek-V4-Flash FP8 on MI35x ROCm 7.2.
+Combined accuracy + performance test for DeepSeek-V4-Flash FP4 on MI35x ROCm 7.2.
 - Accuracy: GSM8K few-shot eval
 - Performance: bench_one_batch_server with input_len=8192, output_len=1024 (bs=1)
 
@@ -30,24 +30,28 @@ register_amd_ci(
     est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-flash", nightly=True
 )
 
-DEEPSEEK_V4_FP8_MODEL_PATH = os.environ.get(
-    "DEEPSEEK_V4_FP8_MODEL_PATH", "sgl-project/DeepSeek-V4-Flash-FP8"
+DEEPSEEK_V4_FP4_MODEL_PATH = os.environ.get(
+    "DEEPSEEK_V4_FP4_MODEL_PATH", "deepseek-ai/DeepSeek-V4-Flash"
 )
 SERVER_LAUNCH_TIMEOUT = 3600
 
 # Common DeepSeek-V4 env vars (AMD ROCm 7.2 path: tilelang + AITER + ROCm700A).
 # Source of truth: python/run_dsv4.sh.
 COMMON_ENV_VARS = {
-    "SGLANG_OPT_USE_FUSED_COMPRESS": "false",
+    "SGLANG_OPT_USE_FUSED_COMPRESS": "true",
     "SGLANG_OPT_USE_OLD_COMPRESSOR": "true",
     "SGLANG_OPT_USE_TILELANG_SWA_PREPARE": "false",
+    "SGLANG_OPT_USE_TRITON_SWA_PREPARE": "true",
     "SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK": "false",
     "SGLANG_OPT_USE_FUSED_HASH_TOPK": "false",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
+    "SGLANG_OPT_USE_AITER_MHC_PRE": "true",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
+    "SGLANG_OPT_USE_AITER_MHC_POST": "true",
     "SGLANG_ENABLE_THINKING": "1",
     "SGLANG_USE_AITER": "1",
+    "AITER_BF16_FP8_MOE_BOUND": "1",
     "SGLANG_USE_ROCM700A": "1",
     "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "1",
     "SGLANG_OPT_DPSK_V4_RADIX": "0",
@@ -55,26 +59,26 @@ COMMON_ENV_VARS = {
     "SGLANG_OPT_USE_FUSED_STORE_CACHE": "false",
     "SGLANG_TOPK_TRANSFORM_512_TORCH": "1",
     "SGLANG_OPT_USE_TILELANG_INDEXER": "true",
-    "SGLANG_HACK_FLASHMLA_BACKEND": "tilelang",
+    "SGLANG_HACK_FLASHMLA_BACKEND": "triton",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
 }
 
-# FP8 variant: dense-FP8 experts via the Triton MoE FP8 path.
-FP8_ENV_VARS = {
-    "SGLANG_DSV4_FP4_EXPERTS": "false",
-    "SGLANG_FORCE_TRITON_MOE_FP8": "1",
+# FP4 variant: FP4 mixed-precision experts.
+FP4_ENV_VARS = {
+    "SGLANG_DSV4_FP4_EXPERTS": "true",
+    "SGLANG_FORCE_TRITON_MOE_FP8": "0",
 }
 
 
-class TestDeepseekV4Fp8(CustomTestCase):
+class TestDeepseekV4Fp4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEEPSEEK_V4_FP8_MODEL_PATH
+        cls.model = DEEPSEEK_V4_FP4_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         env = os.environ.copy()
         env.update(COMMON_ENV_VARS)
-        env.update(FP8_ENV_VARS)
+        env.update(FP4_ENV_VARS)
 
         other_args = [
             "--trust-remote-code",
@@ -82,7 +86,7 @@ class TestDeepseekV4Fp8(CustomTestCase):
             "8",
             "--disable-radix-cache",
             "--attention-backend",
-            "dsv4",
+            "compressed",
             "--max-running-requests",
             "256",
             "--page-size",
@@ -124,13 +128,13 @@ class TestDeepseekV4Fp8(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v4-flash-fp8)\n"
+                f"### test_gsm8k (deepseek-v4-flash-fp4)\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.91)
 
     def test_b_perf_8k_1k(self):
-        json_output = "/tmp/deepseek_v4_flash_fp8_perf.json"
+        json_output = "/tmp/deepseek_v4_flash_fp4_perf.json"
         if os.path.exists(json_output):
             os.remove(json_output)
 
@@ -179,7 +183,7 @@ class TestDeepseekV4Fp8(CustomTestCase):
             report_results = results_data
 
         summary_lines = [
-            "### test_perf_8k_1k (deepseek-v4-flash-fp8)",
+            "### test_perf_8k_1k (deepseek-v4-flash-fp4)",
             "input_len=8192 output_len=1024",
             "",
             "| batch size | latency (s) | input throughput (tok/s) | output throughput (tok/s) | ITL (ms) |",
@@ -204,4 +208,12 @@ class TestDeepseekV4Fp8(CustomTestCase):
 
 
 if __name__ == "__main__":
+    # run_suite.py's run_one_file launches each test file with `python3 <file> -f`,
+    # which enables unittest fail-fast. For this file, `test_a_gsm8k` (accuracy)
+    # and `test_b_perf_8k_1k` (performance) are independent measurements that
+    # share a very expensive server launch in setUpClass; we want perf data even
+    # if accuracy fails. Strip `-f` locally so subsequent test methods still run.
+    import sys
+
+    sys.argv = [a for a in sys.argv if a not in ("-f", "--failfast")]
     unittest.main()

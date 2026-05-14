@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/tests/kernels/mamba/test_mamba_mixer2.py
 
 
@@ -16,7 +18,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.utils import get_device, get_device_count
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=32, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=32, stage="stage-b", runner_config="2-gpu-large")
 
 NUM_GPUS = 2
 
