@@ -33,12 +33,10 @@ class EngineScoreMixin:
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-        # Placeholder token id in query/items that indicates override locations.
         embed_override_token_id: Optional[int] = None,
-        # Query embedding overrides.
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
-        # Item embedding overrides: per-item list of tensors.
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
+        return_pooled_hidden_states: bool = False,
     ) -> ScoreResult:
         """
         Score items against a query using the loaded model.
@@ -63,9 +61,13 @@ class EngineScoreMixin:
             embed_override_token_id: Placeholder token ID used to locate override positions.
             query_embed_overrides: Embedding vectors replacing placeholder tokens in query.
             item_embed_overrides: Per-item embedding vectors replacing placeholder tokens in items.
+            return_pooled_hidden_states: Whether to include raw pooled transformer
+                hidden states (before the task head) in the result. Only supported
+                for non-generation models (SequenceClassification, RewardModel).
 
         Returns:
-            ScoreResult with scores (one list per item) and prompt token count.
+            ScoreResult with scores (one list per item), prompt token count, and
+            optional pooled_hidden_states tensors.
         """
         return self.loop.run_until_complete(
             self.tokenizer_manager.score_request(
@@ -78,6 +80,7 @@ class EngineScoreMixin:
                 query_embed_overrides=query_embed_overrides,
                 item_embed_overrides=item_embed_overrides,
                 request=None,
+                return_pooled_hidden_states=return_pooled_hidden_states,
             )
         )
 
@@ -91,6 +94,7 @@ class EngineScoreMixin:
         embed_override_token_id: Optional[int] = None,
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
+        return_pooled_hidden_states: bool = False,
     ) -> ScoreResult:
         """Asynchronous version of score(). See score() for full documentation."""
         return await self.tokenizer_manager.score_request(
@@ -103,4 +107,5 @@ class EngineScoreMixin:
             query_embed_overrides=query_embed_overrides,
             item_embed_overrides=item_embed_overrides,
             request=None,
+            return_pooled_hidden_states=return_pooled_hidden_states,
         )

@@ -2,16 +2,15 @@
 python3 -m unittest test_deepseek_ocr.py
 """
 
-import gc
 import json
 import os
 import unittest
 from pathlib import Path
 
 import requests
-from transformers import AutoTokenizer
 
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -22,25 +21,9 @@ from sglang.test.test_utils import (
 
 class TestDeepSeekOCR(CustomTestCase):
     @classmethod
-    def _cleanup_xpu_memory(cls):
-        gc.collect()
-        try:
-            import torch
-
-            if hasattr(torch, "xpu") and torch.xpu.is_available():
-                torch.xpu.synchronize()
-                torch.xpu.empty_cache()
-        except Exception:
-            # Best-effort cleanup only; tests should continue if cleanup is unavailable.
-            pass
-
-    @classmethod
     def setUpClass(cls):
-        cls._cleanup_xpu_memory()
         cls.model = "deepseek-ai/DeepSeek-OCR"
-        cls.tokenizer = AutoTokenizer.from_pretrained(
-            cls.model, use_fast=False, trust_remote_code=True
-        )
+        cls.tokenizer = get_tokenizer(cls.model)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.image_path = str(
             (Path(__file__).resolve().parents[3] / "examples/assets/example_image.png")
@@ -67,8 +50,12 @@ class TestDeepSeekOCR(CustomTestCase):
     def tearDownClass(cls):
         """Fixture that is run once after all tests in the class."""
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-        cls._cleanup_xpu_memory()
+            cls.process.terminate()
+            try:
+                cls.process.wait(timeout=30)
+            except Exception:
+                # Force kill if it didn't exit cleanly in time
+                kill_process_tree(cls.process.pid)
 
     def get_request_json(self, max_new_tokens=32, n=1):
         response = requests.post(

@@ -2,7 +2,7 @@ name: Weekly Update Est Time
 
 on:
   schedule:
-    - cron: '0 0 * * 6'  # Saturday 00:00 UTC
+    - cron: '0 0 * * 1'  # Monday 00:00 UTC
   workflow_dispatch: {}
 
 permissions:
@@ -27,7 +27,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python scripts/ci/update_est_time.py
+          python scripts/ci/update_est_time.py \
+            --summary-file /tmp/est_time_summary.md
 
       - name: Check for changes
         id: changes
@@ -57,14 +58,22 @@ jobs:
 
           git push origin "$BRANCH_NAME"
 
+          {
+            echo "## Summary"
+            echo
+            echo "Updates \`est_time\` values in CI test registration calls based on the 90th percentile of the last 15 successful executions from scheduled PR Test runs on main."
+            echo
+            echo "This keeps the LPT load-balancing algorithm accurate for partitioning tests across parallel CI jobs."
+            echo
+            if [ -f /tmp/est_time_summary.md ]; then
+              cat /tmp/est_time_summary.md
+              echo
+            fi
+            echo "🤖 Generated with GitHub Actions"
+          } > /tmp/pr_body.md
+
           gh pr create \
             --title "chore: update CI test est_time values" \
-            --body "## Summary
-
-          Updates \`est_time\` values in CI test registration calls based on the median of the last 10 successful executions from scheduled PR Test runs on main.
-
-          This keeps the LPT load-balancing algorithm accurate for partitioning tests across parallel CI jobs.
-
-          🤖 Generated with GitHub Actions" \
+            --body-file /tmp/pr_body.md \
             --base main \
             --head "$BRANCH_NAME"

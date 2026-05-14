@@ -21,7 +21,7 @@ on:
 
 concurrency:
   group: pr-test-xeon-${{ inputs.ref || github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
   # ==================== Check Changes ==================== #
@@ -58,7 +58,7 @@ jobs:
               - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "python/pyproject_cpu.toml"
               - "test/**/!(*.md)"
-              - "sgl-kernel/**/*.!(md|txt)"
+              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-xeon.yml"
               - "docker/xeon.Dockerfile"
 
@@ -115,7 +115,7 @@ jobs:
         timeout-minutes: 36
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_xeon \
-            bash -c "source /opt/.venv/bin/activate && cd ./test/srt && python3 run_suite.py --suite per-commit-cpu --timeout-per-file 1500"
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite stage-b-test-cpu"
 
       - name: Change permission
         timeout-minutes: 2

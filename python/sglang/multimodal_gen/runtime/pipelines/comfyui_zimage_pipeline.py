@@ -143,7 +143,6 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         head_dim = dim // num_heads
         q_size = dim
         k_size = head_dim * num_kv_heads
-        v_size = head_dim * num_kv_heads
 
         for name, tensor in weight_iterator:
             # Match qkv weights in layers, noise_refiner, or context_refiner
@@ -311,7 +310,6 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
             if use_fsdp:
-                world_size = server_args.hsdp_replicate_dim * server_args.hsdp_shard_dim
                 device_mesh = init_device_mesh(
                     current_platform.device_type,
                     mesh_shape=(
@@ -326,7 +324,9 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                     reshard_after_forward=True,
                     mp_policy=mp_policy,
                     mesh=device_mesh,
-                    fsdp_shard_conditions=model._fsdp_shard_conditions,
+                    fsdp_shard_conditions=getattr(
+                        model, "_fsdp_shard_conditions", None
+                    ),
                     pin_cpu_memory=server_args.pin_cpu_memory,
                 )
 

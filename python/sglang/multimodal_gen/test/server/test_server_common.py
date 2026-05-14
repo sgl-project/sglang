@@ -2,7 +2,7 @@
 Config-driven diffusion generation test with pytest parametrization.
 
 
-If the actual run is significantly better than the baseline, the improved cases with their updated baseline will be printed
+Each collected request prints a performance log before validation.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
 )
 from sglang.multimodal_gen.test.test_utils import (
+    SGL_TEST_FILES_CI_DATA_REVISION,
     _consistency_gt_filenames,
     _get_consistency_gt_dir,
     compare_with_gt,
@@ -46,6 +47,7 @@ from sglang.multimodal_gen.test.test_utils import (
     gt_exists,
     image_bytes_to_numpy,
     load_consistency_gt,
+    save_consistency_failure_artifact,
     wait_for_req_perf_record,
 )
 
@@ -78,6 +80,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
+    extra_args = f"--model-type diffusion {extra_args}".strip()
 
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
@@ -122,6 +125,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     env_vars = {}
     if server_args.enable_cache_dit:
         env_vars["SGLANG_CACHE_DIT_ENABLED"] = "true"
+    env_vars.update(server_args.env_vars)
 
     # start server
     wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200"))
@@ -154,7 +158,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         # pipeline class.  This avoids hard failures when a model needs a
         # newer diffusers release than what is currently installed in CI.
         msg = str(exc)
-        if "not found in diffusers" in msg or "has no attribute" in msg:
+        if "not found in diffusers" in msg or (
+            "has no attribute" in msg and "diffusers" in msg.lower()
+        ):
             pytest.skip(
                 f"Skipping {case.id}: required diffusers pipeline class "
                 f"is not available in the installed version. "
@@ -219,13 +225,11 @@ class DiffusionServerBase:
     """
 
     _perf_results: list[dict[str, Any]] = []
-    _improved_baselines: list[dict[str, Any]] = []
     _pytest_config = None  # Store pytest config for stash access
 
     @classmethod
     def setup_class(cls):
         cls._perf_results = []
-        cls._improved_baselines = []
 
     @classmethod
     def teardown_class(cls):
@@ -244,20 +248,6 @@ class DiffusionServerBase:
             print(
                 "[DEBUG teardown_class] No pytest_config available, skipping stash update"
             )
-
-        if cls._improved_baselines:
-            import json
-
-            output = """
---- POTENTIAL BASELINE IMPROVEMENTS DETECTED ---
-The following test cases performed significantly better than their baselines.
-Consider updating perf_baselines.json with the snippets below:
-"""
-            for item in cls._improved_baselines:
-                output += (
-                    f'\n"{item["id"]}": {json.dumps(item["baseline"], indent=4)},\n'
-                )
-            print(output)
 
     @pytest.fixture(autouse=True)
     def _capture_pytest_config(self, request):
@@ -345,6 +335,7 @@ Consider updating perf_baselines.json with the snippets below:
         )
 
         summary = validator.collect_metrics(perf_record)
+        self._print_performance_log(case, summary, scenario)
 
         if case.run_perf_check:
             if is_baseline_generation_mode:
@@ -358,8 +349,6 @@ Consider updating perf_baselines.json with the snippets below:
                         f"Testcase '{case.id}' not found in perf_baselines.json"
                     )
                 return
-
-            self._check_for_improvement(case, summary, scenario)
 
             # only run performance validation if run_perf_check is True
             try:
@@ -394,83 +383,43 @@ Consider updating perf_baselines.json with the snippets below:
             f"[DEBUG _validate_and_record] Appended result for {case.id}, class {self.__class__.__name__} now has {len(self.__class__._perf_results)} results"
         )
 
-    def _check_for_improvement(
+    def _print_performance_log(
         self,
         case: DiffusionTestCase,
         summary: PerformanceSummary,
-        scenario: "ScenarioConfig",
+        scenario: ScenarioConfig | None,
     ) -> None:
-        """Check for potential significant performance improvements and record them."""
-        is_improved = False
-        threshold = BASELINE_CONFIG.improvement_threshold
-
-        def is_sig_faster(actual, expected):
-            if expected == 0 or expected is None:
-                return False
-            return actual < expected * (1 - threshold)
-
-        def safe_get_metric(metric_dict, key):
-            val = metric_dict.get(key)
-            return val if val is not None else float("inf")
-
-        # Check for any significant improvement
-        if (
-            is_sig_faster(summary.e2e_ms, scenario.expected_e2e_ms)
-            or is_sig_faster(summary.avg_denoise_ms, scenario.expected_avg_denoise_ms)
-            or is_sig_faster(
-                summary.median_denoise_ms, scenario.expected_median_denoise_ms
+        lines = [
+            "",
+            f"--- Performance Log: {case.id} ---",
+            (
+                f"  e2e={summary.e2e_ms:.2f}ms, "
+                f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
+                f"median_denoise={summary.median_denoise_ms:.2f}ms"
+            ),
+        ]
+        if scenario is not None:
+            lines.append(
+                "  baseline: "
+                f"e2e={scenario.expected_e2e_ms:.2f}ms, "
+                f"avg_denoise={scenario.expected_avg_denoise_ms:.2f}ms, "
+                f"median_denoise={scenario.expected_median_denoise_ms:.2f}ms"
             )
-        ):
-            is_improved = True
-        # Combine metrics, always taking the better (lower) value
-        new_stages = {
-            stage: min(
-                safe_get_metric(summary.stage_metrics, stage),
-                safe_get_metric(scenario.stages_ms, stage),
+        if summary.stage_metrics:
+            stages = ", ".join(
+                f"{name}={duration:.2f}ms"
+                for name, duration in summary.stage_metrics.items()
             )
-            for stage in set(summary.stage_metrics) | set(scenario.stages_ms)
-        }
-        new_denoise_steps = {
-            step: min(
-                safe_get_metric(summary.all_denoise_steps, step),
-                safe_get_metric(scenario.denoise_step_ms, step),
+            lines.append(f"  stages: {stages}")
+        if summary.all_denoise_steps:
+            # ci retries need the exact outlier, not only sampled checkpoints
+            steps = ", ".join(
+                f"{idx}={duration:.2f}ms"
+                for idx, duration in sorted(summary.all_denoise_steps.items())
             )
-            for step in set(summary.all_denoise_steps.keys())
-            | set(scenario.denoise_step_ms)
-        }
-
-        # Check for stage-level improvements
-        if not is_improved:
-            for stage, new_val in new_stages.items():
-                if is_sig_faster(new_val, scenario.stages_ms.get(stage, float("inf"))):
-                    is_improved = True
-                    break
-        if not is_improved:
-            for step, new_val in new_denoise_steps.items():
-                if is_sig_faster(
-                    new_val, scenario.denoise_step_ms.get(step, float("inf"))
-                ):
-                    is_improved = True
-                    break
-
-        if is_improved:
-            new_baseline = {
-                "stages_ms": {k: round(v, 2) for k, v in new_stages.items()},
-                "denoise_step_ms": {
-                    str(k): round(v, 2) for k, v in new_denoise_steps.items()
-                },
-                "expected_e2e_ms": round(
-                    min(summary.e2e_ms, scenario.expected_e2e_ms), 2
-                ),
-                "expected_avg_denoise_ms": round(
-                    min(summary.avg_denoise_ms, scenario.expected_avg_denoise_ms), 2
-                ),
-                "expected_median_denoise_ms": round(
-                    min(summary.median_denoise_ms, scenario.expected_median_denoise_ms),
-                    2,
-                ),
-            }
-            self._improved_baselines.append({"id": case.id, "baseline": new_baseline})
+            lines.append(f"  denoise_steps: {steps}")
+        lines.append(f"--- End Performance Log: {case.id} ---")
+        print("\n".join(lines), flush=True)
 
     def _dump_baseline_for_testcase(
         self,
@@ -557,13 +506,14 @@ Consider updating perf_baselines.json with the snippets below:
 --- MISSING GROUND TRUTH DETECTED ---
 GT image(s) not found for '{case.id}'.
 
-Add the expected file(s) to sglang-ci-data in diffusion-ci/consistency_gt/ with naming (n=num_gpus).
+Add the expected file(s) to sgl-project/ci-data in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_gpus).
   Image: {case.id}_{{n}}gpu.<ext> (ext from output_format: png, jpg, webp)
   Video: {case.id}_{{n}}gpu_frame_0.png, {case.id}_{{n}}gpu_frame_mid.png, {case.id}_{{n}}gpu_frame_last.png
 
 For this case, expected file(s): {names}
 
-Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/consistency_gt/)
+Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/)
+Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
 (Optional) Per-case override in consistency_threshold.json:
   "cases": {{
@@ -604,6 +554,22 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
                 is_video=is_video,
                 output_format=output_format,
             )
+            artifact_path = save_consistency_failure_artifact(
+                artifact_dir=os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                case_id=case.id,
+                num_gpus=num_gpus,
+                output_frames=output_frames,
+                gt_data=gt_data,
+                result=result,
+                is_video=is_video,
+                output_format=output_format,
+                gt_remote_files=gt_remote_files,
+            )
+            if artifact_path is not None:
+                logger.info(
+                    "[Artifact] Saved consistency failure comparison: %s",
+                    artifact_path,
+                )
             gt_remote_info = "\n".join(
                 f"    - {filename}: {url}" for filename, url in gt_remote_files
             )
@@ -1088,46 +1054,91 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
             self._save_gt_output(case, content)
             return
 
-        # Validation 1: Performance
-        self._validate_and_record(case, perf_record)
+        failures: list[tuple[str, str]] = []
 
-        # Mesh correctness check (Chamfer Distance) for 3D models
+        def run_case_check(name: str, fn: Callable[[], None]) -> None:
+            try:
+                fn()
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                failures.append((name, str(exc)))
+
+        run_case_check(
+            "performance",
+            lambda: self._validate_and_record(case, perf_record),
+        )
+
         if case.server_args.custom_validator == "mesh":
             from sglang.multimodal_gen.test.server.test_server_utils import (
                 MESH_OUTPUT_PATHS,
                 validate_mesh_correctness,
             )
 
-            mesh_path = MESH_OUTPUT_PATHS.pop(case.id, None)
-            if mesh_path:
-                validate_mesh_correctness(mesh_path)
+            def validate_mesh_output() -> None:
+                mesh_path = MESH_OUTPUT_PATHS.pop(case.id, None)
+                if mesh_path:
+                    validate_mesh_correctness(mesh_path)
 
-        # Test /v1/models endpoint for router compatibility
+            run_case_check("mesh correctness", validate_mesh_output)
+
         if case.run_models_api_check:
-            self._test_v1_models_endpoint(diffusion_server, case)
+            run_case_check(
+                "/v1/models endpoint",
+                lambda: self._test_v1_models_endpoint(diffusion_server, case),
+            )
         if case.run_t2v_input_reference_check:
-            self._test_t2v_rejects_input_reference(diffusion_server, case)
+            run_case_check(
+                "t2v input_reference rejection",
+                lambda: self._test_t2v_rejects_input_reference(diffusion_server, case),
+            )
 
         if case.run_consistency_check:
-            self._validate_consistency(case, content)
+            run_case_check(
+                "consistency",
+                lambda: self._validate_consistency(case, content),
+            )
 
-        # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
         if case.run_lora_basic_api_check:
-            self._test_lora_api_functionality(diffusion_server, case, generate_fn)
+            run_case_check(
+                "LoRA basic API",
+                lambda: self._test_lora_api_functionality(
+                    diffusion_server, case, generate_fn
+                ),
+            )
 
         if case.run_lora_dynamic_switch_check:
-            self._test_lora_dynamic_switch_e2e(
-                diffusion_server,
-                case,
-                generate_fn,
-                case.server_args.second_lora_path,
+            run_case_check(
+                "LoRA dynamic switch",
+                lambda: self._test_lora_dynamic_switch_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.second_lora_path,
+                ),
             )
 
         if case.run_multi_lora_api_check:
-            self._test_multi_lora_e2e(
-                diffusion_server,
-                case,
-                generate_fn,
-                case.server_args.lora_path,
-                case.server_args.second_lora_path,
+            run_case_check(
+                "multi-LoRA API",
+                lambda: self._test_multi_lora_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.lora_path,
+                    case.server_args.second_lora_path,
+                ),
+            )
+
+        if failures:
+            formatted_failures = []
+            for name, message in failures:
+                if "\n" in message:
+                    formatted_failures.append(f"[{name}]\n{message}")
+                else:
+                    formatted_failures.append(f"[{name}] {message}")
+            pytest.fail(
+                f"Diffusion testcase '{case.id}' failed {len(failures)} check(s):\n\n"
+                + "\n\n".join(formatted_failures),
+                pytrace=False,
             )

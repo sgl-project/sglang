@@ -303,6 +303,8 @@ class Platform:
             return "mccl"
         elif self.is_mps():
             return "gloo"
+        elif self.is_cpu():
+            return "gloo"
         elif self.is_xpu():
             return "xccl"
         else:

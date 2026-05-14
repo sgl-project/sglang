@@ -214,6 +214,32 @@ class FlashAttentionBackend(AttentionBackend):
             else 0
         )
 
+        # In embedding mode with no chunked prefill and radix cache disabled,
+        # skip KV cache write and use flash_attn_varlen_func with raw K/V
+        # instead of flash_attn_with_kvcache, bypassing paged KV cache entirely.
+        # Restricted to non-MLA backends: the read-skip elif lives inside the
+        # `if not self.use_mla:` branch in forward_extend, while the write-skip
+        # guard wraps both set_kv_buffer and set_mla_kv_buffer. Without this
+        # gate, MLA + is_embedding would skip the write but still read stale
+        # cache via get_key_buffer in the absorbed-MLA path.
+        server_args = model_runner.server_args
+        self.fa_skip_kv_cache = (
+            server_args.is_embedding
+            and server_args.chunked_prefill_size == -1
+            and server_args.disable_radix_cache
+            and not self.use_mla
+        )
+
+        # Skip the FA3 scheduler_metadata precompute (PR #21104) under DP
+        # attention. The precomputed buffer can become inconsistent with the
+        # num_splits the C++ mha_fwd kernel derives from live cache_seqlens
+        # during decode, leading to an OOB read in the split-KV combine kernel
+        # (flash_fwd_combine_launch_template.h:52). Leaving scheduler_metadata
+        # unset uses the existing per-layer metadata path.
+        self._disable_scheduler_metadata_precompute = bool(
+            getattr(server_args, "enable_dp_attention", False)
+        )
+
     def _compute_scheduler_metadata(
         self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
     ):
@@ -222,6 +248,8 @@ class FlashAttentionBackend(AttentionBackend):
         Returns the scheduler_metadata tensor, or None if not applicable.
         """
         if self._get_scheduler_metadata is None or self.use_mla:
+            return None
+        if self._disable_scheduler_metadata_precompute:
             return None
         # Always use window_size=(-1, -1) because scheduler_metadata is only
         # consumed by non-SWA layers (SWA layers skip it in forward_decode).
@@ -606,7 +634,7 @@ class FlashAttentionBackend(AttentionBackend):
                 and self.attn_cp_size > 1
             )
 
-            if save_kv_cache and not is_cp_mode:
+            if save_kv_cache and not is_cp_mode and not self.fa_skip_kv_cache:
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
@@ -680,6 +708,12 @@ class FlashAttentionBackend(AttentionBackend):
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
+
+        _fa_out = (
+            forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if getattr(forward_batch, "_attn_output", None) is not None
+            else None
+        )
 
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
@@ -764,6 +798,32 @@ class FlashAttentionBackend(AttentionBackend):
                     self.device,
                     _fa_cp_attn,
                 )
+            elif self.fa_skip_kv_cache:
+                # Embedding mode: skip KV cache read and use raw K/V tensors
+                # directly via flash_attn_varlen_func. The KV cache write is
+                # also skipped (guarded above). This eliminates store_kvcache
+                # and prepare_varlen_num_blocks overhead per layer.
+                assert k is not None, "fa_skip_kv_cache requires k to be provided"
+                assert k_descale is None and v_descale is None, (
+                    "fa_skip_kv_cache uses raw K/V tensors, "
+                    "FP8 KV cache descaling is not supported in this mode"
+                )
+                result = flash_attn_varlen_func(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    num_splits=self.num_splits,
+                    out=_fa_out,
+                    **kwargs,
+                )
             else:
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -782,6 +842,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    out=_fa_out,
                     ver=self.fa_impl_ver,
                     **kwargs,
                 )
@@ -850,6 +911,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=False,
                         return_softmax_lse=True,
+                        out=_fa_out,
                         ver=self.fa_impl_ver,
                         **kwargs,
                     )
@@ -876,6 +938,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
+                        out=_fa_out,
                         ver=self.fa_impl_ver,
                         **kwargs,
                     )
@@ -1029,6 +1092,12 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
+        _fa_out = (
+            forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if getattr(forward_batch, "_attn_output", None) is not None
+            else None
+        )
+
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -1140,6 +1209,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    out=_fa_out,
                     ver=self.fa_impl_ver,
                     scheduler_metadata=sched_meta,
                     **kwargs,
@@ -2092,14 +2162,14 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            accept_length = spec_info.accept_length[:bs]
-            if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
+            extend_lens = spec_info.num_accept_tokens[:bs]
+            if spec_info.num_accept_tokens_cpu:
+                metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
             else:
                 metadata.max_seq_len_q = 1
 
             metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
             )
 
             max_seq_pages = (
@@ -2413,10 +2483,20 @@ class FlashAttentionBackend(AttentionBackend):
             else metadata_swa.page_table
         )
 
+        page_table_a = metadata.page_table
+        page_table_b = metadata_expand.page_table
+        if self.use_sliding_window_kv_pool:
+            page_table_a = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                page_table_a
+            )
+            page_table_b = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                page_table_b
+            )
+
         prepare_swa_spec_page_table_triton(
             page_table,
-            metadata.page_table,
-            metadata_expand.page_table,
+            page_table_a,
+            page_table_b,
             metadata.cache_seqlens_int32,
             metadata_expand.cache_seqlens_int32,
             self.speculative_num_draft_tokens,
