@@ -336,6 +336,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--elastic-ep-backend` | Specify the collective communication backend for elastic EP. Currently supports 'mooncake'. | `none` | `none`, `mooncake` |
 | `--enable-elastic-expert-backup` | Enable elastic EP backend to backup expert weights in DRAM feature. Currently supports 'mooncake'.| `False` | bool flag (set to enable) |
 | `--mooncake-ib-device` | The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled. | `None` | Type: str |
+| `--enable-deepep-waterfill` | Enable DeepEP Waterfill: dispatch the shared expert as the 9th routed expert to the least-loaded EP rank. Automatically sets `--moe-a2a-backend deepep`, implicitly enables shared-expert fusion, and supports `--deepep-mode auto`, `normal`, or `low_latency`. Use `auto` or `low_latency` for production decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2. By default, Waterfill uses the static local-batch path; set `SGLANG_DISABLE_STATIC_WATERFILL=1` to force dynamic Waterfill with runtime EP all-reduce. | `False` | bool flag (set to enable) |
 | `--elastic-ep-rejoin` | Indicates that this process is a relaunched elastic EP rank that should rejoin an existing process group during rank recovery. | `False` | bool flag (set to enable) |
 
 ## Mamba Cache

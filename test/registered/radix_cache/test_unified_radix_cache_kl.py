@@ -35,7 +35,7 @@ MAMBA_TRACK_INTERVAL = 128
 SWA_MODEL = "openai/gpt-oss-20b"
 FULL_MODEL = "Qwen/Qwen3-32B"
 
-register_cuda_ci(est_time=760, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=760, stage="stage-c", runner_config="4-gpu-h100")
 
 
 class UnifiedRadixTreeTestMixin:
