@@ -1,7 +1,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Generation model tests (CUDA only)
-register_cuda_ci(est_time=150, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=150, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=106, suite="stage-b-test-1-gpu-small-amd")
 
 # Copyright 2023-2024 SGLang Team
@@ -161,14 +161,17 @@ class TestGenerationModels(CustomTestCase):
         ) as hf_runner:
             hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
-        with env_ctx, SRTRunner(
-            model_path,
-            tp_size=model_case.tp_size,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            trust_remote_code=model_case.trust_remote_code,
-            attention_backend=model_case.attention_backend,
-        ) as srt_runner:
+        with (
+            env_ctx,
+            SRTRunner(
+                model_path,
+                tp_size=model_case.tp_size,
+                torch_dtype=torch_dtype,
+                model_type="generation",
+                trust_remote_code=model_case.trust_remote_code,
+                attention_backend=model_case.attention_backend,
+            ) as srt_runner,
+        ):
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
         check_close_model_outputs(
