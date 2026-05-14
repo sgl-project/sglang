@@ -51,14 +51,26 @@ _SAMPLING_MEMORY_EXCLUDE = frozenset(
     {
         "prompt",
         "negative_prompt",
+        "prompt_path",
         "seed",
         "request_id",
         "output_path",
         "output_file_name",
+        "output_quality",
+        "output_compression",
+        "fps",
         "save_output",
         "return_file_paths_only",
+        "generator_device",
+        "supported_resolutions",
+        "profile",
+        "num_profiled_timesteps",
+        "profile_all_stages",
+        "debug",
         "suppress_logs",
         "perf_dump_path",
+        "no_override_protected_fields",
+        "adjust_frames",
     }
 )
 
@@ -237,8 +249,9 @@ class MemoryProfile:
         if batch_cost <= 0.0 or peak_memory_mb <= 0.0:
             return
 
+        previous_max_cost = self.get_max_success_cost()
         predicted = self._estimate_base_peak_memory_mb(batch_cost)
-        if predicted is not None and predicted > 0.0:
+        if predicted is not None and predicted > 0.0 and batch_cost > previous_max_cost:
             self.ratio_residuals.append(max(1.0, peak_memory_mb / predicted))
             self.absolute_residuals_mb.append(max(0.0, peak_memory_mb - predicted))
             del self.ratio_residuals[: -_MEMORY_POLICY.history_size]
@@ -268,6 +281,8 @@ class MemoryProfile:
         predicted = self._estimate_base_peak_memory_mb(batch_cost)
         if predicted is None:
             return None
+        if batch_cost <= self.get_max_success_cost():
+            return predicted
         return max(
             predicted * self._get_residual_ratio(),
             predicted + self._get_residual_mb(),
@@ -883,6 +898,15 @@ class BatchAdmissionController:
             self._memory_profiles[_unjsonable(key)] = MemoryProfile.from_dict(
                 profile_data
             )
+        observation_count = sum(
+            len(profile.successes) for profile in self._memory_profiles.values()
+        )
+        logger.info(
+            "Loaded memory profile cache: path=%s, profiles=%d, observations=%d",
+            path,
+            len(self._memory_profiles),
+            observation_count,
+        )
 
     def _save_memory_profile_cache(self) -> None:
         path = self._memory_profile_cache_path
@@ -919,6 +943,11 @@ class BatchAdmissionController:
             os.replace(tmp_path, path)
             self._memory_profiles_dirty = False
             self._last_profile_save_s = time.monotonic()
+            logger.info(
+                "Saved memory profile cache: path=%s, profiles=%d",
+                path,
+                len(payload["profiles"]),
+            )
         except Exception:
             try:
                 os.unlink(tmp_path)

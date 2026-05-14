@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,6 +41,14 @@ class CalibrationRecord:
     peak_allocated_memory_mb: float
     duration_s: float
     errors: list[str]
+
+
+@dataclass
+class CalibrationProfileRecord:
+    key_hash: str
+    observation_count: int
+    batch_sizes: list[int]
+    peak_memory_mb: list[float]
 
 
 def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
@@ -87,6 +97,12 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
         "model_path": args.model_path,
         "profile_cache": args.batching_memory_profile_cache,
         "records": [asdict(record) for record in records],
+        "profiles": [
+            asdict(record)
+            for record in _read_profile_cache_summary(
+                args.batching_memory_profile_cache
+            )
+        ],
     }
     if args.output_json:
         with open(args.output_json, "w", encoding="utf-8") as f:
@@ -208,6 +224,67 @@ def _add_geometric_ramp(batch_sizes: list[int]) -> list[int]:
             current = min(target, current * 2)
             expanded.add(current)
     return sorted(expanded)
+
+
+def _read_profile_cache_summary(
+    cache_path: str | None,
+) -> list[CalibrationProfileRecord]:
+    if not cache_path:
+        return []
+
+    path = cache_path
+    if not path.endswith(".json"):
+        try:
+            files = [
+                os.path.join(path, name)
+                for name in os.listdir(path)
+                if name.endswith(".json")
+            ]
+        except OSError:
+            return []
+        if not files:
+            return []
+        path = max(files, key=os.path.getmtime)
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return []
+
+    records = []
+    for item in payload.get("profiles", []):
+        profile = item.get("profile", {}) if isinstance(item, dict) else {}
+        key = item.get("key") if isinstance(item, dict) else None
+        successes = profile.get("successes", [])
+        if not isinstance(successes, list):
+            continue
+        batch_sizes = sorted(
+            {
+                int(obs.get("batch_size", 1))
+                for obs in successes
+                if isinstance(obs, dict)
+            }
+        )
+        peaks = [
+            float(obs.get("peak_memory_mb", 0.0))
+            for obs in successes
+            if isinstance(obs, dict)
+        ]
+        records.append(
+            CalibrationProfileRecord(
+                key_hash=_short_json_hash(key),
+                observation_count=len(successes),
+                batch_sizes=batch_sizes,
+                peak_memory_mb=peaks,
+            )
+        )
+    return records
+
+
+def _short_json_hash(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
