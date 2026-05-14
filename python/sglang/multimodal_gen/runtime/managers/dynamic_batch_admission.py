@@ -255,6 +255,7 @@ class MemoryProfile:
         batch_size: int,
         baseline_memory_mb: float | None = None,
     ) -> None:
+        """Record a successful batch and update prediction residuals."""
         if batch_cost <= 0.0 or peak_memory_mb <= 0.0:
             return
 
@@ -305,6 +306,7 @@ class MemoryProfile:
         )
 
     def estimate_rough_peak_memory_mb(self, batch_cost: float) -> float | None:
+        """Estimate cold-start memory before the measured fit is available."""
         if batch_cost <= 0.0:
             return None
         seeds = [
@@ -384,6 +386,7 @@ class MemoryProfile:
         return profile
 
     def _recompute_residuals_from_successes(self) -> None:
+        """Rebuild adaptive residuals after loading cached observations."""
         replay = type(self)()
         for obs in self.successes:
             replay.observe_success(
@@ -493,8 +496,8 @@ class BatchAdmissionController:
     def enabled(self) -> bool:
         return self._mode == "dynamic" and self._user_max_batch_size > 1
 
-    def update_memory_budget(self) -> None:
-        """Refresh the memory budget for one scheduler pass."""
+    def refresh_memory_budget(self) -> None:
+        """Refresh the memory budget for one scheduler selection pass."""
         if not self.enabled:
             self._memory_budget_mb = None
             return
@@ -546,7 +549,7 @@ class BatchAdmissionController:
             is not None
         )
 
-    def get_batch_limit_reason(self, reqs: list[Req]) -> str | None:
+    def get_batch_stop_reason(self, reqs: list[Req]) -> str | None:
         if not self.enabled or not reqs:
             return None
 
@@ -592,7 +595,7 @@ class BatchAdmissionController:
                 low = mid
         return low
 
-    def record_batch_result(self, reqs: list[Req], output_batch: OutputBatch) -> None:
+    def observe_batch_result(self, reqs: list[Req], output_batch: OutputBatch) -> None:
         if not self.enabled or not reqs:
             return
 
@@ -686,6 +689,7 @@ class BatchAdmissionController:
         memory_key: tuple[Any, ...],
         next_batch: bool = False,
     ) -> str | None:
+        """Apply OOM, calibration, and budget gates."""
         profile = self._memory_profiles.get(memory_key)
         if profile is not None and profile.oom_cost is not None:
             if batch_cost + 1e-9 >= profile.oom_cost:
@@ -724,6 +728,7 @@ class BatchAdmissionController:
         batch_size: int,
         batch_cost: float,
     ) -> str | None:
+        """Gate new profiles through a geometric cold-start ramp."""
         if profile is None or not profile.successes:
             if batch_size > 1:
                 return "memory_uncalibrated:allow=1"
@@ -842,6 +847,10 @@ class BatchAdmissionController:
             ("cfg_parallel_degree", server_args.cfg_parallel_degree),
             ("dit_cpu_offload", server_args.dit_cpu_offload),
             ("dit_layerwise_offload", server_args.dit_layerwise_offload),
+            (
+                "layerwise_offload_components",
+                _freeze_key_value(server_args.layerwise_offload_components),
+            ),
             ("dit_offload_prefetch_size", server_args.dit_offload_prefetch_size),
             ("text_encoder_cpu_offload", server_args.text_encoder_cpu_offload),
             ("image_encoder_cpu_offload", server_args.image_encoder_cpu_offload),
