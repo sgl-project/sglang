@@ -73,6 +73,9 @@ env:
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
+  # Forwarded to composite actions (setup-cuda-test-stage reads env.PR_HEAD_SHA / env.GIT_REF for checkout ref).
+  PR_HEAD_SHA: ${{ inputs.pr_head_sha || '' }}
+  GIT_REF: ${{ inputs.git_ref || '' }}
 
 permissions:
   actions: write
@@ -299,8 +302,6 @@ jobs:
         with:
           runner_config: 1-gpu-small
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - uses: ./.github/actions/run-test-cuda-suite
         with:
@@ -407,8 +408,6 @@ jobs:
         with:
           runner_config: 1-gpu-small
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - uses: ./.github/actions/run-test-cuda-suite
         with:
@@ -445,8 +444,6 @@ jobs:
         with:
           runner_config: 1-gpu-large
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - uses: ./.github/actions/run-test-cuda-suite
         with:
@@ -483,8 +480,6 @@ jobs:
         with:
           runner_config: 2-gpu-large
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - uses: ./.github/actions/run-test-cuda-suite
         with:
@@ -520,9 +515,6 @@ jobs:
         with:
           runner_config: 4-gpu-b200
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          download_artifact_version: 'v6'
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - uses: ./.github/actions/run-test-cuda-suite
         with:
@@ -595,8 +587,6 @@ jobs:
         with:
           runner_config: 4-gpu-h100
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - uses: ./.github/actions/run-test-cuda-suite
         with:
@@ -632,8 +622,6 @@ jobs:
         with:
           runner_config: 8-gpu-h200
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - name: Warmup DeepGEMM JIT Compilation
         timeout-minutes: 25
@@ -690,8 +678,6 @@ jobs:
         with:
           runner_config: 8-gpu-h20
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - uses: ./.github/actions/run-test-cuda-suite
         with:
@@ -725,8 +711,6 @@ jobs:
         with:
           runner_config: deepep-4-gpu-h100
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - name: Warmup DeepGEMM JIT Compilation
         timeout-minutes: 25
@@ -777,8 +761,6 @@ jobs:
         with:
           runner_config: deepep-8-gpu-h200
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - name: Warmup DeepGEMM JIT Compilation
         timeout-minutes: 25
@@ -831,9 +813,6 @@ jobs:
         with:
           runner_config: 4-gpu-b200
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          download_artifact_version: 'v6'
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - uses: ./.github/actions/run-test-cuda-suite
         with:
@@ -870,10 +849,6 @@ jobs:
         with:
           runner_config: dsv4-4-gpu-b200
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          download_artifact_version: 'v6'
-          install_timeout_minutes: '30'
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - uses: ./.github/actions/run-test-cuda-suite
         with:
@@ -908,9 +883,6 @@ jobs:
         with:
           runner_config: dsv4-8-gpu-h200
           sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-          install_timeout_minutes: '30'
-          pr_head_sha: ${{ inputs.pr_head_sha || '' }}
-          git_ref: ${{ inputs.git_ref || '' }}
 
       - uses: ./.github/actions/run-test-cuda-suite
         with:
