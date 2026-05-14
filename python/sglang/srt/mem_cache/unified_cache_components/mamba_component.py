@@ -67,7 +67,7 @@ class MambaComponent(TreeComponent):
     ) -> MatchResult:
         cow_mamba = params.cow_mamba
         req = params.req
-        last_node = result.last_device_node
+        last_node = result.best_match_node
 
         if len(value_chunks) > best_value_len:
             chunk_size = get_global_server_args().mamba_cache_chunk_size
@@ -101,8 +101,7 @@ class MambaComponent(TreeComponent):
 
         # HiCache: if mamba was evicted from device but has host backup,
         # ensure host_hit_length >= 1 so load_back is triggered.
-        host_node = result.last_host_node
-        cd = host_node.component_data[self.component_type]
+        cd = last_node.component_data[self.component_type]
         if cd.value is None and cd.host_value is not None:
             result = result._replace(host_hit_length=max(result.host_hit_length, 1))
 
@@ -217,12 +216,16 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
         cd = node.component_data[ct]
         value = cd.value
-        if value is not None:
-            if cd.lock_ref == 0:
-                vlen = len(value)
-                self.cache.component_evictable_size_[ct] -= vlen
-                self.cache.component_protected_size_[ct] += vlen
-            cd.lock_ref += 1
+        # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
+        if value is None:
+            result.skip_lock_node_ids.setdefault(ct, set()).add(node.id)
+            return result
+
+        if cd.lock_ref == 0:
+            vlen = len(value)
+            self.cache.component_evictable_size_[ct] -= vlen
+            self.cache.component_protected_size_[ct] += vlen
+        cd.lock_ref += 1
         return result
 
     def release_component_lock(
@@ -230,6 +233,10 @@ class MambaComponent(TreeComponent):
     ) -> None:
         ct = self.component_type
         cd = node.component_data[ct]
+        skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
+        if node.id in skip_lock_node_ids:
+            return
+
         value = cd.value
         if value is not None and cd.lock_ref > 0:
             if cd.lock_ref == 1:
