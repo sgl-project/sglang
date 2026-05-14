@@ -1,9 +1,12 @@
 import pickle
+import time
 from typing import Any
 
 import zmq
 import zmq.asyncio
 
+from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -80,6 +83,7 @@ class SchedulerClient:
         try:
             self.scheduler_socket.send_pyobj(batch)
             output_batch = self.scheduler_socket.recv_pyobj()
+            _materialize_output_batch_file_refs(output_batch)
             return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
@@ -162,7 +166,9 @@ class AsyncSchedulerClient:
         try:
             await socket.send(pickle.dumps(batch))
             payload = await socket.recv()
-            return pickle.loads(payload)
+            output_batch = pickle.loads(payload)
+            _materialize_output_batch_file_refs(output_batch)
+            return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")
@@ -203,3 +209,16 @@ class AsyncSchedulerClient:
 # Singleton instances for easy access
 async_scheduler_client = AsyncSchedulerClient()
 sync_scheduler_client = SchedulerClient()
+
+
+def _materialize_output_batch_file_refs(output_batch: Any) -> None:
+    if not isinstance(output_batch, OutputBatch):
+        return
+
+    start_time = time.perf_counter()
+    output_batch.output = materialize_file_refs(output_batch.output)
+    if output_batch.metrics is not None:
+        output_batch.metrics.record_stage(
+            "SchedulerClient.materialize_file_refs",
+            time.perf_counter() - start_time,
+        )

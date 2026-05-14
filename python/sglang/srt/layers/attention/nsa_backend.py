@@ -67,6 +67,17 @@ else:
     )
 
 
+def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
+    # Always normalize to (N_total, 1) layout, to avoid deadlock at deep_gemm.fp8_paged_mqa_logits
+    if seqlens_32.dim() == 2:
+        if seqlens_32.size(1) == 1:
+            return seqlens_32
+        # Fall through and re-flatten if the caller already gave us a (bs, next_n)
+        # view — we want (N_total, 1) regardless.
+        seqlens_32 = seqlens_32.reshape(-1)
+    return seqlens_32.contiguous().view(-1, 1)
+
+
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
 
@@ -504,7 +515,7 @@ class NativeSparseAttnBackend(
                     page_table, repeats=self.speculative_num_draft_tokens, dim=0
                 )
             else:
-                # DRAFT_EXTEND (v1): V1 worker extends by (num_accepted_drafts + 1) per request
+                # DRAFT_EXTEND (v1): V1 worker extends by (num_correct_drafts + 1) per request
                 # after verification. Lengths vary per request based on how many tokens
                 # were accepted.
                 page_table = torch.repeat_interleave(
@@ -633,7 +644,7 @@ class NativeSparseAttnBackend(
         if is_cuda() and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             try:
                 import deep_gemm
@@ -643,12 +654,15 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend()
+                        or forward_batch.forward_mode.is_draft_extend(include_v2=True)
                     )
                     else cache_seqlens_int32
                 )
+                seqlens_32_2d = _to_2d_context_lens(
+                    seqlens_32, forward_batch.batch_size
+                )
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -919,7 +933,7 @@ class NativeSparseAttnBackend(
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
+            or forward_mode.is_draft_extend(include_v2=True)
         ):
             try:
                 import deep_gemm
@@ -928,12 +942,13 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend()
+                        or forward_mode.is_draft_extend(include_v2=True)
                     )
                     else cache_seqlens_int32
                 )
+                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -1038,7 +1053,7 @@ class NativeSparseAttnBackend(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
 
-            extend_seq_lens = spec_info.num_accepted_tokens[:bs]
+            extend_seq_lens = spec_info.num_accept_tokens[:bs]
             extend_seq_lens_cpu = extend_seq_lens.tolist()
 
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
@@ -1069,7 +1084,7 @@ class NativeSparseAttnBackend(
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
+            or forward_mode.is_draft_extend(include_v2=True)
         ):
             try:
                 import deep_gemm
@@ -1078,19 +1093,22 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend()
+                        or forward_mode.is_draft_extend(include_v2=True)
                     )
                     else metadata.cache_seqlens_int32
                 )
+                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
                 if metadata.paged_mqa_schedule_metadata is None:
-                    metadata.paged_mqa_schedule_metadata = new_schedule
+                    object.__setattr__(
+                        metadata, "paged_mqa_schedule_metadata", new_schedule
+                    )
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
             except (ImportError, ModuleNotFoundError):
-                metadata.paged_mqa_schedule_metadata = None
+                object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.nsa_cache_seqlens_int32 is not None
@@ -1276,6 +1294,33 @@ class NativeSparseAttnBackend(
                 size = precomputed.seqlens_expanded_size
                 flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
                 flashmla_metadata.copy_(precomputed.flashmla_metadata)
+
+        # Refresh DeepGEMM paged MQA schedule metadata for the actual seqlens of
+        # this replay (the captured graph holds stale data otherwise, which can
+        # deadlock the kernel when the runtime work decomposition diverges from
+        # the captured one).
+        if is_cuda():
+            try:
+                import deep_gemm
+
+                if forward_mode.is_decode_or_idle():
+                    seqlens_32 = metadata.cache_seqlens_int32
+                else:
+                    seqlens_32 = metadata.nsa_seqlens_expanded[
+                        : precomputed.seqlens_expanded_size
+                    ]
+                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
+                new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                )
+                if metadata.paged_mqa_schedule_metadata is None:
+                    object.__setattr__(
+                        metadata, "paged_mqa_schedule_metadata", new_schedule
+                    )
+                else:
+                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            except (ImportError, ModuleNotFoundError):
+                pass
 
         self.forward_metadata = metadata
 
@@ -1549,7 +1594,13 @@ class NativeSparseAttnBackend(
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
+            # Caller passed split q_nope / q_rope; we'll need to concat below if
+            # the chosen impl wants q_all.
+            q_all = None
         else:
+            # Caller passed already-concatenated q (q_all = q). Reuse it directly
+            # via a zero-copy view; the impl-specific blocks below will skip the
+            # otherwise redundant concat_mla_absorb_q_general call.
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
@@ -1598,7 +1649,11 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif self.nsa_decode_impl == "tilelang":
-            if q_rope is not None:
+            # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
+            # has already been set to a zero-copy view of q in the else branch
+            # above and we can reuse it directly. The `not _is_hip` clause keeps
+            # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
+            if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
@@ -1623,7 +1678,7 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
         elif self.nsa_decode_impl == "aiter":
-            if q_rope is not None:
+            if q_all is None or not _is_hip:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
             return self._forward_aiter(
                 q_all=q_all,
