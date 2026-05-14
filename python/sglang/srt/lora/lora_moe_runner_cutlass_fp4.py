@@ -37,8 +37,15 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 
 if _is_cuda:
-    from sgl_kernel import silu_and_mul
+    # In-tree JIT variant (carries the ``swap_halves`` flag added for the
+    # ``[Up | Gate]`` Kimi-K2.5 W13 loader layout). The sgl_kernel AOT
+    # build doesn't expose ``swap_halves`` yet; the JIT path is the only
+    # caller of swap_halves and is loaded on demand on first use.
+    from sglang.jit_kernel.activation import silu_and_mul
 elif _is_hip:
+    # HIP path doesn't reach the cutlass FP4 LoRA runner (SM100+ only).
+    # Keep the existing import for code-symmetry; if it's ever called with
+    # swap_halves=True it will raise.
     from vllm._custom_ops import silu_and_mul
 
 
@@ -175,17 +182,13 @@ class CutlassFp4LoraRunnerCore:
             )
 
         # ---- silu + mul
-        if quant_info.w13_swap_halves:
-            # ``[up | gate]`` layout: silu(gate) * up = silu(second) * first.
-            intermediate = (
-                torch.nn.functional.silu(gateup_flat[:, N // 2 :].float())
-                * gateup_flat[:, : N // 2].float()
-            ).to(out_dtype)
-        else:
-            intermediate = torch.empty(
-                total_tokens, N // 2, dtype=out_dtype, device=device
-            )
-            silu_and_mul(gateup_flat, intermediate)
+        # ``w13_swap_halves=True`` selects the ``[up | gate]`` convention
+        # (silu(second) * first) for FlashInfer-CUTLASS NVFP4 W13 loaders;
+        # the default ``[gate | up]`` convention does silu(first) * second.
+        intermediate = torch.empty(
+            total_tokens, N // 2, dtype=out_dtype, device=device
+        )
+        silu_and_mul(gateup_flat, intermediate, swap_halves=quant_info.w13_swap_halves)
 
         # ---- GEMM 2 (w2)
         int_fp4, int_blockscale = scaled_fp4_experts_quant(
