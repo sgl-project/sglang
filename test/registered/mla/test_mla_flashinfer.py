@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 )
 
 # FlashInfer MLA backend tests with MTP speculative decoding
-register_cuda_ci(est_time=130, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=130, stage="stage-b", runner_config="1-gpu-large")
 
 
 class TestFlashinferMLAMTP(CustomTestCase):

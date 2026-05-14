@@ -14,7 +14,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, suite="stage-a-test-1-gpu-small")
+register_cuda_ci(est_time=5, stage="stage-a", runner_config="1-gpu-small")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
