@@ -202,7 +202,11 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
-
+        if envs.SGLANG_ENABLE_SPEC_V2.get() and not enable_mamba_extra_buffer:
+            raise ValueError(
+                "Spec v2 requires mamba scheduler strategy `extra_buffer` for mamba models. "
+                "Please set `--mamba-scheduler-strategy extra_buffer`."
+            )
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
@@ -345,6 +349,8 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
             )
+        kv_args.prefill_pp_size = self.prefill_pp_size
+        kv_args.non_draft_kv_data_lens = len(kv_data_ptrs)
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.

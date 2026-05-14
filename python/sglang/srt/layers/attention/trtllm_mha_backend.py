@@ -138,6 +138,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
+        # Init backend (XQA or TRTLLM-GEN)
+        # We need to specify q_type and out_type for different backend
+        # XQA: (q_type must be bf16)
+        #   KV bf16: q_type = bf16, out_type=model_runner.dtype
+        #   KV fp8: q_type = bf16, out_type=model_runner.dtype
+        # TRTLLM-GEN:
+        #   KV bf16: q_type = bf16, out_type=model_runner.dtype
+        #   KV fp8: q_type = fp8, out_type=model_runner.dtype
+        self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
