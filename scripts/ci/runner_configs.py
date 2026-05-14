@@ -1,6 +1,6 @@
 """Emit a runner_config's setup details (install / artifact_version /
 install_timeout) in $GITHUB_OUTPUT format. Reads scripts/ci/runner_configs.yml.
-Called by .github/actions/setup-cuda-test-stage.
+Called by .github/workflows/_pr-test-stage.yml.
 """
 
 import os

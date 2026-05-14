@@ -1,11 +1,11 @@
 # Per-runner-config CUDA setup details. Single source of truth for the
 # `runner_config` field on `register_cuda_ci(...)` calls. Consumed by
 # scripts/ci/runner_configs.py (CLI wrapper), which is in turn called by
-# .github/actions/setup-cuda-test-stage.
+# .github/workflows/_pr-test-stage.yml.
 #
 # Each runner_config carries install script, actions/download-artifact major
-# version, and install-step wall-clock cap (minutes, enforced inside the
-# composite action via bash `timeout`).
+# version, and install-step wall-clock cap (minutes, enforced via
+# `timeout-minutes:` on the install step in _pr-test-stage.yml).
 
 _anchors:
   default_install: &default scripts/ci/cuda/ci_install_dependency.sh
