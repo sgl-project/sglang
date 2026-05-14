@@ -207,9 +207,7 @@ def _sm120_sparse_decode_fwd(
 # Default SM120 FlashMLA backend: "triton" (optimized) or "torch" (pure-PyTorch fallback).
 # Controlled by SGLANG_SM120_TRITON_FLASHMLA env var for backward compat (1=triton, 0=torch).
 _sm120_default_backend = (
-    "triton"
-    if os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "1") == "1"
-    else "torch"
+    "triton" if os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "1") == "1" else "torch"
 )
 
 

@@ -9,7 +9,7 @@ from torch.nn import Module
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import log_info_on_rank0, set_weight_attrs
-from sglang.srt.utils.common import is_sm120_supported, is_sm90_supported
+from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
