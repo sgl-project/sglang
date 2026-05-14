@@ -122,6 +122,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
@@ -652,6 +653,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+        self._prepare_moe_topk()
 
         # Load the expert backup client
         self.expert_backup_client = (
@@ -1599,6 +1601,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
+
+    def _prepare_moe_topk(self):
+        balancer_cls = None
+        num_prepared = 0
+        num_routed_experts = None
+        for module in self.model.modules():
+            if not isinstance(module, TopK):
+                continue
+            if (
+                not module.enable_deepep_waterfill
+                or module.deepep_waterfill_balancer is not None
+            ):
+                continue
+            if num_routed_experts is None:
+                num_routed_experts = getattr(
+                    self.model_config.hf_config, "n_routed_experts", None
+                )
+                if num_routed_experts is None:
+                    raise ValueError(
+                        "DeepEP waterfill requires model config n_routed_experts."
+                    )
+            if balancer_cls is None:
+                from sglang.srt.layers.moe.deepep_waterfill import (
+                    DeepEPWaterfillBalancer,
+                )
+
+                balancer_cls = DeepEPWaterfillBalancer
+            module.deepep_waterfill_balancer = balancer_cls(
+                num_routed_experts=num_routed_experts,
+                world_size=self.moe_ep_size,
+                rank=self.moe_ep_rank,
+                layer_id=module.layer_id,
+                routed_scaling_factor=(
+                    module.topk_config.routed_scaling_factor
+                    if module.topk_config.routed_scaling_factor is not None
+                    else 1.0
+                ),
+            )
+            num_prepared += 1
+        if num_prepared:
+            log_info_on_rank0(
+                logger, f"Prepared {num_prepared} DeepEP waterfill TopK modules."
+            )
 
     def update_expert_location(
         self,

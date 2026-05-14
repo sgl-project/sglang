@@ -34,6 +34,8 @@ on:
         value: ${{ jobs.run.outputs.multimodal_gen }}
       partitions:
         value: ${{ jobs.run.outputs.partitions }}
+      partition_model_sha:
+        value: ${{ jobs.run.outputs.partition_model_sha }}
       b200_runner:
         value: ${{ jobs.run.outputs.b200_runner }}
       enable_retry:
@@ -60,6 +62,7 @@ jobs:
       jit_kernel: ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       partitions: ${{ steps.partitions.outputs.partitions }}
+      partition_model_sha: ${{ steps.partition-model-sha.outputs.sha }}
       b200_runner: ${{ steps.set-runner.outputs.b200_runner }}
       enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
@@ -233,6 +236,33 @@ jobs:
           fi
           echo "full=$FULL" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve sglang-ci-stats SHA
+        id: partition-model-sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Pin all shards to one immutable commit so dispatch and every
+          # runtime LPT use the same model snapshot. Soft fail -> static.
+          SHA=$(gh api repos/sgl-project/sglang-ci-stats/commits/main --jq '.sha' 2>/dev/null || true)
+          if [[ -n "$SHA" ]]; then
+            echo "Pinned sglang-ci-stats@$SHA"
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not resolve sglang-ci-stats SHA; using in-source est_time"
+            echo "sha=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch live partition model
+        if: steps.partition-model-sha.outputs.sha != ''
+        run: |
+          # SHA resolved -> require fetch (curl --retry). Soft fallback
+          # would risk cross-shard LPT divergence on transient curl flake.
+          rm -f /tmp/partition-model.json
+          URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ steps.partition-model-sha.outputs.sha }}/model.json"
+          curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
+            "$URL" -o /tmp/partition-model.json
+          echo "Fetched partition-model.json ($(wc -c < /tmp/partition-model.json) bytes)"
+
       - name: Compute partitions
         id: partitions
         run: |
@@ -243,6 +273,7 @@ jobs:
           # See scripts/ci/utils/compute_partitions.py.
           python3 scripts/ci/utils/compute_partitions.py \
             --full-parallel ${{ steps.parallel-mode.outputs.full }} \
+            --partition-model-file /tmp/partition-model.json \
             >> "$GITHUB_OUTPUT"
 
       - name: Set B200 runner tag
