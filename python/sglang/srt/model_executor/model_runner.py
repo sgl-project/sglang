@@ -2883,24 +2883,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_kv_heads_global=num_kv_heads_global,
         )
 
-        # Selection-kernel capacity check: fail at startup when
-        # (num_blocks * k_block) or union candidates exceed the single-
-        # program in-program-sort budget. The runtime path raises in
-        # `ds_select_stage2_merge` / `ds_union_per_batch` for these
-        # configs, and (separately) the kernel can hang silently inside
-        # CUDA-graph capture when violated. Either way the misconfig is
-        # always-fatal at first decode — surface it now rather than
-        # mid-serving. The chunked merge/union paths (v1.1.x) will lift
-        # this; until then, lower token_budget / k_block, or raise block_t.
+        # Selection-kernel capacity check (legacy stage-2 merge / union
+        # single-program budget). The native sparse-decode path
+        # (`DoubleSparsityAlgorithm.try_native_sparse_decode`) does NOT
+        # use these kernels — selection happens via the score-kernel +
+        # torch.topk + build_selected_physical pipeline, all of which
+        # scale with `token_budget` not `num_blocks * k_block`.
+        # We still surface the legacy-path warning at startup because
+        # the legacy path remains the fallback for `bs > scratch_max_bs`
+        # (if anyone exceeds the captured-graph cap), but we no longer
+        # hard-error — the native path will run for all in-scope
+        # configurations.
         max_ctx = self.req_to_token_pool.req_to_token.shape[1]
         num_kv_heads_local = num_kv_heads_global // self.tp_size
         capacity_warnings = runtime_cfg.warn_capacity(max_ctx, num_kv_heads_local)
         if capacity_warnings:
-            raise RuntimeError(
-                "Double Sparsity capacity guard tripped at startup; the "
-                "configured (block_t, k_block, token_budget) cannot be "
-                "served by the single-program merge/union kernels (chunked "
-                "paths land in v1.1.x). Details:\n  - "
+            logger.warning(
+                "Double Sparsity legacy capacity guard tripped (native "
+                "sparse-decode path is unaffected; legacy fallback would "
+                "fail-loud if invoked). Details:\n  - "
                 + "\n  - ".join(capacity_warnings)
             )
 
