@@ -601,8 +601,7 @@ TWO_GPU_CASES = [
         "ltx_2_two_stage_t2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2",
-            ulysses_degree=2,
-            dit_layerwise_offload=True,
+            cfg_parallel=True,
             extras=["--pipeline-class-name LTX2TwoStagePipeline"],
         ),
         T2V_sampling_params,
@@ -613,7 +612,7 @@ TWO_GPU_CASES = [
             model_path="Lightricks/LTX-2.3",
             cfg_parallel=True,
             extras=[
-                "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original"
+                "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original",
             ],
         ),
         TI2V_sampling_params,
@@ -634,10 +633,10 @@ TWO_GPU_CASES = [
             cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
-                "--ltx2-two-stage-device-mode original",
+                "--component-attention-backends transformer=fa",
             ],
         ),
-        T2V_sampling_params,
+        DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
         run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
@@ -708,7 +707,7 @@ TWO_GPU_CASES = [
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            ulysses_degree=2,
+            cfg_parallel=True,
         ),
         TI2V_sampling_params,
         run_component_accuracy_check=False,
