@@ -76,17 +76,100 @@ python benchmark/double_sparsity/compare.py \
     --branch-on /tmp/results_on.json
 ```
 
-## Ship-gate criteria (v1)
+## Two-tier gate (v1.2 → 70B TP=8 work)
 
-- **Speedup (DS on / DS off)**: `>= 1.30×` decode tok/s on Llama-3.1-70B
-  at 64K context, output_len=1024, batch=1, on H200 (TP=8).
-- **DS-off regression vs main**: `|delta| <= 2%` decode tok/s — proves
-  the dense path is unchanged on the branch.
-- **NIAH accuracy delta**: `>= -0.02` (DS on within 2 pts of DS off) at
-  64K context.
+- **VISIBLE_WIN** (the current goal): `decode_tok_per_s(DS_on) >= 1.10 ×
+  decode_tok_per_s(DS_off)` OR `tbt_ms_p50(DS_on) <= 0.90 × tbt_ms_p50
+  (DS_off)`, on Llama-3.1-70B-Instruct at 128K context, output_len=1024,
+  batch=1, H200 TP=8, across 3 repeated runs.
+- **STRETCH_1_30X** (original v1 ship-gate, still tracked): `decode_tok
+  _per_s(DS_on) >= 1.30 × decode_tok_per_s(DS_off)`. Separate badge in
+  `compare.py` output. A PR-quality ship-claim requires `STRETCH_1_30X=YES`.
+- **Quality guard**: `niah_accuracy(DS_on) >= niah_accuracy(DS_off) -
+  0.02`. **Both DS-off and DS-on legs must pass `--niah`** — otherwise
+  the guard cannot be computed and `compare.py` reports
+  `quality_guard: UNKNOWN`.
+- **Dense-path regression vs main** (structural sanity, optional):
+  `|delta| <= 2%` decode tok/s between branch DS-off and a clean
+  `origin/main` worktree. Used in the 3-way harness; not required for
+  the discovery run.
+- **Calibration cite**: README-cited result JSONs must have
+  `extra.calibration_mode != "synthetic"` (real wikitext or real prompts
+  file). Synthetic calibration is plumbing-only.
 
-If any check fails, ship feature-flagged off-by-default and document
-the gap.
+If `VISIBLE_WIN=PASS` and `quality_guard=PASS`: ship the result. If only
+`STRETCH_1_30X=YES`: cite the stronger ship gate. If neither passes:
+ship off-by-default and run the pivot path (profile → Triton union →
+custom sparse-decode kernel; FlashInfer sparse last).
+
+## 70B TP=8 H200 invocation (the primary visible-win workload)
+
+Generate calibration on the H200 box first (real text required for the
+headline claim; `--device-map auto` is mandatory for 70B in bf16
+because the weights don't fit on a single H200 once forward activations
+land on top — `calibrate.py --device-map auto` triggers Accelerate
+multi-GPU loading with `use_cache=False` to skip HF's KV cache):
+
+```bash
+python scripts/double_sparsity/calibrate.py \
+    --model meta-llama/Meta-Llama-3.1-70B-Instruct \
+    --output /workspace/calib_llama_3_1_70b_wikitext_s32.json \
+    --heavy-channels 32 \
+    --n-samples 64 --seq-len 4096 \
+    --dataset wikitext --dataset-subset wikitext-2-raw-v1 \
+    --device-map auto
+```
+
+DS-off baseline (3 repeats, NIAH on both legs):
+
+```bash
+for i in 1 2 3; do
+  python benchmark/double_sparsity/bench_decode.py \
+      --config branch_ds_off --tp-size 8 \
+      --model meta-llama/Meta-Llama-3.1-70B-Instruct \
+      --context-len 131072 --output-len 1024 \
+      --n-requests 4 --concurrency 1 \
+      --mem-fraction-static 0.85 --max-running-requests 4 \
+      --niah --niah-context-tokens 131072 --niah-n-samples 5 \
+      --output-json /workspace/70b_128k_off_${i}.json
+done
+```
+
+DS-on (real calibration; `--block-t 2048 --k-block 64` is the only
+size-1 knob slot that satisfies the merge capacity guard at 128K —
+`num_blocks * k_block = 64 * 64 = 4096`, exactly at the threshold):
+
+```bash
+for i in 1 2 3; do
+  python benchmark/double_sparsity/bench_decode.py \
+      --config branch_ds_on --tp-size 8 \
+      --model meta-llama/Meta-Llama-3.1-70B-Instruct \
+      --calibration /workspace/calib_llama_3_1_70b_wikitext_s32.json \
+      --context-len 131072 --output-len 1024 \
+      --n-requests 4 --concurrency 1 \
+      --block-t 2048 --k-block 64 --token-budget 1024 \
+      --mem-fraction-static 0.85 --max-running-requests 4 \
+      --niah --niah-context-tokens 131072 --niah-n-samples 5 \
+      --output-json /workspace/70b_128k_on_${i}.json
+done
+```
+
+Compare (use median run of each by inspecting `decode_tok_per_s` in
+each JSON, then pass the medians):
+
+```bash
+python benchmark/double_sparsity/compare.py \
+    --main /workspace/70b_128k_off_2.json \
+    --branch-off /workspace/70b_128k_off_2.json \
+    --branch-on /workspace/70b_128k_on_2.json
+```
+
+(`--main` and `--branch-off` are the same file in the discovery run;
+the dense-path regression check is the structural sanity at the end
+of `compare.py` output.)
+
+64K corroboration: same as above with `--context-len 65536` and
+`--niah-context-tokens 65536`.
 
 ## v1.2 follow-ups (deferred from v1.1)
 

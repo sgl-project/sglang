@@ -89,6 +89,10 @@ def _mock_pools(num_tokens: int, num_kv_heads: int, head_dim: int, num_layers: i
     token_pool = MagicMock()
     token_pool.get_key_buffer.side_effect = lambda layer_id: k_buffers[layer_id]
     req_pool = MagicMock()
+    # Commit 0: DoubleSparsityAlgorithm.initialize_representation_pool now reads
+    # req_to_token_pool.req_to_token.shape[1] to size the selection scratch.
+    # Provide a real tensor so the K_label-extend tests still construct.
+    req_pool.req_to_token = torch.zeros(1, num_tokens, dtype=torch.int32)
     return token_pool, req_pool, k_buffers
 
 

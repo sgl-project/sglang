@@ -1,0 +1,30 @@
+{
+  "config": "branch_ds_on",
+  "model": "meta-llama/Llama-3.1-70B-Instruct",
+  "context_len": 30720,
+  "output_len": 1024,
+  "n_requests": 4,
+  "concurrency": 1,
+  "decode_tok_per_s": 9.985506105372068,
+  "aggregate_tok_per_s": 9.840169922676914,
+  "e2e_latency_s": 104.06317365169525,
+  "ttft_ms_p50": 1598.5493659973145,
+  "ttft_ms_p95": 1657.964849472046,
+  "tbt_ms_p50": 100.13854503631592,
+  "tbt_ms_p95": 100.28409957885742,
+  "niah_accuracy": 1.0,
+  "block_t": 1024,
+  "k_block": 64,
+  "calibration_mode": "wikitext",
+  "extra": {
+    "tp_size": 8.0,
+    "mem_fraction_static": 0.85,
+    "max_running_requests": 4.0,
+    "niah_n_samples": 5.0,
+    "token_budget": 512.0,
+    "recent_tokens": 64.0,
+    "sink_tokens": 4.0,
+    "min_seq_len": 4096.0,
+    "max_selected_per_request": 8192.0
+  }
+}

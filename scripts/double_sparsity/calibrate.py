@@ -134,12 +134,27 @@ def calibrate(args) -> dict:
 
     logger.info("loading tokenizer + model %s", args.model)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
+
+    # Multi-GPU loading for >24-32GB models (e.g., Llama-3.1-70B in bf16
+    # cannot land on a single H200 once forward activations + KV are added).
+    # When --device-map none (the historical default), keep the previous
+    # single-replica behavior unchanged. When set (e.g., "auto"), let
+    # Accelerate place layers across visible GPUs and skip the explicit .to().
+    use_device_map = args.device_map and args.device_map != "none"
+    load_kwargs = dict(
         torch_dtype=torch.bfloat16,
         trust_remote_code=False,
     )
-    model = model.to(args.device)
+    if use_device_map:
+        load_kwargs["device_map"] = args.device_map
+    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+    # Disable HF KV cache during calibration forwards. Otherwise HF allocates
+    # full prompt KV at every forward, which is exactly the memory pressure
+    # device_map="auto" is trying to avoid. We only need K projections via
+    # forward hooks; no autoregressive generation.
+    model.config.use_cache = False
+    if not use_device_map:
+        model = model.to(args.device)
     model.eval()
 
     cfg = model.config
@@ -160,13 +175,11 @@ def calibrate(args) -> dict:
             num_layers,
         )
 
-    # Per-layer accumulator: [num_kv_heads, head_dim] running abs_mean.
-    accum: Dict[int, torch.Tensor] = {
-        layer_id: torch.zeros(
-            num_kv_heads, head_dim, dtype=torch.float64, device=args.device
-        )
-        for layer_id, _ in pairs
-    }
+    # Per-layer accumulator. Lazily allocated on the same device as each
+    # hooked k_proj output's first activation — so Accelerate-placed layers
+    # don't trigger cross-device adds. Final aggregation in `topk` step
+    # moves everything to CPU.
+    accum: Dict[int, torch.Tensor] = {}
     counts: Dict[int, int] = {layer_id: 0 for layer_id, _ in pairs}
 
     def make_hook(layer_id: int):
@@ -175,23 +188,32 @@ def calibrate(args) -> dict:
             x = out.detach()
             shape = (-1, num_kv_heads, head_dim)
             x = x.reshape(shape).to(torch.float64)
-            accum[layer_id] += x.abs().mean(dim=0)
+            stat = x.abs().mean(dim=0)
+            if layer_id not in accum:
+                accum[layer_id] = torch.zeros_like(stat)
+            accum[layer_id] += stat
             counts[layer_id] += 1
 
         return _hook
 
     handles = [m.register_forward_hook(make_hook(lid)) for lid, m in pairs]
+    # Where to put input_ids. With device_map="auto", embeddings normally live
+    # on cuda:0; otherwise the user's explicit --device.
+    input_device = (
+        next(model.parameters()).device if use_device_map else args.device
+    )
     try:
         prompts = _load_calibration_prompts(args, tokenizer)
         logger.info(
-            "running %d calibration forwards (seq_len cap=%d)",
+            "running %d calibration forwards (seq_len cap=%d, device_map=%s)",
             len(prompts),
             args.seq_len,
+            args.device_map if use_device_map else "(single-replica)",
         )
         with torch.inference_mode():
             for i, ids in enumerate(prompts):
                 t0 = time.time()
-                model(ids.to(args.device))
+                model(ids.to(input_device), use_cache=False)
                 if i % max(1, len(prompts) // 8) == 0:
                     logger.info(
                         "calibration step %d/%d (%.1fs)",
@@ -204,12 +226,12 @@ def calibrate(args) -> dict:
             h.remove()
 
     # Per-layer top-S channel indices per kv_head, by accumulated abs_mean.
+    # Move accumulators to CPU before topk to avoid any cross-device ops.
     channels = {}
     for layer_id in sorted(accum.keys()):
-        importance = accum[layer_id]  # [num_kv_heads, head_dim]
-        # Argsort descending → take top S
+        importance = accum[layer_id].cpu()  # [num_kv_heads, head_dim]
         topk = importance.topk(args.heavy_channels, dim=1).indices.to(torch.int32)
-        channels[str(layer_id)] = topk.cpu().tolist()
+        channels[str(layer_id)] = topk.tolist()
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -245,6 +267,16 @@ def main():
     p.add_argument("--seq-len", type=int, default=4096)
     p.add_argument("--min-prompt-len", type=int, default=512)
     p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument(
+        "--device-map",
+        type=str,
+        default="none",
+        help=(
+            "HuggingFace device_map. 'none' (default) preserves single-GPU "
+            "behavior with --device. Use 'auto' for multi-GPU loading "
+            "(required for 70B+ models in bf16 that exceed one H200's HBM)."
+        ),
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--synthetic",

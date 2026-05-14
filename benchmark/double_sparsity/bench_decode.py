@@ -95,6 +95,10 @@ class WorkloadResult:
     niah_accuracy: Optional[float] = None
     block_t: Optional[int] = None
     k_block: Optional[int] = None
+    # Self-describing calibration tag, derived from the calibration JSON's
+    # `calibration.dataset` field. README-cited result JSONs must satisfy
+    # `calibration_mode != "synthetic"` (per plan ship-gate).
+    calibration_mode: Optional[str] = None
     extra: Dict[str, float] = field(default_factory=dict)
 
 
@@ -113,11 +117,15 @@ def _build_long_prompt(target_tokens: int, fill: str = "The quick brown fox. ") 
 
 
 def _build_niah_prompt(context_tokens: int, needle: str, query: str) -> str:
-    """Needle-in-a-haystack prompt: hide `needle` in a long filler context."""
+    """Needle-in-a-haystack prompt: hide `needle` in a long filler context.
+
+    Each filler repetition is ~10 Llama BPE tokens; divide by 10 (not 5) so
+    head+tail tokens approximate `context_tokens` rather than overshoot by ~2x.
+    """
     filler = "The quick brown fox jumps over the lazy dog. "
     half = context_tokens // 2
-    head = filler * (half // 5)
-    tail = filler * (half // 5)
+    head = filler * (half // 10)
+    tail = filler * (half // 10)
     return f"{head}\n\n{needle}\n\n{tail}\n\n{query}"
 
 
@@ -128,6 +136,10 @@ def _launch_server(
     ds_args: List[str],
     log_path: Path,
     context_length: int,
+    *,
+    tp_size: int = 1,
+    mem_fraction_static: float = 0.85,
+    max_running_requests: int = 32,
     timeout_s: int = 600,
 ):
     """Yield a live SGLang server, then tear it down."""
@@ -139,10 +151,12 @@ def _launch_server(
         model,
         "--port",
         str(port),
+        "--tp-size",
+        str(tp_size),
         "--mem-fraction-static",
-        "0.85",
+        str(mem_fraction_static),
         "--max-running-requests",
-        "32",
+        str(max_running_requests),
         "--disable-radix-cache",
         "--context-length",
         str(context_length),
@@ -292,7 +306,9 @@ def _run_workload(
     )
 
 
-def _run_niah(base_url: str, model: str, context_tokens: int, n: int = 5) -> float:
+def _run_niah(
+    base_url: str, model: str, context_tokens: int, n: int = 5
+) -> float:
     """Score `n` NIAH retrieval probes; return accuracy in [0, 1]."""
     import requests
 
@@ -324,6 +340,12 @@ def _build_ds_args(
     heavy_channels: int,
     block_t: int,
     k_block: int,
+    *,
+    token_budget: int = 1024,
+    recent_tokens: int = 64,
+    sink_tokens: int = 4,
+    min_seq_len: int = 4096,
+    max_selected_per_request: int = 8192,
 ) -> List[str]:
     if config == "branch_ds_on":
         if not calibration:
@@ -335,15 +357,15 @@ def _build_ds_args(
             "--double-sparsity-heavy-channels",
             str(heavy_channels),
             "--double-sparsity-token-budget",
-            "1024",
+            str(token_budget),
             "--double-sparsity-recent-tokens",
-            "64",
+            str(recent_tokens),
             "--double-sparsity-sink-tokens",
-            "4",
+            str(sink_tokens),
             "--double-sparsity-min-seq-len",
-            "4096",
+            str(min_seq_len),
             "--double-sparsity-max-selected-per-request",
-            "8192",
+            str(max_selected_per_request),
             "--double-sparsity-block-t",
             str(block_t),
             "--double-sparsity-k-block",
@@ -359,6 +381,25 @@ def _build_ds_args(
         "--attention-backend",
         "fa3",
     ]
+
+
+def _calibration_mode(calibration_path: Optional[str]) -> Optional[str]:
+    """Derive a self-describing calibration mode tag from the calibration JSON.
+
+    Returns `"synthetic"` iff the file's `calibration.dataset` field is
+    literally `"synthetic"`. Otherwise returns the dataset name or
+    prompts-file path as written into the JSON by scripts/double_sparsity/
+    calibrate.py:225-228. This is the field a README-cited result must
+    check via `extra.calibration_mode != "synthetic"` (per plan).
+    """
+    if not calibration_path:
+        return None
+    try:
+        with open(calibration_path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+        return blob.get("calibration", {}).get("dataset")
+    except Exception:
+        return "unknown"
 
 
 def main():
@@ -393,6 +434,62 @@ def main():
         choices=[16, 32, 64, 128, 256],
         help="DS stage-1 K_BLOCK (only used by branch_ds_on).",
     )
+    # Server-launch knobs (apply to all configs).
+    p.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="Tensor-parallel size. 70B target uses 8.",
+    )
+    p.add_argument(
+        "--mem-fraction-static",
+        type=float,
+        default=0.85,
+        help="Server --mem-fraction-static. Tune for K_label overhead at long context.",
+    )
+    p.add_argument(
+        "--max-running-requests",
+        type=int,
+        default=32,
+        help="Server --max-running-requests. Decode batch admission cap.",
+    )
+    # DS tuning sweep knobs (only used by branch_ds_on).
+    p.add_argument(
+        "--token-budget",
+        type=int,
+        default=1024,
+        help="--double-sparsity-token-budget (branch_ds_on only).",
+    )
+    p.add_argument(
+        "--recent-tokens",
+        type=int,
+        default=64,
+        help="--double-sparsity-recent-tokens (branch_ds_on only).",
+    )
+    p.add_argument(
+        "--sink-tokens",
+        type=int,
+        default=4,
+        help="--double-sparsity-sink-tokens (branch_ds_on only).",
+    )
+    p.add_argument(
+        "--min-seq-len",
+        type=int,
+        default=4096,
+        help="--double-sparsity-min-seq-len (branch_ds_on only).",
+    )
+    p.add_argument(
+        "--max-selected-per-request",
+        type=int,
+        default=8192,
+        help="--double-sparsity-max-selected-per-request (branch_ds_on only).",
+    )
+    p.add_argument(
+        "--niah-n-samples",
+        type=int,
+        default=5,
+        help="Number of NIAH probes. Discovery=5; publishable=20+.",
+    )
     args = p.parse_args()
 
     ds_args = _build_ds_args(
@@ -401,6 +498,11 @@ def main():
         args.heavy_channels,
         args.block_t,
         args.k_block,
+        token_budget=args.token_budget,
+        recent_tokens=args.recent_tokens,
+        sink_tokens=args.sink_tokens,
+        min_seq_len=args.min_seq_len,
+        max_selected_per_request=args.max_selected_per_request,
     )
     port = _free_port()
     log_path = (
@@ -412,7 +514,14 @@ def main():
     # Server's max-context window. Add headroom for generation.
     server_ctx_len = args.context_len + args.output_len + 256
     with _launch_server(
-        args.model, port, ds_args, log_path, context_length=server_ctx_len
+        args.model,
+        port,
+        ds_args,
+        log_path,
+        context_length=server_ctx_len,
+        tp_size=args.tp_size,
+        mem_fraction_static=args.mem_fraction_static,
+        max_running_requests=args.max_running_requests,
     ) as base_url:
         wl = _run_workload(
             base_url,
@@ -426,8 +535,35 @@ def main():
         if args.config == "branch_ds_on":
             wl.block_t = args.block_t
             wl.k_block = args.k_block
+        # Derive and stamp calibration_mode from the calibration JSON. For
+        # branch_ds_off / main_dense it stays None.
+        if args.config == "branch_ds_on":
+            wl.calibration_mode = _calibration_mode(args.calibration)
         if args.niah:
-            wl.niah_accuracy = _run_niah(base_url, args.model, args.niah_context_tokens)
+            wl.niah_accuracy = _run_niah(
+                base_url,
+                args.model,
+                args.niah_context_tokens,
+                n=args.niah_n_samples,
+            )
+
+        # Numeric server/DS config goes into `extra` (typed Dict[str, float])
+        # for the CSV writer. calibration_mode is a top-level string field
+        # so a README cite-check can `extra.calibration_mode != "synthetic"`.
+        wl.extra.update(
+            {
+                "tp_size": float(args.tp_size),
+                "mem_fraction_static": float(args.mem_fraction_static),
+                "max_running_requests": float(args.max_running_requests),
+                "niah_n_samples": float(args.niah_n_samples),
+            }
+        )
+        if args.config == "branch_ds_on":
+            wl.extra["token_budget"] = float(args.token_budget)
+            wl.extra["recent_tokens"] = float(args.recent_tokens)
+            wl.extra["sink_tokens"] = float(args.sink_tokens)
+            wl.extra["min_seq_len"] = float(args.min_seq_len)
+            wl.extra["max_selected_per_request"] = float(args.max_selected_per_request)
 
     out = Path(args.output_json)
     out.parent.mkdir(parents=True, exist_ok=True)

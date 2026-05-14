@@ -241,6 +241,12 @@ def ds_select_tokens_triton(
     gqa_reduction_id: int,
     block_t: int = 1024,
     k_block: int = 64,
+    block_topk_logical: torch.Tensor = None,
+    block_topk_scores: torch.Tensor = None,
+    merged_logical: torch.Tensor = None,
+    merged_scores: torch.Tensor = None,
+    selected_logical: torch.Tensor = None,
+    valid_lengths: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """CUDA perf path — two-stage block-topk + score-aware union.
 
@@ -259,6 +265,14 @@ def ds_select_tokens_triton(
     All capture-safe: stage-1/2 are static-grid Triton; union is
     bounded-shape torch with preallocated outputs (capacity-guarded
     by `DoubleSparsityRuntimeConfig.warn_capacity` at startup).
+
+    Optional buffer kwargs (`block_topk_logical`, `block_topk_scores`,
+    `merged_logical`, `merged_scores`, `selected_logical`,
+    `valid_lengths`) let the caller pre-allocate once at init and
+    reuse across decode steps. The helpers write in-place when these
+    are provided, so the production path performs zero output-tensor
+    allocation. When `None`, each helper falls back to allocating its
+    own tensor (used by tests and one-shot calls).
     """
     if not queries.is_cuda:
         raise RuntimeError("ds_select_tokens_triton requires CUDA tensors")
@@ -285,6 +299,8 @@ def ds_select_tokens_triton(
         block_t=block_t,
         k_block=k_block,
         gqa_reduction_id=gqa_reduction_id,
+        block_topk_logical=block_topk_logical,
+        block_topk_scores=block_topk_scores,
     )
 
     # Stage 2
@@ -292,6 +308,8 @@ def ds_select_tokens_triton(
         block_topk_logical=block_topk_logical,
         block_topk_scores=block_topk_scores,
         effective_budget=effective_budget,
+        merged_logical=merged_logical,
+        merged_scores=merged_scores,
     )
 
     # Union
@@ -303,4 +321,6 @@ def ds_select_tokens_triton(
         recent_tokens=recent_tokens,
         min_seq_len=min_seq_len,
         max_selected_per_request=max_selected,
+        selected_logical=selected_logical,
+        valid_lengths=valid_lengths,
     )

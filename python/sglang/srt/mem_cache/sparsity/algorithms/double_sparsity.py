@@ -105,6 +105,19 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         self.start_layer: int = 0
         self.end_layer: int = 0
 
+        # Selection-pipeline scratch buffers — allocated once in
+        # initialize_representation_pool (where req_to_token_pool is
+        # available) and reused across decode steps via .narrow(0, 0, bs)
+        # row-slices. The helpers in select_triton.py accept these as
+        # optional kwargs and write in-place, so the production decode
+        # path performs zero output-tensor allocation.
+        self._block_topk_logical: Optional[torch.Tensor] = None
+        self._block_topk_scores: Optional[torch.Tensor] = None
+        self._merged_logical: Optional[torch.Tensor] = None
+        self._merged_scores: Optional[torch.Tensor] = None
+        self._selected_logical: Optional[torch.Tensor] = None
+        self._valid_lengths: Optional[torch.Tensor] = None
+
         logger.info(
             "DoubleSparsity init: layers=%d S=%d kv_heads_local=%d q_heads_local=%d "
             "tp_size=%d tp_rank=%d klabel_dtype=%s gqa_reduction=%s",
@@ -222,6 +235,84 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
             / (1024 * 1024),
         )
 
+        self._allocate_selection_scratch()
+
+    def _allocate_selection_scratch(self) -> None:
+        """Pre-allocate selection-pipeline scratch (stage-1/2 and union outputs).
+
+        Sized to the static worst case for the captured graph:
+          * max_ctx       = req_to_token.shape[1]
+          * num_blocks    = ceil(max_ctx / block_t)
+          * effective_bud = min(token_budget, num_blocks * k_block)
+          * scratch_bs    = runtime_config.scratch_max_bs
+
+        Total size is bounded (<<1 MiB at 70B/TP=8/128K, well under any
+        practical KV-budget) — see plan §"Commit 0" for the math. Buffers
+        are threaded through `ds_select_tokens_triton` via .narrow(0, 0,
+        bs) row-slices on each call; the helpers write in-place.
+        """
+        rt = self.runtime_config
+        max_ctx = self.req_to_token_pool.req_to_token.shape[1]
+        num_blocks = (max_ctx + rt.block_t - 1) // rt.block_t
+        effective_budget = min(rt.token_budget, num_blocks * rt.k_block)
+        bs = rt.scratch_max_bs
+        h_kv = self.num_kv_heads_local
+        device = self.device
+        NEG_INF = float("-inf")
+
+        self._block_topk_logical = torch.full(
+            (bs, h_kv, num_blocks, rt.k_block),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._block_topk_scores = torch.full(
+            (bs, h_kv, num_blocks, rt.k_block),
+            NEG_INF,
+            dtype=torch.float32,
+            device=device,
+        )
+        self._merged_logical = torch.full(
+            (bs, h_kv, effective_budget),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._merged_scores = torch.full(
+            (bs, h_kv, effective_budget),
+            NEG_INF,
+            dtype=torch.float32,
+            device=device,
+        )
+        self._selected_logical = torch.full(
+            (bs, rt.max_selected_per_request),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._valid_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
+
+        bytes_total = (
+            self._block_topk_logical.numel() * 4
+            + self._block_topk_scores.numel() * 4
+            + self._merged_logical.numel() * 4
+            + self._merged_scores.numel() * 4
+            + self._selected_logical.numel() * 4
+            + self._valid_lengths.numel() * 4
+        )
+        logger.info(
+            "DoubleSparsity selection scratch allocated: bs=%d h_kv=%d "
+            "num_blocks=%d k_block=%d effective_budget=%d "
+            "max_selected=%d total=%.2f KiB",
+            bs,
+            h_kv,
+            num_blocks,
+            rt.k_block,
+            effective_budget,
+            rt.max_selected_per_request,
+            bytes_total / 1024,
+        )
+
     def _write_k_label(
         self,
         layer_id: int,
@@ -337,6 +428,42 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
             )
 
         if queries.is_cuda:
+            bs = queries.shape[0]
+            # Narrow the preallocated scratch to the current batch size.
+            # All helpers write in-place into these views; the returned
+            # tensors share storage with the algorithm's permanent buffers
+            # so the production decode path performs zero output-tensor
+            # allocation per step.
+            if self._selected_logical is None:
+                # initialize_representation_pool was never called — only
+                # happens in tests that exercise retrieve_topk directly
+                # without setting up the pool. Fall back to the unthreaded
+                # path so existing tests stay green.
+                return ds_select_tokens_triton(
+                    queries=queries,
+                    channel_idx=self.channel_indices[layer_id],
+                    k_label_layer=self.k_label[layer_id],
+                    req_to_token=self.req_to_token_pool.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    num_kv_heads=self.num_kv_heads_local,
+                    token_budget=self.runtime_config.token_budget,
+                    recent_tokens=self.runtime_config.recent_tokens,
+                    sink_tokens=self.runtime_config.sink_tokens,
+                    min_seq_len=self.runtime_config.min_seq_len,
+                    max_selected=self.runtime_config.max_selected_per_request,
+                    gqa_reduction_id=gqa_reduction_id(
+                        self.runtime_config.gqa_reduction
+                    ),
+                    block_t=self.runtime_config.block_t,
+                    k_block=self.runtime_config.k_block,
+                )
+            if bs > self._selected_logical.shape[0]:
+                raise RuntimeError(
+                    f"DoubleSparsity decode batch size {bs} exceeds "
+                    f"scratch_max_bs={self._selected_logical.shape[0]}; "
+                    f"raise --max-running-requests or --cuda-graph-max-bs."
+                )
             return ds_select_tokens_triton(
                 queries=queries,
                 channel_idx=self.channel_indices[layer_id],
@@ -353,6 +480,12 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
                 gqa_reduction_id=gqa_reduction_id(self.runtime_config.gqa_reduction),
                 block_t=self.runtime_config.block_t,
                 k_block=self.runtime_config.k_block,
+                block_topk_logical=self._block_topk_logical.narrow(0, 0, bs),
+                block_topk_scores=self._block_topk_scores.narrow(0, 0, bs),
+                merged_logical=self._merged_logical.narrow(0, 0, bs),
+                merged_scores=self._merged_scores.narrow(0, 0, bs),
+                selected_logical=self._selected_logical.narrow(0, 0, bs),
+                valid_lengths=self._valid_lengths.narrow(0, 0, bs),
             )
 
         return ds_select_tokens_torch_ref(

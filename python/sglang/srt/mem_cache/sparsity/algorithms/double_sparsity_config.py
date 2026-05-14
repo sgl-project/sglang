@@ -241,6 +241,10 @@ class DoubleSparsityRuntimeConfig:
     # v1.1 selection-kernel knobs (consumed by the two-stage Triton path).
     block_t: int = 1024
     k_block: int = 64
+    # Worst-case decode batch size used to size DS selection scratch buffers
+    # at algorithm init. Sourced from `server_args.max_running_requests` (or
+    # `cuda_graph_max_bs`); default 1 keeps the existing test/CPU paths happy.
+    scratch_max_bs: int = 1
 
     def validate(self) -> None:
         _require(self.heavy_channels > 0, "heavy_channels must be positive")
@@ -276,6 +280,10 @@ class DoubleSparsityRuntimeConfig:
         _require(
             self.k_block in SUPPORTED_K_BLOCK,
             f"k_block must be one of {SUPPORTED_K_BLOCK}, got {self.k_block}",
+        )
+        _require(
+            self.scratch_max_bs >= 1,
+            f"scratch_max_bs must be >= 1, got {self.scratch_max_bs}",
         )
 
     def warn_capacity(
@@ -326,6 +334,13 @@ class DoubleSparsityRuntimeConfig:
 
 
 def build_runtime_config(server_args) -> DoubleSparsityRuntimeConfig:
+    # Worst-case decode batch size for scratch sizing. Prefer the explicit
+    # admission cap; fall back to the captured-graph cap; floor at 1.
+    scratch_max_bs = (
+        getattr(server_args, "max_running_requests", None)
+        or getattr(server_args, "cuda_graph_max_bs", None)
+        or 1
+    )
     cfg = DoubleSparsityRuntimeConfig(
         heavy_channels=server_args.double_sparsity_heavy_channels,
         token_budget=server_args.double_sparsity_token_budget,
@@ -337,6 +352,7 @@ def build_runtime_config(server_args) -> DoubleSparsityRuntimeConfig:
         klabel_dtype=server_args.double_sparsity_klabel_dtype,
         block_t=server_args.double_sparsity_block_t,
         k_block=server_args.double_sparsity_k_block,
+        scratch_max_bs=int(scratch_max_bs),
     )
     cfg.validate()
     return cfg
