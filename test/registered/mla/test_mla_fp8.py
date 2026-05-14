@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 # MLA FP8 KV cache test with MGSM evaluation
-register_cuda_ci(est_time=104, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=104, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=800, suite="stage-b-test-1-gpu-small-amd")
 
 

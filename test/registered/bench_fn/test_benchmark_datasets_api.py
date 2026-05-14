@@ -405,12 +405,15 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         fake_mmmu_dataset = _FakeMMMUDataset(
             [{"image_1": Image.new("RGB", (4, 4), color="white"), "question": "q"}]
         )
-        with patch(
-            "sglang.benchmark.datasets.mmmu.get_processor",
-            return_value=self.processor,
-        ), patch(
-            "sglang.benchmark.datasets.mmmu.load_dataset",
-            return_value=fake_mmmu_dataset,
+        with (
+            patch(
+                "sglang.benchmark.datasets.mmmu.get_processor",
+                return_value=self.processor,
+            ),
+            patch(
+                "sglang.benchmark.datasets.mmmu.load_dataset",
+                return_value=fake_mmmu_dataset,
+            ),
         ):
             mmmu_args = make_args(dataset_name="mmmu", num_prompts=1)
             mmmu_rows = get_dataset(mmmu_args, self.tokenizer, model_id="dummy-model")

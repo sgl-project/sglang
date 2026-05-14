@@ -196,6 +196,52 @@ def _jit_fused_store_module(
 
 
 @cache_once
+def _jit_main_q_norm_rope_module(
+    dtype: torch.dtype, head_dim: int, rope_dim: int
+) -> Module:
+    """Main MLA path Q kernel: rmsnorm-self + RoPE, warp per (token, head)."""
+    args = make_cpp_args(dtype, head_dim, rope_dim, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_q_norm_rope"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQNormRopeKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
+def _jit_main_k_norm_rope_flashmla_module(
+    dtype: torch.dtype, head_dim: int, rope_dim: int, page_size: int
+) -> Module:
+    """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache."""
+    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_k_norm_rope_flashmla"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedKNormRopeFlashMLAKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
+def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype) -> Module:
+    """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant (no norm)."""
+    args = make_cpp_args(dtype, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_q_indexer_rope_hadamard_quant"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQIndexerRopeHadamardQuantKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
 def _jit_metadata_module():
     return load_jit(
         make_name("metadata"),
@@ -571,6 +617,26 @@ def compress_fused_norm_rope_inplace(
     )
 
 
+def fused_norm_rope_inplace(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    freq_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
+    module.forward(
+        kv,
+        weight,
+        positions,
+        freq_cis,
+        2,
+        eps,
+        0,
+    )
+
+
 def fused_rope(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -581,6 +647,62 @@ def fused_rope(
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)
+
+
+# Alias for V2 code paths
+fused_rope_inplace = fused_rope
+
+
+def fused_q_norm_rope(
+    q_input: torch.Tensor,
+    q_output: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    head_dim = q_input.shape[-1]
+    rope_dim = freqs_real.shape[-1]
+    module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
+    module.forward(q_input, q_output, freqs_real, positions, eps)
+
+
+def fused_q_indexer_rope_hadamard_quant(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
+    weights_out = torch.empty(
+        (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
+    )
+    module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
+    module.forward(
+        q_input, q_fp8, weight, weights_out, float(weight_scale), freqs_real, positions
+    )
+    return q_fp8, weights_out
+
+
+def fused_k_norm_rope_flashmla(
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+) -> None:
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    head_dim = kv.shape[-1]
+    rope_dim = freqs_real.shape[-1]
+    module = _jit_main_k_norm_rope_flashmla_module(
+        kv.dtype, head_dim, rope_dim, page_size
+    )
+    module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
 
 
 @triton.jit
@@ -818,9 +940,12 @@ def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm
     return metadata
 
 
-def rmsnorm_self(q: torch.Tensor, eps: float) -> torch.Tensor:
+def rmsnorm_self(
+    q: torch.Tensor, eps: float, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     module = _jit_rmsnorm_head_module(q.shape[-1], q.dtype)
-    out = q.new_empty(q.shape)
+    if out is None:
+        out = q.new_empty(q.shape)
     module.run_self(q, out, eps)
     return out
 
