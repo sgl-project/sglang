@@ -232,17 +232,26 @@ class FunctionCallParser:
         )
 
         # Highest priority: model-native structural_tag when available.
+        # NOTE: XGrammar model-native structural-tag templates currently emit
+        # exactly one tool-call block and don't permit repeated tool calls,
+        # so when the caller requests parallel tool calls we skip the
+        # model-native path and fall through to the legacy structural tag
+        # (which allows multiple tool calls). Track the xgrammar-side fix
+        # separately so this bypass can be removed.
         try:
             if is_required or should_constrain_auto:
-                structural_tag = self.detector.get_structural_tag(
-                    tools=self.tools,
-                    thinking_mode=thinking_mode,
-                    tool_choice=tool_choice,
-                )
+                structural_tag = None
+                if not parallel_tool_calls:
+                    structural_tag = self.detector.get_structural_tag(
+                        tools=self.tools,
+                        thinking_mode=thinking_mode,
+                        tool_choice=tool_choice,
+                    )
                 if structural_tag is not None:
                     return ("structural_tag", structural_tag)
 
-                # Fallback to legacy structural tag if model-native tag is not supported.
+                # Fallback to legacy structural tag if model-native tag is not supported
+                # (or was skipped because parallel tool calls were requested).
                 if self.detector.supports_structural_tag():
                     # For "required"/named: always use structural_tag to preserve the
                     # model's native tool call format. Schema is only included when
