@@ -1286,6 +1286,19 @@ def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
 
     sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
     sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
+
+    # In sgl-deep-gemm, the C++ deepgemm path returns through DLPack which collapses the stride
+    # of size-1 trailing dims to 1 (happens when packed_sf_k == 1, i.e.
+    # K <= block_k * 4). Restore the TMA-aligned stride so the deepgemm
+    # assertion sf.stride(-1) == get_tma_aligned_size(mn, element_size) holds.
+    if not use_torch_impl and sf.shape[-1] == 1:
+        from deep_gemm.utils import get_tma_aligned_size
+
+        aligned_mn = get_tma_aligned_size(sf.shape[-2], sf.element_size())
+        if sf.stride(-1) != aligned_mn:
+            new_stride = list(sf.stride())
+            new_stride[-1] = aligned_mn
+            sf = sf.as_strided(sf.shape, tuple(new_stride))
     return sf
 
 

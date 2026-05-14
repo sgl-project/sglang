@@ -7,14 +7,15 @@ register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
 
 
 class TestAdaptiveSpeculativeParams(unittest.TestCase):
-    def test_initial_steps_snap_to_nearest_candidate_preferring_larger_step(self):
+    def test_initial_steps_added_to_candidates_when_missing(self):
         params = AdaptiveSpeculativeParams(
             initial_steps=2,
             config={"candidate_steps": [1, 3, 7]},
         )
 
-        self.assertEqual(params.current_steps, 3)
-        self.assertEqual(params.ema_accept_len, 2.0)
+        self.assertEqual(params.candidate_steps, [1, 2, 3, 7])
+        self.assertEqual(params.current_steps, 2)
+        self.assertEqual(params.ema_accept_len, 1.0)
 
     def test_update_respects_warmup_and_interval(self):
         params = AdaptiveSpeculativeParams(

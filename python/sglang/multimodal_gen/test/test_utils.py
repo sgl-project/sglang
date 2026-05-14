@@ -33,12 +33,30 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/ci-data/main/diffusion-ci/consistency_gt/official_generated"
-SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/ci-data/main/diffusion-ci/consistency_gt/sglang_generated"
+SGL_TEST_FILES_CI_DATA_REVISION = "3ca3bad088ecc9ef80947d85c551cd335c75b87f"
+SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
+    "https://raw.githubusercontent.com/"
+    f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
+    "diffusion-ci/consistency_gt"
+)
+SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = (
+    f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/official_generated"
+)
+SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = (
+    f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/sglang_generated"
+)
 SGL_TEST_FILES_CONSISTENCY_GT_BASE = SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
     SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
+)
+# LTX cases listed here compare against official-generated GT.
+SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
+    {
+        "ltx_2.3_one_stage_ti2v",
+        "ltx_2.3_two_stage_t2v_2gpus",
+        "ltx_2_3_two_stage_ti2v_2gpus",
+    }
 )
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
@@ -945,10 +963,28 @@ def _remote_consistency_gt_candidates(
 
 
 def _remote_file_exists(url: str) -> bool:
-    try:
-        return requests.head(url, timeout=10, allow_redirects=True).status_code == 200
-    except requests.RequestException:
-        return False
+    for method in ("head", "get"):
+        try:
+            if method == "head":
+                resp = requests.head(url, timeout=10, allow_redirects=True)
+            else:
+                resp = requests.get(
+                    url,
+                    timeout=10,
+                    allow_redirects=True,
+                    headers={"Range": "bytes=0-0"},
+                    stream=True,
+                )
+            try:
+                if resp.status_code in (200, 206):
+                    return True
+                if resp.status_code not in (403, 405, 429) and resp.status_code < 500:
+                    return False
+            finally:
+                resp.close()
+        except requests.RequestException:
+            pass
+    return False
 
 
 def _find_remote_consistency_gt_files(
@@ -957,7 +993,12 @@ def _find_remote_consistency_gt_files(
     is_video: bool,
     output_format: str | None = None,
 ) -> list[tuple[str, str]]:
-    for base_url in SGL_TEST_FILES_CONSISTENCY_GT_BASES:
+    if case_id in SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES:
+        bases = SGL_TEST_FILES_CONSISTENCY_GT_BASES
+    else:
+        # Avoid accidentally comparing non-comparable CI cases against official GT.
+        bases = (SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,)
+    for base_url in bases:
         candidates = _remote_consistency_gt_candidates(
             base_url, case_id, num_gpus, is_video, output_format
         )
@@ -1417,6 +1458,7 @@ def _consistency_failure_record(
     is_video: bool,
     output_format: str | None,
     image_name: str,
+    generated_files: list[str],
     gt_remote_files: list[tuple[str, str]] | None,
 ) -> dict[str, Any]:
     return {
@@ -1425,6 +1467,7 @@ def _consistency_failure_record(
         "is_video": is_video,
         "output_format": output_format,
         "comparison_png": image_name,
+        "generated_files": generated_files,
         "metrics": {
             "min_clip_similarity": _json_metric_value(result.min_similarity),
             "min_ssim": _json_metric_value(result.min_ssim),
@@ -1458,6 +1501,36 @@ def _consistency_failure_record(
     }
 
 
+def _save_generated_artifact_images(
+    out_dir: Path,
+    case_id: str,
+    num_gpus: int,
+    output_frames: list[np.ndarray],
+    is_video: bool,
+    output_format: str | None,
+) -> list[str]:
+    generated_dir = out_dir / "generated"
+    generated_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_case_id = _safe_artifact_name(case_id)
+    if is_video:
+        suffixes = ("frame_0", "frame_mid", "frame_last")
+        filenames = [
+            f"{safe_case_id}_{num_gpus}gpu_{suffix}.png"
+            for suffix in suffixes[: len(output_frames)]
+        ]
+    else:
+        ext = output_format_to_ext(output_format)
+        filenames = [f"{safe_case_id}_{num_gpus}gpu.{ext}"]
+
+    generated_files = []
+    for frame, filename in zip(output_frames, filenames):
+        path = generated_dir / filename
+        Image.fromarray(_ensure_rgb_uint8_image(frame)).save(path)
+        generated_files.append(str(path.relative_to(out_dir)))
+    return generated_files
+
+
 def _write_consistency_failure_index(
     out_dir: Path,
     records: list[dict[str, Any]],
@@ -1467,6 +1540,15 @@ def _write_consistency_failure_index(
         case_id = html.escape(record["case_id"])
         png = html.escape(record["comparison_png"])
         metrics = record["metrics"]
+        generated_links = "".join(
+            f'<li><a href="{html.escape(path)}">{html.escape(path)}</a></li>'
+            for path in record.get("generated_files", [])
+        )
+        generated_html = (
+            f"<p>Generated images:</p><ul>{generated_links}</ul>"
+            if generated_links
+            else ""
+        )
         sections.append(
             "<section>"
             f"<h2>{case_id} ({record['num_gpus']} GPU)</h2>"
@@ -1477,6 +1559,7 @@ def _write_consistency_failure_index(
             f"mean_abs_diff={metrics['max_mean_abs_diff']}"
             "</p>"
             f'<img src="{png}" alt="{case_id} comparison">'
+            f"{generated_html}"
             "</section>"
         )
 
@@ -1488,6 +1571,7 @@ def _write_consistency_failure_index(
         "section{margin:0 0 28px;padding:16px;background:white;border:1px solid #ddd;border-radius:6px}"
         "h2{font-size:18px;margin:0 0 8px}"
         "p{margin:0 0 12px;color:#444}"
+        "ul{margin:0 0 12px;padding-left:20px}"
         "img{max-width:100%;height:auto;border:1px solid #ddd}"
         "</style></head><body>"
         "<h1>Diffusion consistency failures</h1>" + "".join(sections) + "</body></html>"
@@ -1525,6 +1609,15 @@ def save_consistency_failure_artifact(
     )
     comparison.save(image_path)
 
+    generated_files = _save_generated_artifact_images(
+        out_dir=out_dir,
+        case_id=case_id,
+        num_gpus=num_gpus,
+        output_frames=output_frames,
+        is_video=is_video,
+        output_format=output_format,
+    )
+
     record = _consistency_failure_record(
         case_id=case_id,
         num_gpus=num_gpus,
@@ -1532,6 +1625,7 @@ def save_consistency_failure_artifact(
         is_video=is_video,
         output_format=output_format,
         image_name=image_name,
+        generated_files=generated_files,
         gt_remote_files=gt_remote_files,
     )
     case_json_path = out_dir / f"{safe_case_id}.json"

@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=12, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=12, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 # ---------------------------------------------------------------------------
@@ -110,6 +110,7 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
         extra_key=None,
         last_node=tree.root_node,
         swa_uuid_for_lock=None,
+        swa_prefix_lock_released=False,
         prefix_indices=torch.tensor([], dtype=torch.int64, device=tree.device),
         _kv_committed_len=len(token_ids),
     )
