@@ -14,8 +14,8 @@ Usage:
     # Single config
     python bench_fwd_h.py --batch 4 --seq-len 256
 
-    # Short run for unitrace (2 warmup + 2 rep)
-    python bench_fwd_h.py --mode unitrace --batch 4 --seq-len 256
+    # Short run for single (2 warmup + 2 rep)
+    python bench_fwd_h.py --mode single --batch 4 --seq-len 256
 """
 
 import argparse
@@ -194,14 +194,14 @@ def main():
     p.add_argument("--device", choices=["xpu", "cuda"], default=default_device)
     p.add_argument(
         "--mode",
-        choices=["bench", "unitrace"],
-        default="bench",
-        help="bench: full sweep (25 warmup, 100 rep); "
-        "unitrace: single config with 2 warmup + 2 rep for short traces",
+        choices=["sweep", "single"],
+        default="sweep",
+        help="sweep: full sweep (25 warmup, 100 rep); "
+        "single: single config with 2 warmup + 2 rep for short traces",
     )
-    p.add_argument("--batch", type=int, default=4, help="batch size (unitrace mode)")
+    p.add_argument("--batch", type=int, default=4, help="batch size (single mode)")
     p.add_argument(
-        "--seq-len", type=int, default=256, help="sequence length (unitrace mode)"
+        "--seq-len", type=int, default=256, help="sequence length (single mode)"
     )
     p.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     args = p.parse_args()
@@ -214,7 +214,7 @@ def main():
     print(f"Device: {device_mod.get_device_name(0)}")
     print(f"Measured memory bandwidth: {peak_bw_gbs:.1f} GB/s")
 
-    if args.mode == "unitrace":
+    if args.mode == "single":
         H, Hg = 32, 16
         K = V = 128
         B, T = args.batch, args.seq_len
