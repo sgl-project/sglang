@@ -450,10 +450,20 @@ class TestAlgorithmNativePathBypassesStage2(CustomTestCase):
             [seq_len - 1], dtype=torch.int64, device=device
         )
         forward_batch.token_to_kv_pool = token_pool
+        forward_batch.forward_mode = MagicMock()
+        forward_batch.forward_mode.is_decode_or_idle = MagicMock(return_value=True)
 
         q = torch.randn(bs, num_q * head_dim, device=device, dtype=torch.bfloat16)
         k = torch.randn(bs, num_kv, head_dim, device=device, dtype=torch.bfloat16)
         v = torch.randn(bs, num_kv, head_dim, device=device, dtype=torch.bfloat16)
+
+        # Production path calls forward_begin once per decode step (from
+        # ModelRunner.forward, before either eager dispatch or graph
+        # replay). The native sparse-decode path now reads from the
+        # scratch populated here; without this call the scratch would
+        # be all zeros and the score kernel would gather the wrong
+        # K_label rows.
+        algo.forward_begin(forward_batch)
 
         # Patch the legacy entry to detect if it's invoked.
         with patch(
@@ -468,6 +478,149 @@ class TestAlgorithmNativePathBypassesStage2(CustomTestCase):
         self.assertEqual(out.shape, (bs, num_q * head_dim))
         # set_kv_buffer must have been called (native path writes K/V).
         token_pool.set_kv_buffer.assert_called_once()
+
+
+@unittest.skipUnless(_have_cuda(), "CUDA required")
+class TestForwardBeginCaching(CustomTestCase):
+    """`forward_begin` populates the native scratch with
+    ``req_to_token[req_pool_indices]`` once per decode step, and
+    ``try_native_sparse_decode`` reads exclusively from that scratch
+    (no per-layer ``torch.index_select`` allowed)."""
+
+    def _make_algo(self, scratch_max_bs: int = 4):
+        """Build a small DS algorithm with native scratch allocated."""
+        from unittest.mock import MagicMock
+
+        from sglang.srt.mem_cache.sparsity.algorithms.double_sparsity import (
+            DoubleSparsityAlgorithm,
+        )
+        from sglang.srt.mem_cache.sparsity.algorithms.double_sparsity_config import (
+            DoubleSparsityCalibration,
+            DoubleSparsityRuntimeConfig,
+        )
+
+        device = torch.device("cuda")
+        head_dim, num_layers, num_q, num_kv, s = 32, 2, 4, 1, 8
+        channels = {
+            i: torch.arange(num_kv * s, dtype=torch.int32).reshape(num_kv, s)
+            for i in range(num_layers)
+        }
+        calib = DoubleSparsityCalibration(
+            schema_version=1,
+            model_arch="t",
+            model_name_or_path="",
+            head_dim=head_dim,
+            num_layers=num_layers,
+            num_heads=num_q,
+            num_kv_heads_global=num_kv,
+            heavy_channels=s,
+            channel_type="k",
+            indexing="global_kv_head_id",
+            channels=channels,
+        )
+        rt = DoubleSparsityRuntimeConfig(
+            heavy_channels=s,
+            token_budget=8,
+            recent_tokens=2,
+            sink_tokens=2,
+            min_seq_len=16,
+            max_selected_per_request=64,
+            gqa_reduction="max_abs",
+            klabel_dtype="bf16",
+            block_t=256,
+            k_block=16,
+            scratch_max_bs=scratch_max_bs,
+        )
+        algo = DoubleSparsityAlgorithm(
+            config=MagicMock(),
+            device=device,
+            runtime_config=rt,
+            calibration=calib,
+            tp_size=1,
+            tp_rank=0,
+            num_kv_heads_local=num_kv,
+            num_q_heads_local=num_q,
+            head_dim=head_dim,
+        )
+        token_pool = MagicMock()
+        T_pool = 128
+        token_pool.get_key_buffer = MagicMock(
+            return_value=torch.randn(
+                T_pool, num_kv, head_dim, device=device, dtype=torch.bfloat16
+            )
+        )
+        token_pool.get_value_buffer = MagicMock(
+            return_value=torch.randn(
+                T_pool, num_kv, head_dim, device=device, dtype=torch.bfloat16
+            )
+        )
+        token_pool.set_kv_buffer = MagicMock()
+
+        # Non-identity req_to_token so we can detect "wrong row gathered".
+        max_ctx = 64
+        req_to_token_pool = MagicMock()
+        req_to_token_pool.req_to_token = (
+            torch.arange(8 * max_ctx, device=device, dtype=torch.int32).reshape(
+                8, max_ctx
+            )
+            * 10
+        )
+        algo.initialize_representation_pool(
+            start_layer=0,
+            end_layer=num_layers,
+            token_to_kv_pool=token_pool,
+            req_to_token_pool=req_to_token_pool,
+            states=MagicMock(),
+        )
+        return algo, req_to_token_pool.req_to_token, max_ctx, device
+
+    def test_forward_begin_populates_scratch_at_correct_rows(self):
+        from unittest.mock import MagicMock
+
+        algo, req_to_token, max_ctx, device = self._make_algo()
+        # Pick arbitrary req_pool_indices in [0, 8) — must land at
+        # algorithm scratch rows [0, bs).
+        forward_batch = MagicMock()
+        forward_batch.req_pool_indices = torch.tensor(
+            [5, 2, 7], dtype=torch.int64, device=device
+        )
+        forward_batch.forward_mode = MagicMock()
+        forward_batch.forward_mode.is_decode_or_idle = MagicMock(return_value=True)
+        algo.forward_begin(forward_batch)
+        scratch = algo._native_req_to_token_indexed[:3]
+        expected = req_to_token[forward_batch.req_pool_indices]
+        self.assertTrue(torch.equal(scratch, expected))
+
+    def test_forward_begin_is_noop_for_extend(self):
+        from unittest.mock import MagicMock
+
+        algo, _, _, device = self._make_algo()
+        # Seed the scratch with sentinel then verify forward_begin
+        # leaves it untouched for non-decode batches.
+        algo._native_req_to_token_indexed.fill_(-1)
+        forward_batch = MagicMock()
+        forward_batch.req_pool_indices = torch.tensor(
+            [0, 1], dtype=torch.int64, device=device
+        )
+        forward_batch.forward_mode = MagicMock()
+        forward_batch.forward_mode.is_decode_or_idle = MagicMock(return_value=False)
+        algo.forward_begin(forward_batch)
+        self.assertEqual(int(algo._native_req_to_token_indexed[:2].max().item()), -1)
+
+    def test_forward_begin_skips_bs_over_scratch_max(self):
+        from unittest.mock import MagicMock
+
+        algo, _, _, device = self._make_algo(scratch_max_bs=2)
+        algo._native_req_to_token_indexed.fill_(-1)
+        forward_batch = MagicMock()
+        # bs=3 > scratch_max_bs=2 → must not touch the scratch.
+        forward_batch.req_pool_indices = torch.tensor(
+            [0, 1, 2], dtype=torch.int64, device=device
+        )
+        forward_batch.forward_mode = MagicMock()
+        forward_batch.forward_mode.is_decode_or_idle = MagicMock(return_value=True)
+        algo.forward_begin(forward_batch)
+        self.assertEqual(int(algo._native_req_to_token_indexed.max().item()), -1)
 
 
 if __name__ == "__main__":

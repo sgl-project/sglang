@@ -330,6 +330,41 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
             bytes_total / (1024 * 1024),
         )
 
+    def forward_begin(self, forward_batch) -> None:
+        """Per-decode-step gather of ``req_to_token[req_pool_indices]``.
+
+        Writes into ``self._native_req_to_token_indexed`` so all layers
+        in the step read from the same buffer (saves 79 redundant
+        ``torch.index_select`` launches per step at 80 layers).
+
+        Capture-safe: the kernel reads a device tensor pointer that is
+        captured once. At replay-time the surrounding pre-replay write
+        from ``ModelRunner.forward`` (and at capture-time the write
+        from ``CUDAGraphRunner.capture_one_batch_size``) refreshes the
+        contents through the stable pointer. ``try_native_sparse_decode``
+        no longer issues its own ``index_select`` — it just
+        ``.narrow(0, 0, bs)``-views this buffer.
+
+        No-op when:
+          * native scratch is not allocated (test paths or DS legacy-
+            only build),
+          * not a decode/idle batch (extend stays on the legacy /
+            dense path),
+          * ``bs > scratch_max_bs`` (caller falls through to the FA3
+            legacy adaptor, which gathers ``req_to_token`` itself).
+        """
+        if self._native_req_to_token_indexed is None:
+            return
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        req_pool_indices = forward_batch.req_pool_indices
+        bs = req_pool_indices.shape[0]
+        if bs > self._native_req_to_token_indexed.shape[0]:
+            return
+        req_to_token = self.req_to_token_pool.req_to_token
+        r2t_indexed = self._native_req_to_token_indexed.narrow(0, 0, bs)
+        torch.index_select(req_to_token, 0, req_pool_indices, out=r2t_indexed)
+
     def try_native_sparse_decode(
         self,
         q: torch.Tensor,
@@ -402,13 +437,11 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
             gqa_reduction_id=gqa_reduction_id(rt.gqa_reduction),
         )  # [bs, h_kv, S]
 
-        # Pre-index req_to_token for this batch. Re-gathered each layer
-        # (cheap; one int32 read per (bs, max_ctx) cell) — could be
-        # cached per decode-step in forward_batch by a future iteration.
-        req_to_token = self.req_to_token_pool.req_to_token
-        req_pool_indices = forward_batch.req_pool_indices
+        # Read the pre-indexed req_to_token table written once per step
+        # by `forward_begin`. Callers that skip `forward_begin` (direct
+        # unit-test invocation, etc.) must populate the scratch
+        # themselves before calling this.
         r2t_indexed = self._native_req_to_token_indexed.narrow(0, 0, bs)
-        torch.index_select(req_to_token, 0, req_pool_indices, out=r2t_indexed)
 
         # Output dtype must match the preallocated `_native_output`
         # (klabel_dtype, bf16 by default). Fail-loud rather than

@@ -161,12 +161,15 @@ class SparseCoordinator:
         """
         Handle forward pass begin event. Called before each forward pass starts.
 
-        Wait for pending KVCache offloading operations to complete before forward pass.
-        Ensures memory consistency for subsequent sparse attention operations.
+        Delegates to the algorithm's per-step ``forward_begin`` hook if it
+        defines one (e.g. ``DoubleSparsityAlgorithm`` uses this slot to
+        gather ``req_to_token[req_pool_indices]`` once per decode step
+        instead of once per layer). Algorithms without a hook get the
+        original no-op behavior.
         """
-        # TODO: Implement forward begin handling
-        # - Check if there are pending offloading operations
-        pass
+        algo_hook = getattr(self.algorithm, "forward_begin", None)
+        if algo_hook is not None:
+            algo_hook(forward_batch)
 
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
         """

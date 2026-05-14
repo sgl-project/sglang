@@ -3471,6 +3471,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.hisparse_coordinator.wait_for_pending_backup()
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+        # Double-Sparsity coordinator: gather req_to_token[req_pool_indices]
+        # once per decode step into algorithm scratch. Captured graphs read
+        # from that scratch via a stable device pointer, so this write
+        # happens outside the graph (analogous to the hisparse num_real_reqs
+        # pattern above). The captured try_native_sparse_decode reads from
+        # the scratch via .narrow and does NOT issue its own index_select.
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and self.ds_coordinator is not None
+        ):
+            self.ds_coordinator.forward_begin(forward_batch)
+
         # Replay cuda graph if applicable
         if can_run_graph:
             ret = self.graph_runner.replay(
