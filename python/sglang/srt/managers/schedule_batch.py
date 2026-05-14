@@ -2544,17 +2544,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         keep_indices: Optional[List[int]] = None,
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
+        exclude_in_flight_other_mb: Optional[set] = None,
     ):
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
             elif chunked_req_to_exclude is None:
                 chunked_req_to_exclude = []
+            in_flight_rids = exclude_in_flight_other_mb or set()
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
                 and self.reqs[i] not in chunked_req_to_exclude
+                and self.reqs[i].rid not in in_flight_rids
             ]
 
         if keep_indices is None or len(keep_indices) == 0:

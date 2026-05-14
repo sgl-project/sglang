@@ -2422,6 +2422,41 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def _in_flight_other_mb_rids(self) -> set:
+        """rids of reqs whose chunked-prefill forward is launched in another
+        PP microbatch but whose result has not yet been processed by the
+        output processor — AND for which a follow-up decode would actually
+        propagate corruption (max_new_tokens > 1).
+
+        In PP+chunked-prefill, mb_a's LAST chunk admit clears has_pending_chunk
+        on the req while mb_a's chunk forward result is still in flight. If
+        mb_b's filter_batch merges this req into running_batch, mb_b's decode
+        forward runs on stale state — input falls back to origin[-1] and
+        writes WRONG K,V at row position N. The wrong K,V at N persists in
+        the KV pool and corrupts every subsequent decode position.
+
+        For req.sampling_params.max_new_tokens == 1, the wrong decode result
+        is filtered by `req.finished()` (line ~240) before being appended,
+        and the wrong K,V at N is released with the rest of the row when
+        the req finishes — no observable effect. Excluding such reqs would
+        delay them by 1 mb step for no correctness gain, so we skip them
+        here and only return rids of reqs that genuinely need protection.
+        """
+        if self.ps.pp_size <= 1 or not hasattr(self, "mbs"):
+            return set()
+        rids = set()
+        for mb in self.mbs:
+            if mb is None or mb is self.last_batch:
+                continue
+            for r in mb.reqs:
+                # max_new_tokens is normalized to a non-None int in
+                # _prepare_input_for_image_request / similar paths during
+                # request admission, but defensively handle missing/zero.
+                max_new = r.sampling_params.max_new_tokens or 0
+                if max_new > 1:
+                    rids.add(r.rid)
+        return rids
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
@@ -2474,8 +2509,12 @@ class Scheduler(
 
             # Filter batch
             last_bs = self.last_batch.batch_size()
+            # PP cross-mb: also drop reqs whose LAST chunk forward is still in
+            # flight in another mb (when more decodes will follow — i.e.,
+            # max_new_tokens > 1). See _in_flight_other_mb_rids for rationale.
             self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
+                chunked_req_to_exclude=list(chunked_req_to_exclude),
+                exclude_in_flight_other_mb=self._in_flight_other_mb_rids(),
             )
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
@@ -2494,7 +2533,11 @@ class Scheduler(
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
-            self.running_batch.filter_batch()
+            # PP cross-mb: drop reqs whose last chunk forward is still in flight
+            # in another mb (max_new_tokens > 1); see _in_flight_other_mb_rids.
+            self.running_batch.filter_batch(
+                exclude_in_flight_other_mb=self._in_flight_other_mb_rids(),
+            )
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
