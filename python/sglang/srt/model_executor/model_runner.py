@@ -122,6 +122,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
@@ -1607,7 +1608,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_prepared = 0
         num_routed_experts = None
         for module in self.model.modules():
-            if not isinstance(module, TopK):
+            if not isinstance(module, (TopK, HashTopK)):
                 continue
             if (
                 not module.enable_deepep_waterfill
@@ -1628,15 +1629,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
                 balancer_cls = DeepEPWaterfillBalancer
+            # Static EPLB remaps TopK ids to physical expert ids before Waterfill.
+            # Redundant experts therefore need to be included in the per-rank
+            # expert count used for Waterfill's shared-expert slot remapping.
+            num_physical_routed_experts = (
+                num_routed_experts + self.server_args.ep_num_redundant_experts
+            )
+            if isinstance(module, TopK):
+                routed_scaling_factor = module.topk_config.routed_scaling_factor
+            else:
+                routed_scaling_factor = module.routed_scaling_factor
             module.deepep_waterfill_balancer = balancer_cls(
-                num_routed_experts=num_routed_experts,
+                num_routed_experts=num_physical_routed_experts,
                 world_size=self.moe_ep_size,
                 rank=self.moe_ep_rank,
                 layer_id=module.layer_id,
                 routed_scaling_factor=(
-                    module.topk_config.routed_scaling_factor
-                    if module.topk_config.routed_scaling_factor is not None
-                    else 1.0
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 ),
             )
             num_prepared += 1
