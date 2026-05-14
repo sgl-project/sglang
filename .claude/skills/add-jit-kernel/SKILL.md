@@ -587,7 +587,7 @@ if __name__ == "__main__":
 - Stack `@mark_args` once per swept axis. The outermost `@mark_benchmark` is required and goes on top.
 - Prefer `create_random` / `create_empty` from `utils.py` over open-coding `torch.randn(..., dtype=..., device=...)`.
 - Set `memory_args` whenever the kernel is memory-bound — the printed GB/s column is the most informative number for those kernels. Skip it (or set `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH=1`) for compute-bound kernels where bandwidth would be misleading.
-- Tune `graph_clone_args` to only the *read* args. For an in-place kernel where all tensors are written, pass `graph_clone_args=None`.
+- Tune `graph_clone_args` / `graph_clone_kwargs` to all the arguments that might be read by the kernel. We can only skip cloning for write-only args. For in-place modified args, we still need to clone them to get accurate timing (reusing the same buffer keeps it L2-hot and skews results).
 - Call `benchmark.run()` (no `print_data=` kwarg — the marker framework prints directly).
 
 Run locally:
