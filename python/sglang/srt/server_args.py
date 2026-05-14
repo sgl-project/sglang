@@ -134,6 +134,10 @@ QUANTIZATION_CHOICES = [
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
+    # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
+    # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
+    "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
+    "mlx_q8",  # 8 bits, group_size=64
     "unquant",
 ]
 
@@ -154,6 +158,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flashinfer",
     "flashmla",
     "trtllm_mla",
+    "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
     # AMD specific
@@ -2071,6 +2076,11 @@ class ServerArgs:
                     logger.warning(
                         "Detected ROCm with SGLANG_USE_AITER for GPT-OSS bf16 model, using triton MOE kernel."
                     )
+                elif is_musa() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
+                    self.moe_runner_backend = "deep_gemm"
+                    logger.warning(
+                        "Detected MUSA with SGLANG_DEEPEP_BF16_DISPATCH for bf16 model, using deep_gemm kernel."
+                    )
                 elif (
                     self.ep_size == 1
                     and is_triton_kernels_available()
@@ -2705,6 +2715,25 @@ class ServerArgs:
             if self.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
                 raise ValueError(
                     "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
+                )
+
+        if (
+            self.attention_backend == "tokenspeed_mla"
+            or self.decode_attention_backend == "tokenspeed_mla"
+        ):
+            if not is_blackwell_supported():
+                raise ValueError(
+                    "tokenspeed_mla backend is only supported on Blackwell GPUs (SM100/SM12x)."
+                )
+            if self.page_size not in [32, 64]:
+                logger.warning(
+                    f"tokenspeed_mla only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
+                )
+                self.page_size = 64
+            if self.kv_cache_dtype not in ["fp8_e4m3"]:
+                raise ValueError(
+                    "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3, "
+                    f"got {self.kv_cache_dtype}."
                 )
 
         if (

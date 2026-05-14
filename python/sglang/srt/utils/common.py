@@ -316,6 +316,18 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
+@lru_cache(maxsize=1)
+def is_tokenspeed_mla_available():
+    """
+    Check whether the tokenspeed_mla CuTe DSL kernels are available.
+    Only available on NVIDIA Blackwell (SM100) at the moment.
+    """
+    return (
+        importlib.util.find_spec("tokenspeed_mla") is not None
+        and is_blackwell_supported()
+    )
+
+
 def is_nvidia_cublas_version_ge_12_9():
     """
     temporary fix for issue #11272 (cublas 12.9+)
@@ -3538,6 +3550,10 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "k_proj",
     "v_proj",
     "o_proj",
+    "q_a_proj",
+    "kv_a_proj_with_mqa",
+    "q_b_proj",
+    "kv_b_proj",
     "gate_proj",
     "up_proj",
     "down_proj",
