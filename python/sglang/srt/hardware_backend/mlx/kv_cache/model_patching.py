@@ -19,6 +19,8 @@ def find_attention_layers(model: Any) -> tuple[list[Any], str]:
             return layer_list, "self_attn"
         if hasattr(sample, "attention"):
             return layer_list, "attention"
+        if hasattr(sample, "linear_attn"):
+            return layer_list, "linear_attn"
         raise ValueError(f"No attention attribute in layer type {type(sample)}")
     return layer_list, "self_attn"
 
