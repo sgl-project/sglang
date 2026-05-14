@@ -1079,18 +1079,21 @@ class TritonAttnBackend(AttentionBackend):
             # Save KV cache first (must do this before unified kernel)
             if save_kv_cache:
                 if layer.k_scale is None:
-                    self._set_kv_buffer(
-                        forward_batch, layer, self._kv_cache_loc(forward_batch), k, v
-                    )
-                elif self.use_mla:
-                    k_scaled = k.clone().div_(layer.k_scale)
-                    self._set_kv_buffer(
-                        forward_batch,
-                        layer,
-                        self._kv_cache_loc(forward_batch),
-                        k_scaled,
-                        v,
-                    )
+                    if self.dcp_size > 1:
+                        self._set_kv_buffer(
+                            forward_batch,
+                            layer,
+                            self._kv_cache_loc(forward_batch),
+                            k,
+                            v,
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            forward_batch.out_cache_loc,
+                            k,
+                            v,
+                        )
                 elif self.use_mla:
                     # For MLA, scale K manually before storing since MLATokenToKVPool
                     # doesn't accept scale parameters. Clone to protect k from mutation
@@ -1103,15 +1106,25 @@ class TritonAttnBackend(AttentionBackend):
                         v,
                     )
                 else:
-                    self._set_kv_buffer(
-                        forward_batch,
-                        layer,
-                        self._kv_cache_loc(forward_batch),
-                        k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
-                        v.clone(),
-                        layer.k_scale,
-                        layer.v_scale,
-                    )
+                    if self.dcp_size > 1:
+                        self._set_kv_buffer(
+                            forward_batch,
+                            layer,
+                            self._kv_cache_loc(forward_batch),
+                            k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
+                            v.clone(),
+                            layer.k_scale,
+                            layer.v_scale,
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            forward_batch.out_cache_loc,
+                            k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
+                            v.clone(),
+                            layer.k_scale,
+                            layer.v_scale,
+                        )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
