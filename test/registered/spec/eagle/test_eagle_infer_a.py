@@ -13,12 +13,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(
-    est_time=357,
-    suite="nightly-1-gpu",
-    nightly=True,
-    tags=("speculative-decoding",),
-)
+register_cuda_ci(est_time=357, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestEAGLEEngine(CustomTestCase):

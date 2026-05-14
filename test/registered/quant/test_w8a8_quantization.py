@@ -14,12 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(
-    est_time=232,
-    suite="nightly-1-gpu",
-    nightly=True,
-    tags=("quant",),
-)
+register_cuda_ci(est_time=232, stage="extra-a", runner_config="1-gpu-large")
 
 
 class BaseW8A8Test(CustomTestCase):

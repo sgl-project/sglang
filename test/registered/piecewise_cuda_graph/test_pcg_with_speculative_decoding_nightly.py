@@ -18,12 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(
-    est_time=400,
-    suite="nightly-2-gpu",
-    nightly=True,
-    tags=("piecewise-cuda-graph", "speculative-decoding"),
-)
+register_cuda_ci(est_time=400, stage="extra-a", runner_config="2-gpu-large")
 
 
 class TestPCGWithMTP(unittest.TestCase):

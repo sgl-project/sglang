@@ -19,16 +19,7 @@ from sglang.test.vlm_utils import (
     VideoOpenAITestMixin,
 )
 
-# Per-commit smoke surface for the OpenAI vision/audio/omni/OCR servers.
-# Models that already get full MMMU eval coverage in
-# nightly-eval-vlm-2-gpu (test_vlms_mmmu_eval.py) — Qwen2.5-VL,
-# Qwen3-VL, InternVL2_5, MiniCPM-o-2_6, Kimi-VL — and Gemma 3-4b (covered
-# in nightly test_vlm_models.py) are not duplicated here. The classes
-# below cover model families NOT present in nightly (Llava, LFM2-VL,
-# Qwen3-Omni, MiniCPM-V-4, Qwen2-Audio, DeepSeek-OCR) plus the
-# Qwen2-VL context-length validation, which is a per-commit concern
-# rather than an accuracy concern.
-register_cuda_ci(est_time=420, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=780, stage="stage-b", runner_config="1-gpu-large")
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
@@ -37,6 +28,18 @@ class TestLlavaServer(ImageOpenAITestMixin):
 
 class TestLfm2VlServer(ImageOpenAITestMixin):
     model = "LiquidAI/LFM2.5-VL-1.6B"
+
+
+class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    model = "Qwen/Qwen2.5-VL-7B-Instruct"
+    extra_args = [
+        "--cuda-graph-max-bs=4",
+    ]
+
+
+class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    model = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    extra_args = ["--cuda-graph-max-bs=4"]
 
 
 class TestQwen3OmniServer(OmniOpenAITestMixin):
@@ -105,10 +108,58 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
         )
 
 
+# flaky
+# class TestMllamaServer(ImageOpenAITestMixin):
+#     model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+
+
+class TestInternVL25Server(ImageOpenAITestMixin):
+    model = "OpenGVLab/InternVL2_5-2B"
+    extra_args = [
+        "--cuda-graph-max-bs=4",
+    ]
+
+
 class TestMiniCPMV4Server(ImageOpenAITestMixin):
     model = "openbmb/MiniCPM-V-4"
     extra_args = [
         "--cuda-graph-max-bs=4",
+    ]
+
+
+class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
+    model = "openbmb/MiniCPM-o-2_6"
+    extra_args = [
+        "--cuda-graph-max-bs=4",
+    ]
+
+
+class TestGemma3itServer(ImageOpenAITestMixin):
+    model = "google/gemma-3-4b-it"
+    extra_args = [
+        "--cuda-graph-max-bs=4",
+    ]
+
+
+class TestKimiVLServer(ImageOpenAITestMixin):
+    model = "moonshotai/Kimi-VL-A3B-Instruct"
+    extra_args = [
+        "--context-length=8192",
+        "--dtype=bfloat16",
+    ]
+
+    def test_video_images_chat_completion(self):
+        # model context length exceeded
+        pass
+
+
+@unittest.skip(
+    "Disabling this test to speed up CI. Prefer to test it within nightly test."
+)
+class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    model = "zai-org/GLM-4.1V-9B-Thinking"
+    extra_args = [
+        "--reasoning-parser=glm45",
     ]
 
 

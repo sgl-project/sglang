@@ -21,12 +21,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(
-    est_time=520,
-    suite="nightly-1-gpu",
-    nightly=True,
-    tags=("session",),
-)
+register_cuda_ci(est_time=520, stage="extra-a", runner_config="1-gpu-large")
 
 LOGPROB_PROMPTS = [
     "The quick brown fox jumps over the lazy dog.",

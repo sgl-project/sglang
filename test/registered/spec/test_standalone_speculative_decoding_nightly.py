@@ -19,12 +19,7 @@ from sglang.test.test_utils import (
 # Non-V2 standalone speculative decoding tests (FA3, Triton, FlashInfer
 # backends). Sibling V2 classes stay per-commit in
 # test_standalone_speculative_decoding.py.
-register_cuda_ci(
-    est_time=210,
-    suite="nightly-1-gpu",
-    nightly=True,
-    tags=("speculative-decoding",),
-)
+register_cuda_ci(est_time=210, stage="extra-a", runner_config="1-gpu-large")
 
 GSM_DATASET_PATH = None
 

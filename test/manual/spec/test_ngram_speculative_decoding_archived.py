@@ -10,7 +10,7 @@ The remaining classes from that file are split between:
 - test/registered/spec/test_ngram_speculative_decoding.py
     -> Paged variant (per-commit, stage-b-test-1-gpu-large)
 - test/registered/spec/test_ngram_speculative_decoding_nightly.py
-    -> Triton + Flashinfer variants (nightly, tags=("speculative-decoding",))
+    -> Triton + Flashinfer variants (extra-a-test-1-gpu-large)
 """
 
 import unittest

@@ -1,8 +1,9 @@
 import argparse
 import glob
+import json
 import os
 import sys
-from typing import List
+from typing import Dict, List, Optional
 
 import tabulate
 
@@ -23,7 +24,7 @@ HW_MAPPING = {
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["stage-a-test-cpu"],
+    HWBackend.CPU: ["stage-a-test-cpu", "stage-b-test-cpu"],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",
@@ -32,6 +33,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-large-8-gpu-35x-disaggregation-amd",
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
+        "jit-kernel-unit-test-amd",
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
@@ -53,9 +55,17 @@ PER_COMMIT_SUITES = {
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-b200",
         "stage-c-test-deepep-4-gpu-h100",
-        "stage-c-test-deepep-8-gpu-h200",
         "stage-c-test-dsv4-4-gpu-b200",
         "stage-c-test-dsv4-8-gpu-h200",
+        # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
+        # (tests still tagged per-commit but skipped on default PR runs).
+        "extra-a-test-1-gpu-small",
+        "extra-a-test-1-gpu-large",
+        "extra-a-test-2-gpu-large",
+        "extra-b-test-4-gpu-h100",
+        "extra-b-test-4-gpu-b200",
+        "extra-b-test-8-gpu-h200",
+        "extra-b-test-deepep-8-gpu-h200",
     ],
     HWBackend.NPU: [
         "stage-a-test-1-gpu-small",
@@ -89,8 +99,6 @@ NIGHTLY_SUITES = {
         "nightly-perf-vlm-2-gpu",
         # GB300 (4x B200 NVL4) nightly suite
         "nightly-4-gpu-gb300",
-        # 5090 / SM12.0 nightly suite (workflow added separately)
-        "nightly-1-gpu-5090",
     ],
     HWBackend.AMD: [
         "nightly-amd",
@@ -130,49 +138,6 @@ OTHER_SUITES = {
 }
 
 
-# Map of per-commit suite -> compatible nightly suite name(s) for the same
-# hardware class. When a PR run carries a label that opts a nightly test in
-# (--include-tags), the test must live on a runner the per-commit suite is
-# already invoking — otherwise we'd ship it to a runner that can't host it.
-#
-# This is the source of truth for the cross-cadence pull-in. Edit here when
-# adding new suites; consumers (filter_tests, the workflow plumbing) read
-# this constant.
-PER_COMMIT_TO_NIGHTLY = {
-    HWBackend.CUDA: {
-        # stage-a is the fast-fail smoke gate (10-minute step budget);
-        # intentionally empty so conditional pull-ins never land here.
-        # nightly-1-gpu-5090 tests ride on stage-b-test-1-gpu-small
-        # (same hardware, 8 partitions, 240-min budget) instead.
-        "stage-a-test-1-gpu-small": [],
-        "stage-b-test-1-gpu-small": ["nightly-1-gpu-5090"],
-        "stage-b-test-1-gpu-large": ["nightly-1-gpu"],
-        "stage-b-test-2-gpu-large": ["nightly-2-gpu"],
-        "stage-b-test-4-gpu-b200": ["nightly-4-gpu-b200"],
-        "stage-b-kernel-unit-1-gpu-large": ["nightly-kernel-1-gpu"],
-        "stage-b-kernel-unit-1-gpu-b200": [],
-        "stage-b-kernel-unit-8-gpu-h200": ["nightly-kernel-8-gpu-h200"],
-        "stage-b-kernel-benchmark-1-gpu-large": ["nightly-kernel-1-gpu"],
-        "stage-c-test-4-gpu-h100": ["nightly-4-gpu"],
-        "stage-c-test-4-gpu-b200": ["nightly-4-gpu-b200"],
-        "stage-c-test-4-gpu-gb200": [],
-        "stage-c-test-8-gpu-h20": ["nightly-8-gpu-h20"],
-        "stage-c-test-8-gpu-h200": [
-            "nightly-8-gpu-h200",
-            "nightly-8-gpu-h200-basic",
-            "nightly-8-gpu-common",
-        ],
-        "stage-c-test-8-gpu-b200": [
-            "nightly-8-gpu-b200",
-            "nightly-8-gpu-b200-basic",
-            "nightly-8-gpu-common",
-        ],
-        "stage-c-test-deepep-4-gpu-h100": ["nightly-4-gpu"],
-        "stage-c-test-deepep-8-gpu-h200": ["nightly-8-gpu-h200"],
-    },
-}
-
-
 _SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
 
@@ -195,60 +160,22 @@ def validate_all_suites(all_tests: List[CIRegistry]):
         if t.backend not in _SUITE_CHECKED_BACKENDS:
             continue
         valid = valid_by_backend.get(t.backend, set())
-        if t.suite not in valid:
+        if t.effective_suite not in valid:
             errors.append(
-                f"  {t.filename}: backend={t.backend.name}, suite='{t.suite}'"
+                f"  {t.filename}: backend={t.backend.name}, suite='{t.effective_suite}'"
             )
     if errors:
         raise ValueError("Tests registered to invalid suites:\n" + "\n".join(errors))
 
 
 def filter_tests(
-    ci_tests: List[CIRegistry],
-    hw: HWBackend,
-    suite: str,
-    nightly: bool = False,
-    include_tags: tuple = (),
+    ci_tests: List[CIRegistry], hw: HWBackend, suite: str, nightly: bool = False
 ) -> List[CIRegistry]:
-    """Filter the parsed CI registry down to the tests that should run.
-
-    `include_tags` is the per-commit pull-in mechanism: when set on a non-
-    nightly run, any nightly test whose `tags ∩ include_tags ≠ ∅` is also
-    pulled in, restricted to nightly suites that share the same hardware
-    class as the per-commit suite (per `PER_COMMIT_TO_NIGHTLY`). Empty
-    `include_tags` (the default) preserves the historical behavior — only
-    tests matching `(hw, suite, nightly)` exactly are returned.
-    """
-    base = [
+    ci_tests = [
         t
         for t in ci_tests
-        if t.backend == hw and t.suite == suite and t.nightly == nightly
+        if t.backend == hw and t.effective_suite == suite and t.nightly == nightly
     ]
-
-    if not nightly and include_tags:
-        compatible_nightly = set(PER_COMMIT_TO_NIGHTLY.get(hw, {}).get(suite, []))
-        include_set = set(include_tags)
-        # Wildcard: `*` opts in EVERY nightly test in the compatible-suite
-        # set, regardless of tag value (or absence). The scheduled cron
-        # passes this so it always exercises the complete CI.
-        match_all = "*" in include_set
-        pulled = [
-            t
-            for t in ci_tests
-            if t.backend == hw
-            and t.nightly is True
-            and t.suite in compatible_nightly
-            and (match_all or (set(t.tags) & include_set))
-        ]
-        # Dedupe by filename (a test should never be doubled even if it
-        # somehow registered twice).
-        seen = {(t.filename, t.suite) for t in base}
-        for t in pulled:
-            key = (t.filename, t.suite)
-            if key in seen:
-                continue
-            seen.add(key)
-            base.append(t)
 
     valid_suites = (
         NIGHTLY_SUITES.get(hw, []) if nightly else PER_COMMIT_SUITES.get(hw, [])
@@ -259,8 +186,8 @@ def filter_tests(
             f"Warning: Unknown suite {suite} for backend {hw.name}, nightly={nightly}"
         )
 
-    enabled_tests = [t for t in base if t.disabled is None]
-    skipped_tests = [t for t in base if t.disabled is not None]
+    enabled_tests = [t for t in ci_tests if t.disabled is None]
+    skipped_tests = [t for t in ci_tests if t.disabled is not None]
 
     return enabled_tests, skipped_tests
 
@@ -304,6 +231,29 @@ def pretty_print_tests(
     print(msg, flush=True)
 
 
+def load_live_est(
+    partition_model_file: Optional[str], suite: str, repo_root: str
+) -> Optional[Dict[str, float]]:
+    """`CIRegistry.filename -> est seconds` from `model.json est[suite]`;
+    None on any miss (caller falls back to in-source `est_time`)."""
+    if not partition_model_file or not os.path.exists(partition_model_file):
+        return None
+    try:
+        with open(partition_model_file) as f:
+            partition_model = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(partition_model, dict):
+        return None
+    suite_est = partition_model.get("est", {}).get(suite)
+    if not isinstance(suite_est, dict) or not suite_est:
+        return None
+    return {
+        os.path.join(repo_root, relpath): float(elapsed)
+        for relpath, elapsed in suite_est.items()
+    }
+
+
 def run_a_suite(args):
     hw = HW_MAPPING[args.hw]
     suite = args.suite
@@ -321,7 +271,9 @@ def run_a_suite(args):
         for f in glob.glob(
             os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
         )
-        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
+        if not f.endswith("/conftest.py")
+        and not f.endswith("/__init__.py")
+        and not f.endswith("/cpu/utils.py")
     ]
 
     # JIT kernel tests and benchmarks (live alongside kernel source)
@@ -338,23 +290,23 @@ def run_a_suite(args):
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
     validate_all_suites(all_tests)
-    # Per-commit pipeline forwards PR labels via --include-tags. Non-empty
-    # only when the workflow has labels to forward (see pr-test.yml). On
-    # nightly invocations and the scheduled cron, this is empty so every
-    # nightly test in the suite runs unconditionally.
-    include_tags = tuple(
-        t.strip() for t in (args.include_tags or "").split(",") if t.strip()
-    )
-    ci_tests, skipped_tests = filter_tests(
-        all_tests,
-        hw,
-        suite,
-        nightly,
-        include_tags=include_tags,
-    )
+    ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
 
     if auto_partition_size:
-        ci_tests = auto_partition(ci_tests, auto_partition_id, auto_partition_size)
+        live_est = load_live_est(args.partition_model_file, suite, repo_root)
+        if live_est is not None:
+            print(
+                f"LPT: {len(live_est)} live est entries from {args.partition_model_file}",
+                flush=True,
+            )
+        else:
+            print(
+                f"LPT: no live est ({args.partition_model_file!r}); using in-source est_time",
+                flush=True,
+            )
+        ci_tests = auto_partition(
+            ci_tests, auto_partition_id, auto_partition_size, live_est=live_est
+        )
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
@@ -389,18 +341,6 @@ def main():
         "--nightly",
         action="store_true",
         help="Run nightly tests instead of per-commit tests.",
-    )
-    parser.add_argument(
-        "--include-tags",
-        type=str,
-        default="",
-        help=(
-            "Comma-separated list of tags. On a per-commit run, additionally "
-            "pulls in any nightly test whose `tags ∩ include_tags ≠ ∅` "
-            "AND whose suite is in PER_COMMIT_TO_NIGHTLY[<this suite>] "
-            "(hardware-class compatible). Driven by the PR label set in "
-            "pr-test.yml. Ignored on --nightly runs."
-        ),
     )
     parser.add_argument(
         "--timeout-per-file",
@@ -447,6 +387,12 @@ def main():
         type=int,
         default=600,
         help="Additional timeout in seconds when retry is enabled (default: 600)",
+    )
+    parser.add_argument(
+        "--partition-model-file",
+        type=str,
+        default=None,
+        help="Path to sglang-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
     )
     args = parser.parse_args()
 

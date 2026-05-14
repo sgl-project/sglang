@@ -11,12 +11,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(
-    est_time=209,
-    suite="nightly-2-gpu",
-    nightly=True,
-    tags=("moe", "perf", "piecewise-cuda-graph"),
-)
+register_cuda_ci(est_time=209, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=630, suite="stage-b-test-2-gpu-large-amd")
 
 

@@ -16,12 +16,7 @@ from sglang.test.test_utils import (
 
 # Nightly: Triton + Flashinfer NGRAM backends. Sibling per-commit file
 # (test_ngram_speculative_decoding.py) keeps the Paged variant.
-register_cuda_ci(
-    est_time=130,
-    suite="nightly-1-gpu",
-    nightly=True,
-    tags=("speculative-decoding",),
-)
+register_cuda_ci(est_time=130, stage="extra-a", runner_config="1-gpu-large")
 
 
 # Default server arguments shared across all NGRAM tests

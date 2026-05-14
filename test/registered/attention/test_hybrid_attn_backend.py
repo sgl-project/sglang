@@ -20,12 +20,7 @@ from sglang.test.test_utils import (
 
 # Hybrid attention backend tests (FA3 prefill + FlashInfer decode, requires SM 90+ / H100)
 # Multiple test classes: base, MLA, TorchCompile, SpecDecode variants
-register_cuda_ci(
-    est_time=407,
-    suite="nightly-1-gpu",
-    nightly=True,
-    tags=("attention-backend",),
-)
+register_cuda_ci(est_time=407, stage="extra-a", runner_config="1-gpu-large")
 
 GSM_DATASET_PATH = None
 

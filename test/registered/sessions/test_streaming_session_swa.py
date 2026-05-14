@@ -26,7 +26,7 @@ from test_streaming_session_nightly import (  # noqa: E402
     TestStreamingSession as _StreamingSessionBase,
 )
 
-register_cuda_ci(est_time=519, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=519, stage="stage-b", runner_config="1-gpu-large")
 
 
 SWA_MODEL = "openai/gpt-oss-20b"
@@ -72,9 +72,10 @@ class TestStreamingSessionSWARetractLargePage(_StreamingSessionBase):
     def setUpClass(cls):
         cls.model = SWA_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_TEST_RETRACT.override(
-            True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+        with (
+            envs.SGLANG_TEST_RETRACT.override(True),
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2),
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -102,9 +103,10 @@ class TestStreamingSessionSWARetractMixedChunk(_StreamingSessionBase):
     def setUpClass(cls):
         cls.model = SWA_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_TEST_RETRACT.override(
-            True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+        with (
+            envs.SGLANG_TEST_RETRACT.override(True),
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2),
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

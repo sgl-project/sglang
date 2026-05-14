@@ -24,12 +24,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(
-    est_time=87,
-    suite="nightly-1-gpu",
-    nightly=True,
-    tags=("session",),
-)
+register_cuda_ci(est_time=87, stage="extra-a", runner_config="1-gpu-large")
 
 
 def remove_prefix(text: str, prefix: str) -> str:

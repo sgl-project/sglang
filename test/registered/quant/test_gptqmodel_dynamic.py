@@ -14,12 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(
-    est_time=100,
-    suite="nightly-1-gpu",
-    nightly=True,
-    tags=("quant",),
-)
+register_cuda_ci(est_time=100, stage="extra-a", runner_config="1-gpu-large")
 
 
 def check_quant_method(model_path: str, use_marlin_kernel: bool):

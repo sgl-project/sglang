@@ -13,8 +13,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=210, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=250, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=406, stage="stage-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=500, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestVLMPerf5090(CustomTestCase):
@@ -40,7 +40,7 @@ class TestVLMPerf5090(CustomTestCase):
     def test_vlm_online_latency(self):
         res = run_bench_serving(
             model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
-            num_prompts=25,
+            num_prompts=250,
             request_rate=1,
             other_server_args=[
                 "--mem-fraction-static",
