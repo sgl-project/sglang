@@ -1,29 +1,20 @@
-import os
-import sys
 import unittest
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.server_fixtures.streaming_session_fixture import (
+    ABORT_REPRO_CHUNKED_PREFILL_SIZE,
+    ABORT_REPRO_CONTEXT_LEN,
+    ABORT_REPRO_PAGE_SIZE,
+    TestStreamingSession,
+    TestStreamingSessionAbortLeakRepro,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
-)
-
-# test/ has no __init__.py; add sibling dir so sibling module is importable
-# when this file is run as a script via `python3 <path>`.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from test_streaming_session import (  # noqa: E402
-    ABORT_REPRO_CHUNKED_PREFILL_SIZE,
-    ABORT_REPRO_CONTEXT_LEN,
-    ABORT_REPRO_PAGE_SIZE,
-    TestStreamingSessionAbortLeakRepro,
-)
-from test_streaming_session_extra import (  # noqa: E402
-    TestStreamingSession as _StreamingSessionBase,
 )
 
 register_cuda_ci(est_time=519, stage="stage-b", runner_config="1-gpu-large")
@@ -39,7 +30,7 @@ SWA_COMMON_ARGS = [
 ]
 
 
-class TestStreamingSessionSWA(_StreamingSessionBase):
+class TestStreamingSessionSWA(TestStreamingSession):
     """Baseline streaming session on a hybrid-SWA model."""
 
     @classmethod
@@ -65,7 +56,7 @@ class TestStreamingSessionSWA(_StreamingSessionBase):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionSWARetractLargePage(_StreamingSessionBase):
+class TestStreamingSessionSWARetractLargePage(TestStreamingSession):
     """SWA under retract decode with page=256."""
 
     @classmethod
@@ -96,7 +87,7 @@ class TestStreamingSessionSWARetractLargePage(_StreamingSessionBase):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionSWARetractMixedChunk(_StreamingSessionBase):
+class TestStreamingSessionSWARetractMixedChunk(TestStreamingSession):
     """SWA under retract decode with --enable-mixed-chunk."""
 
     @classmethod
