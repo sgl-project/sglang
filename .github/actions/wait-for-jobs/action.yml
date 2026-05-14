@@ -89,11 +89,7 @@ runs:
             if (spec.exact) {
               return jobName === spec.prefix;
             }
-            // Match bare prefix or any GHA-rendered shard suffix. Inline matrix
-            // produces `<prefix> (<shard>)`; reusable-workflow callers produce
-            // `<prefix> / <called-job> (<shard>)`. Both have a space after the
-            // prefix, so a single ' '-delimited check covers both.
-            return jobName === spec.prefix || jobName.startsWith(spec.prefix + ' ');
+            return jobName === spec.prefix || jobName.startsWith(spec.prefix + ' (');
           };
 
           // Use ETag conditional requests to avoid consuming rate limit when nothing changed.
