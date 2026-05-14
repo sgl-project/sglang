@@ -789,6 +789,30 @@ def detect_multimodal_suite(file_path):
     return MULTIMODAL_DEFAULT_RUNNER, None
 
 
+def _extract_suite(content, func_name):
+    """Pull a suite name out of a `register_{cuda,cpu}_ci(...)` call.
+
+    Two styles are supported:
+      1. legacy: register_cuda_ci(..., suite="stage-X-test-Y")
+      2. new:    register_cuda_ci(..., stage="stage-X", runner_config="Y")
+                 -> suite = f"{stage}-test-{runner_config}"
+    """
+    legacy = re.search(
+        rf'^[^#\n]*{func_name}\([^)]*suite\s*=\s*["\']([^"\']+)["\']',
+        content,
+        re.MULTILINE,
+    )
+    if legacy:
+        return legacy.group(1)
+    args = re.search(rf"^[^#\n]*{func_name}\(([^)]*)\)", content, re.MULTILINE)
+    if args:
+        stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args.group(1))
+        rc_m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
+        if stage_m and rc_m:
+            return f"{stage_m.group(1)}-test-{rc_m.group(1)}"
+    return None
+
+
 def detect_suite(file_path_from_test):
     """
     Read a test file and extract the suite from register_cuda_ci or register_cpu_ci.
@@ -799,14 +823,8 @@ def detect_suite(file_path_from_test):
     with open(full_path, "r") as f:
         content = f.read()
 
-    # Try CUDA first
-    match = re.search(
-        r'^[^#\n]*register_cuda_ci\([^)]*suite\s*=\s*["\']([^"\']+)["\']',
-        content,
-        re.MULTILINE,
-    )
-    if match:
-        suite = match.group(1)
+    suite = _extract_suite(content, "register_cuda_ci")
+    if suite:
         runner = CUDA_SUITE_TO_RUNNER.get(suite)
         if not runner:
             known = ", ".join(f"`{s}`" for s in sorted(CUDA_SUITE_TO_RUNNER))
@@ -823,14 +841,8 @@ def detect_suite(file_path_from_test):
         use_deepep = suite in DEEPEP_SUITES
         return suite, runner, use_deepep, False, None
 
-    # Try CPU
-    match = re.search(
-        r'^[^#\n]*register_cpu_ci\([^)]*suite\s*=\s*["\']([^"\']+)["\']',
-        content,
-        re.MULTILINE,
-    )
-    if match:
-        suite = match.group(1)
+    suite = _extract_suite(content, "register_cpu_ci")
+    if suite:
         return suite, "ubuntu-latest", False, True, None
 
     return (
