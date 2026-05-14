@@ -36,8 +36,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=160,
-    stage="stage-c",
-    runner_config="4-gpu-b200",
+    suite="nightly-4-gpu-b200",
+    nightly=True,
 )
 
 BASE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
