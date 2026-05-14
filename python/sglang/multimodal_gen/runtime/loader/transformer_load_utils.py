@@ -368,6 +368,12 @@ def resolve_transformer_quant_load_spec(
         safetensors_list=safetensors_list,
         component_model_path=component_model_path,
     )
+
+    if quant_config is not None:
+        packed = getattr(model_cls, "packed_modules_mapping", None)
+        if packed and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = packed
+
     nunchaku_config = server_args.nunchaku_config
 
     # resolve target param dtype
@@ -479,7 +485,7 @@ def _resolve_quant_config(
     resolve quant config from checkpoints' metadata
     priority: explicit --quantization flag -> model config.json -> safetensors metadata -> format-specific fallback
     """
-    # priority: explicit --quantization flag (e.g. mxfp8, mxfp4, modelslim)
+    # priority: explicit --quantization flag (e.g. mxfp8, mxfp4_npu, modelslim)
     if server_args.quantization is not None:
         from sglang.multimodal_gen.runtime.layers.quantization import (
             get_quantization_config,

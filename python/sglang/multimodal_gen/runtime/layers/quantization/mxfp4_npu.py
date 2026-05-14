@@ -1,10 +1,13 @@
 """Online MXFP4 quantization for Diffusion models on Ascend NPU.
 
-Provides ``MXFP4Config`` (registered as ``"mxfp4"``) and
+Provides ``MXFP4Config`` (registered as ``"mxfp4_npu"``) and
 ``NPUMXFP4DiffusionLinearMethod`` which quantises FP16/BF16 weights to MXFP4
 at load time using dual-level MX quantization and uses
 ``npu_dynamic_dual_level_mx_quant`` + ``npu_dual_level_quant_matmul`` for
 inference.
+
+The ``"mxfp4_npu"`` key is distinct from upstream's ROCm ``"mxfp4"``
+(``Mxfp4Config`` in ``mxfp4.py``) which targets AMD MI350+ via aiter kernels.
 
 NOTE: Online weight quantization via ``npu_dynamic_dual_level_mx_quant`` is
 experimental. MindIE-SD only uses an offline (pre-quantized) path for MXFP4
@@ -45,7 +48,7 @@ class MXFP4Config(QuantizationConfig):
 
     @classmethod
     def get_name(cls) -> str:
-        return "mxfp4"
+        return "mxfp4_npu"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:

@@ -22,7 +22,7 @@ Usage:
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
@@ -319,6 +319,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.req_to_token_pool.available_size.return_value = 1
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
+        queue.token_to_kv_pool = MagicMock()
         queue.token_to_kv_pool_allocator = MagicMock()
         queue.token_to_kv_pool_allocator.page_size = 4
 
@@ -336,7 +337,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.scheduler = scheduler
 
         # Initial budget says the request fits; post-lock budget says it does not.
-        queue._allocatable_tokens = MagicMock(side_effect=[8, 3])
+        queue._allocatable_token_budgets = MagicMock(side_effect=[8, 3])
 
         preallocated, failed = queue.pop_preallocated()
 
@@ -344,7 +345,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
         queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
-        self.assertEqual(queue._allocatable_tokens.call_count, 2)
+        self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""
