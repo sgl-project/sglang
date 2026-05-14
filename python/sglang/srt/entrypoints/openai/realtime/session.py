@@ -329,6 +329,19 @@ class RealtimeConnection:
                 param="session.audio.input.transcription.prompt",
             )
             return
+        if (
+            transcription is not None
+            and transcription.model
+            and transcription.model != self.server_args.served_model_name
+        ):
+            await self._send_error(
+                "not_supported",
+                f"Model {transcription.model!r} is not served by this endpoint "
+                f"(serving {self.server_args.served_model_name!r}); set "
+                f"transcription.model to null or to the server's model name.",
+                param="session.audio.input.transcription.model",
+            )
+            return
 
         new_rate = self.config.input_sample_rate  # default: keep current
         fmt = audio.format
@@ -406,6 +419,10 @@ class RealtimeConnection:
             await self._send_error(
                 "invalid_state", "Send session.update before audio frames"
             )
+            return False
+
+        # Empty audio is a no-op (heartbeat frames); skip b64decode.
+        if not event.audio:
             return False
 
         try:
