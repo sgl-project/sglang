@@ -610,8 +610,6 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                 forward_batch
             )
-            ret_topk_p = draft_logits_output.topk_p
-            ret_topk_index = draft_logits_output.topk_index
         else:
             draft_logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
@@ -629,9 +627,10 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[
             select_index
         ]
-        if not can_cuda_graph:
-            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+        # The draft-extend graph only anchors full logits; selected-row topk is
+        # owned by the worker for both graph and eager paths.
+        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values

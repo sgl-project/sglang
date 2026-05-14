@@ -251,6 +251,12 @@ class EAGLEDraftExtendCudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def _anchor_draft_extend_v2_logits(self, ret: LogitsProcessorOutput) -> None:
+        # DRAFT_EXTEND_V2 recomputes selected-row topk in EagleDraftWorker.
+        # This cheap full-logits consumer keeps the graph replay output materialized.
+        ret.topk_p = torch.amax(ret.next_token_logits, dim=-1, keepdim=True)
+        ret.topk_index = torch.zeros_like(ret.topk_p, dtype=torch.int64)
+
     def _capture_init(self, run_once_fn):
         for _ in range(2):
             torch.cuda.synchronize()
@@ -408,16 +414,10 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch,
             )
             if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
-                select_index = (
-                    torch.arange(bs, device=self.model_runner.device)
-                    * self.num_tokens_per_bs
-                    + num_accepted_tokens
-                    - 1
-                )
-                probs = torch.softmax(ret.next_token_logits[select_index], dim=-1)
+                self._anchor_draft_extend_v2_logits(ret)
             else:
                 probs = torch.softmax(ret.next_token_logits, dim=-1)
-            ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
+                ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -565,6 +565,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 next_token_logits=out.next_token_logits[:unpadding_bs],
                 hidden_states=out.hidden_states[:unpadding_bs],
             )
-            out.topk_p = out_copy.topk_p[:topk_unpadding_bs]
-            out.topk_index = out_copy.topk_index[:topk_unpadding_bs]
+            if self.forward_mode != ForwardMode.DRAFT_EXTEND_V2:
+                out.topk_p = out_copy.topk_p[:topk_unpadding_bs]
+                out.topk_index = out_copy.topk_index[:topk_unpadding_bs]
         return out
