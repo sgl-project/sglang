@@ -2008,10 +2008,13 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_len_kv = (
                         self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                     )
+                num_token_padding = q.shape[0]
+                actual_bs = self.forward_metadata.block_tables.shape[0]
+                q = q[:actual_bs]
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q.view(
-                        forward_batch.batch_size,
                         -1,
+                        1,
                         layer.tp_q_head_num,
                         layer.qk_head_dim,
                     ),
@@ -2030,6 +2033,17 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
                 )
+                if actual_bs != num_token_padding:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - actual_bs,
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
             # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
             # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
             elif forward_batch.encoder_lens is None and layer.logit_cap == 0:

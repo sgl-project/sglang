@@ -40,7 +40,11 @@ if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 try:
-    from deep_ep import Buffer, Config
+    if _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
+        from zbal.zbal.deepep_adaptor import Config
+        from zbal.zbal_buffer import Buffer
+    else:
+        from deep_ep import Buffer, Config
 
     if not _is_npu:
         from sglang.srt.layers.quantization.fp8_kernel import (
@@ -393,11 +397,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and not get_moe_runner_backend().is_cutlass()
-            and not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
-        ):
+        backend = get_moe_runner_backend()
+        # BF16 dispatch is needed when:
+        #   - cutlass backend (uses different kernel)
+        #   - deep_gemm backend with SGLANG_DEEPEP_BF16_DISPATCH enabled
+        need_bf16_dispatch = backend.is_cutlass() or (
+            backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+        )
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not need_bf16_dispatch:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -620,14 +627,19 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
             use_nvfp4 = True
-        elif not get_moe_runner_backend().is_flashinfer_cutedsl() and (
-            not _is_npu or not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
-        ):
-            # flashinfer_cutedsl expects BF16 dispatch when NVFP4 dispatch is
-            # off; its kernel quantizes to NVFP4 internally.
-            # SGLANG_DEEPEP_BF16_DISPATCH forces BF16 dispatch for NPU
-            # where INT8 input + BF16 weight GMM is not supported.
-            use_fp8 = True
+        else:
+            backend = get_moe_runner_backend()
+            # BF16 dispatch is needed when:
+            #   - flashinfer_cutedsl: kernel quantizes to NVFP4 internally
+            #   - NPU with SGLANG_DEEPEP_BF16_DISPATCH: INT8 input + BF16 weight GMM not supported
+            #   - deep_gemm with SGLANG_DEEPEP_BF16_DISPATCH: user requests BF16 dispatch
+            need_bf16_dispatch = (
+                backend.is_flashinfer_cutedsl()
+                or (_is_npu and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
+                or (backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
+            )
+            if not need_bf16_dispatch:
+                use_fp8 = True
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
         # to return int32-packed UE8M0 scales that don't feed the flashinfer

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/0384aa7150c4c9778efca041ffd1beb3ad2bd694/vllm/model_executor/layers/fla/ops/kda.py
 # This file contains code copied from the flash-linear-attention project.
 # The original source code was licensed under the MIT license and included
@@ -52,7 +54,6 @@ def fused_recurrent_kda_fwd(
     inplace_final_state: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     # ssm_state_indices: torch.Tensor | None = None,
-    num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
@@ -92,7 +93,6 @@ def fused_recurrent_kda_fwd(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         # ssm_state_indices=ssm_state_indices,
-        # num_accepted_tokens=num_accepted_tokens,
         scale=scale,
         # N=N,
         T=T,
@@ -155,7 +155,6 @@ def fused_recurrent_kda(
         inplace_final_state=inplace_final_state,
         cu_seqlens=cu_seqlens,
         # ssm_state_indices=ssm_state_indices,
-        num_accepted_tokens=None,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
     return o, final_state

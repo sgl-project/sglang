@@ -33,6 +33,7 @@ class _StubReq:
         self.prefix_indices = None
         self.last_node = None
         self.last_host_node = None
+        self.best_match_node = None
         self.host_hit_length = None
         self.mamba_branching_seqlen = None
         self.cache_protected_len = None
@@ -50,25 +51,25 @@ class TestZeroMatchResult(unittest.TestCase):
         self.assertEqual(int(zeroed.device_indices.numel()), 0)
         self.assertIs(zeroed.last_device_node, tree.root_node)
         self.assertIs(zeroed.last_host_node, tree.root_node)
+        self.assertIs(zeroed.best_match_node, tree.root_node)
         self.assertEqual(zeroed.host_hit_length, 0)
         # dtype/device preserved (slice-not-allocate).
         self.assertEqual(zeroed.device_indices.dtype, match.device_indices.dtype)
         self.assertEqual(zeroed.device_indices.device, match.device_indices.device)
 
-    def test_no_root_node_raises(self):
-        # tree_cache without a root_node: must raise loudly rather than silently
-        # leak cache hits past the gate.
-        class _NoRoot:
-            pass
+    def test_chunk_cache_is_passthrough(self):
+        class _StubChunkCache:
+            def is_chunk_cache(self) -> bool:
+                return True
 
         original = MatchResult(
-            device_indices=torch.tensor([7, 8, 9], dtype=torch.int64),
-            last_device_node="sentinel-device",
-            last_host_node="sentinel-host",
-            host_hit_length=4,
+            device_indices=torch.empty((0,), dtype=torch.int64),
+            last_device_node=None,
+            last_host_node=None,
+            best_match_node=None,
+            host_hit_length=0,
         )
-        with self.assertRaisesRegex(RuntimeError, "SGLANG_RADIX_FORCE_MISS"):
-            zero_match_result(_NoRoot(), original)
+        self.assertIs(zero_match_result(_StubChunkCache(), original), original)
 
 
 class TestMatchPrefixForReqForceMiss(unittest.TestCase):

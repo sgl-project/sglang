@@ -95,11 +95,12 @@ class SWAComponent(TreeComponent):
     ) -> MatchResult:
         ct = self.component_type
         n_swa = 0
-        node = result.last_device_node
+        node = result.best_match_node
         root = self.cache.root_node
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
             if cd.value is None and cd.host_value is not None:
+                # TODO(ispobock): refactor host_hit_length usage
                 return result._replace(host_hit_length=max(result.host_hit_length, 1))
             if cd.value is not None:
                 n_swa += len(cd.value)
@@ -362,6 +363,7 @@ class SWAComponent(TreeComponent):
         while cur != root and swa_lock_size < sliding_window_size:
             comp = cur.component_data[ct]
             if comp.value is None:
+                result.skip_lock_node_ids.setdefault(ct, set()).add(cur.id)
                 cur = cur.parent
                 continue
             if comp.lock_ref == 0:
@@ -385,14 +387,16 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         root = self.cache.root_node
         swa_uuid_for_lock = params.swa_uuid_for_lock if params else None
+        skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         dec_swa = True
 
-        # lock_ref == 0 means acquire_component_lock skipped this node
-        # (tombstone at acquire time) or load_back revived a tombstone between
-        # acquire and release. Either way, there is nothing for us to undo here.
+        # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
         cur = node
         while cur != root and dec_swa:
             comp = cur.component_data[ct]
+            if cur.id in skip_lock_node_ids:
+                cur = cur.parent
+                continue
             if comp.lock_ref == 0:
                 cur = cur.parent
                 continue
@@ -437,11 +441,14 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
+            # `node` is best_match_node; the SWA validator guarantees every
+            # ancestor within `sliding_window_size` has value or host_value.
             n_swa = 0
             backed_up: list[torch.Tensor] = []
             nodes: list = []
-            while node is not self.cache.root_node and n_swa < self.sliding_window_size:
-                cd = node.component_data[ct]
+            cur = node
+            while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
+                cd = cur.component_data[ct]
                 assert cd.host_value is not None or cd.value is not None
                 if cd.value is not None:
                     # device exists, skip it
@@ -449,9 +456,9 @@ class SWAComponent(TreeComponent):
                 else:
                     # host only, collect it
                     backed_up.append(cd.host_value)
-                    nodes.append(node)
+                    nodes.append(cur)
                     n_swa += len(cd.host_value)
-                node = node.parent
+                cur = cur.parent
 
             if not backed_up:
                 return None

@@ -20,11 +20,6 @@ import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsv4.compressor import (
-    CompressorBackendMixin,
-    FusedCompressMetadata,
-    create_paged_compressor_data,
-)
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
@@ -48,13 +43,28 @@ from sglang.srt.utils import ceil_align, cpu_has_amx_support, is_cpu
 
 _is_cpu = is_cpu()
 _cpu_amx = cpu_has_amx_support()
-
+_use_compressor_v2 = envs.SGLANG_OPT_USE_COMPRESSOR_V2.get()
 if _is_cpu and _cpu_amx:
     from sglang.srt.layers.attention.dsv4.metadata_kernel import (
         init_compression_metadata_torch,
     )
 
     _init_compression_metadata_triton = init_compression_metadata_torch
+    _use_compressor_v2 = False  # TODO: add support for v2
+
+if _use_compressor_v2:
+    # NOTE: should eventually be the only compressor backend
+    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
+        CompressorBackendMixin,
+        FusedCompressMetadata,
+        create_paged_compressor_data,
+    )
+else:
+    from sglang.srt.layers.attention.dsv4.compressor import (
+        CompressorBackendMixin,
+        FusedCompressMetadata,
+        create_paged_compressor_data,
+    )
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
