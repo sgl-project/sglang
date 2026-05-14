@@ -56,8 +56,7 @@ _HYBM_WARN_FRAGMENT = "HYBM hybm_va_manager.cpp:173 GetRank] No allocated spaces
 
 logger = logging.getLogger(__name__)
 
-# Keys consumed by SGLang wrapper logic, not forwarded to memcache_hybrid.LocalConfig.
-# memcache 不用的接口
+# Keys handled by SGLang only; not applied to memcache_hybrid.LocalConfig.
 _MEMCACHE_CTRL_KEYS = frozenset(
     {
         "device_id",
@@ -70,43 +69,47 @@ _MEMCACHE_CTRL_KEYS = frozenset(
     }
 )
 
+from dataclasses import dataclass
 
-#------------------------------------------------------------
-# 对应MooncakeConfig
-#Mooncake通过SGLANG_HICACHE_MOONCAKE_CONFIG_PATH和extra_config来获取配置文件
-#Memcache仿照Mooncake，通过SGLANG_HICACHE_MEMCACHE_CONFIG_PATH和extra_config来获取配置文件
-#memcache LocalConfig 接口https://gitcode.com/Ascend/memcache/blob/master/doc/memcache_python_api.md#localconfig-%E7%B1%BB
+@dataclass
 
-def _merge_memcache_config_dict(storage_config: Optional[HiCacheStorageConfig]) -> dict:
-    merged: dict = {}
-    if envs.SGLANG_HICACHE_MEMCACHE_CONFIG_PATH.is_set():
-        path = envs.SGLANG_HICACHE_MEMCACHE_CONFIG_PATH.get()
-        with open(path, encoding="utf-8") as fin:
-            merged.update(json.load(fin))
-        logger.info("Memcache configuration loaded from %s", path)
-    extra = getattr(storage_config, "extra_config", None) or {}
-    merged.update(extra)
-    return merged
+class AscendMemcacheConfig:
+    """
+    Encapsulates MemCache configuration by merging a JSON file and `extra_config`, 
+    then splits the result into `local_fields` and `ctrl`.
+    """
 
+    local_fields: dict
+    ctrl: dict
 
+    @staticmethod
+    def from_sources(storage_config: Optional[HiCacheStorageConfig]) -> "AscendMemcacheConfig":
+        merged: dict = {}
+        if envs.SGLANG_HICACHE_MEMCACHE_CONFIG_PATH.is_set():
+            path = envs.SGLANG_HICACHE_MEMCACHE_CONFIG_PATH.get()
+            try:
+                with open(path, encoding="utf-8") as fin:
+                    merged.update(json.load(fin))
+                logger.info("Memcache configuration loaded from %s", path)
+            except Exception as exc:
+                logger.warning("Failed to load memcache configuration from %s: %s", path, exc)
 
-#把merged字段分为两部分，一部分是memcache真正需要用的字段，另一部分是sglang自己控制的
-def _split_memcache_ctrl(merged: dict) -> tuple[dict, dict]:
-    ctrl = {k: merged[k] for k in _MEMCACHE_CTRL_KEYS if k in merged}
-    local_fields = {k: v for k, v in merged.items() if k not in _MEMCACHE_CTRL_KEYS}
-    return local_fields, ctrl
+        extra = getattr(storage_config, "extra_config", None) or {}
+        merged.update(extra)
 
+        local_fields = {k: v for k, v in merged.items() if k not in _MEMCACHE_CTRL_KEYS}
+        ctrl = {k: merged[k] for k in _MEMCACHE_CTRL_KEYS if k in merged}
 
-#将字典写入对象，把未知字段忽略，若字段需要严格匹配则需要重改
-def _apply_dict_to_local_config(local_cfg: Any, data: dict) -> List[str]:
-    unknown: List[str] = []
-    for key, value in data.items():
-        if not hasattr(local_cfg, key):
-            unknown.append(key)
-            continue
-        setattr(local_cfg, key, value)
-    return unknown
+        return AscendMemcacheConfig(local_fields=local_fields, ctrl=ctrl)
 
+    def apply_to_local_config(self, local_cfg: Any) -> List[str]:
+        unknown: List[str] = []
+        for key, value in self.local_fields.items():
+            if hasattr(local_cfg, key):
+                setattr(local_cfg, key, value)
+            else:
+                unknown.append(key)
+        return unknown
 
 @contextmanager
 def _capture_c_stderr() -> tuple[list[str], bool]:
@@ -132,9 +135,6 @@ def _capture_c_stderr() -> tuple[list[str], bool]:
     finally:
         os.close(saved_fd)
 
-
-#------------------------------------------------------------
-
 class AscendMemcacheStore(HiCacheStorage):
     """HiCache storage backend backed by Ascend MemCache (`memcache_hybrid`)."""
 
@@ -147,7 +147,6 @@ class AscendMemcacheStore(HiCacheStorage):
         self.storage_config = storage_config
         
 
-        # 导入memcache接口，Mooncake通过MooncakeBaseStore导入
         try:
             from memcache_hybrid import DistributedObjectStore, LocalConfig
         except ImportError as e:
@@ -158,22 +157,12 @@ class AscendMemcacheStore(HiCacheStorage):
             ) from e
 
         try:
-            #-----
-            # 合并配置文件和extra_config
-            merged = _merge_memcache_config_dict(storage_config)
-            local_fields, ctrl = _split_memcache_ctrl(merged)
-
+            config = AscendMemcacheConfig.from_sources(storage_config)
             local_cfg = LocalConfig()
-            unknown_fields = _apply_dict_to_local_config(local_cfg, local_fields)
+            unknown_fields = config.apply_to_local_config(local_cfg)
             if unknown_fields:
-                # Keep Mooncake-like tolerance, but surface invalid config keys
-                # clearly to avoid silent setup/init failures.
-                logger.warning(
-                    "Ignoring unknown Memcache LocalConfig keys: %s", unknown_fields
-                )
-            #-----
+                logger.warning("Ignoring unknown Memcache LocalConfig keys: %s", unknown_fields)
 
-            #创建对象
             self.store = DistributedObjectStore()
             if self.store.setup(local_cfg) != 0:
                 raise RuntimeError(
@@ -184,7 +173,7 @@ class AscendMemcacheStore(HiCacheStorage):
             init_bm = bool(ctrl.get("init_bm", True))
             if self.store.init(device_id, init_bm) != 0:
                 raise RuntimeError("memcache_hybrid.DistributedObjectStore.init failed")
-            #都与mooncake类似
+
             self._memcache_metrics_url = ctrl.get("metrics_url") or ctrl.get(
                 "memcache_metrics_url"
             )
@@ -194,8 +183,6 @@ class AscendMemcacheStore(HiCacheStorage):
             if self._check_server_enabled:
                 self.check_server()
 
-            # memcache_hybrid documents init_bm=False as pure client mode without
-            # data read/write capability.
             if not init_bm:
                 logger.info(
                     "Memcache init_bm is False; skip warmup because read/write is unavailable in pure client mode."
