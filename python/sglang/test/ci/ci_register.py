@@ -16,8 +16,9 @@ __all__ = [
     "ut_parse_one_file",
 ]
 
-# `suite` stays in positional slot 2 for backward compat; new fields are
-# kwarg-only.
+# `suite` stays in positional slot 2 for backward compat with existing
+# `register_cpu_ci(5, "stage-a-test-cpu")` style positional calls. New fields
+# (`stage`, `runner_config`) are kwarg-only.
 _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
 _KWARG_ONLY = ("stage", "runner_config")
 _ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
@@ -38,12 +39,14 @@ class CIRegistry:
     est_time: float
     stage: Optional[str] = None
     runner_config: Optional[str] = None
+    # Legacy single-string suite; kept for nightly/stress/weekly + AMD/CPU/NPU
+    # suites whose names don't follow `{stage}-test-{runner_config}` shape.
     suite: Optional[str] = None
     nightly: bool = False
     disabled: Optional[str] = None
 
     @property
-    def effective_suite(self) -> str:
+    def effective_suite(self) -> Optional[str]:
         if self.stage is not None and self.runner_config is not None:
             return f"{self.stage}-test-{self.runner_config}"
         return self.suite
@@ -158,20 +161,21 @@ class RegistryVisitor(ast.NodeVisitor):
                 f"{self.filename}: est_time is a required constant in {func_call.func.id}()"
             )
 
-        # Exactly one of (stage+runner_config) pair or `suite` must be specified.
-        has_pair = args["stage"] is not _UNSET and args["runner_config"] is not _UNSET
-        has_suite = args["suite"] is not _UNSET
-        if has_pair and has_suite:
+        # The only valid (stage, runner_config, suite) shapes are:
+        #   (set,   set,   unset)  -> new-style pair
+        #   (unset, unset, set)    -> legacy single-string
+        # Any other combination is rejected with the actual triple in the error.
+        stage_set = args["stage"] is not _UNSET
+        runner_set = args["runner_config"] is not _UNSET
+        suite_set = args["suite"] is not _UNSET
+        valid_shape = (stage_set and runner_set and not suite_set) or (
+            not stage_set and not runner_set and suite_set
+        )
+        if not valid_shape:
             raise ValueError(
-                f"{self.filename}: cannot mix (stage, runner_config) and suite in {func_call.func.id}()"
-            )
-        if not has_pair and not has_suite:
-            raise ValueError(
-                f"{self.filename}: must specify either (stage, runner_config) or suite in {func_call.func.id}()"
-            )
-        if (args["stage"] is _UNSET) != (args["runner_config"] is _UNSET):
-            raise ValueError(
-                f"{self.filename}: stage and runner_config must be set together in {func_call.func.id}()"
+                f"{self.filename}: {func_call.func.id}() must specify exactly one of "
+                f"(stage, runner_config) pair or suite; got stage={stage_set}, "
+                f"runner_config={runner_set}, suite={suite_set}"
             )
 
         est_time = args["est_time"]
@@ -180,14 +184,14 @@ class RegistryVisitor(ast.NodeVisitor):
                 f"{self.filename}: est_time must be a number in {func_call.func.id}()"
             )
 
-        suite = args["suite"] if has_suite else None
+        suite = args["suite"] if suite_set else None
         if suite is not None and not isinstance(suite, str):
             raise ValueError(
                 f"{self.filename}: suite must be a string in {func_call.func.id}()"
             )
 
-        stage = args["stage"] if has_pair else None
-        runner_config = args["runner_config"] if has_pair else None
+        stage = args["stage"] if stage_set else None
+        runner_config = args["runner_config"] if runner_set else None
         for name, value in (("stage", stage), ("runner_config", runner_config)):
             if value is not None and not isinstance(value, str):
                 raise ValueError(
