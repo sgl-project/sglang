@@ -249,9 +249,15 @@ class MemoryProfile:
         if batch_cost <= 0.0 or peak_memory_mb <= 0.0:
             return
 
+        previous_success_costs = self.get_num_success_costs()
         previous_max_cost = self.get_max_success_cost()
         predicted = self._estimate_base_peak_memory_mb(batch_cost)
-        if predicted is not None and predicted > 0.0 and batch_cost > previous_max_cost:
+        if (
+            previous_success_costs >= 2
+            and predicted is not None
+            and predicted > 0.0
+            and batch_cost > previous_max_cost
+        ):
             self.ratio_residuals.append(max(1.0, peak_memory_mb / predicted))
             self.absolute_residuals_mb.append(max(0.0, peak_memory_mb - predicted))
             del self.ratio_residuals[: -_MEMORY_POLICY.history_size]
@@ -318,24 +324,24 @@ class MemoryProfile:
                 for item in data.get("successes", [])
                 if isinstance(item, dict)
             ],
-            ratio_residuals=[
-                float(item)
-                for item in data.get("ratio_residuals", [])[
-                    -_MEMORY_POLICY.history_size :
-                ]
-            ],
-            absolute_residuals_mb=[
-                float(item)
-                for item in data.get("absolute_residuals_mb", [])[
-                    -_MEMORY_POLICY.history_size :
-                ]
-            ],
             oom_cost=_optional_float(data.get("oom_cost")),
             recovery_cost=_optional_float(data.get("recovery_cost")),
             recovery_successes=int(data.get("recovery_successes", 0)),
         )
+        profile._recompute_residuals_from_successes()
         profile._cache_dirty = True
         return profile
+
+    def _recompute_residuals_from_successes(self) -> None:
+        replay = type(self)()
+        for obs in self.successes:
+            replay.observe_success(
+                obs.batch_cost,
+                obs.peak_memory_mb,
+                batch_size=obs.batch_size,
+            )
+        self.ratio_residuals = replay.ratio_residuals
+        self.absolute_residuals_mb = replay.absolute_residuals_mb
 
     def _update_oom_boundary_after_success(self, batch_cost: float) -> None:
         if self.oom_cost is None or self.recovery_cost is None:
