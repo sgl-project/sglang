@@ -614,9 +614,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 # NOTE: We skip the reasoning output of the previous response
                 if isinstance(output_item, ResponseReasoningItem):
                     continue
-                text_parts = [
-                    c.text for c in output_item.content if hasattr(c, "text")
-                ]
+                text_parts = [c.text for c in output_item.content if hasattr(c, "text")]
                 if text_parts:
                     messages.append(
                         {
