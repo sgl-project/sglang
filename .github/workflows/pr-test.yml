@@ -518,22 +518,6 @@ jobs:
       warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
     secrets: inherit
 
-  stage-c-test-deepep-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: stage-c-test-deepep-8-gpu-h200
-      runner_config: deepep-8-gpu-h200
-      runs_on: 8-gpu-h200-deepep
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '45'
-      warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8'
-      warmup_server_models: 'deepseek-ai/DeepSeek-V3-0324:8'
-    secrets: inherit
-
   stage-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
@@ -606,7 +590,6 @@ jobs:
         stage-c-test-8-gpu-h20,
         stage-c-test-8-gpu-h200,
         stage-c-test-deepep-4-gpu-h100,
-        stage-c-test-deepep-8-gpu-h200,
         stage-c-test-4-gpu-b200,
         stage-c-test-dsv4-4-gpu-b200,
         stage-c-test-dsv4-8-gpu-h200,

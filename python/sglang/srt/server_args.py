@@ -209,7 +209,6 @@ MOE_A2A_BACKEND_CHOICES = [
     "mori",
     "ascend_fuseep",
     "flashinfer",
-    "megamoe",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -610,14 +609,7 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
-        "none",
-        "deepep",
-        "mooncake",
-        "nixl",
-        "mori",
-        "ascend_fuseep",
-        "flashinfer",
-        "megamoe",
+        "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
     moe_runner_backend: str = "auto"
     record_nolora_graph: bool = True
@@ -3191,25 +3183,6 @@ class ServerArgs:
                 "Waterfill requires the DeepEP backend."
             )
             self.moe_a2a_backend = "deepep"
-
-        if (
-            envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
-            and self.moe_a2a_backend != "megamoe"
-        ):
-            self.moe_a2a_backend = "megamoe"
-            logger.info(
-                "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
-                "auto-configuring --moe-a2a-backend megamoe."
-            )
-
-        if self.moe_a2a_backend == "megamoe":
-            self.ep_size = self.tp_size
-            if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
-                envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
-            logger.info(
-                f"Mega MoE is enabled. The expert parallel size is adjusted "
-                f"to be the same as the tensor parallel size[{self.tp_size}]."
-            )
 
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":

@@ -131,6 +131,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
             assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+            assert envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
             self.use_swizzle = True
 
     def run(
