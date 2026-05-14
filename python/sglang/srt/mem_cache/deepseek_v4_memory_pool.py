@@ -590,19 +590,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """Allocate non-paged DeepSeekV4CompressState buffers used by the
         old-compressor fallback.
 
-        Layout per layer: ``(max_num_reqs, ratio*coff, 2*head_dim*coff)``.
+        Layout per layer: ``(max_num_reqs + 1, ratio*coff, 2*head_dim*coff)``.
+        ReqToTokenPool reserves row 0 as a dummy slot and assigns real request
+        pool indices in the inclusive range [1, max_num_reqs].
         The buffers are small relative to the paged ring pools and only
         materialised when the radix path is off.
         """
         self.compress_states: List[Optional[DeepSeekV4CompressState]] = []
         self.indexer_compress_states: List[Optional[DeepSeekV4CompressState]] = []
         attn_kv_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        req_state_size = self.max_num_reqs + 1
         for ratio in self.compression_ratios:
             overlap = ratio == 4
             compress_state = indexer_compress_state = None
             if ratio != 0:
                 compress_state = DeepSeekV4CompressState(
-                    max_num_reqs=self.max_num_reqs,
+                    max_num_reqs=req_state_size,
                     ratio=ratio,
                     overlap=overlap,
                     head_dim=attn_kv_head_dim,
@@ -612,7 +615,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 )
             if ratio == 4:
                 indexer_compress_state = DeepSeekV4CompressState(
-                    max_num_reqs=self.max_num_reqs,
+                    max_num_reqs=req_state_size,
                     ratio=ratio,
                     overlap=overlap,
                     head_dim=self.indexer_head_dim,

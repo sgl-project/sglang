@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.deepseek_v4_compress_state import DeepSeekV4CompressState
 from sglang.test.test_utils import CustomTestCase
 
 torch.manual_seed(42)
@@ -351,6 +352,26 @@ class TestCompressDecodeKernel(CustomTestCase):
         )
 
         torch.testing.assert_close(ref, out, atol=1e-3, rtol=1e-3)
+
+
+class TestDeepSeekV4CompressState(CustomTestCase):
+    def test_state_includes_dummy_req_pool_row(self):
+        max_running_requests = 2
+        state = DeepSeekV4CompressState(
+            max_num_reqs=max_running_requests + 1,
+            ratio=4,
+            overlap=True,
+            head_dim=8,
+            device="cpu",
+            dtype=torch.float32,
+            enable_memory_saver=False,
+        ).get_state()
+
+        # ReqToTokenPool reserves row 0 as padding, so real request slots can
+        # reach max_running_requests.
+        state[max_running_requests].clear()
+        state_shape = state.shape if hasattr(state, "shape") else state.kv_score.shape
+        self.assertEqual(state_shape[0], max_running_requests + 1)
 
 
 if __name__ == "__main__":
