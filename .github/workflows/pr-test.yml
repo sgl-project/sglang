@@ -593,58 +593,6 @@ jobs:
       timeout_per_file: '1800'
     secrets: inherit
 
-  # NOTE: GB200 stage temporarily disabled — no company-owned GB200 runner available yet.
-  # Re-enable when a 4-gpu-gb200 runner is provisioned.
-  # stage-c-test-4-gpu-gb200:
-  #   needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
-  #   if: |
-  #     always() &&
-  #     (
-  #       (inputs.target_stage == 'stage-c-test-4-gpu-gb200') ||
-  #       (
-  #         !inputs.target_stage &&
-  #         ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-  #         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-  #       )
-  #     )
-  #   runs-on: 4-gpu-gb200
-  #   timeout-minutes: 240
-  #   strategy:
-  #     fail-fast: false
-  #   steps:
-  #     - uses: ./.github/actions/check-maintenance
-  #       with:
-  #         github-token: ${{ github.token }}
-  #
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
-  #       with:
-  #         ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-  #
-  #     - name: Download artifacts
-  #       if: needs.check-changes.outputs.sgl_kernel == 'true'
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         path: sgl-kernel/dist/
-  #         merge-multiple: true
-  #         pattern: wheel-python3.10-cuda13.0-aarch64
-  #
-  #     - name: Install dependencies
-  #       timeout-minutes: 20
-  #       run: |
-  #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} GRACE_BLACKWELL=1 bash scripts/ci/cuda/ci_install_deepep.sh
-  #
-  #     - name: Run test
-  #       timeout-minutes: 45
-  #       env:
-  #         CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-  #       run: |
-  #         cd test
-  #         python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG
-  #
-  #     - uses: ./.github/actions/upload-cuda-coredumps
-  #       if: failure()
-
   pr-test-finish:
     needs:
       [
