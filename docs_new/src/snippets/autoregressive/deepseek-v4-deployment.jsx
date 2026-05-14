@@ -429,7 +429,6 @@ export const DeepSeekV4Deployment = () => {
           "SGLANG_OPT_USE_JIT_NORM=1",
           "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
           "SGLANG_OPT_USE_TOPK_V2=1",
-          "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
         );
       }
     } else if (recipe === "balanced") {
@@ -445,14 +444,6 @@ export const DeepSeekV4Deployment = () => {
           "SGLANG_OPT_USE_JIT_NORM=1",
           "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
           "SGLANG_OPT_USE_TOPK_V2=1",
-          "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
-          "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN=1",
-          "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=0",
-          "SGLANG_OPT_USE_FAST_MASK_EP=1",
-          "SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1",
-          "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
-          "SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1",
-          "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
         );
       } else {
         recipeEnv.push(isBig
@@ -475,15 +466,9 @@ export const DeepSeekV4Deployment = () => {
           "SGLANG_OPT_USE_JIT_NORM=1",
           "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
           "SGLANG_OPT_USE_TOPK_V2=1",
-          "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
-          "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN=1",
-          "SGLANG_OPT_USE_FAST_MASK_EP=1",
-          "SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1",
-          "SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1",
           "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
           "NVSHMEM_DISABLE_IB=1",
           "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1",
-          "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1",
           "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
         );
       } else {
@@ -610,7 +595,11 @@ export const DeepSeekV4Deployment = () => {
       flags.push(`  --dp ${tp}`);
       flags.push("  --enable-dp-attention");
       if (multinode) flags.push(...multiNodeFlags(nnodes));
-      flags.push("  --moe-a2a-backend deepep");
+      if (isBig && hardware === "b200") {
+        flags.push("  --moe-a2a-backend megamoe");
+      } else {
+        flags.push("  --moe-a2a-backend deepep");
+      }
       if (hardware === "h200" && isBig) {
         flags.push("  --mem-fraction-static 0.88");
       } else if (isBig && hardware === "gb300") {
@@ -993,12 +982,9 @@ python3 -m sglang_router.launch_router \\
         </p>
         <pre style={{ margin: "8px 0 0 0", padding: "8px 12px", background: isDark ? "#111827" : "#f5f5f5", borderRadius: "4px", fontSize: "12px", lineHeight: "1.5", overflowX: "auto" }}>{
 `# Add this flag to the sglang serve command:
---moe-a2a-backend deepep
+--moe-a2a-backend megamoe
 
 # And set these env vars:
-SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1
-SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1
-SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1
 SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320
 SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0`
         }</pre>
