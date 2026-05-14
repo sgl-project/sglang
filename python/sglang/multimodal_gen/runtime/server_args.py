@@ -256,6 +256,7 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
     batching_memory_profile_cache: str | None = None
+    batching_memory_reserve_fraction: float = 0.02
     enable_batching_metrics: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
@@ -1454,6 +1455,15 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
+            "--batching-memory-reserve-fraction",
+            type=float,
+            default=ServerArgs.batching_memory_reserve_fraction,
+            help=(
+                "Fraction of total device memory held back from memory-aware "
+                "diffusion batching as allocator/workspace slack. Default: 0.02."
+            ),
+        )
+        parser.add_argument(
             "--enable-batching-metrics",
             action="store_true",
             default=ServerArgs.enable_batching_metrics,
@@ -1999,6 +2009,8 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if not 0.0 <= self.batching_memory_reserve_fraction < 1.0:
+            raise ValueError("batching_memory_reserve_fraction must be in [0, 1)")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

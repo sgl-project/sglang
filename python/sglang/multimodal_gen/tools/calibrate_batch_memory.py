@@ -69,6 +69,7 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
         batching_max_size=max_batch_size,
         batching_delay_ms=args.batching_delay_ms,
         batching_memory_profile_cache=args.batching_memory_profile_cache,
+        batching_memory_reserve_fraction=args.batching_memory_reserve_fraction,
         warmup=args.warmup,
     )
 
@@ -364,6 +365,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--batching-delay-ms", type=float, default=25.0)
     parser.add_argument("--batching-memory-profile-cache", default=None)
+    parser.add_argument(
+        "--batching-memory-reserve-fraction",
+        type=float,
+        default=0.02,
+        help=(
+            "Fraction of total device memory held back from memory-aware "
+            "batching during calibration. Default: 0.02."
+        ),
+    )
     parser.add_argument("--per-batch-timeout-s", type=float, default=600.0)
     parser.add_argument(
         "--output-json", default="batch_memory_calibration_summary.json"

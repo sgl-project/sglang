@@ -85,8 +85,7 @@ class MemoryAdmissionPolicy:
     save_interval_s: float = 60.0
     # Successes required near safe cost before clearing an OOM boundary.
     oom_clear_successes: int = 8
-    # Internal allocator slack.
-    internal_reserve_fraction: float = 0.02
+    # Minimum allocator slack.
     internal_reserve_min_mb: float = 512.0
 
 
@@ -408,6 +407,9 @@ class BatchAdmissionController:
         self._gpu_id = gpu_id
         self._device_name = self._get_device_name(gpu_id)
         self._device_memory_gb = self._get_device_memory_gb(gpu_id)
+        self._memory_reserve_fraction = float(
+            server_args.batching_memory_reserve_fraction
+        )
         self._rules = load_batching_config(server_args.batching_config)
         self._pipeline_config = server_args.pipeline_config
         self._limit_cache: dict[str | None, AdmissionLimit] = {}
@@ -806,7 +808,7 @@ class BatchAdmissionController:
 
         internal_reserve_mb = max(
             _MEMORY_POLICY.internal_reserve_min_mb,
-            total_mb * _MEMORY_POLICY.internal_reserve_fraction,
+            total_mb * self._memory_reserve_fraction,
         )
         budget_mb = max(0.0, total_mb - internal_reserve_mb)
         if available_mb is not None and reserved_mb is not None:
