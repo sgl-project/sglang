@@ -354,12 +354,11 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
 
         scheduler = clone_scheduler_runtime(original_batch_scheduler or self.scheduler)
         distilled_device = scheduler.sigmas.device
+        num_steps = len(self.distilled_sigmas) - 1
         # Inject `0.0011` before the terminal `0.0` to avoid the
         # `sigma_next==0` singularity in res2s' `(sample - denoised) /
-        # (sigma - sigma_next)`. Official `res2s_denoising_loop` does this
-        # exact injection (samplers.py:262); official `euler_denoising_loop`
-        # does NOT — it uses `sigma_next` directly. So gate on the active
-        # sampler, not on the model variant.
+        # (sigma - sigma_next)`. This changes the final sigma pair only; it
+        # must not add an extra denoising timestep.
         if self.sampler_name == "res2s" and self.distilled_sigmas[-1].item() == 0.0:
             scheduler_sigmas = torch.cat(
                 [
@@ -372,9 +371,10 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             scheduler_sigmas = self.distilled_sigmas
 
         scheduler.sigmas = scheduler_sigmas
-        num_steps = len(scheduler_sigmas) - 1
         scheduler.num_inference_steps = num_steps
-        scheduler.timesteps = (scheduler_sigmas[:num_steps] * 1000).to(distilled_device)
+        scheduler.timesteps = (self.distilled_sigmas[:num_steps] * 1000).to(
+            distilled_device
+        )
         scheduler._step_index = None
         scheduler._begin_index = None
 
