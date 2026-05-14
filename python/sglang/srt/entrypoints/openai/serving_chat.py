@@ -983,6 +983,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
+            completion_tokens = text
+            completion_token_ids = ret_item["output_ids"]
 
             # Handle reasoning content
             reasoning_text = None
@@ -1031,6 +1033,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     content=text if text else None,
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text if reasoning_text else None,
+                    completion_token_ids=completion_token_ids,
+                    completion_tokens=completion_tokens,
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,

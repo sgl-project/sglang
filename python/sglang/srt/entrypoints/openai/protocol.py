@@ -833,6 +833,8 @@ class ChatMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    completion_token_ids: Optional[List[int]] = None
+    completion_tokens: Optional[str] = None
 
 
 class ChatCompletionResponseChoice(BaseModel):
