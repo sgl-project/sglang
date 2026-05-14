@@ -2854,15 +2854,6 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
         )
-        # Stamp the batch's chunked_req at admit time so subsequent filter_batch
-        # calls (across PP microbatches) can exclude this req from running_batch
-        # merging until its last chunk's forward result has been processed.
-        # has_pending_chunk-based filtering alone is insufficient: in PP, when
-        # mb_a admits the last chunk (has_pending_chunk -> False) but mb_b still
-        # holds a middle-chunk batch in its last_batch slot, mb_b would merge
-        # the still-prefilling req into running_batch.
-        if chunked_in_batch:
-            new_batch.chunked_req = chunked_in_batch[0]
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered

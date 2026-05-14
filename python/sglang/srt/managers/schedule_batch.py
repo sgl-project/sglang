@@ -1414,15 +1414,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    # The chunked-resume req that was admitted into this batch as mid-prefill
-    # (truncated at admit time -> has_pending_chunk True). Set by the scheduler
-    # right after init_new; consulted by filter_batch to exclude this req from
-    # merging into running_batch in subsequent iters. Required for PP, where
-    # mb_a's last-chunk admit clears has_pending_chunk but mb_b is still holding
-    # a middle-chunk batch in its last_batch slot — without this per-batch
-    # marker, mb_b would merge the still-prefilling req into running_batch.
-    chunked_req: Optional[Req] = None
-
     # Sampling info
     sampling_info: SamplingBatchInfo = None
 
@@ -2450,7 +2441,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self.reqs[i].has_pending_chunk
                         or self.reqs[i].pending_middle_outputs > 0
                         or self.reqs[i].is_dllm()
-                        or self.reqs[i] is self.chunked_req
                     )
                 )
             ]
