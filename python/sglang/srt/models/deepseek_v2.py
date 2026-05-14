@@ -894,7 +894,11 @@ class DeepseekV2MoE(nn.Module):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
 
-        if defer_shared and hidden_states.shape[0] > 0 and not self._fuse_shared_experts_inside_sbo:
+        if (
+            defer_shared
+            and hidden_states.shape[0] > 0
+            and not self._fuse_shared_experts_inside_sbo
+        ):
             shared_output = self._forward_shared_experts(
                 hidden_states, gemm_output_zero_allocator
             )
