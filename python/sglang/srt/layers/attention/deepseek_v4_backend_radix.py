@@ -54,6 +54,7 @@ from sglang.srt.layers.attention.compressed.compressor import (
 from sglang.srt.layers.attention.compressed.indexer import C4IndexerBackend
 from sglang.srt.layers.attention.compressed.metadata import (
     PagedIndexerMetadata,
+    create_flashmla_metadata,
     maybe_copy_inplace,
 )
 from sglang.srt.layers.attention.debug_flash_mla_adapter import (
@@ -128,9 +129,7 @@ def _copy_metadata(
 
 
 def _create_flashmla_metadata():
-    import flash_mla
-
-    return flash_mla.get_mla_metadata()[0]
+    return create_flashmla_metadata()
 
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
