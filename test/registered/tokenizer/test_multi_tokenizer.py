@@ -1,9 +1,8 @@
 import unittest
-from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.kits.eval_accuracy_kit import MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -11,18 +10,22 @@ from sglang.test.test_utils import (
     CustomTestCase,
     auto_config_device,
     get_benchmark_args,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     run_benchmark,
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=230, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=345, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=211, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=345, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestMultiTokenizer(CustomTestCase):
-    # from test_hicache.py
+class TestMultiTokenizer(CustomTestCase, MMLUMixin):
+    mmlu_score_threshold = 0.65
+    mmlu_num_examples = 64
+    mmlu_num_threads = 32
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -42,17 +45,6 @@ class TestMultiTokenizer(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-        metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
 
     def test_multi_tokenizer_ttft(self):
         # from test_bench_serving.py run_bench_serving
@@ -79,7 +71,8 @@ class TestMultiTokenizer(CustomTestCase):
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
-            self.assertLess(res["median_ttft_ms"], 86)
+            # relax for mi300x
+            self.assertLess(res["median_ttft_ms"], 130 if is_in_amd_ci() else 86)
             self.assertLess(res["median_itl_ms"], 10)
 
 

@@ -4,11 +4,10 @@
 
 use std::sync::{Arc, RwLock as StdRwLock};
 
-use crate::{
-    data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
-    mcp::McpManager,
-    routers::grpc::{context::SharedComponents, pipeline::RequestPipeline},
-};
+use data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage};
+use smg_mcp::McpManager;
+
+use crate::routers::grpc::{context::SharedComponents, pipeline::RequestPipeline};
 
 /// Context for /v1/responses endpoint
 ///

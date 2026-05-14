@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import threading
 import time
@@ -77,7 +78,6 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
-    post_load_weights,
     set_default_torch_dtype,
 )
 
@@ -87,6 +87,7 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
+    buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
@@ -98,7 +99,6 @@ from sglang.srt.model_loader.weight_utils import (
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
-    multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
     safetensors_weights_iterator,
@@ -191,49 +191,20 @@ logger = logging.getLogger(__name__)
 def _get_quantization_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
-    packed_modules_mapping: Dict[str, List[str]],
-    remap_prefix: Dict[str, str] | None = None,
 ) -> Optional[QuantizationConfig]:
     """Get the quantization config."""
-    if model_config.quantization is not None:
-        quant_config = get_quant_config(
-            model_config, load_config, packed_modules_mapping, remap_prefix
-        )
-        # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
-        if quant_config is None:
-            return None
-        if not _is_npu:
-            major, minor = get_device_capability()
-
-            if major is not None and minor is not None:
-                assert 0 <= minor < 10
-                capability = major * 10 + minor
-                if capability < quant_config.get_min_capability():
-                    raise ValueError(
-                        f"The quantization method {model_config.quantization} "
-                        "is not supported for the current GPU. "
-                        f"Minimum capability: {quant_config.get_min_capability()}. "
-                        f"Current capability: {capability}."
-                    )
-        supported_dtypes = quant_config.get_supported_act_dtypes()
-        if model_config.dtype not in supported_dtypes:
-            raise ValueError(
-                f"{model_config.dtype} is not supported for quantization "
-                f"method {model_config.quantization}. Supported dtypes: "
-                f"{supported_dtypes}"
-            )
-        return quant_config
-    return None
-
-
-def _initialize_model(
-    model_config: ModelConfig,
-    load_config: LoadConfig,
-) -> nn.Module:
-    """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     remap_prefix = getattr(model_class, "remap_prefix", None)
+    # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
+    if model_config.quantization == "quark":
+        packed_modules_mapping.update(
+            {
+                "gate_up_proj": ["gate_proj", "up_proj"],
+                "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+            }
+        )
+
     if _is_npu:
         packed_modules_mapping.update(
             {
@@ -256,15 +227,53 @@ def _initialize_model(
             }
         )
 
-    quant_config = _get_quantization_config(
-        model_config, load_config, packed_modules_mapping, remap_prefix
-    )
-    hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
-    # pass mappings by reference to quant_config
-    if hf_to_sglang_mapper is not None and quant_config is not None:
-        quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
+    if model_config.quantization is not None:
+        quant_config = get_quant_config(
+            model_config, load_config, packed_modules_mapping, remap_prefix
+        )
+        # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
+        if quant_config is None:
+            return None
+        # Carry DSV4 expert layout into Fp8Config so downstream readers don't read env.
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
 
-    # Build kwargs conditionally
+        if isinstance(quant_config, Fp8Config):
+            quant_config.is_fp4_experts = model_config.is_fp4_experts
+        if not _is_npu:
+            major, minor = get_device_capability()
+
+            if major is not None and minor is not None:
+                assert 0 <= minor < 10
+                capability = major * 10 + minor
+                if capability < quant_config.get_min_capability():
+                    raise ValueError(
+                        f"The quantization method {model_config.quantization} "
+                        "is not supported for the current GPU. "
+                        f"Minimum capability: {quant_config.get_min_capability()}. "
+                        f"Current capability: {capability}."
+                    )
+        supported_dtypes = quant_config.get_supported_act_dtypes()
+        if model_config.dtype not in supported_dtypes:
+            raise ValueError(
+                f"{model_config.dtype} is not supported for quantization "
+                f"method {model_config.quantization}. Supported dtypes: "
+                f"{supported_dtypes}"
+            )
+        hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
+        # pass mappings by reference to quant_config
+        if hf_to_sglang_mapper is not None and quant_config is not None:
+            quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
+        return quant_config
+    return None
+
+
+def _initialize_model(
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+    quant_config: Optional[QuantizationConfig] = None,
+) -> nn.Module:
+    """Initialize a model with the given configurations."""
+    model_class, _ = get_model_architecture(model_config)
     kwargs = {
         "config": model_config.hf_config,
         "quant_config": quant_config,
@@ -275,7 +284,19 @@ def _initialize_model(
         kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.get()
         kwargs["model_path"] = model_config.model_path
 
+    if load_config.draft_model_idx is not None:
+        kwargs["draft_model_idx"] = load_config.draft_model_idx
+
     return model_class(**kwargs)
+
+
+def _post_load_weights(model: nn.Module) -> None:
+    # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
+    # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
+    # would normally do it internally. NextN subclasses override the method to fill in
+    # `is_nextn=True`, so the loader doesn't need to know.
+    if hasattr(model, "post_load_weights"):
+        model.post_load_weights()
 
 
 class BaseModelLoader(ABC):
@@ -306,6 +327,8 @@ class DefaultModelLoader(BaseModelLoader):
     # default number of thread when enable multithread weight loading
     DEFAULT_NUM_THREADS = 8
 
+    _MTP_PATTERN = re.compile(r"model\.mtp\.layers\.(\d+)\.")
+
     @dataclasses.dataclass
     class Source:
         """A source for weights."""
@@ -335,6 +358,9 @@ class DefaultModelLoader(BaseModelLoader):
                 model_config=model_config,
             )
 
+    counter_before_loading_weights: float = 0.0
+    counter_after_loading_weights: float = 0.0
+
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
@@ -350,11 +376,11 @@ class DefaultModelLoader(BaseModelLoader):
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
-    ) -> Optional[str]:
+    ) -> str:
         """Download model from ModelScope hub if SGLANG_USE_MODELSCOPE is True.
 
-        Returns the path to the downloaded model, or None if the model is not
-        downloaded from ModelScope."""
+        Returns the path to the downloaded model, or the original model path if
+        not downloaded from ModelScope."""
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
@@ -372,7 +398,7 @@ class DefaultModelLoader(BaseModelLoader):
             else:
                 model_path = model
             return model_path
-        return None
+        return model
 
     def _prepare_weights(
         self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
@@ -380,9 +406,8 @@ class DefaultModelLoader(BaseModelLoader):
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
-        model_name_or_path = (
-            self._maybe_download_from_modelscope(model_name_or_path, revision)
-            or model_name_or_path
+        model_name_or_path = self._maybe_download_from_modelscope(
+            model_name_or_path, revision
         )
 
         is_local = os.path.isdir(model_name_or_path)
@@ -466,6 +491,9 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
+        if envs.SGLANG_SORT_WEIGHT_FILES.get():
+            hf_weights_files.sort()
+
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
@@ -473,6 +501,7 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
+        use_multithread = extra_config.get("enable_multithread_load", True)
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
@@ -495,29 +524,40 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            weight_loader_disable_mmap = (
-                get_global_server_args().weight_loader_disable_mmap
+            server_args = get_global_server_args()
+            weight_loader_disable_mmap = server_args.weight_loader_disable_mmap
+            weight_loader_prefetch = server_args.weight_loader_prefetch_checkpoints
+            prefetch_num_threads = server_args.weight_loader_prefetch_num_threads
+            weight_loader_drop_cache_after_load = (
+                server_args.weight_loader_drop_cache_after_load
             )
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                 )
-            elif extra_config.get("enable_multithread_load"):
-                weights_iterator = multi_thread_safetensors_weights_iterator(
+            elif use_multithread:
+                weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
                         "num_threads", self.DEFAULT_NUM_THREADS
                     ),
                     disable_mmap=weight_loader_disable_mmap,
+                    prefetch=weight_loader_prefetch,
+                    prefetch_num_threads=prefetch_num_threads,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
-                    hf_weights_files, disable_mmap=weight_loader_disable_mmap
+                    hf_weights_files,
+                    disable_mmap=weight_loader_disable_mmap,
+                    prefetch=weight_loader_prefetch,
+                    prefetch_num_threads=prefetch_num_threads,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
 
         else:
-            if extra_config.get("enable_multithread_load"):
+            if use_multithread:
                 weights_iterator = multi_thread_pt_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
@@ -528,24 +568,33 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = pt_weights_iterator(hf_weights_files)
 
         if self.load_config.draft_model_idx is not None:
-            import re
+            return self._filter_mtp_weights(
+                weights_iterator, source.prefix, self.load_config.draft_model_idx
+            )
 
-            pattern = r"model.mtp.layers.(\d+)."
-            filtered_weights = []
-            for name, tensor in weights_iterator:
-                group = re.match(pattern, name)
-                if group is not None:
-                    idx = int(group.group(1))
-                    if idx != self.load_config.draft_model_idx:
-                        continue
-                    new_name = name.replace(group.group(), "model.mtp.layers.0.")
-                else:
-                    new_name = name
-                filtered_weights.append((source.prefix + new_name, tensor))
-            return tuple(filtered_weights)
-
+        if self.counter_before_loading_weights == 0.0:
+            self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+
+    @classmethod
+    def _filter_mtp_weights(
+        cls, weights_iterator, prefix: str, draft_model_idx: int
+    ) -> Tuple[Tuple[str, torch.Tensor], ...]:
+        """Filter MTP (Multi-Token Prediction) weights to keep only the
+        specified draft model layer and remap it to layer 0."""
+        filtered_weights = []
+        for name, tensor in weights_iterator:
+            match = cls._MTP_PATTERN.match(name)
+            if match is not None:
+                idx = int(match.group(1))
+                if idx != draft_model_idx:
+                    continue
+                new_name = name.replace(match.group(), "model.mtp.layers.0.")
+            else:
+                new_name = name
+            filtered_weights.append((prefix + new_name, tensor))
+        return tuple(filtered_weights)
 
     def _get_all_weights(
         self,
@@ -579,11 +628,19 @@ class DefaultModelLoader(BaseModelLoader):
                 "Please install it with: pip install accelerate"
             )
 
-        hf_config = AutoConfig.from_pretrained(
-            model_config.model_path,
-            trust_remote_code=True,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-        )
+        try:
+            hf_config = AutoConfig.from_pretrained(
+                model_config.model_path,
+                trust_remote_code=True,
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            )
+        except (KeyError, ValueError):
+            from sglang.srt.utils.hf_transformers_utils import get_config
+
+            hf_config = get_config(
+                model_config.model_path,
+                trust_remote_code=True,
+            )
         with init_empty_weights():
             torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
             model = AutoModelForCausalLM.from_config(
@@ -612,6 +669,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         model = AutoModelForCausalLM.from_pretrained(
             model_config.model_path,
+            config=hf_config,
             device_map=device_map,
             **model_kwargs,
             trust_remote_code=True,
@@ -652,17 +710,20 @@ class DefaultModelLoader(BaseModelLoader):
             return model.eval()
 
         target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    quant_config,
                 )
 
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )
 
+        self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
     @staticmethod
@@ -679,8 +740,6 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
-                if _is_npu:
-                    torch.npu.empty_cache()
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -703,6 +762,7 @@ class LayeredModelLoader(DefaultModelLoader):
 
         torchao_config = get_global_server_args().torchao_config
         target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
 
         with set_default_torch_dtype(model_config.dtype):
             # Create model on meta device
@@ -710,6 +770,7 @@ class LayeredModelLoader(DefaultModelLoader):
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    quant_config,
                 )
 
             # Check model's layered load support
@@ -1254,11 +1315,14 @@ class DummyModelLoader(BaseModelLoader):
                 self, model_config=model_config, device_config=device_config
             )
 
+        quant_config = _get_quantization_config(model_config, self.load_config)
+
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    quant_config,
                 )
 
             for _, module in model.named_modules():
@@ -1276,7 +1340,7 @@ class DummyModelLoader(BaseModelLoader):
             # random values to the weights.
             initialize_dummy_weights(model)
 
-            post_load_weights(model, model_config)
+            _post_load_weights(model)
 
         return model.eval()
 
@@ -1372,9 +1436,11 @@ class ShardedStateLoader(BaseModelLoader):
             model_config.model_path, model_config.revision
         )
 
+        quant_config = _get_quantization_config(model_config, self.load_config)
+
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config)
+                model = _initialize_model(model_config, self.load_config, quant_config)
                 for _, module in model.named_modules():
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
@@ -1417,7 +1483,7 @@ class ShardedStateLoader(BaseModelLoader):
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
-            post_load_weights(model, model_config)
+            _post_load_weights(model)
 
         return model.eval()
 
@@ -1924,11 +1990,13 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
+        quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    quant_config,
                 )
 
                 self._load_weights(model_config, model)
@@ -1982,6 +2050,8 @@ class GGUFModelLoader(BaseModelLoader):
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
+        elif model_type == "qwen3_moe":
+            model_type = "qwen3moe"
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():
             if value == model_type:
@@ -2026,9 +2096,10 @@ class GGUFModelLoader(BaseModelLoader):
             model_config.hf_config.update({"tie_word_embeddings": True})
 
         target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                model = _initialize_model(model_config, self.load_config)
+                model = _initialize_model(model_config, self.load_config, quant_config)
             model.load_weights(
                 self._get_weights_iterator(local_model_path, gguf_weights_map)
             )
@@ -2070,9 +2141,10 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             f"load format {load_config.load_format}"
         )
 
+        quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config)
+                model = _initialize_model(model_config, self.load_config, quant_config)
 
         if (
             load_config.remote_instance_weight_loader_backend
@@ -2121,6 +2193,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 raise RuntimeError(
                     "Failed to load weights from remote instance via transfer engine."
                 )
+        elif (
+            load_config.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+        ):
+            self.load_model_from_modelexpress(
+                model,
+                load_config,
+                device_config,
+            )
         else:
             raise ValueError("Invalid remote instance weight loader backend.")
 
@@ -2165,8 +2246,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 )
             torch.cuda.synchronize()
 
-            if hasattr(model, "post_load_weights"):
-                model.post_load_weights()
+            _post_load_weights(model)
         end_get_weights_tic = time.time()
         logger.debug(
             f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
@@ -2229,10 +2309,270 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.error(f"batch transfer failed, error: {ret}")
             return False
 
-        if hasattr(model, "post_load_weights"):
-            model.post_load_weights()
+        _post_load_weights(model)
 
         return True
+
+    def load_model_from_modelexpress(
+        self,
+        model,
+        load_config: LoadConfig,
+        device_config: DeviceConfig,
+    ):
+        """Load weights via ModelExpress coordination + RDMA transfer.
+
+        Supports two transport backends:
+        - transfer_engine: Mooncake TransferEngine (default)
+        - nixl: NIXL UCX-based RDMA
+        """
+        try:
+            import grpc
+            from modelexpress import p2p_pb2
+            from modelexpress.client import MxClient
+        except ImportError as exc:
+            raise ImportError(
+                "ModelExpress support requires the 'modelexpress' package. "
+                "Install it with: pip install modelexpress"
+            ) from exc
+
+        tp_rank = load_config.tp_rank
+        model_name = load_config.modelexpress_model_name
+        transport = load_config.modelexpress_transport
+
+        # Process quantized weights to establish final tensor layout
+        target_device = torch.device(device_config.device)
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
+        # Register local memory for the chosen transport
+        if transport == "nixl":
+            nixl_mgr = self._init_nixl_for_target(model, load_config, device_config)
+        else:
+            transfer_engine = load_config.remote_instance_weight_loader_transfer_engine
+            if transfer_engine is None:
+                raise RuntimeError(
+                    "TransferEngine is not initialized for modelexpress backend."
+                )
+            logger.info(
+                "ModelExpress: registering memory regions for tp_rank=%d...", tp_rank
+            )
+            self.remote_instance_transfer_engine_weight_info = register_memory_region(
+                model, transfer_engine
+            )
+
+        # --- Shared MX discovery logic ---
+        identity = p2p_pb2.SourceIdentity(
+            model_name=model_name,
+            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
+            tensor_parallel_size=load_config.modelexpress_tp_size or 1,
+            pipeline_parallel_size=load_config.modelexpress_pp_size or 1,
+            expert_parallel_size=load_config.modelexpress_ep_size or 1,
+            dtype=load_config.modelexpress_dtype or "",
+            quantization=load_config.modelexpress_quantization or "",
+        )
+
+        mx_client = MxClient(server_url=load_config.modelexpress_url)
+        try:
+            logger.info(
+                "ModelExpress [%s]: looking for seed (model=%s, rank=%d)...",
+                transport,
+                model_name,
+                tp_rank,
+            )
+            try:
+                resp = mx_client.list_sources(
+                    identity=identity,
+                    status_filter=p2p_pb2.SOURCE_STATUS_READY,
+                )
+            except grpc.RpcError as e:
+                raise RuntimeError(
+                    f"ModelExpress: cannot reach server at "
+                    f"{load_config.modelexpress_url}: "
+                    f"{e.code()}: {e.details()}"
+                ) from e
+
+            source_ref = None
+            for inst in resp.instances:
+                if inst.worker_rank == tp_rank:
+                    source_ref = inst
+                    break
+
+            if source_ref is None:
+                raise RuntimeError(
+                    f"ModelExpress: no READY source found for "
+                    f"model={model_name}, rank={tp_rank}. "
+                    f"Ensure the seed instance is running and has published metadata."
+                )
+
+            response = mx_client.get_metadata(
+                mx_source_id=source_ref.mx_source_id,
+                worker_id=source_ref.worker_id,
+            )
+            if not response.found:
+                raise RuntimeError(
+                    f"ModelExpress: no metadata found for "
+                    f"source_id={source_ref.mx_source_id}, "
+                    f"worker_id={source_ref.worker_id}"
+                )
+
+            source_worker = response.worker
+        finally:
+            mx_client.close()
+
+        # --- Transport-specific transfer ---
+        if transport == "nixl":
+            self._transfer_via_nixl(model, nixl_mgr, source_worker, tp_rank)
+        else:
+            self._transfer_via_transfer_engine(
+                model, transfer_engine, source_worker, tp_rank
+            )
+
+        _post_load_weights(model)
+
+        logger.info("ModelExpress: weight transfer complete for tp_rank=%d", tp_rank)
+
+    def _transfer_via_transfer_engine(
+        self, model, transfer_engine, source_worker, tp_rank
+    ):
+        """Execute weight transfer using Mooncake TransferEngine."""
+        backend_field = source_worker.WhichOneof("backend_metadata")
+        if backend_field != "transfer_engine_session_id":
+            raise RuntimeError(
+                f"ModelExpress: expected transfer_engine_session_id, "
+                f"got backend_metadata={backend_field}"
+            )
+        seed_session_id = source_worker.transfer_engine_session_id
+
+        seed_weight_info = {}
+        for td in source_worker.tensors:
+            seed_weight_info[td.name] = (td.addr, td.size)
+
+        logger.info(
+            "ModelExpress: got %d tensor descriptors from seed (session=%s)",
+            len(seed_weight_info),
+            seed_session_id,
+        )
+
+        seed_ptr_list = []
+        client_ptr_list = []
+        client_len_list = []
+        for name, tensor in model.named_parameters():
+            weight_info = seed_weight_info.get(name, None)
+            if weight_info is None:
+                raise RuntimeError(
+                    f"ModelExpress: cannot find weight info for {name} "
+                    f"in seed metadata"
+                )
+            seed_ptr, seed_size = weight_info
+            local_size = tensor.numel() * tensor.element_size()
+            if seed_size != local_size:
+                raise RuntimeError(
+                    f"ModelExpress: size mismatch for {name}: "
+                    f"seed={seed_size} bytes, local={local_size} bytes"
+                )
+            seed_ptr_list.append(seed_ptr)
+            client_ptr_list.append(tensor.data_ptr())
+            client_len_list.append(local_size)
+
+        logger.info(
+            "ModelExpress: starting TransferEngine RDMA of %d tensors...",
+            len(seed_ptr_list),
+        )
+        ret = transfer_engine.batch_transfer_sync_read(
+            seed_session_id,
+            client_ptr_list,
+            seed_ptr_list,
+            client_len_list,
+        )
+        if ret < 0:
+            raise RuntimeError(
+                f"ModelExpress: batch_transfer_sync_read failed, error={ret}"
+            )
+
+    def _init_nixl_for_target(self, model, load_config, device_config):
+        """Initialize NIXL agent and register local tensors for the target."""
+        import uuid
+
+        from modelexpress.nixl_transfer import NixlTransferManager
+
+        tp_rank = load_config.tp_rank
+        device_id = device_config.gpu_id
+
+        agent_name = f"sglang-target-rank{tp_rank}-{uuid.uuid4().hex[:8]}"
+        nixl_mgr = NixlTransferManager(agent_name, device_id)
+        nixl_mgr.initialize()
+
+        # Collect local tensors, handling non-contiguous via storage views
+        local_tensors = {}
+        seen_ptrs = set()
+        for name, param in model.named_parameters():
+            t = param.data
+            if t.is_contiguous():
+                ptr = t.data_ptr()
+                if ptr in seen_ptrs:
+                    continue
+                seen_ptrs.add(ptr)
+                local_tensors[name] = t
+            else:
+                sv = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
+                    t.untyped_storage()
+                )
+                ptr = sv.data_ptr()
+                if ptr in seen_ptrs:
+                    continue
+                seen_ptrs.add(ptr)
+                local_tensors[f"{name}.__storage"] = sv
+
+        nixl_mgr.register_tensors(local_tensors)
+        logger.info(
+            "ModelExpress [nixl]: registered %d tensors for tp_rank=%d",
+            len(local_tensors),
+            tp_rank,
+        )
+        return nixl_mgr
+
+    def _transfer_via_nixl(self, model, nixl_mgr, source_worker, tp_rank):
+        """Execute weight transfer using NIXL RDMA."""
+        from modelexpress.types import TensorDescriptor
+
+        backend_field = source_worker.WhichOneof("backend_metadata")
+        if backend_field != "nixl_metadata":
+            raise RuntimeError(
+                f"ModelExpress: expected nixl_metadata, "
+                f"got backend_metadata={backend_field}"
+            )
+
+        source_tensors = [
+            TensorDescriptor(
+                name=td.name,
+                addr=td.addr,
+                size=td.size,
+                device_id=td.device_id,
+                dtype=td.dtype,
+            )
+            for td in source_worker.tensors
+        ]
+
+        logger.info(
+            "ModelExpress [nixl]: starting RDMA transfer of %d tensors...",
+            len(source_tensors),
+        )
+
+        total_bytes, matched, duration = nixl_mgr.receive_from_source(
+            source_metadata=source_worker.nixl_metadata,
+            source_tensors=source_tensors,
+            coalesce_transfers=False,
+        )
+
+        logger.info(
+            "ModelExpress [nixl]: transferred %d tensors, " "%.2f GB in %.2fs",
+            matched,
+            total_bytes / 1e9,
+            duration,
+        )
 
 
 class RemoteModelLoader(BaseModelLoader):
@@ -2320,7 +2660,7 @@ class RemoteModelLoader(BaseModelLoader):
         if state_dict:
             raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
-        post_load_weights(model, model_config)
+        _post_load_weights(model)
 
     def _load_model_from_remote_fs(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
@@ -2360,9 +2700,11 @@ class RemoteModelLoader(BaseModelLoader):
         if hasattr(model_config, "model_weights"):
             model_weights = model_config.model_weights
 
+        quant_config = _get_quantization_config(model_config, self.load_config)
+
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config)
+                model = _initialize_model(model_config, self.load_config, quant_config)
 
             with create_remote_connector(
                 model_weights, device=device_config.device
@@ -2387,10 +2729,12 @@ def load_model_with_cpu_quantization(
     device_config: DeviceConfig,
 ) -> nn.Module:
     target_device = torch.device(device_config.device)
+    quant_config = _get_quantization_config(model_config, self.load_config)
     with set_default_torch_dtype(model_config.dtype):
         model = _initialize_model(
             model_config,
             self.load_config,
+            quant_config,
         )
 
         if not isinstance(self, DummyModelLoader):
@@ -2684,6 +3028,247 @@ class ModelOptModelLoader(DefaultModelLoader):
         return model.eval()
 
 
+class RunaiModelStreamerLoader(BaseModelLoader):
+    """
+    Model loader that uses Runai Model Streamer to load a model.
+
+    Supports fast model loading from SSDs, shared filesystems and object storage (S3, GCS, Azure blob) with weight streaming.
+
+    Configuration (via load_config.model_loader_extra_config):
+        - distributed (bool): Enable distributed streaming - True by default for url paths (object storage)
+        - concurrency (int): Number of concurrent downloads
+        - memory_limit (int): Memory limit for streaming buffer
+
+    Note: Metadata files must be pre-downloaded via
+    ObjectStorageModel.download_and_get_path() before instantiation.
+    """
+
+    @dataclasses.dataclass
+    class Source:
+        """A source for weights."""
+
+        model_or_path: str
+        """The model ID or path."""
+
+        revision: Optional[str]
+        """The optional model revision."""
+
+        prefix: str = ""
+        """A prefix to prepend to all weights."""
+
+        fall_back_to_pt: bool = True
+        """Whether .pt weights can be used."""
+
+        model_config: Optional["ModelConfig"] = None
+        """The model configuration (for checking architecture, etc)."""
+
+        @classmethod
+        def init_new(cls, model_config: ModelConfig, model):
+            model_weights = model_config.model_path
+            if hasattr(model_config, "model_weights"):
+                model_weights = model_config.model_weights
+            return cls(
+                model_weights,
+                model_config.revision,
+                prefix="",
+                fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+                model_config=model_config,
+            )
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        extra_config = load_config.model_loader_extra_config
+        allowed_keys = {"distributed", "concurrency", "memory_limit"}
+        unexpected_keys = set(extra_config.keys()) - allowed_keys
+
+        if unexpected_keys:
+            raise ValueError(
+                f"Unexpected extra config keys for load format "
+                f"{load_config.load_format}: "
+                f"{unexpected_keys}"
+            )
+
+        set_runai_streamer_env(load_config)
+
+        self._is_distributed = None
+        if load_config.model_loader_extra_config:
+            extra_config = load_config.model_loader_extra_config
+
+            if "distributed" in extra_config and isinstance(
+                extra_config.get("distributed"), bool
+            ):
+                self._is_distributed = extra_config.get("distributed")
+
+    def _prepare_weights(
+        self, model_name_or_path: str, revision: Optional[str]
+    ) -> Tuple[str, List[str]]:
+        """Prepare weights for the model.
+
+        If the model is not local, it will be downloaded."""
+        from sglang.srt.utils.runai_utils import is_runai_obj_uri, list_safetensors
+
+        is_object_storage_path = is_runai_obj_uri(model_name_or_path)
+        if self._is_distributed is None:
+            self._is_distributed = is_object_storage_path
+        is_local = os.path.isdir(model_name_or_path)
+        safetensors_pattern = "*.safetensors"
+        index_file = SAFE_WEIGHTS_INDEX_NAME
+
+        hf_folder = (
+            model_name_or_path
+            if (is_local or is_object_storage_path)
+            else download_weights_from_hf(
+                model_name_or_path,
+                self.load_config.download_dir,
+                [safetensors_pattern],
+                revision,
+                ignore_patterns=self.load_config.ignore_patterns,
+            )
+        )
+
+        server_args = get_global_server_args()
+        if server_args and server_args.model_checksum is not None:
+            from sglang.srt.utils.model_file_verifier import verify
+
+            checksums_source = server_args.model_checksum or model_name_or_path
+            verify(model_path=hf_folder, checksums_source=checksums_source)
+
+        hf_weights_files = list_safetensors(path=hf_folder)
+
+        # For models like Mistral-7B-Instruct-v0.3
+        # there are both sharded safetensors files and a consolidated
+        # safetensors file. Using both breaks.
+        # Here, we download the `model.safetensors.index.json` and filter
+        # any files not found in the index.
+        if not is_local and not is_object_storage_path:
+            download_safetensors_index_file_from_hf(
+                model_name_or_path,
+                index_file,
+                self.load_config.download_dir,
+                revision,
+            )
+        hf_weights_files = filter_duplicate_safetensors_files(
+            hf_weights_files, hf_folder, index_file
+        )
+
+        if len(hf_weights_files) == 0:
+            raise RuntimeError(
+                f"Cannot find any model weights with `{model_name_or_path}`"
+            )
+
+        return hf_folder, hf_weights_files
+
+    def _get_weights_iterator(
+        self, source: "Source"
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Get an iterator for the model weights based on the load format."""
+        from sglang.srt.model_loader.weight_utils import (
+            runai_safetensors_weights_iterator,
+        )
+
+        hf_folder, hf_weights_files = self._prepare_weights(
+            source.model_or_path, source.revision
+        )
+
+        if source.model_config is not None:
+            hf_weights_files = maybe_add_mtp_safetensors(
+                hf_weights_files,
+                hf_folder,
+                "model.safetensors.index.json",
+                source.model_config.hf_config,
+            )
+
+        weights_iterator = runai_safetensors_weights_iterator(
+            hf_weights_files, self._is_distributed, self.target_device_str
+        )
+
+        if self.load_config.draft_model_idx is not None:
+            import re
+
+            def filter_weights(original_weights_iterator):
+                pattern = r"model.mtp.layers.(\d+)."
+                for name, tensor in original_weights_iterator:
+                    group = re.match(pattern, name)
+                    if group is not None:
+                        idx = int(group.group(1))
+                        if idx != self.load_config.draft_model_idx:
+                            continue
+                        new_name = name.replace(group.group(), "model.mtp.layers.0.")
+                    else:
+                        new_name = name
+                    yield (new_name, tensor)
+
+            weights_iterator = filter_weights(weights_iterator)
+
+        def apply_prefix(original_weights_iterator):
+            yield from (
+                (source.prefix + name, tensor)
+                for (name, tensor) in original_weights_iterator
+            )
+
+        return apply_prefix(weights_iterator)
+
+    def _get_all_weights(
+        self,
+        model_config: ModelConfig,
+        model: nn.Module,
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+
+        primary_weights = RunaiModelStreamerLoader.Source.init_new(model_config, model)
+        yield from self._get_weights_iterator(primary_weights)
+
+        secondary_weights = cast(
+            Iterable[RunaiModelStreamerLoader.Source],
+            getattr(model, "secondary_weights", ()),
+        )
+        for source in secondary_weights:
+            yield from self._get_weights_iterator(source)
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        self._prepare_weights(model_config.model_path, model_config.revision)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+
+        if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
+            # Load base model using shared method
+            raise NotImplementedError(
+                "Runai Model Streamer Loader does not support ModelOpt quantization yet"
+            )
+
+        assert device_config.device_type in ("cuda", "cpu"), (
+            f"Runai Model Streamer only supports CUDA and CPU, "
+            f"got {device_config.device_type}"
+        )
+
+        if device_config.device_type == "cuda":
+            self.target_device_str = (
+                device_config.device_type + ":" + str(device_config.gpu_id)
+            )
+        else:
+            self.target_device_str = "cpu"
+
+        target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                    quant_config,
+                )
+
+            DefaultModelLoader.load_weights_and_postprocess(
+                model, self._get_all_weights(model_config, model), target_device
+            )
+
+        return model.eval()
+
+
 def get_model_loader(
     load_config: LoadConfig, model_config: Optional[ModelConfig] = None
 ) -> BaseModelLoader:
@@ -2692,18 +3277,29 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
 
-    if model_config and (
+    # ModelOptModelLoader's local-copy quantize-and-export workflow doesn't apply
+    # to RUNAI_STREAMER, which streams weights directly from object storage.
+    # RUNAI_STREAMER loads always fall through to the unconditional branch at
+    # the bottom of this function. This also avoids calling _is_already_quantized()
+    # on RunAI streamer cache paths, where huggingface_hub raises HFValidationError.
+    model_optloader_allowed = (
+        model_config and load_config.load_format != LoadFormat.RUNAI_STREAMER
+    )
+
+    if model_optloader_allowed and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
-        or model_config.quantization in ["modelopt_fp8", "modelopt_fp4", "modelopt"]
+        or model_config.quantization
+        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
     ):
         logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
         return ModelOptModelLoader(load_config)
 
     # Use ModelOptModelLoader for unified quantization flags
     if (
-        model_config
+        model_optloader_allowed
         and hasattr(model_config, "quantization")
-        and model_config.quantization in ["modelopt_fp8", "modelopt_fp4"]
+        and model_config.quantization
+        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
     ):
         if model_config._is_already_quantized():
             logger.info(
@@ -2765,5 +3361,8 @@ def get_model_loader(
             return module.PrivateModelLoader(load_config)
         except ImportError:
             raise ValueError("Failed to import sglang.private.private_model_loader")
+
+    if load_config.load_format == LoadFormat.RUNAI_STREAMER:
+        return RunaiModelStreamerLoader(load_config)
 
     return DefaultModelLoader(load_config)

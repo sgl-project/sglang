@@ -127,7 +127,7 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
 
         # Get page indices from cache
-        page_indices = self.req_to_token[req_pool_indices, :max_len]
+        page_indices = self.req_to_token[req_pool_indices, :max_len].contiguous()
 
         # Compute NSA seqlens
         nsa_cache_seqlens = compute_nsa_seqlens(
@@ -187,7 +187,7 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
         page_indices = torch.repeat_interleave(
             page_indices, repeats=self.speculative_num_draft_tokens, dim=0
-        )
+        ).contiguous()
 
         # Generate expanded seqlens
         extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
@@ -261,15 +261,16 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         cache_seqlens = seq_lens.to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
 
-        # Extend seqlens from spec_info
-        extend_seq_lens = spec_info.accept_length[:bs]
+        # Extend seqlens from spec_info: num_accepted_tokens already includes
+        # the bonus token (drafts + 1).
+        extend_seq_lens = spec_info.num_accepted_tokens[:bs]
         extend_seq_lens_cpu = extend_seq_lens.tolist()
 
         # Page indices (repeated per accept length)
         page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
         page_indices = torch.repeat_interleave(
             page_indices, repeats=extend_seq_lens, dim=0
-        )
+        ).contiguous()
 
         # Generate expanded seqlens
         seqlens_expanded = torch.cat(

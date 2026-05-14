@@ -74,6 +74,12 @@ class RadioConfig(PretrainedConfig):
         norm_mean: tuple[float, float, float] | list = OPENAI_CLIP_MEAN,
         norm_std: tuple[float, float, float] | list = OPENAI_CLIP_STD,
         reg_tokens: int | None = None,
+        min_num_patches: int = 0,
+        max_num_patches: int = 0,
+        video_temporal_patch_size: int = 1,
+        separate_video_embedder: bool = True,
+        video_target_num_patches: int = 0,
+        video_maintain_aspect_ratio: bool = True,
         drop_path_rate: float = 0.0,
         dropout: float = 0.0,
         **kwargs,
@@ -101,6 +107,12 @@ class RadioConfig(PretrainedConfig):
             list(norm_std) if isinstance(norm_std, (tuple, list)) else norm_std
         )
         self.reg_tokens = reg_tokens
+        self.min_num_patches = min_num_patches
+        self.max_num_patches = max_num_patches
+        self.video_temporal_patch_size = video_temporal_patch_size
+        self.separate_video_embedder = separate_video_embedder
+        self.video_target_num_patches = video_target_num_patches
+        self.video_maintain_aspect_ratio = video_maintain_aspect_ratio
         self.drop_path_rate = drop_path_rate
         self.dropout = dropout
         super().__init__(**kwargs)

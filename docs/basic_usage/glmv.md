@@ -133,4 +133,4 @@ python -m sglang.launch_server \
 
 In SGLang, we can implement thinking budget with `CustomLogitProcessor`.
 
-Launch a server with `--enable-custom-logit-processor` flag on. and using `Glm4MoeThinkingBudgetLogitProcessor` in the request likes `GLM-4.6` example in [glm45.md](./glm45.md).
+Launch a server with the `--enable-custom-logit-processor` flag. Then, use `Glm4MoeThinkingBudgetLogitProcessor` in the request, similar to the `GLM-4.6` example in [glm45.md](./glm45.md).

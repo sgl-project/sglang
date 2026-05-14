@@ -15,6 +15,30 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
 
 
+def _init_npu_conv_state(
+    conv_state_in, conv_state_shape, speculative_num_draft_tokens: Optional[int] = None
+):
+    extra_conv_len = 0
+    if speculative_num_draft_tokens is not None:
+        extra_conv_len = speculative_num_draft_tokens - 1
+
+    # conv_state shape (layers, pool_size, conv_wind + draft_step, dim) for conv1d ascendc ops require dim as last dim
+    conv_state = [
+        torch.zeros(
+            size=(
+                conv_state_in.shape[0],
+                conv_state_in.shape[1],
+                conv_shape[1] + extra_conv_len,
+                conv_shape[0],
+            ),
+            dtype=conv_state_in.dtype,
+            device=conv_state_in.device,
+        )
+        for conv_shape in conv_state_shape
+    ]
+    return conv_state
+
+
 class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def __init__(
@@ -100,13 +124,22 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             self.get_value_buffer(i).nbytes
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
-        kv_item_lens = [
-            self.get_key_buffer(i)[0].nbytes
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self.get_value_buffer(i)[0].nbytes
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
+        if self.use_fia:
+            kv_item_lens = [
+                self.get_key_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ] + [
+                self.get_value_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
+        else:
+            kv_item_lens = [
+                self.get_key_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ] + [
+                self.get_value_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(
@@ -221,6 +254,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 dtype=self.store_dtype,
                 device=self.device,
             )
+            self.index_k_buffer = None
             if self.index_head_dim is not None:
                 self.index_k_buffer = torch.zeros(
                     (

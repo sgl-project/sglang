@@ -32,7 +32,10 @@ constexpr size_t kSmem = static_cast<size_t>(SGL_TOPK_DYNAMIC_SMEM_BYTES);
 constexpr size_t kSmem = 48 * 1024;  // bytes
 #endif
 #else
-constexpr size_t kSmem = 32 * 1024 * sizeof(uint32_t);  // 128KB (bytes)
+// Reduced from 128KB to 32KB to improve occupancy.
+// Each radix pass needs at most ~TopK candidates in the threshold bin,
+// so 4K entries per round (2 rounds = 8K entries = 32KB) is sufficient.
+constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);  // 32KB (bytes)
 #endif
 
 struct FastTopKParams {

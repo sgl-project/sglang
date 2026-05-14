@@ -111,14 +111,17 @@ class LlamaModel(nn.Module):
         super().__init__()
         self.config = config
 
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if rope_parameters is not None:
+            rope_scaling = rope_parameters
+        else:
+            rope_scaling = getattr(config, "rope_scaling", None)
         self.is_mrope_enabled = (
-            hasattr(config, "rope_scaling")
-            and config.rope_scaling is not None
-            and "mrope_section" in config.rope_scaling
+            rope_scaling is not None and "mrope_section" in rope_scaling
         )
         # fix rope_scaling for qwen2.5-vl
         if self.is_mrope_enabled:
-            config.rope_scaling["rope_type"] = "default"
+            rope_scaling["rope_type"] = "default"
 
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
@@ -131,6 +134,15 @@ class LlamaModel(nn.Module):
             self.hidden_size_in = config.target_hidden_size
         else:
             self.hidden_size_in = config.hidden_size
+
+        # Optional per-layer RMSNorm applied to each aux hidden state before
+        # concatenation, so that all three layers contribute equally regardless
+        # of their raw scale. Enabled via config "use_aux_norm": true.
+        self.use_aux_norm = getattr(config, "use_aux_norm", False)
+        if self.use_aux_norm:
+            self.aux_norm_low = RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+            self.aux_norm_mid = RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+            self.aux_norm_high = RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
 
         self.fc = torch.nn.Linear(
             self.hidden_size_in * 3,
@@ -151,7 +163,18 @@ class LlamaModel(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if input_embeds is None:
-            embeds = self.embed_tokens(input_ids)
+            embeds = forward_batch.mm_input_embeds
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_mm_inputs()
+                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            ):
+                assert embeds is not None
+                embeds = torch.cat(
+                    [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
+                )
+            if embeds is None:
+                embeds = self.embed_tokens(input_ids)
         else:
             embeds = input_embeds
 
@@ -160,6 +183,13 @@ class LlamaModel(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
+            if self.use_aux_norm and hidden_states.shape[-1] == self.hidden_size_in * 3:
+                # Normalize each aux layer independently before fc projection.
+                h_low, h_mid, h_high = hidden_states.split(self.hidden_size_in, dim=-1)
+                h_low = self.aux_norm_low(h_low)
+                h_mid = self.aux_norm_mid(h_mid)
+                h_high = self.aux_norm_high(h_high)
+                hidden_states = torch.cat((h_low, h_mid, h_high), dim=-1)
             hidden_states = self.fc(hidden_states)
 
         # idle batch
