@@ -3,15 +3,6 @@ keyed by suite name. Consumed by pr-test.yml stage jobs as
 `fromJson(needs.check-changes.outputs.partitions)['<suite>']`.
 
     partitions={"stage-b-test-1-gpu-small": {"size": 8, "arr": [0,...,7], "max_parallel": 2}, ...}
-
-Per-shard wall-clock estimate, when a live model is available:
-
-    pred_shard_wall = coeff * sum(est[file] for file in shard) + bias
-
-where `est`, `coeff`, `bias` come from sglang-ci-stats' `model.json`. Each
-falls back independently to (a) the in-source `register_X_ci(est_time=N)`
-literal for a missing per-file `est`, and (b) `(coeff=1.0, bias=0.0)` for
-a missing per-suite fit.
 """
 
 import argparse
@@ -80,12 +71,7 @@ def discover_files(repo_root: str) -> list[str]:
 
 
 def load_partition_model(path):
-    """Read sglang-ci-stats' model.json. Returns None when path is missing
-    or unparsable -- the caller falls back to (in-source est, coeff=1,
-    bias=0) on a per-suite / per-file basis.
-
-    Note the upstream file is called `model.json`; the `partition_model_*`
-    naming in sglang disambiguates against ML model checkpoints."""
+    """Read sglang-ci-stats' model.json; None on missing/unparsable."""
     if not path or not os.path.exists(path):
         return None
     try:
@@ -102,10 +88,9 @@ def compute_max_parallel(size: int) -> int:
 def compute_partitions(tests, repo_root, partition_model=None, full_parallel=False):
     """Group per-commit tests by suite and emit partition metadata.
 
-    `partition_model` (optional): parsed `model.json` from sglang-ci-stats.
-    Each missing key falls back independently: a file absent from
-    `partition_model["est"][suite]` keeps its in-source `est_time`; a
-    suite absent from `partition_model["fit"]` uses `(coeff=1.0, bias=0.0)`.
+    `partition_model` (optional): sglang-ci-stats `model.json`. Per-file
+    `est` and per-suite `(coeff, bias)` fit; either may be missing and
+    falls back to (in-source `est_time`, `(1.0, 0.0)`) independently.
 
     `full_parallel=True` (scheduled cron or `high priority` PR) sets
     max_parallel = size, lifting the matrix-fanout throttle.
@@ -133,11 +118,7 @@ def compute_partitions(tests, repo_root, partition_model=None, full_parallel=Fal
         coeff = fit["coeff"] if fit else 1.0
         bias = fit["bias"] if fit else 0.0
 
-        # Each shard pays `bias` once (setup / install / warmup overhead),
-        # so the per-shard budget for actual test elapsed is
-        # (TARGET - bias) / coeff. Solve:
-        #     coeff * (total / size) + bias <= TARGET
-        # ->  size >= coeff * total / (TARGET - bias)
+        # Each shard pays `bias` once, so size >= coeff*total / (TARGET-bias).
         if suite in _STAGE_A_OVERRIDES:
             size = _STAGE_A_OVERRIDES[suite]
             max_parallel = size
@@ -154,7 +135,7 @@ def compute_partitions(tests, repo_root, partition_model=None, full_parallel=Fal
         # Predicted per-shard wall on naive average (total/size). LPT can
         # be ~4/3 of that in worst case; the 30-min job timeout enforces
         # the real ceiling at runtime. This build-time check fails fast
-        # on egregious misconfigs (e.g. stage-a override fixed too small).
+        # on egregious misconfigs.
         pred_per_shard = coeff * (total / size) + bias
         if pred_per_shard > MAX_PARTITION_SECONDS:
             raise RuntimeError(
@@ -216,14 +197,10 @@ def main():
         with open(summary_path, "a") as f:
             f.write("## Partitions\n\n")
             if partition_model is None:
-                src_note = (
-                    "live partition model unavailable -- "
-                    "all suites fall back to in-source est_time + (coeff=1, bias=0)"
-                )
+                src_note = "no live model -- static est_time + (coeff=1, bias=0)"
             else:
                 src_note = (
-                    f"live partition model: "
-                    f"`data_as_of={partition_model.get('data_as_of')}`, "
+                    f"live model `data_as_of={partition_model.get('data_as_of')}`, "
                     f"`n_runs={partition_model.get('n_runs')}`"
                 )
             f.write(

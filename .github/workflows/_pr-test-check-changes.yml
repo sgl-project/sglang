@@ -241,32 +241,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Pin every shard in this PR run to the same immutable partition
-          # model.json commit, even if the upstream cron commits a new
-          # version mid-flight. Soft fail: empty SHA -> downstream curl is
-          # skipped -> static fallback in both dispatch and runtime.
+          # Pin all shards to one immutable commit so dispatch and every
+          # runtime LPT use the same model snapshot. Soft fail -> static.
           SHA=$(gh api repos/sgl-project/sglang-ci-stats/commits/main --jq '.sha' 2>/dev/null || true)
           if [[ -n "$SHA" ]]; then
             echo "Pinned sglang-ci-stats@$SHA"
             echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::Could not resolve sglang-ci-stats SHA; falling back to in-source est_time everywhere"
+            echo "::warning::Could not resolve sglang-ci-stats SHA; using in-source est_time"
             echo "sha=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Fetch live partition model
         if: steps.partition-model-sha.outputs.sha != ''
         run: |
-          # Use the SHA-pinned raw URL so this fetch and every downstream
-          # stage's fetch land on the same immutable file. compute_partitions
-          # treats a missing /tmp/partition-model.json as "fall back to
-          # in-source est_time + (coeff=1, bias=0)".
           rm -f /tmp/partition-model.json
           URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ steps.partition-model-sha.outputs.sha }}/model.json"
           if curl --fail --silent --show-error --max-time 15 "$URL" -o /tmp/partition-model.json; then
             echo "Fetched partition-model.json ($(wc -c < /tmp/partition-model.json) bytes)"
           else
-            echo "::warning::Failed to fetch partition-model.json from $URL; compute_partitions will fall back to in-source est_time"
+            echo "::warning::Failed to fetch $URL; using in-source est_time"
           fi
 
       - name: Compute partitions

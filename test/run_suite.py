@@ -226,12 +226,9 @@ def pretty_print_tests(
 def load_live_est(
     partition_model_file: Optional[str], suite: str, repo_root: str
 ) -> Optional[Dict[str, float]]:
-    """Build a `CIRegistry.filename -> live est seconds` map from
-    sglang-ci-stats' partition model.json so `auto_partition` LPT uses the
-    same `est` snapshot the dispatcher (compute_partitions.py) used to
-    size this stage. Returns None when the file is missing / unparsable,
-    or when the requested suite has no live entries -- callers fall back
-    to in-source est_time."""
+    """Build a `CIRegistry.filename -> est seconds` map from
+    sglang-ci-stats' `model.json est[suite]`; None on missing file /
+    parse error / suite absent (caller falls back to in-source est)."""
     if not partition_model_file or not os.path.exists(partition_model_file):
         return None
     try:
@@ -290,15 +287,12 @@ def run_a_suite(args):
         live_est = load_live_est(args.partition_model_file, suite, repo_root)
         if live_est is not None:
             print(
-                f"Loaded {len(live_est)} live est entries from "
-                f"{args.partition_model_file} for suite={suite}",
+                f"LPT: {len(live_est)} live est entries from {args.partition_model_file}",
                 flush=True,
             )
         else:
             print(
-                f"No live est available "
-                f"(partition_model_file={args.partition_model_file!r}); "
-                f"LPT falling back to in-source est_time",
+                f"LPT: no live est ({args.partition_model_file!r}); using in-source est_time",
                 flush=True,
             )
         ci_tests = auto_partition(
@@ -389,13 +383,7 @@ def main():
         "--partition-model-file",
         type=str,
         default=None,
-        help=(
-            "Path to sglang-ci-stats partition model.json. When provided, "
-            "auto_partition uses live `est` (p90 of recent CI elapsed) for "
-            "LPT bucketing so the partition decision matches what "
-            "compute_partitions.py used to size this stage. Missing / "
-            "malformed -> falls back to in-source est_time."
-        ),
+        help="Path to sglang-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
     )
     args = parser.parse_args()
 
