@@ -44,9 +44,7 @@ class StandaloneServerBase:
 
     @classmethod
     def get_server_args(cls):
-        assert cls.attention_backend, (
-            f"{cls.__name__} must set `attention_backend`"
-        )
+        assert cls.attention_backend, f"{cls.__name__} must set `attention_backend`"
         return [
             "--trust-remote-code",
             "--cuda-graph-max-bs",

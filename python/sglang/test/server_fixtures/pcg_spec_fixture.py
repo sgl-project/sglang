@@ -40,9 +40,9 @@ class PCGSpecBase:
 
     @classmethod
     def setUpClass(cls):
-        assert cls.model and cls.server_args, (
-            f"{cls.__name__} must set `model` and `server_args`"
-        )
+        assert (
+            cls.model and cls.server_args
+        ), f"{cls.__name__} must set `model` and `server_args`"
         cls.base_url = DEFAULT_URL_FOR_TEST
         kwargs = dict(
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * cls.timeout_mult,

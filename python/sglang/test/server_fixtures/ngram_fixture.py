@@ -49,9 +49,7 @@ class NgramServerBase(CustomTestCase):
 
     @classmethod
     def get_server_args(cls):
-        assert cls.attention_backend, (
-            f"{cls.__name__} must set `attention_backend`"
-        )
+        assert cls.attention_backend, f"{cls.__name__} must set `attention_backend`"
         return (
             DEFAULT_NGRAM_SERVER_ARGS
             + ["--attention-backend", cls.attention_backend]

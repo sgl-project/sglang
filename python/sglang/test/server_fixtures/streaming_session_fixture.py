@@ -12,10 +12,9 @@ Also exports:
 Lives under sglang.test.server_fixtures so siblings under test/registered
 can `import` it without sys.path hacks.
 """
+
 import asyncio
 import json
-import time
-import unittest
 from typing import Any, Optional
 
 import aiohttp
@@ -25,9 +24,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -419,7 +416,9 @@ class StreamingSessionServerBase(CustomTestCase):
         import contextlib
 
         with contextlib.ExitStack() as stack:
-            stack.enter_context(envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2))
+            stack.enter_context(
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2)
+            )
             for name, val in cls.env_overrides:
                 stack.enter_context(getattr(envs, name).override(val))
             cls.process = popen_launch_server(
@@ -433,4 +432,3 @@ class StreamingSessionServerBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-

@@ -6,6 +6,7 @@ Variants combine `TestHybridAttnBackendBase` with their own
 Requires SM 90+ (H100); the base class wraps that in a `skipIf`.
 """
 
+import unittest
 from types import SimpleNamespace
 
 import requests
@@ -21,7 +22,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-import unittest
 
 GSM_DATASET_PATH = None
 

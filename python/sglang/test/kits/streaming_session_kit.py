@@ -407,7 +407,6 @@ class StreamingSessionKitMixin:
         self.assertEqual(health.status_code, 200)
 
 
-
 class AbortLeakReproKitMixin:
     """Abort-heavy chunked-prefill leak repro."""
 
