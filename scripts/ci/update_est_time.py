@@ -215,11 +215,25 @@ def update_est_times(p90s, dry_run=False):
 
         for suite, backend, p90 in entries:
             # Match registration calls with this specific backend and suite.
-            # Handles: register_cuda_ci(est_time=300, suite="stage-c-test-4-gpu-h100")
-            pattern = re.compile(
+            # Two styles:
+            #   legacy: register_X_ci(est_time=N, suite="stage-Y-test-Z")
+            #   new:    register_X_ci(est_time=N, stage="stage-Y", runner_config="Z")
+            # New-style files all use the canonical `stage=` then `runner_config=` order.
+            legacy_pattern = re.compile(
                 rf"(register_{backend}_ci\(est_time=)(\d+)"
                 rf'(,\s*suite="{re.escape(suite)}")'
             )
+            pattern = legacy_pattern if legacy_pattern.search(new_content) else None
+            if pattern is None and "-test-" in suite:
+                stage, _, rc = suite.partition("-test-")
+                new_style_pattern = re.compile(
+                    rf"(register_{backend}_ci\(est_time=)(\d+)"
+                    rf'(,\s*stage="{re.escape(stage)}",\s*runner_config="{re.escape(rc)}")'
+                )
+                if new_style_pattern.search(new_content):
+                    pattern = new_style_pattern
+            if pattern is None:
+                continue
             match = pattern.search(new_content)
             if not match:
                 continue
