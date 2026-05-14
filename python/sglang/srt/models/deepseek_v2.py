@@ -182,9 +182,6 @@ if _use_aiter_gfx95:
         get_dsv3_gemm_output_zero_allocator_size,
     )
 
-if _use_aiter:
-    pass
-
 if _is_cuda:
     from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
     from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm

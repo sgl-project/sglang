@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_torch_compile_disable_decorator,
     is_gfx95_supported,
     is_hip,
     set_weight_attrs,
@@ -25,12 +26,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_shuffle_moe_mxfp4 = _is_gfx95_supported = is_gfx95_supported()
 
 __all__ = ["QuarkW4A4MXFp4MoE"]
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
@@ -196,6 +199,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             # TODO(cwan): refactor other backends
             pass
 
+    @get_torch_compile_disable_decorator(_use_aiter_gfx95)
     def apply_weights(
         self,
         layer: torch.nn.Module,
