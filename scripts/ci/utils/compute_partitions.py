@@ -39,14 +39,12 @@ _STAGE_A_OVERRIDES = {
     "stage-a-test-1-gpu-small": 1,
 }
 
-# Per-partition wall-clock target + ceiling. Single knob for the whole
-# pipeline. ~17 min avg under perfect LPT (TARGET / LPT_SLOP), ~22 min under
-# worst-case LPT 4/3 imbalance, fail-fast above 30 min.
+# Per-partition wall-clock target. ~20 min avg naive; worst-case LPT 4/3
+# imbalance is ~27 min, still below the 30-min job-level timeout that acts
+# as the real safety net. No LPT slop applied — we lean on the runtime
+# timeout + the explicit MAX_PARTITION_SECONDS sanity check rather than
+# padding partition count.
 TARGET_SECONDS = 20 * 60
-
-# LPT (Longest Processing Time first) worst case is 4/3 * OPT; pad ~15% so a
-# slightly-unlucky LPT result still fits inside MAX_PARTITION_SECONDS.
-LPT_SLOP = 1.15
 
 # Hard ceiling. Exceeded → raise, forcing the maintainer to split a slow file
 # or bump TARGET_SECONDS deliberately.
@@ -97,10 +95,11 @@ def compute_partitions(tests, full_parallel=False):
             size = _STAGE_A_OVERRIDES[suite]
             max_parallel = size
         else:
-            size = max(1, math.ceil(total * LPT_SLOP / TARGET_SECONDS))
+            size = max(1, math.ceil(total / TARGET_SECONDS))
             max_parallel = size if full_parallel else compute_max_parallel(size)
-        # Check naive average (total/size). LPT can be ~4/3 of that, but the
-        # ceil + LPT_SLOP padding above absorbs that slack.
+        # Check naive average (total/size). LPT can be ~4/3 of that in
+        # worst case; the 30-min job timeout enforces the real ceiling at
+        # runtime. This build-time check fails fast on egregious misconfigs.
         if total / size > MAX_PARTITION_SECONDS:
             raise RuntimeError(
                 f"Suite {suite!r}: total est_time {total:.0f}s / size {size} "
