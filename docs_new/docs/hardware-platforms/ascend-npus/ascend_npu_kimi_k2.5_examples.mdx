@@ -70,7 +70,7 @@ pip install git+https://github.com/huggingface/transformers.git@v4.57.1
 
 ### Single-node Deployment
 
-- Quantized model `kimi_k2.5_w4a8` can be deployed on 1 Atlas 800 A3 (64G x 16) .
+- Quantized model `Kimi-K2.5-w4a8` can be deployed on 1 Atlas 800 A3 (64G x 16) .
 
 Run the following script to execute online inference.
 
@@ -124,7 +124,7 @@ python -m sglang.launch_server \
 
 ### Multi-node Deployment
 
-- Quantized model `kimi_k2.5_w4a8` also can be deployed on 2 Atlas 800 A3 (64G x 16) .
+- Quantized model `Kimi-K2.5-w4a8` also can be deployed on 2 Atlas 800 A3 (64G x 16) .
 
 **A3 series**
 
@@ -162,8 +162,8 @@ export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 export SGLANG_NPU_USE_MLAPO=1
 
 # Run command ifconfig on two nodes, find out which inet addr has same IP with your node IP. That is your public interface, which should be added here
-export HCCL_SOCKET_IFNAME=lo
-export GLOO_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=xxx
+export GLOO_SOCKET_IFNAME=xxx
 
 NODES_IP=('your ip1' 'your ip2')
 
@@ -200,7 +200,7 @@ done
 
 ### Prefill-Decode Disaggregation
 
-Here is an example of a large EP scenario (3P1D).
+Here is an example of a large EP scenario (3P1D) for `Kimi-K2.5-w4a8` on 5 Atlas 800 A3 (64G x 16) .
 
 ```shell
 # System Settings
@@ -211,6 +211,15 @@ sysctl -w kernel.numa_balancing=0
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+# cann
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
 
 P_IP=('your prefill ip1' 'your prefill ip2' 'your prefill ip3')
 D_IP=('your decode ip1' 'your decode ip2')
@@ -259,8 +268,8 @@ do
         echo "Decode -> ${D_IP[$i]}"
 
         # Run command ifconfig on two nodes, find out which inet addr has same IP with your node IP. That is your public interface, which should be added here
-        export HCCL_SOCKET_IFNAME=lo
-        export GLOO_SOCKET_IFNAME=lo
+        export HCCL_SOCKET_IFNAME=xxx
+        export GLOO_SOCKET_IFNAME=xxx
 
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
