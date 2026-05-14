@@ -11,9 +11,10 @@ from sglang.jit_kernel.benchmark.utils import (
 )
 from sglang.jit_kernel.clamp_position import clamp_position_cuda
 from sglang.srt.utils import get_compiler_backend
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_amd_ci
 
 register_cuda_ci(est_time=13, suite="stage-b-kernel-benchmark-1-gpu-large")
+register_amd_ci(est_time=16, suite="stage-b-test-1-gpu-large-amd")
 
 SIZE_LIST = get_benchmark_range(
     full_range=[2**n for n in range(4, 16)],
