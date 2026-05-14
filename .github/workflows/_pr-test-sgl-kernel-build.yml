@@ -83,21 +83,24 @@ jobs:
       - name: Free Docker disk space
         run: |
           set -x
-          # build.sh retags sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}
-          # on every run, leaving the previous image as a dangling <none>:<none>
-          # entry (~16-23 GB each). Prune them before building so the runner
-          # doesn't fill up. The local buildx cache at ~/.cache/sgl-kernel/buildx
-          # and the tagged sgl-kernel-deps image are not affected.
-          # `until=12h` avoids racing with a sibling matrix cell (cuda 12.9 vs
-          # 13.0) that may have just orphaned an image seconds ago.
-          docker image prune -f --filter "until=12h"
-          # Drop orphaned buildx builder volumes from past `docker buildx create`
-          # invocations. The active `sgl-kernel-builder` volume is held open and
-          # would fail to remove anyway, but skip it explicitly for clarity.
-          for v in $(docker volume ls -q | grep '^buildx_buildkit_' | grep -v '^buildx_buildkit_sgl-kernel-builder' || true); do
-            echo "Removing orphan buildx volume: $v"
-            docker volume rm "$v" || true
+          # `-f` only (no `-a`): drops dangling <none>:<none> layers from
+          # prior runs but keeps the tagged sgl-kernel-deps:* base images.
+          docker image prune -f
+          # Reap orphan buildx builders from interrupted prior runs. Must
+          # `buildx rm` (not `volume rm`) — the volume is held open by the
+          # buildkit helper container; removing the builder frees both.
+          # `sgl-kernel-builder` and `default` are skipped on purpose.
+          for b in $(docker buildx ls --format '{{.Name}}' | grep -E '^builder-' || true); do
+            echo "Removing orphan buildx builder: $b"
+            docker buildx rm "$b" || true
           done
+          # Trim the persistent local buildx cache (--cache-to mode=max grows
+          # unbounded). Cache-hit imports rewrite the blob, so mtime tracks
+          # "last carried forward by a build" — 14d is well past the freshest
+          # CI cycle.
+          if [ -d "$HOME/.cache/sgl-kernel/buildx/blobs" ]; then
+            find "$HOME/.cache/sgl-kernel/buildx/blobs" -type f -mtime +14 -delete
+          fi
           df -h /
 
       - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
