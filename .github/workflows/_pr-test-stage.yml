@@ -150,10 +150,13 @@ jobs:
       - name: Fetch live partition model
         if: fromJson(inputs.check_changes).partition_model_sha != ''
         run: |
+          # SHA already resolved by check-changes -> hard-fail (with curl
+          # --retry) instead of soft fallback so all shards stay on the
+          # same partition model snapshot.
           rm -f /tmp/partition-model.json
           URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ fromJson(inputs.check_changes).partition_model_sha }}/model.json"
-          curl --fail --silent --show-error --max-time 15 "$URL" -o /tmp/partition-model.json \
-            || echo "::warning::Failed to fetch $URL; LPT will use in-source est_time"
+          curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
+            "$URL" -o /tmp/partition-model.json
 
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
