@@ -2425,14 +2425,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
         exclude_chunked_req: bool = False,
-        exclude_in_flight_other_mb: Optional[set] = None,
     ):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
 
         if keep_indices is None:
-            in_flight_rids = exclude_in_flight_other_mb or set()
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
@@ -2445,7 +2443,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         or self.reqs[i].is_dllm()
                     )
                 )
-                and self.reqs[i].rid not in in_flight_rids
             ]
 
         if keep_indices is None or len(keep_indices) == 0:

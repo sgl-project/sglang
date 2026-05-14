@@ -2480,33 +2480,6 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
-    def _in_flight_other_mb_rids(self) -> set:
-        """rids of reqs whose forward is launched in another mb but whose
-        result has not yet been processed by the output processor.
-
-        Used by filter_batch on last_batch / running_batch to exclude
-        chunked-prefill reqs whose LAST chunk admit cleared has_pending_chunk
-        (and pending_middle_outputs may have been decremented to 0 by an
-        earlier mid-chunk forward result), but whose actual last-chunk
-        forward result has not yet arrived in the output processor — they
-        must not be merged into running_batch as decode reqs yet.
-
-        At PP loop iter T mb_id step's filter_batch time, mbs[other_id !=
-        mb_id] holds an in-flight forward batch (launched, not yet
-        processed). For pp_loop_size==2, the other mb's batch is always
-        in-flight at this point. Skip self.last_batch (==mbs[mb_id], the
-        batch being filtered itself).
-        """
-        if self.pp_size <= 1 or not hasattr(self, "mbs"):
-            return set()
-        rids = set()
-        for mb in self.mbs:
-            if mb is None or mb is self.last_batch:
-                continue
-            for r in mb.reqs:
-                rids.add(r.rid)
-        return rids
-
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
@@ -2562,20 +2535,7 @@ class Scheduler(
             # dropped reqs persist in self.waiting_queue (retention at
             # ~line 2775: `x not in can_run_set or x.has_pending_chunk`)
             # and re-enter via next iter's Stage A stash + admission.
-            #
-            # PP cross-mb: also drop reqs whose forward result is still
-            # pending in another mb's pipeline. has_pending_chunk +
-            # pending_middle_outputs alone do not cover the window where
-            # mb_a admitted the LAST chunk (clearing has_pending_chunk; not
-            # bumping pending_middle_outputs since chunked_in_batch only
-            # counts mid-chunk admits) but mb_a's forward result has not
-            # yet been processed — without this exclusion, mb_b would merge
-            # the still-prefilling req into running_batch and run a decode
-            # forward on stale state.
-            self.last_batch.filter_batch(
-                exclude_chunked_req=True,
-                exclude_in_flight_other_mb=self._in_flight_other_mb_rids(),
-            )
+            self.last_batch.filter_batch(exclude_chunked_req=True)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -2598,10 +2558,7 @@ class Scheduler(
             # shouldn't normally hold one. Keep the flag set so any leak in
             # that invariant doesn't survive here; the dropped req still
             # has its waiting_queue retention to re-admit next iter.
-            self.running_batch.filter_batch(
-                exclude_chunked_req=True,
-                exclude_in_flight_other_mb=self._in_flight_other_mb_rids(),
-            )
+            self.running_batch.filter_batch(exclude_chunked_req=True)
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
