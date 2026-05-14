@@ -13,6 +13,8 @@ import triton
 import triton.testing
 from sgl_kernel.utils import is_arch_support_pdl
 
+from sglang.utils import is_in_ci
+
 # Optional imports
 try:
     from flashinfer.norm import fused_add_rmsnorm, rmsnorm
@@ -31,11 +33,7 @@ except ImportError:
     vllm_ops = None
     VLLM_AVAILABLE = False
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 
 def str2int_list(arg: str) -> List[int]:

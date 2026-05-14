@@ -1,0 +1,40 @@
+name: Sync LMSYS SGLang blogs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */12 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Sync blog cards
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python docs_new/scripts/update_lmsys_sglang_blogs.py
+
+      - name: Commit and push changes
+        run: |
+          if git diff --quiet -- docs_new/index.mdx; then
+            echo "No blog card changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs_new/index.mdx
+          git diff --cached --quiet && exit 0
+          git commit -m "docs: sync LMSYS SGLang blog cards"
+          git push

@@ -57,7 +57,6 @@ void act_and_mul_kernel_impl(
 // input   : {num_tokens, 2 * d}
 // output  : {num_tokens, d}
 at::Tensor silu_and_mul_cpu(at::Tensor& input) {
-  RECORD_FUNCTION("sgl-kernel::silu_and_mul_cpu", std::vector<c10::IValue>({input}));
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
   int64_t d = sizes[last_dim] / 2;
@@ -79,7 +78,6 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input) {
 }
 
 at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
-  RECORD_FUNCTION("sgl-kernel::gelu_tanh_and_mul_cpu", std::vector<c10::IValue>({input}));
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
   int64_t d = sizes[last_dim] / 2;
@@ -111,7 +109,6 @@ at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
 }
 
 at::Tensor gelu_and_mul_cpu(const at::Tensor& input) {
-  RECORD_FUNCTION("sgl-kernel::gelu_and_mul_cpu", std::vector<c10::IValue>({input}));
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
   int64_t d = sizes[last_dim] / 2;

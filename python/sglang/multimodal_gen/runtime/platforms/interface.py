@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import enum
 import random
+from collections.abc import Callable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -31,14 +32,27 @@ class AttentionBackendEnum(enum.Enum):
     SAGE_ATTN = enum.auto()
     SAGE_ATTN_3 = enum.auto()
     VIDEO_SPARSE_ATTN = enum.auto()
+    SPARSE_VIDEO_GEN_2_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
+    AITER_SAGE = enum.auto()
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
         return self.name.lower()
+
+    @property
+    def is_sparse(self) -> bool:
+        return self in {
+            AttentionBackendEnum.SLIDING_TILE_ATTN,
+            AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+            AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
+            AttentionBackendEnum.VMOBA_ATTN,
+            AttentionBackendEnum.SLA_ATTN,
+            AttentionBackendEnum.SAGE_SLA_ATTN,
+        }
 
 
 class PlatformEnum(enum.Enum):
@@ -47,7 +61,9 @@ class PlatformEnum(enum.Enum):
     TPU = enum.auto()
     CPU = enum.auto()
     MPS = enum.auto()
+    NPU = enum.auto()
     MUSA = enum.auto()
+    XPU = enum.auto()
     OOT = enum.auto()
     UNSPECIFIED = enum.auto()
 
@@ -79,6 +95,7 @@ class Platform:
     _enum: PlatformEnum
     device_name: str
     device_type: str
+    device: torch.device | None = None  # Dummy attribute for compatibility
 
     # available dispatch keys:
     # check https://github.com/pytorch/pytorch/blob/313dac6c1ca0fa0cde32477509cce32089f8532a/torchgen/model.py#L134 # noqa
@@ -97,6 +114,10 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_cuda(self) -> bool:
         return self.is_cuda_static()
+
+    @lru_cache(maxsize=1)
+    def is_npu(self) -> bool:
+        return self._enum == PlatformEnum.NPU
 
     @lru_cache(maxsize=1)
     def is_rocm(self) -> bool:
@@ -175,6 +196,32 @@ class Platform:
         return self.is_rocm()
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def is_amp_supported(cls) -> bool:
+        return True
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_float64_supported(cls) -> bool:
+        return True
+
+    @classmethod
+    def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
+        return None
+
+    @classmethod
+    def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+        return None, None
+
+    @classmethod
+    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
+        return "auto"
+
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        raise NotImplementedError
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,
@@ -235,6 +282,10 @@ class Platform:
     def get_device(self, local_rank: int) -> torch.device:
         if self.is_cuda() or self.is_rocm():
             return torch.device("cuda", local_rank)
+        elif self.is_npu():
+            return torch.device("npu", local_rank)
+        elif self.is_xpu():
+            return torch.device("xpu", local_rank)
         elif self.is_musa():
             return torch.device("musa", local_rank)
         elif self.is_mps():
@@ -246,10 +297,16 @@ class Platform:
     def get_torch_distributed_backend_str(self) -> str:
         if self.is_cuda_alike():
             return "nccl"
+        elif self.is_npu():
+            return "hccl"
         elif self.is_musa():
             return "mccl"
         elif self.is_mps():
             return "gloo"
+        elif self.is_cpu():
+            return "gloo"
+        elif self.is_xpu():
+            return "xccl"
         else:
             raise NotImplementedError(
                 "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"
@@ -284,7 +341,7 @@ class Platform:
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
+            torch.get_device_module().manual_seed_all(seed)
 
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
@@ -347,6 +404,11 @@ class Platform:
     def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
         """Whether to enable DIT layerwise offload by default on the current platform."""
         return True
+
+    @classmethod
+    def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
+        """Apply platform-specific optimizations to VAE after loading."""
+        return vae
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)

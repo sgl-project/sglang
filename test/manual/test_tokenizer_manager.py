@@ -2,19 +2,28 @@
 Unit tests for TokenizerManager helper methods.
 
 This tests the refactored tokenization functionality including input format detection,
-tokenizer input preparation, and result extraction logic.
+tokenizer input preparation, result extraction logic, and ReqState text buffering.
 
 Usage:
 python3 -m unittest test_tokenizer_manager.TestInputFormatDetection
 python3 -m unittest test_tokenizer_manager.TestTokenizerInputPreparation
 python3 -m unittest test_tokenizer_manager.TestTokenizerResultExtraction
 python3 -m unittest test_tokenizer_manager.TestTokenizerManagerIntegration
+python3 -m unittest test_tokenizer_manager.TestReqStateTextBuffering
+python3 -m unittest test_tokenizer_manager.TestReqStateCrashDump
 """
 
+import asyncio
 import unittest
 from unittest.mock import Mock, patch
 
-from sglang.srt.managers.tokenizer_manager import InputFormat, TokenizerManager
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import (
+    InputFormat,
+    ReqState,
+    TokenizerManager,
+)
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -29,7 +38,7 @@ class TestInputFormatDetection(unittest.TestCase):
             self.port_args = PortArgs.init_new(self.server_args)
 
         with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.get_zmq_socket"
+            "sglang.srt.utils.network.get_zmq_socket"
         ), patch(
             "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
         ) as mock_tokenizer:
@@ -125,7 +134,7 @@ class TestTokenizerInputPreparation(unittest.TestCase):
             self.port_args = PortArgs.init_new(self.server_args)
 
         with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.get_zmq_socket"
+            "sglang.srt.utils.network.get_zmq_socket"
         ), patch(
             "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
         ) as mock_tokenizer:
@@ -183,7 +192,7 @@ class TestTokenizerResultExtraction(unittest.TestCase):
             self.port_args = PortArgs.init_new(self.server_args)
 
         with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.get_zmq_socket"
+            "sglang.srt.utils.network.get_zmq_socket"
         ), patch(
             "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
         ) as mock_tokenizer:
@@ -305,7 +314,7 @@ class TestTokenizerManagerIntegration(unittest.TestCase):
             self.port_args = PortArgs.init_new(self.server_args)
 
         with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.get_zmq_socket"
+            "sglang.srt.utils.network.get_zmq_socket"
         ), patch(
             "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
         ) as mock_tokenizer:
@@ -402,6 +411,65 @@ class TestTokenizerManagerIntegration(unittest.TestCase):
             result_input_ids, [[101, 7592, 102], [101, 2088, 102], [101, 2774, 102]]
         )
         self.assertIsNone(result_token_type_ids)
+
+
+def _make_state() -> ReqState:
+    """Create a minimal ReqState for testing."""
+    obj = Mock(spec=GenerateReqInput)
+    return ReqState(
+        out_list=[],
+        finished=False,
+        event=asyncio.Event(),
+        obj=obj,
+        time_stats=APIServerReqTimeStats(),
+    )
+
+
+class TestReqStateTextBuffering(unittest.TestCase):
+    """Test ReqState.append_text / get_text in both buffering modes."""
+
+    def test_collects_chunks_lazily(self):
+        state = _make_state()
+        state.append_text("hello ")
+        state.append_text("world")
+        self.assertEqual(state.text, "")
+        self.assertEqual(state.text_chunks, ["hello ", "world"])
+        self.assertEqual(state.get_text(), "hello world")
+        self.assertEqual(state.text_chunks, [])
+
+    def test_get_text_preserves_materialized_prefix(self):
+        state = _make_state()
+        state.append_text("hello ")
+        self.assertEqual(state.get_text(), "hello ")
+        state.append_text("world")
+        self.assertEqual(state.get_text(), "hello world")
+
+
+class TestReqStateCrashDump(unittest.TestCase):
+    """Test ReqState.get_crash_dump_output."""
+
+    def test_empty_state(self):
+        state = _make_state()
+        self.assertEqual(state.get_crash_dump_output(), {})
+
+    def test_with_text_only(self):
+        state = _make_state()
+        state.append_text("partial output")
+        self.assertEqual(state.get_crash_dump_output(), {"text": "partial output"})
+
+    def test_with_output_ids_only(self):
+        state = _make_state()
+        state.output_ids = [1, 2, 3]
+        self.assertEqual(state.get_crash_dump_output(), {"output_ids": [1, 2, 3]})
+
+    def test_with_text_and_output_ids(self):
+        state = _make_state()
+        state.append_text("hello")
+        state.output_ids = [10, 20]
+        self.assertEqual(
+            state.get_crash_dump_output(),
+            {"text": "hello", "output_ids": [10, 20]},
+        )
 
 
 if __name__ == "__main__":

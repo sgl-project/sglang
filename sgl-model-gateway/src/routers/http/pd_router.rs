@@ -30,8 +30,10 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+        classify::ClassifyRequest,
         common::{InputIds, StringOrArray},
         completion::CompletionRequest,
+        embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
     },
@@ -1221,7 +1223,7 @@ impl RouterTrait for PDRouter {
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         // Get info from the first decode server to match sglang's server info format
         // Note: We use decode workers for server info to match expected format
-        self.proxy_to_first_prefill_worker("get_server_info", None)
+        self.proxy_to_first_prefill_worker("server_info", None)
             .await
     }
 
@@ -1239,7 +1241,7 @@ impl RouterTrait for PDRouter {
         let headers = header_utils::copy_request_headers(&req);
 
         // Proxy to first prefill worker
-        self.proxy_to_first_prefill_worker("get_model_info", Some(headers))
+        self.proxy_to_first_prefill_worker("model_info", Some(headers))
             .await
     }
 
@@ -1373,6 +1375,34 @@ impl RouterTrait for PDRouter {
         };
 
         self.execute_dual_dispatch(headers, body, context).await
+    }
+
+    async fn route_embeddings(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &EmbeddingRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let _ = (headers, body, model_id);
+        warn!("PD mode does not support /v1/embeddings; returning bad request");
+        error::bad_request(
+            "pd_unsupported_embeddings",
+            "PD mode does not support /v1/embeddings",
+        )
+    }
+
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let _ = (headers, body, model_id);
+        warn!("PD mode does not support /v1/classify; returning bad request");
+        error::bad_request(
+            "pd_unsupported_classify",
+            "PD mode does not support /v1/classify",
+        )
     }
 
     fn router_type(&self) -> &'static str {
