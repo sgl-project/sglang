@@ -55,6 +55,10 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
+    # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
+    fpm_start_event: Optional[torch.cuda.Event] = None
+    fpm_end_event: Optional[torch.cuda.Event] = None
+
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,

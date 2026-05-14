@@ -308,9 +308,11 @@ class BreakableCudaGraphRunner:
 
     def _capture_all(self):
         """Capture breakable CUDA graphs for all token sizes."""
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context, enable_breakable_cuda_graph():
+        with (
+            freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
+            graph_capture() as graph_capture_context,
+            enable_breakable_cuda_graph(),
+        ):
             stream = graph_capture_context.stream
             pool = get_global_graph_memory_pool()
 
