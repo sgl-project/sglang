@@ -21,14 +21,29 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1800, stage="stage-c", runner_config="dsv4-4-gpu-b200")
+register_cuda_ci(est_time=1800, suite="stage-c-test-dsv4-4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
-DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
-_DEEPEP_ENV = {
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+
+_W4A8_MEGAMOE_ENV = {
+    "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE": "1",
+    "SGLANG_OPT_FIX_MEGA_MOE_MEMORY": "1",
+    "SGLANG_OPT_FIX_NEXTN_MEGA_MOE": "1",
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "4096",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "0",
+}
+
+
+_W4A4_MEGAMOE_ENV = {
+    "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE": "1",
+    "SGLANG_OPT_FIX_MEGA_MOE_MEMORY": "1",
+    "SGLANG_OPT_FIX_NEXTN_MEGA_MOE": "1",
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "4096",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "0",
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": "1",
 }
 
 
@@ -47,48 +62,8 @@ def _gsm8k_check(test_case):
     test_case.assertGreater(metrics["score"], 0.93)
 
 
-class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
-    """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "4",
-                "--moe-runner-backend",
-                "flashinfer_mxfp4",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "3",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "4",
-                "--chunked-prefill-size",
-                "4096",
-                "--disable-flashinfer-autotune",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        _gsm8k_check(self)
-
-
-class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
-    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+class TestDSV4FlashFP4B200W4A8MegaMoE(ServerSanityMixin, CustomTestCase):
+    """Balanced recipe: TP=4, DP=4, MegaMoE."""
 
     @classmethod
     def setUpClass(cls):
@@ -115,10 +90,49 @@ class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
-                "--deepep-config",
-                DEEPEP_CONFIG,
             ],
-            env=_DEEPEP_ENV,
+            env=_W4A8_MEGAMOE_ENV,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        _gsm8k_check(self)
+
+
+class TestDSV4FlashFP4B200W4A4MegaMoE(ServerSanityMixin, CustomTestCase):
+    """Balanced recipe: TP=4, DP=4, MegaMoE."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--dp",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "deepep",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
+            ],
+            env=_W4A4_MEGAMOE_ENV,
         )
 
     @classmethod

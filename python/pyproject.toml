@@ -59,7 +59,7 @@ dependencies = [
   "sentencepiece",
   "setproctitle",
   "flash-attn-4>=4.0.0b9",
-  "sgl-deep-gemm==0.0.1",
+  "sgl-deep-gemm==0.1.0",
   "sglang-kernel==0.4.2.post1",
   "soundfile==0.13.1",
   "tiktoken",

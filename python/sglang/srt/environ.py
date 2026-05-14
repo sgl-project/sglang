@@ -595,6 +595,17 @@ class Envs:
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
+
+    # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
+    # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
+    # Setting this also exports DG_USE_FP4_ACTS=1 so DeepGEMM's symm-buffer
+    # sizing + fp8_fp4_mega_moe pick up the FP4 layout.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS = EnvBool(False)
+    # Switches the L1+L2 mainloops from kind::mxf8f6f4 (K=32 with-padding) to
+    # kind::mxf4 (K=64 dense) inside fp8_fp4_mega_moe. No effect unless
+    # SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
+    # this combination on the host side.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
     # TopK
