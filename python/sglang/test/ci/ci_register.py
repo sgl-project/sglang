@@ -297,9 +297,8 @@ def auto_partition(
     estimated times using a greedy algorithm (LPT heuristic), and return the
     partition for the specified rank.
 
-    `live_est` (optional): `filename -> est seconds` overrides (from
-    sglang-ci-stats `model.json` p90); files absent fall back to in-source
-    `est_time`. Used by both the sort key and the LPT sum.
+    `live_est`: optional `filename -> est seconds` overrides; missing
+    files fall back to in-source `est_time`.
     """
     if not files or size <= 0:
         return []

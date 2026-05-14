@@ -45,12 +45,9 @@ _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
 
 
 def load_run_timeouts(pr_test_yml_path: str) -> dict:
-    """Map `self_name -> run_timeout_minutes` by reading `pr-test.yml`.
-    Every stage that uses `_pr-test-stage.yml` must specify
-    `run_timeout_minutes:` (it's a required reusable-workflow input);
-    KeyError surfaces a missing one. Stage-a-test-cpu lives inline and
-    is skipped here -- it goes through `_STAGE_A_OVERRIDES` and never
-    consults `run_timeouts`."""
+    """Map `self_name -> run_timeout_minutes` from pr-test.yml. The input
+    is required in `_pr-test-stage.yml` -- KeyError surfaces missing.
+    Inline stage-a-test-cpu is skipped (uses `_STAGE_A_OVERRIDES`)."""
     with open(pr_test_yml_path) as f:
         wf = yaml.safe_load(f)
     timeouts = {}
@@ -117,20 +114,14 @@ def compute_partitions(
 ):
     """Group per-commit tests by suite and emit partition metadata.
 
-    `run_timeouts`: `suite -> run_timeout_minutes`, parsed from pr-test.yml
-    via `load_run_timeouts`. Drives per-shard wall budget.
-
-    `partition_model` (optional): sglang-ci-stats `model.json`. Per-file
-    `est` and per-suite `(coeff, bias)` fit; either may be missing and
-    falls back to (in-source `est_time`, `(1.0, 0.0)`) independently.
-
-    `full_parallel=True` (scheduled cron or `high priority` PR) sets
-    max_parallel = size, lifting the matrix-fanout throttle.
+    `run_timeouts`: `suite -> minutes` from `load_run_timeouts`.
+    `partition_model`: optional sglang-ci-stats `model.json`; per-file
+    `est` and per-suite `(coeff, bias)` each fall back independently to
+    in-source `est_time` / `(1.0, 0.0)`.
+    `full_parallel=True` lifts the matrix-fanout throttle.
     """
-    # Only emit partitions for suites pr-test.yml actually dispatches.
-    # `run_timeouts` covers reusable stages; `_STAGE_A_OVERRIDES` covers
-    # the inline stage-a jobs. Stress / weekly / nightly-* suites have
-    # tests in test/registered/ but aren't run by pr-test.yml.
+    # Allowlist: stages pr-test.yml dispatches. Stress / weekly /
+    # nightly-* live in test/registered/ but pr-test doesn't run them.
     dispatched_suites = set(run_timeouts) | set(_STAGE_A_OVERRIDES)
     suite_tests = defaultdict(list)
     for t in tests:
@@ -170,11 +161,8 @@ def compute_partitions(
                     "Investigate the fit or raise the stage's run_timeout_minutes."
                 )
             ideal_size = math.ceil(coeff * total / budget)
-            # size > len(group) means at least one shard would be empty --
-            # the slowest single file alone is bigger than the per-shard
-            # budget. Either split that file, raise the stage's
-            # run_timeout_minutes, or update its in-source est_time if
-            # the live model already shows a smaller value.
+            # ideal_size > len(group) -> slowest single file alone exceeds
+            # the per-shard budget; surface via raise instead of empty shard.
             if ideal_size > len(group):
                 raise RuntimeError(
                     f"Suite {suite!r}: needs {ideal_size} shards but has only "

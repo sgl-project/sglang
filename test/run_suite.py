@@ -226,9 +226,8 @@ def pretty_print_tests(
 def load_live_est(
     partition_model_file: Optional[str], suite: str, repo_root: str
 ) -> Optional[Dict[str, float]]:
-    """Build a `CIRegistry.filename -> est seconds` map from
-    sglang-ci-stats' `model.json est[suite]`; None on missing file /
-    parse error / suite absent (caller falls back to in-source est)."""
+    """`CIRegistry.filename -> est seconds` from `model.json est[suite]`;
+    None on any miss (caller falls back to in-source `est_time`)."""
     if not partition_model_file or not os.path.exists(partition_model_file):
         return None
     try:

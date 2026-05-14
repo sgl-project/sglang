@@ -255,10 +255,8 @@ jobs:
       - name: Fetch live partition model
         if: steps.partition-model-sha.outputs.sha != ''
         run: |
-          # SHA already resolved -> shards expect this fetch to succeed.
-          # Hard-fail (with curl --retry) instead of soft fallback so we
-          # don't get cross-shard LPT divergence when one shard's curl
-          # transiently fails while others succeed.
+          # SHA resolved -> require fetch (curl --retry). Soft fallback
+          # would risk cross-shard LPT divergence on transient curl flake.
           rm -f /tmp/partition-model.json
           URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ steps.partition-model-sha.outputs.sha }}/model.json"
           curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
