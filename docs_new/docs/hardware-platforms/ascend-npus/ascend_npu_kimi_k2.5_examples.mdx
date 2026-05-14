@@ -21,32 +21,32 @@ Kimi K2.5 is an open-source, native multimodal agentic model built through conti
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the online platform. You can directly pull it.
 
 ```bash Command
-#Atlas 800 A3
+# Atlas 800 A3
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.5.0-a3-openEuler-20260427
 
-#start container
+# Start container
 docker run -itd --shm-size=16g --privileged=true --name ${NAME} --net=host \
     -v /var/queue_schedule:/var/queue_schedule \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v /usr/local/sbin:/usr/local/sbin \
     -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
     -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
-    --device=/dev/davinci0:/dev/davinci0  \
-    --device=/dev/davinci1:/dev/davinci1  \
-    --device=/dev/davinci2:/dev/davinci2  \
-    --device=/dev/davinci3:/dev/davinci3  \
-    --device=/dev/davinci4:/dev/davinci4  \
-    --device=/dev/davinci5:/dev/davinci5  \
-    --device=/dev/davinci6:/dev/davinci6  \
-    --device=/dev/davinci7:/dev/davinci7  \
-    --device=/dev/davinci8:/dev/davinci8  \
-    --device=/dev/davinci9:/dev/davinci9  \
-    --device=/dev/davinci10:/dev/davinci10  \
-    --device=/dev/davinci11:/dev/davinci11  \
-    --device=/dev/davinci12:/dev/davinci12  \
-    --device=/dev/davinci13:/dev/davinci13  \
-    --device=/dev/davinci14:/dev/davinci14  \
-    --device=/dev/davinci15:/dev/davinci15  \
+    --device=/dev/davinci0:/dev/davinci0 \
+    --device=/dev/davinci1:/dev/davinci1 \
+    --device=/dev/davinci2:/dev/davinci2 \
+    --device=/dev/davinci3:/dev/davinci3 \
+    --device=/dev/davinci4:/dev/davinci4 \
+    --device=/dev/davinci5:/dev/davinci5 \
+    --device=/dev/davinci6:/dev/davinci6 \
+    --device=/dev/davinci7:/dev/davinci7 \
+    --device=/dev/davinci8:/dev/davinci8 \
+    --device=/dev/davinci9:/dev/davinci9 \
+    --device=/dev/davinci10:/dev/davinci10 \
+    --device=/dev/davinci11:/dev/davinci11 \
+    --device=/dev/davinci12:/dev/davinci12 \
+    --device=/dev/davinci13:/dev/davinci13 \
+    --device=/dev/davinci14:/dev/davinci14 \
+    --device=/dev/davinci15:/dev/davinci15 \
     --device=/dev/davinci_manager:/dev/davinci_manager \
     --device=/dev/hisi_hdc:/dev/hisi_hdc \
     --entrypoint=bash \
@@ -199,6 +199,8 @@ done
 ### Prefill-Decode Disaggregation
 
 Here is an example of a large EP scenario (3P1D) for `Kimi-K2.5-w4a8` on 5 Atlas 800 A3 (64G x 16) .
+
+Modify the IP of 5 nodes, then run the same scripts on 5 nodes. Then start an additional Router on the first P node.
 
 ```shell
 # System Settings
