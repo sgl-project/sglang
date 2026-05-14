@@ -84,7 +84,7 @@ def _run_select(backend_name: str, att_out, r2t, seq_lens, top_k, sink, recent):
     bs, h_kv, _ = att_out.shape
     total = top_k + sink + recent
     out = torch.zeros((bs, h_kv, total), dtype=torch.int32, device=att_out.device)
-    selector = make_selector(backend_name)
+    selector = make_selector(backend_name, max_bs=bs, h_kv=h_kv, device=att_out.device)
     selector.select(
         att_out_approx=att_out,
         req_to_token_indexed=r2t,
@@ -175,15 +175,21 @@ class TestSelectorParity(CustomTestCase):
         """`sgl_fast_topk_transform` is registered but not yet wired; the
         installed sgl_kernel.fast_topk_transform_fused signature lacks the
         row_to_batch parameter we need for the per-h_kv broadcast.
-        Constructing the selector must fail loud rather than silently
-        fall back. Once the kernel exposes a compatible API (or we land
-        the score-row-duplication adaptor), flip this to a parity test."""
+        ``make_selector`` must fail loud rather than constructing a
+        crippled selector. Once the kernel exposes a compatible API
+        (or we land the score-row-duplication adaptor), flip this to a
+        parity test."""
         from sglang.srt.mem_cache.sparsity.algorithms.selector_backends import (
             make_selector,
         )
 
         with self.assertRaises(NotImplementedError):
-            make_selector("sgl_fast_topk_transform")
+            make_selector(
+                "sgl_fast_topk_transform",
+                max_bs=1,
+                h_kv=1,
+                device=torch.device("cpu"),
+            )
 
 
 @unittest.skipUnless(_have_cuda(), "CUDA required")
@@ -213,7 +219,12 @@ class TestSelectorConstruction(CustomTestCase):
         )
 
         with self.assertRaises(NotImplementedError):
-            make_selector("jit_fused_selector")
+            make_selector(
+                "jit_fused_selector",
+                max_bs=1,
+                h_kv=1,
+                device=torch.device("cpu"),
+            )
 
     def test_flashinfer_topk_ceiling_validated_in_runtime_config(self):
         """``DoubleSparsityRuntimeConfig.validate()`` must reject the

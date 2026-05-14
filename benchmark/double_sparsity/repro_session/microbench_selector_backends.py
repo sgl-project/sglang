@@ -52,7 +52,7 @@ def bench_backend(
     n_iters: int = 200,
 ) -> float:
     att_out, r2t, seq_lens, out = _make_inputs(bs, h_kv, max_ctx, seq_len, top_k)
-    sel = make_selector(backend)
+    sel = make_selector(backend, max_bs=bs, h_kv=h_kv, device=att_out.device)
     for _ in range(n_warmup):
         sel.select(
             att_out_approx=att_out,

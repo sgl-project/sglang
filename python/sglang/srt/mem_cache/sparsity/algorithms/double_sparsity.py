@@ -81,11 +81,6 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
 
         self.runtime_config = runtime_config
         self.calibration = calibration
-        # Lazily-constructed selector backend (the FlashInfer / SGL
-        # selectors keep small per-shape caches). Built on first use so
-        # `import double_sparsity` doesn't pull in FlashInfer when the
-        # default `torch` backend is selected.
-        self._selector = None
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         self.num_kv_heads_local = (
@@ -342,15 +337,17 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         # memory access" in early bench runs. The first .select() call
         # below pulls those compiles + lazy aux-tensor allocations to
         # init time, where they're allowed.
-        if rt.selector_backend != "torch":
+        if rt.selector_backend == "torch":
+            self._selector = None
+        else:
             from sglang.srt.mem_cache.sparsity.algorithms.selector_backends import (
                 make_selector,
             )
 
-            self._selector = make_selector(rt.selector_backend)
+            self._selector = make_selector(
+                rt.selector_backend, max_bs=bs, h_kv=h_kv, device=device
+            )
             self._warmup_selector(bs, h_kv)
-        else:
-            self._selector = None
 
     def _warmup_selector(self, max_bs: int, h_kv: int) -> None:
         """Issue selector calls at every bs the CUDA graph might capture so
@@ -390,24 +387,20 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         bs_ladder = sorted({b for b in bs_ladder if 1 <= b <= max_bs})
 
         for bs in bs_ladder:
-            try:
-                self._selector.select(
-                    att_out_approx=att_out[:bs, :h_kv],
-                    req_to_token_indexed=r2t[:bs],
-                    seq_lens=seq_lens_full[:bs],
-                    top_k=rt.token_budget,
-                    sink_tokens=rt.sink_tokens,
-                    recent_tokens=rt.recent_tokens,
-                    out=self._native_selected_physical[:bs, :h_kv],
-                )
-            except Exception:
-                logger.exception(
-                    "DoubleSparsity selector warmup failed at bs=%d "
-                    "(backend=%s); first captured call may JIT inside capture.",
-                    bs,
-                    rt.selector_backend,
-                )
-                return
+            # Failures propagate: warmup is the only place this selector
+            # is invoked outside the CUDA-graph capture region, so a
+            # silent log-and-continue means the *real* first call lands
+            # inside capture and crashes the server mid-init. Refusing
+            # to start is the honest outcome.
+            self._selector.select(
+                att_out_approx=att_out[:bs, :h_kv],
+                req_to_token_indexed=r2t[:bs],
+                seq_lens=seq_lens_full[:bs],
+                top_k=rt.token_budget,
+                sink_tokens=rt.sink_tokens,
+                recent_tokens=rt.recent_tokens,
+                out=self._native_selected_physical[:bs, :h_kv],
+            )
         torch.cuda.synchronize()
         logger.info(
             "DoubleSparsity selector warmup OK: backend=%s bs_sweep=%s h_kv=%d top_k=%d",

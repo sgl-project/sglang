@@ -30,7 +30,6 @@ match.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import torch
 
@@ -143,6 +142,15 @@ the kernel. Empirically the bound holds independent of ``max_ctx``."""
 # section "conc=16 move-left").
 
 
+def _row_to_batch_buffer(bs: int, h_kv: int, device: torch.device) -> torch.Tensor:
+    """Build the FlashInfer ``row_to_batch`` index for a fixed
+    ``(bs, h_kv)``. Pure function — captured at selector construction
+    so the per-step ``select()`` does no allocation."""
+    if h_kv == 1:
+        return torch.arange(bs, dtype=torch.int32, device=device)
+    return torch.arange(bs * h_kv, dtype=torch.int32, device=device) // h_kv
+
+
 class FlashInferTopKPageTableSelector(_BaseSelector):
     """Top-k via ``flashinfer.top_k_page_table_transform`` (fused topk +
     page-table lookup) + a small sink/recent Triton kernel.
@@ -169,7 +177,7 @@ class FlashInferTopKPageTableSelector(_BaseSelector):
 
     name = "flashinfer_topk_page_table"
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_bs: int, h_kv: int, device: torch.device) -> None:
         super().__init__()
         try:
             import flashinfer  # noqa: F401
@@ -178,54 +186,15 @@ class FlashInferTopKPageTableSelector(_BaseSelector):
                 "FlashInfer is required for "
                 "--double-sparsity-selector-backend=flashinfer_topk_page_table"
             ) from e
-        # Cached aux tensors (allocated lazily on first call to match
-        # the per-shape contract). Stored on the algorithm side ideally,
-        # but kept here in-selector for now — small allocations bounded
-        # by max_running_requests * h_kv.
-        self._lengths_cache: Optional[torch.Tensor] = None
-        self._row_to_batch_cache: Optional[torch.Tensor] = None
-        self._cached_bs: int = -1
-        self._cached_h_kv: int = -1
-
-    def _ensure_aux(self, bs: int, h_kv: int, seq_lens: torch.Tensor) -> tuple:
-        """Materialize / refresh ``lengths`` and ``row_to_batch``.
-
-        ``lengths`` changes per step (it's ``seq_lens - 1`` per row); allocate
-        a stable shape-``[bs*h_kv]`` int32 buffer so the captured-graph
-        pointer is stable and only the data refreshes.
-        """
-        n_rows = bs * h_kv
-        if (
-            self._lengths_cache is None
-            or self._cached_bs != bs
-            or self._cached_h_kv != h_kv
-            or self._lengths_cache.device != seq_lens.device
-        ):
-            self._lengths_cache = torch.zeros(
-                n_rows, dtype=torch.int32, device=seq_lens.device
-            )
-            if h_kv == 1:
-                self._row_to_batch_cache = torch.arange(
-                    bs, dtype=torch.int32, device=seq_lens.device
-                )
-            else:
-                # row i -> batch (i // h_kv)
-                self._row_to_batch_cache = (
-                    torch.arange(n_rows, dtype=torch.int32, device=seq_lens.device)
-                    // h_kv
-                )
-            self._cached_bs = bs
-            self._cached_h_kv = h_kv
-
-        # Refresh contents in-place (capture-safe).
-        seq_minus_one = (seq_lens - 1).to(torch.int32)
-        if h_kv == 1:
-            self._lengths_cache.copy_(seq_minus_one)
-        else:
-            # Repeat each row's length across the h_kv heads:
-            # lengths_cache[i] = seq_lens[i // h_kv] - 1
-            self._lengths_cache.copy_(seq_minus_one.repeat_interleave(h_kv))
-        return self._lengths_cache, self._row_to_batch_cache
+        # Pre-allocate aux tensors at construction time (outside any
+        # CUDA-graph capture region). select() only refreshes contents
+        # in-place; the captured device pointers stay stable.
+        # Sized to the worst case `max_bs` so smaller-bs captured graphs
+        # narrow into the same buffers.
+        self._max_bs = max_bs
+        self._h_kv = h_kv
+        self._lengths_buf = torch.zeros(max_bs * h_kv, dtype=torch.int32, device=device)
+        self._row_to_batch_buf = _row_to_batch_buffer(max_bs, h_kv, device)
 
     def select(
         self,
@@ -248,16 +217,35 @@ class FlashInferTopKPageTableSelector(_BaseSelector):
                 f"--double-sparsity-selector-backend=torch."
             )
         bs, h_kv, max_ctx = att_out_approx.shape
-        # FlashInfer expects scores [num_rows, max_len]. h_kv collapses
-        # into the row dim; row_to_batch then maps each row back to the
-        # batch row in src_page_table.
-        scores = att_out_approx.view(bs * h_kv, max_ctx)
+        if bs > self._max_bs or h_kv != self._h_kv:
+            raise ValueError(
+                f"selector built for max_bs={self._max_bs}/h_kv={self._h_kv} "
+                f"but called with bs={bs}/h_kv={h_kv}; constructor mismatch."
+            )
         if req_to_token_indexed.dtype != torch.int32:
             raise ValueError(
                 f"req_to_token_indexed must be int32, got {req_to_token_indexed.dtype}"
             )
-        lengths, row_to_batch = self._ensure_aux(bs, h_kv, seq_lens)
 
+        # Refresh the lengths buffer in-place. For h_kv==1 the per-row
+        # length is just seq_lens-1; for h_kv>1 each batch repeats h_kv
+        # times. We slice the preallocated buffer to the current bs;
+        # no allocation either way.
+        lengths = self._lengths_buf[: bs * h_kv]
+        row_to_batch = self._row_to_batch_buf[: bs * h_kv]
+        seq_minus_one = (seq_lens - 1).to(torch.int32)
+        if h_kv == 1:
+            lengths.copy_(seq_minus_one)
+        else:
+            # Inline the (i // h_kv) gather without allocating: write
+            # h_kv copies of each row's length into adjacent slots.
+            # `index_select` writes into our preallocated buffer.
+            torch.index_select(
+                seq_minus_one, 0, row_to_batch.to(torch.int64), out=lengths
+            )
+
+        # FlashInfer expects scores [num_rows, max_len].
+        scores = att_out_approx.view(bs * h_kv, max_ctx)
         topk_phys_flat = flashinfer.top_k_page_table_transform(
             scores,
             req_to_token_indexed,
@@ -280,63 +268,44 @@ class FlashInferTopKPageTableSelector(_BaseSelector):
         )
 
 
-class SglFastTopKTransformSelector(_BaseSelector):
-    """SGLang-native ``sgl_kernel.fast_topk_transform_fused`` selector.
+def make_selector(
+    backend: str,
+    *,
+    max_bs: int = 1,
+    h_kv: int = 1,
+    device: torch.device = torch.device("cpu"),
+) -> _BaseSelector:
+    """Construct the requested selector.
 
-    The current ``sgl_kernel`` API (signature:
-    ``(score, lengths, page_table_size_1, cu_seqlens_q, topk,
-    row_starts=None)``) does not match the FlashInfer-style
-    ``row_to_batch`` contract we use for the per-head-h_kv broadcast,
-    and ``page_table_size_1`` is interpreted by the kernel as a
-    ``(B, topk)`` output buffer rather than a page table. Wiring this
-    correctly requires either a per-row score expansion (duplicate
-    the same row across the h_kv heads inline, so ``B = bs * h_kv``
-    and the page table is per-row) or a kernel-side ``row_to_batch``
-    parameter that the installed sgl_kernel build doesn't expose yet.
+    ``max_bs`` / ``h_kv`` / ``device`` are only consulted by backends
+    that pre-allocate aux state at construction time (currently the
+    FlashInfer backend). Defaults keep ``make_selector('torch')``
+    backward-compatible.
 
-    PLAN.md gates this backend behind a measurement step ("test
-    tb=2048 first"); we wire it through the registry so the
-    benchmark harness can request it once the kernel signature aligns
-    with ours (or we land an adaptor that duplicates the score rows
-    across heads).
+    Fails loud:
+      * unknown backend names -> ValueError
+      * registered but not-yet-implemented backends
+        (``sgl_fast_topk_transform``, ``jit_fused_selector``) ->
+        NotImplementedError with the gating rationale
+      * the optional dep for a registered backend is missing
+        (FlashInfer) -> RuntimeError from the backend ctor
     """
-
-    name = "sgl_fast_topk_transform"
-
-    def __init__(self) -> None:
-        super().__init__()
-        raise NotImplementedError(
-            "sgl_fast_topk_transform selector is not yet wired: the installed "
-            "sgl_kernel.fast_topk_transform_fused signature does not accept a "
-            "row_to_batch parameter, which we need to broadcast the per-bs "
-            "page table across h_kv heads. Use 'flashinfer_topk_page_table' "
-            "until either the kernel exposes row_to_batch or we add a "
-            "score-row-duplication adaptor on the algorithm side."
-        )
-
-    def select(
-        self,
-        *,
-        att_out_approx: torch.Tensor,
-        req_to_token_indexed: torch.Tensor,
-        seq_lens: torch.Tensor,
-        top_k: int,
-        sink_tokens: int,
-        recent_tokens: int,
-        out: torch.Tensor,
-    ) -> None:
-        raise NotImplementedError
-
-
-def make_selector(backend: str) -> _BaseSelector:
-    """Construct the requested selector. Fails loud if the optional
-    backend is unavailable (FlashInfer / sgl_kernel not installed)."""
     if backend == "torch":
         return TorchTopKSelector()
     if backend == "flashinfer_topk_page_table":
-        return FlashInferTopKPageTableSelector()
+        return FlashInferTopKPageTableSelector(max_bs=max_bs, h_kv=h_kv, device=device)
     if backend == "sgl_fast_topk_transform":
-        return SglFastTopKTransformSelector()
+        # Registered but not wired: ``sgl_kernel.fast_topk_transform_fused``
+        # in the installed build doesn't accept ``row_to_batch``, which
+        # the per-h_kv broadcast needs. Either the upstream kernel
+        # exposes it, or we land a score-row-duplication adaptor on the
+        # algorithm side.
+        raise NotImplementedError(
+            "sgl_fast_topk_transform: installed sgl_kernel.fast_topk"
+            "_transform_fused lacks the row_to_batch parameter required "
+            "for the per-h_kv broadcast. Use 'flashinfer_topk_page_table' "
+            "or 'torch' for now."
+        )
     if backend == "jit_fused_selector":
         raise NotImplementedError(
             "jit_fused_selector is gated behind the FlashInfer / SGL "
@@ -351,7 +320,6 @@ def make_selector(backend: str) -> _BaseSelector:
 __all__ = [
     "SUPPORTED_SELECTOR_BACKENDS",
     "FlashInferTopKPageTableSelector",
-    "SglFastTopKTransformSelector",
     "TorchTopKSelector",
     "make_selector",
 ]

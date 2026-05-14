@@ -43,6 +43,47 @@ tags: [cuda-graph, capture, host-sync, dispatch, kernel-launch]
   the same `cudaErrorStreamCaptureInvalidated`). Fix by **fail-loud
   validating the input dtype/shape at the eligibility gate** instead
   of silently reallocating.
+- The **JIT-compile form** of this trap: a third-party kernel
+  (FlashInfer Triton, sgl_kernel, etc.) JIT-compiles a fresh CUDA
+  module on the first call for a given shape. Triton's `load_binary`
+  inside capture surfaces as `Triton Error [CUDA]: illegal memory
+  access` (NOT `cudaErrorStreamCaptureInvalidated`). Symptom: the
+  bench/server crashes during the FIRST captured forward call after
+  model load. Fix: before capture starts, issue a warmup call at
+  **every** captured-bs in the SGLang ladder (`1, 2, 4, 8, 12, 16,
+  24, 32, ...`) so each shape's Triton kernel handle is already
+  populated. Warming only the worst-case bs is NOT sufficient —
+  Triton specializes per shape, and the first capture at bs=1 still
+  triggers a fresh `load_binary` if only bs=32 was warmed.
+- The **stream/context form** of this trap (observed but currently
+  unfixable from our side): some kernel libraries bind their compiled
+  Triton handles to the stream/context they were first compiled on.
+  Even after warming at every captured-bs OUTSIDE capture, the first
+  call INSIDE capture (different stream / graph-stream context)
+  re-invokes `load_binary` and fails. Worked-around by NOT using the
+  affected backend under graph capture; documented in
+  `selector_backends.py:FLASHINFER_TOPK_MAX` block comment.
+
+## Positive form: stable-pointer scratch writes from outside capture
+
+The mirror image of the host-sync rule is a useful pattern: **host-side
+writes to a stable device tensor are allowed OUTSIDE the captured
+region**, and the captured graph picks up the new contents on each
+replay. SGLang already uses this for `hisparse_coordinator.num_real_reqs.fill_(bs)`.
+The DS native pipeline uses the same trick for:
+* `_native_req_to_token_indexed` — written once per decode step from
+  `ModelRunner.forward` (eager + before-replay) and from
+  `CUDAGraphRunner.capture_one_batch_size` (capture-time seed). The
+  captured `try_native_sparse_decode` does a Python-static
+  `.narrow(0, 0, bs)` view that's recorded at trace time; replay
+  reads the stable pointer's current contents.
+* FlashInfer selector's `_lengths_buf` / `_row_to_batch_buf` —
+  preallocated at construction (outside capture), refreshed in-place
+  per call. No per-call `repeat_interleave` allocation.
+
+Rule of thumb: **anything that can be a stable device pointer
+populated externally should be**. Allocation inside capture is the
+hazard; data refresh through a stable pointer is not.
 
 ## Boundaries
 
