@@ -659,6 +659,7 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
+    hicache_host_components: str = "all"
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -3432,6 +3433,8 @@ class ServerArgs:
         ):
             return
 
+        self._validate_hicache_host_components()
+
         # Step 1: Initial layout-io compatibility normalization.
         self._resolve_layout_io_compatibility()
 
@@ -3444,6 +3447,37 @@ class ServerArgs:
         # Step 4: Re-normalize layout after io backend changes.
         if io_changed:
             self._resolve_layout_io_compatibility()
+
+    def _validate_hicache_host_components(self):
+        if self.hicache_host_components.strip().lower() == "all":
+            self.hicache_host_components = "all"
+            return
+
+        valid_components = {"full", "mamba", "swa"}
+        components = {
+            component.strip().lower()
+            for component in self.hicache_host_components.split(",")
+            if component.strip()
+        }
+        invalid_components = components - valid_components
+        if invalid_components:
+            raise ValueError(
+                f"Invalid --hicache-host-components values: {sorted(invalid_components)}. "
+                f"Valid values are: {sorted(valid_components)} or 'all'."
+            )
+        if "full" not in components:
+            raise ValueError("--hicache-host-components must include 'full'.")
+        self.hicache_host_components = ",".join(sorted(components))
+
+    def hicache_host_component_enabled(self, component: str) -> bool:
+        if self.hicache_host_components == "all":
+            return True
+        components = {
+            item.strip()
+            for item in self.hicache_host_components.split(",")
+            if item.strip()
+        }
+        return component in components
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -6193,6 +6227,17 @@ class ServerArgs:
             type=int,
             default=ServerArgs.hicache_size,
             help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        )
+        parser.add_argument(
+            "--hicache-host-components",
+            type=str,
+            default=ServerArgs.hicache_host_components,
+            help=(
+                "Comma-separated unified radix components that use HiCache host offload. "
+                "Use 'all' to enable host offload for all available components. "
+                "For hybrid Mamba models, 'full' keeps KV HiCache enabled while "
+                "leaving Mamba states device-only."
+            ),
         )
         parser.add_argument(
             "--hicache-write-policy",

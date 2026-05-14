@@ -894,6 +894,7 @@ class UnifiedRadixCache(BasePrefixCache):
         trigger: TreeComponent,
         tracker: dict[ComponentType, int],
         target: EvictLayer = EvictLayer.DEVICE,
+        preserve_device_without_host: bool = False,
     ):
         """Cascade eviction from trigger to lower-or-equal priority components."""
 
@@ -907,6 +908,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
         for comp in self._components_tuple:
             if comp.eviction_priority(is_leaf) <= trigger_priority:
+                if (
+                    preserve_device_without_host
+                    and EvictLayer.DEVICE in target
+                    and comp.component_type != BASE_COMPONENT_TYPE
+                    and not comp.hicache_host_enabled()
+                ):
+                    continue
                 if comp is not trigger and comp.node_has_component_data(node, target):
                     cd = node.component_data[comp.component_type]
                     if EvictLayer.DEVICE in target:
@@ -1092,7 +1100,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._evict_component_and_detach_lru(
             node, trigger, target=EvictLayer.DEVICE, tracker=tracker
         )
-        self._cascade_evict(node, trigger, tracker)
+        self._cascade_evict(node, trigger, tracker, preserve_device_without_host=True)
 
         # after device eviction, insert aux components into host LRU.
         self._for_each_component_lru(
@@ -1634,8 +1642,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 if ct == FCT:
                     continue
                 cd = node.component_data[ct]
-                if cd.value is not None and not full_dev:
-                    E(f"node {nid} {ct} device present but Full.value=None")
+                if cd.value is not None and not (full_dev or full_hst):
+                    E(f"node {nid} {ct} device present but Full missing")
                 if cd.host_value is not None and not full_hst:
                     E(f"node {nid} {ct} host present but Full.host_value=None")
 

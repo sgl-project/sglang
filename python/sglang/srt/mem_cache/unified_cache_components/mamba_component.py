@@ -79,6 +79,10 @@ class MambaComponent(TreeComponent):
             branching_seqlen = None
 
         mamba_value = last_node.component_data[self.component_type].value
+        if mamba_value is None:
+            host_node_cd = result.last_host_node.component_data[self.component_type]
+            if host_node_cd.value is not None:
+                mamba_value = host_node_cd.value
         if cow_mamba and mamba_value is not None:
             assert req is not None
             if req.mamba_pool_idx is None:
@@ -336,6 +340,8 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
 
         if phase == CacheTransferPhase.BACKUP_HOST:
+            if not self.hicache_host_enabled():
+                return None
             cd = node.component_data[ct]
             if cd.value is None:
                 return None
@@ -385,6 +391,9 @@ class MambaComponent(TreeComponent):
             return transfers if transfers else None
 
         return None
+
+    def hicache_host_enabled(self) -> bool:
+        return self._mamba_pool_host is not None
 
     def commit_hicache_transfer(
         self,

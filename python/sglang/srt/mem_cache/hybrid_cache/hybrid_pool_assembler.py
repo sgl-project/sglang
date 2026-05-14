@@ -168,6 +168,7 @@ def build_hybrid_swa_stack(
     attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
     storage_backend: Optional[str],
     use_mla: bool,
+    enable_swa_host_pool: bool = True,
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     prefetch_threshold: int = 256,
@@ -184,15 +185,6 @@ def build_hybrid_swa_stack(
         server_args=server_args,
         use_mla=use_mla,
     )
-    swa_host_pool = build_kv_host_pool(
-        kv_pool=swa_kv_pool,
-        page_size=page_size,
-        server_args=server_args,
-        use_mla=use_mla,
-    )
-
-    # For SWA hybrid, the device alloc/free goes through the inner swa_attn_allocator
-    swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -202,18 +194,29 @@ def build_hybrid_swa_stack(
             transfer_layer_num=transfer_layer_num,
             is_anchor=True,
         ),
-        build_pool_entry(
-            name=PoolName.SWA,
-            host_pool=swa_host_pool,
-            device_pool=swa_kv_pool,
-            layer_mapping=swa_layer_mapping,
-            transfer_layer_num=transfer_layer_num,
-            host_evict_fn=host_swa_evict_fn,
-            device_evict_fn=device_swa_evict_fn,
-            device_alloc_fn=swa_attn_allocator.alloc,
-            device_free_fn=swa_attn_allocator.free,
-        ),
     ]
+    if enable_swa_host_pool:
+        swa_host_pool = build_kv_host_pool(
+            kv_pool=swa_kv_pool,
+            page_size=page_size,
+            server_args=server_args,
+            use_mla=use_mla,
+        )
+        # For SWA hybrid, device alloc/free goes through the inner swa_attn_allocator.
+        swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
+        entries.append(
+            build_pool_entry(
+                name=PoolName.SWA,
+                host_pool=swa_host_pool,
+                device_pool=swa_kv_pool,
+                layer_mapping=swa_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+                host_evict_fn=host_swa_evict_fn,
+                device_evict_fn=device_swa_evict_fn,
+                device_alloc_fn=swa_attn_allocator.alloc,
+                device_free_fn=swa_attn_allocator.free,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -252,6 +255,7 @@ def build_hybrid_mamba_stack(
     attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
     storage_backend: Optional[str],
     use_mla: bool,
+    enable_mamba_host_pool: bool = True,
     host_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
     device_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
     prefetch_threshold: int = 256,
@@ -268,13 +272,6 @@ def build_hybrid_mamba_stack(
         server_args=server_args,
         use_mla=use_mla,
     )
-    mamba_host_pool = MambaPoolHost(
-        mamba_pool,
-        server_args.hicache_ratio,
-        server_args.hicache_size,
-        allocator_type=server_args.hicache_storage_backend,
-        layout=server_args.hicache_mem_layout,
-    )
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -284,16 +281,26 @@ def build_hybrid_mamba_stack(
             transfer_layer_num=transfer_layer_num,
             is_anchor=True,
         ),
-        build_pool_entry(
-            name=PoolName.MAMBA,
-            host_pool=mamba_host_pool,
-            device_pool=mamba_pool,
-            layer_mapping=mamba_layer_mapping,
-            transfer_layer_num=transfer_layer_num,
-            host_evict_fn=host_mamba_evict_fn,
-            device_evict_fn=device_mamba_evict_fn,
-        ),
     ]
+    if enable_mamba_host_pool:
+        mamba_host_pool = MambaPoolHost(
+            mamba_pool,
+            server_args.hicache_ratio,
+            server_args.hicache_size,
+            allocator_type=server_args.hicache_storage_backend,
+            layout=server_args.hicache_mem_layout,
+        )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.MAMBA,
+                host_pool=mamba_host_pool,
+                device_pool=mamba_pool,
+                layer_mapping=mamba_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+                host_evict_fn=host_mamba_evict_fn,
+                device_evict_fn=device_mamba_evict_fn,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -453,6 +460,9 @@ def attach_hybrid_pool_to_unified_cache(
                 attn_tp_group=attn_tp_group,
                 storage_backend=None,
                 use_mla=use_mla,
+                enable_mamba_host_pool=server_args.hicache_host_component_enabled(
+                    "mamba"
+                ),
                 host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
                 device_mamba_evict_fn=lambda n: cache.evict(EvictParams(mamba_num=n)),
                 pp_rank=params.pp_rank,
@@ -464,7 +474,11 @@ def attach_hybrid_pool_to_unified_cache(
             cache.components[ComponentType.FULL]._full_kv_pool_host = (
                 cache.full_kv_pool_host
             )
-            cache.mamba_pool_host = host_pool_group.get_pool(PoolName.MAMBA)
+            cache.mamba_pool_host = (
+                host_pool_group.get_pool(PoolName.MAMBA)
+                if server_args.hicache_host_component_enabled("mamba")
+                else None
+            )
             cache.components[ComponentType.MAMBA]._mamba_pool_host = (
                 cache.mamba_pool_host
             )
@@ -497,6 +511,7 @@ def attach_hybrid_pool_to_unified_cache(
                 attn_tp_group=attn_tp_group,
                 storage_backend=None,
                 use_mla=False,
+                enable_swa_host_pool=server_args.hicache_host_component_enabled("swa"),
                 host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
                 device_swa_evict_fn=lambda n: cache.evict(
                     EvictParams(swa_num_tokens=n)
@@ -510,7 +525,11 @@ def attach_hybrid_pool_to_unified_cache(
             cache.components[ComponentType.FULL]._full_kv_pool_host = (
                 cache.full_kv_pool_host
             )
-            cache.swa_kv_pool_host = host_pool_group.get_pool(PoolName.SWA)
+            cache.swa_kv_pool_host = (
+                host_pool_group.get_pool(PoolName.SWA)
+                if server_args.hicache_host_component_enabled("swa")
+                else None
+            )
             cache.components[ComponentType.SWA]._swa_kv_pool_host = (
                 cache.swa_kv_pool_host
             )
@@ -587,9 +606,17 @@ def attach_hybrid_pool_to_unified_cache(
         )
 
         if mamba_stack:
-            pools_desc = "KV + MAMBA"
+            pools_desc = (
+                "KV + MAMBA"
+                if server_args.hicache_host_component_enabled("mamba")
+                else "KV"
+            )
         elif swa_stack:
-            pools_desc = "KV + SWA"
+            pools_desc = (
+                "KV + SWA"
+                if server_args.hicache_host_component_enabled("swa")
+                else "KV"
+            )
         elif nsa_stack:
             pools_desc = "KV + INDEXER"
         else:
@@ -698,6 +725,7 @@ def attach_hybrid_pool_to_mamba_cache(
             attn_tp_group=attn_tp_group,
             storage_backend=server_args.hicache_storage_backend,
             use_mla=hybrid_kv.use_mla,
+            enable_mamba_host_pool=True,
             host_mamba_evict_fn=mamba_cache.evict_mamba_host,
             device_mamba_evict_fn=mamba_cache.evict_mamba,
             prefetch_threshold=prefetch_threshold,
