@@ -38,6 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
+from sglang.srt.server_args import get_global_server_args
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -46,6 +47,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         config: LlamaConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        draft_window_size: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
@@ -64,6 +66,9 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
+
+        if draft_window_size is not None:
+            self.self_attn.attn.sliding_window_size = draft_window_size
 
         if config.model_type == "llama4_text":
             inter_size = config.intermediate_size_mlp
@@ -115,6 +120,7 @@ class LlamaModel(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        draft_window_size: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -173,7 +179,7 @@ class LlamaModel(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                LlamaDecoderLayer(config, i, quant_config, prefix)
+                LlamaDecoderLayer(config, i, quant_config, draft_window_size, prefix)
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -254,7 +260,10 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.pp_group = get_pp_group()
 
         self.model = LlamaModel(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config=quant_config,
+            draft_window_size=self.get_attention_sliding_window_size(),
+            prefix=add_prefix("model", prefix),
         )
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
@@ -338,6 +347,15 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
     def get_hot_token_id(self):
         return self.hot_token_id
+
+    def get_attention_sliding_window_size(self):
+        server_args = get_global_server_args()
+        draft_window_size: Optional[int] = (
+            int(server_args.speculative_draft_window_size)
+            if server_args.speculative_draft_window_size is not None
+            else None
+        )
+        return draft_window_size
 
 
 EntryClass = [LlamaForCausalLMEagle3]

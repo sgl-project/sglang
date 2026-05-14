@@ -111,8 +111,6 @@ def build_kv_only_stack(
     storage_backend_extra_config: Optional[dict] = None,
     pp_rank: int = 0,
     pp_size: int = 1,
-    attn_cp_rank: int = 0,
-    attn_cp_size: int = 1,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
@@ -151,8 +149,6 @@ def build_kv_only_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        attn_cp_rank=attn_cp_rank,
-        attn_cp_size=attn_cp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
@@ -170,6 +166,8 @@ def build_hybrid_swa_stack(
     page_size: int,
     tp_group,
     load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
@@ -180,8 +178,6 @@ def build_hybrid_swa_stack(
     storage_backend_extra_config: Optional[dict] = None,
     pp_rank: int = 0,
     pp_size: int = 1,
-    attn_cp_rank: int = 0,
-    attn_cp_size: int = 1,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
@@ -228,6 +224,8 @@ def build_hybrid_swa_stack(
         page_size,
         tp_group,
         load_cache_event=load_cache_event,
+        attn_cp_group=attn_cp_group,
+        attn_tp_group=attn_tp_group,
         write_policy=server_args.hicache_write_policy,
         io_backend=server_args.hicache_io_backend,
         storage_backend=storage_backend,
@@ -237,8 +235,6 @@ def build_hybrid_swa_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        attn_cp_rank=attn_cp_rank,
-        attn_cp_size=attn_cp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
@@ -268,8 +264,6 @@ def build_hybrid_mamba_stack(
     storage_backend_extra_config: Optional[dict] = None,
     pp_rank: int = 0,
     pp_size: int = 1,
-    attn_cp_rank: int = 0,
-    attn_cp_size: int = 1,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
@@ -323,8 +317,6 @@ def build_hybrid_mamba_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        attn_cp_rank=attn_cp_rank,
-        attn_cp_size=attn_cp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
@@ -353,8 +345,6 @@ def build_shared_anchor_stack(
     storage_backend_extra_config: Optional[dict] = None,
     pp_rank: int = 0,
     pp_size: int = 1,
-    attn_cp_rank: int = 0,
-    attn_cp_size: int = 1,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
@@ -402,8 +392,6 @@ def build_shared_anchor_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        attn_cp_rank=attn_cp_rank,
-        attn_cp_size=attn_cp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
@@ -513,6 +501,8 @@ def attach_hybrid_pool_to_unified_cache(
                 page_size=cache.page_size,
                 tp_group=params.tp_cache_group,
                 load_cache_event=load_cache_event,
+                attn_cp_group=attn_cp_group,
+                attn_tp_group=attn_tp_group,
                 storage_backend=None,
                 use_mla=False,
                 host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
@@ -546,8 +536,11 @@ def attach_hybrid_pool_to_unified_cache(
                 page_size=cache.page_size,
                 tp_group=params.tp_cache_group,
                 load_cache_event=load_cache_event,
+                attn_cp_group=attn_cp_group,
+                attn_tp_group=attn_tp_group,
                 storage_backend=None,
                 use_mla=use_mla,
+                override_kv_cache_dim=full_kv_pool.kv_cache_dim,
                 shared_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
                     full_kv_pool,
                     kv_host_pool,
@@ -556,8 +549,6 @@ def attach_hybrid_pool_to_unified_cache(
                 ),
                 pp_rank=params.pp_rank,
                 pp_size=params.pp_size,
-                attn_cp_rank=params.attn_cp_rank,
-                attn_cp_size=params.attn_cp_size,
             )
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
@@ -653,6 +644,7 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
             attn_tp_group=attn_tp_group,
             storage_backend=server_args.hicache_storage_backend,
             use_mla=True,
+            override_kv_cache_dim=kv.kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
             shared_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
                 kv,
@@ -665,8 +657,6 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
             storage_backend_extra_config=extra_config,
             pp_rank=radix_cache.pp_rank,
             pp_size=radix_cache.pp_size,
-            attn_cp_rank=params.attn_cp_rank,
-            attn_cp_size=params.attn_cp_size,
             enable_storage_metrics=enable_storage_metrics,
         )
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
@@ -725,8 +715,6 @@ def attach_hybrid_pool_to_mamba_cache(
             storage_backend_extra_config=extra_config,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
-            attn_cp_rank=params.attn_cp_rank,
-            attn_cp_size=params.attn_cp_size,
             enable_storage_metrics=enable_storage_metrics,
         )
         mamba_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)

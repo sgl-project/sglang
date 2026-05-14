@@ -10,8 +10,8 @@ from sglang.srt.utils.numa_utils import (
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
-register_cuda_ci(est_time=10, suite="stage-c-test-4-gpu-gb200")
-register_cuda_ci(est_time=10, suite="stage-c-test-8-gpu-b200")
+register_cuda_ci(est_time=10, stage="stage-c", runner_config="4-gpu-gb200")
+register_cuda_ci(est_time=10, stage="stage-c", runner_config="8-gpu-b200")
 
 
 class TestIsNumaAvailable(unittest.TestCase):
