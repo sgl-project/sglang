@@ -20,7 +20,7 @@ use axum::{
 };
 use futures_util::stream::{self, StreamExt};
 use serde_json::json;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use uuid::Uuid;
 
 /// Configuration for mock worker behavior
@@ -330,8 +330,10 @@ async fn generate_handler(
             let error_after = get_stream_error_after_for_port(port);
             init_stream_tracking(port, num_chunks);
 
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::io::Error>>(4);
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<Result<Event, std::io::Error>>(MOCK_STREAM_BUFFER);
             tokio::spawn(async move {
+                let _exit_guard = install_stream_exit_notifier(port);
                 let timestamp_start = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -521,9 +523,11 @@ async fn chat_completions_handler(
             // Small bounded capacity gives a bit of slack between the producer
             // task and the SSE consumer; on receiver drop, send().await
             // returns Err and the loop exits regardless of capacity.
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::io::Error>>(4);
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<Result<Event, std::io::Error>>(MOCK_STREAM_BUFFER);
 
             tokio::spawn(async move {
+                let _exit_guard = install_stream_exit_notifier(port);
                 for i in 0..num_chunks {
                     if let Some(n) = error_after {
                         if i == n {
@@ -1093,9 +1097,11 @@ async fn responses_handler(
 
             init_stream_tracking(port, num_chunks);
 
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::io::Error>>(4);
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<Result<Event, std::io::Error>>(MOCK_STREAM_BUFFER);
 
             tokio::spawn(async move {
+                let _exit_guard = install_stream_exit_notifier(port);
                 // Emit response.created and response.in_progress so the
                 // gateway's /responses persistence accumulator has the
                 // structural events it expects.
@@ -1527,10 +1533,63 @@ fn get_stream_tracker() -> &'static Mutex<HashMap<u16, StreamTrackingState>> {
     STREAM_CANCEL_TRACKER.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// Per-port `Notify` fired when the worker's producer task exits (either
+// because its outbound `send().await` failed — i.e. the gateway dropped
+// the upstream connection — or because the stream completed naturally).
+// Tests await this notification instead of polling counters, so cancel
+// assertions don't depend on timing windows.
+static STREAM_FINISH_NOTIFIERS: OnceLock<Mutex<HashMap<u16, Arc<Notify>>>> = OnceLock::new();
+
+fn get_stream_finish_notifier_map() -> &'static Mutex<HashMap<u16, Arc<Notify>>> {
+    STREAM_FINISH_NOTIFIERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_stream_finish_notifier(port: u16) -> Arc<Notify> {
+    let mut map = get_stream_finish_notifier_map().lock().unwrap();
+    map.entry(port)
+        .or_insert_with(|| Arc::new(Notify::new()))
+        .clone()
+}
+
+/// Bound on the per-stream mpsc buffer used by every slow-stream producer
+/// task in this mock worker. Tests assert that `chunks_sent` after a cancel
+/// grew by at most this many over the pre-drop snapshot, on the theory that
+/// anything more means the gateway did not propagate the disconnect
+/// upstream.
+pub const MOCK_STREAM_BUFFER: usize = 4;
+
+/// RAII guard that fires the per-port finish notifier on drop, so the
+/// notification fires whether the producer task exits normally or returns
+/// early on `tx.send(...).await.is_err()`.
+#[must_use = "StreamExitNotifier must be bound to a local (typically `_exit_guard`) \
+              and held until the producer task ends — dropping it immediately fires \
+              the notifier early, causing `wait_for_stream_finish` to return before \
+              the producer has actually exited"]
+pub struct StreamExitNotifier(Arc<Notify>);
+
+impl Drop for StreamExitNotifier {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+/// Install the exit notifier inside a producer task. Hold the returned
+/// guard until the task ends (typically by binding it to `_exit_guard`).
+#[must_use = "the returned guard fires the exit notifier on drop; bind it to a local \
+              (e.g. `let _exit_guard = install_stream_exit_notifier(port);`) so it lives \
+              for the producer task's lifetime"]
+pub fn install_stream_exit_notifier(port: u16) -> StreamExitNotifier {
+    StreamExitNotifier(get_stream_finish_notifier(port))
+}
+
 /// Reset the stream tracker for a given port before starting a new test.
+/// Also replaces the finish notifier so any unconsumed permit from a
+/// previous test doesn't satisfy this test's wait immediately.
 pub fn reset_stream_tracker(port: u16) {
     let mut map = get_stream_tracker().lock().unwrap();
     map.remove(&port);
+    let mut nmap = get_stream_finish_notifier_map().lock().unwrap();
+    nmap.insert(port, Arc::new(Notify::new()));
 }
 
 /// Get the stream tracking state for a given port.
@@ -1539,34 +1598,37 @@ pub fn get_stream_tracking_state(port: u16) -> Option<StreamTrackingState> {
     map.get(&port).cloned()
 }
 
-/// Wait until the worker's `chunks_sent` counter for `port` stops advancing
-/// for at least `quiet_window`, or until `timeout` elapses. Returns the
-/// final tracking state. Used by cancel tests to confirm the worker has
-/// actually stopped producing — instead of relying on a fixed `sleep` that
-/// might be shorter or longer than the worker's natural completion time.
-pub async fn wait_for_chunks_plateau(
+/// Wait until the worker's producer task for `port` exits — either because
+/// the gateway dropped the upstream connection (`send().await` failed) or
+/// because the stream finished naturally. Returns the final tracking state.
+/// The `timeout` is a safety net for hung tests; a healthy run returns the
+/// instant the producer task drops its exit guard.
+///
+/// **Precondition:** call [`reset_stream_tracker`] before issuing the
+/// gateway request whose producer you intend to wait on. The reset
+/// installs a fresh `Notify` so a stale permit left by a previous test
+/// on the same port can't satisfy this wait immediately.
+pub async fn wait_for_stream_finish(
     port: u16,
-    quiet_window: tokio::time::Duration,
     timeout: tokio::time::Duration,
 ) -> Option<StreamTrackingState> {
-    let poll_interval = tokio::time::Duration::from_millis(20);
-    let start = tokio::time::Instant::now();
-    let mut last_count = get_stream_tracking_state(port).map(|s| s.chunks_sent);
-    let mut last_change = tokio::time::Instant::now();
-
-    while start.elapsed() < timeout {
-        tokio::time::sleep(poll_interval).await;
-        let now_state = get_stream_tracking_state(port);
-        let now_count = now_state.as_ref().map(|s| s.chunks_sent);
-
-        if now_count != last_count {
-            last_count = now_count;
-            last_change = tokio::time::Instant::now();
-        } else if last_change.elapsed() >= quiet_window {
-            return now_state;
-        }
+    let notifier = get_stream_finish_notifier(port);
+    if tokio::time::timeout(timeout, notifier.notified())
+        .await
+        .is_err()
+    {
+        // A hung producer would silently look like a successful cancel
+        // (chunks_sent < total_chunks, completed=false) if we just
+        // returned what we have. Panic instead so the test fails loudly.
+        panic!(
+            "wait_for_stream_finish timed out after {:?} for port {} — \
+             producer task never fired its exit notifier. Last tracker \
+             state: {:?}",
+            timeout,
+            port,
+            get_stream_tracking_state(port)
+        );
     }
-
     get_stream_tracking_state(port)
 }
 

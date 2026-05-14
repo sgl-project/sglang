@@ -14,7 +14,7 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -44,6 +44,7 @@ use crate::{
         mcp_utils::{ensure_request_mcp_client, McpLoopConfig},
         openai::context::{RequestContext, StreamingEventContext, StreamingRequest},
         persistence_utils::persist_conversation_items,
+        streaming_utils::BreakerTrackedStream,
     },
 };
 
@@ -189,6 +190,18 @@ fn send_sse_event(
 ) -> bool {
     let block = format!("event: {}\ndata: {}\n\n", event_name, data);
     tx.send(Ok(Bytes::from(block))).is_ok()
+}
+
+/// Append a fully-formed SSE block to a `\n\n` terminator without going
+/// through `format!()` — the `/responses` streaming path forwards a chunk
+/// for every model token, so avoiding the intermediate `String` allocation
+/// matters under load.
+#[inline]
+fn sse_block_to_bytes(block: &str) -> Bytes {
+    let mut buf = BytesMut::with_capacity(block.len() + 2);
+    buf.extend_from_slice(block.as_bytes());
+    buf.extend_from_slice(b"\n\n");
+    buf.freeze()
 }
 
 /// Transform fc_* item IDs to mcp_* format
@@ -484,7 +497,7 @@ pub(super) fn send_final_response_event(
 /// Simple pass-through streaming without MCP interception
 pub(super) async fn handle_simple_streaming_passthrough(
     client: &reqwest::Client,
-    circuit_breaker: &crate::core::CircuitBreaker,
+    worker: Arc<dyn crate::core::Worker>,
     headers: Option<&HeaderMap>,
     req: StreamingRequest,
 ) -> Response {
@@ -499,7 +512,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
     let response = match request_builder.send().await {
         Ok(resp) => resp,
         Err(err) => {
-            circuit_breaker.record_failure();
+            worker.circuit_breaker().record_failure();
             return (
                 StatusCode::BAD_GATEWAY,
                 format!("Failed to forward request to OpenAI: {}", err),
@@ -513,18 +526,28 @@ pub(super) async fn handle_simple_streaming_passthrough(
         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     if !status.is_success() {
-        circuit_breaker.record_failure();
+        worker.circuit_breaker().record_failure();
         let error_body = response
             .text()
             .await
             .unwrap_or_else(|err| format!("Failed to read upstream error body: {}", err));
         return (status_code, error_body).into_response();
     }
-
-    circuit_breaker.record_success();
+    // Do NOT record_success here at status-OK time — the spawned forwarder
+    // below records the actual stream outcome on termination (success on
+    // clean end / `[DONE]`, failure on mid-stream error). Recording success
+    // eagerly here would mask 200-then-broken workers and double-count when
+    // the stream completes normally.
 
     let preserved_headers = preserve_response_headers(response.headers());
-    let mut upstream_stream = response.bytes_stream();
+    // Wrap upstream in `BreakerTrackedStream` so the breaker tick is decided
+    // once on drop: success on clean `None`, failure on `Some(Err)`, neither
+    // on early drop (client disconnected before upstream terminated).
+    let upstream_stream = BreakerTrackedStream::new(
+        response.bytes_stream(),
+        Arc::clone(&worker),
+        req.url.clone(),
+    );
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
 
@@ -547,7 +570,11 @@ pub(super) async fn handle_simple_streaming_passthrough(
         let mut chunk_processor = ChunkProcessor::new();
 
         if need_persistence {
-            // Persistence path: keep consuming upstream even after client disconnect
+            // Persistence path: keep consuming upstream even after client
+            // disconnect. The wrapper's terminal state at drop encodes the
+            // breaker outcome; `upstream_failed` is just a local flag used
+            // to skip persistence on stream error.
+            let mut upstream_stream = upstream_stream;
             let mut accumulator = StreamingResponseAccumulator::new();
             let mut upstream_failed = false;
             let mut receiver_connected = true;
@@ -568,27 +595,23 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
                             accumulator.ingest_block(&block_cow);
 
-                            if receiver_connected {
-                                let chunk_to_send = format!("{}\n\n", block_cow);
-                                if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
-                                    receiver_connected = false;
-                                    tracing::debug!(
-                                        "Client disconnected during /responses persistence \
-                                        stream from {}; continuing to drain upstream for \
-                                        storage",
-                                        upstream_url
-                                    );
-                                }
+                            if receiver_connected
+                                && tx.send(Ok(sse_block_to_bytes(&block_cow))).is_err()
+                            {
+                                receiver_connected = false;
+                                tracing::debug!(
+                                    "Client disconnected during /responses persistence \
+                                    stream from {}; continuing to drain upstream for \
+                                    storage",
+                                    upstream_url
+                                );
                             }
                         }
                     }
                     Err(err) => {
                         upstream_failed = true;
-                        tracing::error!(
-                            "Upstream /responses stream error from {}: {}",
-                            upstream_url,
-                            err
-                        );
+                        // BreakerTrackedStream already marked terminal=Errored
+                        // and logged; just forward the error to the client.
                         let io_err = io::Error::other(err);
                         let _ = tx.send(Err(io_err));
                         break;
@@ -632,11 +655,17 @@ pub(super) async fn handle_simple_streaming_passthrough(
                     warn!("Streaming completed without a final response payload");
                 }
             }
+            // upstream_stream dropped here → breaker tick fires (success or
+            // failure depending on terminal state set during the loop).
         } else {
             // No persistence: use select! to cancel upstream on client disconnect.
             // `biased;` drains a ready upstream chunk before observing client
             // disconnect, so a chunk already produced by reqwest reaches the
-            // client before we tear the loop down.
+            // client before we tear the loop down. The `BreakerTrackedStream`
+            // wrapper records the breaker outcome on drop based on the
+            // terminal it observed: clean `None` → success, `Some(Err)` →
+            // failure, dropped while still active (client disconnect or
+            // `tx.send` failure) → neither.
             futures_util::pin_mut!(upstream_stream);
             'outer: loop {
                 tokio::select! {
@@ -656,8 +685,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
                                         None => Cow::Borrowed(raw_block.as_str()),
                                     };
 
-                                    let chunk_to_send = format!("{}\n\n", block_cow);
-                                    if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
+                                    if tx.send(Ok(sse_block_to_bytes(&block_cow))).is_err() {
                                         tracing::debug!(
                                             "Receiver dropped (likely client disconnect), \
                                             cancelling upstream /responses stream from {}",
@@ -668,15 +696,15 @@ pub(super) async fn handle_simple_streaming_passthrough(
                                 }
                             }
                             Some(Err(err)) => {
-                                tracing::error!(
-                                    "Upstream /responses stream error from {}: {}",
-                                    upstream_url, err
-                                );
+                                // BreakerTrackedStream already marked terminal=Errored.
                                 let io_err = io::Error::other(err);
                                 let _ = tx.send(Err(io_err));
                                 break 'outer;
                             }
-                            None => break 'outer,
+                            None => {
+                                // BreakerTrackedStream already marked terminal=Completed.
+                                break 'outer;
+                            }
                         }
                     }
                     _ = tx.closed() => {
@@ -688,6 +716,8 @@ pub(super) async fn handle_simple_streaming_passthrough(
                     }
                 }
             }
+            // upstream_stream dropped here → breaker tick fires based on
+            // terminal state.
         }
     });
 
@@ -720,6 +750,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
 /// should not enable MCP tools for that request.
 pub(super) async fn handle_streaming_with_tool_interception(
     client: &reqwest::Client,
+    worker: Arc<dyn crate::core::Worker>,
     headers: Option<&HeaderMap>,
     req: StreamingRequest,
     active_mcp: &Arc<smg_mcp::McpManager>,
@@ -743,6 +774,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
     let payload_clone = payload.clone();
     let active_mcp_clone = Arc::clone(active_mcp);
     let server_keys_clone = server_keys.clone();
+    let worker_for_breaker = worker;
 
     // Spawn the streaming loop task
     tokio::spawn(async move {
@@ -799,9 +831,25 @@ pub(super) async fn handle_streaming_with_tool_interception(
             }
             request_builder = request_builder.header("Accept", "text/event-stream");
 
-            let response = match request_builder.send().await {
+            // Race send() against tx.closed() so that a client disconnect
+            // while we're still waiting for upstream response headers also
+            // cancels this in-flight HTTP request (not just mid-stream).
+            let response = tokio::select! {
+                biased;
+                res = request_builder.send() => res,
+                _ = tx.closed() => {
+                    tracing::info!(
+                        "Client disconnected before /responses tool-interception \
+                        upstream response from {}, cancelling",
+                        url_clone
+                    );
+                    return;
+                }
+            };
+            let response = match response {
                 Ok(r) => r,
                 Err(e) => {
+                    worker_for_breaker.circuit_breaker().record_failure();
                     tracing::error!(
                         "Failed to send /responses tool-interception request to {}: {}",
                         url_clone,
@@ -817,8 +865,12 @@ pub(super) async fn handle_streaming_with_tool_interception(
             };
 
             if !response.status().is_success() {
+                worker_for_breaker.circuit_breaker().record_failure();
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<body read failed: {e}>"));
                 tracing::error!(
                     "Upstream /responses tool-interception non-success from {}: status={} \
                     body={}",
@@ -969,11 +1021,19 @@ pub(super) async fn handle_streaming_with_tool_interception(
                         }
                     }
                     Some(Err(e)) => {
+                        worker_for_breaker.circuit_breaker().record_failure();
                         tracing::error!(
                             "Upstream /responses tool-interception stream error from {}: {}",
                             url_clone,
                             e
                         );
+                        if should_store || persist_needed {
+                            warn!(
+                                "Skipping /responses persistence (tool-interception) due to \
+                                 upstream stream error from {}: store={} conversation={:?}",
+                                url_clone, should_store, original_request.conversation
+                            );
+                        }
                         let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Stream error: {}\"}}}}\n\n", e);
                         let _ = tx.send(Ok(Bytes::from(error_event)));
                         return;
@@ -1042,8 +1102,15 @@ pub(super) async fn handle_streaming_with_tool_interception(
                             err
                         );
                     }
+                } else if should_store || persist_needed {
+                    warn!(
+                        "/responses tool-interception stream ended with no final \
+                         response payload; persistence skipped (store={} conversation={:?})",
+                        should_store, original_request.conversation
+                    );
                 }
 
+                worker_for_breaker.circuit_breaker().record_success();
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 return;
             }
@@ -1061,10 +1128,24 @@ pub(super) async fn handle_streaming_with_tool_interception(
             };
 
             if state.total_calls > effective_limit {
+                // Reaching the tool-call iteration limit is a request-level
+                // shape problem (the user asked for unbounded work or the
+                // model is in a tight tool-call loop); the upstream worker
+                // is not unhealthy. Record a success to reflect that the
+                // last upstream call returned cleanly.
+                worker_for_breaker.circuit_breaker().record_success();
                 warn!(
                     "Reached tool call limit during streaming: {}",
                     effective_limit
                 );
+                if should_store || persist_needed {
+                    warn!(
+                        "Skipping /responses persistence (tool-interception): \
+                         max_tool_calls limit reached, no final response built. \
+                         store={} conversation={:?}",
+                        should_store, original_request.conversation
+                    );
+                }
                 let error_event = "event: error\ndata: {\"error\": {\"message\": \"Exceeded max_tool_calls limit\"}}\n\n".to_string();
                 let _ = tx.send(Ok(Bytes::from(error_event)));
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
@@ -1101,6 +1182,18 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     // Continue loop to make next streaming request
                 }
                 Err(e) => {
+                    // Upstream stream finished cleanly (we got pending tool
+                    // calls out of it); the gateway-side payload build failed.
+                    // Credit the worker for the upstream call, mirroring the
+                    // tool-iteration-limit path above.
+                    worker_for_breaker.circuit_breaker().record_success();
+                    if should_store || persist_needed {
+                        warn!(
+                            "Skipping /responses persistence (tool-interception): \
+                             build_resume_payload failed ({}); store={} conversation={:?}",
+                            e, should_store, original_request.conversation
+                        );
+                    }
                     let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Failed to build resume payload: {}\"}}}}\n\n", e);
                     let _ = tx.send(Ok(Bytes::from(error_event)));
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
@@ -1122,7 +1215,6 @@ pub(super) async fn handle_streaming_with_tool_interception(
 /// Main entry point for streaming responses
 pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
     let worker = ctx.worker().expect("Worker not selected").clone();
-    let circuit_breaker = worker.circuit_breaker();
     let headers = ctx.headers().cloned();
     let original_body = ctx.responses_request();
     let mcp_manager = ctx.components.mcp_manager().expect("MCP manager required");
@@ -1147,7 +1239,7 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
     if active_mcp.is_none() {
         return handle_simple_streaming_passthrough(
             &client,
-            circuit_breaker,
+            Arc::clone(&worker),
             headers.as_ref(),
             req,
         )
@@ -1159,6 +1251,7 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
     // MCP is active - transform tools and set up interception
     handle_streaming_with_tool_interception(
         &client,
+        Arc::clone(&worker),
         headers.as_ref(),
         req,
         &active_mcp,

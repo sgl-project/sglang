@@ -13,10 +13,8 @@ use axum::{
     Json,
 };
 use data_connector::{ConversationId, ListParams, ResponseId, SortOrder};
-use futures_util::{future::join_all, StreamExt};
+use futures_util::future::join_all;
 use serde_json::{json, to_value, Value};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
 use super::{
@@ -42,7 +40,10 @@ use crate::{
             ResponsesGetParams, ResponsesRequest,
         },
     },
-    routers::header_utils::{apply_provider_headers, extract_auth_header},
+    routers::{
+        header_utils::{apply_provider_headers, extract_auth_header},
+        streaming_utils::BreakerTrackedStream,
+    },
 };
 
 pub struct OpenAIRouter {
@@ -596,16 +597,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     let status = StatusCode::from_u16(resp.status().as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-                    // Record circuit breaker failure for error status codes
-                    if !status.is_success() {
-                        worker.circuit_breaker().record_failure();
-                    }
-
                     if !is_streaming {
+                        // Non-streaming: record the breaker outcome inline
+                        // once the body is fully read.
+                        if !status.is_success() {
+                            worker.circuit_breaker().record_failure();
+                        }
                         let content_type = resp.headers().get(CONTENT_TYPE).cloned();
                         match resp.bytes().await {
                             Ok(body) => {
-                                // Only record success after body is fully read
                                 if status.is_success() {
                                     worker.circuit_breaker().record_success();
                                 }
@@ -626,64 +626,23 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                             }
                         }
                     } else {
-                        // Streaming response - record success when stream starts
-                        if status.is_success() {
-                            worker.circuit_breaker().record_success();
+                        // Streaming response: pass the reqwest byte stream
+                        // through `BreakerTrackedStream`, which records the
+                        // circuit-breaker outcome exactly once on drop (success
+                        // on clean end, failure on stream error, neither on
+                        // client disconnect). For non-2xx responses we pre-mark
+                        // the wrapper as Errored — otherwise the small error
+                        // body would stream cleanly to `None` and Drop would
+                        // record a spurious success.
+                        let mut tracked = BreakerTrackedStream::new(
+                            resp.bytes_stream(),
+                            Arc::clone(&worker),
+                            url.clone(),
+                        );
+                        if !status.is_success() {
+                            tracked.mark_errored();
                         }
-                        let stream = resp.bytes_stream();
-                        let (tx, rx) = mpsc::unbounded_channel();
-                        // Uses select! to race stream.next() against tx.closed() so that
-                        // when the client disconnects the upstream HTTP connection is
-                        // dropped promptly, allowing the engine to abort the request.
-                        // `biased;` drains a ready upstream chunk before observing client
-                        // disconnect, so any chunk already produced by reqwest reaches
-                        // the client before we tear the loop down.
-                        let url_for_log = url.clone();
-                        let worker_for_log = Arc::clone(&worker);
-                        tokio::spawn(async move {
-                            futures_util::pin_mut!(stream);
-                            loop {
-                                tokio::select! {
-                                    biased;
-                                    chunk = stream.next() => {
-                                        match chunk {
-                                            Some(Ok(bytes)) => {
-                                                if tx.send(Ok(bytes)).is_err() {
-                                                    tracing::debug!(
-                                                        "Receiver dropped (likely client \
-                                                        disconnect), cancelling upstream \
-                                                        stream from {}",
-                                                        url_for_log
-                                                    );
-                                                    break;
-                                                }
-                                            }
-                                            Some(Err(e)) => {
-                                                tracing::error!(
-                                                    "Upstream stream error from worker {}: {}",
-                                                    url_for_log, e
-                                                );
-                                                worker_for_log
-                                                    .circuit_breaker()
-                                                    .record_failure();
-                                                let _ = tx.send(Err(format!("Stream error: {}", e)));
-                                                break;
-                                            }
-                                            None => break,
-                                        }
-                                    }
-                                    _ = tx.closed() => {
-                                        tracing::info!(
-                                            "Client disconnected, cancelling upstream stream from {}",
-                                            url_for_log
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                        let mut response =
-                            Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
+                        let mut response = Response::new(Body::from_stream(tracked));
                         *response.status_mut() = status;
                         response
                             .headers_mut()
