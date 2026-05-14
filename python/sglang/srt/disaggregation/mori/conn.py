@@ -24,7 +24,6 @@ from mori.io import (
     MemoryLocationType,
     PollCqMode,
     RdmaBackendConfig,
-    XgmiBackendConfig,
 )
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
@@ -39,6 +38,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
 )
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import get_int_env_var
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
@@ -279,12 +279,13 @@ class MoriKVManager(CommonKVManager):
             self._start_decode_thread()
 
     def _init_engine(self) -> IOEngine:
-        mori_io_backend = self.server_args.disaggregation_mori_io_backend
-        create_xgmi = mori_io_backend == "xgmi"
-        create_rdma = mori_io_backend == "rdma"
+        use_xgmi = envs.SGLANG_MORI_USE_XGMI.get()
 
-        if create_rdma and self.kv_args.ib_device:
+        if self.kv_args.ib_device:
             os.environ["MORI_RDMA_DEVICES"] = self.kv_args.ib_device
+
+        if use_xgmi:
+            os.environ["MORI_DISABLE_AUTO_XGMI"] = "0"
 
         self.local_ip = get_local_ip_auto()
         config = IOEngineConfig(host=self.local_ip, port=0)
@@ -297,63 +298,30 @@ class MoriKVManager(CommonKVManager):
         )
 
         engine = IOEngine(engine_key, config)
+        poll_mode = PollCqMode.POLLING
 
-        xgmi_num_streams = xgmi_num_events = None
-        if create_xgmi:
-            xgmi_num_streams = get_int_env_var("SGLANG_MORI_XGMI_NUM_STREAMS", 64)
-            xgmi_num_events = get_int_env_var("SGLANG_MORI_XGMI_NUM_EVENTS", 64)
-            xgmi_cfg = XgmiBackendConfig(xgmi_num_streams, xgmi_num_events)
-            engine.create_backend(BackendType.XGMI, xgmi_cfg)
+        qp_per_transfer = get_int_env_var("SGLANG_MORI_QP_PER_TRANSFER", 4)
+        post_batch_size = get_int_env_var("SGLANG_MORI_POST_BATCH_SIZE", -1)
+        num_worker_threads = get_int_env_var("SGLANG_MORI_NUM_WORKERS", 4)
 
-        poll_mode = None
-        qp_per_transfer = post_batch_size = num_worker_threads = None
-        if create_rdma:
-            poll_mode = PollCqMode.POLLING
-
-            # Number of RDMA Queue Pairs (QPs) used per transfer operation.
-            # Higher values can increase parallelism and bandwidth utilization.
-            # Default: 4
-            qp_per_transfer = get_int_env_var("SGLANG_MORI_QP_PER_TRANSFER", 4)
-
-            # Number of RDMA work requests posted in a single batch to each QP.
-            # Larger batch sizes reduce per-operation overhead and improve throughput
-            # at the cost of higher latency. Use -1 for automatic sizing based on
-            # the number of merged work requests and available endpoints.
-            # Default: -1 (automatic)
-            post_batch_size = get_int_env_var("SGLANG_MORI_POST_BATCH_SIZE", -1)
-
-            # Number of worker threads in the RDMA executor thread pool.
-            # Each worker handles RDMA operations on a separate CPU core (with affinity).
-            # More workers can improve parallelism for large batch transfers across
-            # multiple QPs, but excessive threads may cause contention.
-            # Default: 4
-            num_worker_threads = get_int_env_var("SGLANG_MORI_NUM_WORKERS", 4)
-
-            rdma_cfg = RdmaBackendConfig(
-                qp_per_transfer,
-                post_batch_size,
-                num_worker_threads,
-                poll_mode,
-                False,
-            )
-            engine.create_backend(BackendType.RDMA, rdma_cfg)
-
+        rdma_cfg = RdmaBackendConfig(
+            qp_per_transfer,
+            post_batch_size,
+            num_worker_threads,
+            poll_mode,
+            False,
+        )
+        engine.create_backend(BackendType.RDMA, rdma_cfg)
         actual_port = engine.get_engine_desc().port
-        if create_rdma:
-            assert actual_port > 0, f"Failed to bind port for engine {engine_key}"
+        assert actual_port > 0, f"Failed to bind port for engine {engine_key}"
         logger.debug(
-            "Initialized Mori IOEngine %s at %s:%s "
-            "(io_backend=%s, xgmi_streams=%s, xgmi_events=%s, "
-            "qp_per_transfer=%s, workers=%s, poll_mode=%s)",
+            "Initialized Mori IOEngine %s at %s:%s (qp_per_transfer=%s, workers=%s, poll_mode=%s)",
             engine_key,
             self.local_ip,
             actual_port,
-            mori_io_backend,
-            xgmi_num_streams,
-            xgmi_num_events,
             qp_per_transfer,
             num_worker_threads,
-            poll_mode.name if poll_mode is not None else None,
+            poll_mode.name,
         )
         return engine
 
@@ -800,9 +768,11 @@ class MoriKVManager(CommonKVManager):
 
         if self.is_mla_backend:
             layer_plan = self._build_contiguous_transfer_plan(grouped_plan, kv_item_len)
-            src_descs, dst_descs, layers_current_pp_stage = (
-                self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
-            )
+            (
+                src_descs,
+                dst_descs,
+                layers_current_pp_stage,
+            ) = self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
             for layer_id in range(layers_current_pp_stage):
                 statuses.extend(
                     self._submit_batch_transfer_plan(
@@ -1413,7 +1383,6 @@ class MoriKVSender(CommonKVSender):
 
 
 class MoriKVReceiver(CommonKVReceiver):
-
     def __init__(
         self,
         mgr: MoriKVManager,

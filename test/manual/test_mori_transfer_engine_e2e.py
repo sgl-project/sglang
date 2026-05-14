@@ -156,8 +156,6 @@ class TestMoriXgmiTransferEngineE2E(PDDisaggregationServerBase):
     """
 
     _PORT_DELTA = 20
-    extra_prefill_args = ["--disaggregation-mori-io-backend", "xgmi"]
-    extra_decode_args = ["--disaggregation-mori-io-backend", "xgmi"]
 
     @classmethod
     def setUpClass(cls):
@@ -181,6 +179,7 @@ class TestMoriXgmiTransferEngineE2E(PDDisaggregationServerBase):
             raise unittest.SkipTest(f"torch is not available/usable: {e}")
 
         os.environ["SGLANG_TEST_PD_DISAGG_BACKEND"] = "mori"
+        os.environ["SGLANG_MORI_USE_XGMI"] = "true"
         super().setUpClass()
 
         cls.lb_port = str(int(cls.lb_port) + cls._PORT_DELTA)
@@ -198,6 +197,7 @@ class TestMoriXgmiTransferEngineE2E(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
+        os.environ.pop("SGLANG_MORI_USE_XGMI", None)
         os.environ.pop("SGLANG_TEST_PD_DISAGG_BACKEND", None)
         super().tearDownClass()
 

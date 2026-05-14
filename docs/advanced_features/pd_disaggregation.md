@@ -345,73 +345,26 @@ python -m sglang.launch_server \
 
 ## Mori
 
-
-
-
-
-
 ### Same-Node XGMI
-
-
-
-
 
 Mori can transfer PD disaggregation KV cache over XGMI/P2P when the prefill and decode GPUs are on the same node. Use the Mori transfer backend and select the XGMI IO backend on both servers:
 
-
-
-
-
 ```bash
-
-
 python -m sglang.launch_server \
-
-
   --model-path meta-llama/Llama-3.1-8B-Instruct \
-
-
   --disaggregation-mode prefill \
-
-
   --disaggregation-transfer-backend mori \
-
-
   --disaggregation-mori-io-backend xgmi \
-
-
   --port 30000
-
-
 python -m sglang.launch_server \
-
-
   --model-path meta-llama/Llama-3.1-8B-Instruct \
-
-
   --disaggregation-mode decode \
-
-
   --disaggregation-transfer-backend mori \
-
-
   --disaggregation-mori-io-backend xgmi \
-
-
   --port 30001 \
-
-
   --base-gpu-id 1
-
-
 python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
-
-
 ```
-
-
-
-
 
 `--disaggregation-mori-io-backend xgmi` is same-node only. Use the default `rdma` backend when RDMA is preferred or when prefill and decode run on different nodes. If prefill and decode run in separate containers on the same host and their hostnames differ, set the same `MORI_IO_NODE_ID` in both containers so Mori treats the engines as same-node.
 
