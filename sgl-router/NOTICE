@@ -1,0 +1,15 @@
+sgl-router
+Copyright (c) 2026 The SGLang Authors
+Licensed under the Apache License, Version 2.0.
+
+This product includes software derived from the following projects:
+
+1. NVIDIA Dynamo (https://github.com/ai-dynamo/dynamo)
+   Copyright (c) 2025-2026 NVIDIA Corporation & Affiliates.
+   Licensed under the Apache License, Version 2.0.
+   Used as a crate dependency (dynamo-protocols, dynamo-tokenizers, dynamo-parsers).
+
+2. sgl-model-gateway (https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway)
+   Copyright (c) The SGLang Authors.
+   Licensed under the Apache License, Version 2.0.
+   Code is ported on a file-by-file basis with original SPDX headers preserved.
