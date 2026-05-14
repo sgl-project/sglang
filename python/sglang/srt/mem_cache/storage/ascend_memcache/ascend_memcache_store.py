@@ -18,6 +18,7 @@ import tempfile
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, List, Optional, Tuple
 
@@ -38,19 +39,6 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 SETUP_TIMEOUT = 600  # seconds
-# Temporary bring-up mode: disable warmup probe to avoid startup failure on
-# environments where memcache put path is unstable during initialization.
-ENABLE_ASCEND_MEMCACHE_WARMUP = False
-DEFAULT_ASCEND_MEMCACHE_TRACE_LOGGING = True
-# <= 0 means no limit (print all keys).
-DEFAULT_ASCEND_MEMCACHE_TRACE_MAX_KEYS = 0
-DEFAULT_ASCEND_MEMCACHE_PRINT_SAMPLE_KEYS = False
-DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_KEYS = False
-DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_MAX_HIT = True
-DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS = False
-DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_POST_EXIST = False
-DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_RESULT_BOOLS = False
-DEFAULT_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN = True
 DEFAULT_ASCEND_MEMCACHE_TRACE_FILE_NAME = "ascend_memcache_trace.log"
 _HYBM_WARN_FRAGMENT = "HYBM hybm_va_manager.cpp:173 GetRank] No allocated spaces found."
 
@@ -69,10 +57,8 @@ _MEMCACHE_CTRL_KEYS = frozenset(
     }
 )
 
-from dataclasses import dataclass
 
 @dataclass
-
 class AscendMemcacheConfig:
     """
     Encapsulates MemCache configuration by merging a JSON file and `extra_config`, 
@@ -169,6 +155,7 @@ class AscendMemcacheStore(HiCacheStorage):
                     "memcache_hybrid.DistributedObjectStore.setup failed"
                 )
 
+            ctrl = config.ctrl
             device_id = int(ctrl.get("device_id", 0))
             init_bm = bool(ctrl.get("init_bm", True))
             if self.store.init(device_id, init_bm) != 0:
@@ -187,9 +174,11 @@ class AscendMemcacheStore(HiCacheStorage):
                 logger.info(
                     "Memcache init_bm is False; skip warmup because read/write is unavailable in pure client mode."
                 )
-            elif not ENABLE_ASCEND_MEMCACHE_WARMUP:
+            elif not envs.SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP.get():
                 logger.warning(
-                    "Ascend memcache warmup is temporarily disabled for bring-up."
+                    "Ascend memcache warmup is disabled "
+                    f"({envs.SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP.name}=0). "
+                    "Set it to true to run the register-time warmup probe."
                 )
             self._init_runtime_fields(storage_config)
 
@@ -247,47 +236,26 @@ class AscendMemcacheStore(HiCacheStorage):
         self.backup_pgs = []
         self.prefetch_bandwidth = []
         self.backup_bandwidth = []
-        self.enable_trace_logging = os.getenv(
-            "SGLANG_ASCEND_MEMCACHE_TRACE_LOGGING",
-            "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_LOGGING else "0",
-        ).lower() in ("1", "true", "yes", "on")
-        self.trace_max_keys = int(
-            os.getenv(
-                "SGLANG_ASCEND_MEMCACHE_TRACE_MAX_KEYS",
-                str(DEFAULT_ASCEND_MEMCACHE_TRACE_MAX_KEYS),
-            )
+        self.enable_trace_logging = envs.SGLANG_ASCEND_MEMCACHE_TRACE_LOGGING.get()
+        self.trace_max_keys = envs.SGLANG_ASCEND_MEMCACHE_TRACE_MAX_KEYS.get()
+        self.print_sample_keys = envs.SGLANG_ASCEND_MEMCACHE_PRINT_SAMPLE_KEYS.get()
+        self.trace_batch_exists_keys = (
+            envs.SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_KEYS.get()
         )
-        self.print_sample_keys = os.getenv(
-            "SGLANG_ASCEND_MEMCACHE_PRINT_SAMPLE_KEYS",
-            "1" if DEFAULT_ASCEND_MEMCACHE_PRINT_SAMPLE_KEYS else "0",
-        ).lower() in ("1", "true", "yes", "on")
-        self.trace_batch_exists_keys = os.getenv(
-            "SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_KEYS",
-            "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_KEYS else "0",
-        ).lower() in ("1", "true", "yes", "on")
-        self.trace_batch_exists_max_hit = os.getenv(
-            "SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_MAX_HIT",
-            "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_MAX_HIT else "0",
-        ).lower() in ("1", "true", "yes", "on")
-        self.trace_batch_put_keys = os.getenv(
-            "SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS",
-            "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS else "0",
-        ).lower() in ("1", "true", "yes", "on")
-        self.trace_batch_put_post_exist = os.getenv(
-            "SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_POST_EXIST",
-            "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_POST_EXIST else "0",
-        ).lower() in ("1", "true", "yes", "on")
-        self.trace_batch_put_result_bools = os.getenv(
-            "SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_RESULT_BOOLS",
-            "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_RESULT_BOOLS else "0",
-        ).lower() in ("1", "true", "yes", "on")
-        self.suppress_hybm_warn = os.getenv(
-            "SGLANG_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN",
-            "1" if DEFAULT_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN else "0",
-        ).lower() in ("1", "true", "yes", "on")
-        self.trace_log_path = os.getenv(
-            "SGLANG_ASCEND_MEMCACHE_TRACE_LOG_PATH",
-            os.path.join(os.path.dirname(__file__), DEFAULT_ASCEND_MEMCACHE_TRACE_FILE_NAME),
+        self.trace_batch_exists_max_hit = (
+            envs.SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_MAX_HIT.get()
+        )
+        self.trace_batch_put_keys = envs.SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS.get()
+        self.trace_batch_put_post_exist = (
+            envs.SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_POST_EXIST.get()
+        )
+        self.trace_batch_put_result_bools = (
+            envs.SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_RESULT_BOOLS.get()
+        )
+        self.suppress_hybm_warn = envs.SGLANG_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN.get()
+        trace_path = envs.SGLANG_ASCEND_MEMCACHE_TRACE_LOG_PATH.get()
+        self.trace_log_path = trace_path or os.path.join(
+            os.path.dirname(__file__), DEFAULT_ASCEND_MEMCACHE_TRACE_FILE_NAME
         )
         logger.warning(
             "[AscendMemcacheTraceInit] enabled=%s max_keys=%s print_sample_keys=%s batch_exists_keys=%s batch_exists_max_hit=%s batch_put_keys=%s batch_put_post_exist=%s batch_put_result_bools=%s trace_log_path=%s suppress_hybm_warn=%s",
@@ -445,7 +413,7 @@ class AscendMemcacheStore(HiCacheStorage):
             if getattr(self.mem_pool_host, "index_k_buffer", None) is not None:
                 self.register_buffer(self.mem_pool_host.index_k_buffer)
 
-        if ENABLE_ASCEND_MEMCACHE_WARMUP:
+        if envs.SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP.get():
             self.warmup()
             logger.info("Ascend memcache store warmup completed successfully.")
 
