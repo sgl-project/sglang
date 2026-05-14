@@ -280,6 +280,7 @@ jobs:
   # Runs on 5090 (32GB, SM120)
   stage-a-test-1-gpu-small:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-a-test-1-gpu-small
@@ -368,6 +369,7 @@ jobs:
   # Runs on 5090 (32GB, SM120)
   stage-b-test-1-gpu-small:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-b-test-1-gpu-small
@@ -384,6 +386,7 @@ jobs:
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   stage-b-test-1-gpu-large:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-b-test-1-gpu-large
@@ -400,6 +403,7 @@ jobs:
 
   stage-b-test-2-gpu-large:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-b-test-2-gpu-large
@@ -415,6 +419,7 @@ jobs:
 
   stage-b-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-b-test-4-gpu-b200
@@ -465,6 +470,7 @@ jobs:
 
   stage-c-test-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-c-test-4-gpu-h100
@@ -480,6 +486,7 @@ jobs:
 
   stage-c-test-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-c-test-8-gpu-h200
@@ -497,6 +504,7 @@ jobs:
 
   stage-c-test-8-gpu-h20:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-c-test-8-gpu-h20
@@ -512,6 +520,7 @@ jobs:
 
   stage-c-test-deepep-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-c-test-deepep-4-gpu-h100
@@ -529,6 +538,7 @@ jobs:
 
   stage-c-test-deepep-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-c-test-deepep-8-gpu-h200
@@ -547,6 +557,7 @@ jobs:
 
   stage-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-c-test-4-gpu-b200
@@ -563,6 +574,7 @@ jobs:
 
   stage-c-test-dsv4-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-c-test-dsv4-4-gpu-b200
@@ -579,6 +591,7 @@ jobs:
 
   stage-c-test-dsv4-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: stage-c-test-dsv4-8-gpu-h200
