@@ -279,21 +279,23 @@ class TokenBlockMatchProvider(FuzzyMatchProvider):
             )
             return None
 
-        # Filter to candidates anchored at the variant's prefix boundary
-        # (query_start == 0). SGLang's device_indices contract is
-        # contiguous from the exact-prefix boundary, so a match that
-        # starts mid-query would silently claim positions [0..N-1] are
-        # cached when only [query_start..query_start+N-1] really are.
-        prefix_anchored = [c for c in candidates if c[2] == 0]
-        if not prefix_anchored:
+        # Pick the longest candidate. If it's anchored at variant
+        # position 0 the result is exact; if it's mid-query we re-anchor
+        # it at the prefix boundary and rely on RadixCache's realization
+        # path (driven by cached_start_pos != exact_matched_len below)
+        # to copy donor KV into fresh slots with RoPE correction. The
+        # recipient's K/V at positions [0..query_start-1] then disagree
+        # with the donor's view, a known quality trade-off shared with
+        # SemBlend's option-β path; the alternative is dropping every
+        # non-prefix literal match and never firing on realistic
+        # question + shared-article workloads.
+        matched_len, entry, query_start, donor_start = candidates[0]
+        if query_start != 0:
             logger.info(
-                f"[FUZZY MATCH] ✗ No prefix-anchored match (longest match "
-                f"started mid-query at offset>0; dropped to keep KV reuse "
-                f"semantically correct)"
+                f"[FUZZY MATCH] re-anchoring mid-query match "
+                f"(query_start={query_start}, donor_start={donor_start}, "
+                f"matched_len={matched_len}); RadixCache will RoPE-correct"
             )
-            return None
-
-        matched_len, entry, _, donor_start = prefix_anchored[0]
 
         if matched_len < self.min_match_length:
             logger.info(
