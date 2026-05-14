@@ -70,6 +70,10 @@ def _allowed_token_ids(vocab_mask, token_ids):
     return allowed
 
 
+def _allowed_dense_token_ids(vocab_mask, token_ids):
+    return [token_id for token_id in token_ids if not vocab_mask[0, token_id].item()]
+
+
 class TestReasonerGrammarObject(unittest.TestCase):
     def _make_strict_object(self):
         return ReasonerGrammarObject(
@@ -161,6 +165,43 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         self.assertTrue(obj.enable_token_filter)
         self.assertEqual(obj.max_think_tokens, 2)
         self.assertEqual(obj.think_excluded_token_ids, [3, 4])
+
+    def test_init_strict_reasoning_grammar_supports_llguidance_masks(self):
+        from sglang.srt.constrained.llguidance_backend import GuidanceBackend
+
+        os.environ["SGLANG_MAX_THINK_TOKENS"] = "0"
+        backend = GuidanceBackend.__new__(GuidanceBackend)
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            self._make_tokenizer(),
+            enable_strict_thinking=True,
+        )
+
+        obj = reasoner.init_strict_reasoning_grammar(reasoning=True)
+        mask = obj.allocate_vocab_mask(65, 1, "cpu")
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertEqual(mask.shape, (1, 3))
+        self.assertEqual(_allowed_token_ids(mask, [0, 1, 2, 3, 4, 7]), [2])
+
+    def test_init_strict_reasoning_grammar_supports_outlines_masks(self):
+        from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
+
+        os.environ["SGLANG_MAX_THINK_TOKENS"] = "0"
+        backend = OutlinesGrammarBackend.__new__(OutlinesGrammarBackend)
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            self._make_tokenizer(),
+            enable_strict_thinking=True,
+        )
+
+        obj = reasoner.init_strict_reasoning_grammar(reasoning=True)
+        mask = obj.allocate_vocab_mask(8, 1, "cpu")
+        obj.fill_vocab_mask(mask, 0)
+
+        self.assertEqual(_allowed_dense_token_ids(mask, [0, 1, 2, 3, 4, 7]), [2])
 
     def test_init_strict_reasoning_grammar_none_when_strict_disabled(self):
         backend = _DummyGrammarBackend(support_token_filter=True)
