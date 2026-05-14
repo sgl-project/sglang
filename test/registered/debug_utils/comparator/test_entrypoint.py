@@ -285,7 +285,7 @@ class TestEntrypointGroupingRaw:
         assert summary.total == 2
         assert summary.passed == 2
 
-    def test_text_output_smoke(self, tmp_path, capsys):
+    def test_text_output_format(self, tmp_path, capsys):
         """Text output format renders without errors and contains Config/Summary sections."""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
         argv = _make_argv(

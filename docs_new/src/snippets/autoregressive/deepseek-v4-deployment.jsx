@@ -7,6 +7,7 @@ export const DeepSeekV4Deployment = () => {
   //     GB200 → FP4 weights, Flash TP=4 / Pro TP=8 2-node
   //     GB300 → FP4 weights, Flash TP=4 / Pro TP=4 single-node
   //     H200  → FP8 weights, Flash TP=4 / Pro TP=16 2-node
+  //     H100  → FP4 weights (Marlin), Flash TP=8 single-node / Pro TP=16 2-node
   //   Model variant → HF slug:
   //     Flash (285B) → deepseek-ai/DeepSeek-V4-Flash
   //     Pro   (1.6T) → deepseek-ai/DeepSeek-V4-Pro
@@ -31,6 +32,8 @@ export const DeepSeekV4Deployment = () => {
         { id: "gb200", label: "GB200 (FP4)", default: false },
         { id: "gb300", label: "GB300 (FP4)", default: false },
         { id: "h200",  label: "H200 (FP8)",  default: false },
+        { id: "h200-fp4", label: "H200 (FP4)", default: false },
+        { id: "h100", label: "H100 (FP4)", default: false },
       ],
     },
     modelSize: {
@@ -70,7 +73,22 @@ export const DeepSeekV4Deployment = () => {
     },
   };
 
-  const resolveItems = (option) => option.items;
+  // Recipes that are not supported on the Marlin (FP4) Hopper paths
+  // (H200 FP4, H100 FP4).
+  const MARLIN_UNSUPPORTED_RECIPES = new Set(["cp", "pd-disagg"]);
+  const MARLIN_HARDWARE = new Set(["h200-fp4", "h100"]);
+  const MARLIN_LABEL = { "h200-fp4": "H200 (FP4)", h100: "H100 (FP4)" };
+
+  const resolveItems = (option, vals) => {
+    if (option.name === "recipe" && vals && MARLIN_HARDWARE.has(vals.hardware)) {
+      return option.items.map((it) =>
+        MARLIN_UNSUPPORTED_RECIPES.has(it.id)
+          ? { ...it, disabled: true, disabledReason: `Not supported on ${MARLIN_LABEL[vals.hardware]}` }
+          : it
+      );
+    }
+    return option.items;
+  };
 
   const getInitialState = () => {
     const initialState = {};
@@ -104,7 +122,20 @@ export const DeepSeekV4Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      // Switching to a Marlin (FP4) Hopper path while cp / pd-disagg is
+      // selected: fall back to low-latency since those recipes are not
+      // supported on Marlin.
+      if (
+        optionName === "hardware" &&
+        MARLIN_HARDWARE.has(value) &&
+        MARLIN_UNSUPPORTED_RECIPES.has(next.recipe)
+      ) {
+        next.recipe = "low-latency";
+      }
+      return next;
+    });
   };
 
   // ============================================================================
@@ -147,6 +178,15 @@ export const DeepSeekV4Deployment = () => {
     // repackagings for both variants.
     "h200|small":  { slug: "sgl-project/DeepSeek-V4-Flash-FP8",        tp: 4,  multinode: false },
     "h200|big":    { slug: "sgl-project/DeepSeek-V4-Pro-FP8",          tp: 16, multinode: true, nnodes: 2 },
+    // H200 (FP4) runs the original FP4-mixed Instruct repos through the Marlin
+    // MoE runner: experts are dequantized from FP4 to FP16 at runtime, so a
+    // single-node TP=4 / TP=8 deployment fits Flash / Pro on Hopper.
+    "h200-fp4|small": { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4, multinode: false },
+    "h200-fp4|big":   { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 8, multinode: false },
+    // H100 (FP4) also uses the Marlin runner, but Hopper memory pressure forces
+    // a higher TP: Flash fits at TP=8 single-node, Pro needs TP=16 across 2 nodes.
+    "h100|small":  { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 8,  multinode: false },
+    "h100|big":    { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 16, multinode: true, nnodes: 2 },
   };
   // Per (hardware, modelSize) PD role TP (from allinone _PD_SPEC).
   const PD_TP_SPEC = {
@@ -180,8 +220,11 @@ export const DeepSeekV4Deployment = () => {
     "h200|small|balanced",
     "h200|small|max-throughput",
     "gb300|small|low-latency",
+    "gb300|big|low-latency",
     "gb300|small|balanced",
+    "gb300|big|balanced",
     "gb300|small|max-throughput",
+    "gb300|big|max-throughput",
     "h200|small|cp",
     "h200|small|pd-disagg",
     "h200|big|low-latency",
@@ -199,6 +242,18 @@ export const DeepSeekV4Deployment = () => {
     "gb200|big|low-latency",
     "gb200|big|balanced",
     "gb200|big|max-throughput",
+    "h200-fp4|small|low-latency",
+    "h200-fp4|small|balanced",
+    "h200-fp4|small|max-throughput",
+    "h200-fp4|big|low-latency",
+    "h200-fp4|big|balanced",
+    "h200-fp4|big|max-throughput",
+    "h100|small|low-latency",
+    "h100|small|balanced",
+    "h100|small|max-throughput",
+    "h100|big|low-latency",
+    "h100|big|balanced",
+    "h100|big|max-throughput",
   ]);
   // Recipes whose command is intentionally not yet provided (e.g. blocked by an
   // upstream limitation). Showing a minimal placeholder is friendlier to users
@@ -252,9 +307,102 @@ export const DeepSeekV4Deployment = () => {
       return buildPDDisaggCommand(hardware, modelSize);
     }
 
+    // H200 (FP4) Marlin path: dedicated branch — Hopper runs the FP4-mixed
+    // Instruct repos through the Marlin MoE runner, so it doesn't share envs
+    // or flags with either the FP8 H200 path or the Blackwell paths.
+    //   Flash: TP=4, single node       Pro: TP=8, single node
+    //   low-latency:    MTP 3 / 1 / 4 (steps / topk / draft-tokens)
+    //   balanced:       MTP 1 / 1 / 2
+    //   max-throughput: MTP disabled
+    if (hardware === "h200-fp4") {
+      const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+      if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
+
+      const fp4Flags = [
+        "  --trust-remote-code",
+        `  --model-path ${slug}`,
+        `  --tp ${tp}`,
+        "  --moe-runner-backend marlin",
+      ];
+      if (recipe === "low-latency") {
+        fp4Flags.push("  --speculative-algo EAGLE");
+        fp4Flags.push("  --speculative-num-steps 3");
+        fp4Flags.push("  --speculative-eagle-topk 1");
+        fp4Flags.push("  --speculative-num-draft-tokens 4");
+      } else if (recipe === "balanced") {
+        fp4Flags.push("  --speculative-algo EAGLE");
+        fp4Flags.push("  --speculative-num-steps 1");
+        fp4Flags.push("  --speculative-eagle-topk 1");
+        fp4Flags.push("  --speculative-num-draft-tokens 2");
+      }
+      if (isBig) fp4Flags.push("  --mem-fraction-static 0.88");
+      if (toolcall === "enabled") fp4Flags.push("  --tool-call-parser deepseekv4");
+      if (reasoningParser === "enabled") fp4Flags.push("  --reasoning-parser deepseek-v4");
+      fp4Flags.push("  --host 0.0.0.0");
+      fp4Flags.push("  --port 30000");
+
+      const fp4Cmd = `sglang serve \\\n${fp4Flags.join(" \\\n")}`;
+      return VERIFIED_RECIPES.has(verifyKey)
+        ? fp4Cmd
+        : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(fp4Cmd)}`;
+    }
+
+    // H100 (FP4) Marlin path: also Hopper + Marlin, but unlike H200 (FP4) the
+    // memory budget forces a higher TP and (for Pro) a 2-node deployment.
+    //   Flash: TP=8, single node
+    //   Pro:   TP=16, 2 nodes, env SGLANG_SHARED_EXPERT_TP1=1
+    //          + mem-fraction-static 0.9; cg=8 / max-run=32 on low-lat/balanced
+    //   low-latency:    MTP 3 / 1 / 4 (steps / topk / draft-tokens)
+    //   balanced:       MTP 1 / 1 / 2
+    //   max-throughput: MTP disabled
+    if (hardware === "h100") {
+      const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+      if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
+
+      const h100Env = isBig ? ["SGLANG_SHARED_EXPERT_TP1=1"] : [];
+      const h100EnvBlock = h100Env.length ? h100Env.join(" \\\n") + " \\\n" : "";
+
+      const h100Flags = [
+        "  --trust-remote-code",
+        `  --model-path ${slug}`,
+        `  --tp ${tp}`,
+      ];
+      if (multinode) h100Flags.push(...multiNodeFlags(nnodes));
+      h100Flags.push("  --moe-runner-backend marlin");
+      if (recipe === "low-latency") {
+        h100Flags.push("  --speculative-algo EAGLE");
+        h100Flags.push("  --speculative-num-steps 3");
+        h100Flags.push("  --speculative-eagle-topk 1");
+        h100Flags.push("  --speculative-num-draft-tokens 4");
+      } else if (recipe === "balanced") {
+        h100Flags.push("  --speculative-algo EAGLE");
+        h100Flags.push("  --speculative-num-steps 1");
+        h100Flags.push("  --speculative-eagle-topk 1");
+        h100Flags.push("  --speculative-num-draft-tokens 2");
+      }
+      if (isBig) {
+        h100Flags.push("  --mem-fraction-static 0.9");
+        // max-throughput leaves cg/max-run at engine defaults; low-lat + balanced
+        // cap them tight to keep latency predictable on Hopper.
+        if (recipe !== "max-throughput") {
+          h100Flags.push("  --cuda-graph-max-bs 8");
+          h100Flags.push("  --max-running-requests 32");
+        }
+      }
+      if (toolcall === "enabled") h100Flags.push("  --tool-call-parser deepseekv4");
+      if (reasoningParser === "enabled") h100Flags.push("  --reasoning-parser deepseek-v4");
+      h100Flags.push("  --host 0.0.0.0");
+      h100Flags.push("  --port 30000");
+
+      const h100Cmd = `${h100EnvBlock}sglang serve \\\n${h100Flags.join(" \\\n")}`;
+      const h100WithNote = multinode ? prependMultiNodeNote(h100Cmd, nnodes) : h100Cmd;
+      return VERIFIED_RECIPES.has(verifyKey)
+        ? h100WithNote
+        : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(h100WithNote)}`;
+    }
+
     // ---- env ----
     // _LAUNCH_HEAD always prepends these:
-    const COMMON_ENV = ["SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
     // Per-hardware env (whitelist #1: NVSHMEM removed for B200).
     const HW_ENV = {
       h200:  ["SGLANG_DSV4_FP4_EXPERTS=0"],   // allinone _ENV_H200
@@ -273,22 +421,71 @@ export const DeepSeekV4Deployment = () => {
       } else if (hardware === "gb200" && isBig) {
         recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
       }
+      // B200/B300 Pro accuracy-verified env vars.
+      if (isBig && hardware === "b200") {
+        recipeEnv.push(
+          "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
+          "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
+          "SGLANG_OPT_USE_JIT_NORM=1",
+          "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
+          "SGLANG_OPT_USE_TOPK_V2=1",
+          "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
+        );
+      }
     } else if (recipe === "balanced") {
       if (hardware === "h200") {
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
+      } else if (isBig && hardware === "b200") {
+        // B200/B300 Pro accuracy-verified env vars.
+        recipeEnv.push(
+          "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
+          "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
+          "SGLANG_OPT_USE_JIT_NORM=1",
+          "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
+          "SGLANG_OPT_USE_TOPK_V2=1",
+          "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
+          "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN=1",
+          "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=0",
+          "SGLANG_OPT_USE_FAST_MASK_EP=1",
+          "SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1",
+          "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
+          "SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1",
+          "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
+        );
       } else {
-        // Blackwell: small=1024, big=256 (allinone ternary).
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       }
     } else if (recipe === "max-throughput") {
       if (hardware === "h200") {
+        if (!isBig) {
+          recipeEnv.push("SGLANG_JIT_DEEPGEMM_PRECOMPILE=0");
+        }
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
+      } else if (isBig && hardware === "b200") {
+        // B200/B300 Pro accuracy-verified env vars.
+        recipeEnv.push(
+          "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
+          "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
+          "SGLANG_OPT_USE_JIT_NORM=1",
+          "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
+          "SGLANG_OPT_USE_TOPK_V2=1",
+          "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
+          "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN=1",
+          "SGLANG_OPT_USE_FAST_MASK_EP=1",
+          "SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1",
+          "SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1",
+          "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
+          "NVSHMEM_DISABLE_IB=1",
+          "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1",
+          "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1",
+          "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+        );
       } else {
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
@@ -344,10 +541,17 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --speculative-eagle-topk 1");
       flags.push("  --speculative-num-draft-tokens 4");
       if (hardware !== "h200") {
-        flags.push("  --chunked-prefill-size 4096");
+        // B200/B300 Pro accuracy-verified: chunked-prefill-size 8192
+        flags.push(isBig ? "  --chunked-prefill-size 8192" : "  --chunked-prefill-size 4096");
         flags.push("  --disable-flashinfer-autotune");
+        flags.push("  --swa-full-tokens-ratio 0.1");
       }
-      if (isBig) flags.push("  --mem-fraction-static 0.88");
+      // B200/B300 Pro accuracy-verified: mem-fraction-static 0.90
+      if (isBig && hardware !== "h200") {
+        flags.push("  --mem-fraction-static 0.90");
+      } else if (isBig) {
+        flags.push("  --mem-fraction-static 0.88");
+      }
     } else if (recipe === "balanced") {
       // allinone balanced: TP + DP + DP-attn + DeepEP + MTP_112.
       //   H200 small: cg=128 max-run=128  |  H200 big: cg=128 max-run=128 (same)
@@ -357,17 +561,27 @@ export const DeepSeekV4Deployment = () => {
       flags.push(`  --dp ${tp}`);
       flags.push("  --enable-dp-attention");
       if (multinode) flags.push(...multiNodeFlags(nnodes));
-      flags.push("  --moe-a2a-backend deepep");
+      // B200/B300 Pro accuracy-verified: flashinfer_mxfp4 (not deepep) for balanced.
+      if (isBig && hardware === "b200") {
+        flags.push("  --moe-runner-backend flashinfer_mxfp4");
+        flags.push("  --disable-flashinfer-autotune");
+        flags.push("  --chunked-prefill-size 32768");
+        flags.push("  --swa-full-tokens-ratio 0.1");
+      } else {
+        flags.push("  --moe-a2a-backend deepep");
+      }
       flags.push("  --speculative-algo EAGLE");
       flags.push("  --speculative-num-steps 1");
       flags.push("  --speculative-eagle-topk 1");
       flags.push("  --speculative-num-draft-tokens 2");
       if (hardware === "h200" && isBig) {
         flags.push("  --mem-fraction-static 0.88");
+      } else if (isBig && hardware === "gb300") {
+        flags.push("  --mem-fraction-static 0.9");
       } else if (isBig && hardware === "gb200") {
         flags.push("  --mem-fraction-static 0.78");
       } else if (isBig) {
-        flags.push("  --mem-fraction-static 0.82");
+        flags.push("  --mem-fraction-static 0.92");
       }
       if (hardware === "h200" && isBig) {
         flags.push("  --cuda-graph-max-bs 8");
@@ -376,8 +590,7 @@ export const DeepSeekV4Deployment = () => {
         flags.push("  --cuda-graph-max-bs 128");
         flags.push("  --max-running-requests 128");
       } else if (isBig && hardware === "b200") {
-        flags.push("  --cuda-graph-max-bs 64");
-        flags.push("  --max-running-requests 128");
+        flags.push("  --cuda-graph-max-bs 256");
       } else if (isBig && hardware === "gb300") {
         flags.push("  --cuda-graph-max-bs 128");
         flags.push("  --max-running-requests 256");
@@ -400,17 +613,23 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --moe-a2a-backend deepep");
       if (hardware === "h200" && isBig) {
         flags.push("  --mem-fraction-static 0.88");
+      } else if (isBig && hardware === "gb300") {
+        flags.push("  --mem-fraction-static 0.9");
       } else if (isBig && hardware === "gb200") {
         flags.push("  --mem-fraction-static 0.78");
       } else if (isBig) {
-        flags.push("  --mem-fraction-static 0.82");
+        flags.push("  --mem-fraction-static 0.835");
       }
       if (hardware === "h200") {
         flags.push("  --cuda-graph-max-bs 128");
         flags.push("  --max-running-requests 256");
       } else if (isBig && hardware === "b200") {
-        flags.push("  --cuda-graph-max-bs 64");
-        flags.push("  --max-running-requests 256");
+        // B200/B300 Pro accuracy-verified max-throughput config.
+        flags.push("  --cuda-graph-max-bs 544");
+        flags.push("  --swa-full-tokens-ratio 0.075");
+        flags.push("  --chunked-prefill-size 65536");
+        flags.push("  --tokenizer-worker-num 8");
+        flags.push("  --enable-prefill-delayer");
       } else if (isBig && hardware === "gb300") {
         flags.push("  --cuda-graph-max-bs 128");
         flags.push("  --max-running-requests 256");
@@ -460,10 +679,15 @@ export const DeepSeekV4Deployment = () => {
     flags.push("  --host 0.0.0.0");
     flags.push("  --port 30000");
 
-    // Assemble: [HW env] [recipe env] [common env] \ sglang serve \ flags...
-    const envAll = [...HW_ENV, ...recipeEnv, ...COMMON_ENV];
+    // Assemble: [HW env] [recipe env] \ sglang serve \ flags...
+    const envAll = [...HW_ENV, ...recipeEnv];
     const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
-    const base = `${envBlock}sglang serve \\\n${flags.join(" \\\n")}`;
+    // B200/B300 Pro recipes carry many accuracy-verified env vars that will be
+    // consolidated; prepend a shell comment so users know these are temporary.
+    const simplifyNote = (isBig && hardware === "b200" && recipeEnv.length > 2)
+      ? "# flags will be simplified\n"
+      : "";
+    const base = `${simplifyNote}${envBlock}sglang serve \\\n${flags.join(" \\\n")}`;
     // GB200 multinode may need machine-specific NVSHMEM / Gloo env vars;
     // emit them as commented hints above the env block so users know to check.
     let cmd = base;
@@ -476,6 +700,38 @@ export const DeepSeekV4Deployment = () => {
         cmd;
     }
     const withMultinode = multinode ? prependMultiNodeNote(cmd, nnodes) : cmd;
+
+    // H200 Pro low-latency: show BOTH a single-node (TP=8 marlin) variant
+    // and the existing multi-node (TP=16 DP-attn + DeepEP) variant.
+    if (hardware === "h200" && isBig && recipe === "low-latency") {
+      const singleFlags = [
+        "  --trust-remote-code",
+        "  --model-path deepseek-ai/DeepSeek-V4-Pro",
+        "  --tp 8",
+        "  --moe-runner-backend marlin",
+        "  --speculative-algo EAGLE",
+        "  --speculative-num-steps 3",
+        "  --speculative-eagle-topk 1",
+        "  --speculative-num-draft-tokens 4",
+        "  --chunked-prefill-size 4096",
+        "  --disable-flashinfer-autotune",
+        "  --mem-fraction-static 0.88",
+      ];
+      if (toolcall === "enabled") singleFlags.push("  --tool-call-parser deepseekv4");
+      if (reasoningParser === "enabled") singleFlags.push("  --reasoning-parser deepseek-v4");
+      singleFlags.push("  --host 0.0.0.0");
+      singleFlags.push("  --port 30000");
+      const singleNodeCmd = `sglang serve \\\n${singleFlags.join(" \\\n")}`;
+      const combined =
+        `# --- Single-Node (TP=8, Marlin) ---\n${singleNodeCmd}\n\n` +
+        `# --- Multi-Node (2 nodes, TP=16, DP-Attn + DeepEP) ---\n${withMultinode}`;
+      const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+      if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
+      return VERIFIED_RECIPES.has(verifyKey)
+        ? combined
+        : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(combined)}`;
+    }
+
     const verifyKey = `${hardware}|${modelSize}|${recipe}`;
     if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
     return VERIFIED_RECIPES.has(verifyKey)
@@ -520,7 +776,6 @@ export const DeepSeekV4Deployment = () => {
     // NCCL_MNNVL_ENABLE / NCCL_CUMEM_ENABLE may also be needed depending on the
     // GB300 cluster's NVLink/IB topology — see §3.2 "Configuration Tips" note.
     const MNNVL_ENV = isGB300 ? ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True"] : [];
-    const COMMON_ENV = ["SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
 
     const buildRole = (mode, port, distPort) => {
       const roleEnv = [];
@@ -545,7 +800,7 @@ export const DeepSeekV4Deployment = () => {
       if (hardware === "h200" && modelSize === "big") {
         roleEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128");
       }
-      const envAll = [...HW_ENV, ...roleEnv, ...MNNVL_ENV, ...COMMON_ENV];
+      const envAll = [...HW_ENV, ...roleEnv, ...MNNVL_ENV];
       const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
 
       const flags = [];
@@ -588,7 +843,7 @@ export const DeepSeekV4Deployment = () => {
         // headroom for DeepEP buffer + mooncake KV recv + CG private pool.
         // Cookbook defaults (mem-frac 0.874, cg_max_bs 512, max-running 256)
         // OOM during CG capture. mem-frac sweep at 0.83 / 0.87 / 0.89 / 0.91
-        // all pass static smoke; 0.9 picked as the default — leaves
+        // all pass static validation; 0.9 picked as the default — leaves
         // ~14 GB / GPU post-CG headroom for mooncake transfer + activation
         // peaks while giving ~1M-token KV pool.
         if (isGB300 && modelSize === "big") {
@@ -688,7 +943,7 @@ python3 -m sglang_router.launch_router \\
   return (
     <div style={containerStyle} className="not-prose">
       {Object.entries(options).map(([key, option]) => {
-        const items = resolveItems(option);
+        const items = resolveItems(option, values);
         return (
           <div key={key} style={cardStyle}>
             <div style={titleStyle}>{option.title}</div>
@@ -727,6 +982,31 @@ python3 -m sglang_router.launch_router \\
       <div style={cardStyle}>
         <div style={titleStyle}>Run this Command:</div>
         <pre style={commandDisplayStyle}>{generateCommand()}</pre>
+      </div>
+      <div style={{ padding: "12px 16px", background: isDark ? "#1a2332" : "#f0f7ff", borderRadius: "6px", border: `1px solid ${isDark ? "#2d4a6f" : "#c8ddf5"}`, fontSize: "13px", lineHeight: "1.6", color: isDark ? "#c8ddf5" : "#1e3a5f" }}>
+        <strong style={{ display: "block", marginBottom: "6px" }}>Enabling MegaMoE</strong>
+        <p style={{ margin: "0" }}>
+          MegaMoE fuses expert dispatch + GEMM into a single kernel for higher throughput on MoE layers.
+          It is currently verified on B200/B300 Pro (balanced &amp; max-throughput recipes above).
+          We have not yet tested the full hardware/recipe matrix, but it should work on other platforms (GB200, GB300, Flash).
+          To enable it, add the flag and env vars:
+        </p>
+        <pre style={{ margin: "8px 0 0 0", padding: "8px 12px", background: isDark ? "#111827" : "#f5f5f5", borderRadius: "4px", fontSize: "12px", lineHeight: "1.5", overflowX: "auto" }}>{
+`# Add this flag to the sglang serve command:
+--moe-a2a-backend deepep
+
+# And set these env vars:
+SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1
+SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1
+SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1
+SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320
+SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0`
+        }</pre>
+        <p style={{ margin: "6px 0 0 0", fontSize: "12px", opacity: 0.85, lineHeight: "1.8" }}>
+          Adjust <code>SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK</code> based on your chunked prefill size (e.g. 4096 for balanced, 8320 for max-throughput).<br/>
+          <code>SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0</code> — if your config mentions DeepEP dispatch buffer constraints, they do not apply when this is set to 0.<br/>
+          These flags are expected to be simplified in a future release.
+        </p>
       </div>
     </div>
   );

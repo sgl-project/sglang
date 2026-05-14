@@ -32,6 +32,16 @@ on:
         required: false
         type: boolean
         default: true
+      build_b300_dev:
+        description: "Build and push the B300 image from the deepseek_v4_dev branch."
+        required: false
+        type: boolean
+        default: true
+      build_grace_blackwell_dev:
+        description: "Build and push the Grace Blackwell (ARM) image from the deepseek_v4_dev branch."
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: release-docker-deepseek-v4-${{ inputs.repository }}
@@ -50,19 +60,27 @@ jobs:
           BUILD_BLACKWELL: ${{ inputs.build_blackwell }}
           BUILD_B300: ${{ inputs.build_b300 }}
           BUILD_GRACE_BLACKWELL: ${{ inputs.build_grace_blackwell }}
+          BUILD_B300_DEV: ${{ inputs.build_b300_dev }}
+          BUILD_GRACE_BLACKWELL_DEV: ${{ inputs.build_grace_blackwell_dev }}
         run: |
           entries=()
           if [ "$BUILD_HOPPER" = "true" ]; then
-            entries+=('{"runner":"x64-docker-build-node","platform":"linux/amd64","dockerfile":"docker/deepseek_v4_h200.Dockerfile","tag":"deepseek-v4-hopper"}')
+            entries+=('{"runner":"x64-docker-build-node","platform":"linux/amd64","dockerfile":"docker/deepseek_v4_h200.Dockerfile","tag":"deepseek-v4-hopper","branch":"deepseek_v4"}')
           fi
           if [ "$BUILD_BLACKWELL" = "true" ]; then
-            entries+=('{"runner":"x64-docker-build-node","platform":"linux/amd64","dockerfile":"docker/deepseek_v4_b200.Dockerfile","tag":"deepseek-v4-blackwell"}')
+            entries+=('{"runner":"x64-docker-build-node","platform":"linux/amd64","dockerfile":"docker/deepseek_v4_b200.Dockerfile","tag":"deepseek-v4-blackwell","branch":"deepseek_v4"}')
           fi
           if [ "$BUILD_B300" = "true" ]; then
-            entries+=('{"runner":"x64-docker-build-node","platform":"linux/amd64","dockerfile":"docker/deepseek_v4_b300.Dockerfile","tag":"deepseek-v4-b300"}')
+            entries+=('{"runner":"x64-docker-build-node","platform":"linux/amd64","dockerfile":"docker/deepseek_v4_b300.Dockerfile","tag":"deepseek-v4-b300","branch":"deepseek_v4"}')
           fi
           if [ "$BUILD_GRACE_BLACKWELL" = "true" ]; then
-            entries+=('{"runner":"arm-docker-build-node","platform":"linux/arm64","dockerfile":"docker/deepseek_v4_grace_blackwell.Dockerfile","tag":"deepseek-v4-grace-blackwell"}')
+            entries+=('{"runner":"arm-docker-build-node","platform":"linux/arm64","dockerfile":"docker/deepseek_v4_grace_blackwell.Dockerfile","tag":"deepseek-v4-grace-blackwell","branch":"deepseek_v4"}')
+          fi
+          if [ "$BUILD_B300_DEV" = "true" ]; then
+            entries+=('{"runner":"x64-docker-build-node","platform":"linux/amd64","dockerfile":"docker/deepseek_v4_b300.Dockerfile","tag":"deepseek-v4-b300-dev","branch":"deepseek_v4_dev"}')
+          fi
+          if [ "$BUILD_GRACE_BLACKWELL_DEV" = "true" ]; then
+            entries+=('{"runner":"arm-docker-build-node","platform":"linux/arm64","dockerfile":"docker/deepseek_v4_grace_blackwell.Dockerfile","tag":"deepseek-v4-grace-blackwell-dev","branch":"deepseek_v4_dev"}')
           fi
           if [ ${#entries[@]} -eq 0 ]; then
             echo "::error::At least one build_* input must be true."
@@ -89,7 +107,7 @@ jobs:
       - name: Checkout deepseek_v4 sources
         uses: actions/checkout@v4
         with:
-          ref: deepseek_v4
+          ref: ${{ matrix.branch }}
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main

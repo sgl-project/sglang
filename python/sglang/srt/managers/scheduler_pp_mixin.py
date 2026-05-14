@@ -29,6 +29,7 @@ from sglang.srt.managers.utils import (
     get_logprob_from_pp_outputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
@@ -1162,7 +1163,18 @@ class SchedulerPPMixin:
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
+                set_time_batch(
+                    self.cur_batch.reqs,
+                    "set_run_batch_cpu_start_time",
+                    trace_only=True,
+                )
                 result = self.run_batch(self.cur_batch, pp_proxy_tensors)
+                set_time_batch(
+                    self.cur_batch.reqs,
+                    "set_run_batch_cpu_end_time",
+                    trace_only=True,
+                    attrs={"pp_mb_id": mb_id},
+                )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                 )

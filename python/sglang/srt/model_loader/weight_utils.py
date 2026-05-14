@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/weight_utils.py
 
 """Utilities for downloading and initializing model weights."""
@@ -11,8 +13,11 @@ import itertools
 import json
 import logging
 import os
+import re
+import struct
 import tempfile
 from collections import defaultdict
+from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -68,6 +73,62 @@ except ImportError as e:
     SafeTensorsFileLoader = SingleGroup = None
 
 logger = logging.getLogger(__name__)
+
+RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
+
+# Matches routed-expert weight keys in both HF-style layouts
+# (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
+# layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). ``shared_experts`` is
+# excluded because the index segment requires a digit after ``.experts.``.
+_ROUTED_EXPERT_KEY_RE = re.compile(
+    r"\.experts\.\d+\.(?:w[123]|down_proj|up_proj|gate_proj)\.weight$"
+)
+
+
+def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
+    """Return the safetensors dtype string (e.g. ``F8_E4M3``, ``U8``) of one
+    routed-expert weight tensor, or ``None`` if the checkpoint is remote or has
+    no matching key. Reads only the safetensors header of the relevant shard.
+    """
+    if not os.path.isdir(model_path):
+        return None
+
+    index_file = os.path.join(model_path, "model.safetensors.index.json")
+    target_key = None
+    target_shard_path = None
+
+    if os.path.exists(index_file):
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {}) or {}
+        for k, shard in weight_map.items():
+            if _ROUTED_EXPERT_KEY_RE.search(k):
+                target_key = k
+                target_shard_path = os.path.join(model_path, shard)
+                break
+        if target_key is None:
+            return None
+    else:
+        shards = sorted(Path(model_path).glob("*.safetensors"))
+        if not shards:
+            return None
+        target_shard_path = str(shards[0])
+
+    with open(target_shard_path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+
+    if target_key is not None:
+        meta = header.get(target_key)
+        return meta.get("dtype") if meta else None
+
+    for k, meta in header.items():
+        if k == "__metadata__" or not isinstance(meta, dict):
+            continue
+        if _ROUTED_EXPERT_KEY_RE.search(k):
+            return meta.get("dtype")
+    return None
+
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
@@ -816,11 +877,30 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def _drop_file_cache_after_load(path: str) -> None:
+    """Release of checkpoint pages after weights have been copied out. Used to avoid CPU OOM in RL."""
+    posix_fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if posix_fadvise is None or dontneed is None:
+        return
+
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        posix_fadvise(fd, 0, 0, dontneed)
+    except OSError as e:
+        logger.debug("Failed to drop file cache for %s: %s", path, e)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -848,6 +928,8 @@ def safetensors_weights_iterator(
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
                     yield name, f.get_tensor(name)
+        if drop_cache_after_load:
+            _drop_file_cache_after_load(st_file)
 
 
 def fastsafetensors_weights_iterator(
@@ -909,6 +991,7 @@ def multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
     disable_mmap: bool = False,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -918,8 +1001,12 @@ def multi_thread_safetensors_weights_iterator(
     def _load_file(st_file: str):
         if disable_mmap:
             with open(st_file, "rb") as f:
-                return safetensors.torch.load(f.read())
-        return safetensors.torch.load_file(st_file, device="cpu")
+                result = safetensors.torch.load(f.read())
+        else:
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                result = {k: f.get_tensor(k) for k in f.keys()}
+
+        return st_file, result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
@@ -936,9 +1023,12 @@ def multi_thread_safetensors_weights_iterator(
             futures_iter = concurrent.futures.as_completed(futures)
 
         for future in futures_iter:
-            state_dict = future.result()
+            st_file, state_dict = future.result()
             for name, param in state_dict.items():
                 yield name, param
+            del state_dict
+            if drop_cache_after_load:
+                _drop_file_cache_after_load(st_file)
 
 
 def buffered_multi_thread_safetensors_weights_iterator(
@@ -947,6 +1037,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1248,7 +1339,11 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
         if (
             is_cpu()
-            and loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
+            and (
+                loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
+                or loaded_weight.size(0)
+                < get_tensor_model_parallel_world_size() * shard_size
+            )
             and loaded_weight.dim() == 1
         ):
             param_data = param.data  # view copy on param for uneven padding
@@ -1313,7 +1408,9 @@ def runai_safetensors_weights_iterator(
             mininterval=2,
         )
 
-        yield from tensor_iter
+        for name, tensor in tensor_iter:
+            setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+            yield name, tensor
 
 
 def set_runai_streamer_env(load_config: LoadConfig):
@@ -1623,3 +1720,33 @@ def narrow_padded_param_and_loaded_weight(
     param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
 
     return param_data, loaded_weight
+
+
+def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
+    # This function is for padding zeros when loaded_weight is less than output_sizes.
+    # Most cases, sum(output_sizes) = loaded_weight.size(output_dim),
+    # while in some TP cases like TP6, output_sizes will be padded, thus loaded_weight needs padding.
+    total_output_size = sum(output_sizes)
+    raw_output_size = loaded_weight.size(output_dim)
+    if total_output_size > raw_output_size:
+        loaded_weight_pad = []
+        weight_split_size = [
+            int(output_size / total_output_size * raw_output_size)
+            for output_size in output_sizes
+        ]
+        assert (
+            sum(weight_split_size) == raw_output_size
+        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+
+        split_weight = loaded_weight.split_with_sizes(weight_split_size, dim=output_dim)
+        for i, output_size in enumerate(output_sizes):
+            pad_size = output_size - weight_split_size[i]
+            target_pad_shape = list(loaded_weight.size())
+            target_pad_shape[output_dim] = pad_size
+            pad_tensor = torch.zeros(target_pad_shape).to(loaded_weight.dtype)
+            loaded_weight_pad.append(
+                torch.cat([split_weight[i], pad_tensor], dim=output_dim)
+            )
+        return torch.cat(loaded_weight_pad, dim=output_dim)
+    else:
+        return loaded_weight

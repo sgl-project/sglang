@@ -8,6 +8,7 @@ This module contains implementations of timestep preparation stages for diffusio
 """
 
 import inspect
+from dataclasses import dataclass
 from typing import Any, Callable, Tuple
 
 import torch
@@ -33,6 +34,17 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class TimestepPreparationFingerprint:
+    num_inference_steps: int
+    timesteps: Any
+    sigmas: Any
+    n_tokens: int | None
+    height: int | None
+    width: int | None
+    num_frames: int | None
+
+
 class TimestepPreparationStage(PipelineStage):
     """
     Stage for preparing timesteps for the diffusion process.
@@ -40,6 +52,10 @@ class TimestepPreparationStage(PipelineStage):
     This stage handles the preparation of the timestep sequence that will be used
     during the diffusion process.
     """
+
+    deduplicated_tensor_tree_output_fields = ("timesteps", "sigmas")
+    deduplicated_deepcopy_output_fields = ("scheduler",)
+    deduplicated_extra_tensor_tree_output_keys = ("mu",)
 
     def __init__(
         self,
@@ -144,6 +160,19 @@ class TimestepPreparationStage(PipelineStage):
             self.log_debug("timesteps: %s", timesteps)
         return batch
 
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> TimestepPreparationFingerprint:
+        return TimestepPreparationFingerprint(
+            num_inference_steps=batch.num_inference_steps,
+            timesteps=self.freeze_for_dedup(batch.timesteps),
+            sigmas=self.freeze_for_dedup(batch.sigmas),
+            n_tokens=batch.n_tokens,
+            height=batch.height,
+            width=batch.width,
+            num_frames=batch.num_frames,
+        )
+
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify timestep preparation stage inputs."""
         result = VerificationResult()
@@ -162,8 +191,7 @@ class TimestepPreparationStage(PipelineStage):
             and isinstance(batch.timesteps, torch.Tensor)
             and torch.isnan(batch.timesteps).any()
         ):
-            # when num-inference-steps == 1, the last sigma being 1, the 1 / last_sigma could be nan
-            # this a workaround for warmup req only
+            # diffusers flow-match scheduler can emit NaN for one-step warmup
             batch.timesteps = torch.ones(
                 (1,), dtype=torch.float32, device=get_local_torch_device()
             )

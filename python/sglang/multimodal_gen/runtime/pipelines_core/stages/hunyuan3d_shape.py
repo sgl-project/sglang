@@ -22,7 +22,10 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingContext,
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -302,26 +305,25 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
         pos_cond_kwargs = {"encoder_hidden_states": cond}
         neg_cond_kwargs = {}
 
-        return {
-            "extra_step_kwargs": extra_step_kwargs,
-            "scheduler": scheduler,
-            "target_dtype": target_dtype,
-            "autocast_enabled": autocast_enabled,
-            "timesteps": timesteps,
-            "num_inference_steps": num_inference_steps,
-            "num_warmup_steps": num_warmup_steps,
-            "image_kwargs": {},
-            "pos_cond_kwargs": pos_cond_kwargs,
-            "neg_cond_kwargs": neg_cond_kwargs,
-            "latents": latents,
-            "prompt_embeds": batch.prompt_embeds,
-            "neg_prompt_embeds": None,
-            "boundary_timestep": None,
-            "z": None,
-            "reserved_frames_mask": None,
-            "seq_len": None,
-            "guidance": guidance,
-        }
+        return DenoisingContext(
+            scheduler=scheduler,
+            extra_step_kwargs=extra_step_kwargs,
+            target_dtype=target_dtype,
+            autocast_enabled=autocast_enabled,
+            timesteps=timesteps,
+            num_inference_steps=num_inference_steps,
+            num_warmup_steps=num_warmup_steps,
+            image_kwargs={},
+            pos_cond_kwargs=pos_cond_kwargs,
+            neg_cond_kwargs=neg_cond_kwargs,
+            latents=latents,
+            boundary_timestep=None,
+            z=None,
+            reserved_frames_mask=None,
+            seq_len=None,
+            guidance=guidance,
+            is_warmup=batch.is_warmup,
+        )
 
     def _predict_noise(
         self,
@@ -517,7 +519,8 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
 
         if return_path.endswith(".glb"):
             return_path = obj_path
-        return OutputBatch(output_file_paths=[return_path], timings=batch.timings)
+        # Preserve request metrics/perf-dump data on the shape-only save path.
+        return OutputBatch(output_file_paths=[return_path], metrics=batch.metrics)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()

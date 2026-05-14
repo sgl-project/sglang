@@ -1,6 +1,7 @@
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -25,6 +26,16 @@ class LTX2AVDecodingStage(DecodingStage):
 
         self.video_processor = VideoProcessor(vae_scale_factor=32)
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(stage_name, "vae", target_dtype=torch.bfloat16),
+            ComponentUse(stage_name, "audio_vae"),
+            ComponentUse(stage_name, "vocoder"),
+        ]
+
     @staticmethod
     def _ltx2_should_externally_denorm_video_latents(server_args: ServerArgs) -> bool:
         arch_config = server_args.pipeline_config.vae_config.arch_config
@@ -33,45 +44,44 @@ class LTX2AVDecodingStage(DecodingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
 
-        self.vae = self.vae.to(get_local_torch_device())
-        self.vae.eval()
-        latents = batch.latents.to(get_local_torch_device())
-
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
         original_dtype = vae_dtype
-        self.vae.to(torch.bfloat16)
-        latents = latents.to(torch.bfloat16)
-        if self._ltx2_should_externally_denorm_video_latents(server_args):
-            std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latents)
-            mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latents)
-            latents = latents * std + mean
-        latents = server_args.pipeline_config.preprocess_decoding(
-            latents, server_args, vae=self.vae
-        )
+        with self.use_declared_component(component_name="vae", module=self.vae) as vae:
+            assert vae is not None
+            self.vae = vae
+            self.vae.eval()
+            latents = batch.latents.to(get_local_torch_device(), dtype=torch.bfloat16)
+            if self._ltx2_should_externally_denorm_video_latents(server_args):
+                std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latents)
+                mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latents)
+                latents = latents * std + mean
+            latents = server_args.pipeline_config.preprocess_decoding(
+                latents, server_args, vae=self.vae
+            )
 
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=vae_dtype,
-            enabled=vae_autocast_enabled,
-        ):
-            try:
-                if server_args.pipeline_config.vae_tiling:
-                    self.vae.enable_tiling()
-            except Exception:
-                pass
-            decode_output = self.vae.decode(latents)
-            if isinstance(decode_output, tuple):
-                video = decode_output[0]
-            elif hasattr(decode_output, "sample"):
-                video = decode_output.sample
-            else:
-                video = decode_output
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=vae_dtype,
+                enabled=vae_autocast_enabled,
+            ):
+                try:
+                    if server_args.pipeline_config.vae_tiling:
+                        self.vae.enable_tiling()
+                except Exception:
+                    pass
+                decode_output = self.vae.decode(latents)
+                if isinstance(decode_output, tuple):
+                    video = decode_output[0]
+                elif hasattr(decode_output, "sample"):
+                    video = decode_output.sample
+                else:
+                    video = decode_output
 
-        self.vae.to(original_dtype)
+            self.vae.to(original_dtype)
         video = self.video_processor.postprocess_video(video, output_type="np")
 
         output_batch = OutputBatch(
@@ -90,49 +100,64 @@ class LTX2AVDecodingStage(DecodingStage):
         if audio_latents is not None:
             # Ensure device/dtype
             device = get_local_torch_device()
-            self.audio_vae = self.audio_vae.to(device)
-            self.vocoder = self.vocoder.to(device)
-            self.audio_vae.eval()
-            self.vocoder.eval()
-            try:
-                dtype = self.audio_vae.dtype
-            except AttributeError:
-                dtype = None
-            if dtype is None:
+            with self.use_declared_component(
+                component_name="audio_vae",
+                module=self.audio_vae,
+            ) as audio_vae:
+                assert audio_vae is not None
+                self.audio_vae = audio_vae
+                self.audio_vae.eval()
                 try:
-                    dtype = next(self.audio_vae.parameters()).dtype
-                except StopIteration:
-                    dtype = torch.float32
-            audio_latents = audio_latents.to(device, dtype=dtype)
-            try:
-                latents_std = self.audio_vae.latents_std
-            except AttributeError:
-                latents_std = None
-            if isinstance(latents_std, torch.Tensor) and torch.all(latents_std == 0):
-                logger.warning(
-                    "audio_vae.latents_std is all zeros; audio denorm may be incorrect."
-                )
-            try:
-                latents_mean = self.audio_vae.latents_mean
-            except AttributeError:
-                latents_mean = None
-            if isinstance(latents_mean, torch.Tensor) and isinstance(
-                latents_std, torch.Tensor
-            ):
-                latents_mean = latents_mean.to(device=device, dtype=dtype)
-                latents_std = latents_std.to(device=device, dtype=dtype)
-                if audio_latents.ndim == 4:
-                    latents_mean = latents_mean.view(
-                        1, audio_latents.shape[1], 1, audio_latents.shape[3]
+                    dtype = self.audio_vae.dtype
+                except AttributeError:
+                    dtype = None
+                if dtype is None:
+                    try:
+                        dtype = next(self.audio_vae.parameters()).dtype
+                    except StopIteration:
+                        dtype = torch.float32
+                audio_latents = audio_latents.to(device, dtype=dtype)
+                try:
+                    latents_std = self.audio_vae.latents_std
+                except AttributeError:
+                    latents_std = None
+                if isinstance(latents_std, torch.Tensor) and torch.all(
+                    latents_std == 0
+                ):
+                    logger.warning(
+                        "audio_vae.latents_std is all zeros; audio denorm may be incorrect."
                     )
-                    latents_std = latents_std.view(
-                        1, audio_latents.shape[1], 1, audio_latents.shape[3]
-                    )
-                audio_latents = audio_latents * latents_std + latents_mean
+                try:
+                    latents_mean = self.audio_vae.latents_mean
+                except AttributeError:
+                    latents_mean = None
+                if isinstance(latents_mean, torch.Tensor) and isinstance(
+                    latents_std, torch.Tensor
+                ):
+                    latents_mean = latents_mean.to(device=device, dtype=dtype)
+                    latents_std = latents_std.to(device=device, dtype=dtype)
+                    if audio_latents.ndim == 4:
+                        latents_mean = latents_mean.view(
+                            1, audio_latents.shape[1], 1, audio_latents.shape[3]
+                        )
+                        latents_std = latents_std.view(
+                            1, audio_latents.shape[1], 1, audio_latents.shape[3]
+                        )
+                    audio_latents = audio_latents * latents_std + latents_mean
 
-            with torch.no_grad():
-                # Decode latents to spectrogram
-                spectrogram = self.audio_vae.decode(audio_latents, return_dict=False)[0]
+                with torch.no_grad():
+                    # Decode latents to spectrogram
+                    spectrogram = self.audio_vae.decode(
+                        audio_latents, return_dict=False
+                    )[0]
+
+            with self.use_declared_component(
+                component_name="vocoder",
+                module=self.vocoder,
+            ) as vocoder:
+                assert vocoder is not None
+                self.vocoder = vocoder
+                self.vocoder.eval()
                 if hasattr(self.vocoder, "conv_in") and hasattr(
                     self.vocoder.conv_in, "in_channels"
                 ):
@@ -143,7 +168,8 @@ class LTX2AVDecodingStage(DecodingStage):
                             f"Vocoder expects channels*mel_bins={expected_in}, got {actual_in} from spectrogram shape {tuple(spectrogram.shape)}"
                         )
                 # Decode spectrogram to waveform
-                waveform = self.vocoder(spectrogram)
+                with torch.no_grad():
+                    waveform = self.vocoder(spectrogram)
             output_batch.audio = waveform.cpu().float()
             try:
                 pipeline_audio_cfg = server_args.pipeline_config.audio_vae_config
@@ -170,5 +196,4 @@ class LTX2AVDecodingStage(DecodingStage):
                 vocoder_sr or audio_vae_sr or pipeline_audio_sr
             )
 
-        self.offload_model()
         return output_batch

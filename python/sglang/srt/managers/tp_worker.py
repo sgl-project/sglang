@@ -41,6 +41,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -249,9 +250,10 @@ class TpModelWorker(BaseTpWorker):
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.memory_pool_config = memory_pool_config
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
+        # Draft worker: target's resolved MemoryPoolConfig (forwarded to ModelRunner).
+        self.memory_pool_config = memory_pool_config
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -273,6 +275,7 @@ class TpModelWorker(BaseTpWorker):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -281,6 +284,7 @@ class TpModelWorker(BaseTpWorker):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
         self.device = self.model_runner.device
 
@@ -476,6 +480,7 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
+                indexer_topk_output=out.indexer_topk_output,
             )
 
             if is_verify:
