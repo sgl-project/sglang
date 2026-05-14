@@ -552,6 +552,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '45'
       timeout_per_file: '1800'
     secrets: inherit
 
