@@ -741,6 +741,7 @@ class DecodePreallocQueue:
             len(r.origin_input_ids) + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
         )
+
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
         swa_allocatable_tokens = 0
         if uses_swa_tail_prealloc:
@@ -759,6 +760,15 @@ class DecodePreallocQueue:
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
+
+        # Sort by priority before any index-based bookkeeping so that both the
+        # abort-scan loop and the preallocation loop operate on the same order.
+        if self.scheduler.enable_priority_scheduling:
+            priority_sign = (
+                1 if self.scheduler.schedule_low_priority_values_first else -1
+            )
+            self.queue.sort(key=lambda r: r.req.priority * priority_sign)
+
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1670,6 +1680,9 @@ class SchedulerDisaggregationDecodeMixin:
 
         if len(self.waiting_queue) == 0:
             return None
+
+        if self.enable_priority_scheduling:
+            self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         curr_batch_size = self.running_batch.batch_size()
 

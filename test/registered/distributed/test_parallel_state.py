@@ -41,9 +41,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=8, stage="stage-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 
 # Import the actual parallel_state module
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
@@ -72,20 +73,16 @@ def test_parallel_group_construction_tp8_attn_cp2():
     # Mock the distributed backend
     # Note: get_rank() returns 0 because we're testing from a single process,
     # but initialize_model_parallel() still creates all groups for all ranks
-    with patch.object(parallel_state, "_WORLD", None), patch.object(
-        parallel_state, "_TP", None
-    ), patch.object(parallel_state, "_ATTN_CP", None), patch.object(
-        parallel_state, "_ATTN_TP", None
-    ), patch.object(
-        parallel_state, "_PP", None
-    ), patch(
-        "torch.distributed.is_initialized", return_value=True
-    ), patch(
-        "torch.distributed.get_world_size", return_value=world_size
-    ), patch(
-        "torch.distributed.get_rank", return_value=0
-    ), patch(
-        "torch.distributed.get_backend", return_value="nccl"
+    with (
+        patch.object(parallel_state, "_WORLD", None),
+        patch.object(parallel_state, "_TP", None),
+        patch.object(parallel_state, "_ATTN_CP", None),
+        patch.object(parallel_state, "_ATTN_TP", None),
+        patch.object(parallel_state, "_PP", None),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=world_size),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.get_backend", return_value="nccl"),
     ):
 
         # Mock init_model_parallel_group to capture the groups being created
@@ -100,11 +97,14 @@ def test_parallel_group_construction_tp8_attn_cp2():
             mock_group.device_group = Mock()
             return mock_group
 
-        with patch.object(
-            parallel_state,
-            "init_model_parallel_group",
-            side_effect=mock_init_model_parallel_group,
-        ), patch.object(parallel_state, "get_world_group") as mock_world_group:
+        with (
+            patch.object(
+                parallel_state,
+                "init_model_parallel_group",
+                side_effect=mock_init_model_parallel_group,
+            ),
+            patch.object(parallel_state, "get_world_group") as mock_world_group,
+        ):
 
             # Mock world group
             mock_world = Mock()
@@ -172,22 +172,17 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
     world_size = 8
 
     # Mock the distributed backend
-    with patch.object(parallel_state, "_WORLD", None), patch.object(
-        parallel_state, "_TP", None
-    ), patch.object(parallel_state, "_MOE_EP", None), patch.object(
-        parallel_state, "_MOE_DP", None
-    ), patch.object(
-        parallel_state, "_MOE_TP", None
-    ), patch.object(
-        parallel_state, "_PP", None
-    ), patch(
-        "torch.distributed.is_initialized", return_value=True
-    ), patch(
-        "torch.distributed.get_world_size", return_value=world_size
-    ), patch(
-        "torch.distributed.get_rank", return_value=0
-    ), patch(
-        "torch.distributed.get_backend", return_value="nccl"
+    with (
+        patch.object(parallel_state, "_WORLD", None),
+        patch.object(parallel_state, "_TP", None),
+        patch.object(parallel_state, "_MOE_EP", None),
+        patch.object(parallel_state, "_MOE_DP", None),
+        patch.object(parallel_state, "_MOE_TP", None),
+        patch.object(parallel_state, "_PP", None),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=world_size),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.get_backend", return_value="nccl"),
     ):
 
         # Mock init_model_parallel_group to capture the groups being created
@@ -202,11 +197,14 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             mock_group.device_group = Mock()
             return mock_group
 
-        with patch.object(
-            parallel_state,
-            "init_model_parallel_group",
-            side_effect=mock_init_model_parallel_group,
-        ), patch.object(parallel_state, "get_world_group") as mock_world_group:
+        with (
+            patch.object(
+                parallel_state,
+                "init_model_parallel_group",
+                side_effect=mock_init_model_parallel_group,
+            ),
+            patch.object(parallel_state, "get_world_group") as mock_world_group,
+        ):
 
             # Mock world group
             mock_world = Mock()
