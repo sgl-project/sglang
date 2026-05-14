@@ -1196,6 +1196,7 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 layer_id=layer_id,
                 alt_stream=alt_stream,
+                config=config,
             )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
@@ -1204,9 +1205,13 @@ class DeepseekV2AttentionMLA(
                 self.skip_topk = False
                 self.next_skip_topk = False
             else:
+                self.index_cli_factor = getattr(config, "cli_factor", 1)
                 self.index_topk_freq = getattr(config, "index_topk_freq", 1)
                 self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
-                if self.index_topk_pattern is None:
+                if self.index_cli_factor > 1:
+                    self.skip_topk = layer_id % self.index_cli_factor != 0
+                    self.next_skip_topk = (layer_id+1) % self.index_cli_factor != 0
+                elif self.index_topk_pattern is None:
                     self.skip_topk = max(layer_id - 1, 0) % self.index_topk_freq != 0
                     self.next_skip_topk = layer_id % self.index_topk_freq != 0
                 else:

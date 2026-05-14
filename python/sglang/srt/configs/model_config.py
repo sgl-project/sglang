@@ -73,6 +73,8 @@ def is_deepseek_nsa(config) -> bool:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
+            "LongcatFlashForCausalLM",
+            "LongcatFlashForCausalLMNextN",
         ]
         and index_topk is not None
     )
