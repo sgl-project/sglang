@@ -54,15 +54,13 @@ class TestCuteDslFlashinferA2A(CustomTestCase):
                 "flashinfer_cutedsl",
                 "--moe-a2a-backend",
                 "flashinfer",
+                "--max-prefill-tokens",
+                "4096",
                 "--disable-radix-cache",
                 "--disable-flashinfer-autotune",
                 "--watchdog-timeout",
                 "900",
             ],
-            env={
-                "FLASHINFER_DISABLE_VERSION_CHECK": "1",
-                "SGLANG_MOE_NVFP4_DISPATCH": "0",
-            },
         )
 
     @classmethod
