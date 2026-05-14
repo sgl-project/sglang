@@ -22,6 +22,9 @@ from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollecto
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+        ComponentType,
+    )
 
 
 @runtime_checkable
@@ -94,10 +97,22 @@ class IncLockRefResult:
 
     delta: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
+    # Component nodes that were tombstones at acquire time. Replaying this set
+    # at release prevents a short-lived lock from consuming a later load-back or
+    # request lock after that tombstone becomes a valid device value.
+    skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
+        default_factory=dict
+    )
 
     def to_dec_params(self) -> "DecLockRefParams":
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
-        return DecLockRefParams(swa_uuid_for_lock=self.swa_uuid_for_lock)
+        return DecLockRefParams(
+            swa_uuid_for_lock=self.swa_uuid_for_lock,
+            skip_lock_node_ids={
+                component_type: set(node_ids)
+                for component_type, node_ids in self.skip_lock_node_ids.items()
+            },
+        )
 
 
 @dataclasses.dataclass
@@ -105,6 +120,9 @@ class DecLockRefParams:
     """Parameters for dec_lock_ref operation."""
 
     swa_uuid_for_lock: Optional[int] = None
+    skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass
@@ -152,13 +170,10 @@ class MatchResult(NamedTuple):
 
 
 def zero_match_result(tree_cache, match_result: "MatchResult") -> "MatchResult":
-    root = getattr(tree_cache, "root_node", None)
-    if root is None:
-        raise RuntimeError(
-            f"SGLANG_RADIX_FORCE_MISS is not supported by {type(tree_cache).__name__} "
-            "(no `root_node` attribute). Disable the flag or use a cache backend "
-            "that exposes a tree root."
-        )
+    if tree_cache.is_chunk_cache():
+        # Chunk caches' match_prefix already returns a miss; no root_node to walk back to.
+        return match_result
+    root = tree_cache.root_node
     return match_result._replace(
         # [:0] keeps dtype and device of the original tensor (e.g. CUDA int64)
         # without allocating a fresh empty tensor.

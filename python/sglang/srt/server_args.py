@@ -134,6 +134,10 @@ QUANTIZATION_CHOICES = [
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
+    # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
+    # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
+    "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
+    "mlx_q8",  # 8 bits, group_size=64
     "unquant",
 ]
 
@@ -154,6 +158,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flashinfer",
     "flashmla",
     "trtllm_mla",
+    "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
     # AMD specific
@@ -305,6 +310,10 @@ def add_rl_on_policy_target_choices(choices):
     RL_ON_POLICY_TARGET_CHOICES.extend(choices)
 
 
+def add_linear_attn_kernel_backend_choices(choices):
+    LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
+
+
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
@@ -365,6 +374,7 @@ class ServerArgs:
     trust_remote_code: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False
+    prefill_only_disable_kv_cache: bool = False
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
@@ -482,6 +492,9 @@ class ServerArgs:
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
+    enable_forward_pass_metrics: bool = False
+    forward_pass_metrics_worker_id: str = ""
+    forward_pass_metrics_ipc_name: Optional[str] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
 
@@ -567,12 +580,12 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
-    speculative_dflash_draft_window_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
+    speculative_draft_window_size: Optional[int] = None
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
@@ -641,7 +654,7 @@ class ServerArgs:
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
-    hicache_storage_prefetch_policy: str = "best_effort"
+    hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
 
     # Hierarchical sparse attention
@@ -846,6 +859,10 @@ class ServerArgs:
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         self._handle_pd_disaggregation()
 
+        # Validate --prefill-only-disable-kv-cache args early (before dummy-model
+        # short-circuit). The backend check is run later after backends settle.
+        self._validate_prefill_only_disable_kv_cache_args()
+
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
             return
@@ -901,6 +918,9 @@ class ServerArgs:
 
         # Set kernel backends.
         self._handle_sampling_backend()
+        # Must run before _handle_attention_backend_compatibility so the
+        # deterministic backend is set before auto-detection fills it in.
+        self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
         self._handle_linear_attn_backend()
@@ -913,6 +933,13 @@ class ServerArgs:
         # Handle multi-item scoring constraints. Must run after the above so
         # the final attention backend and chunked_prefill_size are in effect.
         self._handle_multi_item_scoring()
+
+        # Backend-dependent half of --prefill-only-disable-kv-cache validation.
+        # Must stay after _handle_attention_backend_compatibility() (above) and
+        # _handle_multi_item_scoring() so the resolved prefill backend is final;
+        # the flag/precondition half runs earlier in
+        # _validate_prefill_only_disable_kv_cache_args().
+        self._handle_prefill_only_disable_kv_cache()
 
         # Handle Hicache settings.
         self._handle_hicache()
@@ -950,9 +977,6 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
-
-        # Handle deterministic inference.
-        self._handle_deterministic_inference()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -1817,15 +1841,8 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    if is_hip():
-                        self.page_size = 1
-                        logger.warning(
-                            "Setting page size to 1 for DeepSeek DSA on ROCm."
-                        )
-                    else:
-                        # For CUDA GPU
-                        self.page_size = 64
-                        logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                    self.page_size = 64
+                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     import torch
 
@@ -2043,6 +2060,11 @@ class ServerArgs:
                     self.moe_runner_backend = "triton"
                     logger.warning(
                         "Detected ROCm with SGLANG_USE_AITER for GPT-OSS bf16 model, using triton MOE kernel."
+                    )
+                elif is_musa() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
+                    self.moe_runner_backend = "deep_gemm"
+                    logger.warning(
+                        "Detected MUSA with SGLANG_DEEPEP_BF16_DISPATCH for bf16 model, using deep_gemm kernel."
                     )
                 elif (
                     self.ep_size == 1
@@ -2680,6 +2702,25 @@ class ServerArgs:
                 )
 
         if (
+            self.attention_backend == "tokenspeed_mla"
+            or self.decode_attention_backend == "tokenspeed_mla"
+        ):
+            if not is_blackwell_supported():
+                raise ValueError(
+                    "tokenspeed_mla backend is only supported on Blackwell GPUs (SM100/SM12x)."
+                )
+            if self.page_size not in [32, 64]:
+                logger.warning(
+                    f"tokenspeed_mla only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
+                )
+                self.page_size = 64
+            if self.kv_cache_dtype not in ["fp8_e4m3"]:
+                raise ValueError(
+                    "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3, "
+                    f"got {self.kv_cache_dtype}."
+                )
+
+        if (
             self.attention_backend == "trtllm_mha"
             or self.decode_attention_backend == "trtllm_mha"
             or self.prefill_attention_backend == "trtllm_mha"
@@ -3243,6 +3284,101 @@ class ServerArgs:
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
+    def _validate_prefill_only_disable_kv_cache_args(self):
+        """Validate --prefill-only-disable-kv-cache flag/precondition constraints.
+
+        Runs before the dummy-model short-circuit so misuse is rejected even
+        for dummy models. Backend resolution is checked separately by
+        _handle_prefill_only_disable_kv_cache after backends settle.
+        """
+        if not self.prefill_only_disable_kv_cache:
+            return
+
+        # This flag is intentionally scoped to embedding mode for now. Other
+        # prefill-only paths (for example scoring and MIS) can benefit from
+        # the same idea later, but some of them still stage K/V through the
+        # paged cache today.
+        if not self.is_embedding:
+            raise ValueError(
+                "--prefill-only-disable-kv-cache currently requires --is-embedding. "
+                "Other prefill-only workloads may be supported in a future change once "
+                "their attention paths stop reading or writing the paged KV cache."
+            )
+        if self.kv_cache_dtype == "fp4_e2m1":
+            raise ValueError(
+                "--prefill-only-disable-kv-cache does not currently support "
+                "--kv-cache-dtype=fp4_e2m1 because the FP4 pool uses a separate "
+                "allocation path."
+            )
+
+        # Structural preconditions for the FA backend's fa_skip_kv_cache path,
+        # which is the only embedding path that doesn't read or write the pool:
+        # - chunked_prefill_size == -1 keeps a request in a single forward,
+        #   so K/V never has to be reused across prefill chunks.
+        # - disable_radix_cache stops the prefix cache from indexing pool
+        #   slots that no longer hold real data.
+        if self.chunked_prefill_size != -1:
+            raise ValueError(
+                "--prefill-only-disable-kv-cache requires --chunked-prefill-size=-1 so the FA "
+                "backend takes the fa_skip_kv_cache path; otherwise the pool would be touched "
+                "between prefill chunks."
+            )
+        if not self.disable_radix_cache:
+            raise ValueError(
+                "--prefill-only-disable-kv-cache requires --disable-radix-cache because the "
+                "radix cache indexes KV pool slots that no longer hold real data."
+            )
+
+        # Context-parallel prefill stages K/V through cp_allgather_and_save_kv_cache,
+        # which writes to the pool via set_kv_buffer. NoOpMHATokenToKVPool intentionally
+        # raises on writes, so the engine would boot fine but fail on the first request.
+        if self.attn_cp_size > 1:
+            raise ValueError(
+                "--prefill-only-disable-kv-cache is incompatible with --attn-cp-size > 1: "
+                "the context-parallel attention path writes K/V to the pool via set_kv_buffer, "
+                "which the no-op pool intentionally rejects."
+            )
+        if self.enable_prefill_context_parallel:
+            raise ValueError(
+                "--prefill-only-disable-kv-cache is incompatible with "
+                "--enable-prefill-context-parallel: the prefill-CP path stages K/V through "
+                "the paged cache, which the no-op pool does not support."
+            )
+
+        # HiSparse selects a different pool class (HiSparseNSATokenToKVPool /
+        # HiSparseTokenToKVPoolAllocator) that is not the no-op pool.
+        if self.enable_hisparse:
+            raise ValueError(
+                "--prefill-only-disable-kv-cache is incompatible with --enable-hisparse: "
+                "HiSparse uses a dedicated pool family that is not the no-op MHA pool."
+            )
+
+    def _handle_prefill_only_disable_kv_cache(self):
+        """Validate --prefill-only-disable-kv-cache backend constraint.
+
+        Must run after _handle_attention_backend_compatibility() (which fills
+        the default attention_backend if unset) and _handle_multi_item_scoring()
+        (which may further mutate it). The assertion below guards against
+        accidental call-site reordering: if attention_backend is still None,
+        backends haven't settled yet and get_attention_backends() would return
+        a stale (None, None).
+        """
+        if not self.prefill_only_disable_kv_cache:
+            return
+
+        assert self.attention_backend is not None, (
+            "_handle_prefill_only_disable_kv_cache must run after "
+            "_handle_attention_backend_compatibility() so the prefill backend is resolved."
+        )
+
+        prefill_backend, _ = self.get_attention_backends()
+        if prefill_backend not in ("fa3", "fa4"):
+            raise ValueError(
+                "--prefill-only-disable-kv-cache currently requires the FA prefill backend "
+                f"(fa3/fa4), but got prefill backend {prefill_backend!r}. Other prefill-only "
+                "workloads and backends may be supported in a future change."
+            )
+
     def _handle_hicache(self):
         """Normalize hicache-related knobs into a valid runtime configuration.
 
@@ -3444,14 +3580,13 @@ class ServerArgs:
                 )
 
             window_size = None
-            if self.speculative_dflash_draft_window_size is not None:
-                window_size = int(self.speculative_dflash_draft_window_size)
+            if self.speculative_draft_window_size is not None:
+                window_size = int(self.speculative_draft_window_size)
                 if window_size <= 0:
                     raise ValueError(
-                        "DFLASH requires --speculative-dflash-draft-window-size "
-                        f"to be positive, got {window_size}."
+                        f"--speculative-draft-window-size must be positive, got {window_size}."
                     )
-                self.speculative_dflash_draft_window_size = window_size
+                self.speculative_draft_window_size = window_size
 
             if self.speculative_num_draft_tokens is None:
                 from sglang.srt.speculative.dflash_utils import (
@@ -3491,7 +3626,7 @@ class ServerArgs:
                 draft_tokens = int(self.speculative_num_draft_tokens)
                 if window_size < draft_tokens:
                     raise ValueError(
-                        "DFLASH --speculative-dflash-draft-window-size must be >= "
+                        "--speculative-draft-window-size must be >= "
                         "--speculative-num-draft-tokens (block_size). "
                         f"window_size={window_size}, block_size={draft_tokens}."
                     )
@@ -3876,11 +4011,11 @@ class ServerArgs:
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
                 envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-                and self.disaggregation_transfer_backend != "mooncake"
+                and self.disaggregation_transfer_backend not in ("mooncake", "nixl")
             ):
                 raise ValueError(
                     f"SGLANG_DISAGG_STAGING_BUFFER requires "
-                    f"disaggregation_transfer_backend='mooncake', "
+                    f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                     f"got '{self.disaggregation_transfer_backend}'."
                 )
 
@@ -4382,6 +4517,11 @@ class ServerArgs:
             "--is-embedding",
             action="store_true",
             help="Whether to use a CausalLM as an embedding model.",
+        )
+        parser.add_argument(
+            "--prefill-only-disable-kv-cache",
+            action="store_true",
+            help="Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
         )
         parser.add_argument(
             "--enable-multimodal",
@@ -5122,6 +5262,25 @@ class ServerArgs:
             help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
         )
         parser.add_argument(
+            "--enable-forward-pass-metrics",
+            action="store_true",
+            help="Enable per-iteration forward pass metrics via ZMQ IPC. "
+            "External consumers (e.g. Dynamo planner) subscribe to the IPC "
+            "endpoint exposed in server_args.forward_pass_metrics_ipc_name.",
+        )
+        parser.add_argument(
+            "--forward-pass-metrics-worker-id",
+            type=str,
+            default="",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--forward-pass-metrics-ipc-name",
+            type=str,
+            default=None,
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
             "--enable-trace",
             action="store_true",
             help="Enable opentelemetry trace",
@@ -5569,15 +5728,6 @@ class ServerArgs:
             default=ServerArgs.speculative_dflash_block_size,
         )
         parser.add_argument(
-            "--speculative-dflash-draft-window-size",
-            type=int,
-            help="DFLASH only. Sliding window size for the draft-model KV cache. "
-            "When set, the draft worker keeps a recent target-token window in its "
-            "local cache (paged backends may retain up to one extra page on the left "
-            "for alignment). Default is full context.",
-            default=ServerArgs.speculative_dflash_draft_window_size,
-        )
-        parser.add_argument(
             "--speculative-accept-threshold-single",
             type=float,
             help="Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -5607,6 +5757,19 @@ class ServerArgs:
             type=str,
             help="Attention backend for speculative decoding drafting.",
             default=ServerArgs.speculative_draft_attention_backend,
+        )
+        parser.add_argument(
+            "--speculative-draft-window-size",
+            "--speculative-dflash-draft-window-size",
+            type=int,
+            dest="speculative_draft_window_size",
+            help="Sliding window size for the draft model (honored by EAGLE-3 and DFLASH). "
+            "For EAGLE-3, the drafter only attends to the most recent N keys "
+            "(verifier hidden states + its own outputs); the verifier is unaffected. "
+            "For DFLASH, the draft worker keeps a recent target-token window in its "
+            "local KV cache (paged backends may retain up to one extra page on the "
+            "left for alignment). Default is full attention/context.",
+            default=ServerArgs.speculative_draft_window_size,
         )
         parser.add_argument(
             "--speculative-moe-runner-backend",
@@ -6946,6 +7109,14 @@ class ServerArgs:
         ), (
             "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
             f"Got: {self.pp_max_micro_batch_size}"
+        )
+
+        assert not (self.disable_cuda_graph_padding and self.enable_torch_compile), (
+            "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
+            "With padding disabled, every distinct batch size gets its own torch.compile + "
+            "Triton autotune cycle (O(max_batch_size) compilations) instead of the small fixed "
+            "set of padded bucket sizes, causing engine initialisation to stall for many minutes. "
+            "Remove --disable-cuda-graph-padding or --enable-torch-compile."
         )
 
         if self.pp_size > 1:

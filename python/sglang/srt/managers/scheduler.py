@@ -417,6 +417,9 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
+        # Init ZBAL, switch allocator should before any torch alloc action
+        self.init_zbal_on_npu()
+
         # Init PD-multiplexing context
         if self.enable_pdmux:
             self.init_pdmux()
@@ -495,6 +498,16 @@ class Scheduler(
         self.grammar_manager = GrammarManager(self)
 
         self.is_initializing = False
+
+    def init_zbal_on_npu(self):
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import init_zbal
+
+            if self.pp_size > 1:
+                logger.error(f"only zbal mix mode support pp_size > 1!")
+            init_zbal(
+                self.tp_size, self.gpu_id, self.tp_rank
+            )  # only switch allocator if is mix mode
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -1852,13 +1865,24 @@ class Scheduler(
             self.external_corpus_manager.check_pending_load()
 
     def init_req_max_new_tokens(self, req):
-        req.sampling_params.max_new_tokens = min(
-            (
-                req.sampling_params.max_new_tokens
-                if req.sampling_params.max_new_tokens is not None
-                else 1 << 30
+        input_len = len(req.origin_input_ids)
+        # Keep this bound consistent with PrefillAdder's admission budget:
+        # ceil_page(input_len) + max_new_tokens + page_size must be strictly
+        # smaller than max_total_num_tokens. Otherwise a request can be accepted
+        # into the waiting queue but can never be scheduled, blocking the queue
+        # and eventually making health checks fail.
+        paged_input_len = -(-input_len // self.page_size) * self.page_size
+        req.sampling_params.max_new_tokens = max(
+            0,
+            min(
+                (
+                    req.sampling_params.max_new_tokens
+                    if req.sampling_params.max_new_tokens is not None
+                    else 1 << 30
+                ),
+                self.max_req_len - input_len - 1,
+                self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
-            self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
     def _process_and_broadcast_mm_inputs(
@@ -2218,9 +2242,9 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if not self._set_or_validate_priority(req):
+            return
         if self.disaggregation_mode == DisaggregationMode.NULL:
-            if not self._set_or_validate_priority(req):
-                return
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
@@ -2459,6 +2483,8 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        if self.enable_fpm:
+            self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
@@ -2572,6 +2598,8 @@ class Scheduler(
 
         if ret:
             set_schedule_time_batch(ret)
+            if self.enable_fpm:
+                ret.fpm_start_time = self._fpm_batch_t0
 
         return ret
 
@@ -3153,6 +3181,11 @@ class Scheduler(
             self.process_batch_result_idle(batch, result)
 
         self.log_batch_result_stats(batch, result)
+
+        # Emit forward pass metrics (every iteration when enabled)
+        if self.enable_fpm:
+            self._emit_forward_pass_metrics(batch, result)
+
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.update_device_timer()
@@ -3442,7 +3475,7 @@ class Scheduler(
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
-                self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
+                self.spec_total_num_accept_tokens / self.spec_total_num_forward_ct
             )
 
         if RECORD_STEP_TIME:
@@ -3481,10 +3514,10 @@ class Scheduler(
         if if_success:
             if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
                 avg_spec_accept_length = (
-                    self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
+                    self.spec_total_num_accept_tokens / self.spec_total_num_forward_ct
                 )
                 logger.info(f"{avg_spec_accept_length=}")
-            self.spec_total_num_accepted_tokens = self.spec_total_num_forward_ct = 0
+            self.spec_total_num_accept_tokens = self.spec_total_num_forward_ct = 0
             for k, v in server_args_dict.items():
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")
@@ -3981,6 +4014,7 @@ def run_scheduler_process(
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
     # Create a scheduler and run the event loop
+    scheduler = None
     try:
         scheduler = Scheduler(
             server_args,
@@ -4004,3 +4038,8 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+    finally:
+        if scheduler is not None:
+            # FPM has a background ZMQ publisher thread that needs explicit
+            # teardown to flush queued metrics and close the socket cleanly.
+            scheduler._shutdown_fpm()

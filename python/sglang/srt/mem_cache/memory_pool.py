@@ -249,10 +249,13 @@ class MambaPool:
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
-            torch.cuda.use_mem_pool(self.custom_mem_pool)
-            if self.enable_custom_mem_pool
-            else nullcontext()
+        with (
+            self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
+            (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ),
         ):
             conv_state = [
                 torch.zeros(
@@ -623,6 +626,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
+
+    def get_state_buf_infos(self):
+        return self.mamba_pool.get_contiguous_buf_infos()
+
+    def get_state_dim_per_tensor(self):
+        return self.mamba_pool.get_state_dim_per_tensor()
 
     def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
         if self.mamba_ping_pong_track_buffer_size == 2:
@@ -1121,6 +1130,116 @@ class MHATokenToKVPool(KVCache):
                 num_warps=cfg["num_warps"],
                 num_stages=2,
             )
+
+
+class NoOpMHATokenToKVPool(MHATokenToKVPool):
+    """KV cache pool that skips physical K/V buffer allocation.
+
+    Used in embedding-mode prefill-only workloads with the FA
+    fa_skip_kv_cache path, where no layer reads or writes KV cache because
+    attention uses raw K/V via flash_attn_varlen_func. Other prefill-only paths
+    such as scoring/MIS may benefit from the same idea later, but some still
+    stage K/V through paged cache today.
+
+    This class keeps the scheduler's view of pool capacity (self.size is
+    honored for admission) but allocates only (page_size, head_num, head_dim)
+    placeholder tensors per layer to satisfy any code paths that dereference
+    the buffers.
+
+    Callers MUST ensure no real set_kv_buffer/get_*_buffer calls happen against
+    this pool; those paths raise loudly so misuse is visible.
+    """
+
+    def _create_buffers(self):
+        # Allocate minimal placeholder buffers. They exist purely so that code
+        # paths holding `k_buffer` / `v_buffer` references (pointer tables,
+        # layer-transfer counters, stride arithmetic) keep working without
+        # None-guards scattered across the codebase. Shape is
+        # [page_size, head_num, head_dim] per layer so that the unconditional
+        # `key_cache.view(-1, page_size, head_num, head_dim)` in the FA backend
+        # at the top of forward_extend succeeds regardless of --page-size.
+        # Total footprint is still on the order of KB vs GBs for a real pool.
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.k_buffer = [
+                torch.zeros(
+                    (self.page_size, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    (self.page_size, self.head_num, self.v_head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+
+    def _finalize_allocation_log(self, num_tokens: int):
+        self.mem_usage = 0.0
+        placeholder_bytes = (
+            2
+            * self.layer_num
+            * self.page_size
+            * self.head_num
+            * max(self.head_dim, self.v_head_dim)
+            * self.store_dtype.itemsize
+        )
+        logger.info(
+            f"KV Cache skipped (no-op pool). Logical #tokens: {num_tokens}, "
+            f"physical K/V size: ~{placeholder_bytes / 1024:.1f} KB placeholder"
+        )
+
+    def get_kv_size_bytes(self):
+        # Report zero so downstream memory accounting matches reality.
+        return (0, 0)
+
+    def set_kv_buffer(self, *args, **kwargs):
+        raise RuntimeError(
+            "NoOpMHATokenToKVPool.set_kv_buffer was called. This pool is only "
+            "valid in prefill-only modes (e.g. --is-embedding, scoring) with "
+            "the FA backend's fa_skip_kv_cache path active; the attention "
+            "backend must never write to it. Check that the workload truly "
+            "performs no decode and that the FA backend's fa_skip_kv_cache "
+            "preconditions are met."
+        )
+
+    def get_key_buffer(self, layer_id: int):
+        # Return the placeholder. The FA backend reads this before taking the
+        # fa_skip_kv_cache branch (which does not use it); the placeholder shape
+        # is (page_size, head_num, head_dim) so downstream .view() calls succeed.
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_value_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # no-op; embedding mode has no KV cache to move
+        return
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
@@ -1907,7 +2026,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
         assert index_head_dim == 128
 
         if _is_hip:
-            assert self.page_size == 1
+            assert (
+                self.page_size % 16 == 0
+            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
         else:
             assert self.page_size == 64
         with (
