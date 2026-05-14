@@ -17,7 +17,7 @@ import requests
 import torch
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -184,6 +184,11 @@ class TestPooledHiddenStatesEngine(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
+@unittest.skipIf(
+    is_hip(),
+    "Multi-Item Scoring (enable_mis) requires the flashinfer prefill/decode "
+    "backend, which is NVIDIA-only.",
+)
 class TestPooledHiddenStatesMISEngine(CustomTestCase):
     """Validates return_pooled_hidden_states in MIS (delimiter) scoring mode.
 
