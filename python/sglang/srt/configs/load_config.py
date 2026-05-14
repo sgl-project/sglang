@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
 import enum
 import logging
@@ -85,6 +87,7 @@ class LoadConfig:
     modelexpress_ep_size: Optional[int] = None
     modelexpress_dtype: Optional[str] = None
     modelexpress_quantization: Optional[str] = None
+    modelexpress_transport: str = "transfer_engine"
 
     # ModelOpt-specific loading options
     modelopt_checkpoint_restore_path: Optional[str] = None

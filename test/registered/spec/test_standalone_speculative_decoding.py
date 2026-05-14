@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -7,6 +6,7 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_STANDALONE,
@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 # Standalone speculative decoding tests (FA3, Triton, FlashInfer backends)
-register_cuda_ci(est_time=406, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=406, stage="stage-b", runner_config="1-gpu-large")
 
 GSM_DATASET_PATH = None
 
@@ -80,6 +80,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
         # please don't do this if you want to make your inference workload faster
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         model = cls.model
         cls.process = popen_launch_server(
             model,
@@ -91,6 +92,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        envs.SGLANG_ENABLE_SPEC_V2.clear()
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")
@@ -140,7 +142,6 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
         # please don't do this if you want to make your inference workload faster
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)  # Enable Speculative Decoding V2
         model = cls.model
         cls.process = popen_launch_server(
             model,
@@ -152,8 +153,6 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-        if "SGLANG_ENABLE_SPEC_V2" in os.environ:
-            envs.SGLANG_ENABLE_SPEC_V2.set(False)
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")
@@ -206,6 +205,10 @@ class TestStandaloneV2SpeculativeDecodingTriton(
     @classmethod
     def get_server_args(cls):
         return DEFAULT_SERVER_ARGS_V2 + ["--attention-backend", "triton"]
+
+    def test_radix_attention(self):
+        run_radix_attention_test(self.base_url)
+        assert self.process.poll() is None
 
 
 class TestStandaloneV2SpeculativeDecodingFlashinfer(

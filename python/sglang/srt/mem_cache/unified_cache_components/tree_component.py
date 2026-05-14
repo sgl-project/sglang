@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
-from enum import Enum
+from enum import Enum, IntFlag
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
@@ -67,6 +67,14 @@ class ComponentData:
     host_lock_ref: int = 0
 
 
+class EvictLayer(IntFlag):
+    """Which storage layer(s) to evict.  Combinable via bitwise OR."""
+
+    DEVICE = 1
+    HOST = 2
+    ALL = DEVICE | HOST
+
+
 class CacheTransferPhase(str, Enum):
 
     BACKUP_HOST = "backup_host"  # D→H
@@ -95,8 +103,13 @@ class TreeComponent(ABC):
     # Subclasses MUST set this as a class attribute (not @property)
     component_type: ComponentType
 
-    def node_has_component_data(self, node: UnifiedTreeNode) -> bool:
-        return node.component_data[self.component_type].value is not None
+    def node_has_component_data(
+        self, node: UnifiedTreeNode, target: EvictLayer = EvictLayer.DEVICE
+    ) -> bool:
+        cd = node.component_data[self.component_type]
+        if target is EvictLayer.DEVICE:
+            return cd.value is not None
+        return cd.host_value is not None
 
     def value_len(self, node: UnifiedTreeNode) -> int:
         value = node.component_data[self.component_type].value
@@ -150,6 +163,19 @@ class TreeComponent(ABC):
         be a tombstone for this component."""
         return False
 
+    def recover_after_unevict(
+        self,
+        node: UnifiedTreeNode,
+        prefix_len: int,
+        total_prefix_len: int,
+        params: InsertParams,
+    ) -> None:
+        """Called after _unevict_node_on_insert restores the base (Full) value
+        on an evicted node. Aux components (e.g. SWA) override this to rebuild
+        their own data from the freshly assigned base value when their entry
+        is still tombstoned. Default no-op."""
+        return None
+
     def commit_insert_component_data(
         self,
         node: UnifiedTreeNode,
@@ -186,17 +212,22 @@ class TreeComponent(ABC):
         ...
 
     @abstractmethod
-    def evict_component(self, node: UnifiedTreeNode, is_leaf: bool) -> int:
+    def evict_component(
+        self,
+        node: UnifiedTreeNode,
+        target: EvictLayer = EvictLayer.DEVICE,
+    ) -> tuple[int, int]:
         """Free this component's KV resources on a node being evicted.
-        For internal (non-leaf) nodes: free memory and tombstone the value
-        (set to None); the node structure is kept.
-        For leaf nodes: free memory; the node will be deleted by caller.
-        Returns the number of tokens/slots freed.
-        - Full: frees full_value via token_to_kv_pool_allocator.
-        - SWA: frees swa value via swa_token_to_kv_pool_allocator;
-          only tombstones on internal nodes.
-        - Mamba: frees mamba value via mamba_token_to_kv_pool_allocator;
-          only tombstones on internal nodes."""
+
+        *target* controls which layer(s) to evict:
+          - DEVICE: free device memory and tombstone (value = None).
+                    Host data is untouched.
+          - HOST:   free host memory (host_value = None).
+                    Device data is untouched.
+          - ALL:    free both device and host memory.
+                    No tombstone — caller will delete the node.
+
+        Returns (device_freed, host_freed) token counts."""
         ...
 
     def eviction_priority(self, is_leaf: bool) -> int:

@@ -167,9 +167,9 @@ def _load_architecture_specific_ops():
 
     # All attempts failed
     cuda_version = torch.version.cuda
-    if cuda_version and cuda_version.startswith("13"):
+    if cuda_version and cuda_version.startswith("12"):
         install_hint = (
-            "pip install sglang-kernel --index-url https://docs.sglang.ai/whl/cu130/"
+            "pip install sglang-kernel --index-url https://docs.sglang.ai/whl/cu129/"
         )
     else:
         install_hint = "pip install --upgrade sglang-kernel"
