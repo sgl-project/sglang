@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 )
 
 # Extra: Triton + Flashinfer NGRAM backends. Sibling per-commit file
-# (test_ngram_spec.py) keeps the Paged variant.
+# (test_spec_ngram.py) keeps the Paged variant.
 register_cuda_ci(est_time=254, stage="extra-a", runner_config="1-gpu-large")
 
 
