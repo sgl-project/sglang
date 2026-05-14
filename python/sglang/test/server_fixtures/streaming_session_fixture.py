@@ -396,20 +396,37 @@ async def _stress_run_all(base_url: str, tokenizer: Any) -> None:
 
 
 class StreamingSessionServerBase(CustomTestCase):
+    """Minimal streaming-session server fixture.
+
+    Subclasses override class attrs to customize launch:
+    - `model`: defaults to the small model.
+    - `extra_args`: appended after `--enable-streaming-session` (set
+      `--chunked-prefill-size`, `--page-size`, spec args, etc. here).
+    - `env_overrides`: list of `(env_attr_name, value)` tuples; each is
+      pushed onto the `setUpClass` context stack so the env override is
+      live during `popen_launch_server` and torn down on
+      `tearDownClass`-time. `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY=2`
+      is always applied on top of these.
+    """
+
+    model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+    base_url = DEFAULT_URL_FOR_TEST
+    extra_args: list = []
+    env_overrides: list = []
+
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+        import contextlib
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2))
+            for name, val in cls.env_overrides:
+                stack.enter_context(getattr(envs, name).override(val))
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--enable-streaming-session",
-                    "--chunked-prefill-size",
-                    "512",
-                ],
+                other_args=["--enable-streaming-session"] + list(cls.extra_args),
             )
         cls.tokenizer = get_tokenizer(cls.model)
 
