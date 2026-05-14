@@ -67,7 +67,7 @@ class MambaComponent(TreeComponent):
     ) -> MatchResult:
         cow_mamba = params.cow_mamba
         req = params.req
-        last_node = result.last_device_node
+        last_node = result.best_match_node
 
         if len(value_chunks) > best_value_len:
             chunk_size = get_global_server_args().mamba_cache_chunk_size
@@ -101,8 +101,7 @@ class MambaComponent(TreeComponent):
 
         # HiCache: if mamba was evicted from device but has host backup,
         # ensure host_hit_length >= 1 so load_back is triggered.
-        host_node = result.last_host_node
-        cd = host_node.component_data[self.component_type]
+        cd = last_node.component_data[self.component_type]
         if cd.value is None and cd.host_value is not None:
             result = result._replace(host_hit_length=max(result.host_hit_length, 1))
 
