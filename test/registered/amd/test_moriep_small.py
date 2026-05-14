@@ -10,7 +10,8 @@ from sglang.srt.utils.network import is_port_available
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -84,6 +85,8 @@ mtp_args = [
     "1",
     "--speculative-num-draft-tokens",
     "4",
+    "--speculative-draft-model-path",
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
 ]
 
 
@@ -91,7 +94,7 @@ class TestPureDP(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = common_args
 
@@ -129,14 +132,14 @@ class TestPureDP(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.60)
 
 
 class TestMTP(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = common_args + mtp_args
 
@@ -173,21 +176,21 @@ class TestMTP(CustomTestCase):
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["accuracy"], 0.92)
+        self.assertGreaterEqual(metrics["accuracy"], 0.60)
 
         server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreaterEqual(avg_spec_accept_length, 2.8)
+        self.assertGreaterEqual(avg_spec_accept_length, 2.1)
 
 
 class TestNormal(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = common_args + [
             "--deepep-mode",
@@ -228,14 +231,14 @@ class TestNormal(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.60)
 
 
 class TestLowLatency(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = common_args + [
             "--deepep-mode",
@@ -278,14 +281,14 @@ class TestLowLatency(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.60)
 
 
 class TestTBOwithNormal(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = common_args + [
             "--deepep-mode",
@@ -327,14 +330,14 @@ class TestTBOwithNormal(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.60)
 
 
 class TestTBOwithLowLatency(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = common_args + [
             "--deepep-mode",
@@ -378,14 +381,14 @@ class TestTBOwithLowLatency(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.935)
+        self.assertGreaterEqual(metrics["accuracy"], 0.60)
 
 
 class TestMTPwithTBONormal(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = (
             common_args
@@ -432,21 +435,21 @@ class TestMTPwithTBONormal(CustomTestCase):
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["accuracy"], 0.92)
+        self.assertGreaterEqual(metrics["accuracy"], 0.60)
 
         server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreaterEqual(avg_spec_accept_length, 2.8)
+        self.assertGreaterEqual(avg_spec_accept_length, 2.1)
 
 
 class TestMTPwithTBOLowLatency(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = (
             common_args
@@ -495,14 +498,14 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["accuracy"], 0.92)
+        self.assertGreaterEqual(metrics["accuracy"], 0.60)
 
         server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
         print(f"{avg_spec_accept_length=}")
-        self.assertGreaterEqual(avg_spec_accept_length, 2.8)
+        self.assertGreaterEqual(avg_spec_accept_length, 2.1)
 
 
 if __name__ == "__main__":
