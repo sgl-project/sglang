@@ -515,8 +515,6 @@ def _torch_plan_compress_prefill(
     ``PrefillPlan{ragged_id, batch_id, position, window_len}`` packed as
     4 little-endian uint32 (16 bytes).
     """
-    import struct
-
     assert compress_plan.dtype == torch.uint8
     assert write_plan.dtype == torch.uint8
     num_tokens = compress_plan.shape[0]
@@ -556,24 +554,22 @@ def _torch_plan_compress_prefill(
         counter == num_tokens
     ), f"input size {counter} != num_q_tokens {num_tokens}"
 
-    kInvalid = 0xFFFFFFFF
-    invalid_row = struct.pack("<IIII", kInvalid, kInvalid, kInvalid, kInvalid)
-
     def _fill(buf: torch.Tensor, entries: list) -> int:
         n_entries = len(entries)
         n_rows = num_tokens if use_cuda_graph else n_entries
         if n_rows == 0:
             return num_tokens if use_cuda_graph else 0
-        valid_bytes = b"".join(struct.pack("<IIII", *e) for e in entries)
-        if use_cuda_graph and n_entries < num_tokens:
-            payload = valid_bytes + invalid_row * (num_tokens - n_entries)
-        else:
-            payload = valid_bytes
-        cpu_view = torch.frombuffer(bytearray(payload), dtype=torch.uint8).view(
-            n_rows, 16
-        )
-        buf[:n_rows].copy_(cpu_view)
-        return num_tokens if use_cuda_graph else n_entries
+        # View the uint8 buffer as int32 — zero-copy, no bytearray or struct.pack
+        buf_i32 = buf[:n_rows].view(torch.int32)  # shape: (n_rows, 4)
+        if n_entries > 0:
+            # Build a (n_entries, 4) int32 tensor directly from the list —
+            # one allocation instead of bytes -> bytearray -> frombuffer copies.
+            entries_t = torch.tensor(entries, dtype=torch.int32)
+            buf_i32[:n_entries].copy_(entries_t)
+        if use_cuda_graph and n_entries < n_rows:
+            # Fill padding slots with 0xFFFFFFFF (== -1 in two's complement int32)
+            buf_i32[n_entries:n_rows].fill_(-1)
+        return n_rows
 
     compress_count = _fill(compress_plan, compress_entries)
     write_count = _fill(write_plan, write_entries)
