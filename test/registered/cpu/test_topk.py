@@ -1,10 +1,18 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
+import sglang.srt.layers.moe.topk as topk_module
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.moe.topk import (
+    TopKConfig,
+    _post_process_topk_ids,
+)
 from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
+from sglang.srt.layers.moe.topk import biased_topk_impl as native_biased_topk
 from sglang.srt.layers.moe.topk import fused_topk_torch_native as native_fused_topk
 from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
 from sglang.srt.models.llama4 import Llama4MoE
@@ -136,6 +144,83 @@ class TestBiasedGroupedTopK(CustomTestCase):
                                 bias_dtype,
                                 routed_scaling_factor,
                             )
+
+
+class TestBiasedTopK(CustomTestCase):
+    def test_biased_topk_returns_logical_ids_with_eplb_info(self):
+        hidden_states = torch.ones(1, 4)
+        gating_output = torch.tensor([[10.0, 9.0, 1.0, 0.0]])
+        correction_bias = torch.zeros(4)
+        dispatch_info = ExpertLocationDispatchInfo(
+            ep_dispatch_algorithm="static",
+            partial_logical_to_rank_dispatch_physical_map=torch.tensor(
+                [2, 3, 0, 1], dtype=torch.int64
+            ),
+            partial_logical_to_all_physical_map=torch.tensor(
+                [[2], [3], [0], [1]], dtype=torch.int64
+            ),
+            partial_logical_to_all_physical_map_num_valid=torch.ones(
+                4, dtype=torch.int64
+            ),
+            num_physical_experts=4,
+        )
+
+        _, topk_ids = native_biased_topk(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            correction_bias=correction_bias,
+            topk=2,
+            renormalize=False,
+            scoring_func="sqrtsoftplus",
+            expert_location_dispatch_info=dispatch_info,
+        )
+
+        torch.testing.assert_close(topk_ids, torch.tensor([[0, 1]], dtype=torch.int32))
+
+    def test_deepep_shared_remap_uses_physical_expert_count_with_eplb(self):
+        topk_ids = torch.tensor([[0, 1, 4]], dtype=torch.int32)
+        topk_weights = torch.ones(1, 3, dtype=torch.float32)
+        topk_config = TopKConfig(
+            top_k=3,
+            num_fused_shared_experts=1,
+            routed_scaling_factor=1.0,
+        )
+        router_logits = torch.zeros(1, 4, dtype=torch.float32)
+        dispatch_info = ExpertLocationDispatchInfo(
+            ep_dispatch_algorithm="static",
+            partial_logical_to_rank_dispatch_physical_map=torch.tensor(
+                [0, 4, 2, 5], dtype=torch.int64
+            ),
+            partial_logical_to_all_physical_map=torch.tensor(
+                [[0], [4], [2], [5]], dtype=torch.int64
+            ),
+            partial_logical_to_all_physical_map_num_valid=torch.ones(
+                4, dtype=torch.int64
+            ),
+            num_physical_experts=6,
+        )
+
+        with (
+            patch.object(topk_module, "_is_cuda", True),
+            patch.object(topk_module, "is_deepep_class_backend", return_value=True),
+            patch.object(
+                topk_module, "get_moe_expert_parallel_world_size", return_value=2
+            ),
+            patch.object(topk_module, "get_moe_expert_parallel_rank", return_value=0),
+        ):
+            remapped_ids, remapped_weights = _post_process_topk_ids(
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                topk_config=topk_config,
+                router_logits=router_logits,
+                layer_id=0,
+                expert_location_dispatch_info=dispatch_info,
+            )
+
+        torch.testing.assert_close(
+            remapped_ids, torch.tensor([[0, 5, 3]], dtype=remapped_ids.dtype)
+        )
+        torch.testing.assert_close(remapped_weights, torch.ones_like(topk_weights))
 
 
 class TestTopK(CustomTestCase):
