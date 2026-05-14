@@ -23,7 +23,7 @@ HW_MAPPING = {
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["stage-a-test-cpu"],
+    HWBackend.CPU: ["stage-a-test-cpu", "stage-b-test-cpu"],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",
@@ -151,9 +151,9 @@ def validate_all_suites(all_tests: List[CIRegistry]):
         if t.backend not in _SUITE_CHECKED_BACKENDS:
             continue
         valid = valid_by_backend.get(t.backend, set())
-        if t.suite not in valid:
+        if t.effective_suite not in valid:
             errors.append(
-                f"  {t.filename}: backend={t.backend.name}, suite='{t.suite}'"
+                f"  {t.filename}: backend={t.backend.name}, suite='{t.effective_suite}'"
             )
     if errors:
         raise ValueError("Tests registered to invalid suites:\n" + "\n".join(errors))
@@ -165,7 +165,7 @@ def filter_tests(
     ci_tests = [
         t
         for t in ci_tests
-        if t.backend == hw and t.suite == suite and t.nightly == nightly
+        if t.backend == hw and t.effective_suite == suite and t.nightly == nightly
     ]
 
     valid_suites = (
@@ -239,7 +239,9 @@ def run_a_suite(args):
         for f in glob.glob(
             os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
         )
-        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
+        if not f.endswith("/conftest.py")
+        and not f.endswith("/__init__.py")
+        and not f.endswith("/cpu/utils.py")
     ]
 
     # JIT kernel tests and benchmarks (live alongside kernel source)
