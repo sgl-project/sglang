@@ -186,6 +186,7 @@ class KimiK2Detector(BaseFormatDetector):
                         tool_index=function_idx,
                         name=function_name,
                         parameters=function_args,
+                        tool_call_id=function_id,
                     )
                 )
 
@@ -254,6 +255,7 @@ class KimiK2Detector(BaseFormatDetector):
                             tool_index=self.current_tool_id,
                             name=function_name,
                             parameters="",
+                            tool_call_id=function_id,
                         )
                     )
                     self.current_tool_name_sent = True
@@ -342,3 +344,23 @@ class KimiK2Detector(BaseFormatDetector):
     # the base get_structural_tag_name (returns None) keeps FunctionCallParser
     # on the legacy path, whose structure_info bakes the section markers in.
     # TODO: re-enable the builtin once https://github.com/mlc-ai/xgrammar/issues/622 is fixed.
+
+
+class KimiK2RawIdDetector(KimiK2Detector):
+    """
+    Variant of KimiK2Detector that preserves the model-emitted tool_call_id verbatim.
+
+    The default kimi_k2 path renumbers ids via `history_tool_calls_cnt + tool_index`
+    in the serving layer so that multi-turn conversations get globally unique,
+    monotonically increasing ids (see PR #10600). That is the right behavior for
+    chat use cases.
+
+    RL training has the opposite requirement: the trajectory must round-trip the
+    exact tool_call_id the model produced (e.g. `functions.foo:5`), so that the
+    follow-up tool result turn references the same id the policy emitted. This
+    subclass exists purely as a marker so the serving layer can branch on the
+    parser name and use `ToolCallItem.tool_call_id` directly. Parsing logic
+    is identical to KimiK2Detector.
+    """
+
+    pass
