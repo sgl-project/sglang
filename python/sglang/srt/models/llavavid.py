@@ -13,6 +13,7 @@
 # ==============================================================================
 """Inference-only LLaVa video model compatible with HuggingFace weights."""
 
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -57,8 +58,8 @@ class LlavaVidForCausalLM(nn.Module):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        pad_values = [item.pad_value for item in image_inputs.mm_items]
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
+        pad_values = array("q", (item.pad_value for item in image_inputs.mm_items))
         new_image_feature_len = self.image_feature_len
 
         pad_ids = pad_values * (
