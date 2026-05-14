@@ -222,6 +222,18 @@ class DiffGenerator:
                 output_file_name=user_output_file_name,
                 image_path=image_paths_per_prompt[i],
             )
+            # `dataclasses.replace` only copies dataclass fields, so the
+            # dynamically-set `_explicit_fields` attribute (added in
+            # SamplingParams.from_user_sampling_params_args) is dropped on the
+            # new instance. Without it, downstream stages (e.g.,
+            # InputValidationStage) cannot tell which user-provided values
+            # were explicit and silently overwrite them — for example,
+            # user-supplied `width`/`height` get replaced with
+            # aspect-ratio-derived defaults for QwenImageEditPlus.
+            # Restore it here, plus the keys we just overrode.
+            sampling_params._explicit_fields = getattr(
+                sampling_params_orig, "_explicit_fields", set()
+            ) | {"prompt", "output_file_name", "image_path"}
             sampling_params._set_output_file_name()
             req = prepare_request(
                 server_args=self.server_args,
