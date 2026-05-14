@@ -110,7 +110,11 @@ try:
     class _DeepseekV32ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v32"
 
+    class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
+        model_type = "deepseek_v4"
+
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
+    _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
 except ImportError:
     pass
 
