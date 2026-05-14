@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import requests
+import torch.distributed as dist
 import zmq
 from aiohttp import web
 
@@ -25,7 +26,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferMetric,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -141,6 +142,13 @@ class CommonKVManager(BaseKVManager):
                 not self.enable_all_cp_ranks_for_transfer
                 and self.attn_cp_size > 1
                 and self.attn_cp_rank != 0
+            )
+            # Sync the leader's bootstrap port to every rank before
+            # registering: in multi-node prefill, registration targets
+            # `dist_init_addr` (rank 0) but each rank's local port may
+            # differ when the launcher auto-reserves a free port per host.
+            self.bootstrap_port = self._sync_bootstrap_port_across_nodes(
+                self.bootstrap_port
             )
             self.register_to_bootstrap()
             self.transfer_infos = {}
@@ -334,6 +342,36 @@ class CommonKVManager(BaseKVManager):
         info.target_pp_ranks = target_pp_ranks
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
+
+    def _sync_bootstrap_port_across_nodes(self, local_port: int) -> int:
+        """Broadcast world-rank-0's bootstrap port to all prefill ranks.
+
+        Required for multi-node prefill when the launcher auto-reserves a
+        free port per host (e.g. Dynamo's
+        `_reserve_disaggregation_bootstrap_port`): without sync, non-leader
+        ranks register to `<leader_ip>:<their_local_port>`, hit
+        `Connection refused`, and the leader's `prefill_port_table` ends
+        up missing rows.
+        """
+        if not self.dist_init_addr or self.server_args.nnodes == 1:
+            return local_port
+
+        if not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError(
+                "torch.distributed must be initialised before "
+                "CommonKVManager registers to the bootstrap server in "
+                "multi-node prefill mode."
+            )
+
+        world_group = get_world_group()
+        synced_port = world_group.broadcast_object(local_port, src=0)
+        if synced_port != local_port:
+            logger.info(
+                f"Synced disaggregation bootstrap port from leader: "
+                f"local={local_port} -> leader={synced_port} "
+                f"(world_rank={world_group.rank_in_group})"
+            )
+        return synced_port
 
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP POST."""

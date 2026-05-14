@@ -48,6 +48,7 @@ class SetLoraReq:
     lora_path: Optional[Union[str, List[Optional[str]]]] = None
     target: Union[str, List[str]] = "all"
     strength: Union[float, List[float]] = 1.0
+    merge_mode: Optional[str] = None
 
 
 @dataclass

@@ -77,9 +77,13 @@ runs:
           const rootCauseFailures = jobs.filter(j => {
             if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
             // h20 runners are flaky (dirty GPU state from prior runs); their failures
-            // should not cascade fast-fail to other stages. Exact match avoids
-            // accidentally matching the h200 job names.
-            if (j.name === 'stage-c-test-8-gpu-h20') {
+            // should not cascade fast-fail to other stages. j.name shape from
+            // listJobsForWorkflowRun: "<job-key>" + optional " / <reusable-job>"
+            // + optional " (<matrix>)". Split off the base job key before exact
+            // match so we cover both inline + reusable forms without confusing
+            // 'h20' with the 'h200' prefix.
+            const baseName = j.name.split(/[ /]/)[0];
+            if (baseName === 'stage-c-test-8-gpu-h20') {
               return false;
             }
             // If the failing step is the health check, it's a cascade — skip it
