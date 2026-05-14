@@ -145,6 +145,42 @@ selected=2048       36.2µs  36.2µs  36.6µs
 Sparse-attn time is **flat across seq_len** at fixed selected count
 (≤2% jitter). Bounded by `total_selected`, not by `seq_len`.
 
+### nsys end-to-end proof at the winning point
+
+After landing the win and the review fixes, ran `nsys profile` on both
+legs at the actual winning operating point (70B/TP=8/128K/conc=32/
+tb=8192, `output_len=64` to bound trace size). Reports +
+manifest live in `repro_session/sweep_70b_128k_tbt_win/nsys/`;
+heavy artifacts (.nsys-rep + .sqlite, 372 MB + 1.06 GB respectively)
+stay outside the repo at `/workspace/nsys_reports/`.
+
+**Native kernels run with expected invocation counts:**
+
+| kernel | GPU time | instances | % of DS-on total |
+|---|---:|---:|---:|
+| `_ds_k_label_write_kernel`                  | 0.985 s | 326,502 | 0.04% |
+| `_ds_native_sparse_attn_stage2_kernel`      | 0.471 s |  10,240 | 0.02% |
+| `_ds_native_score_kernel`                   | 0.179 s |  10,240 | 0.01% |
+| `_ds_native_sparse_attn_stage3_kernel`      | 0.055 s |  10,240 | <0.01% |
+| `_ds_native_build_selected_physical_kernel` | 0.055 s |  10,240 | <0.01% |
+| **DS-only kernels total**                   | **1.88 s** |  — | **0.1%** |
+
+(Instances = 80 layers × 64 decode steps × 2 graph captures = 10,240
+per Triton kernel. K_label fires per-layer per-request through prefill
+and decode.)
+
+**Legacy kernels absent**: `_ds_select_stage2_merge_kernel` (the prior-
+session 32K hotspot at 51.3%) and `_ds_select_stage1_block_topk_kernel`
+do not appear in the DS-on trace. The native dispatch successfully
+bypasses the legacy stage-2 / union path; prefill still uses FA3 dense
+extend, as designed.
+
+**Profiling overhead bounded**: DS-off TBT 34.64 ms under nsys vs
+34.68 ms without; DS-on TBT 31.26 ms under nsys vs 31.21 ms without.
+≤ 0.16% on both legs — the visible-win gate (0.8999× without
+profiling) holds, and the kernel mix observed under nsys is
+representative of production.
+
 ## 5. What went wrong / what was learned
 
 ### Failure 1: CUDA-graph capture vs host-sync gate

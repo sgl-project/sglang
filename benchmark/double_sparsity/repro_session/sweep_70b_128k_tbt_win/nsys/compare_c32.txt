@@ -1,0 +1,65 @@
+DS-off total GPU time:  1207.90 s   (125 unique kernels)
+DS-on  total GPU time:  2550.23 s   (42 unique kernels)
+DS-on  / DS-off total:     2.11x
+
+==============================================================================================================
+KERNELS EXCLUSIVE TO DS-ON (pure DS overhead — would not exist without DS)
+==============================================================================================================
+  Kernel                                                                     GPU time    % on    inst
+  _ds_k_label_write_kernel                                                  0.985 s     0.0%  326502
+  _ds_native_sparse_attn_stage2_kernel                                      0.471 s     0.0%   10240
+  _ds_native_score_kernel                                                   0.179 s     0.0%   10240
+  at                                                                        0.133 s     0.0%   40960
+  _ds_native_sparse_attn_stage3_kernel                                      0.055 s     0.0%   10240
+  _ds_native_build_selected_physical_kernel                                 0.055 s     0.0%   10240
+  ... ALL DS-only kernels                                                   1.877 s     0.1%
+
+==============================================================================================================
+SHARED KERNELS (run in both modes; expected to be nearly identical wall-clock)
+==============================================================================================================
+  Kernel                                               off time    on time   ratio off inst  on inst
+  void cutlass                                       1076.724 s   1154.294 s    1.07x   445037   316263
+  ncclDevKernel_AllReduce_Sum_bf16_RING_LL           23.531 s   495.103 s   21.04x    52808   633899
+  nvjet_sm90_tst_256x128_64x4_1x2_h_bz_coopA_TNT     11.947 s   388.976 s   32.56x    45440   314979
+  nvjet_sm90_tst_320x128_64x3_1x2_h_bz_coopB_TNT      6.590 s   343.198 s   52.08x    23680   944943
+  void                                               48.499 s   52.980 s    1.09x   717035  1012467
+  kernel_cutlass_kernel_flashinfernormkernelsfused    2.512 s   89.023 s   35.44x    21760   652996
+  kernel_cutlass_kernel_flashinfernormkernelsrmsno    6.241 s   11.597 s    1.86x      136     4085
+  void at                                             6.776 s   10.179 s    1.50x   570466   898576
+  void flash                                          1.447 s    1.207 s    0.83x   406008   316911
+  ncclDevKernel_AllGather_RING_LL                     1.205 s    0.265 s    0.22x     5184     4077
+  nvjet_sm90_tst_128x8_64x12_2x1_v_bz_TNT             0.364 s    0.291 s    0.80x     5120     4013
+  write_req_to_token_pool_triton                      0.273 s    0.267 s    0.98x     3664     3957
+  nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT       0.265 s    0.211 s    0.79x     8320     6400
+  nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT              0.196 s    0.150 s    0.77x    16640    12800
+  nvjet_sm90_tst_64x16_64x16_2x1_v_bz_splitK_TNT      0.170 s    0.094 s    0.55x     5120     2560
+  nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT             0.123 s    0.062 s    0.51x    10240     5120
+  void cublasLt                                       0.135 s    0.046 s    0.34x    57600    21760
+  nvjet_sm90_tst_64x24_64x16_2x1_v_bz_splitK_TNT      0.129 s    0.047 s    0.37x     3840     1280
+  void at_cuda_detail                                 0.032 s    0.108 s    3.42x    26272    64286
+  nvjet_sm90_tst_64x32_64x16_4x1_v_bz_TNT             0.083 s    0.047 s    0.57x     2560     1280
+  ... ALL shared kernels                             1187.242 s   2548.146 s    2.15x
+
+==============================================================================================================
+KERNELS EXCLUSIVE TO DS-OFF (likely just FA3 variants the sparse path doesn't trigger)
+==============================================================================================================
+  void flashinfer                                                           5.390 s     0.4%  150696
+  nvjet_sm90_tst_192x192_64x4_2x1_v_bz_coopB_TNN                            3.907 s     0.3%   16640
+  nvjet_sm90_tst_192x128_64x5_1x2_h_bz_coopB_TNT                            1.788 s     0.1%    3840
+  nvjet_sm90_tst_176x128_64x5_1x2_h_bz_TNN                                  1.725 s     0.1%    5120
+  nvjet_sm90_tst_128x192_64x5_2x1_v_bz_coopB_TNN                            0.748 s     0.1%   12800
+  nvjet_sm90_tst_168x128_64x5_1x2_h_bz_TNN                                  0.599 s     0.0%    3840
+  nvjet_sm90_tst_192x192_64x4_1x2_h_bz_coopB_TNN                            0.542 s     0.0%    1280
+  nvjet_sm90_tst_144x128_64x6_1x2_h_bz_TNN                                  0.436 s     0.0%    3840
+  nvjet_sm90_tst_320x128_64x3_2x4_h_bz_coopB_TNT                            0.379 s     0.0%    2560
+  nvjet_sm90_tst_112x128_64x7_2x1_v_bz_TNN                                  0.284 s     0.0%    5120
+
+==============================================================================================================
+SUMMARY
+==============================================================================================================
+  DS-off total GPU time:           1207.90 s
+  DS-on  total GPU time:           2550.23 s
+  Shared workload (matmuls, FA3):  off=1187.24s, on=2548.15s  (delta=+1356251942872ns)
+  Pure DS overhead (DS-only):         1.88 s   (0.1% of DS-on GPU time)
+  Excess GPU time (DS-on - DS-off):1342.33 s
+  → DS-only kernels explain        0.1% of the GPU-time gap

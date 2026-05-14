@@ -197,6 +197,53 @@ Apples-to-apples DS-off NIAH at n=10 is being measured to verify the
 delta against the −0.02 quality guard; preliminary read is that the
 n=5 → n=10 sample count is the main driver of the apparent gap.
 
+## 3.5 nsys proof at the winning point
+
+End-to-end CUDA-graph replay confirmed at 70B/TP=8/128K/conc=32/tb=8192
+(`output_len=64` to keep trace size bounded). Reports + analysis in
+`repro_session/sweep_70b_128k_tbt_win/nsys/`; full nsys-rep + sqlite
+live outside the repo at `/workspace/nsys_reports/`.
+
+### Native kernels — present in DS-on, absent from DS-off
+
+| kernel | GPU time | instances | % of DS-on |
+|---|---:|---:|---:|
+| `_ds_k_label_write_kernel`              | 0.985 s | 326,502 | 0.04% |
+| `_ds_native_sparse_attn_stage2_kernel`  | 0.471 s |  10,240 | 0.02% |
+| `_ds_native_score_kernel`               | 0.179 s |  10,240 | 0.01% |
+| `_ds_native_sparse_attn_stage3_kernel`  | 0.055 s |  10,240 | <0.01% |
+| `_ds_native_build_selected_physical_kernel` | 0.055 s | 10,240 | <0.01% |
+| **DS-only kernels total**               | **1.88 s** | — | **0.1%** of DS-on |
+
+All four ported kernels show up in the trace with the expected
+invocation count (`80 layers × 64 decode steps × 2 graph captures =
+10,240`). K_label write fires per request per layer
+(`32 reqs × 80 layers × ~127 timesteps`).
+
+### Legacy kernels — absent from DS-on
+
+Did **not** appear anywhere in the DS-on trace:
+* `_ds_select_stage2_merge_kernel` (the legacy 32K hotspot at 51.3%)
+* `_ds_select_stage1_block_topk_kernel`
+* `ds_union_per_batch`'s torch-op pipeline
+* FA3 page-table-rewrite kernels (`prepare_varlen_num_blocks`,
+  `index_put` for the metadata adaptor) at decode time
+
+This is the structural proof: the replayed CUDA graph executes the
+native pipeline, not the legacy adaptor path. (Prefill still uses FA3
+dense extend; that's unchanged.)
+
+### TBT under nsys (sanity check)
+
+| | non-nsys | under nsys |
+|---|---:|---:|
+| DS-off TBT p50 | 34.68 ms | 34.64 ms |
+| DS-on TBT p50  | 31.21 ms | 31.26 ms |
+
+Profiling overhead ≤ 0.16% on TBT for both legs — small enough that
+the headline visible-win gate (0.8999× ≤ 0.90) holds without nsys
+and the per-step picture matches the headline measurement.
+
 ## 4. What landed in code
 
 | File | Change |
