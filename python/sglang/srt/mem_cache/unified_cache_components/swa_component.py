@@ -95,7 +95,7 @@ class SWAComponent(TreeComponent):
     ) -> MatchResult:
         ct = self.component_type
         n_swa = 0
-        node = result.last_device_node
+        node = result.last_host_node
         root = self.cache.root_node
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]

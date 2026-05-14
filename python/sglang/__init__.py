@@ -69,6 +69,7 @@ from sglang.utils import LazyImport
 from sglang.version import __version__
 
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
+Crusoe = LazyImport("sglang.lang.backend.crusoe", "Crusoe")
 LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
 OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
 VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
@@ -106,6 +107,7 @@ __all__ = [
     "unconditional_likelihood_normalized",
     "ServerArgs",
     "Anthropic",
+    "Crusoe",
     "LiteLLM",
     "OpenAI",
     "VertexAI",

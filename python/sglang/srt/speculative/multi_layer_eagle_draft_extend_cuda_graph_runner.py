@@ -359,6 +359,12 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         )
         spec_info.positions = None
 
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.model_runner.spec_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+
         # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
@@ -381,7 +387,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=capture_mode,
             attn_backend=self.eagle_worker.draft_extend_attn_backend_list[self.step],
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
