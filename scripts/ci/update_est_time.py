@@ -24,7 +24,8 @@ DEFAULT_MODEL_URL = (
     "https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/main/model.json"
 )
 
-BACKENDS = ("cuda", "cpu", "amd", "npu")
+# AMD / NPU live in separate workflows and are not scraped by sglang-ci-stats.
+BACKENDS = ("cuda", "cpu")
 
 # A change is "significant" if |delta| >= this many seconds AND the relative
 # change is at least SIGNIFICANT_REL_DELTA. Dual threshold filters out both
