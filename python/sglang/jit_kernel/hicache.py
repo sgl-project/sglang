@@ -248,14 +248,13 @@ def transfer_hicache_all_layer_staged_lf_pf(
     staging_v = staging_v.view(staging_v.shape[0], staging_v.shape[1], -1)
     dst_k = dst_k.view(dst_k.shape[0], dst_k.shape[1], -1)
     dst_v = dst_v.view(dst_v.shape[0], dst_v.shape[1], -1)
-    dst_indices_cpu = dst_indices.cpu()
     for page_begin in range(0, src_page_indices.numel(), staging_page_capacity):
         chunk_pages = min(staging_page_capacity, src_page_indices.numel() - page_begin)
         chunk_tokens = chunk_pages * page_size
         module.launch_all_lf_pf_staged(
             dst_k,
             dst_v,
-            dst_indices_cpu[
+            dst_indices[
                 page_begin * page_size : (page_begin + chunk_pages) * page_size
             ],
             staging_k[:chunk_tokens],
@@ -293,13 +292,12 @@ def transfer_hicache_all_layer_mla_staged_lf_pf(
     staging_page_capacity = staging.shape[0] // page_size
     staging = staging.view(staging.shape[0], staging.shape[1], -1)
     dst = dst.view(dst.shape[0], dst.shape[1], -1)
-    dst_indices_cpu = dst_indices.cpu()
     for page_begin in range(0, src_page_indices.numel(), staging_page_capacity):
         chunk_pages = min(staging_page_capacity, src_page_indices.numel() - page_begin)
         chunk_tokens = chunk_pages * page_size
         module.launch_all_mla_lf_pf_staged(
             dst,
-            dst_indices_cpu[
+            dst_indices[
                 page_begin * page_size : (page_begin + chunk_pages) * page_size
             ],
             staging[:chunk_tokens],

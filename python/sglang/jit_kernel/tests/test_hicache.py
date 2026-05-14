@@ -109,9 +109,14 @@ def _run_transfer_roundtrip_mha(layout: str, element_dim: int) -> None:
     host_pages = torch.tensor([0, 1, 2], device=DEVICE, dtype=torch.int64)
     device_indices = _token_indices_for_pages(device_pages)
     host_indices = _token_indices_for_pages(host_pages)
+    host_indices_backup = (
+        _token_indices_for_pages(host_pages, device="cpu")
+        if layout == "page_first"
+        else host_indices
+    )
 
     host_pool.backup_from_device_all_layer(
-        device_pool, host_indices, device_indices, "kernel"
+        device_pool, host_indices_backup, device_indices, "kernel"
     )
     torch.cuda.synchronize()
 
@@ -197,9 +202,14 @@ def _run_transfer_roundtrip_mla(layout: str, element_dim: int) -> None:
     host_pages = torch.tensor([0, 1, 2], device=DEVICE, dtype=torch.int64)
     device_indices = _token_indices_for_pages(device_pages)
     host_indices = _token_indices_for_pages(host_pages)
+    host_indices_backup = (
+        _token_indices_for_pages(host_pages, device="cpu")
+        if layout == "page_first"
+        else host_indices
+    )
 
     host_pool.backup_from_device_all_layer(
-        device_pool, host_indices, device_indices, "kernel"
+        device_pool, host_indices_backup, device_indices, "kernel"
     )
     torch.cuda.synchronize()
 
@@ -281,12 +291,12 @@ def _run_page_first_staged_write_back_mha(
         page_count,
         0,
         -1,
-        device=DEVICE,
         dtype=torch.int64,
     )
     src_index_dtype = torch.int32 if page_count == 64 else torch.int64
     device_indices = _token_indices_for_pages(device_pages, dtype=src_index_dtype)
-    host_indices = _token_indices_for_pages(host_pages)
+    host_indices = _token_indices_for_pages(host_pages, device="cpu")
+    assert not host_indices.is_cuda
 
     host_pool.backup_from_device_all_layer(
         device_pool, host_indices, device_indices, "kernel"
@@ -358,12 +368,12 @@ def _run_page_first_staged_write_back_mla(
         page_count,
         0,
         -1,
-        device=DEVICE,
         dtype=torch.int64,
     )
     src_index_dtype = torch.int32 if page_count == 64 else torch.int64
     device_indices = _token_indices_for_pages(device_pages, dtype=src_index_dtype)
-    host_indices = _token_indices_for_pages(host_pages)
+    host_indices = _token_indices_for_pages(host_pages, device="cpu")
+    assert not host_indices.is_cuda
 
     host_pool.backup_from_device_all_layer(
         device_pool, host_indices, device_indices, "kernel"
