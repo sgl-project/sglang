@@ -1,4 +1,4 @@
-"""Nightly: PCG coexistence with non-EAGLE3 speculative decoding variants.
+"""Extra: PCG coexistence with non-EAGLE3 speculative decoding variants.
 
 EAGLE3 stays per-commit in the sibling file
 test_pcg_with_speculative_decoding.py.
@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=400, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=531, stage="extra-a", runner_config="2-gpu-large")
 
 
 class TestPCGWithMTP(unittest.TestCase):

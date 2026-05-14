@@ -1,4 +1,4 @@
-"""Nightly: DeepSeek-V3 FP4 with FlashInfer Cutlass MoE backend.
+"""Extra: DeepSeek-V3 FP4 with FlashInfer Cutlass MoE backend.
 
 Sibling per-commit file (test_deepseek_v3_fp4_4gpu.py) keeps the
 SymmetricMemory variant.
@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=400, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=960, stage="extra-b", runner_config="4-gpu-b200")
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 SERVER_LAUNCH_TIMEOUT = 1200

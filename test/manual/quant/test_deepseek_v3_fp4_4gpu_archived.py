@@ -9,7 +9,7 @@ Originally lived in:
 The remaining classes from that file are split between:
 - test/registered/quant/test_deepseek_v3_fp4_4gpu.py
     -> SymmetricMemory variant (per-commit, stage-c-test-4-gpu-b200)
-- test/registered/quant/test_deepseek_v3_fp4_4gpu_nightly.py
+- test/registered/quant/test_deepseek_v3_fp4_4gpu_extra.py
     -> CutlassMoE variant (extra-b-test-4-gpu-b200)
 """
 

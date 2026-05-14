@@ -1,4 +1,4 @@
-"""Nightly: TP=2 EP=2 with FP8 + DeepGEMM MoE backend.
+"""Extra: TP=2 EP=2 with FP8 + DeepGEMM MoE backend.
 
 Sibling per-commit file (test_moe_ep.py) keeps the baseline TP=2 EP=2
 variant.
@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=140, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=279, stage="extra-a", runner_config="2-gpu-large")
 
 
 class TestEpDeepGEMM(CustomTestCase):
