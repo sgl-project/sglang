@@ -19,6 +19,7 @@ from typing import (
 import torch
 
 from sglang.jit_kernel.utils import cache_once
+from sglang.utils import is_in_ci
 
 F = TypeVar("F", bound=Callable[..., "BenchResult"])
 Metric: TypeAlias = 'float | Literal["avg"]'
@@ -91,8 +92,11 @@ def bench_one_function(
     graph_clone_args: Iterable[int] | Literal["all"] | None = "all",
     graph_clone_kwargs: Iterable[str] | Literal["all"] | None = "all",
     # NOTE: for memory-bandwidth profiling
-    memory_args: Iterable[Any] | None = None,
-    extra_memory_footprint: int | None = None,
+    disable_log_bandwidth: bool = DISABLE_LOG_BANDWIDTH,
+    memory_args: Iterable[Any] | Literal["all"] | None = "all",
+    memory_output: Iterable[Any] | Literal["out"] | None = "out",
+    extra_memory_args: Iterable[Any] | None = None,
+    extra_memory_footprint: int = 0,
 ) -> BenchResult:
     """
     Benchmark a function using CUDA graph or naive loop.
@@ -109,10 +113,13 @@ def bench_one_function(
                              Only the read args need to be cloned to avoid L2 cache effect.
     :param graph_clone_kwargs: Keys of input_kwargs to clone for each iteration.
                                Only the read args need to be cloned to avoid L2 cache effect.
+    :param disable_log_bandwidth: Whether to disable logging memory bandwidth in the profile report.
     :param memory_args: Optional sequence of arguments to calculate total memory footprint.
                         Used for memory bandwidth estimation in the profile report.
+    :param memory_output: Arguments whose output memory should be included in the memory footprint.
+    :param extra_memory_args: Additional arguments to consider for memory footprint calculation.
     :param extra_memory_footprint: Additional memory footprint to consider.
-                                   Usually used for kernels with dynamic input shape.
+                                   This is typically used when the load/store bytes is dynamic.
     """
     # first warmup the function
     device_id = torch.cuda.current_device()
@@ -182,10 +189,16 @@ def bench_one_function(
     stream.synchronize()
     result = _process_metrics(result, metrics)
     memory_footprint = None
-    if memory_args is not None:
-        memory_footprint = sum(_get_nbytes(arg) for arg in memory_args)
-    if extra_memory_footprint is not None:
-        memory_footprint = (memory_footprint or 0) + extra_memory_footprint
+    if not disable_log_bandwidth:
+        if memory_args == "all":
+            memory_args = input_args + tuple(input_kwargs.values())
+        if memory_output == "out":
+            memory_output = fn(*input_args, **input_kwargs)
+        memory_footprint = extra_memory_footprint
+        memory_footprint += _get_nbytes(extra_memory_args)
+        memory_footprint += _get_nbytes(memory_args)
+        memory_footprint += _get_nbytes(memory_output)
+
     return BenchResult(metrics, result, memory_footprint)
 
 
@@ -280,9 +293,12 @@ def mark_benchmark(line_arg: str, line_vals: List[str], *, unit: str = "us"):
     return decorator
 
 
-def mark_args(name: str, vals: List[Any]):
+def mark_args(name: str, vals: List[Any], ci_vals: Optional[List[Any]] = None):
     def decorator(bench: Benchmark[F]) -> Benchmark[F]:
-        bench.benchmark_configs[name] = vals
+        if ci_vals is not None and is_in_ci():
+            bench.benchmark_configs[name] = ci_vals
+        else:
+            bench.benchmark_configs[name] = vals
         return bench
 
     return decorator

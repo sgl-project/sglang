@@ -1,10 +1,7 @@
 import torch
 
 from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import (
-    create_random,
-    get_benchmark_range,
-)
+from sglang.jit_kernel.benchmark.utils import create_random
 from sglang.jit_kernel.norm import fused_inplace_qknorm
 from sglang.srt.utils import get_current_device_stream_fast
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -49,22 +46,6 @@ def torch_impl_qknorm(
     k.copy_(k.float() * k_norm * k_weight.float())
 
 
-BS_RANGE = get_benchmark_range(
-    full_range=[2**n for n in range(0, 14)],
-    ci_range=[16],
-)
-GQA_RANGE = get_benchmark_range(
-    full_range=[4, 8],
-    ci_range=[4],
-)
-KV_HEAD_RANGE = get_benchmark_range(
-    full_range=[1, 2, 4, 8],
-    ci_range=[1],
-)
-HEAD_DIM_RANGE = get_benchmark_range(
-    full_range=[128, 256, 512, 1024],
-    ci_range=[128],
-)
 FN_MAP = {
     "aot": sglang_aot_qknorm,
     "jit": fused_inplace_qknorm,
@@ -72,10 +53,10 @@ FN_MAP = {
 }
 
 
-@marker.mark_args("head_dim", HEAD_DIM_RANGE)
-@marker.mark_args("GQA", GQA_RANGE)
-@marker.mark_args("num_kv_heads", KV_HEAD_RANGE)
-@marker.mark_args("batch_size", BS_RANGE)
+@marker.mark_args("head_dim", [128, 256, 512, 1024], [128])
+@marker.mark_args("GQA", [4, 8], [4])
+@marker.mark_args("num_kv_heads", [1, 2, 4, 8], [1])
+@marker.mark_args("batch_size", [2**n for n in range(0, 14)], [16])
 @marker.mark_benchmark("impl", ["aot", "jit", "torch"])
 def benchmark(head_dim: int, GQA: int, num_kv_heads: int, batch_size: int, impl: str):
     num_qo_heads = GQA * num_kv_heads
@@ -86,7 +67,7 @@ def benchmark(head_dim: int, GQA: int, num_kv_heads: int, batch_size: int, impl:
     return marker.bench_one_function(
         FN_MAP[impl],
         input_args=(q, k, q_weight, k_weight),
-        memory_args=(2 * (q, k), q_weight, k_weight),  # q + k load/store, weight load
+        memory_output=(q, k),  # inplace write to q, k
     )
 
 
