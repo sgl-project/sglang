@@ -14,6 +14,7 @@ Usage:
         deepseek-ai/DeepSeek-V3.2:8
 """
 
+import hashlib
 import json
 import os
 import signal
@@ -24,6 +25,16 @@ import time
 from math import ceil
 from pathlib import Path
 from typing import Dict, List
+
+# Marker dir for short-circuiting the (slow) fallback path on a warm machine.
+# After `sglang.compile_deep_gemm` succeeds for a (model, tp, extra_args) tuple
+# we drop a marker; the next CI run skips that fallback entirely. The marker
+# filename includes a hash of extra_args + a version_key over Python/Triton/Torch
+# so the marker auto-invalidates when FALLBACK_ARGS or the toolchain changes.
+# Note: clearing /root/.cache/deep_gemm without also clearing this directory
+# WILL cause a false-positive skip → in-test JIT compile. If you wipe the
+# DeepGEMM cache, also wipe ~/.cache/sglang/warmup_markers/deepgemm_fallback_*.
+MARKER_DIR = os.path.join(os.path.expanduser("~"), ".cache", "sglang", "warmup_markers")
 
 # Per-model fallback timeout. Outer cap: if a subprocess wedges for any reason
 # the crash-marker watcher can't see, kill it after this many seconds. Even
@@ -371,6 +382,56 @@ def _kill_pg_and_wait(proc):
             return -1
 
 
+def get_version_key():
+    """Hash of Python + Triton + PyTorch versions; invalidates markers on upgrade."""
+    parts = [sys.version]
+    try:
+        import triton  # noqa: WPS433
+
+        parts.append(f"triton={triton.__version__}")
+    except ImportError:
+        parts.append("triton=none")
+    try:
+        import torch  # noqa: WPS433
+
+        parts.append(f"torch={torch.__version__}")
+    except ImportError:
+        parts.append("torch=none")
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:12]
+
+
+def get_fallback_marker_path(model, tp, extra_args):
+    """Marker path for one (model, tp, extra_args) fallback invocation."""
+    args_blob = json.dumps(list(extra_args))
+    args_hash = hashlib.md5(args_blob.encode()).hexdigest()[:8]
+    safe_model = model.replace("/", "--")
+    return os.path.join(
+        MARKER_DIR,
+        f"deepgemm_fallback_{safe_model}_tp{tp}_{args_hash}_{get_version_key()}.done",
+    )
+
+
+def check_fallback_marker(model, tp, extra_args):
+    return os.path.exists(get_fallback_marker_path(model, tp, extra_args))
+
+
+def write_fallback_marker(model, tp, extra_args):
+    marker = get_fallback_marker_path(model, tp, extra_args)
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    Path(marker).write_text(
+        json.dumps(
+            {
+                "model": model,
+                "tp": tp,
+                "extra_args": list(extra_args),
+                "version_key": get_version_key(),
+                "timestamp": time.time(),
+            }
+        )
+    )
+    print(f"  Wrote marker: {marker}")
+
+
 def fallback_compile_deep_gemm(model, tp):
     """Fall back to full sglang.compile_deep_gemm (loads model weights).
 
@@ -534,8 +595,20 @@ def main():
         print(f"{'=' * 60}")
 
         if shapes is None:
-            # Unknown architecture: fall back to full compile_deep_gemm
-            fallback_compile_deep_gemm(model, tp)
+            # Fallback path: full sglang.compile_deep_gemm with the test's launch
+            # flags. Loading model weights inside that subprocess is the dominant
+            # cost (45-170s/model) and dwarfs the actual DeepGEMM compile, so we
+            # skip the whole fallback when the marker says we already populated
+            # this cache. Cache is keyed on (model, tp, extra_args, version_key).
+            extra_args = FALLBACK_ARGS.get(model, [])
+            if check_fallback_marker(model, tp, extra_args):
+                print(
+                    f"  SKIP fallback (warm marker found): {model} (tp={tp}, "
+                    f"extra_args={extra_args})"
+                )
+                continue
+            if fallback_compile_deep_gemm(model, tp):
+                write_fallback_marker(model, tp, extra_args)
             continue
 
         # Print shape summary
