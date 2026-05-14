@@ -27,7 +27,7 @@ try:
 except ImportError:
     _HAS_GRANIAN = False
 
-register_cuda_ci(est_time=52, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=52, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=52, suite="stage-b-test-1-gpu-small-amd")
 
 
