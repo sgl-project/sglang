@@ -792,6 +792,24 @@ def load_audio(
             return samples.data.squeeze(0).numpy()
         return samples.data.T.numpy()
 
+    if is_npu():
+        import soundfile as sf
+
+        if isinstance(source, bytes):
+            audio, original_sr = sf.read(BytesIO(source))
+        else:
+            audio, original_sr = sf.read(source)
+
+        if mono and len(audio.shape) > 1:
+            audio = np.mean(audio, axis=1)
+
+        if original_sr != sr:
+            # Use scipy for resampling to avoid torchaudio CUDA dependency
+            from scipy.signal import resample_poly
+
+            audio = resample_poly(audio, sr, original_sr)
+        return audio
+
     # Fallback: soundfile + torchaudio (ARM / no FFmpeg)
     import soundfile as sf
     import torch
