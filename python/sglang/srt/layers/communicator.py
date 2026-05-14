@@ -1301,8 +1301,12 @@ class CommunicateSummableTensorPairFn:
 
         # DP scatter (if DP attention is enabled)
         if context.attn_dp_size > 1:
+            if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+                group = get_tp_group()
+            else:
+                group = get_attention_tp_group()
             hidden_states_output, global_hidden_states = (
-                get_local_dp_buffer(),
+                get_local_dp_buffer(group),
                 hidden_states,
             )
             dp_scatter(hidden_states_output, global_hidden_states, forward_batch)
