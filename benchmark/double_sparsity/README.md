@@ -39,6 +39,27 @@ For 70B, do the same with `--model meta-llama/Meta-Llama-3.1-70B-Instruct`.
 
 ## Running
 
+### Long-context concurrency sweep (post-v2-native pivot — RECOMMENDED)
+
+For the 70B/TP=8/128K target, the native-decode path's win lives at
+high concurrency where dense decode is KV-bandwidth bound. The
+`run_70b_sweep.sh` driver launches one DS-off and one DS-on server
+(not 10 separate launches) and sweeps concurrency in `{1,4,8,16}` per
+leg:
+
+```bash
+CTX=131072 N_REQUESTS=8 OUTPUT_LEN=512 CONCURRENCIES=1,4,8,16 \
+  bash benchmark/double_sparsity/run_70b_sweep.sh \
+    /workspace/calib_llama_3_1_70b_wikitext_s32.json
+```
+
+The driver writes `bench_70b_sweep_131072/branch_ds_{off,on}.json` and
+runs `compare.py` to render the per-concurrency table + visible-win
+gate at the best speedup point. See `HANDOFF_NATIVE.md` for the
+results landed this session.
+
+### Single-point comparison (legacy harness)
+
 Each config is a separate process. Easiest is a small driver shell
 script that sets up the right git checkout for `main_dense`:
 
