@@ -966,28 +966,6 @@ class HiRadixCache(RadixCache):
                 locked_nodes.append((_priority, x))
                 continue
 
-            if self._is_pinned(x):
-                # Still active: demote to host if possible
-                if x.backuped:
-                    n = self._evict_backuped(x)
-                    num_evicted += n
-                    num_evicted_backuped += n
-                    continue
-                written = self.write_backup(x, write_back=True)
-                if written > 0:
-                    num_evicted += written
-                    write_back_nodes.append(x)
-                    continue  # backup succeeded, pin holds on host
-                # Host full -- drop pin so GPU can be freed
-                self._clear_pin(x)
-                logger.warning(
-                    "[PIN] evict: can't backup node %d to host, releasing pin",
-                    x.id,
-                )
-            elif x.pin_expiry > 0:
-                # Expired pin: clear and fall through to normal eviction
-                self._clear_pin(x)
-
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
