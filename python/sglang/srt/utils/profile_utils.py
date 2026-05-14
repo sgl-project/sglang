@@ -30,22 +30,28 @@ logger = logging.getLogger(__name__)
 
 @contextlib.contextmanager
 def profile_startup_region(label: str, snapshot_path: str, enabled: bool):
-    """Wrap a one-shot startup memory-allocation region with a torch profiler
-    trace and a CUDA memory history snapshot.
+    """Wrap a one-shot startup region with a torch profiler trace and a CUDA
+    memory history snapshot.
 
     Mirrors :class:`CudaGraphRunner._init_profile_context_and_memory_record`
-    / ``_post_process_after_profile`` so that arbitrary startup workspaces
-    (CUDA graph capture, FlashInfer all-reduce fusion workspace, FlashInfer
-    autotune, symmetric memory pre-allocation, ...) can be inspected with the
-    same tooling.
+    / ``_post_process_after_profile``. Currently used to instrument the
+    FlashInfer autotune kernel warmup, but the helper itself is general and
+    can wrap any short-lived region whose allocations go through PyTorch's
+    CUDA caching allocator.
 
     On exit, this dumps a CUDA memory history pickle (open at
     https://pytorch.org/memory_viz) and logs four ranked tables: top ops by
     ``self_cuda_memory_usage`` and ``self_cpu_memory_usage`` (primary signal
-    for workspace regions), followed by ``cuda_time_total`` and
+    for memory-attribution questions), followed by ``cuda_time_total`` and
     ``cpu_time_total`` (secondary signal for kernel-bound regions like
-    autotune). Memory tables are populated by passing ``profile_memory=True``
-    to the underlying ``torch.profiler.profile``.
+    autotune).
+
+    Limitation: ``_record_memory_history`` and ``profile_memory=True`` only
+    instrument PyTorch's CUDA caching allocator. Allocations made directly
+    via the CUDA driver API (e.g. ``cuMemCreate`` for FlashInfer's symmetric
+    workspaces or NCCL symmetric memory pools) are invisible to this
+    instrumentation. For those regions, ``torch.cuda.mem_get_info()`` deltas
+    are the right primitive instead.
 
     When ``enabled`` is ``False`` this is a zero-overhead no-op.
 
@@ -62,7 +68,12 @@ def profile_startup_region(label: str, snapshot_path: str, enabled: bool):
         yield
         return
 
-    torch.cuda.memory._record_memory_history()
+    # stacks="python" attaches Python frames (instead of degraded C++ unwinder
+    # frames) to each alloc event, which makes blocks clickable in
+    # https://pytorch.org/memory_viz with their actual SGLang/FlashInfer call
+    # sites. max_entries is bumped well above the 64 K default so long
+    # autotune runs don't evict early events from the trace ring buffer.
+    torch.cuda.memory._record_memory_history(stacks="python", max_entries=100_000)
     try:
         with torch.profiler.profile(
             activities=[

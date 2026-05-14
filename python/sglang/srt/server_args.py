@@ -698,7 +698,7 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     enable_breakable_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
-    enable_profile_startup_workspaces: bool = False
+    enable_profile_flashinfer_autotune: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
     enable_layerwise_nvtx_marker: bool = False
@@ -6335,15 +6335,15 @@ class ServerArgs:
             help="Enable profiling of cuda graph capture.",
         )
         parser.add_argument(
-            "--enable-profile-startup-workspaces",
+            "--enable-profile-flashinfer-autotune",
             action="store_true",
             help=(
                 "Enable torch profiler + CUDA memory snapshot capture around "
-                "startup workspace allocations: FlashInfer all-reduce fusion "
-                "workspace pre-init, FlashInfer autotune kernel warmup, and "
-                "symmetric-memory pool pre-allocation. Each region writes its "
-                "own *_memory_usage.pickle in the cwd and logs top ops sorted "
-                "by CUDA / CPU time."
+                "the FlashInfer autotune kernel warmup. Writes "
+                "flashinfer_autotune_memory_usage.pickle in the cwd (open at "
+                "https://pytorch.org/memory_viz) and logs top ops by self "
+                "CUDA / CPU memory and CUDA / CPU time. Useful for measuring "
+                "autotune's startup memory and time cost."
             ),
         )
         parser.add_argument(
