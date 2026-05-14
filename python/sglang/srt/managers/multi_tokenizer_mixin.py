@@ -493,8 +493,10 @@ class TokenizerWorker(TokenizerManager):
         async with self.is_pause_cond:
             if obj.is_pause:
                 self.is_pause = True
+                self._pause_notify.set()
             else:
                 self.is_pause = False
+                self._pause_notify.clear()
                 self.is_pause_cond.notify_all()
 
         # Resolve the pending future if this worker initiated the pause/continue

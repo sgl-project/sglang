@@ -25,7 +25,7 @@ import socket
 import sys
 import threading
 from collections import deque
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext, suppress
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
@@ -420,6 +420,69 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+        self._pause_notify = asyncio.Event()
+
+    @asynccontextmanager
+    async def _ensure_paused_or_model_locked(self):
+        """Run while paused, or with the model update writer lock held.
+
+        _pause_notify is only a wakeup signal. When it fires, we still acquire
+        is_pause_cond and re-check is_pause, then hold the condition through the
+        update so continue_generation cannot unpause concurrently.
+        """
+
+        async def cancel_wait(task: asyncio.Task):
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        async def cancel_writer_acquire(task: asyncio.Task):
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+                await self.model_update_lock.release_writer()
+
+        async with self.is_pause_cond:
+            if self.is_pause:
+                yield
+                return
+
+        writer_task = asyncio.create_task(self.model_update_lock.acquire_writer())
+        pause_task = asyncio.create_task(self._pause_notify.wait())
+        writer_held = False
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    (writer_task, pause_task), return_when=asyncio.FIRST_COMPLETED
+                )
+
+                if writer_task in done:
+                    writer_task.result()
+                    writer_held = True
+                    await cancel_wait(pause_task)
+                    yield
+                    return
+
+                pause_task.result()
+                async with self.is_pause_cond:
+                    if self.is_pause:
+                        await cancel_writer_acquire(writer_task)
+                        writer_task = None
+                        yield
+                        return
+
+                    # Stale wakeup: continue_generation cleared is_pause before
+                    # we could hold is_pause_cond. Keep racing the writer lock.
+                    self._pause_notify.clear()
+
+                pause_task = asyncio.create_task(self._pause_notify.wait())
+        finally:
+            if not pause_task.done():
+                await cancel_wait(pause_task)
+            if writer_held:
+                await self.model_update_lock.release_writer()
+            elif writer_task is not None:
+                await cancel_writer_acquire(writer_task)
 
     def init_lora(self):
         # LoRA
@@ -1493,6 +1556,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = True
+            self._pause_notify.set()
             if obj.mode != "abort":
                 await self.send_to_scheduler.send_pyobj(obj)
             else:
@@ -1508,6 +1572,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
+            self._pause_notify.clear()
             await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
@@ -1526,14 +1591,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # Immediately update the weights if the engine is in paused state
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
+        async with self._ensure_paused_or_model_locked():
             success, message, num_paused_requests = (
                 await self._wait_for_model_update_from_disk(obj)
             )
