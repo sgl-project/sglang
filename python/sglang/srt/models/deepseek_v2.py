@@ -167,7 +167,6 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
-    dispose_tensor,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -1931,7 +1930,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states_orig = hidden_states
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
@@ -1956,9 +1954,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-
-        if residual is not hidden_states_orig:
-            dispose_tensor(hidden_states_orig)
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
