@@ -150,6 +150,10 @@ class GenerateReqInput(BaseReq):
     video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None
+    # Optional per-image hashes (hex). When set, seeds MultimodalDataItem.hash
+    # so pad_value is deterministic from the caller's hash; None preserves the
+    # default hash_feature() behavior.
+    mm_hashes: Optional[Union[List[str], List[List[str]]]] = None
     # Whether to extract and process audio from video inputs.
     use_audio_in_video: bool = False
     # The sampling_params. See descriptions below.

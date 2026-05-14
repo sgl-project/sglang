@@ -801,6 +801,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
                     token_type_ids = token_type_ids.flatten().tolist()
+            # Seed each item's hash from caller-supplied mm_hashes so
+            # set_pad_value() skips the hash_feature() recompute. Length
+            # mismatch or per-item parse error falls back to recompute.
+            caller_mm_hashes = getattr(obj, "mm_hashes", None)
+            if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
+                if len(caller_mm_hashes) != len(mm_inputs.mm_items):
+                    logger.warning(
+                        "mm_hashes length (%d) != mm_items length (%d); "
+                        "ignoring caller hashes for this request.",
+                        len(caller_mm_hashes),
+                        len(mm_inputs.mm_items),
+                    )
+                else:
+                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
+                        if not isinstance(item, MultimodalDataItem):
+                            continue
+                        try:
+                            # Parse the first 16 hex chars (u64 width).
+                            # Wider inputs (e.g. 64-char strings from vLLM's
+                            # parse_mm_hash_from_extra_key convention) place
+                            # the meaningful bits in the high 16 chars.
+                            if isinstance(hex_hash, str) and len(hex_hash) >= 16:
+                                item.hash = int(hex_hash[:16], 16)
+                            else:
+                                item.hash = int(hex_hash, 16)
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "Ignoring malformed mm_hashes entry %r; "
+                                "this item will fall back to hash_feature().",
+                                hex_hash,
+                            )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
