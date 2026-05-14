@@ -310,6 +310,106 @@ def _build_selected_physical(
     )
 
 
+@triton.jit
+def _ds_native_append_sink_recent_kernel(
+    Req_to_tokens,  # [bs, max_ctx]
+    B_Seqlen,  # [bs]
+    Out,  # [bs, H_kv, total_selected]
+    stride_rt_b,
+    stride_o_b,
+    stride_o_h,
+    sink_tokens,  # runtime int
+    recent_tokens,  # runtime int
+    TOP_K: tl.constexpr,
+    SINK_RECENT_SLACK: tl.constexpr,
+    SINK_RECENT_PADDED: tl.constexpr,
+):
+    """One program per (bs, kv_head). Writes the sink + recent tail slots
+    of `Out` starting at offset `TOP_K`. Assumes top-k physical ids were
+    already written by a selector backend (e.g. FlashInfer's
+    `top_k_page_table_transform`).
+
+    Same layout as the second half of
+    `_ds_native_build_selected_physical_kernel`:
+        Out[bs, h, TOP_K            : TOP_K + sink_tokens)  = req_to_token[bs, 0..sink)
+        Out[bs, h, TOP_K + sink     : TOP_K + sink + recent) = req_to_token[bs, seq-recent..seq)
+    """
+    bs_idx = tl.program_id(0)
+    kv_idx = tl.program_id(1)
+
+    out_base = bs_idx * stride_o_b + kv_idx * stride_o_h
+    rt_base = bs_idx * stride_rt_b
+
+    sr_offs = tl.arange(0, SINK_RECENT_PADDED)
+    sr_in_range = sr_offs < SINK_RECENT_SLACK
+    is_sink = sr_in_range & (sr_offs < sink_tokens)
+    is_recent = (
+        sr_in_range & (sr_offs >= sink_tokens) & (sr_offs < sink_tokens + recent_tokens)
+    )
+
+    sink_pos = sr_offs
+    sink_phys = tl.load(
+        Req_to_tokens + rt_base + sink_pos,
+        mask=is_sink,
+        other=0,
+    ).to(tl.int32)
+
+    seq_len = tl.load(B_Seqlen + bs_idx).to(tl.int64)
+    rec_lo = tl.maximum(seq_len - recent_tokens, 0)
+    rec_idx = sr_offs - sink_tokens
+    rec_pos = rec_lo + rec_idx
+    rec_phys = tl.load(
+        Req_to_tokens + rt_base + rec_pos,
+        mask=is_recent,
+        other=0,
+    ).to(tl.int32)
+
+    combined = tl.where(is_sink, sink_phys, rec_phys)
+    tl.store(Out + out_base + TOP_K + sr_offs, combined, mask=sr_in_range)
+
+
+def _append_sink_recent_physical(
+    *,
+    req_to_token_indexed: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    top_k: int,
+    sink_tokens: int,
+    recent_tokens: int,
+) -> None:
+    """Write the sink + recent physical slots of `out` starting at offset
+    `top_k`, assuming a selector backend already wrote `out[..., :top_k]`.
+
+    Companion to the FlashInfer / SGL selector backends, which output
+    top-k physical ids directly and don't need the gather-from-logical
+    step that `_build_selected_physical` does.
+    """
+    if not out.is_cuda:
+        raise RuntimeError("_append_sink_recent_physical requires CUDA tensors")
+    bs, h_kv, total = out.shape
+    slack = total - top_k
+    if slack < sink_tokens + recent_tokens:
+        raise ValueError(
+            f"out has slack {slack} < sink+recent = {sink_tokens + recent_tokens}"
+        )
+    grid = (bs, h_kv)
+    _ds_native_append_sink_recent_kernel[grid](
+        req_to_token_indexed,
+        seq_lens,
+        out,
+        req_to_token_indexed.stride(0),
+        out.stride(0),
+        out.stride(1),
+        sink_tokens,
+        recent_tokens,
+        TOP_K=top_k,
+        SINK_RECENT_SLACK=slack,
+        SINK_RECENT_PADDED=triton.next_power_of_2(max(slack, 1)),
+        num_warps=1,
+        num_stages=1,
+    )
+
+
 def _build_selected_physical_torch_ref(
     *,
     topk_logical: torch.Tensor,
@@ -587,6 +687,7 @@ def ds_native_sparse_decode(
     score_block_t: int = 128,
     attn_block_seq: int = 128,
     attn_block_n: int = 16,
+    selector=None,  # _BaseSelector | None
 ) -> torch.Tensor:
     """Full DS native sparse-decode forward.
 
@@ -629,24 +730,36 @@ def ds_native_sparse_decode(
         block_t=score_block_t,
     )
 
-    # 2. Top-k. Sink/recent/oob positions were masked to -inf in step 1.
-    # torch.topk allocates a fresh int64 indices tensor each call; the
-    # CUDA-graph caching allocator handles the routing under capture.
-    topk_logical = torch.topk(att_out_approx, top_k, dim=-1, sorted=False).indices
-    if topk_logical.dtype != torch.int32:
-        # torch.topk returns int64 indices; the build kernel expects int32.
-        # The conversion is a small alloc, ~5-10 µs at bs=1.
-        topk_logical = topk_logical.to(torch.int32)
-
-    # 3. Build selected_physical (top-k + sink + recent), in-place.
-    _build_selected_physical(
-        topk_logical=topk_logical,
-        req_to_token_indexed=req_to_token_indexed,
-        seq_lens=seq_lens,
-        sink_tokens=sink_tokens,
-        recent_tokens=recent_tokens,
-        out=selected_physical,
-    )
+    # 2 + 3. Selector backend chooses top_k positions and lays out
+    # `selected_physical = [top-k phys | sink phys | recent phys]`
+    # in-place. Default selector reproduces the prior behavior
+    # (`torch.topk` + fused build kernel); alternative backends fuse
+    # top-k with the page-table lookup.
+    if selector is None:
+        # Inline default to avoid the import cycle from the orchestrator
+        # back up to selector_backends (the latter imports kernels from
+        # this module).
+        topk_logical = torch.topk(att_out_approx, top_k, dim=-1, sorted=False).indices
+        if topk_logical.dtype != torch.int32:
+            topk_logical = topk_logical.to(torch.int32)
+        _build_selected_physical(
+            topk_logical=topk_logical,
+            req_to_token_indexed=req_to_token_indexed,
+            seq_lens=seq_lens,
+            sink_tokens=sink_tokens,
+            recent_tokens=recent_tokens,
+            out=selected_physical,
+        )
+    else:
+        selector.select(
+            att_out_approx=att_out_approx,
+            req_to_token_indexed=req_to_token_indexed,
+            seq_lens=seq_lens,
+            top_k=top_k,
+            sink_tokens=sink_tokens,
+            recent_tokens=recent_tokens,
+            out=selected_physical,
+        )
 
     # 4. Sparse attention
     _launch_sparse_attn(
@@ -667,6 +780,7 @@ def ds_native_sparse_decode(
 __all__ = [
     "ds_native_sparse_decode",
     "_build_selected_physical",
+    "_append_sink_recent_physical",
     "_launch_score",
     "_launch_sparse_attn",
 ]

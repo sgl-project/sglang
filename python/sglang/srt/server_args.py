@@ -674,6 +674,11 @@ class ServerArgs:
     # v1.1 selection-kernel knobs (two-stage block-topk + merge).
     double_sparsity_block_t: int = 1024
     double_sparsity_k_block: int = 64
+    # Top-k selector backend for the native DS sparse-decode pipeline.
+    # `torch` is the default (`torch.topk` + fused build kernel). Other
+    # choices replace just the topk + page-table lookup step; see
+    # `mem_cache.sparsity.algorithms.selector_backends`.
+    double_sparsity_selector_backend: str = "torch"
 
     # LMCache
     enable_lmcache: bool = False
@@ -6347,6 +6352,23 @@ class ServerArgs:
             help="Stage-1 per-block top-k count emitted to stage-2. Sweep "
             "{32, 64, 128}. Effective budget = min(token_budget, "
             "num_blocks * k_block).",
+        )
+        parser.add_argument(
+            "--double-sparsity-selector-backend",
+            type=str,
+            choices=[
+                "torch",
+                "flashinfer_topk_page_table",
+                "sgl_fast_topk_transform",
+                "jit_fused_selector",
+            ],
+            default=ServerArgs.double_sparsity_selector_backend,
+            help="Top-k selector backend for the native DS sparse-decode "
+            "pipeline. 'torch' (default) uses torch.topk + a fused build "
+            "kernel; 'flashinfer_topk_page_table' fuses top-k + page-table "
+            "lookup via FlashInfer; 'sgl_fast_topk_transform' is the "
+            "SGLang counterpart; 'jit_fused_selector' is reserved for a "
+            "future hand-written fused kernel.",
         )
 
         # LMCache

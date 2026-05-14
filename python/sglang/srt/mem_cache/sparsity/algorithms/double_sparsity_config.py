@@ -245,6 +245,10 @@ class DoubleSparsityRuntimeConfig:
     # at algorithm init. Sourced from `server_args.max_running_requests` (or
     # `cuda_graph_max_bs`); default 1 keeps the existing test/CPU paths happy.
     scratch_max_bs: int = 1
+    # Top-k selector backend used inside `ds_native_sparse_decode`.
+    # Default `"torch"` keeps behavior identical to pre-flag builds.
+    # See `selector_backends.SUPPORTED_SELECTOR_BACKENDS`.
+    selector_backend: str = "torch"
 
     def validate(self) -> None:
         _require(self.heavy_channels > 0, "heavy_channels must be positive")
@@ -284,6 +288,27 @@ class DoubleSparsityRuntimeConfig:
         _require(
             self.scratch_max_bs >= 1,
             f"scratch_max_bs must be >= 1, got {self.scratch_max_bs}",
+        )
+        # Imported lazily to avoid a top-level cycle with selector_backends,
+        # which imports kernels from layers/attention/triton_ops.
+        from sglang.srt.mem_cache.sparsity.algorithms.selector_backends import (
+            FLASHINFER_TOPK_MAX,
+            SUPPORTED_SELECTOR_BACKENDS,
+        )
+
+        _require(
+            self.selector_backend in SUPPORTED_SELECTOR_BACKENDS,
+            f"selector_backend must be one of {SUPPORTED_SELECTOR_BACKENDS}, "
+            f"got {self.selector_backend!r}",
+        )
+        _require(
+            self.selector_backend != "flashinfer_topk_page_table"
+            or self.token_budget <= FLASHINFER_TOPK_MAX,
+            f"selector_backend='flashinfer_topk_page_table' requires "
+            f"token_budget <= {FLASHINFER_TOPK_MAX} (FlashInfer's "
+            f"top_k_page_table_transform errors above that ceiling); "
+            f"got token_budget={self.token_budget}. Lower the budget or "
+            f"use selector_backend='torch'.",
         )
 
     def warn_capacity(
@@ -353,6 +378,9 @@ def build_runtime_config(server_args) -> DoubleSparsityRuntimeConfig:
         block_t=server_args.double_sparsity_block_t,
         k_block=server_args.double_sparsity_k_block,
         scratch_max_bs=int(scratch_max_bs),
+        selector_backend=getattr(
+            server_args, "double_sparsity_selector_backend", "torch"
+        ),
     )
     cfg.validate()
     return cfg

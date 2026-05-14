@@ -81,6 +81,11 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
 
         self.runtime_config = runtime_config
         self.calibration = calibration
+        # Lazily-constructed selector backend (the FlashInfer / SGL
+        # selectors keep small per-shape caches). Built on first use so
+        # `import double_sparsity` doesn't pull in FlashInfer when the
+        # default `torch` backend is selected.
+        self._selector = None
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         self.num_kv_heads_local = (
@@ -467,6 +472,13 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         mid_out = self._native_mid_out.narrow(0, 0, bs)
         mid_log = self._native_mid_o_logexpsum.narrow(0, 0, bs)
 
+        if self._selector is None and rt.selector_backend != "torch":
+            from sglang.srt.mem_cache.sparsity.algorithms.selector_backends import (
+                make_selector,
+            )
+
+            self._selector = make_selector(rt.selector_backend)
+
         ds_native_sparse_decode(
             q=q_3d,
             k_buffer=forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -485,6 +497,7 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
             mid_o_logexpsum=mid_log,
             output=output,
             attn_block_seq=self._native_attn_block_seq,
+            selector=self._selector,
         )
 
         # Flatten to the 2D shape downstream code expects.
