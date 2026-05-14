@@ -422,7 +422,7 @@ def get_kv_class(
         }
         return class_mapping.get(class_type)
 
-    elif transfer_backend == TransferBackend.P2P:  
+    elif transfer_backend == TransferBackend.P2P:
         from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.p2p import (
             P2PKVBootstrapServer,
@@ -431,7 +431,7 @@ def get_kv_class(
             P2PKVSender,
         )
         class_mapping = {
-            KVClassType.KVARGS: KVArgs, 
+            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: P2PKVManager,
             KVClassType.SENDER: P2PKVSender,
             KVClassType.RECEIVER: (P2PKVReceiver),

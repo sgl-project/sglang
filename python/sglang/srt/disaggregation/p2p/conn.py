@@ -293,7 +293,7 @@ class P2PKVManager(CommonKVManager):
                 "registered_state_ptrs and state_handles length mismatch, "
                 "this should never happen."
             )
-        
+
         handle_min_ptr: Dict[bytes, int] = {}
         for ptr, handle in zip(registered_state_ptrs, self.state_handles):
             old = handle_min_ptr.get(handle)
@@ -305,7 +305,7 @@ class P2PKVManager(CommonKVManager):
             for ptr, handle in zip(registered_state_ptrs, self.state_handles)
         ]
 
-    
+
     def _execute_batch_transfer(
         self,
         transfer_blocks: List[dict],
@@ -449,8 +449,8 @@ class P2PKVManager(CommonKVManager):
 
     def send_kvcache(
         self,
-        req: TransferInfo, 
-        p2p_session_id: str,  
+        req: TransferInfo,
+        p2p_session_id: str,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: List[bytes],
         dst_kv_indices: npt.NDArray[np.int32],
@@ -468,7 +468,7 @@ class P2PKVManager(CommonKVManager):
             dst_data_indices=dst_kv_indices,
             executor=executor,
             req=req,
-            track_stats=True, 
+            track_stats=True,
         )
 
     def send_aux(
@@ -666,7 +666,7 @@ class P2PKVManager(CommonKVManager):
                     "dst_handle": dst_handle,
                     "dst_dev": dst_physical_gpu_id,
                     "dst_offset": dst_offset,
-                    "length": src_item_len,  
+                    "length": src_item_len,
                 }
             )
 
@@ -1048,7 +1048,7 @@ class P2PKVManager(CommonKVManager):
                             result = self.engine.register_d_handle(kv_handle)
                         except Exception as e:
                             logger.exception(f"register_d_handle failed: {e}")
-                        
+
                     # AUX raw ptrs
                     aux_ptrs = list(
                         struct.unpack(
@@ -1299,8 +1299,8 @@ class P2PKVManager(CommonKVManager):
             )
         )
 
-    def get_session_id(self): 
-        return self.engine.get_session_id() 
+    def get_session_id(self):
+        return self.engine.get_session_id()
 
     def _handle_node_failure(self, failed_bootstrap_addr):
         with self.connection_lock:
@@ -1354,7 +1354,7 @@ class P2PKVSender(CommonKVSender):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
-        
+
         # Special handling for cp
         if self.kv_mgr.enable_all_cp_ranks_for_transfer:
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
@@ -1371,9 +1371,9 @@ class P2PKVSender(CommonKVSender):
 
         if not is_last:
             self.kv_mgr.add_transfer_request(
-                self.bootstrap_room, 
-                kv_indices, 
-                index_slice, 
+                self.bootstrap_room,
+                kv_indices,
+                index_slice,
                 False
             )
         else:
@@ -1415,7 +1415,7 @@ class P2PKVSender(CommonKVSender):
     def clear(self) -> None:
         if self.bootstrap_room in self.kv_mgr.request_status:
             self.kv_mgr.request_status.pop(self.bootstrap_room)
-    
+
     def failure_exception(self):
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
@@ -1424,11 +1424,11 @@ class P2PKVSender(CommonKVSender):
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(
-                self.bootstrap_room, 
+                self.bootstrap_room,
                 "P2P transfer failed due to an unknown reason"
             )
-        raise P2PTransferError(self.bootstrap_room, failure_reason) 
-    
+        raise P2PTransferError(self.bootstrap_room, failure_reason)
+
     def abort(self):
         self.kv_mgr.record_failure(
             self.bootstrap_room,
@@ -1444,7 +1444,7 @@ class P2PKVReceiver(CommonKVReceiver):
         mgr: P2PKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None
-    ):   
+    ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
@@ -1616,7 +1616,7 @@ class P2PKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, "P2P transfer failed due to an unknown reason"
             )
         raise P2PTransferError(self.bootstrap_room, failure_reason)
-    
+
     def abort(self):
         self.kv_mgr.record_failure(
             self.bootstrap_room,

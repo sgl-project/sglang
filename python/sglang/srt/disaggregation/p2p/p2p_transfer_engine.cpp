@@ -205,7 +205,7 @@ void CudaP2PTransfer::TransferThreadPool::worker(int thread_id) {
         CHECK(cudaMemcpyPeerAsync(task.dst_ptr, task.dst_gpu_id,
                                   task.src_ptr, task.src_gpu_id,
                                   task.length_bytes, stream));
-        CHECK(cudaStreamSynchronize(stream)); 
+        CHECK(cudaStreamSynchronize(stream));
         bytes_transferred_.fetch_add(task.length_bytes, std::memory_order_relaxed);
 
         task.done->store(true, std::memory_order_release);

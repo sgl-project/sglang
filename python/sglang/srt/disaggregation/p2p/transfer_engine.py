@@ -34,7 +34,7 @@ class CompositeTransferHandle:
             else:
                 while not getattr(h, "is_done", lambda: True)():
                     time.sleep(0.001)
-                    
+
 
 class P2PTransferEngine:
     def __init__(self, hostname: str, physical_gpu_id: int):
@@ -49,7 +49,7 @@ class P2PTransferEngine:
         except Exception as e:
             logger.exception(f"Failed to initialize P2P engine for GPU {physical_gpu_id}")
             raise RuntimeError(f"P2P engine initialization failed: {e}") from e
-    
+
     def register_buffer(self, ptr):
         try:
             handle = self.p2p_engine.register_buffer(ptr)
@@ -98,7 +98,7 @@ class P2PTransferEngine:
         except Exception as e:
             logger.exception(f"transfer_many failed: {e}")
             raise
-        
+
     def register_d_handle(self, dst_handle: bytes) -> int:
         try:
             result = self.p2p_engine.register_d_handle(dst_handle)
