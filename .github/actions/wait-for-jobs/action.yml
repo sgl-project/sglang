@@ -181,13 +181,16 @@ runs:
 
               if (matchingJobs.length < spec.expected_count) {
                 // Job-level `if:` is evaluated before matrix expansion. When it
-                // evaluates false, GitHub emits exactly one "skipped" entry using
-                // the un-expanded job name (bare prefix, no " (shard)" suffix)
-                // instead of N matrix entries. Detect that precise shape so we
-                // don't poll forever — and so we don't mistake a partially
+                // evaluates false, GitHub emits exactly one "skipped" entry
+                // without a "(shard)" suffix instead of N matrix entries. Two
+                // shapes are possible:
+                //   - inline matrix:     `<prefix>`
+                //   - reusable workflow: `<prefix> / <called-job>`
+                // Both lack the ` (` shard marker. Detect that precise shape so
+                // we don't poll forever — and so we don't mistake a partially
                 // materialized dynamic/reusable matrix for a skipped one.
                 const unexpandedSkip = matchingJobs.length === 1 &&
-                  matchingJobs[0].name === spec.prefix &&
+                  !matchingJobs[0].name.includes(' (') &&
                   matchingJobs[0].status === 'completed' &&
                   matchingJobs[0].conclusion === 'skipped';
                 if (unexpandedSkip) {
