@@ -336,6 +336,8 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
 
         if phase == CacheTransferPhase.BACKUP_HOST:
+            if self._mamba_pool_host is None:
+                return None
             cd = node.component_data[ct]
             if cd.value is None:
                 return None

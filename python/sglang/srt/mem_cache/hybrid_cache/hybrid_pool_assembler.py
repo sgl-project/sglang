@@ -262,18 +262,12 @@ def build_hybrid_mamba_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
+    enable_mamba_hicache = not server_args.hicache_disable_mamba
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=page_size,
         server_args=server_args,
         use_mla=use_mla,
-    )
-    mamba_host_pool = MambaPoolHost(
-        mamba_pool,
-        server_args.hicache_ratio,
-        server_args.hicache_size,
-        allocator_type=server_args.hicache_storage_backend,
-        layout=server_args.hicache_mem_layout,
     )
     entries = [
         build_pool_entry(
@@ -284,16 +278,26 @@ def build_hybrid_mamba_stack(
             transfer_layer_num=transfer_layer_num,
             is_anchor=True,
         ),
-        build_pool_entry(
-            name=PoolName.MAMBA,
-            host_pool=mamba_host_pool,
-            device_pool=mamba_pool,
-            layer_mapping=mamba_layer_mapping,
-            transfer_layer_num=transfer_layer_num,
-            host_evict_fn=host_mamba_evict_fn,
-            device_evict_fn=device_mamba_evict_fn,
-        ),
     ]
+    if enable_mamba_hicache:
+        mamba_host_pool = MambaPoolHost(
+            mamba_pool,
+            server_args.hicache_ratio,
+            server_args.hicache_size,
+            allocator_type=server_args.hicache_storage_backend,
+            layout=server_args.hicache_mem_layout,
+        )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.MAMBA,
+                host_pool=mamba_host_pool,
+                device_pool=mamba_pool,
+                layer_mapping=mamba_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+                host_evict_fn=host_mamba_evict_fn,
+                device_evict_fn=device_mamba_evict_fn,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -464,10 +468,14 @@ def attach_hybrid_pool_to_unified_cache(
             cache.components[ComponentType.FULL]._full_kv_pool_host = (
                 cache.full_kv_pool_host
             )
-            cache.mamba_pool_host = host_pool_group.get_pool(PoolName.MAMBA)
-            cache.components[ComponentType.MAMBA]._mamba_pool_host = (
-                cache.mamba_pool_host
-            )
+            if server_args.hicache_disable_mamba:
+                cache.mamba_pool_host = None
+                cache.components[ComponentType.MAMBA]._mamba_pool_host = None
+            else:
+                cache.mamba_pool_host = host_pool_group.get_pool(PoolName.MAMBA)
+                cache.components[ComponentType.MAMBA]._mamba_pool_host = (
+                    cache.mamba_pool_host
+                )
             params.req_to_token_pool.register_layer_transfer_counter(
                 cache_controller.layer_done_counter
             )
@@ -587,7 +595,7 @@ def attach_hybrid_pool_to_unified_cache(
         )
 
         if mamba_stack:
-            pools_desc = "KV + MAMBA"
+            pools_desc = "KV + MAMBA" if not server_args.hicache_disable_mamba else "KV"
         elif swa_stack:
             pools_desc = "KV + SWA"
         elif nsa_stack:
@@ -708,7 +716,11 @@ def attach_hybrid_pool_to_mamba_cache(
             enable_storage_metrics=enable_storage_metrics,
         )
         mamba_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
-        mamba_cache.mamba_pool_host = host_pool_group.get_pool(PoolName.MAMBA)
+        mamba_cache.mamba_pool_host = (
+            host_pool_group.get_pool(PoolName.MAMBA)
+            if not server_args.hicache_disable_mamba
+            else None
+        )
         mamba_cache.transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
         mamba_cache.host_pool_group = host_pool_group
         mamba_cache.cache_controller = cache_controller
@@ -717,8 +729,9 @@ def attach_hybrid_pool_to_mamba_cache(
         )
         hybrid_kv.register_layer_transfer_counter(cache_controller.layer_done_counter)
         logger.info(
-            "Attached hybrid Mamba pool stack to HiMambaRadixCache: pools=KV + MAMBA, "
+            "Attached hybrid Mamba pool stack to HiMambaRadixCache: pools=%s, "
             "transfer_layer_num=%s",
+            "KV + MAMBA" if mamba_cache.mamba_pool_host is not None else "KV",
             mamba_cache.transfer_layer_num,
         )
     except Exception:
