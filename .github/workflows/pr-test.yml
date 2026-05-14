@@ -513,8 +513,13 @@ jobs:
       main_package: ${{ needs.check-changes.outputs.main_package }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-      warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2-Exp:8'
-      warmup_server_models: 'deepseek-ai/DeepSeek-V3-0324:8 inclusionAI/Ring-2.5-1T:8'
+      # Per-model TP must match the test's launch in test/registered/ -- see
+      # FALLBACK_ARGS in scripts/ci/cuda/warmup_deep_gemm.py for extra dp/ep
+      # flags. Only models that actually invoke DeepGEMM kernels at runtime
+      # are listed. Cold-cache ~13 min; warm-cache <=30 s via marker file.
+      # Server CUDA Graph warmup is combined into this step (warmup_server_models unset).
+      warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8 zai-org/GLM-5-FP8:8 XiaomiMiMo/MiMo-V2-Flash:4 XiaomiMiMo/MiMo-V2.5:8'
+      warmup_timeout_minutes: '60'
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
       skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
@@ -575,7 +580,7 @@ jobs:
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error_flag: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
       run_timeout_minutes: '45'
-      warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2-Exp:8'
+      warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8'
       warmup_server_models: 'deepseek-ai/DeepSeek-V3-0324:8'
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}

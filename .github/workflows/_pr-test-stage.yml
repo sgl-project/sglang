@@ -60,6 +60,10 @@ on:
         description: 'Space-separated `model:gpus` list. Empty = skip server-CUDA-graph warmup.'
         type: string
         default: ''
+      warmup_timeout_minutes:
+        description: 'Wall-clock cap for each warmup step (DeepGEMM + server). Default 25min; bump for stages with large cold-cache warmup model lists.'
+        type: string
+        default: '25'
       extra_pytest_path:
         description: 'Optional pytest path to run after the suite (stage-b-test-4-gpu-b200 uses this for FA4 jit_kernel tests). Empty = skip.'
         type: string
@@ -152,7 +156,7 @@ jobs:
 
       - name: Warmup DeepGEMM JIT Compilation
         if: inputs.warmup_deep_gemm_models != ''
-        timeout-minutes: 25
+        timeout-minutes: ${{ fromJson(inputs.warmup_timeout_minutes) }}
         run: |
           # Activate venv if available (GITHUB_ENV may have failed to propagate)
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
@@ -161,7 +165,7 @@ jobs:
 
       - name: Warmup Server CUDA Graphs
         if: inputs.warmup_server_models != ''
-        timeout-minutes: 25
+        timeout-minutes: ${{ fromJson(inputs.warmup_timeout_minutes) }}
         run: |
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
