@@ -182,6 +182,12 @@ class ServerArgs(DisaggArgsMixin):
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
+
+    # Quantization method for online quantization
+    quantization: str | None = None
+    # Layer name patterns to skip during online quantization
+    quantization_ignored_layers: list[str] | None = None
+
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -1144,9 +1150,26 @@ class ServerArgs(DisaggArgsMixin):
         parser.add_argument(
             "--quantization",
             type=str,
-            default=None,
-            help='Quantization method override (e.g. "mxfp8", "fp8", "modelslim"). '
-            "When set, the transformer loader will use this instead of auto-detection.",
+            default=ServerArgs.quantization,
+            help=(
+                "Quantization method for the transformer. If omitted, the method is "
+                "auto-detected from the checkpoint config or safetensors metadata when "
+                "possible. Applies to both pre-quantized checkpoints and online "
+                "quantization. Use this flag to override auto-detection. "
+                "Options: 'fp8', 'mxfp8', 'mxfp4', 'modelslim'. "
+                "Note: MXFP4 requires ROCm and MI350+ (gfx95x)."
+            ),
+        )
+        parser.add_argument(
+            "--quantization-ignored-layers",
+            type=str,
+            nargs="+",
+            default=ServerArgs.quantization_ignored_layers,
+            help=(
+                "Layer name patterns to keep unquantized during online quantization "
+                "(fp8/mxfp4). Each pattern is matched against the layer prefix. "
+                "Example: --quantization-ignored-layers img_mod txt_mod to_out"
+            ),
         )
 
         # Nunchaku SVDQuant quantization parameters
