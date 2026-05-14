@@ -1,6 +1,17 @@
 import logging
 import re
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    overload,
+)
 
 import torch
 
@@ -55,12 +66,20 @@ class EmptySlot:
 EMPTY_SLOT = EmptySlot()
 
 
+@overload
+def append_cache_key_suffix(cache_keys: str, suffix: str) -> str: ...
+
+
+@overload
 def append_cache_key_suffix(
-    cache_keys: Optional[Union[str, Dict[int, str]]],
+    cache_keys: Dict[int, str], suffix: str
+) -> Dict[int, str]: ...
+
+
+def append_cache_key_suffix(
+    cache_keys: Union[str, Dict[int, str]],
     suffix: str,
 ) -> Union[str, Dict[int, str]]:
-    assert cache_keys is not None
-    assert not suffix.startswith("#")
     if isinstance(cache_keys, dict):
         return {
             expert_id: f"{cache_key}#{suffix}"
@@ -739,8 +758,7 @@ class LoRAMemoryPool:
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
         def load_lora_weight_tensor(
-            buffer_view: torch.Tensor,
-            weight: Optional[torch.Tensor],
+            buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
         ):
             if weight is None:
                 # If the particular weight is not present in the adapter, we initialize the buffer to zero
@@ -894,8 +912,10 @@ class LoRAMemoryPool:
                                     target_module,
                                 )
                             )
+                            cache_keys = temp_A_cache_keys[target_module]
+                            assert cache_keys is not None
                             temp_A_cache_keys[target_module] = append_cache_key_suffix(
-                                temp_A_cache_keys[target_module],
+                                cache_keys,
                                 f"moe_tp{self.moe_tp_rank}",
                             )
                         if temp_B_buffer.get(target_module) is not None:
@@ -906,8 +926,10 @@ class LoRAMemoryPool:
                                     target_module,
                                 )
                             )
+                            cache_keys = temp_B_cache_keys[target_module]
+                            assert cache_keys is not None
                             temp_B_cache_keys[target_module] = append_cache_key_suffix(
-                                temp_B_cache_keys[target_module],
+                                cache_keys,
                                 f"moe_tp{self.moe_tp_rank}",
                             )
 
@@ -929,16 +951,20 @@ class LoRAMemoryPool:
                 temp_A_buffer[target_module] = module.slice_lora_a_weights(
                     temp_A_buffer[target_module], self.tp_rank
                 )
+                cache_keys = temp_A_cache_keys[target_module]
+                assert cache_keys is not None
                 temp_A_cache_keys[target_module] = append_cache_key_suffix(
-                    temp_A_cache_keys[target_module],
+                    cache_keys,
                     f"tp{self.tp_rank}",
                 )
 
                 temp_B_buffer[target_module] = module.slice_lora_b_weights(
                     temp_B_buffer[target_module], self.tp_rank
                 )
+                cache_keys = temp_B_cache_keys[target_module]
+                assert cache_keys is not None
                 temp_B_cache_keys[target_module] = append_cache_key_suffix(
-                    temp_B_cache_keys[target_module],
+                    cache_keys,
                     f"tp{self.tp_rank}",
                 )
 
