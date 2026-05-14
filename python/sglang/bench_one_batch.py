@@ -531,6 +531,7 @@ class _MlxBenchRunner:
             trust_remote_code=server_args.trust_remote_code,
             disable_radix_cache=True,
             mem_fraction_static=server_args.mem_fraction_static,
+            quantization=server_args.quantization,
         )
         if server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = server_args.max_total_tokens
