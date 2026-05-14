@@ -35,6 +35,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
@@ -342,6 +343,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
+        self.use_marlin = get_moe_runner_backend().is_marlin()
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
         )
@@ -507,6 +509,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        if self.use_marlin:
+            from sglang.srt.layers.quantization.marlin_utils import (
+                check_moe_marlin_supports_layer,
+            )
+            from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+                prepare_moe_mxfp4_layer_for_marlin,
+            )
+
+            if not is_sm90_supported():
+                raise RuntimeError("MXFP4 Marlin requires Hopper/SM90 or above.")
+            if not check_moe_marlin_supports_layer(layer, 32):
+                raise RuntimeError(
+                    "Current MXFP4 MoE layer is not supported by Marlin."
+                )
+
+            prepare_moe_mxfp4_layer_for_marlin(layer)
+            layer._mxfp4_backend = "marlin"
+            return
+
         if self._fi_kernel == "cutlass_sm90":
             self._process_weights_for_sm90_cutlass(layer)
             return
@@ -954,7 +975,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.runner = MoeRunner(
                 moe_runner_backend, replace(moe_runner_config, activation="swiglu")
             )
-        elif moe_runner_backend.is_triton_kernels() or moe_runner_backend.is_triton():
+        elif (
+            moe_runner_backend.is_triton_kernels()
+            or moe_runner_backend.is_triton()
+            or moe_runner_backend.is_marlin()
+        ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
@@ -1039,6 +1064,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+
+        if self.use_marlin:
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            quant_info = MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale,
+                w2_scales=layer.w2_weight_scale,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=4,
+                is_k_full=True,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, x, topk_output)

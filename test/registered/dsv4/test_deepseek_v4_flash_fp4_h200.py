@@ -66,6 +66,8 @@ class TestDSV4FlashFP4H200(ServerSanityMixin, CustomTestCase):
                 "1",
                 "--speculative-num-draft-tokens",
                 "4",
+                "--watchdog-timeout",
+                "900",
             ],
         )
 
