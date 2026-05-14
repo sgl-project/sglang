@@ -19,7 +19,7 @@ import logging
 import os
 import random
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -53,6 +53,9 @@ class BenchArgs:
     extra_request_body: Optional[str] = None
     apply_chat_template: bool = False
     profile: bool = False
+    profile_activities: Tuple[str] = ("CPU", "GPU")
+    profile_start_step: Optional[int] = None
+    profile_steps: Optional[int] = None
     skip_warmup: bool = False
     do_not_exit: bool = False
     prompt_suffix: str = ""
@@ -170,6 +173,26 @@ class BenchArgs:
             "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
+            "--profile-activities",
+            type=str,
+            nargs="+",
+            default=["CPU", "GPU"],
+            choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
+            help="Profiler activities: CPU, GPU, XPU, CUDA_PROFILER. If CPU/GPU/XPU, use torch profiler. If CUDA_PROFILER, use CUDA profiler.",
+        )
+        parser.add_argument(
+            "--profile-start-step",
+            type=int,
+            default=None,
+            help="Decode step at which to start profiling (0-indexed). If not specified, defaults to output_len // 2.",
+        )
+        parser.add_argument(
+            "--profile-steps",
+            type=int,
+            default=None,
+            help="Number of decode steps to profile starting from profile-start-step. If not specified, profiles only one step.",
+        )
+        parser.add_argument(
             "--skip-warmup",
             action="store_true",
             help="Skip the warmup batches.",
@@ -210,6 +233,9 @@ def throughput_test_once(
     ignore_eos: bool,
     extra_request_body: Dict,
     profile: bool,
+    profile_activities=None,
+    profile_start_step=None,
+    profile_steps=None,
     return_logprob: bool = False,
     logprob_start_len: int = -1,
 ):
@@ -241,7 +267,7 @@ def throughput_test_once(
             "SGLANG_TORCH_PROFILER_DIR" in os.environ
         ), "Please set SGLANG_TORCH_PROFILER_DIR."
         os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
-        backend.start_profile()
+        backend.start_profile(start_step=profile_start_step, num_steps=profile_steps, activities=profile_activities)
 
     st = time.perf_counter()
     gen_out = backend.generate(
@@ -255,8 +281,9 @@ def throughput_test_once(
     if profile:
         dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
         known_files = set(os.listdir(dir))
-        backend.stop_profile()
-        monitor_trace_file(known_files, dir)
+        if not profile_steps:
+            backend.stop_profile()
+            monitor_trace_file(known_files, dir)
 
     if backend_name == "runtime":
         gen_out = json.loads(gen_out)
@@ -455,6 +482,9 @@ def throughput_test(
         ignore_eos=not bench_args.disable_ignore_eos,
         extra_request_body=extra_request_body,
         profile=bench_args.profile,
+        profile_activities=bench_args.profile_activities,
+        profile_start_step=bench_args.profile_start_step,
+        profile_steps=bench_args.profile_steps,
         return_logprob=bench_args.return_logprob,
         logprob_start_len=bench_args.logprob_start_len,
     )
