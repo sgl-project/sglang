@@ -45,11 +45,12 @@ class TestHybridAttnBackendBase(CustomTestCase):
     accuracy_threshold = 0.65  # derived tests need to override this
     speculative_decode = False
     spec_decode_threshold = 2.2  # derived spec decoding tests need to override this
+    # Appended after DEFAULT_HYBRID_ATTN_SERVER_ARGS in get_server_args.
+    extra_args: list = []
 
     @classmethod
     def get_server_args(cls):
-        """Return the arguments for the server launch. Override in subclasses."""
-        return DEFAULT_HYBRID_ATTN_SERVER_ARGS
+        return DEFAULT_HYBRID_ATTN_SERVER_ARGS + list(cls.extra_args)
 
     @classmethod
     def setUpClass(cls):

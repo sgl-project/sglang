@@ -2,7 +2,6 @@ import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.hybrid_attn_backend_fixture import (
-    DEFAULT_HYBRID_ATTN_SERVER_ARGS,
     TestHybridAttnBackendBase,
 )
 from sglang.test.test_utils import (
@@ -19,63 +18,50 @@ class TestHybridAttnBackendMLA(TestHybridAttnBackendBase):
     accuracy_threshold = 0.60
     model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
 
-    @classmethod
-    def get_server_args(cls):
-        return DEFAULT_HYBRID_ATTN_SERVER_ARGS
-
 
 class TestHybridAttnBackendTorchCompile(TestHybridAttnBackendBase):
     accuracy_threshold = 0.65
-
-    @classmethod
-    def get_server_args(cls):
-        return DEFAULT_HYBRID_ATTN_SERVER_ARGS + ["--enable-torch-compile"]
+    extra_args = ["--enable-torch-compile"]
 
 
 class TestHybridAttnBackendSpeculativeDecodingPrefillBackend(TestHybridAttnBackendBase):
     speculative_decode = True
     # This eagle test uses a very small model, so the accuracy is low.
     accuracy_threshold = 0.2
-
-    @classmethod
-    def get_server_args(cls):
-        return DEFAULT_HYBRID_ATTN_SERVER_ARGS + [
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-draft-model-path",
-            DEFAULT_DRAFT_MODEL_EAGLE,
-            "--speculative-num-steps",
-            "3",
-            "--speculative-eagle-topk",
-            "2",
-            "--speculative-num-draft-tokens",
-            "4",
-            "--speculative-attention-mode",
-            "prefill",
-        ]
+    extra_args = [
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-draft-model-path",
+        DEFAULT_DRAFT_MODEL_EAGLE,
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "2",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--speculative-attention-mode",
+        "prefill",
+    ]
 
 
 class TestHybridAttnBackendSpeculativeDecodingDecodeBackend(TestHybridAttnBackendBase):
     speculative_decode = True
     # This eagle test uses a very small model, so the accuracy is low.
     accuracy_threshold = 0.2
-
-    @classmethod
-    def get_server_args(cls):
-        return DEFAULT_HYBRID_ATTN_SERVER_ARGS + [
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-draft-model-path",
-            DEFAULT_DRAFT_MODEL_EAGLE,
-            "--speculative-num-steps",
-            "3",
-            "--speculative-eagle-topk",
-            "2",
-            "--speculative-num-draft-tokens",
-            "4",
-            "--speculative-attention-mode",
-            "decode",
-        ]
+    extra_args = [
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-draft-model-path",
+        DEFAULT_DRAFT_MODEL_EAGLE,
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "2",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--speculative-attention-mode",
+        "decode",
+    ]
 
 
 if __name__ == "__main__":
