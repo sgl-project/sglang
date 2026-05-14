@@ -26,6 +26,7 @@ import heapq
 import logging
 import sys
 import time
+from array import array
 from collections import defaultdict
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
@@ -70,7 +71,7 @@ class RadixKey:
 
     def __init__(
         self,
-        token_ids: List[int],
+        token_ids: array,
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
     ):
@@ -110,7 +111,7 @@ class RadixKey:
         if self.is_bigram:
             # bigrams [start, stop) span raw tokens [start, stop + 1);
             # empty slice -> empty raw tokens (not a dangling boundary token).
-            raw = self.token_ids[start : stop + 1] if stop > start else []
+            raw = self.token_ids[start : stop + 1] if stop > start else array("q")
             return RadixKey(raw, self.extra_key, is_bigram=True)
         return RadixKey(self.token_ids[start:stop], self.extra_key)
 
@@ -337,7 +338,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def reset(self):
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
-        self.root_node.key = RadixKey(token_ids=[], extra_key=None)
+        self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
         self.root_node.value = []
         self.root_node.host_value = []
         self.root_node.lock_ref = 1
