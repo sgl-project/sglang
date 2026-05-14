@@ -932,7 +932,7 @@ class UnifiedRadixCacheSuite:
             best_value_len,
         ) = tree._match_prefix_helper(RadixKey([1, 2, 3, 4]))
         self.assertEqual(best_value_len, 2)
-        self.assertEqual(best_match_node.key.token_ids, [3, 4])
+        self.assertEqual(list(best_match_node.key.token_ids), [3, 4])
         self.assertIs(best_match_device_node, best_match_node)
         node_count_after_regular = count_nodes(tree.root_node)
         self.assertEqual(node_count_after_regular, node_count_before + 2)
@@ -944,7 +944,7 @@ class UnifiedRadixCacheSuite:
             best_value_len,
         ) = tree._match_prefix_helper_readonly(RadixKey([1, 2, 3]))
         self.assertEqual(best_value_len, 1)
-        self.assertEqual(best_match_node.key.token_ids, [1, 2])
+        self.assertEqual(list(best_match_node.key.token_ids), [1, 2])
         self.assertIs(best_match_device_node, best_match_node)
         node_count_after_readonly = count_nodes(tree.root_node)
         self.assertEqual(node_count_after_readonly, node_count_after_regular)
@@ -1512,8 +1512,8 @@ class UnifiedRadixCacheSuite:
         self.assertIsNot(split_parent, tree.root_node)
         self.assertTrue(split_parent.evicted)
         self.assertTrue(split_parent.backuped)
-        self.assertEqual(split_parent.key.token_ids, expected_prefix)
-        self.assertEqual(node.key.token_ids, expected_suffix)
+        self.assertEqual(list(split_parent.key.token_ids), expected_prefix)
+        self.assertEqual(list(node.key.token_ids), expected_suffix)
 
         if self.cfg.has_mamba:
             self.assertEqual(m.host_hit_length, 0)

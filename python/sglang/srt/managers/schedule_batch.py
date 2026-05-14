@@ -946,8 +946,8 @@ class Req(ReqDllmMixin):
         self.hisparse_staging = False
 
     # TODO(Jialin): clean up callers that still assign list[int] to
-    # origin_input_ids / output_ids / fill_ids, and we should
-    # drop the property and setter eventually
+    # origin_input_ids / origin_input_ids_unpadded / output_ids / fill_ids,
+    # and we should drop the properties and setters eventually
     @property
     def origin_input_ids(self) -> array:
         return self._origin_input_ids
@@ -955,6 +955,16 @@ class Req(ReqDllmMixin):
     @origin_input_ids.setter
     def origin_input_ids(self, value: Union[List[int], array]) -> None:
         self._origin_input_ids: array = (
+            value if isinstance(value, array) else array("q", value)
+        )
+
+    @property
+    def origin_input_ids_unpadded(self) -> array:
+        return self._origin_input_ids_unpadded
+
+    @origin_input_ids_unpadded.setter
+    def origin_input_ids_unpadded(self, value: Union[List[int], array]) -> None:
+        self._origin_input_ids_unpadded: array = (
             value if isinstance(value, array) else array("q", value)
         )
 

@@ -51,7 +51,7 @@ class TestRadixKey(unittest.TestCase):
         """Test basic initialization of RadixKey."""
         token_ids = [1, 2, 3, 4]
         key = RadixKey(token_ids)
-        self.assertEqual(key.token_ids, token_ids)
+        self.assertEqual(list(key.token_ids), token_ids)
         self.assertIsNone(key.extra_key)
 
     def test_init_with_extra_key(self):
@@ -59,7 +59,7 @@ class TestRadixKey(unittest.TestCase):
         token_ids = [1, 2, 3]
         extra_key = "test_key"
         key = RadixKey(token_ids, extra_key)
-        self.assertEqual(key.token_ids, token_ids)
+        self.assertEqual(list(key.token_ids), token_ids)
         self.assertEqual(key.extra_key, extra_key)
 
     def test_len(self):
@@ -103,7 +103,7 @@ class TestRadixKey(unittest.TestCase):
                 key = RadixKey(tokens)
                 result = key[index]
                 self.assertIsInstance(result, RadixKey)
-                self.assertEqual(result.token_ids, expected)
+                self.assertEqual(list(result.token_ids), expected)
 
     def test_getitem_slice(self):
         """Test __getitem__ with slice and edge cases."""
@@ -112,12 +112,12 @@ class TestRadixKey(unittest.TestCase):
         # Basic slice
         sliced = key[1:4]
         self.assertIsInstance(sliced, RadixKey)
-        self.assertEqual(sliced.token_ids, [2, 3, 4])
+        self.assertEqual(list(sliced.token_ids), [2, 3, 4])
         self.assertEqual(sliced.extra_key, "extra")
 
         # Edge cases
-        self.assertEqual(key[2:2].token_ids, [])  # Empty slice
-        self.assertEqual(key[:].token_ids, [1, 2, 3, 4, 5])  # Full slice
+        self.assertEqual(list(key[2:2].token_ids), [])  # Empty slice
+        self.assertEqual(list(key[:].token_ids), [1, 2, 3, 4, 5])  # Full slice
 
     def test_getitem_invalid_index(self):
         """Test __getitem__ with invalid indices."""
