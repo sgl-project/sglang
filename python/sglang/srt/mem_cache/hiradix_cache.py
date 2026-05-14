@@ -1062,7 +1062,7 @@ class HiRadixCache(RadixCache):
             # Verify node is still in the tree — it may have been removed
             # by a prior evict_host call within the same evict() invocation
             # and re-added to evictable_host_leaves by _update_host_leaf_status.
-            key = self.get_child_key_fn(x.key)
+            key = x.key.child_key(self.page_size)
             if x.parent.children.get(key) is not x:
                 if x in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(x)
