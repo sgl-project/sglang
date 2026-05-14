@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """Refresh est_time literals from sglang-ci-stats/model.json.
 
-The previous version of this script scraped CI logs itself; the scrape
-is now centralized in https://github.com/sgl-project/sglang-ci-stats
-and shared with `compute_partitions.py`'s live override (so weekly
-source-code refresh and per-PR LPT prediction see the same numbers).
-
 Usage:
     python scripts/ci/update_est_time.py [--dry-run] \\
         [--model-url URL] [--summary-file PATH]
