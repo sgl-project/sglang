@@ -272,41 +272,64 @@ class NonPrefixKVStore:
         
         return entry_id
     
-    def resolve_kv_cache(self, entry: NonPrefixEntry, matched_len: int) -> torch.Tensor:
+    def resolve_kv_cache(
+        self,
+        entry: NonPrefixEntry,
+        matched_len: int,
+        donor_offset: int = 0,
+    ) -> torch.Tensor:
         """Resolve pool indices from node references for the matched portion.
-        
+
         Args:
             entry: The NonPrefixEntry containing node references.
-            matched_len: Number of matched tokens from the start.
-            
+            matched_len: Number of matched tokens from ``donor_offset``.
+            donor_offset: Number of tokens to skip into the entry before
+                collecting slots. Set to the donor-side offset where the
+                block-hash match actually started; ``0`` reproduces the
+                legacy "first N slots" behavior. Required so the slot
+                indices returned to the engine correspond to the actual
+                matched region in the donor (the radix_cache then does
+                RoPE correction from those donor positions). Without this,
+                a match found at e.g. donor positions [16..115] would
+                return slots [0..99] and SGLang would silently use the
+                donor's first 100 slots → semantic mismatch + pool leak.
+
         Returns:
-            Tensor of pool indices for the matched tokens.
+            Tensor of pool indices for tokens
+            ``[donor_offset .. donor_offset + matched_len)``.
         """
         indices = []
+        skip = donor_offset
         remaining = matched_len
         for ref in entry.node_refs:
             if remaining <= 0:
                 break
-            
+
             node = self._node_registry.get(ref.node_id)
             if node is None or node.value is None:
                 logger.warning(
                     f"Node {ref.node_id} not found or evicted during resolution"
                 )
                 continue
-            
-            # Get the portion of this ref that overlaps with matched_len
-            start = ref.offset
-            end = min(ref.offset + ref.length, ref.offset + remaining)
+
+            # Skip refs that lie entirely before the donor_offset.
+            if skip >= ref.length:
+                skip -= ref.length
+                continue
+
+            # Slice from (ref.offset + skip) to keep alignment with the
+            # donor's actual matched region.
+            start = ref.offset + skip
+            end = min(ref.offset + ref.length, start + remaining)
             actual_len = end - start
             if actual_len > 0:
-                node_indices = node.value[start:end]
-                indices.append(node_indices)
+                indices.append(node.value[start:end])
                 remaining -= actual_len
-        
+            skip = 0
+
         if not indices:
             return torch.empty(0, dtype=torch.int64)
-        
+
         return torch.cat(indices)
     
     def find_by_block_hash(
@@ -314,7 +337,7 @@ class NonPrefixKVStore:
         query_tokens: List[int],
         min_length: int,
         extra_key: Optional[str] = None,
-    ) -> List[Tuple[int, NonPrefixEntry, int]]:
+    ) -> List[Tuple[int, NonPrefixEntry, int, int]]:
         """Find entries that share a block with the query.
 
         This is for token-level fuzzy matching only. Semantic matching
@@ -326,8 +349,20 @@ class NonPrefixKVStore:
             extra_key: Optional extra key for namespace filtering.
 
         Returns:
-            List of (matched_len, entry, query_matched_start) tuples,
-            sorted by matched_len in descending order.
+            List of ``(matched_len, entry, query_start, donor_start)``
+            tuples, sorted by matched_len in descending order.
+
+            ``query_start`` is the offset *into the query* where the match
+            begins. Callers that must surface a contiguous prefix to
+            SGLang's device_indices contract should filter to ``query_start
+            == 0`` and either reject the rest or handle the gap upstream.
+
+            ``donor_start`` is the offset *into the entry* (the donor's
+            stored token sequence) where the matched block begins. Callers
+            must pass this to ``resolve_kv_cache(entry, matched_len,
+            donor_offset=donor_start)`` and surface it via
+            ``FuzzyMatchResult.cached_start_pos = entry.start_pos +
+            donor_start`` so RadixCache's RoPE correction picks up.
         """
         candidates = []
 
@@ -372,7 +407,7 @@ class NonPrefixKVStore:
                 )
 
                 if count >= min_length:
-                    candidates.append((count, entry, start))
+                    candidates.append((count, entry, start, cached_pos))
 
         # Sort by matched_len descending
         candidates.sort(key=lambda x: x[0], reverse=True)
@@ -411,8 +446,13 @@ class NonPrefixKVStore:
         query_tokens: List[int],
         min_length: int,
         extra_key: Optional[str] = None,
-    ) -> List[Tuple[int, NonPrefixEntry, int]]:
-        """Linear scan fallback for short queries (token-level matching only)."""
+    ) -> List[Tuple[int, NonPrefixEntry, int, int]]:
+        """Linear scan fallback for short queries (token-level matching only).
+
+        Returns ``(matched_len, entry, query_start=0, donor_start=cached_pos)``
+        tuples, matching the shape of ``find_by_block_hash`` so callers
+        don't have to special-case the short-query fallback.
+        """
         candidates = []
 
         for entry in self.entries:
@@ -428,7 +468,7 @@ class NonPrefixKVStore:
                     0,
                 )
                 if count >= min_length:
-                    candidates.append((count, entry, 0))
+                    candidates.append((count, entry, 0, cached_pos))
                     break
 
         candidates.sort(key=lambda x: x[0], reverse=True)

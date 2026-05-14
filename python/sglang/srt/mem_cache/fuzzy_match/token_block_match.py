@@ -278,25 +278,43 @@ class TokenBlockMatchProvider(FuzzyMatchProvider):
                 f"min_match_length={self.min_match_length})"
             )
             return None
-        
-        matched_len, entry, _ = candidates[0]
-        
-        # Return result if we found a good match
+
+        # Filter to candidates anchored at the variant's prefix boundary
+        # (query_start == 0). SGLang's device_indices contract is
+        # contiguous from the exact-prefix boundary, so a match that
+        # starts mid-query would silently claim positions [0..N-1] are
+        # cached when only [query_start..query_start+N-1] really are.
+        prefix_anchored = [c for c in candidates if c[2] == 0]
+        if not prefix_anchored:
+            logger.info(
+                f"[FUZZY MATCH] ✗ No prefix-anchored match (longest match "
+                f"started mid-query at offset>0; dropped to keep KV reuse "
+                f"semantically correct)"
+            )
+            return None
+
+        matched_len, entry, _, donor_start = prefix_anchored[0]
+
         if matched_len < self.min_match_length:
             logger.info(
                 f"[FUZZY MATCH] ✗ No match found (best_len={matched_len}, "
                 f"min_match_length={self.min_match_length})"
             )
             return None
-        
+
         logger.info(
             f"[FUZZY MATCH] ✓ Match found! "
-            f"cached_token_count={matched_len}, "
-            f"token_ids (first 20): {entry.token_ids[:20]}"
+            f"cached_token_count={matched_len}, donor_start={donor_start}, "
+            f"token_ids (first 20): {entry.token_ids[donor_start:donor_start + 20]}"
         )
-        
-        # Get pool indices from node references
-        kv_cache_indices = self.non_prefix_store.resolve_kv_cache(entry, matched_len)
+
+        # The slot indices returned to the engine must correspond to the
+        # donor positions implied by cached_start_pos below. Pass
+        # donor_start so resolve_kv_cache slices from the matched region
+        # rather than the entry's first matched_len slots.
+        kv_cache_indices = self.non_prefix_store.resolve_kv_cache(
+            entry, matched_len, donor_offset=donor_start,
+        )
 
         # Surface the donor's final TreeNode id so RadixCache.match_prefix can
         # inc_lock_ref it. Without this, the donor's KV-pool slots can be
@@ -308,12 +326,21 @@ class TokenBlockMatchProvider(FuzzyMatchProvider):
             entry.node_refs[-1].node_id if entry.node_refs else None
         )
 
+        # cached_start_pos reflects the donor position where the matched
+        # block actually begins. When the match is non-prefix in the
+        # donor (donor_start > 0), this triggers
+        # `needs_realization = (cached_start_pos != exact_matched_len)`
+        # in radix_cache: realized_locs get pre-allocated and donor KV
+        # is copied with RoPE correction into fresh slots. Without it,
+        # donor and recipient share physical pool slots and the pool
+        # accounting silently double-counts (over-count leak proportional
+        # to matched_len per fuzzy hit).
         return FuzzyMatchResult(
             cached_token_count=matched_len,
-            cached_token_ids=entry.token_ids[:matched_len],
+            cached_token_ids=entry.token_ids[donor_start:donor_start + matched_len],
             prompt_token_count=matched_len,  # 1:1 for token-level matching
             kv_cache_indices=kv_cache_indices,
             position_offset=already_matched_len,
-            cached_start_pos=entry.start_pos,
+            cached_start_pos=entry.start_pos + donor_start,
             donor_last_node_id=donor_last_node_id,
         )
