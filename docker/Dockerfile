@@ -7,13 +7,12 @@ ARG BRANCH_TYPE=remote
 ARG GRACE_BLACKWELL=0
 ARG HOPPER_SBO=0
 
-ARG GRACE_BLACKWELL_DEEPEP_BRANCH=hybrid-ep
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.4.2.post1
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.0.1
+ARG SGL_DEEP_GEMM_VERSION=0.1.0
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
@@ -259,7 +258,6 @@ FROM torch_deps AS deepep_builder
 ARG CUDA_VERSION
 ARG BUILD_AND_DOWNLOAD_PARALLEL
 ARG GRACE_BLACKWELL
-ARG GRACE_BLACKWELL_DEEPEP_BRANCH
 ARG HOPPER_SBO
 ARG HOPPER_SBO_DEEPEP_COMMIT
 ARG DEEPEP_COMMIT
@@ -270,12 +268,21 @@ WORKDIR /build
 # Clone DeepEP
 RUN set -eux; \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
-      git clone https://github.com/deepseek-ai/DeepEP.git -b ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
-      cd DeepEP && \
-      git checkout d28bd676c2120573c9f1425f0c16c39faa4117e6 && \
-      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-      sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
-      cd .. ; \
+      if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+        git clone https://github.com/fzyzcjy/DeepEP.git && \
+        cd DeepEP && \
+        git checkout gb200_blog_part_2 && \
+        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
+        cd .. ; \
+      else \
+        git clone https://github.com/deepseek-ai/DeepEP.git -b hybrid-ep && \
+        cd DeepEP && \
+        git checkout d28bd676c2120573c9f1425f0c16c39faa4117e6 && \
+        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
+        cd .. ; \
+      fi; \
     elif [ "$HOPPER_SBO" = "1" ]; then \
       git clone https://github.com/deepseek-ai/DeepEP.git -b antgroup-opt && \
       cd DeepEP && \

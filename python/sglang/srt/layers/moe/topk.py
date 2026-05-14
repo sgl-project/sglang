@@ -296,6 +296,25 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
+        if num_fused_shared_experts > 0:
+            from sglang.srt.server_args import get_global_server_args
+
+            try:
+                self.enable_deepep_waterfill = (
+                    get_global_server_args().enable_deepep_waterfill
+                )
+            except ValueError:
+                self.enable_deepep_waterfill = False
+        else:
+            self.enable_deepep_waterfill = False
+
+        self.deepep_waterfill_balancer = None
+        if self.enable_deepep_waterfill:
+            # TODO(ch-wan): Refactor shared-expert fusion and routed TopK fusion.
+            top_k -= num_fused_shared_experts
+            num_fused_shared_experts = 0
+            output_format = TopKOutputFormat.STANDARD
+
         # flashinfer_mxfp4 backend only: True -> STANDARD (Mxfp4FlashinferTrtllmMoEMethod
         # consumes), False -> BYPASSED (flashinfer's own mxfp4 kernel). No-op otherwise.
         self.is_fp4_experts = is_fp4_experts
@@ -315,6 +334,18 @@ class TopK(MultiPlatformOp):
             scoring_func=scoring_func,
         )
 
+    def _apply_deepep_waterfill(
+        self, topk_output: TopKOutput, num_tokens: int
+    ) -> TopKOutput:
+        if self.enable_deepep_waterfill and self.deepep_waterfill_balancer is None:
+            raise RuntimeError(
+                "DeepEP waterfill TopK must be prepared by ModelRunner before forward."
+            )
+        if self.deepep_waterfill_balancer is None:
+            return topk_output
+        assert TopKOutputChecker.format_is_standard(topk_output)
+        return self.deepep_waterfill_balancer.expand_topk(topk_output, num_tokens)
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,
@@ -324,7 +355,7 @@ class TopK(MultiPlatformOp):
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
         self.topk_config.torch_native = True
-        return select_experts(
+        topk_output = select_experts(
             hidden_states=hidden_states,
             layer_id=self.layer_id,
             router_logits=router_logits,
@@ -332,6 +363,7 @@ class TopK(MultiPlatformOp):
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
+        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
 
     def forward_cuda(
         self,
@@ -381,7 +413,7 @@ class TopK(MultiPlatformOp):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
-            return topk_output
+        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
 
     def forward_cpu(
         self,
@@ -391,7 +423,7 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
-        return select_experts(
+        topk_output = select_experts(
             hidden_states=hidden_states,
             layer_id=self.layer_id,
             router_logits=router_logits,
@@ -399,6 +431,7 @@ class TopK(MultiPlatformOp):
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
+        return self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
 
     def forward_npu(
         self,
@@ -429,7 +462,18 @@ class TopK(MultiPlatformOp):
             topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         # FIXME: router_logits should be of size (0, num_experts)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
-        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+        topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
+        if self.topk_config.num_fused_shared_experts > 0 and is_deepep_class_backend():
+            n = self.topk_config.num_fused_shared_experts
+            topk_output = topk_output._replace(
+                topk_ids=topk_output.topk_ids.new_empty(
+                    (0, topk_output.topk_ids.shape[-1] + n)
+                ),
+                topk_weights=topk_output.topk_weights.new_empty(
+                    (0, topk_output.topk_weights.shape[-1] + n)
+                ),
+            )
+        return self._apply_deepep_waterfill(topk_output, 0)
 
 
 # ------------------------------- TopK implementation -------------------------------------
