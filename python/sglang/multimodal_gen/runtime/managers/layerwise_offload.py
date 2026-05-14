@@ -5,6 +5,9 @@ from typing import Any, Dict, List, Set, Tuple
 import torch
 from torch.distributed.tensor import DTensor
 
+from sglang.multimodal_gen.runtime.managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -675,9 +678,16 @@ def configure_layerwise_offload_modules(
     select_all = (
         selected_component_names is not None and "all" in selected_component_names
     )
+    select_default = (
+        selected_component_names is not None
+        and LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS in selected_component_names
+    )
 
     if warn_missing and selected_component_names is not None and not select_all:
-        missing_component_names = selected_component_names - set(modules)
+        explicit_component_names = selected_component_names - {
+            LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS
+        }
+        missing_component_names = explicit_component_names - set(modules)
         if missing_component_names:
             logger.warning(
                 "Layerwise offload components are not currently loaded: %s. "
@@ -688,7 +698,7 @@ def configure_layerwise_offload_modules(
 
         unsupported_component_names = [
             component_name
-            for component_name in selected_component_names & set(modules)
+            for component_name in explicit_component_names & set(modules)
             if not isinstance(modules[component_name], LayerwiseOffloadableModuleMixin)
         ]
         if unsupported_component_names:
@@ -703,7 +713,11 @@ def configure_layerwise_offload_modules(
         if selected_component_names is None:
             if not module.layerwise_offload_default_enabled:
                 continue
-        elif not select_all and component_name not in selected_component_names:
+        elif (
+            not select_all
+            and component_name not in selected_component_names
+            and not (select_default and module.layerwise_offload_default_enabled)
+        ):
             continue
         if id(module) in configured_module_ids:
             continue

@@ -272,6 +272,30 @@ def test_layerwise_configuration_filters_by_component_name(monkeypatch):
     assert not is_layerwise_offloaded_module(vae)
 
 
+def test_layerwise_configuration_default_marker_extends_legacy_defaults(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    text_encoder = _NestedEncoderDummyModel()
+    transformer = _NestedDummyModel()
+    vae = _NestedEncoderDummyModel()
+    modules = {
+        "text_encoder": text_encoder,
+        "transformer": transformer,
+        "vae": vae,
+    }
+
+    configured = configure_layerwise_offload_modules(
+        modules, _server_args(), component_names=["default", "text_encoder"]
+    )
+
+    assert configured == ["text_encoder", "transformer"]
+    assert is_layerwise_offloaded_module(text_encoder)
+    assert is_layerwise_offloaded_module(transformer)
+    assert not is_layerwise_offloaded_module(vae)
+
+
 def test_layerwise_configuration_all_selects_every_capable_component(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule

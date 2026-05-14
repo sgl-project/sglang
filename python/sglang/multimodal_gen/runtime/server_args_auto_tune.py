@@ -10,6 +10,9 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.runtime.managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -178,6 +181,44 @@ class ServerArgsAutoTuner:
             args.dit_layerwise_offload = True
             args.dit_layerwise_offload_auto_enabled = True
             args.dit_cpu_offload = False
+
+    def maybe_replace_cpu_offloaded_components_with_layerwise(self) -> None:
+        args = self.server_args
+        if (
+            not self.could_override_server_args()
+            or current_platform.is_cpu()
+            or not current_platform.is_cuda()
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or args.use_fsdp_inference
+            or args.dit_layerwise_offload is False
+            or args.layerwise_offload_components is not None
+        ):
+            return
+
+        layerwise_components: list[str] = []
+        if args.dit_layerwise_offload:
+            layerwise_components.append(LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS)
+
+        changed: list[str] = []
+        if args.text_encoder_cpu_offload:
+            layerwise_components.append("text_encoder")
+            changed.append("text_encoder")
+        if args.image_encoder_cpu_offload:
+            layerwise_components.append("image_encoder")
+            changed.append("image_encoder")
+        if args.vae_cpu_offload:
+            layerwise_components.append("vae")
+            changed.append("vae")
+
+        if not changed:
+            return
+
+        args.dit_layerwise_offload = True
+        args.layerwise_offload_components = layerwise_components
+        logger.info(
+            "Automatically replacing CPU offload with layerwise offload for components: %s",
+            ", ".join(changed),
+        )
 
     def finalize_auto_flags(self) -> None:
         """if some args are unset after all the adjustment, set them to defaults"""

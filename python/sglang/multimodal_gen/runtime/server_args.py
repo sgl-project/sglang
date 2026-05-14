@@ -334,6 +334,7 @@ class ServerArgs(DisaggArgsMixin):
         if auto_tuner.could_override_server_args():
             auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
+            auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
         self._adjust_quant_config()
         self._adjust_warmup()
@@ -1158,10 +1159,12 @@ class ServerArgs(DisaggArgsMixin):
             nargs="+",
             default=ServerArgs.layerwise_offload_components,
             help="Restrict layerwise offload to pipeline component names. "
-            "Use all to select every layerwise-offloadable component. "
+            "Use default to keep the legacy default DiT component selection, "
+            "or all to select every layerwise-offloadable component. "
+            "Auto tuning may add CPU-offloaded encoder/VAE components when this is unset. "
             "The --layerwise-offload-modules alias is accepted. "
             "This option implies --dit-layerwise-offload true. Example: "
-            "--layerwise-offload-components transformer text_encoder.",
+            "--layerwise-offload-components default text_encoder.",
         )
         parser.add_argument(
             "--dit-offload-prefetch-size",

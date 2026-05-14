@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 
 LAYERWISE_OFFLOAD_ALL_COMPONENTS = "all"
+LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS = "default"
 DIT_COMPONENT_NAMES = frozenset(
     {
         "transformer",
@@ -54,7 +55,12 @@ def cpu_offload_flags_for_layerwise_components(
         return CPU_OFFLOAD_FLAG_NAMES
 
     flag_names: list[str] = []
+    if LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS in component_names:
+        flag_names.append("dit_cpu_offload")
+
     for component_name in component_names:
+        if component_name == LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS:
+            continue
         if is_dit_component_name(component_name):
             flag_name = "dit_cpu_offload"
         elif is_text_encoder_component_name(component_name):
