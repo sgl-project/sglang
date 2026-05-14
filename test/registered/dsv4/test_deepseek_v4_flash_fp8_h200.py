@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-8-gpu-h200")
+register_cuda_ci(est_time=900, stage="stage-c", runner_config="dsv4-8-gpu-h200")
 
 MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -63,6 +63,8 @@ class TestDSV4FlashFP8H200(ServerSanityMixin, CustomTestCase):
                 "128",
                 "--deepep-config",
                 DEEPEP_CONFIG,
+                "--watchdog-timeout",
+                "900",
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",

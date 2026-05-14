@@ -108,11 +108,14 @@ class NPUGraphRunner(CudaGraphRunner):
         else:
             skip_guard_context = empty_context()
 
-        with skip_guard_context, torch.npu.graph(
-            graph,
-            pool=pool,
-            stream=stream,
-            auto_dispatch_capture=True,
+        with (
+            skip_guard_context,
+            torch.npu.graph(
+                graph,
+                pool=pool,
+                stream=stream,
+                auto_dispatch_capture=True,
+            ),
         ):
             out = run_once_fn()
         return out

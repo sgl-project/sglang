@@ -249,10 +249,13 @@ class MambaPool:
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
-            torch.cuda.use_mem_pool(self.custom_mem_pool)
-            if self.enable_custom_mem_pool
-            else nullcontext()
+        with (
+            self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
+            (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ),
         ):
             conv_state = [
                 torch.zeros(
@@ -2023,7 +2026,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
         assert index_head_dim == 128
 
         if _is_hip:
-            assert self.page_size == 1
+            assert (
+                self.page_size % 16 == 0
+            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
         else:
             assert self.page_size == 64
         with (
