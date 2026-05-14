@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 

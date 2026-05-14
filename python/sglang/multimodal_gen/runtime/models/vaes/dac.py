@@ -12,7 +12,7 @@ from einops import rearrange
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.dac import DacVAEConfig
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import (

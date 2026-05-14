@@ -37,7 +37,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
-from sglang.multimodal_gen.runtime.managers.layerwise_offload_components import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     cpu_offload_flags_for_layerwise_components,
     normalize_layerwise_offload_components,
 )

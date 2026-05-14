@@ -16,12 +16,12 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
-from sglang.multimodal_gen.runtime.managers.component_manager import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyStrategy,
     ComponentUse,
     ResidencyState,
 )
-from sglang.multimodal_gen.runtime.managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     SnapshotModuleResidency,
     SnapshotStrategy,
 )

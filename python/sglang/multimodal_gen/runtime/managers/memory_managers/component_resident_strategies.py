@@ -10,14 +10,14 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.managers.component_manager import (
+    from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
         ComponentUse,
         ResidencyState,
     )

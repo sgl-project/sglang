@@ -20,8 +20,10 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.models.vision_utils import (
     normalize,
@@ -489,7 +491,7 @@ class LTX2ImageEncodingStage(PipelineStage):
             server_args.dit_layerwise_offload
             and not server_args.dit_layerwise_offload_auto_enabled
         ):
-            from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+            from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
                 configure_layerwise_offload_modules,
             )
 

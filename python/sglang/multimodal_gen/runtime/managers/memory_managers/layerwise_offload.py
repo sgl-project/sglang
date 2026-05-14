@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Set, Tuple
 import torch
 from torch.distributed.tensor import DTensor
 
-from sglang.multimodal_gen.runtime.managers.layerwise_offload_components import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
     layerwise_component_matches_selection,
 )

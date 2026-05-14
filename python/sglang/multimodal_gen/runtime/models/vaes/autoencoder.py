@@ -22,7 +22,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 

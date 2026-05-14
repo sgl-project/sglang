@@ -7,16 +7,16 @@ from typing import Mapping, MutableMapping, Protocol, Sequence, TypeVar
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.runtime.managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     ComponentResidencyStrategy,
     LayerwiseOffloadStrategy,
     ResidentStrategy,
     VanillaD2HStrategy,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload_components import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     is_dit_component_name,
     is_image_encoder_component_name,
     is_text_encoder_component_name,

@@ -10,7 +10,7 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload_components import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
