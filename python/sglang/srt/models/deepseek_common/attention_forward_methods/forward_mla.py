@@ -141,18 +141,13 @@ class DeepseekMLAForwardMixin:
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
-        # Ensure w_kc, w_vc and w_scale are on the same device as hidden_states.
+        # Ensure w_kc and w_vc are on the same device as hidden_states.
         # These are plain tensor attributes, not nn.Parameter, so they need
         # special handling (For OffloaderV1).
         if self.w_kc is not None and self.w_kc.device != hidden_states.device:
             self.w_kc = self.w_kc.to(hidden_states.device, non_blocking=True)
         if self.w_vc is not None and self.w_vc.device != hidden_states.device:
             self.w_vc = self.w_vc.to(hidden_states.device, non_blocking=True)
-        if (
-            isinstance(self.w_scale, torch.Tensor)
-            and self.w_scale.device != hidden_states.device
-        ):
-            self.w_scale = self.w_scale.to(hidden_states.device, non_blocking=True)
 
         q_lora = None
         topk_indices = None
