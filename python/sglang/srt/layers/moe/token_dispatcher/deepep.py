@@ -174,7 +174,10 @@ class DeepEPBuffer:
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
-            hidden_bytes = hidden_size * param_bytes
+            if param_bytes == 0:
+                hidden_bytes = hidden_size // 2
+            else:
+                hidden_bytes = hidden_size * param_bytes
             for config in (
                 DeepEPConfig.get_instance().normal_dispatch_config
                 or Buffer.get_dispatch_config(group.size()),
@@ -399,7 +402,7 @@ class _DeepEPDispatcherImplBase:
                 "use_nvfp4": False,
             },
             DeepEPOutputDtype.NVFP4: {
-                "params_bytes": 1,
+                "params_bytes": 0,
                 "use_fp8": False,
                 "use_nvfp4": True,
             },
