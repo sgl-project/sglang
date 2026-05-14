@@ -304,6 +304,7 @@ class GPUWorker:
             forward_fn: the actual forward function for reqs
         """
         output_batch = None
+        pre_forward_reserved_mb = self._get_current_reserved_memory_mb()
         try:
             if self.rank == 0 and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
@@ -334,7 +335,10 @@ class GPUWorker:
                 return result
 
             output_batch = self._to_output_batch(result)
-            self._record_output_memory_stats(output_batch)
+            self._record_output_memory_stats(
+                output_batch,
+                pre_forward_reserved_mb=pre_forward_reserved_mb,
+            )
 
             output_metrics = self._iter_output_metrics(output_batch)
             if self.rank == 0 and output_metrics and not current_platform.is_cpu():
@@ -399,7 +403,10 @@ class GPUWorker:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
             output_batch.is_oom = is_oom
-            self._record_output_memory_stats(output_batch)
+            self._record_output_memory_stats(
+                output_batch,
+                pre_forward_reserved_mb=pre_forward_reserved_mb,
+            )
             # clean cache if OOM
             if torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
@@ -471,7 +478,21 @@ class GPUWorker:
         )
         return np.asarray(frames)
 
-    def _record_output_memory_stats(self, output_batch: OutputBatch) -> None:
+    @staticmethod
+    def _get_current_reserved_memory_mb() -> float:
+        if current_platform.is_cpu():
+            return 0.0
+        try:
+            device_module = torch.get_device_module()
+            if hasattr(device_module, "memory_reserved"):
+                return float(device_module.memory_reserved()) / (1024**2)
+        except Exception:
+            return 0.0
+        return 0.0
+
+    def _record_output_memory_stats(
+        self, output_batch: OutputBatch, *, pre_forward_reserved_mb: float
+    ) -> None:
         if current_platform.is_cpu():
             return
         device_module = torch.get_device_module()
@@ -490,16 +511,18 @@ class GPUWorker:
                 else current_platform.device_name.lower()
             )
             peaks = torch.tensor(
-                [peak_reserved_mb, peak_allocated_mb],
+                [pre_forward_reserved_mb, peak_reserved_mb, peak_allocated_mb],
                 dtype=torch.float32,
                 device=f"{device_type}:{device_module.current_device()}",
             )
             torch.distributed.all_reduce(peaks, op=torch.distributed.ReduceOp.MAX)
-            peak_reserved_mb = float(peaks[0].item())
-            peak_allocated_mb = float(peaks[1].item())
+            pre_forward_reserved_mb = float(peaks[0].item())
+            peak_reserved_mb = float(peaks[1].item())
+            peak_allocated_mb = float(peaks[2].item())
 
         if self.rank != 0:
             return
+        output_batch.pre_forward_reserved_memory_mb = pre_forward_reserved_mb
         output_batch.peak_memory_mb = peak_reserved_mb
         output_batch.peak_allocated_memory_mb = peak_allocated_mb
 
@@ -676,6 +699,10 @@ class GPUWorker:
         if output_batch.error is not None and merged.error is None:
             merged.error = output_batch.error
         merged.is_oom = merged.is_oom or output_batch.is_oom
+        merged.pre_forward_reserved_memory_mb = max(
+            merged.pre_forward_reserved_memory_mb,
+            output_batch.pre_forward_reserved_memory_mb,
+        )
         merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
         merged.peak_allocated_memory_mb = max(
             merged.peak_allocated_memory_mb,

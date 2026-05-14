@@ -399,6 +399,7 @@ class OutputBatch:
 
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
+    pre_forward_reserved_memory_mb: float = 0.0
     peak_memory_mb: float = 0.0
     peak_allocated_memory_mb: float = 0.0
     is_oom: bool = False
