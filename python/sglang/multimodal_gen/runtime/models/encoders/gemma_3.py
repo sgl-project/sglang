@@ -146,14 +146,21 @@ class Gemma3Attention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.layer_type = (
-            config.text_config.layer_types[layer_id]
-            if hasattr(config.text_config, "layer_types")
-            else None
-        )
-        self.is_sliding = (
-            config.text_config.layer_types[layer_id] == "sliding_attention"
-        )
+        layer_types = getattr(config.text_config, "layer_types", None)
+        if layer_types:
+            self.layer_type = layer_types[layer_id]
+            self.is_sliding = self.layer_type == "sliding_attention"
+        else:
+            # official Gemma3 uses sliding_window_pattern when layer_types is absent
+            sliding_window_pattern = getattr(
+                config.text_config, "sliding_window_pattern", None
+            )
+            self.is_sliding = (
+                bool((layer_id + 1) % sliding_window_pattern)
+                if sliding_window_pattern
+                else False
+            )
+            self.layer_type = "sliding_attention" if self.is_sliding else None
 
         rope_parameters = getattr(config.text_config, "rope_parameters", None) or {}
         layer_rope_params = {}
@@ -204,7 +211,7 @@ class Gemma3Attention(nn.Module):
             self.sliding_window = None
             self.window_size = (-1, -1)
 
-        self.rotary_emb = get_rope(
+        self.rotary_pos_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=config.text_config.max_position_embeddings,
@@ -212,19 +219,6 @@ class Gemma3Attention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=True,
         )
-
-        # NOTE(gmixiaojin): The shared RotaryEmbedding above computes inv_freq on
-        # GPU and uses the x1*cos - x2*sin formula, which causes slight
-        # numerical differences vs HuggingFace (see the NOTE in
-        # rotary_embedding.py:_compute_inv_freq).  For HF-exact alignment we
-        # precompute inv_freq on CPU and use rotate_half in self.rotary_emb().
-        freq_indices = (
-            torch.arange(0, self.head_dim, 2, dtype=torch.int64).float() / self.head_dim
-        )
-        inv_freq = 1.0 / (self.rope_theta**freq_indices)
-        if rope_scaling and rope_scaling.get("factor"):
-            inv_freq = inv_freq / float(rope_scaling["factor"])
-        self.register_buffer("_hf_inv_freq", inv_freq, persistent=False)
 
         # Local Attention not support attention mask, we use global attention instead.
         # self.attn = LocalAttention(
@@ -245,16 +239,18 @@ class Gemma3Attention(nn.Module):
             dim=self.head_dim, eps=config.text_config.rms_norm_eps
         )
 
-    def rotary_emb(self, positions, q, k):
-        """Apply RoPE using HF-exact formula with precomputed inv_freq."""
-        positions_flat = positions.flatten().float()
+    def _apply_rotary_pos_emb(self, positions, q, k):
+        positions_flat = positions.flatten().to(
+            device=self.rotary_pos_emb.cos_sin_cache.device, dtype=torch.long
+        )
+        cos_sin = self.rotary_pos_emb.cos_sin_cache.index_select(0, positions_flat)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        # match HF Gemma3: expand half-dim freqs to full head dim before rotate_half
+        cos = torch.cat((cos, cos), dim=-1).to(device=q.device, dtype=q.dtype)
+        sin = torch.cat((sin, sin), dim=-1).to(device=q.device, dtype=q.dtype)
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
         num_tokens = positions_flat.shape[0]
-
-        with torch.autocast(device_type=q.device.type, enabled=False):
-            freqs = torch.outer(positions_flat, self._hf_inv_freq.float())
-            emb = freqs.repeat(1, 2)
-            cos = emb.cos().to(q.dtype).unsqueeze(1)
-            sin = emb.sin().to(q.dtype).unsqueeze(1)
 
         q = q.reshape(num_tokens, -1, self.head_dim)
         k = k.reshape(num_tokens, -1, self.head_dim)
@@ -281,7 +277,7 @@ class Gemma3Attention(nn.Module):
         k = self.k_norm(k)
 
         # Apply RoPE
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self._apply_rotary_pos_emb(positions, q, k)
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
@@ -290,11 +286,10 @@ class Gemma3Attention(nn.Module):
         key = k.transpose(1, 2)
         value = v.transpose(1, 2)
 
-        min_val = torch.finfo(query.dtype).min
-        attn_mask = torch.zeros(
+        attn_mask = torch.ones(
             (seq_len, seq_len),
             device=hidden_states.device,
-            dtype=query.dtype,
+            dtype=torch.bool,
         )
         causal = torch.triu(
             torch.ones(
@@ -302,30 +297,39 @@ class Gemma3Attention(nn.Module):
             ),
             diagonal=1,
         )
-        attn_mask = attn_mask.masked_fill(causal, min_val)
+        attn_mask = attn_mask.masked_fill(causal, False)
         if self.is_sliding and self.sliding_window is not None:
             idx = torch.arange(seq_len, device=hidden_states.device)
-            dist = idx[None, :] - idx[:, None]
+            dist = idx[:, None] - idx[None, :]
             too_far = dist > self.sliding_window
-            attn_mask = attn_mask.masked_fill(too_far, min_val)
+            attn_mask = attn_mask.masked_fill(too_far, False)
 
-        key_pad = ~attention_mask.to(torch.bool)
         attn_mask = attn_mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
-        attn_mask = attn_mask.masked_fill(
-            key_pad[:, None, None, :].expand(batch_size, 1, seq_len, seq_len),
-            min_val,
-        )
+        attn_mask = attn_mask & attention_mask.to(torch.bool)[:, None, None, :]
 
-        attn_kwargs = {
-            "attn_mask": attn_mask,
-            "dropout_p": 0.0,
-            "is_causal": False,
-            "scale": self.scaling,
-        }
         if query.shape[1] != key.shape[1]:
-            attn_kwargs["enable_gqa"] = True
+            num_key_value_groups = query.shape[1] // key.shape[1]
+            key = key[:, :, None, :, :].expand(
+                batch_size, key.shape[1], num_key_value_groups, seq_len, self.head_dim
+            )
+            value = value[:, :, None, :, :].expand(
+                batch_size,
+                value.shape[1],
+                num_key_value_groups,
+                seq_len,
+                self.head_dim,
+            )
+            key = key.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
+            value = value.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query, key, value, **attn_kwargs
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.scaling,
         )
         attn_output = attn_output.transpose(1, 2)
 

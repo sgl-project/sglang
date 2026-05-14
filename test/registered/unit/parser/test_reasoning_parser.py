@@ -1499,5 +1499,21 @@ class TestGptOssDetectorToolCall(CustomTestCase):
         self.assertIn("done", all_normal)
 
 
+class TestPoolsideV1Registered(CustomTestCase):
+    """poolside_v1 (Laguna-XS.2) reuses the Qwen3 `<think>...</think>` envelope.
+    Request dispatch differs (Mimo-style explicit `enable_thinking=True`,
+    asserted in test_serving_chat.py), driven by
+    `reasoning_default = "explicit_enable_thinking"` on the detector."""
+
+    def test_registered_to_qwen3_subclass(self):
+        cls = ReasoningParser.DetectorMap["poolside_v1"]
+        self.assertTrue(issubclass(cls, Qwen3Detector))
+
+    def test_explicit_enable_thinking_default(self):
+        rp = ReasoningParser("poolside_v1", stream_reasoning=True)
+        self.assertEqual(rp.detector.reasoning_default, "explicit_enable_thinking")
+        self.assertTrue(rp.detector.thinks_internally)
+
+
 if __name__ == "__main__":
     unittest.main()
