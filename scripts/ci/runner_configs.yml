@@ -1,0 +1,26 @@
+# Per-runner-config CUDA setup details. Single source of truth for the
+# `runner_config` field on `register_cuda_ci(...)` calls. Consumed by
+# scripts/ci/runner_configs.py (CLI wrapper), which is in turn called by
+# .github/workflows/_pr-test-stage.yml.
+#
+# Each runner_config carries install script, actions/download-artifact major
+# version, and install-step wall-clock cap (minutes, enforced via
+# `timeout-minutes:` on the install step in _pr-test-stage.yml).
+
+_anchors:
+  default_install: &default scripts/ci/cuda/ci_install_dependency.sh
+  deepep_install:  &deepep  scripts/ci/cuda/ci_install_deepep.sh
+  dsv4_install:    &dsv4    scripts/ci/cuda/ci_install_dsv4_dep.sh
+
+runner_configs:
+  1-gpu-small:       { install: *default, artifact_version: v4, install_timeout: "20" }
+  1-gpu-large:       { install: *default, artifact_version: v4, install_timeout: "20" }
+  2-gpu-large:       { install: *default, artifact_version: v4, install_timeout: "20" }
+  4-gpu-b200:        { install: *default, artifact_version: v6, install_timeout: "20" }
+  4-gpu-h100:        { install: *default, artifact_version: v4, install_timeout: "20" }
+  8-gpu-h200:        { install: *default, artifact_version: v4, install_timeout: "20" }
+  8-gpu-h20:         { install: *deepep,  artifact_version: v4, install_timeout: "20" }
+  deepep-4-gpu-h100: { install: *deepep,  artifact_version: v4, install_timeout: "20" }
+  deepep-8-gpu-h200: { install: *deepep,  artifact_version: v4, install_timeout: "20" }
+  dsv4-4-gpu-b200:   { install: *dsv4,    artifact_version: v6, install_timeout: "30" }
+  dsv4-8-gpu-h200:   { install: *dsv4,    artifact_version: v4, install_timeout: "30" }
