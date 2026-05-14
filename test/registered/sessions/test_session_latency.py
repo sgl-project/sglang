@@ -36,7 +36,11 @@ register_cuda_ci(
     stage="stage-b",
     runner_config="1-gpu-large",
 )
-register_amd_ci(est_time=122, suite="stage-b-test-1-gpu-large-amd")
+register_amd_ci(
+    est_time=122,
+    suite="stage-b-test-1-gpu-large-amd",
+    disabled="Uses gpt-oss-20b which is mxfp4-quantized; AMD does not yet accept mxfp4 quantization",
+)
 
 NUM_TURNS = 150
 INPUT_LEN = 16
