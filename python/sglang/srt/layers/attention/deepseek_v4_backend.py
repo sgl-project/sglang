@@ -71,6 +71,7 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+_is_xpu = is_xpu()
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])

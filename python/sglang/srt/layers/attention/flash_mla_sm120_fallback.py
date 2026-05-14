@@ -21,13 +21,14 @@ import os
 
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_xpu
 from sglang.srt.utils.common import get_device_sm
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = torch.cuda.is_available() and not is_hip()
 _is_sm120 = _is_cuda and get_device_sm() // 10 == 12
+_is_xpu = is_xpu()
 
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
