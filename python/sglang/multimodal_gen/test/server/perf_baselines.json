@@ -1105,7 +1105,7 @@
                 "TimestepPreparationStage": 7.85,
                 "LTX2AVLatentPreparationStage": 0.34,
                 "LTX2ImageEncodingStage": 0.02,
-                "LTX2AVDenoisingStage": 7744.44,
+                "LTX2AVDenoisingStage": 6000.0,
                 "LTX2UpsampleStage": 2.98,
                 "LTX2RefinementStage": 666.08,
                 "LTX2AVDecodingStage": 338.87,
@@ -1156,9 +1156,9 @@
                 "41": 223.51,
                 "42": 221.07
             },
-            "expected_e2e_ms": 10601.1,
-            "expected_avg_denoise_ms": 195.04,
-            "expected_median_denoise_ms": 191.34,
+            "expected_e2e_ms": 8500.0,
+            "expected_avg_denoise_ms": 150.0,
+            "expected_median_denoise_ms": 135.0,
             "estimated_full_test_time_s": 345.4
         },
         "wan2_2_ti2v_5b": {
@@ -2384,7 +2384,7 @@
                 "LTX2SigmaPreparationStage": 0.26,
                 "TimestepPreparationStage": 13.63,
                 "LTX2AVLatentPreparationStage": 0.12,
-                "LTX2AVDenoisingStage": 24658.05,
+                "LTX2AVDenoisingStage": 18500.0,
                 "LTX2AVDecodingStage": 383.25
             },
             "denoise_step_ms": {
@@ -2419,9 +2419,9 @@
                 "28": 815.91,
                 "29": 803.65
             },
-            "expected_e2e_ms": 26917.71,
-            "expected_avg_denoise_ms": 791.24,
-            "expected_median_denoise_ms": 791.0,
+            "expected_e2e_ms": 21000.0,
+            "expected_avg_denoise_ms": 620.0,
+            "expected_median_denoise_ms": 620.0,
             "estimated_full_test_time_s": 144.2
         },
         "ltx_2.3_two_stage_t2v_2gpus": {
