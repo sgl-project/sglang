@@ -137,7 +137,7 @@ def select_last_extend_hidden(
 def select_last_verified_seed(
     draft_input: FrozenKVMTPDraftExtendInput,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    counts = draft_input.num_accepted_tokens.to(torch.long)
+    counts = draft_input.num_accept_tokens.to(torch.long)
     last_indices = torch.cumsum(counts, dim=0) - 1
     return (
         draft_input.bonus_tokens[last_indices],

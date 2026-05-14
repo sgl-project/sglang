@@ -15,6 +15,8 @@
 /python/sglang/srt/constrained @hnyls2002 @DarkSharpness
 /python/sglang/srt/disaggregation @ByronHsu @hnyls2002 @ShangmingCai
 /python/sglang/srt/disaggregation/ascend @ping1jing2 @iforgetmyname
+/python/sglang/srt/disaggregation/encode_receiver.py @ShangmingCai @liusy58 @ZhengWG @gty111
+/python/sglang/srt/disaggregation/encode_server.py @ShangmingCai @liusy58 @ZhengWG @gty111
 /python/sglang/srt/distributed @yizhang2077 @merrymercy @ch-wan
 /python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py @ShangmingCai @stmatengss
 /python/sglang/srt/dllm @ClawSeven @btw616
@@ -85,5 +87,6 @@
 /docs_new/src/snippets/autoregressive/gemma4-deployment.jsx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl
 /python/sglang/srt/speculative/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/srt/speculative/cpp_ngram @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/srt/speculative/frozen_kv_mtp_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/jit_kernel/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/jit_kernel/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl
