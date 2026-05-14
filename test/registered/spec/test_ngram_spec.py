@@ -13,8 +13,8 @@ from sglang.test.test_utils import (
 )
 
 # Per-commit: Paged backend only.
-# - FA3 base test archived to test/manual/spec/test_ngram_speculative_decoding_fa3.py
-# - Triton + Flashinfer moved to test_ngram_speculative_decoding_extra.py
+# - FA3 base test archived to test/manual/spec/test_ngram_spec_fa3.py
+# - Triton + Flashinfer moved to test_ngram_spec_extra.py
 register_cuda_ci(est_time=254, stage="stage-b", runner_config="1-gpu-large")
 
 
