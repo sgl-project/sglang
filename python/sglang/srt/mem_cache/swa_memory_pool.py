@@ -436,28 +436,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         full_indices = full_indices.to(dtype=torch.int64)
         swa_indices = swa_indices.to(dtype=torch.int64)
         valid = (full_indices > 0) & (swa_indices > 0)
-        if not torch.any(valid):
-            return
-
         full_indices = full_indices[valid]
         swa_indices = swa_indices[valid]
 
         previous_swa_indices = self.full_to_swa_index_mapping[full_indices]
         previous_valid = previous_swa_indices > 0
-        if torch.any(previous_valid):
-            previous_swa_indices = previous_swa_indices[previous_valid]
-            previous_full_indices = full_indices[previous_valid]
-            previous_owners = self.swa_to_full_index_mapping[previous_swa_indices]
-            previous_same_owner = previous_owners == previous_full_indices
-            if torch.any(previous_same_owner):
-                self.swa_to_full_index_mapping[
-                    previous_swa_indices[previous_same_owner]
-                ] = 0
+        previous_swa_indices = previous_swa_indices[previous_valid]
+        previous_full_indices = full_indices[previous_valid]
+        previous_owners = self.swa_to_full_index_mapping[previous_swa_indices]
+        previous_same_owner = previous_owners == previous_full_indices
+        self.swa_to_full_index_mapping[
+            previous_swa_indices[previous_same_owner]
+        ] = 0
 
         old_full_indices = self.swa_to_full_index_mapping[swa_indices]
         old_full_indices = old_full_indices[old_full_indices > 0]
-        if old_full_indices.numel() > 0:
-            self.full_to_swa_index_mapping[old_full_indices] = 0
+        self.full_to_swa_index_mapping[old_full_indices] = 0
 
         self.full_to_swa_index_mapping[full_indices] = swa_indices
         self.swa_to_full_index_mapping[swa_indices] = full_indices
@@ -682,7 +676,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_indices = (
             pages[:, None] * self.page_size + offsets[None, :]
         ).reshape(pages.numel(), self.page_size)
-        has_owner = torch.any(self.swa_to_full_index_mapping[page_indices] > 0, dim=1)
+        valid_page_indices = page_indices < self.swa_to_full_index_mapping.numel()
+        safe_page_indices = torch.where(
+            valid_page_indices, page_indices, torch.zeros_like(page_indices)
+        )
+        has_owner = torch.any(
+            (self.swa_to_full_index_mapping[safe_page_indices] > 0)
+            & valid_page_indices,
+            dim=1,
+        )
         free_pages = pages[~has_owner]
         if free_pages.numel() > 0:
             self.swa_attn_allocator.free(free_pages * self.page_size)
@@ -696,8 +698,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         swa_indices = self.full_to_swa_index_mapping[free_index]
         valid = swa_indices > 0
-        if not torch.any(valid):
-            return
 
         full_indices = free_index[valid]
         swa_indices = swa_indices[valid]
@@ -707,13 +707,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         current_full_indices = self.swa_to_full_index_mapping[swa_indices]
         current_owner = current_full_indices == full_indices
         stale_full_indices = full_indices[~current_owner]
-        if stale_full_indices.numel() > 0:
-            self.full_to_swa_index_mapping[stale_full_indices] = 0
+        self.full_to_swa_index_mapping[stale_full_indices] = 0
 
         full_indices = full_indices[current_owner]
         swa_indices = swa_indices[current_owner]
-        if swa_indices.numel() == 0:
-            return
 
         self.swa_to_full_index_mapping[swa_indices] = 0
         self.full_to_swa_index_mapping[full_indices] = 0
