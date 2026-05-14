@@ -1,67 +1,61 @@
 name: PR Test Stage
-# Reusable workflow that owns one CUDA test stage. Caller (pr-test.yml) passes
-# (self_name, runner_config, runs_on, partitions, check_changes JSON, caller_inputs JSON)
-# and the per-commit/target_stage gating + matrix fanout + setup/run/teardown all
-# live here. Only stage-a-test-cpu still lives inline in pr-test.yml (bespoke
-# uv pip / protoc / rust-cache install path).
-#
-# `check_changes` = ${{ toJson(needs.check-changes.outputs) }} forwarded as-is.
-# `caller_inputs` = ${{ toJson(inputs) }} forwarded as-is.
-# `partitions` is kept as its own input (rather than read from check_changes)
-# so accessing it needs only one fromJson — the value itself is a JSON string,
-# which inside `check_changes` would become a JSON-escaped string requiring
-# nested fromJson. `partitions` is referenced 3x in job-level strategy/matrix
-# where step-resolution isn't available, so the inline expressions stay short.
+# Reusable workflow for one CUDA test stage. Caller pr-test.yml forwards
+# `check_changes` = toJson(needs.check-changes.outputs) and
+# `caller_inputs` = toJson(inputs) as bundles. `partitions` is forwarded
+# separately to keep matrix expressions single-fromJson — its value is itself
+# a JSON string, so reading it via `check_changes` would need double fromJson,
+# and matrix can't use step-resolved values. stage-a-test-cpu stays inline in
+# pr-test.yml (bespoke uv pip / protoc / rust-cache install).
 
 on:
   workflow_call:
     inputs:
       self_name:
-        description: 'Caller job key, used for $GITHUB_JOB-style gating + partitions[suite] lookup.'
+        description: 'Caller job key; used for partitions[suite] lookup and target_stage gating.'
         type: string
         required: true
       runner_config:
-        description: 'Looked up in scripts/ci/runner_configs.yml for install script / artifact version / install timeout.'
+        description: 'Key in scripts/ci/runner_configs.yml (install script / artifact version / install timeout).'
         type: string
         required: true
       runs_on:
-        description: 'Physical GHA runner label, e.g. "1-gpu-5090" or the b200_runner output from check-changes for B200 stages.'
+        description: 'GHA runner label. B200 stages pass needs.check-changes.outputs.b200_runner for dynamic selection.'
         type: string
         required: true
       check_changes:
-        description: 'JSON-encoded `needs.check-changes.outputs` bundle. Use fromJson(...) to read main_package / sgl_kernel / continue_on_error etc.'
+        description: 'toJson(needs.check-changes.outputs). Read via fromJson(...).main_package / sgl_kernel / continue_on_error etc.'
         type: string
         required: true
       caller_inputs:
-        description: 'JSON-encoded pr-test.yml workflow inputs bundle (toJson(inputs)). Reads target_stage / test_parallel_dispatch / pr_head_sha / git_ref / skip_stage_health_check.'
+        description: 'toJson(inputs) from pr-test.yml. Read via fromJson(...).target_stage / pr_head_sha / git_ref / skip_stage_health_check / test_parallel_dispatch.'
         type: string
         required: true
       partitions:
-        description: 'JSON from check-changes (size, arr, max_parallel per suite). Passed as its own input so single-level fromJson suffices in matrix expressions.'
+        description: 'check-changes.outputs.partitions raw — kept separate to avoid double-fromJson in matrix expressions.'
         type: string
         required: true
       run_timeout_minutes:
-        description: 'Per-suite wall-clock cap (minutes), enforced via bash `timeout` around run_suite.py.'
+        description: 'timeout-minutes for the Run test step.'
         type: string
         default: '30'
       timeout_per_file:
-        description: 'Optional run_suite.py --timeout-per-file value.'
+        description: 'run_suite.py --timeout-per-file value (empty = unset).'
         type: string
         default: ''
       warmup_deep_gemm_models:
-        description: 'Space-separated `model:gpus` list. Empty = skip DeepGEMM warmup.'
+        description: 'Space-separated `model:gpus` list; empty skips DeepGEMM warmup.'
         type: string
         default: ''
       warmup_server_models:
-        description: 'Space-separated `model:gpus` list. Empty = skip server-CUDA-graph warmup.'
+        description: 'Space-separated `model:gpus` list; empty skips server-CUDA-graph warmup.'
         type: string
         default: ''
       warmup_timeout_minutes:
-        description: 'Wall-clock cap for each warmup step (DeepGEMM + server). Default 25min; bump for stages with large cold-cache warmup model lists.'
+        description: 'timeout-minutes for each warmup step. Bump for stages with large cold-cache model lists.'
         type: string
         default: '25'
       extra_pytest_path:
-        description: 'Optional pytest path to run after the suite (stage-b-test-4-gpu-b200 uses this for FA4 jit_kernel tests). Empty = skip.'
+        description: 'pytest path to run after the suite (b200 FA4 jit_kernel tests). Empty skips.'
         type: string
         default: ''
 
@@ -79,10 +73,9 @@ env:
 
 jobs:
   run:
-    # Mirror the inline gating that used to live in pr-test.yml on every CUDA
-    # stage job. target_stage takes precedence; otherwise default per-commit
-    # gating runs the stage on schedule / parallel-dispatch / non-failed PR
-    # with main_package or sgl_kernel changes.
+    # target_stage takes precedence; otherwise default per-commit gating
+    # runs on schedule / parallel-dispatch / non-failed PR with main_package
+    # or sgl_kernel changes.
     if: |
       always() &&
       (
@@ -96,8 +89,7 @@ jobs:
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 240
     env:
-      # Only stage-c-test-8-gpu-h20 needs the RDMA device list. Empty for
-      # everyone else (env var unset, harmless).
+      # Only stage-c-test-8-gpu-h20 needs the RDMA device list.
       SGLANG_CI_RDMA_ALL_DEVICES: ${{ inputs.runner_config == '8-gpu-h20' && 'mlx5_1,mlx5_2,mlx5_3,mlx5_4' || '' }}
     strategy:
       fail-fast: false
