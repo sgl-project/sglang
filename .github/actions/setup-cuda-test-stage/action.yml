@@ -1,13 +1,13 @@
 name: Setup CUDA Test Stage
 description: >-
   Boilerplate run at the start of every CUDA test stage in pr-test.yml:
-  checkout the PR ref, run the stage-health and maintenance gates, download
-  the sgl-kernel wheel artifact (when the PR has kernel changes), and install
-  the CUDA dependencies. All runner-specific details (install script,
-  download-artifact major version, install timeout) are looked up by
-  `runner_config` from scripts/ci/runner_configs.py. The PR head SHA / git
-  ref are read from workflow-level env (PR_HEAD_SHA, GIT_REF) that pr-test.yml
-  exports.
+  stage-health / maintenance gates, sgl-kernel wheel download (when the PR
+  has kernel changes), and install CUDA deps. All runner-specific details
+  (install script, download-artifact major version, install timeout) are
+  looked up by `runner_config` from scripts/ci/runner_configs.yml.
+
+  Caller must run `actions/checkout` first — composite-action local references
+  (`uses: ./...`) cannot bootstrap their own action.yml from an empty workspace.
 inputs:
   runner_config:
     description: >-
@@ -25,11 +25,6 @@ runs:
       run: |
         python3 scripts/ci/runner_configs.py github_output \
           --runner-config '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
-
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
 
     - uses: ./.github/actions/check-stage-health
 

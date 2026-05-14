@@ -298,6 +298,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-a-test-1-gpu-small'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: 1-gpu-small
@@ -404,6 +408,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-small'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: 1-gpu-small
@@ -440,6 +448,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-1-gpu-large'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: 1-gpu-large
@@ -476,6 +488,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-2-gpu-large'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: 2-gpu-large
@@ -511,6 +527,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-b-test-4-gpu-b200'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: 4-gpu-b200
@@ -583,6 +603,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-h100'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: 4-gpu-h100
@@ -618,6 +642,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h200'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: 8-gpu-h200
@@ -674,6 +702,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-8-gpu-h20'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: 8-gpu-h20
@@ -707,6 +739,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-4-gpu-h100'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: deepep-4-gpu-h100
@@ -757,6 +793,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-deepep-8-gpu-h200'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: deepep-8-gpu-h200
@@ -809,6 +849,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-4-gpu-b200'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: 4-gpu-b200
@@ -845,6 +889,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-4-gpu-b200'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: dsv4-4-gpu-b200
@@ -879,6 +927,10 @@ jobs:
       matrix:
         partition: ${{ fromJson(needs.check-changes.outputs.partitions)['stage-c-test-dsv4-8-gpu-h200'].arr }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PR_HEAD_SHA || env.GIT_REF || github.sha }}
+
       - uses: ./.github/actions/setup-cuda-test-stage
         with:
           runner_config: dsv4-8-gpu-h200
