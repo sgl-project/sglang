@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=420, suite="stage-b-test-4-gpu-b200")
+register_cuda_ci(est_time=420, stage="stage-b", runner_config="4-gpu-b200")
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 SERVER_LAUNCH_TIMEOUT = 1200
@@ -49,9 +49,10 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
-        with envs.SGLANG_SPEC_NAN_DETECTION.override(
-            True
-        ), envs.SGLANG_SPEC_OOB_DETECTION.override(True):
+        with (
+            envs.SGLANG_SPEC_NAN_DETECTION.override(True),
+            envs.SGLANG_SPEC_OOB_DETECTION.override(True),
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

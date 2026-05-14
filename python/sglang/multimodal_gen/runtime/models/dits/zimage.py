@@ -159,7 +159,7 @@ class ZImageAttention(nn.Module):
         self.local_num_kv_heads = num_kv_heads // tp_size
 
         kv_dim = self.head_dim * num_kv_heads
-        self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
+        self.use_fused_qkv = True
 
         if self.use_fused_qkv:
             self.to_qkv = MergedColumnParallelLinear(
