@@ -14,6 +14,7 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(2.0, "stage-a-test-cpu")
 
@@ -74,7 +75,7 @@ def _allowed_dense_token_ids(vocab_mask, token_ids):
     return [token_id for token_id in token_ids if not vocab_mask[0, token_id].item()]
 
 
-class TestReasonerGrammarObject(unittest.TestCase):
+class TestReasonerGrammarObject(CustomTestCase):
     def _make_strict_object(self):
         return ReasonerGrammarObject(
             grammar=None,
@@ -121,7 +122,7 @@ class TestReasonerGrammarObject(unittest.TestCase):
         self.assertIsNotNone(obj.apply_vocab_mask)
 
 
-class TestReasonerGrammarBackend(unittest.TestCase):
+class TestReasonerGrammarBackend(CustomTestCase):
     def setUp(self):
         self._prev_budget = os.environ.get("SGLANG_MAX_THINK_TOKENS")
 
@@ -300,7 +301,7 @@ class TestReasonerGrammarBackend(unittest.TestCase):
             )
 
 
-class TestReasonerGrammarObjectRollback(unittest.TestCase):
+class TestReasonerGrammarObjectRollback(CustomTestCase):
     """Tests for rollback correctness at the THINKING→GENERATION boundary."""
 
     def _make_object_with_mock_grammar(self):
@@ -424,7 +425,7 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         self.assertTrue(copy._is_thinking())
 
 
-class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
+class TestReasonerGrammarObjectFillVocabMask(CustomTestCase):
     """Tests for fill_vocab_mask behavior in different states."""
 
     def test_thinking_phase_does_not_consult_inner_grammar(self):
