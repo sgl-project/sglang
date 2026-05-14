@@ -201,6 +201,7 @@ class Envs:
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_DEBUG_KV_ALLOC = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
@@ -244,6 +245,7 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+    SGLANG_DEBUG_DISAGG_PREFILL_CACHE = EnvBool(False)
     # Extra slots in req_to_token_pool for decode workers (only effective when
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
     # can overlap with decode execution without raising max_running_requests.

@@ -557,12 +557,50 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def total_size(self) -> Tuple[int, int]:
         return self._total_size_helper()
 
+    @staticmethod
+    def _debug_sub(*values):
+        if all(isinstance(v, (int, float)) for v in values):
+            return int(values[0] - sum(values[1:]))
+        return None
+
+    def _debug_allocator_snapshot(self) -> dict[str, int | Tuple[int, int] | None]:
+        allocator = self.token_to_kv_pool_allocator
+        full_total, swa_total = self.total_size()
+        full_capacity = getattr(allocator, "size_full", None)
+        full_capacity = full_capacity() if callable(full_capacity) else full_capacity
+        swa_capacity = getattr(allocator, "size_swa", None)
+        swa_capacity = swa_capacity() if callable(swa_capacity) else swa_capacity
+        full_available = allocator.full_available_size()
+        swa_available = allocator.swa_available_size()
+        return {
+            "full_capacity": full_capacity,
+            "full_available": full_available,
+            "full_used": self._debug_sub(full_capacity, full_available),
+            "full_tree_total": full_total,
+            "full_tree_evictable": self.full_evictable_size_,
+            "full_tree_protected": self.full_protected_size_,
+            "full_non_tree_live": self._debug_sub(
+                full_capacity, full_available, full_total
+            ),
+            "swa_capacity": swa_capacity,
+            "swa_available": swa_available,
+            "swa_used": self._debug_sub(swa_capacity, swa_available),
+            "swa_tree_total": swa_total,
+            "swa_tree_evictable": self.swa_evictable_size_,
+            "swa_tree_protected": self.swa_protected_size_,
+            "swa_non_tree_live": self._debug_sub(
+                swa_capacity, swa_available, swa_total
+            ),
+        }
+
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
         start_time = time.perf_counter()
         full_num_tokens = params.num_tokens
         swa_num_tokens = params.swa_num_tokens
+        debug_enabled = envs.SGLANG_DEBUG_KV_ALLOC.get()
+        debug_before = self._debug_allocator_snapshot() if debug_enabled else None
         full_num_evicted = 0
         swa_num_evicted = 0
         if full_num_tokens > 0:
@@ -660,6 +698,17 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 x = x_next
 
         self.update_eviction_metrics(full_num_evicted + swa_num_evicted, start_time)
+        if debug_enabled:
+            logger.info(
+                "SWA_EVICT_PRESSURE request_full=%s request_swa=%s "
+                "evicted_full=%s evicted_swa=%s before=%s after=%s",
+                full_num_tokens,
+                swa_num_tokens,
+                full_num_evicted,
+                swa_num_evicted,
+                debug_before,
+                self._debug_allocator_snapshot(),
+            )
         return EvictResult(
             num_tokens_evicted=full_num_evicted, swa_num_tokens_evicted=swa_num_evicted
         )
