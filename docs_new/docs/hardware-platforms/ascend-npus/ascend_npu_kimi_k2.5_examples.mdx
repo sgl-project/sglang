@@ -258,7 +258,7 @@ do
         NODE_RANK=$i
         exit 1
     fi
-done    
+done
 
 
 for i in "${!D_IP[@]}";
@@ -291,7 +291,7 @@ do
             --enable-multimodal --mm-attention-backend ascend_attn --sampling-backend ascend \
             --enable-dp-attention --dp-size 32 \
             --moe-a2a-backend deepep --deepep-mode auto \
-            --cuda-graph-bs 4 
+            --cuda-graph-bs 4
         NODE_RANK=$i
         exit 1
     fi
