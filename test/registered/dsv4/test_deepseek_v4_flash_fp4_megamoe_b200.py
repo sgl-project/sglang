@@ -28,12 +28,18 @@ SERVER_LAUNCH_TIMEOUT = 3600
 
 
 _W4A8_MEGAMOE_ENV = {
+    "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE": "1",
+    "SGLANG_OPT_FIX_MEGA_MOE_MEMORY": "1",
+    "SGLANG_OPT_FIX_NEXTN_MEGA_MOE": "1",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "4096",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "0",
 }
 
 
 _W4A4_MEGAMOE_ENV = {
+    "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE": "1",
+    "SGLANG_OPT_FIX_MEGA_MOE_MEMORY": "1",
+    "SGLANG_OPT_FIX_NEXTN_MEGA_MOE": "1",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "4096",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "0",
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
@@ -75,7 +81,7 @@ class TestDSV4FlashFP4B200W4A8MegaMoE(ServerSanityMixin, CustomTestCase):
                 "4",
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
-                "megamoe",
+                "deepep",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",
@@ -116,7 +122,7 @@ class TestDSV4FlashFP4B200W4A4MegaMoE(ServerSanityMixin, CustomTestCase):
                 "4",
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
-                "megamoe",
+                "deepep",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",
