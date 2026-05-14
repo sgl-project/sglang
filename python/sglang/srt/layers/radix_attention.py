@@ -139,8 +139,27 @@ class RadixAttention(nn.Module):
             # cleared, fall back to dense rather than crash.
             return self._forward_inner(q, k, v, forward_batch, save_kv_cache, **kwargs)
 
-        # Decode-only: rewrite FA3 metadata in-place before the kernel runs.
+        # Decode-only: try the native sparse-decode path first (bypasses FA3
+        # entirely; runs its own Triton score + topk + sparse-attn kernels).
+        # If it returns a tensor, the attention output is already computed —
+        # skip both attention_begin (no FA3 metadata rewrite) and
+        # _forward_inner (no FA3 backend call). Only attention_end runs to
+        # write K_label for the new decode token.
+        # Falls through to the legacy FA3 + DSFlashAttentionAdaptor path
+        # when not eligible (short seq_len, missing scratch, etc.).
         if forward_batch.forward_mode.is_decode_or_idle():
+            try_native = getattr(
+                coordinator.algorithm, "try_native_sparse_decode", None
+            )
+            if try_native is not None and not kwargs:
+                native_out = try_native(
+                    q, k, v, self, forward_batch, save_kv_cache=save_kv_cache
+                )
+                if native_out is not None:
+                    if save_kv_cache:
+                        coordinator.attention_end(native_out, self, forward_batch)
+                    return native_out
+
             attn_metadata = getattr(
                 forward_batch.attn_backend, "forward_metadata", None
             )

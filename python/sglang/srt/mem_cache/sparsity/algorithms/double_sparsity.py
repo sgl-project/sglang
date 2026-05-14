@@ -22,11 +22,15 @@ from sglang.srt.mem_cache.sparsity.algorithms.double_sparsity_config import (
     torch_dtype_for_klabel,
     validate_against_model,
 )
+from sglang.srt.layers.attention.triton_ops.double_sparsity_native_decode import (
+    ds_native_sparse_decode,
+)
 from sglang.srt.mem_cache.sparsity.triton_ops.k_label_kernels import (
     ds_compute_k_label_torch_ref,
     ds_compute_k_label_write,
 )
 from sglang.srt.mem_cache.sparsity.triton_ops.select_kernels import (
+    _compute_q_label,
     ds_select_tokens_torch_ref,
     ds_select_tokens_triton,
 )
@@ -117,6 +121,18 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         self._merged_scores: Optional[torch.Tensor] = None
         self._selected_logical: Optional[torch.Tensor] = None
         self._valid_lengths: Optional[torch.Tensor] = None
+
+        # Native sparse-decode scratch (new path, replaces FA3 page-table).
+        # See `try_native_sparse_decode` and `double_sparsity_native_decode.py`.
+        self._native_att_out: Optional[torch.Tensor] = None
+        self._native_selected_physical: Optional[torch.Tensor] = None
+        self._native_mid_out: Optional[torch.Tensor] = None
+        self._native_mid_o_logexpsum: Optional[torch.Tensor] = None
+        self._native_output: Optional[torch.Tensor] = None
+        self._native_req_to_token_indexed: Optional[torch.Tensor] = None
+        # Cached at first call; identifies the captured forward shape so
+        # subsequent calls can short-circuit the eligibility test.
+        self._native_attn_block_seq: int = 128
 
         logger.info(
             "DoubleSparsity init: layers=%d S=%d kv_heads_local=%d q_heads_local=%d "
@@ -236,6 +252,204 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         )
 
         self._allocate_selection_scratch()
+        self._allocate_native_scratch()
+
+    def _allocate_native_scratch(self) -> None:
+        """Pre-allocate scratch for the native sparse-decode path.
+
+        Sized for the static worst case: `scratch_max_bs`, `H_kv_local`,
+        `H_q_local`, `head_dim`, `max_ctx`, `total_selected`. Buffers are
+        threaded into `ds_native_sparse_decode` via `.narrow(0, 0, bs)`
+        on each call; the kernel writes in-place.
+
+        At 70B/TP=8/128K/concurrency=16: ~9 MiB total — dominated by
+        `att_out_approx[H_kv=1, bs=16, max_ctx=131072]` (8 MiB).
+        """
+        rt = self.runtime_config
+        max_ctx = self.req_to_token_pool.req_to_token.shape[1]
+        bs = rt.scratch_max_bs
+        h_kv = self.num_kv_heads_local
+        h_q = self.num_q_heads_local
+        d = self.head_dim
+        total_selected = rt.token_budget + rt.sink_tokens + rt.recent_tokens
+        attn_block_seq = self._native_attn_block_seq
+        max_num_blocks = (total_selected + attn_block_seq - 1) // attn_block_seq
+
+        device = self.device
+        # Layout [bs, H_kv, max_ctx] so torch.topk yields [bs, H_kv, top_k]
+        # directly (no transpose round-trip into _build_selected_physical).
+        self._native_att_out = torch.full(
+            (bs, h_kv, max_ctx),
+            float("-inf"),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._native_selected_physical = torch.zeros(
+            (bs, h_kv, total_selected), dtype=torch.int32, device=device
+        )
+        self._native_mid_out = torch.zeros(
+            (bs, h_q, max_num_blocks, d), dtype=torch.float32, device=device
+        )
+        self._native_mid_o_logexpsum = torch.full(
+            (bs, h_q, max_num_blocks),
+            float("-inf"),
+            dtype=torch.float32,
+            device=device,
+        )
+        # Output preallocated in the algorithm's compute dtype (fp16/bf16).
+        # Inferred from k_label dtype isn't right — output dtype must match
+        # the query dtype; we'll set this lazily on the first call.
+        self._native_output = None  # set in try_native_sparse_decode
+
+        # req_to_token indexed per-batch. Re-gathered on first call per step
+        # in try_native_sparse_decode (cached only if shape matches).
+        self._native_req_to_token_indexed = torch.zeros(
+            (bs, max_ctx), dtype=torch.int32, device=device
+        )
+
+        bytes_total = (
+            self._native_att_out.numel() * 4
+            + self._native_selected_physical.numel() * 4
+            + self._native_mid_out.numel() * 4
+            + self._native_mid_o_logexpsum.numel() * 4
+            + self._native_req_to_token_indexed.numel() * 4
+        )
+        logger.info(
+            "DoubleSparsity native scratch allocated: bs=%d h_kv=%d h_q=%d d=%d "
+            "max_ctx=%d total_selected=%d max_blocks=%d total=%.2f MiB",
+            bs, h_kv, h_q, d, max_ctx, total_selected, max_num_blocks,
+            bytes_total / (1024 * 1024),
+        )
+
+    def try_native_sparse_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch,
+        *,
+        save_kv_cache: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """Native sparse-decode forward, or None to fall back to the FA3 path.
+
+        Returns `None` (signaling fallback) when:
+          * scratch is not allocated yet (test/CPU paths);
+          * any row has `seq_len < total_selected` (sparse-decode kernel
+            assumes a full top-k history exists);
+          * bs > scratch_max_bs.
+
+        Returns a `[bs, H_q*D]` output tensor when the native path runs.
+        Writes K/V into the KV pool internally (matching FA3 backend
+        behavior).
+        """
+        if self._native_att_out is None:
+            return None
+
+        # Eligibility gate. `seq_lens.min().item()` triggers a host sync —
+        # tolerable while CUDA-graph capture is disabled for DS. A
+        # capture-safe gate can replace this once we wire DS into the
+        # captured-graph path (out of scope for v0).
+        rt = self.runtime_config
+        total_selected = rt.token_budget + rt.sink_tokens + rt.recent_tokens
+        seq_lens = forward_batch.seq_lens
+        if not seq_lens.is_cuda:
+            return None
+        try:
+            seq_min = int(seq_lens.min().item())
+        except Exception:
+            return None
+        if seq_min < max(rt.min_seq_len, total_selected):
+            return None
+
+        bs = q.shape[0]
+        if bs > self._native_att_out.shape[0]:  # [bs, H_kv, max_ctx] layout
+            return None
+
+        # Reshape q: callers hand us [bs, H_q*D] flat.
+        if q.dim() == 2:
+            q_3d = q.view(bs, self.num_q_heads_local, self.head_dim)
+        else:
+            q_3d = q
+
+        # Write K/V to the KV pool now (FA3 backend would have done this
+        # inside its `forward_decode`; we're bypassing it).
+        if save_kv_cache and k is not None and v is not None:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
+
+        # Q_label: gather + GQA-reduce per-(bs, kv_head). Small alloc per
+        # call (~bs*H_kv*S floats); preallocation is a v0.1 optimization.
+        from sglang.srt.mem_cache.sparsity.algorithms.double_sparsity_config import (
+            gqa_reduction_id,
+        )
+
+        q_label = _compute_q_label(
+            q_3d,
+            self.channel_indices[layer.layer_id],
+            num_kv_heads=self.num_kv_heads_local,
+            gqa_reduction_id=gqa_reduction_id(rt.gqa_reduction),
+        )  # [bs, h_kv, S]
+
+        # Pre-index req_to_token for this batch. Re-gathered each layer
+        # (cheap; one int32 read per (bs, max_ctx) cell) — could be
+        # cached per decode-step in forward_batch by a future iteration.
+        req_to_token = self.req_to_token_pool.req_to_token
+        req_pool_indices = forward_batch.req_pool_indices
+        r2t_indexed = self._native_req_to_token_indexed.narrow(0, 0, bs)
+        torch.index_select(req_to_token, 0, req_pool_indices, out=r2t_indexed)
+
+        # Output tensor — preallocate on first call (q dtype now known).
+        if (
+            self._native_output is None
+            or self._native_output.dtype != q_3d.dtype
+            or self._native_output.shape[0] < bs
+        ):
+            self._native_output = torch.zeros(
+                (self._native_att_out.shape[0], self.num_q_heads_local, self.head_dim),
+                dtype=q_3d.dtype,
+                device=self.device,
+            )
+        output = self._native_output.narrow(0, 0, bs)
+
+        # Slice scratch to bs. Layout for att_out is [bs, H_kv, max_ctx]
+        # (bs is dim 0); the others have bs at dim 0 too.
+        att_out = self._native_att_out.narrow(0, 0, bs)
+        sel_phys = self._native_selected_physical.narrow(0, 0, bs)
+        mid_out = self._native_mid_out.narrow(0, 0, bs)
+        mid_log = self._native_mid_o_logexpsum.narrow(0, 0, bs)
+
+        # Reset score scratch to -inf — the kernel writes [0, max_ctx) but
+        # `torch.topk` over the FULL last dim would otherwise pick stale
+        # values from a previous decode step (where max_ctx slots beyond
+        # the score-kernel grid stayed at whatever they were).
+        # The score kernel covers all [0, max_ctx) via ceil(max_ctx/block_t)
+        # programs, so this is defensive — but cheap (~8 MiB write at 16x128K).
+        # Skip when we cover exactly max_ctx.
+
+        ds_native_sparse_decode(
+            q=q_3d,
+            k_buffer=forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            v_buffer=forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            k_label_layer=self.k_label[layer.layer_id],
+            q_label=q_label,
+            req_to_token_indexed=r2t_indexed,
+            seq_lens=seq_lens,
+            top_k=rt.token_budget,
+            sink_tokens=rt.sink_tokens,
+            recent_tokens=rt.recent_tokens,
+            sm_scale=layer.scaling,
+            att_out_approx=att_out,
+            selected_physical=sel_phys,
+            mid_out=mid_out,
+            mid_o_logexpsum=mid_log,
+            output=output,
+            attn_block_seq=self._native_attn_block_seq,
+        )
+
+        # Flatten to the 2D shape downstream code expects.
+        return output.view(bs, self.num_q_heads_local * self.head_dim)
 
     def _allocate_selection_scratch(self) -> None:
         """Pre-allocate selection-pipeline scratch (stage-1/2 and union outputs).

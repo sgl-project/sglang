@@ -415,7 +415,14 @@ def main():
     p.add_argument("--context-len", type=int, default=65536)
     p.add_argument("--output-len", type=int, default=1024)
     p.add_argument("--n-requests", type=int, default=4)
-    p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument(
+        "--concurrency",
+        type=str,
+        default="1",
+        help="Concurrency to drive against the server. Single int (e.g. '4') "
+             "or CSV sweep (e.g. '1,2,4,8,16') — sweep mode runs all values "
+             "against the SAME launched server (one model load instead of N).",
+    )
     p.add_argument("--niah", action="store_true", help="Run a NIAH retrieval probe.")
     p.add_argument("--niah-context-tokens", type=int, default=32768)
     p.add_argument("--output-json", required=True)
@@ -511,8 +518,14 @@ def main():
         else Path(f"./bench_{args.config}_server.log")
     )
 
+    # Parse concurrency CSV sweep.
+    concurrencies = [int(x) for x in str(args.concurrency).split(",") if x]
+    if not concurrencies:
+        raise SystemExit("--concurrency must be int or CSV of ints, e.g. '4' or '1,2,4'")
+
     # Server's max-context window. Add headroom for generation.
     server_ctx_len = args.context_len + args.output_len + 256
+    results: List[WorkloadResult] = []
     with _launch_server(
         args.model,
         port,
@@ -523,62 +536,78 @@ def main():
         mem_fraction_static=args.mem_fraction_static,
         max_running_requests=args.max_running_requests,
     ) as base_url:
-        wl = _run_workload(
-            base_url,
-            args.model,
-            context_len=args.context_len,
-            output_len=args.output_len,
-            n_requests=args.n_requests,
-            concurrency=args.concurrency,
-        )
-        wl.config = args.config
-        if args.config == "branch_ds_on":
-            wl.block_t = args.block_t
-            wl.k_block = args.k_block
-        # Derive and stamp calibration_mode from the calibration JSON. For
-        # branch_ds_off / main_dense it stays None.
-        if args.config == "branch_ds_on":
-            wl.calibration_mode = _calibration_mode(args.calibration)
-        if args.niah:
-            wl.niah_accuracy = _run_niah(
+        for conc in concurrencies:
+            # Use the larger of args.n_requests and conc — at higher
+            # concurrencies the per-request decode-only sample is small if
+            # there are fewer requests than worker threads, biasing TBT.
+            n_req_effective = max(args.n_requests, conc)
+            wl = _run_workload(
                 base_url,
                 args.model,
-                args.niah_context_tokens,
-                n=args.niah_n_samples,
+                context_len=args.context_len,
+                output_len=args.output_len,
+                n_requests=n_req_effective,
+                concurrency=conc,
             )
+            wl.config = args.config
+            if args.config == "branch_ds_on":
+                wl.block_t = args.block_t
+                wl.k_block = args.k_block
+                wl.calibration_mode = _calibration_mode(args.calibration)
+            # NIAH is concurrency-independent (single short prompt at a
+            # fixed shorter context). Run only once at the first sweep
+            # point to avoid wasting wall-clock on duplicate measurements.
+            if args.niah and not results:
+                wl.niah_accuracy = _run_niah(
+                    base_url,
+                    args.model,
+                    args.niah_context_tokens,
+                    n=args.niah_n_samples,
+                )
+            wl.extra.update(
+                {
+                    "tp_size": float(args.tp_size),
+                    "mem_fraction_static": float(args.mem_fraction_static),
+                    "max_running_requests": float(args.max_running_requests),
+                    "niah_n_samples": float(args.niah_n_samples),
+                }
+            )
+            if args.config == "branch_ds_on":
+                wl.extra["token_budget"] = float(args.token_budget)
+                wl.extra["recent_tokens"] = float(args.recent_tokens)
+                wl.extra["sink_tokens"] = float(args.sink_tokens)
+                wl.extra["min_seq_len"] = float(args.min_seq_len)
+                wl.extra["max_selected_per_request"] = float(args.max_selected_per_request)
+            results.append(wl)
 
-        # Numeric server/DS config goes into `extra` (typed Dict[str, float])
-        # for the CSV writer. calibration_mode is a top-level string field
-        # so a README cite-check can `extra.calibration_mode != "synthetic"`.
-        wl.extra.update(
-            {
-                "tp_size": float(args.tp_size),
-                "mem_fraction_static": float(args.mem_fraction_static),
-                "max_running_requests": float(args.max_running_requests),
-                "niah_n_samples": float(args.niah_n_samples),
-            }
-        )
-        if args.config == "branch_ds_on":
-            wl.extra["token_budget"] = float(args.token_budget)
-            wl.extra["recent_tokens"] = float(args.recent_tokens)
-            wl.extra["sink_tokens"] = float(args.sink_tokens)
-            wl.extra["min_seq_len"] = float(args.min_seq_len)
-            wl.extra["max_selected_per_request"] = float(args.max_selected_per_request)
-
+    # Output format:
+    #   * single concurrency: {WorkloadResult} (backwards compat with v0 callers)
+    #   * sweep: {"results": [WorkloadResult, ...], "concurrencies": [...]}
     out = Path(args.output_json)
     out.parent.mkdir(parents=True, exist_ok=True)
+    if len(results) == 1:
+        payload = asdict(results[0])
+    else:
+        payload = {
+            "concurrencies": concurrencies,
+            "results": [asdict(r) for r in results],
+        }
     with out.open("w") as f:
-        json.dump(asdict(wl), f, indent=2)
+        json.dump(payload, f, indent=2)
 
+    # CSV mirror — always a flat per-row table.
     csv_path = out.with_suffix(".csv")
     with csv_path.open("w", newline="") as f:
-        d = asdict(wl)
-        d.pop("extra", None)
-        w = csv.DictWriter(f, fieldnames=list(d.keys()))
+        first = asdict(results[0])
+        first.pop("extra", None)
+        w = csv.DictWriter(f, fieldnames=list(first.keys()))
         w.writeheader()
-        w.writerow(d)
+        for r in results:
+            row = asdict(r)
+            row.pop("extra", None)
+            w.writerow(row)
 
-    print(json.dumps(asdict(wl), indent=2))
+    print(json.dumps(payload, indent=2))
 
 
 if __name__ == "__main__":

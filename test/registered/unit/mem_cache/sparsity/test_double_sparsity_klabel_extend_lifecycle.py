@@ -304,7 +304,11 @@ class TestRadixAttentionSaveKvCacheRealPath(CustomTestCase):
         attn = self._build_attn()
         fb = self._build_fb("decode")
         coord = MagicMock()
-        # Make get_sparse_coordinator return our stubbed coordinator.
+        # Force the legacy FA3 + DSFlashAttentionAdaptor path: the native
+        # sparse-decode entry returns None, so dispatch falls through to
+        # attention_begin. Without this, the MagicMock's try_native attr
+        # would return a truthy MagicMock and short-circuit the legacy path.
+        coord.algorithm.try_native_sparse_decode = MagicMock(return_value=None)
         with patch(
             "sglang.srt.mem_cache.sparsity.get_sparse_coordinator", return_value=coord
         ):
@@ -324,6 +328,9 @@ class TestRadixAttentionSaveKvCacheRealPath(CustomTestCase):
         attn = self._build_attn()
         fb = self._build_fb("decode")
         coord = MagicMock()
+        # Same as above: pin the legacy path so this test stays focused on
+        # the FA3-path save_kv_cache contract.
+        coord.algorithm.try_native_sparse_decode = MagicMock(return_value=None)
         with patch(
             "sglang.srt.mem_cache.sparsity.get_sparse_coordinator", return_value=coord
         ):
