@@ -115,6 +115,34 @@ Requests above this raise CUDA ``operation not supported`` from inside
 the kernel. Empirically the bound holds independent of ``max_ctx``."""
 
 
+# Known limitation, May 2026, flashinfer 0.6.11 + Triton (installed env):
+#
+# The `flashinfer.top_k_page_table_transform` Triton kernel **crashes
+# with "Triton Error [CUDA]: an illegal memory access" inside SGLang's
+# CUDA graph capture region** even after a pre-capture warmup sweep
+# that triggers JIT compilation at every bs in the capture ladder
+# (1, 2, 4, 8, 12, 16, 24, 32). The crash occurs at the first
+# captured forward call, in `load_binary` — i.e. Triton attempting
+# to load an already-compiled kernel handle that is bound to a
+# different stream / context than the capture region uses. Bypassing
+# `dsa_graph_safe=True` does not help (it's a kernel-internal flag
+# for filtering top-k, not the cause of the load_binary failure).
+#
+# The selector microbench (no server, no capture) shows correct
+# parity and ~1.10x to 1.30x speedup vs torch.topk at bs>=16 (see
+# `benchmark/double_sparsity/repro_session/microbench_selector_backends.py`),
+# so the backend is wired correctly but cannot yet be used under
+# graph replay. Investigation deferred: a future session may need
+# either a FlashInfer upstream fix, an opt-out from graph capture
+# for the DS layers (large perf cost), or a swap to a different
+# fused-topk + page-table-transform kernel.
+#
+# Until then, use ``selector_backend='torch'`` for production. The
+# torch backend already lands both gates at conc=16 / tb=2048 with
+# retrieval-shaped calibration (see SESSION_REPORT_2026-05-14.md
+# section "conc=16 move-left").
+
+
 class FlashInferTopKPageTableSelector(_BaseSelector):
     """Top-k via ``flashinfer.top_k_page_table_transform`` (fused topk +
     page-table lookup) + a small sink/recent Triton kernel.

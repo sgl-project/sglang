@@ -344,6 +344,7 @@ def _build_ds_args(
     sink_tokens: int = 4,
     min_seq_len: int = 4096,
     max_selected_per_request: int = 8192,
+    selector_backend: str = "torch",
 ) -> List[str]:
     if config == "branch_ds_on":
         if not calibration:
@@ -368,6 +369,8 @@ def _build_ds_args(
             str(block_t),
             "--double-sparsity-k-block",
             str(k_block),
+            "--double-sparsity-selector-backend",
+            selector_backend,
             "--page-size",
             "1",
             "--attention-backend",
@@ -490,6 +493,18 @@ def main():
         help="--double-sparsity-max-selected-per-request (branch_ds_on only).",
     )
     p.add_argument(
+        "--selector-backend",
+        type=str,
+        default="torch",
+        choices=[
+            "torch",
+            "flashinfer_topk_page_table",
+            "sgl_fast_topk_transform",
+            "jit_fused_selector",
+        ],
+        help="--double-sparsity-selector-backend (branch_ds_on only).",
+    )
+    p.add_argument(
         "--niah-n-samples",
         type=int,
         default=5,
@@ -508,6 +523,7 @@ def main():
         sink_tokens=args.sink_tokens,
         min_seq_len=args.min_seq_len,
         max_selected_per_request=args.max_selected_per_request,
+        selector_backend=args.selector_backend,
     )
     port = _free_port()
     log_path = (
@@ -580,6 +596,7 @@ def main():
                 wl.extra["max_selected_per_request"] = float(
                     args.max_selected_per_request
                 )
+                wl.extra["selector_backend_tag"] = args.selector_backend
             results.append(wl)
 
     # Output format:

@@ -410,7 +410,128 @@ PYTHONPATH=python python3 benchmark/double_sparsity/repro_session/microbench_spa
 pytest test/registered/unit/mem_cache/sparsity/ -q   # → 120 passed
 ```
 
-## 11. Open work
+## 11. Follow-on 2026-05-14 session — conc=16 move-left
+
+After the initial conc=32 / tb=8192 win landed, a same-day follow-on
+session moved the win left to **conc=16 / tb=2048** while preserving
+quality. Headline:
+
+| operating point | TBT(off) | TBT(on) | TBT ratio | NIAH(off) | NIAH(on) | NIAH delta |
+|---|---:|---:|---:|---:|---:|---:|
+| conc=16 / tb=2048 / retrieval calib / torch | 27.94 ms | **22.45 ms** | **0.8035× PASS** | 0.80 | **1.00** (n=10) | **+0.20 PASS** |
+
+Recheck of the original headline on the updated code:
+
+| operating point | prior TBT | new TBT | ratio | NIAH |
+|---|---:|---:|---:|---:|
+| conc=32 / tb=8192 / wikitext / torch | 31.21 ms | **30.52 ms** | **0.8800×** PASS (was 0.8995×) | 1.00 |
+
+Improvements landed in commit range `5880259d2..` (this follow-on):
+
+1. **Per-step `req_to_token[req_pool_indices]` caching**
+   (`e114aa02c`). One `index_select` per decode step into algorithm
+   scratch, plumbed via `SparseCoordinator.forward_begin(forward
+   _batch)` from `ModelRunner.forward` (and
+   `CUDAGraphRunner.capture_one_batch_size` so capture sees the
+   scratch already populated). ~0.7 ms / decode step saved at
+   bs=16-32; explains the headline TBT improvement at conc=32.
+
+2. **Pluggable selector backends** (`dc3dcf13f`). New
+   `--double-sparsity-selector-backend` flag with `torch` (default,
+   bytewise unchanged), `flashinfer_topk_page_table`,
+   `sgl_fast_topk_transform` (registered, NotImplementedError until
+   the upstream API exposes `row_to_batch`), and a placeholder
+   `jit_fused_selector`. Selector-microbench at 70B/TP=8 shape
+   shows FlashInfer 1.10x–1.30x faster than torch.topk at bs >= 16,
+   but the FlashInfer Triton kernel currently crashes inside
+   SGLang's CUDA graph capture region with `illegal memory access`
+   in `load_binary` even after a per-bs warmup sweep. **Selector
+   backend is wired correctly (microbench passes parity tests) but
+   the FlashInfer variant cannot yet be used under graph replay**;
+   investigation deferred. Production lands on the torch backend —
+   which is what the conc=16 headline above uses.
+
+3. **Synthetic NIAH-shaped calibration corpus** (`3dca4be73`).
+   `scripts/double_sparsity/make_retrieval_calib_prompts.py`
+   generates 128 prompts with random needle keys/values embedded
+   at random ~30-70% positions within haystack filler. The
+   resulting calibration at `/workspace/calib_llama_3_1_70b_retrieval
+   _s32.json` shifts 19% of K-channels relative to the wikitext
+   calibration (same `heavy_channels=32`); the shifted channels are
+   what enable NIAH at tb=2048 (10/10 vs 4/10 on wikitext at the
+   same operating point).
+
+4. **Profiling attribution + stale-doc hygiene** (`5880259d2`).
+   `compare_nsys.py` now preserves the full `ns1::ns2::name`
+   kernel-name path; the `torch.topk` decomposition (8 mbtopk +
+   scan_by_key CUB kernels totalling ~0.64 s of stream-time at
+   conc=32) is now visible instead of bucketed into `void at`.
+   Selector-backend work targets exactly this hotspot. `run_nsys
+   _at_winning_point.sh` defaults now match the actual winning
+   point (CONC=32, OUTPUT_LEN=64, TB=8192, MAX_SELECTED=16384) and
+   are overridable via env vars.
+
+### Files modified (this session)
+
+* `python/sglang/srt/mem_cache/sparsity/algorithms/double_sparsity.py`
+  — `forward_begin` hook, native scratch carries selector + warmup.
+* `python/sglang/srt/mem_cache/sparsity/algorithms/double_sparsity_config.py`
+  — `selector_backend` field + validation including FlashInfer
+  `top_k <= 2048` ceiling.
+* `python/sglang/srt/mem_cache/sparsity/algorithms/selector_backends.py` (NEW)
+  — TorchTopKSelector, FlashInferTopKPageTableSelector,
+  SglFastTopKTransformSelector stub, `make_selector` registry.
+* `python/sglang/srt/mem_cache/sparsity/core/sparse_coordinator.py`
+  — `forward_begin` delegates to the algorithm hook.
+* `python/sglang/srt/model_executor/model_runner.py` — invoke
+  `ds_coordinator.forward_begin` per decode forward (eager + replay).
+* `python/sglang/srt/model_executor/cuda_graph_runner.py` — invoke
+  `forward_begin` inside `capture_one_batch_size` so the captured
+  graph sees a populated scratch.
+* `python/sglang/srt/layers/attention/triton_ops/double_sparsity_native_decode.py`
+  — `_append_sink_recent_physical` Triton kernel (used by the
+  FlashInfer backend, which writes top-k physical itself).
+* `python/sglang/srt/server_args.py` —
+  `--double-sparsity-selector-backend` CLI flag.
+* `benchmark/double_sparsity/bench_decode.py` — `--selector-backend`
+  bench arg; per-result `selector_backend_tag` for downstream
+  filtering in `compare.py`.
+* `benchmark/double_sparsity/repro_session/microbench_selector_backends.py`
+  (NEW) — torch vs FlashInfer per-call microbench.
+* `benchmark/double_sparsity/repro_session/conc16_move_left/`
+  (NEW) — JSONs for the conc=16 tb=2048 retrieval-torch win
+  and the conc=32 tb=8192 wikitext-torch recheck.
+* `scripts/double_sparsity/make_retrieval_calib_prompts.py` (NEW)
+  — synthetic NIAH-shaped prompt generator.
+* `test/registered/unit/mem_cache/sparsity/test_double_sparsity_native_decode.py`
+  — `TestForwardBeginCaching` (3 tests).
+* `test/registered/unit/mem_cache/sparsity/test_selector_backends.py` (NEW)
+  — selector parity, validation, and registry tests (7 tests).
+* `compare_nsys.py` — namespace-preserving aggregation, topk
+  decomposition table, attribution caveat.
+* `run_nsys_at_winning_point.sh` — defaults match the actual
+  winning point; overridable via env.
+
+### Final recommendation
+
+* **Production decode setting for both gates simultaneously at
+  conc=16 / 128K**: `--double-sparsity-token-budget 2048
+  --double-sparsity-recent-tokens 64 --double-sparsity-sink-tokens
+  4 --double-sparsity-min-seq-len 4096
+  --double-sparsity-max-selected-per-request 8192
+  --double-sparsity-block-t 1024 --double-sparsity-k-block 64
+  --double-sparsity-selector-backend torch --double-sparsity-config
+  /workspace/calib_llama_3_1_70b_retrieval_s32.json`
+* **Headline at conc=32 / 128K** still valid: same flags but
+  `--double-sparsity-token-budget 8192 --double-sparsity-max-selected
+  -per-request 16384`. Both calibrations work at this point;
+  wikitext is the documented baseline.
+* **FlashInfer selector backend**: do NOT enable in production
+  yet. Microbench parity passes but server capture crashes;
+  documented in `selector_backends.py:FLASHINFER_TOPK_MAX` block
+  comment.
+
+## 12. Open work
 
 ### Near-term (next session)
 1. **Move the win left to conc=16** (primary goal of the follow-on

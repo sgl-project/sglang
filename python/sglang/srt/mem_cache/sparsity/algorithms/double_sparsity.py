@@ -335,6 +335,88 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
             bytes_total / (1024 * 1024),
         )
 
+        # Construct + warm up the selector backend now (outside the
+        # CUDA-graph capture region that ModelRunner will start later).
+        # FlashInfer / SGL kernels JIT-compile on first call; doing that
+        # under capture is what triggered "Triton Error [CUDA]: illegal
+        # memory access" in early bench runs. The first .select() call
+        # below pulls those compiles + lazy aux-tensor allocations to
+        # init time, where they're allowed.
+        if rt.selector_backend != "torch":
+            from sglang.srt.mem_cache.sparsity.algorithms.selector_backends import (
+                make_selector,
+            )
+
+            self._selector = make_selector(rt.selector_backend)
+            self._warmup_selector(bs, h_kv)
+        else:
+            self._selector = None
+
+    def _warmup_selector(self, max_bs: int, h_kv: int) -> None:
+        """Issue selector calls at every bs the CUDA graph might capture so
+        any JIT-compile / lazy-alloc happens outside the capture region.
+
+        FlashInfer's ``top_k_page_table_transform`` JIT-compiles a fresh
+        Triton kernel for each (num_rows, k) shape it sees. The default
+        SGLang capture sweeps bs in {1, 2, 4, 8, 12, 16, 24, 32, ...},
+        so warming only the worst case left smaller bs's first call
+        landing inside capture — which surfaces as a Triton
+        ``load_binary`` failure with ``illegal memory access``."""
+        if self._selector is None:
+            return
+        rt = self.runtime_config
+        att_out = self._native_att_out
+        r2t = self._native_req_to_token_indexed
+
+        # Seed att_out with a finite region so topk has valid winners
+        # (sink/recent/oob masked out as in the production score kernel).
+        att_out.fill_(float("-inf"))
+        att_out[..., rt.sink_tokens : rt.token_budget + rt.sink_tokens].zero_()
+        r2t.zero_()
+        device = att_out.device
+        seq_lens_full = torch.full(
+            (max_bs,),
+            max(
+                rt.min_seq_len, rt.token_budget + rt.sink_tokens + rt.recent_tokens + 1
+            ),
+            dtype=torch.int64,
+            device=device,
+        )
+
+        # bs sweep mirrors SGLang's `_get_cuda_graph_bs` default ladder.
+        # Includes 1 and every power-of-two up to max_bs (cap), plus a
+        # couple of in-between values that the runner uses.
+        bs_ladder = sorted({1, 2, 4, 8, 12, 16, 24, 32}) + [max_bs]
+        bs_ladder = sorted({b for b in bs_ladder if 1 <= b <= max_bs})
+
+        for bs in bs_ladder:
+            try:
+                self._selector.select(
+                    att_out_approx=att_out[:bs, :h_kv],
+                    req_to_token_indexed=r2t[:bs],
+                    seq_lens=seq_lens_full[:bs],
+                    top_k=rt.token_budget,
+                    sink_tokens=rt.sink_tokens,
+                    recent_tokens=rt.recent_tokens,
+                    out=self._native_selected_physical[:bs, :h_kv],
+                )
+            except Exception:
+                logger.exception(
+                    "DoubleSparsity selector warmup failed at bs=%d "
+                    "(backend=%s); first captured call may JIT inside capture.",
+                    bs,
+                    rt.selector_backend,
+                )
+                return
+        torch.cuda.synchronize()
+        logger.info(
+            "DoubleSparsity selector warmup OK: backend=%s bs_sweep=%s h_kv=%d top_k=%d",
+            rt.selector_backend,
+            bs_ladder,
+            h_kv,
+            rt.token_budget,
+        )
+
     def forward_begin(self, forward_batch) -> None:
         """Per-decode-step gather of ``req_to_token[req_pool_indices]``.
 
@@ -472,13 +554,8 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         mid_out = self._native_mid_out.narrow(0, 0, bs)
         mid_log = self._native_mid_o_logexpsum.narrow(0, 0, bs)
 
-        if self._selector is None and rt.selector_backend != "torch":
-            from sglang.srt.mem_cache.sparsity.algorithms.selector_backends import (
-                make_selector,
-            )
-
-            self._selector = make_selector(rt.selector_backend)
-
+        # Selector is constructed + warmed up in `_allocate_native_scratch`
+        # so JIT / lazy-alloc happens before CUDA-graph capture starts.
         ds_native_sparse_decode(
             q=q_3d,
             k_buffer=forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),

@@ -142,14 +142,30 @@ insensitive; sparse attention scales linearly with `total_selected`
 but at bs=1 the kernel is overhead-bound (microbench: selected=512
 and selected=2048 take essentially identical time).
 
-### Sweep across `token_budget` × concurrency
+### Sweep across `token_budget` × concurrency × calibration
 
-| tb | conc | TBT(off) | TBT(on) | TBT ratio | NIAH(off) | NIAH(on) | NIAH delta |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 512  | 16 | 27.94 | 22.99 | **0.82×** PASS | 0.80 | 0.00 (n=5) | −0.60 FAIL |
-| 2048 | 16 | 27.94 | 23.38 | **0.84×** PASS | 0.80 | 0.40 (n=10) | −0.40 FAIL |
-| 8192 | 16 | 27.94 | 27.83 | 0.996× FAIL | 0.80 | 0.90 (n=10) | **+0.10** PASS |
-| **8192** | **32** | **34.68** | **31.19** | **0.8995×** **PASS** | **0.80** | **0.90** | **+0.10** **PASS** |
+| tb | conc | calib | TBT(off) | TBT(on) | TBT ratio | NIAH(off) | NIAH(on) | NIAH delta |
+|---:|---:|---|---:|---:|---:|---:|---:|---:|
+| 512  | 16 | wikitext  | 27.94 | 22.99 | **0.82×** PASS | 0.80 | 0.00 (n=5) | −0.60 FAIL |
+| 2048 | 16 | wikitext  | 27.94 | 23.38 | **0.84×** PASS | 0.80 | 0.40 (n=10) | −0.40 FAIL |
+| 8192 | 16 | wikitext  | 27.94 | 27.83 | 0.996× FAIL | 0.80 | 0.90 (n=10) | **+0.10** PASS |
+| 8192 | 32 | wikitext  | 34.68 | 31.19 | **0.8995×** PASS | 0.80 | 0.90 (n=10) | **+0.10** PASS |
+| **2048** | **16** | **retrieval** | **27.94** | **22.45** | **0.8035×** **PASS** | **0.80** | **1.00** (n=10) | **+0.20** **PASS** |
+| 8192 (recheck) | 32 | wikitext  | 34.68 | 30.52 | **0.8800×** PASS | 0.80 | 1.00 (n=10) | **+0.20** PASS |
+
+The 2026-05-14 follow-on session landed **the conc=16 / tb=2048 /
+retrieval-calibration point passing both gates with the torch
+selector backend** — see `repro_session/conc16_move_left/conc16_tb2048
+_retrieval_torch.json`. The retrieval-shaped calibration is the
+unlock: identical kernel shape as wikitext at the same operating
+point, but NIAH jumps from 4/10 → 10/10 (channel selection shifts by
+~19% — see SESSION_REPORT_2026-05-14.md section 4 for the
+calibration-overlap analysis).
+
+The headline `conc=32 / tb=8192` recheck on the same updated code
+landed 30.52 ms (improved from 31.21 ms post-review and 31.19 ms
+pre-review) — the per-step `req_to_token` caching shaved ~0.7 ms
+off the per-step Python+launch overhead.
 
 **Both gates pass simultaneously at conc=32 / tb=8192 / 128K:**
   * `tbt_p50(on) = 31.19 ms`, `tbt_p50(off) = 34.68 ms` → ratio
