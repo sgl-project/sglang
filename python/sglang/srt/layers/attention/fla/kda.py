@@ -26,9 +26,16 @@ from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.fla.op import exp, log
 from sglang.srt.layers.attention.fla.utils import (
     check_shared_mem,
+    is_tf32_supported,
 )
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+# PR #24271 hardcoded DOT_PRECISION="tf32", which is NVIDIA-only.
+# AMD/ROCm triton only accepts ('ieee', 'bf16x3', 'bf16x6'); fall back to
+# "ieee" on non-tf32 hosts (mirrors `chunk_fwd.py`'s _MERGE_DOT_PRECISION
+# pattern). On AMD this kernel is reached only when _small_grid is False
+# (see chunk_kda_fwd), so the "ieee" cost is not on the hot fused path.
+_KDA_DOT_PRECISION = "tf32" if is_tf32_supported else "ieee"
 
 
 def cdiv(a: int, b: int) -> int:
@@ -684,7 +691,7 @@ def recompute_w_u_fwd(
         STORE_QG=False,
         STORE_KG=kg is not None,
         IS_VARLEN=cu_seqlens is not None,
-        DOT_PRECISION="tf32",
+        DOT_PRECISION=_KDA_DOT_PRECISION,
     )
     return w, u, None, kg
 
@@ -1082,7 +1089,14 @@ def chunk_kda_fwd(
     )
     _H_pr = q.shape[-2]
     _B = q.shape[0]
-    _small_grid = _B * _NT_pr * _H_pr <= 256
+    # PR #24271 added a fused diagonal + recompute path that wins on CUDA
+    # Ampere+ (small launch overhead, tf32 dot). On AMD/ROCm the same fusion
+    # changes the chunk dot-product accumulation order in bf16 and increases
+    # gsm8k score variance (~0.9 mean -> 0.014 stdev, scattered <0.88
+    # outliers) for Kimi-Linear without a clear perf win. Gate on
+    # is_tf32_supported (= CUDA Ampere+) so AMD/ROCm takes the pre-#24271
+    # non-fused KDA path which was numerically stable.
+    _small_grid = (_B * _NT_pr * _H_pr <= 256) and is_tf32_supported
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,

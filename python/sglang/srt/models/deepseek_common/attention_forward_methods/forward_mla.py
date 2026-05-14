@@ -500,7 +500,7 @@ class DeepseekMLAForwardMixin:
                     ),
                 )
         else:
-            if _use_aiter_gfx95:
+            if _use_aiter_gfx95 and self.rotary_emb is not None:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
