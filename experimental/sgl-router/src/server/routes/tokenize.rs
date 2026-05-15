@@ -64,8 +64,8 @@ pub async fn detokenize(
         .tokenizers
         .get(&req.model)
         .ok_or_else(|| ApiError::ModelNotFound(req.model.clone()))?;
-    let text =
-        adapter::decode(&tok, &req.tokens, req.skip_special_tokens).map_err(ApiError::Internal)?;
+    let text = adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens)
+        .map_err(ApiError::Internal)?;
     Ok(Json(DetokenizeResponse {
         model: req.model,
         text,

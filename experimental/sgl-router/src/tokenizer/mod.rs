@@ -81,12 +81,12 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_encode_decode() {
+    fn decode_complete_preserves_round_trip() {
         let r = TokenizerRegistry::load_from_config(&cfg()).unwrap();
         let t = r.get("tiny").unwrap();
         let ids = adapter::encode(&t, "hello world").unwrap();
         assert!(!ids.is_empty());
-        let text = adapter::decode(&t, &ids, true).unwrap();
+        let text = adapter::decode_complete(&t, &ids, true).unwrap();
         // gpt2 reproduces "hello world" exactly
         assert_eq!(text, "hello world");
     }
