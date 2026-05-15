@@ -20,6 +20,11 @@ def skip_if_no_blackwell_nvfp4(func):
     )(func)
 
 
+def skip_if_no_cuda(func):
+    """Skip test if CUDA is not available."""
+    return unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")(func)
+
+
 class TestKVCacheQuantRegistry(CustomTestCase):
     """Test the registry and factory function."""
 
@@ -196,7 +201,7 @@ class TestBlockFP4KVMethod(CustomTestCase):
         self.assertEqual(len(bufs["k_buffer"]), layers)
         self.assertEqual(bufs["k_buffer"][0].shape, (size, heads, dim // 2))
         # MXFP4 flattens head dims for scales
-        self.assertEqual(bufs["k_scale_buffer"][0].shape, (size, (heads * dim) // 16))
+        self.assertEqual(bufs["k_scale_buffer"][0].shape, (size, (heads * dim) // 32))
 
     def test_quantize_dequantize_roundtrip_cpu(self):
         """Test MXFP4 quantize→dequantize roundtrip on CPU."""
@@ -243,6 +248,26 @@ class TestBlockFP4KVQuantizeUtil(CustomTestCase):
         x = torch.randn(4, 8, 128, dtype=torch.bfloat16)
         packed, scales = BlockFP4KVQuantizeUtil.batched_quantize(x)
         reconstructed = BlockFP4KVQuantizeUtil.batched_dequantize(packed, scales)
+
+        self.assertEqual(reconstructed.shape, x.shape)
+        rel_error = (
+            x.float() - reconstructed.float()
+        ).abs().mean() / x.float().abs().mean()
+        self.assertLess(rel_error, 0.5)
+
+    @skip_if_no_cuda
+    def test_hadamard_roundtrip_cuda(self):
+        from sglang.srt.layers.quantization.kvfp4_tensor import BlockFP4KVQuantizeUtil
+
+        torch.manual_seed(42)
+        x = torch.randn(4, 8, 128, dtype=torch.bfloat16, device="cuda")
+
+        packed, scales = BlockFP4KVQuantizeUtil.batched_quantize(
+            x, block_size=32, hadamard_rotate=True
+        )
+        reconstructed = BlockFP4KVQuantizeUtil.batched_dequantize(
+            packed, scales, hadamard_rotate=True
+        )
 
         self.assertEqual(reconstructed.shape, x.shape)
         rel_error = (
