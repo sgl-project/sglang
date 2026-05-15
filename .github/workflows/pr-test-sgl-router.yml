@@ -71,8 +71,8 @@ jobs:
       # cargo-audit uses --deny unsound --deny yanked (block CVEs + yanked, not unmaintained).
       - name: Install cargo-deny + cargo-audit
         run: |
-          cargo install --locked cargo-deny@0.19
-          cargo install --locked cargo-audit@0.21
+          cargo install --locked cargo-deny@0.19.6
+          cargo install --locked cargo-audit@0.21.2
 
       - name: cargo deny check
         working-directory: sgl-router
