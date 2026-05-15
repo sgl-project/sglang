@@ -300,7 +300,7 @@ class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
 
     hicache_io_backend = "kernel"
     hicache_mem_layout = "layer_first"
-    max_running_requests = 4
+    max_running_requests = 2
 
 
 if __name__ == "__main__":
