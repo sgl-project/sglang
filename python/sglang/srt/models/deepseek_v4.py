@@ -14,7 +14,6 @@ import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
-    fused_rope,
     fused_rope_inplace,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -520,48 +519,24 @@ class MQALayer(nn.Module):
                 None if qkv_a is not None else self.wkv(x)
             )
 
-            if x.shape[0] <= 64:
-                from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
-                    fused_reduce_qk_norm_rope_swa_write,
-                )
+            from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
+                fused_reduce_qk_norm_rope_swa_write,
+            )
 
-                q = fused_reduce_qk_norm_rope_swa_write(
-                    q=q,
-                    kv=kv,
-                    q_norm_weight=None,
-                    kv_norm_weight=self.kv_norm.weight,
-                    q_rms_eps=self.eps,
-                    kv_rms_eps=self.eps,
-                    rope_head_dim=self.qk_rope_head_dim,
-                    cos_cache=self.cos_cache,
-                    sin_cache=self.sin_cache,
-                    positions=positions,
-                    is_neox=False,
-                    dtype=x.dtype,
-                )
-            else:
-                from sglang.srt.layers.fused_qk_norm import fused_qk_norm
-
-                q, _ = self.wq_b(q_lora)
-                kv, _ = qkv_a[..., self.q_lora_rank :], (
-                    None if qkv_a is not None else self.wkv(x)
-                )
-
-                q = q.view(-1, self.n_local_heads, self.head_dim)
-                q, kv_normed = fused_qk_norm(
-                    q,
-                    kv.unsqueeze(1),
-                    q_weight=None,
-                    k_weight=self.kv_norm.weight,
-                    eps=self.eps,
-                )
-                kv = kv_normed.squeeze(1)
-                fused_rope(
-                    q[..., -self.qk_rope_head_dim :],
-                    kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-                    self.freqs_cis,
-                    positions=positions,
-                )
+            q = fused_reduce_qk_norm_rope_swa_write(
+                q=q,
+                kv=kv,
+                q_norm_weight=None,
+                kv_norm_weight=self.kv_norm.weight,
+                q_rms_eps=self.eps,
+                kv_rms_eps=self.eps,
+                rope_head_dim=self.qk_rope_head_dim,
+                cos_cache=self.cos_cache,
+                sin_cache=self.sin_cache,
+                positions=positions,
+                is_neox=False,
+                dtype=x.dtype,
+            )
 
             if use_cp:
                 kv = cp_all_gather_rerange_output(
