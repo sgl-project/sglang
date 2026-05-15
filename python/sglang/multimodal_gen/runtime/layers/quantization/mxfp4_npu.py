@@ -1,6 +1,6 @@
 """Online MXFP4 quantization for Diffusion models on Ascend NPU.
 
-Provides ``MXFP4Config`` (registered as ``"mxfp4_npu"``) and
+Provides ``NPUMXFP4Config`` (registered as ``"mxfp4_npu"``) and
 ``NPUMXFP4DiffusionLinearMethod`` which quantises FP16/BF16 weights to MXFP4
 at load time using dual-level MX quantization and uses
 ``npu_dynamic_dual_level_mx_quant`` + ``npu_dual_level_quant_matmul`` for
@@ -40,7 +40,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-class MXFP4Config(QuantizationConfig):
+class NPUMXFP4Config(QuantizationConfig):
     """Config for online MXFP4 quantization on Ascend NPU (Diffusion)."""
 
     def __init__(self) -> None:
@@ -63,7 +63,7 @@ class MXFP4Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "MXFP4Config":
+    def from_config(cls, config: Dict[str, Any]) -> "NPUMXFP4Config":
         return cls()
 
     def get_quant_method(
@@ -87,7 +87,7 @@ class NPUMXFP4DiffusionLinearMethod(LinearMethodBase):
     Reference: MindIE-SD ``W4A4MXFP4DualQuantLinear`` (offline path only).
     """
 
-    def __init__(self, quant_config: MXFP4Config):
+    def __init__(self, quant_config: NPUMXFP4Config):
         self.quant_config = quant_config
 
     def create_weights(
