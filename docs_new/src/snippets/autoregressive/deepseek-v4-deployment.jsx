@@ -1044,8 +1044,8 @@ export SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1`
         <p style={{ margin: "6px 0 0 0", fontSize: "12px", opacity: 0.85, lineHeight: "1.8" }}>
           Adjust <code>SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK</code> based on your chunked prefill size (e.g. 4096 for balanced, 8320 for max-throughput).<br/>
           <code>SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0</code> — if your config mentions DeepEP dispatch buffer constraints, they do not apply when this is set to 0.<br/>
+          <code>SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1 SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1</code> for customized w4a4 MegaMoE kernel. With this kernel, the performance can be increased with negligible accuracy drop (~89.5 GPQA for Pro model)<br/>
           These flags are expected to be simplified in a future release.
-          <code>export SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1 export SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1</code> for customized w4a4 MegaMoE kernel. With this kernel, the performance can be increased with negligible accuracy drop (~89.5 GPQA for Pro model)
         </p>
       </div>
     </div>
