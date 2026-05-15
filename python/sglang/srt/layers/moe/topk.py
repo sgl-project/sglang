@@ -1369,7 +1369,6 @@ def select_experts(
         )
     elif custom_routing_function is None:
         if scoring_func != "sqrtsoftplus":
-            print(f"kkkkk {scoring_func=}", flush=True)
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
         if scoring_func == "sqrtsoftplus":
