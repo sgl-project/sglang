@@ -6,7 +6,7 @@ import importlib
 import os
 import pkgutil
 import traceback
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Any, Type
 
 import torch
@@ -105,7 +105,6 @@ class ComponentLoader(ABC):
         else:
             return get_local_torch_device()
 
-    @abstractmethod
     def customized_load_kwargs_for_component(
         self, _server_args: ServerArgs, _component_name: str
     ) -> dict[str, Any]:
