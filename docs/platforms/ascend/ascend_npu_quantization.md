@@ -17,6 +17,7 @@ SGLang support **mix-bits** quantization (independently defines and loads each l
 | [MXFP8](https://github.com/sgl-project/sglang/pull/20922) | `W8A8_MXFP8`        | `ModelSlimMXFP8Scheme`   | MoE                      | **<span style="color: red;">x</span>**   | **<span style="color: red;">x</span>**   | **<span style="color: blue;">WIP</span>**  | **<span style="color: red;">x</span>**     |
 
 [AWQ on Ascend support](https://github.com/sgl-project/sglang/pull/10158):
+
 | Quantization scheme            | Layer type               |               A2 Supported               |               A3 Supported               |               A5 Supported                 |
 |--------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|:------------------------------------------:|
 | W4A16                          | Linear                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>**  |
@@ -24,6 +25,7 @@ SGLang support **mix-bits** quantization (independently defines and loads each l
 | W4A16                          | MoE                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>**  |
 
 GPTQ on Ascend support
+
 | Quantization scheme                                                        | Layer type               |               A2 Supported               |               A3 Supported               |               A5 Supported                |
 |----------------------------------------------------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|:-----------------------------------------:|
 | [W4A16](https://github.com/sgl-project/sglang/pull/15203)                  | Linear                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
@@ -32,6 +34,7 @@ GPTQ on Ascend support
 | [W8A16 MOE](https://github.com/sgl-project/sglang/pull/16364)              | MoE                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
 
 [Auto-round on Ascend support](https://github.com/sgl-project/sglang/pull/16699)
+
 | Quantization scheme            | Layer type               |               A2 Supported               |               A3 Supported               |               A5 Supported                |
 |--------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|:-----------------------------------------:|
 | W4A16                          | Linear                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
@@ -40,6 +43,7 @@ GPTQ on Ascend support
 | W8A16                          | MoE                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
 
 Compressed-tensors (LLM Compressor) on Ascend support:
+
 | Quantization scheme                                                                           | Layer type               |               A2 Supported               |               A3 Supported               |               A5 Supported                |
 |-----------------------------------------------------------------------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|:-----------------------------------------:|
 | [W8A8 dynamic](https://github.com/sgl-project/sglang/pull/14504)                              | Linear                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
@@ -48,6 +52,7 @@ Compressed-tensors (LLM Compressor) on Ascend support:
 | [W8A8 dynamic](https://github.com/sgl-project/sglang/pull/14504)                              | MoE                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
 
 [GGUF on Ascend support](https://github.com/sgl-project/sglang/pull/17883)
+
 | Quantization scheme                                       | Layer type               |               A2 Supported               |               A3 Supported               |               A5 Supported                |
 |-----------------------------------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|:-----------------------------------------:|
 | [GGUF (all types)](https://github.com/sgl-project/sglang/pull/17883) | Linear                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
