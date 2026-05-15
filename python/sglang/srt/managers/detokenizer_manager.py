@@ -405,7 +405,7 @@ class LimitedCapacityDict(OrderedDict):
         self.capacity = capacity
 
     def __setitem__(self, key, value):
-        if len(self) >= self.capacity:
+        if key not in self and len(self) >= self.capacity:
             # Remove the oldest element (first item in the dict)
             self.popitem(last=False)
         # Set the new item
