@@ -79,18 +79,6 @@ class DsaMtpServerBase(CustomTestCase):
         ]
         return args
 
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        # Force gsm8k -> bs_1_speed order so the long accuracy eval warms
-        # the server before the single-prompt speed measurement.
-        # unittest discovers tests by name; non-callable attrs are skipped.
-        if callable(getattr(cls, "test_gsm8k", None)):
-            cls.test_a_gsm8k = cls.test_gsm8k
-            cls.test_gsm8k = None
-        if callable(getattr(cls, "test_bs_1_speed", None)):
-            cls.test_b_bs_1_speed = cls.test_bs_1_speed
-            cls.test_bs_1_speed = None
-
     @classmethod
     def setUpClass(cls):
         cls.process = popen_launch_server(
