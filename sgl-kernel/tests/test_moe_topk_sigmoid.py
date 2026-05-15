@@ -6,6 +6,14 @@ import torch
 from sgl_kernel import topk_sigmoid
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_seed():
+    # Pin RNG so torch.randn produces identical gating scores across runs.
+    # Without this, near-tied sigmoid scores trip atol=0 index comparisons
+    # against torch.topk's tie-break (which can differ from sgl_kernel.topk_sigmoid).
+    torch.manual_seed(0)
+
+
 @pytest.mark.parametrize(
     "num_tokens, num_experts, topk",
     list(
