@@ -672,6 +672,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          pip install slack_sdk
 
       - name: Run cross-framework comparison
         env:
@@ -705,6 +706,18 @@ jobs:
             --results comparison-results.json \
             --dashboard dashboard.md \
             --charts-dir comparison-charts
+
+      - name: Post diffusion comparison summary to Slack
+        if: always()
+        continue-on-error: true
+        env:
+          SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+        run: |
+          python3 scripts/ci/utils/diffusion/post_diffusion_comparison_to_slack.py \
+            --results-file comparison-results.json
 
       - name: Upload comparison artifacts
         if: always()
