@@ -27,8 +27,8 @@ class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
-    num_accepted_drafts: int = 0  # no bonus included
-    num_accepted_drafts_per_req_cpu: Optional[List[int]] = None
+    num_correct_drafts: int = 0  # no bonus included
+    num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
 
     # For output processing
@@ -39,6 +39,7 @@ class GenerationBatchResult:
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
+    speculative_num_draft_tokens: Optional[int] = None
 
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
@@ -54,7 +55,11 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
-    def copy_to_cpu(self, return_logprob: bool):
+    # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
+    fpm_start_event: Optional[torch.cuda.Event] = None
+    fpm_end_event: Optional[torch.cuda.Event] = None
+
+    def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
@@ -83,7 +88,7 @@ class GenerationBatchResult:
                     v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
-        if self.logits_output.hidden_states is not None:
+        if return_hidden_states and self.logits_output.hidden_states is not None:
             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True
             )

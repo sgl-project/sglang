@@ -51,9 +51,14 @@ You can install SGLang using any of the methods below. Please go through `System
   </tbody>
 </table>
 
-<a id="obtain-cann-image"></a>
 ### Obtain CANN Image
+
 You can obtain the dependency of a specified version of CANN through an image.
+
+<Note>
+CANN images and SGLang images are hosted at different registry addresses. Make sure to pull them from the correct location.
+</Note>
+
 ```bash Command
 # for Atlas 800I A3 and Ubuntu OS
 docker pull quay.io/ascend/cann:8.5.0-a3-ubuntu22.04-py3.11
@@ -138,7 +143,7 @@ pip install -e python[all_npu]
 #### Obtain Image
 You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
 1. Download SGLang image
-```angular2html
+```bash Command
 dockerhub: docker.io/lmsysorg/sglang:$tag
 # Main-based tag, change main to specific version like v0.5.6,
 # you can get image for specific version
@@ -163,7 +168,6 @@ __Notice:__ `--privileged` and `--network=host` are required by RDMA, which is t
 __Notice:__ The following docker command is based on Atlas 800I A3 machines. If you are using Atlas 800I A2, make sure only `davinci[0-7]` are mapped into container.
 
 ```bash Command
-
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
     --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \

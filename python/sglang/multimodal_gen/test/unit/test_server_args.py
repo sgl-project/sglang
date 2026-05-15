@@ -12,9 +12,13 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
+from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
@@ -110,12 +114,34 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             "torch_sdpa",
         ]
 
-        with patch.object(sys, "argv", ["sglang"] + argv):
-            args, unknown_args = parser.parse_known_args(argv)
-            with patch.object(
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
                 PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
-            ):
-                server_args = ServerArgs.from_cli_args(args, unknown_args)
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                return_value=80 * 1024**3,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                return_value=80,
+            ),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         self.assertEqual(
             server_args.component_attention_backends, {"text_encoder": "torch_sdpa"}
@@ -123,6 +149,50 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
 
 class TestOffloadDefaults(unittest.TestCase):
+    def _from_dict_with_pipeline_config(
+        self,
+        pipeline_config,
+        *,
+        memory_gb=80,
+        available_memory_gb=None,
+        kwargs=None,
+    ):
+        def get_available_gpu_memory(device_id=0, **_kwargs):
+            if isinstance(available_memory_gb, dict):
+                return available_memory_gb[device_id]
+            if available_memory_gb is not None:
+                return available_memory_gb
+            return memory_gb
+
+        with (
+            patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.enable_dit_layerwise_offload_for_wan_by_default",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                return_value=memory_gb * 1024**3,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                side_effect=get_available_gpu_memory,
+            ),
+        ):
+            return ServerArgs.from_dict({"model_path": "/fake", **(kwargs or {})})
+
     def _from_dict_with_task_type(
         self,
         task_type,
@@ -142,6 +212,10 @@ class TestOffloadDefaults(unittest.TestCase):
                 "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
                 return_value=memory_gb * 1024**3,
             ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                return_value=memory_gb,
+            ),
         ):
             return ServerArgs.from_dict({"model_path": "/fake", **(kwargs or {})})
 
@@ -151,7 +225,11 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.vae_cpu_offload)
 
     def test_vae_cpu_offload_defaults_false_on_low_memory_gpu(self):
-        args = self._from_dict_with_task_type(ModelTaskType.T2V, memory_gb=16)
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            memory_gb=16,
+            kwargs={"performance_mode": "memory"},
+        )
 
         self.assertFalse(args.vae_cpu_offload)
         self.assertTrue(args.dit_cpu_offload)
@@ -165,6 +243,353 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertTrue(args.vae_cpu_offload)
+
+    def test_pipeline_configs_declare_auto_tune_hints(self):
+        qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
+        wan_deployment = WanT2V480PConfig().get_model_deployment_config()
+        mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
+        zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
+        ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
+
+        self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
+        self.assertFalse(qwen_deployment.auto_dit_layerwise_offload)
+
+        self.assertIsNone(wan_deployment.fsdp_auto_min_available_memory_gb)
+        self.assertTrue(wan_deployment.auto_dit_layerwise_offload)
+
+        self.assertIsNone(mova_deployment.fsdp_auto_min_available_memory_gb)
+        self.assertTrue(mova_deployment.auto_dit_layerwise_offload)
+
+        self.assertEqual(zimage_deployment.fsdp_auto_min_available_memory_gb, 40)
+        self.assertTrue(zimage_deployment.fsdp_auto_requires_cfg)
+        self.assertFalse(zimage_deployment.auto_dit_layerwise_offload)
+
+        self.assertEqual(
+            ltx_deployment.auto_disable_component_offload_min_available_memory_gb, 70
+        )
+        self.assertEqual(
+            ltx_deployment.auto_disable_component_offload_components, ("dit",)
+        )
+
+    def test_manual_mode_preserves_unset_performance_args(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "num_gpus": 2,
+                "performance_mode": "manual",
+            },
+        )
+
+        self.assertEqual(args.performance_mode, "manual")
+        self.assertIsNone(args.use_fsdp_inference)
+        self.assertIsNone(args.dit_cpu_offload)
+        self.assertIsNone(args.dit_layerwise_offload)
+        self.assertIsNone(args.text_encoder_cpu_offload)
+        self.assertIsNone(args.image_encoder_cpu_offload)
+        self.assertFalse(args.enable_cfg_parallel)
+
+    def test_default_auto_keeps_legacy_single_gpu_offload_defaults(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={"model_path": "Qwen/Qwen-Image"},
+        )
+
+        self.assertEqual(args.performance_mode, "auto")
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+
+    def test_auto_ltx_snapshot_keeps_dit_offload_with_headroom(self):
+        args = self._from_dict_with_pipeline_config(
+            LTX2PipelineConfig(),
+            available_memory_gb=76,
+            kwargs={
+                "model_path": "Lightricks/LTX-2.3",
+                "pipeline_class_name": "LTX2TwoStageHQPipeline",
+                "ltx2_two_stage_device_mode": "snapshot",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertEqual(args.ltx2_two_stage_device_mode, "snapshot")
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.image_encoder_cpu_offload)
+
+    def test_auto_wan_layerwise_offload_is_enabled_without_fsdp(self):
+        args = self._from_dict_with_pipeline_config(
+            WanT2V480PConfig(),
+            kwargs={"performance_mode": "auto"},
+        )
+
+        self.assertTrue(args.dit_layerwise_offload)
+        self.assertFalse(args.use_fsdp_inference)
+
+    def test_memory_wan_layerwise_offload_is_enabled_without_fsdp(self):
+        args = self._from_dict_with_pipeline_config(
+            WanT2V480PConfig(),
+            kwargs={"performance_mode": "memory"},
+        )
+
+        self.assertTrue(args.dit_layerwise_offload)
+        self.assertFalse(args.use_fsdp_inference)
+
+    def test_auto_wan_layerwise_offload_does_not_disable_explicit_fsdp(self):
+        args = self._from_dict_with_pipeline_config(
+            WanT2V480PConfig(),
+            kwargs={
+                "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+                "use_fsdp_inference": True,
+            },
+        )
+
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertTrue(args.use_fsdp_inference)
+
+    def test_auto_multi_gpu_wan_uses_layerwise_offload_without_cfg(self):
+        with patch.object(ServerArgs, "_model_default_uses_cfg", return_value=False):
+            args = self._from_dict_with_pipeline_config(
+                WanT2V480PConfig(),
+                kwargs={
+                    "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+                    "num_gpus": 2,
+                    "performance_mode": "auto",
+                },
+            )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.enable_cfg_parallel)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_layerwise_offload)
+
+    def test_auto_multi_gpu_qwen_keeps_legacy_offload_with_cfg(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+
+    def test_auto_multi_gpu_zimage_base_prefers_fsdp(self):
+        args = self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            kwargs={
+                "model_path": "Tongyi-MAI/Z-Image",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+
+    def test_auto_multi_gpu_zimage_turbo_skips_fsdp(self):
+        args = self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            kwargs={
+                "model_path": "Tongyi-MAI/Z-Image-Turbo",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.enable_cfg_parallel)
+
+    def test_auto_multi_gpu_qwen_preserves_explicit_fsdp_false(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+                "use_fsdp_inference": False,
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+
+    def test_auto_multi_gpu_qwen_skips_fsdp_when_available_memory_is_low(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            memory_gb=50,
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+
+    def test_auto_multi_gpu_qwen_uses_selected_gpu_min_available_memory(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            available_memory_gb={1: 50, 2: 80},
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "base_gpu_id": 1,
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+
+    def test_auto_multi_gpu_qwen_keeps_legacy_offload_with_headroom(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            available_memory_gb={1: 72, 2: 80},
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "base_gpu_id": 1,
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+
+    def test_speed_mode_single_gpu_disables_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "performance_mode": "speed",
+            },
+        )
+
+        self.assertEqual(args.performance_mode, "speed")
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+
+    def test_speed_mode_preserves_explicit_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "performance_mode": "speed",
+                "dit_cpu_offload": True,
+            },
+        )
+
+        self.assertEqual(args.performance_mode, "speed")
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+
+    def test_memory_mode_wan_uses_layerwise_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            WanT2V480PConfig(),
+            kwargs={
+                "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+                "performance_mode": "memory",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.dit_layerwise_offload)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.image_encoder_cpu_offload)
+
+    def test_memory_mode_preserves_explicit_fsdp(self):
+        args = self._from_dict_with_pipeline_config(
+            WanT2V480PConfig(),
+            kwargs={
+                "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+                "num_gpus": 2,
+                "performance_mode": "memory",
+                "use_fsdp_inference": True,
+            },
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertFalse(args.dit_cpu_offload)
+
+    def test_invalid_performance_mode_raises(self):
+        with self.assertRaises(ValueError):
+            self._from_dict_with_pipeline_config(
+                QwenImagePipelineConfig(),
+                kwargs={"performance_mode": "turbo"},
+            )
+
+    def test_cfg_parallel_cli_can_be_disabled_explicitly(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "Qwen/Qwen-Image",
+            "--num-gpus",
+            "2",
+            "--performance-mode",
+            "auto",
+            "--enable-cfg-parallel",
+            "false",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                return_value=80 * 1024**3,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                return_value=80,
+            ),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertFalse(server_args.use_fsdp_inference)
+        self.assertFalse(server_args.enable_cfg_parallel)
 
 
 class TestFSDPShardConditions(unittest.TestCase):

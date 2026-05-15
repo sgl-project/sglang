@@ -12,15 +12,7 @@ on:
       b200_runner:
         required: true
         type: string
-      pr_head_sha:
-        required: false
-        type: string
-        default: ''
       git_ref:
-        required: false
-        type: string
-        default: ''
-      target_stage:
         required: false
         type: string
         default: ''
@@ -46,14 +38,13 @@ jobs:
   jit-kernel-unit-test:
     if: |
       github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true' &&
-      !inputs.target_stage
+      inputs.test_parallel_dispatch != 'true'
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
 
@@ -87,14 +78,13 @@ jobs:
   jit-kernel-multigpu-unit-test:
     if: |
       github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true' &&
-      !inputs.target_stage
+      inputs.test_parallel_dispatch != 'true'
     runs-on: 8-gpu-h200
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
 
@@ -126,14 +116,13 @@ jobs:
   jit-kernel-benchmark-test:
     if: |
       github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true' &&
-      !inputs.target_stage
+      inputs.test_parallel_dispatch != 'true'
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
 
@@ -167,14 +156,13 @@ jobs:
   jit-kernel-b200-test:
     if: |
       github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != 'true' &&
-      !inputs.target_stage
+      inputs.test_parallel_dispatch != 'true'
     runs-on: ${{ inputs.b200_runner }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
 

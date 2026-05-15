@@ -39,6 +39,39 @@ class ZImageArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            r"(.*)\.attention\.to_q\.weight$": (r"\1.attention.to_qkv.weight", 0, 3),
+            r"(.*)\.attention\.to_k\.weight$": (r"\1.attention.to_qkv.weight", 1, 3),
+            r"(.*)\.attention\.to_v\.weight$": (r"\1.attention.to_qkv.weight", 2, 3),
+            r"(.*)\.attention\.to_q\.weight_scale_inv$": (
+                r"\1.attention.to_qkv.weight_scale_inv",
+                0,
+                3,
+            ),
+            r"(.*)\.attention\.to_k\.weight_scale_inv$": (
+                r"\1.attention.to_qkv.weight_scale_inv",
+                1,
+                3,
+            ),
+            r"(.*)\.attention\.to_v\.weight_scale_inv$": (
+                r"\1.attention.to_qkv.weight_scale_inv",
+                2,
+                3,
+            ),
+            r"(.*)\.attention\.to_q\.(lora_A|lora_B)$": (
+                r"\1.attention.to_qkv.\2",
+                0,
+                3,
+            ),
+            r"(.*)\.attention\.to_k\.(lora_A|lora_B)$": (
+                r"\1.attention.to_qkv.\2",
+                1,
+                3,
+            ),
+            r"(.*)\.attention\.to_v\.(lora_A|lora_B)$": (
+                r"\1.attention.to_qkv.\2",
+                2,
+                3,
+            ),
             r"(.*)\.feed_forward\.w1\.weight$": (r"\1.feed_forward.w13.weight", 0, 2),
             r"(.*)\.feed_forward\.w3\.weight$": (r"\1.feed_forward.w13.weight", 1, 2),
             r"(.*)\.feed_forward\.w1\.(lora_A|lora_B)$": (
