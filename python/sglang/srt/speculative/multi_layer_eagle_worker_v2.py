@@ -724,9 +724,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 self._draft_done_event.record()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
-            self.draft_worker._draft_extend_for_decode(
-                model_worker_batch, batch_output
-            )
+            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
             return batch_output
 
     def verify(
