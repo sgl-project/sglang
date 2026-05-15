@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::config::Config;
 use crate::discovery::{DiscoveryEvent, ModelId, WorkerSpec};
+use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::workers::WorkerRegistry;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -22,7 +24,7 @@ struct ServerInfoResponse {
 /// small JSON read served by SGLang's HTTP server.
 const SERVER_INFO_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Build the default HTTP client used by `run`.
+/// Build the default HTTP client used by `run` and `run_with_config`.
 fn default_http_client() -> Arc<reqwest::Client> {
     Arc::new(
         reqwest::Client::builder()
@@ -87,16 +89,50 @@ async fn fetch_served_model_name(worker_url: &str, http: &reqwest::Client) -> Op
     Some(name)
 }
 
+/// Resolve the circuit-breaker config for all model IDs carried by a spec.
+///
+/// Workers may serve multiple models; we use the config of the **first** model
+/// that has an explicit CB config, falling back to `None` (default config).
+fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerConfig> {
+    for model_id in &spec.model_ids {
+        if let Some(mc) = cfg.models.iter().find(|m| m.id == model_id.0) {
+            if let Some(cbc) = &mc.circuit_breaker {
+                return Some(CircuitBreakerConfig {
+                    threshold: cbc.threshold,
+                    cool_down: Duration::from_secs(cbc.cool_down_secs),
+                });
+            }
+        }
+    }
+    None
+}
+
 pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistry>) {
-    run_with_http(rx, registry, default_http_client()).await
+    run_with_config(rx, registry, None).await;
+}
+
+/// Run the worker manager, optionally honoring per-model circuit-breaker
+/// configuration from `cfg`.  When `cfg` is `None` the default CB config is
+/// used for every worker (threshold = 3).
+///
+/// Uses the default HTTP client (2-second timeout) for `/server_info`
+/// introspection.  Tests that want a tighter timeout call
+/// [`run_with_http`] directly.
+pub async fn run_with_config(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+) {
+    run_with_http(rx, registry, cfg, default_http_client()).await
 }
 
 /// Internal entry point used by tests so they can supply a custom HTTP
 /// client (e.g. a shorter timeout, or a fake transport).  Production
-/// callers use [`run`].
+/// callers use [`run_with_config`].
 pub async fn run_with_http(
     mut rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
     http: Arc<reqwest::Client>,
 ) {
     while let Some(event) = rx.recv().await {
@@ -109,7 +145,8 @@ pub async fn run_with_http(
                 if let Some(name) = fetch_served_model_name(&spec.url, &http).await {
                     spec.model_ids = vec![ModelId(name)];
                 }
-                registry.add(spec);
+                let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
+                registry.add_with_cb(spec, cb);
             }
             DiscoveryEvent::Removed { id } => {
                 tracing::info!("discovery: -worker {id}");
@@ -126,8 +163,9 @@ pub async fn run_with_http(
                         mode,
                         model_ids: w.model_ids.clone(),
                     };
+                    let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&new_spec, c));
                     registry.remove(&id);
-                    registry.add(new_spec);
+                    registry.add_with_cb(new_spec, cb);
                 }
             }
         }
@@ -194,7 +232,12 @@ mod tests {
 
         let registry = Arc::new(WorkerRegistry::default());
         let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
-        let manager_handle = tokio::spawn(run_with_http(rx, registry.clone(), fast_http_client()));
+        let manager_handle = tokio::spawn(run_with_http(
+            rx,
+            registry.clone(),
+            None,
+            fast_http_client(),
+        ));
 
         let spec = WorkerSpec {
             id: WorkerId("w-1".into()),
@@ -230,7 +273,12 @@ mod tests {
 
         let registry = Arc::new(WorkerRegistry::default());
         let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
-        let manager_handle = tokio::spawn(run_with_http(rx, registry.clone(), fast_http_client()));
+        let manager_handle = tokio::spawn(run_with_http(
+            rx,
+            registry.clone(),
+            None,
+            fast_http_client(),
+        ));
 
         let spec = WorkerSpec {
             id: WorkerId("w-2".into()),
@@ -270,7 +318,12 @@ mod tests {
 
         let registry = Arc::new(WorkerRegistry::default());
         let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
-        let manager_handle = tokio::spawn(run_with_http(rx, registry.clone(), fast_http_client()));
+        let manager_handle = tokio::spawn(run_with_http(
+            rx,
+            registry.clone(),
+            None,
+            fast_http_client(),
+        ));
 
         for (id, url) in [("w-no-field", no_field_url), ("w-empty", empty_url)] {
             let spec = WorkerSpec {

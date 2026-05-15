@@ -79,9 +79,10 @@ async fn main() -> Result<()> {
     let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
         .await
         .context("spawn discovery")?;
-    let manager_handle = tokio::spawn(sgl_router::workers::manager::run(
+    let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config(
         event_rx,
         registry.clone(),
+        Some(Arc::new(cfg.clone())),
     ));
 
     // Build proxy. The constructor still requires a worker_url + timeout

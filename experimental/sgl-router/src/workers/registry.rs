@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::workers::worker::Worker;
 use dashmap::DashMap;
 use std::collections::HashSet;
@@ -15,7 +16,13 @@ pub struct WorkerRegistry {
 
 impl WorkerRegistry {
     pub fn add(&self, spec: WorkerSpec) {
-        let w = Arc::new(Worker::new(spec));
+        self.add_with_cb(spec, None);
+    }
+
+    /// Add a worker, optionally supplying a circuit-breaker config.
+    /// Pass `None` to use the circuit-breaker default (threshold = 3).
+    pub fn add_with_cb(&self, spec: WorkerSpec, cb: Option<CircuitBreakerConfig>) {
+        let w = Arc::new(Worker::with_cb_config(spec, cb));
         let id = w.id.clone();
         for m in &w.model_ids {
             self.by_model
