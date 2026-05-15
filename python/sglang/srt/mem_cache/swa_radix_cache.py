@@ -44,7 +44,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.utils import convert_to_bigram_key, split_node_hash_value
+from sglang.srt.mem_cache.utils import split_node_hash_value
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -353,11 +353,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
-        if self.is_eagle:
-            self.key_convert_fn = convert_to_bigram_key
-        else:
-            self.key_convert_fn = lambda key: key
-
         if params.enable_metrics:
             self.init_metrics_collector()
 
@@ -410,6 +405,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 ),
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
+                best_match_node=self.root_node,
             )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
@@ -965,6 +961,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
+            best_match_node=last_node,
         )
 
     def _compact_single_child_chain(self, node: TreeNode) -> None:
