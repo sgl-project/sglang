@@ -441,8 +441,17 @@ class XPUAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
-        if k is not None:
-            assert v is not None
+        if k is None and v is None:
+            # Cross-layer KV sharing (Gemma 4): the layer reuses another
+            # layer's KV cache. The paged kernel reads K/V directly via
+            # page_table, and pool.get_kv_buffer(layer.layer_id) routes
+            # to the correct sub-pool because RadixAttention is initialized
+            # with layer_id=kv_shared_layer_index for shared layers. No
+            # materialization needed; just skip the write path.
+            pass
+        elif k is None or v is None:
+            raise ValueError("Both k and v should be None or not None")
+        else:
             if save_kv_cache:
                 cache_loc = (
                     forward_batch.out_cache_loc
@@ -752,8 +761,12 @@ class XPUAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if k is not None:
-            assert v is not None
+        if k is None and v is None:
+            # Cross-layer KV sharing (Gemma 4): see forward_extend for details.
+            pass
+        elif k is None or v is None:
+            raise ValueError("Both k and v should be None or not None")
+        else:
             if save_kv_cache:
                 cache_loc = (
                     forward_batch.out_cache_loc
