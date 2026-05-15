@@ -199,6 +199,21 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 slot_indices=loc,
             )
 
+    def _chunk_copy_npu_to_cpu(self, buf_of_layers, indices):
+        chunk_size = self.cpu_offloading_chunk_size
+        out = []
+        for tensors_per_layer in buf_of_layers:  # [k_buf, v_buf]
+            layer_chunks = []
+            for i in range(0, len(indices), chunk_size):
+                ci = indices[i : i + chunk_size]
+                layer_chunks.append(
+                    [
+                        t[ci].to("cpu", non_blocking=True) for t in tensors_per_layer if t is not None
+                    ]
+                )
+            out.append(layer_chunks)
+        return out
+
     # Parent MHATokenToKVPool.get_cpu_copy / load_cpu_copy use
     # `self.k_buffer[layer_id][chunk_indices]` which indexes the first dim.
     # NPUMHATokenToKVPool stores buffers as
@@ -206,8 +221,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
     #   (num_pages*page_size, 1, head_num, head_dim)          # use_fia=True
     def get_cpu_copy(self, indices):
         torch.npu.synchronize()
-        kv_cache_cpu = []
-        chunk_size = self.cpu_offloading_chunk_size
+        buf_of_layers = []
         for local_layer_id in range(self.layer_num):
             k_layer = self.k_buffer[local_layer_id].view(
                 -1, self.head_num, self.head_dim
@@ -215,13 +229,8 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             v_layer = self.v_buffer[local_layer_id].view(
                 -1, self.head_num, self.head_dim
             )
-            layer_chunks = []
-            for i in range(0, len(indices), chunk_size):
-                chunk_indices = indices[i : i + chunk_size]
-                k_cpu = k_layer[chunk_indices].to("cpu", non_blocking=True)
-                v_cpu = v_layer[chunk_indices].to("cpu", non_blocking=True)
-                layer_chunks.append([k_cpu, v_cpu])
-            kv_cache_cpu.append(layer_chunks)
+            buf_of_layers.append([k_layer, v_layer])
+        kv_cache_cpu = self._chunk_copy_npu_to_cpu(buf_of_layers, indices)
         torch.npu.synchronize()
         return kv_cache_cpu
 
@@ -450,10 +459,24 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             index_k.view(-1, 1, self.index_head_dim),
         )
 
+    def _chunk_copy_npu_to_cpu(self, buf_of_layers, indices):
+        chunk_size = self.cpu_offloading_chunk_size
+        out = []
+        for tensors_per_layer in buf_of_layers:  # [k_buf, v_buf, ik_buf/None]
+            layer_chunks = []
+            for i in range(0, len(indices), chunk_size):
+                ci = indices[i : i + chunk_size]
+                layer_chunks.append(
+                    [
+                        t[ci].to("cpu", non_blocking=True) for t in tensors_per_layer if t is not None
+                    ]
+                )
+            out.append(layer_chunks)
+        return out
+
     def get_cpu_copy(self, indices):
         torch.npu.synchronize()
-        kv_cache_cpu = []
-        chunk_size = self.cpu_offloading_chunk_size
+        buf_of_layers = []
         has_ik = self.index_head_dim is not None
         for local_layer_id in range(self.layer_num):
             k_layer = self.k_buffer[local_layer_id].view(-1, 1, self.kv_lora_rank)
@@ -463,17 +486,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 if has_ik
                 else None
             )
-            layer_chunks = []
-            for i in range(0, len(indices), chunk_size):
-                chunk_indices = indices[i : i + chunk_size]
-                k_cpu = k_layer[chunk_indices].to("cpu", non_blocking=True)
-                v_cpu = v_layer[chunk_indices].to("cpu", non_blocking=True)
-                if has_ik:
-                    ik_cpu = ik_layer[chunk_indices].to("cpu", non_blocking=True)
-                    layer_chunks.append([k_cpu, v_cpu, ik_cpu])
-                else:
-                    layer_chunks.append([k_cpu, v_cpu])
-            kv_cache_cpu.append(layer_chunks)
+            buf_of_layers.append([k_layer, v_layer, ik_layer])
+
+        kv_cache_cpu = self._chunk_copy_npu_to_cpu(buf_of_layers, indices)
         torch.npu.synchronize()
         return kv_cache_cpu
 
