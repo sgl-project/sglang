@@ -155,7 +155,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
                 "--max-total-tokens",
                 "20000",
                 "--max-running-requests",
-                "4",
+                "2",
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
