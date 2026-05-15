@@ -128,6 +128,14 @@ def _copy_metadata(
 
 
 def _create_flashmla_metadata():
+    # flash_mla is CUDA-only. On HIP the radix backend uses the tilelang /
+    # triton flashmla shim (SGLANG_HACK_FLASHMLA_BACKEND), which ignores the
+    # returned tile_scheduler_metadata, so returning None here is safe and
+    # avoids forcing a CUDA-only dependency on ROCm.
+    from sglang.srt.utils import is_hip
+
+    if is_hip():
+        return None
     import flash_mla
 
     return flash_mla.get_mla_metadata()[0]
