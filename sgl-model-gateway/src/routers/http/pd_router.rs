@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -13,7 +19,51 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, enabled, error, warn, Level};
+
+static REQ_SENT: AtomicU64 = AtomicU64::new(0);
+static REQ_DONE: AtomicU64 = AtomicU64::new(0);
+
+struct InflightGuard {
+    active: bool,
+}
+
+impl InflightGuard {
+    fn new() -> Self {
+        let sent = REQ_SENT.fetch_add(1, Ordering::Relaxed) + 1;
+        let done = REQ_DONE.load(Ordering::Relaxed);
+        debug!(
+            "[REQ_SENT] sent={} done={} inflight={}",
+            sent,
+            done,
+            sent - done
+        );
+        Self { active: true }
+    }
+
+    fn done_only() -> Self {
+        Self { active: true }
+    }
+
+    fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let done = REQ_DONE.fetch_add(1, Ordering::Relaxed) + 1;
+            let sent = REQ_SENT.load(Ordering::Relaxed);
+            debug!(
+                "[REQ_DONE] sent={} done={} inflight={}",
+                sent,
+                done,
+                sent - done
+            );
+        }
+    }
+}
 
 use super::pd_types::api_path;
 use crate::{
@@ -570,6 +620,8 @@ impl PDRouter {
 
         // Send both requests concurrently and wait for both
         // Note: Using borrowed references avoids heap allocation
+        let _inflight = enabled!(Level::DEBUG).then(InflightGuard::new);
+
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
@@ -625,7 +677,10 @@ impl PDRouter {
                 };
 
                 if context.is_stream {
-                    // Streaming response
+                    // Streaming: disarm guard, spawned task will handle REQ_DONE
+                    if let Some(g) = _inflight {
+                        g.disarm();
+                    }
                     let prefill_logprobs = if context.return_logprob {
                         prefill_body
                             .as_ref()
@@ -651,7 +706,7 @@ impl PDRouter {
                     )
                 } else {
                     // Non-streaming response
-                    if context.return_logprob {
+                    let response = if context.return_logprob {
                         self.process_non_streaming_response(
                             res,
                             status,
@@ -679,7 +734,9 @@ impl PDRouter {
                                 )
                             }
                         }
-                    }
+                    };
+                    // _inflight guard drops here, auto-increments REQ_DONE
+                    response
                 }
             }
             Err(e) => {
@@ -846,7 +903,9 @@ impl PDRouter {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
+        let _stream_guard = enabled!(Level::DEBUG).then(InflightGuard::done_only);
         tokio::spawn(async move {
+            let _guard = _stream_guard;
             futures_util::pin_mut!(stream);
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
@@ -877,6 +936,7 @@ impl PDRouter {
                     }
                 }
             }
+            // _guard drops here, auto-increments REQ_DONE
         });
 
         let stream = UnboundedReceiverStream::new(rx);
