@@ -197,6 +197,98 @@ mod tests {
         );
     }
 
+    /// Gap: `tokenize_round_trip` tests only `skip_special_tokens: true`.
+    /// When omitted, `#[serde(default)]` gives `false` — a different decode code-path.
+    /// This covers the default (omitted) and explicit-false routes end-to-end via HTTP.
+    #[tokio::test]
+    async fn detokenize_skip_special_tokens_false_default() {
+        let app = crate::server::app::build_router(ctx_with_tiny());
+
+        // First tokenize to get IDs.
+        let tok_body = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny", "prompt": "hello world"
+        }))
+        .unwrap();
+        let tok_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokenize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(tok_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tok_res.status(), StatusCode::OK);
+        let tok_bytes = tok_res.into_body().collect().await.unwrap().to_bytes();
+        let r: TokenizeResponse = serde_json::from_slice(&tok_bytes).unwrap();
+
+        // Detokenize with skip_special_tokens omitted (defaults to false).
+        let det_body_omitted = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny",
+            "tokens": r.tokens
+            // skip_special_tokens intentionally absent — must default to false
+        }))
+        .unwrap();
+        let det_res_omitted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/detokenize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(det_body_omitted))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(det_res_omitted.status(), StatusCode::OK);
+        let det_bytes_omitted = det_res_omitted
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let d_omitted: DetokenizeResponse = serde_json::from_slice(&det_bytes_omitted).unwrap();
+        assert_eq!(
+            d_omitted.text, "hello world",
+            "detokenize with skip_special_tokens omitted (default false) must round-trip"
+        );
+
+        // Also test explicit false — must be identical to omitted.
+        let det_body_explicit = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny",
+            "tokens": r.tokens,
+            "skip_special_tokens": false
+        }))
+        .unwrap();
+        let det_res_explicit = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/detokenize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(det_body_explicit))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(det_res_explicit.status(), StatusCode::OK);
+        let det_bytes_explicit = det_res_explicit
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let d_explicit: DetokenizeResponse = serde_json::from_slice(&det_bytes_explicit).unwrap();
+        assert_eq!(
+            d_explicit.text, d_omitted.text,
+            "explicit skip_special_tokens=false must produce same result as omitted"
+        );
+    }
+
     #[tokio::test]
     async fn unknown_model_404() {
         let app = crate::server::app::build_router(ctx_with_tiny());
