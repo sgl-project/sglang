@@ -253,7 +253,7 @@ def _sm120_sparse_decode_fwd(
     return out, lse
 
 
-_use_triton_flashmla = os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "1") == "1"
+_use_triton_flashmla = os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "0") == "1"
 
 
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
