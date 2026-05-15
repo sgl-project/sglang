@@ -1,4 +1,3 @@
-export SGLANG_OPT_USE_OLD_COMPRESSOR=true
 export SGLANG_OPT_USE_TILELANG_SWA_PREPARE=false
 export SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=false
 
@@ -12,7 +11,6 @@ export SGLANG_USE_AITER=1
 export SGLANG_USE_ROCM700A=1
 export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 
-export SGLANG_OPT_DPSK_V4_RADIX=0
 export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=false
 export SGLANG_OPT_USE_FUSED_STORE_CACHE=true
 
@@ -27,6 +25,9 @@ export SGLANG_OPT_USE_AITER_MHC_PRE=true
 export SGLANG_OPT_USE_AITER_MHC_POST=true
 export SGLANG_OPT_USE_TRITON_SWA_PREPARE=true
 export SGLANG_OPT_USE_FUSED_HASH_TOPK=true
+export SGLANG_OPT_DPSK_V4_RADIX=1
+export SGLANG_OPT_USE_OLD_COMPRESSOR=false
+export SGLANG_OPT_USE_FUSED_PAGED_COMPRESS=true
 export SGLANG_OPT_FUSE_WQA_WKV=true
 
 export AITER_BF16_FP8_MOE_BOUND=1
@@ -38,7 +39,6 @@ python3 -m sglang.launch_server \
     --model-path ${MODEL} \
     --trust-remote-code \
     --tp 8 \
-    --disable-radix-cache \
     --attention-backend compressed \
     --max-running-request 256 \
     --page-size 256 \

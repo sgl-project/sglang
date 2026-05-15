@@ -128,6 +128,10 @@ def _copy_metadata(
 
 
 def _create_flashmla_metadata():
+    from sglang.srt.utils import is_hip
+
+    if is_hip():
+        return None
     import flash_mla
 
     return flash_mla.get_mla_metadata()[0]
@@ -619,7 +623,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             seq_lens_cpu=None,
             extend_lens_cpu=None,
             use_prefill_cuda_graph=True,
-            num_q_tokens=num_draft_tokens,
+            num_q_tokens=num_draft_tokens * bs,
         )
         return DSV4MetadataRadix(
             core_attn_metadata,
@@ -940,6 +944,13 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         current_simplified = getattr(self, "_current_capture_simplified", None)
         if current_simplified is not None:
             self.forward_metadata = current_simplified
+
+    def _maybe_upgrade_forward_metadata(self) -> None:
+        if isinstance(self.forward_metadata, DSV4MetadataSimplified):
+            real_metadata = self.make_forward_metadata_from_simplified(
+                simplified_metadata=self.forward_metadata,
+            )
+            self.forward_metadata = real_metadata
 
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
