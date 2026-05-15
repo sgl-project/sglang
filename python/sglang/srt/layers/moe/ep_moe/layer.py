@@ -92,7 +92,9 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-        if _use_aiter or _is_npu:
+        if _use_aiter:
+            self.deprecate_flag = True
+        elif _is_npu:
             self.deprecate_flag = False
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
             quant_config, Fp8Config
@@ -198,9 +200,7 @@ class DeepEPMoE(FusedMoE):
         dispatch_output: DispatchOutput,
     ):
 
-        if self.deprecate_flag or _use_aiter:
-            # AITER routes through quant_method.apply -> self.runner.run, which
-            # picks the right ("<dispatch>", "aiter") pre/post permute pair.
+        if self.deprecate_flag:
             return super().run_moe_core(dispatch_output)
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
