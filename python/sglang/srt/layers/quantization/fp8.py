@@ -1646,7 +1646,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
-
         if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
