@@ -99,6 +99,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         self.enable_pdmux = False
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self.is_dllm = False
 
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.padded_static_len = -1

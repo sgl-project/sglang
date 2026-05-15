@@ -2659,6 +2659,15 @@ class ServerArgs:
                 f"Attention backend not specified. Use {self.attention_backend} backend by default."
             )
 
+        # DLLM (diffusion LLM) requires bidirectional attention for block denoising.
+        # Only the flashinfer backend supports the required ENCODER_ONLY attention mode.
+        if self.dllm_algorithm is not None and self.attention_backend != "flashinfer":
+            raise ValueError(
+                f"DLLM requires the flashinfer attention backend for bidirectional "
+                f"attention, but got '{self.attention_backend}'. Please set "
+                f"--attention-backend flashinfer."
+            )
+
         # Torch native and flex attention backends
         if self.attention_backend == "torch_native":
             logger.warning(
@@ -4051,7 +4060,19 @@ class ServerArgs:
             from sglang.srt.dllm.config import DllmConfig
 
             config = DllmConfig.from_server_args(self)
-            if self.page_size % config.block_size != 0:
+            # LinearSpec uses partial block acceptance, so it frees
+            # individual slots within a page.  PagedTokenToKVPoolAllocator
+            # frees ENTIRE pages when any slot is freed, which corrupts
+            # in-use prefix slots sharing the same page.  Use page_size=1
+            # for algorithms with partial acceptance to avoid this.
+            partial_accept_algos = {"LinearSpec", "linear_spec"}
+            if self.dllm_algorithm in partial_accept_algos:
+                if self.page_size != 1:
+                    logger.info(
+                        "Setting page size to 1 for LinearSpec (partial block acceptance)"
+                    )
+                    self.page_size = 1
+            elif self.page_size % config.block_size != 0:
                 logger.warning(
                     f"Setting page size to {config.block_size} for diffusion LLM inference"
                 )
@@ -5989,7 +6010,7 @@ class ServerArgs:
             "--dllm-algorithm",
             type=str,
             default=ServerArgs.dllm_algorithm,
-            help="The diffusion LLM algorithm, such as LowConfidence.",
+            help="The diffusion LLM algorithm: LinearSpec or FastDiffuser.",
         )
         parser.add_argument(
             "--dllm-algorithm-config",

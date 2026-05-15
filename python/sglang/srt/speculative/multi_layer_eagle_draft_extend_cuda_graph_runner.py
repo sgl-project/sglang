@@ -114,6 +114,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.padded_static_len = -1
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self.is_dllm = False
 
         # For Attention Backend
         self.num_tokens_per_bs = self.speculative_num_steps + 1 + step

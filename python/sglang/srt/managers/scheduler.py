@@ -1502,21 +1502,52 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        # DLLM scheduler profiling (zero overhead when disabled)
+        _dllm_prof = (
+            self.dllm_config is not None
+            and self.dllm_config.algorithm_config.get("profile", False)
+        )
+        if _dllm_prof:
+            import time as _time
+
+            _dp_n = 0
+            _dp_recv = 0.0
+            _dp_get_batch = 0.0
+            _dp_run_batch = 0.0
+            _dp_process = 0.0
+            _dp_rest = 0.0
+
         while True:
+            if _dllm_prof:
+                _t0 = _time.perf_counter()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
+            if _dllm_prof:
+                _t1 = _time.perf_counter()
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
+            if _dllm_prof:
+                _t2 = _time.perf_counter()
+
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+
+                if _dllm_prof:
+                    _t3 = _time.perf_counter()
+
                 self.process_batch_result(batch, result)
+
+                if _dllm_prof:
+                    _t4 = _time.perf_counter()
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
@@ -1525,6 +1556,37 @@ class Scheduler(
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+            if _dllm_prof and batch and batch.forward_mode.is_dllm_extend():
+                _t5 = _time.perf_counter()
+                _dp_recv += _t1 - _t0
+                _dp_get_batch += _t2 - _t1
+                _dp_run_batch += _t3 - _t2
+                _dp_process += _t4 - _t3
+                _dp_rest += _t5 - _t4
+                _dp_n += 1
+                if _dp_n % 500 == 0:
+                    n = _dp_n
+                    logger.info(
+                        "SCHEDULER PROFILE (%d iters, per-iter avg): "
+                        "recv=%.2fms  get_batch=%.2fms  run_batch=%.2fms  "
+                        "process_result=%.2fms  rest=%.2fms | total=%.2fms",
+                        n,
+                        _dp_recv / n * 1000,
+                        _dp_get_batch / n * 1000,
+                        _dp_run_batch / n * 1000,
+                        _dp_process / n * 1000,
+                        _dp_rest / n * 1000,
+                        (
+                            _dp_recv
+                            + _dp_get_batch
+                            + _dp_run_batch
+                            + _dp_process
+                            + _dp_rest
+                        )
+                        / n
+                        * 1000,
+                    )
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -2272,8 +2334,10 @@ class Scheduler(
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
-            for req in self.dllm_manager.staging_queue:
-                self.stash_chunked_request(req)
+            # DLLM reqs manage KV explicitly (via req_to_token_pool).  Skip
+            # stash_chunked_request to avoid inserting mask-token keys into the
+            # radix tree and the double-free that would follow from tree eviction
+            # freeing pages that were also freed by the stale-KV cleanup step.
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
