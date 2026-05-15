@@ -1645,11 +1645,15 @@ class MooncakeKVManager(CommonKVManager):
         with self.session_lock:
             snapshot = list(self.failed_sessions)
         for session_id in snapshot:
-            try:
-                rc = self.engine.send_probe(session_id)
-            except Exception as e:
-                logger.warning("send_probe(%s) raised: %s", session_id, e)
-                continue
+            send_probe = getattr(self.engine, "send_probe", None)
+            if send_probe is None:
+                rc = -1
+            else:
+                try:
+                    rc = send_probe(session_id)
+                except Exception as e:
+                    logger.warning("send_probe(%s) raised: %s", session_id, e)
+                    continue
             if rc == 0:
                 with self.session_lock:
                     was_blacklisted = session_id in self.failed_sessions
