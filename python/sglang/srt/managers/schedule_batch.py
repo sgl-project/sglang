@@ -2724,9 +2724,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # preserving cache reuse in multi-turn scenarios. Without this, leaf nodes
         # may become tombstoned, causing SWA memory leak.
         # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
+        if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
+            evict_threshold = pre_len - sliding_window_size
+        else:
+            evict_threshold = pre_len - sliding_window_size - self.tree_cache.page_size
         new_swa_evicted_seqlen = max(
             req.swa_evicted_seqlen,
-            pre_len - sliding_window_size - self.tree_cache.page_size,
+            evict_threshold,
         )
 
         if self.tree_cache.page_size > 1:
