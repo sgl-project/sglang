@@ -444,10 +444,10 @@ class CompressorPrefillPlan(NamedTuple):
             # unavailable, such as on XPU, CPU). Mirrors plan_prefill_host in
             # jit_kernel/csrc/deepseek_v4/common.cuh.
             if _is_cpu:
-                plan_lens = _plan_compress_prefill_torch
+                fn = _plan_compress_prefill_torch
             else:
-                plan_lens = _torch_plan_compress_prefill
-            plan_lens(
+                fn= _torch_plan_compress_prefill
+            plan_lens = fn(
                 extend_lens,
                 seq_lens,
                 plan_tensor[0],
