@@ -822,7 +822,9 @@ class ServerArgs(DisaggArgsMixin):
         """
         return bool(self.layerwise_offload_components)
 
+    @property
     def is_dit_layerwise_offload_selected(self) -> bool:
+        """returns if dit is selected to be layerwise-offload"""
         component_names = self.layerwise_offload_components
         return bool(
             component_names
