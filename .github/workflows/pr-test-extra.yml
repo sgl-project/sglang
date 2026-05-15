@@ -76,7 +76,7 @@ permissions:
   actions: write
   contents: read
   issues: read
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   # =============================================== check changes ====================================================
@@ -103,6 +103,18 @@ jobs:
       run_all_tests: ${{ inputs.run_all_tests == true }}
       force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
       pr_test_yml: '.github/workflows/pr-test-extra.yml'
+    secrets: inherit
+
+  # Fires regardless of check-changes outcome (always() handles the label-gate
+  # skip case). On a PR without `run-ci-extra` the rest of this workflow's
+  # graph is skipped, but the awareness block still needs updating so the
+  # author sees this run was a no-op.
+  call-pr-awareness:
+    needs: check-changes
+    if: always() && github.event_name == 'pull_request'
+    uses: ./.github/workflows/_pr-awareness-comment.yml
+    with:
+      workflow_kind: pr-test-extra
     secrets: inherit
 
   # =============================================== sgl-kernel ====================================================

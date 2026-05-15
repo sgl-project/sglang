@@ -98,6 +98,17 @@ jobs:
       force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
     secrets: inherit
 
+  # Fires right after check-changes so the awareness block (extra-CI opt-in
+  # state + latest CI run URLs) is injected into the PR body within ~30s,
+  # without waiting for downstream stages.
+  call-pr-awareness:
+    needs: check-changes
+    if: always() && github.event_name == 'pull_request'
+    uses: ./.github/workflows/_pr-awareness-comment.yml
+    with:
+      workflow_kind: pr-test
+    secrets: inherit
+
   call-pr-test-extra:
     if: github.event_name == 'schedule' || inputs.test_parallel_dispatch == true
     uses: ./.github/workflows/pr-test-extra.yml
@@ -610,47 +621,6 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Sticky comment about extra-CI status
-        # Surfaces extra-CI opt-in state in the PR conversation. Uses an HTML
-        # marker to dedupe across re-runs: in-place update on subsequent
-        # syncs, never spammed. The comment text flips when run-ci-extra
-        # is added or removed.
-        if: always() && github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const marker = '<!-- pr-test-extra-awareness -->';
-            const labels = context.payload.pull_request.labels.map(l => l.name);
-            const enabled = labels.includes('run-ci-extra');
-            const extraUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/workflows/pr-test-extra.yml`;
-            const body = enabled
-              ? `${marker}\n:white_check_mark: **Extra CI is enabled** for this PR (\`run-ci-extra\` label present). [PR Test Extra](${extraUrl}) will run nightly-class coverage.`
-              : `${marker}\n:warning: **Extra CI is not enabled** for this PR. Nightly-class coverage in [PR Test Extra](${extraUrl}) was skipped. Add the \`run-ci-extra\` label to opt in.`;
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              per_page: 100,
-            });
-            const existing = comments.find(c => c.body && c.body.includes(marker));
-            if (existing) {
-              if (existing.body !== body) {
-                await github.rest.issues.updateComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  comment_id: existing.id,
-                  body,
-                });
-              }
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-            }
-
       - name: Check all dependent job statuses
         run: |
           # Convert the 'needs' context to a JSON string
