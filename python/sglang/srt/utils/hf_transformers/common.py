@@ -111,6 +111,22 @@ try:
         model_type = "deepseek_v32"
 
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
+
+    class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
+        model_type = "deepseek_v4"
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            for key in (
+                "rope_theta", "compress_rope_theta", "window_size",
+                "qk_nope_head_dim", "v_head_dim", "o_lora_rank",
+                "o_groups", "n_hash_layers", "hc_mult",
+                "hc_sinkhorn_iters", "hc_eps", "expert_dtype",
+            ):
+                if key in kwargs and not hasattr(self, key):
+                    setattr(self, key, kwargs[key])
+
+    _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
 except ImportError:
     pass
 
