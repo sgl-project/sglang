@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import dataclasses
 import faulthandler
 import logging
 import os
@@ -2997,8 +2998,16 @@ class Scheduler(
         # NOTE: - for all future tensors, we shall always read from future map
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
+        # Snapshot SB's current attribute values so that any post-forward
+        # attribute rebinds (e.g. spec V2 reassigns batch.seq_lens to
+        # next_draft_input.new_seq_lens) do not drop the old tensor refs while
+        # forward stream is still using their GPU memory. Pre-MWB-removal this
+        # was provided implicitly by ModelWorkerBatch's per-field copy.
+        attr_snapshot = [
+            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
+        ]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
-        self.batch_record_buf[self.batch_record_ct] = batch
+        self.batch_record_buf[self.batch_record_ct] = (batch, attr_snapshot)
 
     def run_batch(
         self,
@@ -3022,31 +3031,83 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
+                # For spec V2 only: snapshot every SB dataclass field so any
+                # mid-forward mutation (prepare_for_v2_verify swaps
+                # input_ids / out_cache_loc / mamba_track_* /
+                # forward_mode -> TARGET_VERIFY,
+                # prepare_for_extend_to_fill_draft_kvcache rebinds
+                # spec_info / input_ids / seq_lens / extend_lens /
+                # forward_mode -> DRAFT_EXTEND_V2) is rolled back. Pre-MWB-
+                # removal these mutations targeted ModelWorkerBatch's
+                # per-field snapshot and never leaked to SB; downstream
+                # code relies on SB staying in its pre-forward state
+                # (process_batch_result dispatches by forward_mode etc).
+                # Intentional post-forward updates (output_ids, spec_info,
+                # seq_lens for next iter under spec V2) are reapplied below.
+                #
+                # Spec V1 (eagle_worker.py) manages SB state explicitly:
+                # each forward path mutates and restores forward_mode /
+                # seq_lens itself, AND intentionally leaves spec_info as
+                # the next-iter draft input for process_batch_result_decode.
+                # A blanket restore wipes those intentional updates, so
+                # only sampling_info gets restored (it's the one we
+                # ourselves swapped to a forward-only copy below).
+                # Non-spec generation has no mid-forward SB mutations.
+                snapshot_v2_full = batch.is_spec_v2
+                sched_snapshot = (
+                    {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+                    if snapshot_v2_full
+                    else None
+                )
+                sched_sampling_info = batch.sampling_info
+
+                # Forward consumes a copy of sampling_info with
+                # penalizer_orchestrator=None (penalty already accumulated
+                # into a buffer once via update_penalties); avoids
+                # double-accumulation across the multiple
+                # ForwardBatch.init_new calls inside spec V2.
+                if sched_sampling_info is not None:
+                    batch.sampling_info = sched_sampling_info.copy_for_forward()
+
+                # Record AFTER the sampling_info swap so attr_snapshot keeps
+                # the forward-only copy alive across the 2-iter buffer window.
+                # The copy holds freshly allocated acc_additive_penalties /
+                # acc_scaling_penalties tensors; if only the original is kept
+                # alive (which `update_penalties` reallocates next iter), the
+                # caching allocator may reuse the underlying memory while the
+                # forward stream is still reading it -> NaN/inf in probability.
+                # Pre-MWB-removal MWB held the copy and lived in this same buf,
+                # giving it a 2-iter lifetime by construction.
                 self.record_batch_in_overlap(batch)
 
-                # Sampling info will be modified during forward, so we store a copy.
-                if batch.sampling_info is not None:
-                    batch.sampling_info = batch.sampling_info.copy_for_forward()
                 bs = len(batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
-                with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
-                    self.future_map.resolve_future(batch)
-                    batch_result = self.model_worker.forward_batch_generation(
-                        batch
-                        # here pp is not compatible with overlap
-                    )
-                    # FIXME(lsyin): maybe move this to forward_batch_generation
-                    batch_result.copy_done = self.device_module.Event()
-                    if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(
-                            return_logprob=batch.return_logprob,
-                            return_hidden_states=batch.return_hidden_states,
+                try:
+                    with self.forward_stream_ctx:
+                        self.forward_stream.wait_stream(self.schedule_stream)
+                        self.future_map.resolve_future(batch)
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch
+                            # here pp is not compatible with overlap
                         )
+                        # FIXME(lsyin): maybe move this to forward_batch_generation
+                        batch_result.copy_done = self.device_module.Event()
+                        if batch_result.delay_sample_func is None:
+                            self.future_map.store_to_map(future_indices, batch_result)
+                            batch_result.copy_to_cpu(
+                                return_logprob=batch.return_logprob,
+                                return_hidden_states=batch.return_hidden_states,
+                            )
+                        else:
+                            batch_result.future_indices = future_indices
+                finally:
+                    if snapshot_v2_full:
+                        for name, value in sched_snapshot.items():
+                            setattr(batch, name, value)
                     else:
-                        batch_result.future_indices = future_indices
+                        # V1 / non-spec: only undo our own sampling_info swap.
+                        batch.sampling_info = sched_sampling_info
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
