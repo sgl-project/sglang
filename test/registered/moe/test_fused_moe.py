@@ -13,7 +13,7 @@ from sglang.srt.utils import get_device, get_device_capability, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
-register_cuda_ci(est_time=87, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=87, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 _is_hip = is_hip()

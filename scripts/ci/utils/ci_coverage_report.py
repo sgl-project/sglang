@@ -155,7 +155,9 @@ def generate_summary_section(data: dict) -> str:
         for t in sorted(disabled_tests, key=lambda x: (x.backend.name, x.filename)):
             test_name = get_test_basename(t.filename)
             reason = t.disabled[:50] + "..." if len(t.disabled) > 50 else t.disabled
-            lines.append(f"| `{test_name}` | {t.backend.name} | {t.suite} | {reason} |")
+            lines.append(
+                f"| `{test_name}` | {t.backend.name} | {t.effective_suite} | {reason} |"
+            )
         lines.append("\n</details>\n")
 
     return "\n".join(lines)
@@ -197,7 +199,7 @@ def generate_by_folder_section(data: dict) -> str:
                     else ("Nightly" if t.nightly else "Per-Commit")
                 )
                 lines.append(
-                    f"| `{test_name}` | {t.suite} | {t.est_time:.0f}s | {status} |"
+                    f"| `{test_name}` | {t.effective_suite} | {t.est_time:.0f}s | {status} |"
                 )
 
             lines.append("")
@@ -231,7 +233,7 @@ def generate_by_suite_section(data: dict) -> str:
         # Group by suite within backend
         backend_suites = defaultdict(list)
         for t in backend_tests:
-            backend_suites[t.suite].append(t)
+            backend_suites[t.effective_suite].append(t)
 
         for suite in sorted(backend_suites.keys()):
             suite_tests = backend_suites[suite]
@@ -336,7 +338,7 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
                 data["tests_by_folder"][folder]["backends"][backend] = [
                     {
                         "filename": get_test_basename(t.filename),
-                        "suite": t.suite,
+                        "suite": t.effective_suite,
                         "est_time": t.est_time,
                         "status": (
                             "disabled"
@@ -355,7 +357,7 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
 
         backend_suites = defaultdict(list)
         for t in backend_tests:
-            backend_suites[t.suite].append(t)
+            backend_suites[t.effective_suite].append(t)
 
         data["tests_by_suite"][backend] = {
             "total": len(backend_tests),
@@ -423,7 +425,7 @@ def generate_json_report(tests: list[CIRegistry]) -> str:
             {
                 "filename": get_test_basename(t.filename),
                 "backend": t.backend.name,
-                "suite": t.suite,
+                "suite": t.effective_suite,
                 "reason": t.disabled,
             }
         )
