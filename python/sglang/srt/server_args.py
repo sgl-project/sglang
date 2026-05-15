@@ -3763,6 +3763,8 @@ class ServerArgs:
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
                 "HYV3ForCausalLM",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
             ]:
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
