@@ -261,7 +261,7 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
         "backend": args.backend,
         "num_gpus": args.num_gpus,
         "dit_cpu_offload": args.dit_cpu_offload,
-        "layerwise_offload": args.layerwise_offload,
+        "dit_layerwise_offload": args.dit_layerwise_offload,
         "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
         "vae_cpu_offload": args.vae_cpu_offload,
         "pin_cpu_memory": args.pin_cpu_memory,
@@ -508,7 +508,6 @@ def main() -> None:
     )
     parser.add_argument(
         "--dit-layerwise-offload",
-        dest="layerwise_offload",
         action=argparse.BooleanOptionalAction,
         default=False,
     )

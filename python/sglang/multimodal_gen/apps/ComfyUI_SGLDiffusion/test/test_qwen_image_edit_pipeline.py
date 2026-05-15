@@ -23,7 +23,7 @@ def test_comfyui_qwen_image_edit_pipeline_direct() -> None:
         pipeline_class_name="ComfyUIQwenImageEditPipeline",
         num_gpus=1,
         comfyui_mode=True,
-        layerwise_offload=False,
+        dit_layerwise_offload=False,
     )
 
     batch_size = 1

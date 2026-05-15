@@ -34,7 +34,7 @@ class ServerArgsAutoTuner:
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
 
-    def adjust(self) -> None:
+    def adjust_based_on_performance_mode(self) -> None:
         """Adjust the server args based on the performance mode"""
         args = self.server_args
         args.performance_mode = self._normalize_performance_mode()
@@ -131,6 +131,7 @@ class ServerArgsAutoTuner:
             self._enable_cfg_parallel_if_supported()
 
     def maybe_adjust_auto_default_layerwise_offload(self) -> None:
+        """adjust the default layerwise offload policy"""
         args = self.server_args
         if not self.could_override_server_args():
             return

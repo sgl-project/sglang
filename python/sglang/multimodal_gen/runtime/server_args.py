@@ -72,10 +72,6 @@ logger = init_logger(__name__)
 
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
-SERVER_ARG_ALIASES = {
-    "dit_layerwise_offload": "layerwise_offload",
-    "layerwise_offload_modules": "layerwise_offload_components",
-}
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 LORA_MERGE_MODES = ("auto", "merge", "dynamic")
@@ -202,8 +198,10 @@ class ServerArgs(DisaggArgsMixin):
 
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
-    layerwise_offload: bool | None = None
-    layerwise_offload_components: list[str] | None = None
+    dit_layerwise_offload: bool | None = None
+    _layerwise_offload_components: list[str] | None = field(
+        default=None, init=False, repr=False
+    )
     dit_offload_prefetch_size: float = 0.0
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -325,6 +323,22 @@ class ServerArgs(DisaggArgsMixin):
         """
         return self.host is None or self.port is None
 
+    @property
+    def layerwise_offload(self) -> bool | None:
+        return self.dit_layerwise_offload
+
+    @layerwise_offload.setter
+    def layerwise_offload(self, value: bool | None) -> None:
+        self.dit_layerwise_offload = value
+
+    @property
+    def layerwise_offload_components(self) -> list[str] | None:
+        return self._layerwise_offload_components
+
+    @layerwise_offload_components.setter
+    def layerwise_offload_components(self, value: list[str] | None) -> None:
+        self._layerwise_offload_components = value
+
     def _adjust_path(self):
         expand_path_fields(self)
         self._adjust_save_paths()
@@ -332,7 +346,7 @@ class ServerArgs(DisaggArgsMixin):
     def _adjust_parameters(self):
         """set defaults and normalize values."""
         auto_tuner = ServerArgsAutoTuner(self)
-        auto_tuner.adjust()
+        auto_tuner.adjust_based_on_performance_mode()
         if auto_tuner.could_override_server_args():
             self._adjust_offload()
             auto_tuner.maybe_adjust_auto_default_layerwise_offload()
@@ -818,12 +832,12 @@ class ServerArgs(DisaggArgsMixin):
         """Return whether a lazy-loaded component should try layerwise offload.
 
         `layerwise_offload` is the internal global switch for layerwise CPU
-        offload. The legacy CLI flag `--dit-layerwise-offload` maps to it.
+        offload, backed by the public `--dit-layerwise-offload` server arg.
 
-        `layerwise_offload_components` is the component scope. Lazy components
-        are loaded after the normal pipeline-wide configuration pass, so they
-        should only attempt layerwise configuration when a component scope is
-        present.
+        `layerwise_offload_components` is an internal component scope. Lazy
+        components are loaded after the normal pipeline-wide configuration
+        pass, so they should only attempt layerwise configuration when a
+        component scope is present.
         """
         return bool(self.layerwise_offload and self.layerwise_offload_components)
 
@@ -834,7 +848,7 @@ class ServerArgs(DisaggArgsMixin):
         if component_names is not None:
             if self.layerwise_offload is False:
                 raise ValueError(
-                    "--layerwise-offload-components cannot be used when "
+                    "layerwise_offload_components cannot be set when "
                     "--dit-layerwise-offload is false."
                 )
             self.layerwise_offload = True
@@ -1162,29 +1176,13 @@ class ServerArgs(DisaggArgsMixin):
             help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
         )
         parser.add_argument(
-            "--layerwise-offload",
             "--dit-layerwise-offload",
-            dest="layerwise_offload",
             action=StoreBoolean,
-            default=ServerArgs.layerwise_offload,
+            default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap. "
-            "`--dit-layerwise-offload` is kept as a legacy alias. Without --layerwise-offload-components, "
-            "it only enables the legacy default DiT components. Cannot be used together with cache-dit "
+            "It enables the legacy default DiT components. Auto-tuning may add "
+            "CPU-offloaded encoder/VAE components internally. Cannot be used together with cache-dit "
             "(SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
-        )
-        parser.add_argument(
-            "--layerwise-offload-components",
-            "--layerwise-offload-modules",
-            type=str,
-            nargs="+",
-            default=ServerArgs.layerwise_offload_components,
-            help="Restrict layerwise offload to pipeline component names. "
-            "Use default to keep the legacy default DiT component selection, "
-            "or all to select every layerwise-offloadable component. "
-            "Auto tuning may add CPU-offloaded encoder/VAE components when this is unset. "
-            "The --layerwise-offload-modules alias is accepted. "
-            "This option implies --layerwise-offload true. Example: "
-            "--layerwise-offload-components default text_encoder.",
         )
         parser.add_argument(
             "--dit-offload-prefetch-size",
@@ -1610,14 +1608,7 @@ class ServerArgs(DisaggArgsMixin):
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
-        kwargs = dict(kwargs)
-        for alias_name, canonical_name in SERVER_ARG_ALIASES.items():
-            if alias_name in kwargs:
-                if canonical_name not in kwargs:
-                    kwargs[canonical_name] = kwargs[alias_name]
-                del kwargs[alias_name]
-
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        attrs = [attr.name for attr in dataclasses.fields(cls) if attr.init]
         server_args_kwargs: dict[str, Any] = {}
 
         component_paths = dict(kwargs.get("component_paths") or {})
@@ -1658,12 +1649,6 @@ class ServerArgs(DisaggArgsMixin):
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
-        for alias_name, canonical_name in SERVER_ARG_ALIASES.items():
-            if alias_name in kwargs:
-                if canonical_name not in kwargs:
-                    kwargs[canonical_name] = kwargs[alias_name]
-                del kwargs[alias_name]
-
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
@@ -1691,7 +1676,6 @@ class ServerArgs(DisaggArgsMixin):
             if arg.startswith("--"):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
-                arg_name = SERVER_ARG_ALIASES.get(arg_name, arg_name)
                 provided_arg_names.add(arg_name)
         if "mode" in provided_arg_names:
             provided_arg_names.add("performance_mode")
@@ -1754,7 +1738,7 @@ class ServerArgs(DisaggArgsMixin):
                     "layerwise_offload cannot be enabled together with cache-dit. "
                     "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
                     "causing shape mismatch errors. "
-                    "Please disable either --layerwise-offload/--dit-layerwise-offload or SGLANG_CACHE_DIT_ENABLED."
+                    "Please disable either --dit-layerwise-offload or SGLANG_CACHE_DIT_ENABLED."
                 )
 
             logger.warning(

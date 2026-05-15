@@ -151,16 +151,18 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "/data/my-model",
-                "layerwise_offload_components": ["text_encoder", "transformer"],
+                "performance_mode": "manual",
             }
         )
+        args.layerwise_offload_components = ["text_encoder", "transformer"]
+        args._adjust_layerwise_offload_components()
 
         self.assertTrue(args.layerwise_offload)
         self.assertEqual(
             args.layerwise_offload_components, ["text_encoder", "transformer"]
         )
 
-    def test_legacy_dit_layerwise_offload_alias_extends_default_components(self):
+    def test_dit_layerwise_offload_extends_default_components(self):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "/data/my-model",
@@ -171,7 +173,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertTrue(args.layerwise_offload)
         self.assertEqual(args.layerwise_offload_components, ["default", "text_encoder"])
 
-    def test_legacy_dit_layerwise_offload_from_kwargs_alias(self):
+    def test_dit_layerwise_offload_from_kwargs(self):
         with patch.object(
             PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
         ):
@@ -187,58 +189,17 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "/data/my-model",
-                "layerwise_offload_components": ["text-encoder,transformer"],
+                "performance_mode": "manual",
             }
         )
+        args.layerwise_offload_components = ["text-encoder,transformer"]
+        args._adjust_layerwise_offload_components()
 
         self.assertEqual(
             args.layerwise_offload_components, ["text_encoder", "transformer"]
         )
 
-    def test_layerwise_offload_components_cli_args(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--layerwise-offload-components",
-            "transformer",
-            "text_encoder",
-        ]
-
-        with patch.object(sys, "argv", ["sglang"] + argv):
-            args, unknown_args = parser.parse_known_args(argv)
-            with patch.object(
-                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
-            ):
-                server_args = ServerArgs.from_cli_args(args, unknown_args)
-
-        self.assertTrue(server_args.layerwise_offload)
-        self.assertEqual(
-            server_args.layerwise_offload_components, ["transformer", "text_encoder"]
-        )
-
-    def test_layerwise_offload_modules_alias_cli_args(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--layerwise-offload-modules",
-            "transformer",
-        ]
-
-        with patch.object(sys, "argv", ["sglang"] + argv):
-            args, unknown_args = parser.parse_known_args(argv)
-            with patch.object(
-                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
-            ):
-                server_args = ServerArgs.from_cli_args(args, unknown_args)
-
-        self.assertTrue(server_args.layerwise_offload)
-        self.assertEqual(server_args.layerwise_offload_components, ["transformer"])
-
-    def test_legacy_dit_layerwise_offload_cli_alias(self):
+    def test_dit_layerwise_offload_cli_arg(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
         argv = [
@@ -371,15 +332,20 @@ class TestOffloadDefaults(unittest.TestCase):
             ModelTaskType.T2V,
             memory_gb=16,
             kwargs={
-                "layerwise_offload_components": [
-                    "text_encoder",
-                    "image_encoder",
-                    "video_dit",
-                    "vae",
-                ],
+                "performance_mode": "manual",
+                "dit_cpu_offload": True,
+                "text_encoder_cpu_offload": True,
+                "image_encoder_cpu_offload": True,
                 "vae_cpu_offload": True,
             },
         )
+        args.layerwise_offload_components = [
+            "text_encoder",
+            "image_encoder",
+            "video_dit",
+            "vae",
+        ]
+        args._adjust_layerwise_offload_components()
 
         self.assertTrue(args.layerwise_offload)
         self.assertFalse(args.dit_cpu_offload)
