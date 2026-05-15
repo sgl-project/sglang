@@ -65,13 +65,22 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
 
         self.mock_lora_manager = MagicMock(spec=LoRAManager)
         self.mock_lora_manager.device = "cuda:0"
+        self.mock_lora_manager.memory_pool = MagicMock()
+        self.mock_lora_manager.memory_pool.uid_to_buffer_id = {}
         self.mock_lora_manager.validate_lora_batch.return_value = True
+        self.mock_lora_manager.fetch_new_loras.side_effect = self._mark_loras_loaded
 
     def tearDown(self):
         self.torch_patcher.stop()
 
     def _create_loader(self) -> LoRAOverlapLoader:
         return LoRAOverlapLoader(cast(LoRAManager, self.mock_lora_manager))
+
+    def _mark_loras_loaded(self, new_loras, _loras_to_be_loaded):
+        for lora_id in new_loras:
+            self.mock_lora_manager.memory_pool.uid_to_buffer_id[lora_id] = len(
+                self.mock_lora_manager.memory_pool.uid_to_buffer_id
+            )
 
     def _create_mock_event(self, query_return: bool = False) -> MagicMock:
         event = MagicMock(spec=CudaEvent)
@@ -103,6 +112,48 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
             {"new_lora"}, set()
         )
+
+    def test_loaded_lora_reused_after_stale_event_drain(self):
+        loader = self._create_loader()
+        self.mock_lora_manager.memory_pool = MagicMock()
+        self.mock_lora_manager.memory_pool.uid_to_buffer_id = {}
+        events = [
+            self._create_mock_event(query_return=True),
+            self._create_mock_event(query_return=False),
+        ]
+        self.mock_device_module.Event.side_effect = events
+        self.mock_lora_manager.validate_lora_batch.side_effect = (
+            lambda lora_ids: len(lora_ids) <= 2
+        )
+
+        self.assertTrue(loader._try_start_overlap_load("lora_A", running_loras=set()))
+        self.assertIn("lora_A", loader.lora_to_overlap_load_event)
+
+        self.mock_lora_manager.fetch_new_loras.reset_mock()
+        self.assertFalse(loader.try_overlap_load_lora("lora_B", running_loras=set()))
+        self.assertNotIn("lora_A", loader.lora_to_overlap_load_event)
+        self.assertIn("lora_B", loader.lora_to_overlap_load_event)
+        self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
+            {"lora_B"}, set()
+        )
+
+        self.mock_lora_manager.fetch_new_loras.reset_mock()
+        self.assertTrue(loader.try_overlap_load_lora("lora_A", running_loras=set()))
+        self.assertIn("lora_B", loader.lora_to_overlap_load_event)
+        self.mock_lora_manager.fetch_new_loras.assert_not_called()
+
+    def test_pending_lora_load_must_complete_even_if_memory_pool_has_slot(self):
+        loader = self._create_loader()
+        self.mock_lora_manager.memory_pool = MagicMock()
+        self.mock_lora_manager.memory_pool.uid_to_buffer_id = {"lora_A": 0}
+
+        loader.lora_to_overlap_load_event["lora_A"] = self._create_mock_event(False)
+
+        result = loader.try_overlap_load_lora("lora_A", running_loras=set())
+
+        self.assertFalse(result)
+        self.mock_lora_manager.fetch_new_loras.assert_not_called()
+        self.assertIn("lora_A", loader.lora_to_overlap_load_event)
 
     def test_full_lifecycle_single_lora_load(self):
         loader = self._create_loader()

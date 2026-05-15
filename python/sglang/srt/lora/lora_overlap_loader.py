@@ -51,17 +51,17 @@ class LoRAOverlapLoader:
     def _check_overlap_load_status(
         self, lora_id: Optional[str]
     ) -> LoRAOverlapLoadStatus:
-        if lora_id not in self.lora_to_overlap_load_event:
-            return LoRAOverlapLoadStatus.NOT_LOADED
+        self._drain_completed_overlap_loads()
 
-        event = self.lora_to_overlap_load_event[lora_id]
-
-        if not event.query():
+        if lora_id in self.lora_to_overlap_load_event:
             return LoRAOverlapLoadStatus.LOADING
 
-        self._mark_overlap_load_complete(lora_id, event)
+        # After completed events are drained, a memory-pool entry with no pending
+        # event is safe to use on the current stream.
+        if lora_id in self.lora_manager.memory_pool.uid_to_buffer_id:
+            return LoRAOverlapLoadStatus.LOADED
 
-        return LoRAOverlapLoadStatus.LOADED
+        return LoRAOverlapLoadStatus.NOT_LOADED
 
     def _mark_overlap_load_complete(
         self, lora_id: Optional[str], event: CudaEvent
@@ -81,7 +81,6 @@ class LoRAOverlapLoader:
     def _try_start_overlap_load(
         self, lora_id: Optional[str], running_loras: set[Optional[str]]
     ) -> bool:
-        self._drain_completed_overlap_loads()
         loras_to_be_loaded = running_loras | self.lora_to_overlap_load_event.keys()
 
         new_lora_set = {lora_id} | loras_to_be_loaded
