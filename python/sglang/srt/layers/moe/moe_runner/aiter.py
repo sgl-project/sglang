@@ -103,10 +103,6 @@ def _aiter_quant_type(quant_type: AiterQuantType):
 
 
 def get_aiter_expert_mask(layer) -> Optional[torch.Tensor]:
-    # DeepEPMoE sets self.expert_mask in __init__; standard FusedMoE exposes
-    # it via the dispatcher.
-    if getattr(layer, "expert_mask", None) is not None:
-        return layer.expert_mask
     return getattr(layer.dispatcher, "expert_mask_gpu", None)
 
 

@@ -153,13 +153,13 @@ class DeepEPMoE(FusedMoE):
         if get_moe_a2a_backend().is_mori():
             # mori dispatch produces global topk_ids in [0, num_experts);
             # mask out experts that are not local to this rank.
-            self.expert_mask = torch.zeros(
+            expert_mask = torch.zeros(
                 self.num_experts,
                 device=torch.cuda.current_device(),
                 dtype=torch.int32,
             )
             start = self.moe_ep_rank * self.num_local_experts
-            self.expert_mask[start : start + self.num_local_experts] = 1
+            expert_mask[start : start + self.num_local_experts] = 1
             self.mori_moe_max_input_tokens = get_int_env_var(
                 "SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0
             )
@@ -167,12 +167,13 @@ class DeepEPMoE(FusedMoE):
             # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
             # pre_permute reroutes them to the sink slot at index
             # num_local_experts, which is masked off here.
-            self.expert_mask = torch.zeros(
+            expert_mask = torch.zeros(
                 self.num_local_experts + 1,
                 device=torch.cuda.current_device(),
                 dtype=torch.int,
             )
-            self.expert_mask[:-1] = 1
+            expert_mask[:-1] = 1
+        self.dispatcher.expert_mask_gpu = expert_mask
 
     def forward(
         self,
