@@ -1675,7 +1675,8 @@ def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
         if pt > 0 and not os.path.exists(filename):
             break
         try:
-            lines = open(filename).readlines()
+            with open(filename) as f:
+                lines = f.readlines()
         except FileNotFoundError:
             print(f"{pt=}, {os.path.exists(filename)=}")
             raise
