@@ -836,6 +836,16 @@ class GroupCoordinator:
         else:
             pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
 
+    def all_to_all(
+        self,
+        input_: torch.Tensor,
+    ) -> torch.Tensor:
+        npu_comm = self.npu_communicator
+        if npu_comm is not None and not npu_comm.disabled:
+            return npu_comm.all_to_all(input_)
+        else:
+            raise ValueError(f"All to all only support npu for now.")
+
     def all_gather(
         self,
         input_: torch.Tensor,
@@ -1502,6 +1512,7 @@ def get_attn_cp_group() -> GroupCoordinator:
 _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
+_LM_HEAD_TP: Optional[GroupCoordinator] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
@@ -1517,6 +1528,11 @@ def get_moe_ep_group() -> GroupCoordinator:
 def get_moe_tp_group() -> GroupCoordinator:
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
+
+
+def get_lm_head_tp_group() -> GroupCoordinator:
+    assert _LM_HEAD_TP is not None, "lm head parallel group is not initialized"
+    return _LM_HEAD_TP
 
 
 # kept for backward compatibility
@@ -2019,6 +2035,27 @@ def initialize_model_parallel(
             recovered_rank=recovered_rank,
         )
 
+    lm_head_tp_size = envs.SGLANG_LM_HEAD_TP.get()
+    if lm_head_tp_size > 1:
+        assert (
+            world_size % lm_head_tp_size == 0
+        ), f"lm_head tp size {lm_head_tp_size} is not divided by world_size {world_size}"
+        global _LM_HEAD_TP
+        assert (
+            _LM_HEAD_TP is None
+        ), f"lm_head model parallel group is already initialized"
+        num_lm_head_tp_groups = world_size // lm_head_tp_size
+        group_ranks = []
+        for i in range(num_lm_head_tp_groups):
+            ranks = list(range(i * lm_head_tp_size, (i + 1) * lm_head_tp_size))
+            group_ranks.append(ranks)
+        _LM_HEAD_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="lm_head_tp",
+        )
+
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     global _PP
@@ -2238,6 +2275,16 @@ def get_moe_tensor_parallel_world_size():
 def get_moe_tensor_parallel_rank():
     """Return my rank for the moe tensor parallel group."""
     return get_moe_tp_group().rank_in_group
+
+
+def get_lm_head_tensor_parallel_world_size():
+    """Return world size for the lm head tensor parallel group."""
+    return get_lm_head_tp_group().world_size
+
+
+def get_lm_head_tensor_parallel_rank():
+    """Return my rank for the lm head tensor parallel group."""
+    return get_lm_head_tp_group().rank_in_group
 
 
 def destroy_model_parallel():
