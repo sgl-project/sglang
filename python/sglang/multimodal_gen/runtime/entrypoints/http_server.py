@@ -35,7 +35,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-DEFAULT_SEED = 1024
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 
 
@@ -278,7 +277,6 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
             rid,
             prompt=inst.get("prompt") or inst.get("text"),
             image_path=inst.get("image") or inst.get("image_url"),
-            seed=params.get("seed", DEFAULT_SEED),
             num_frames=params.get("num_frames"),
             fps=params.get("fps"),
             width=params.get("width"),

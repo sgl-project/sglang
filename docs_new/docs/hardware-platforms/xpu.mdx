@@ -71,15 +71,40 @@ pip install -v . --extra-index-url https://download.pytorch.org/whl/xpu
 
 ### Install Using Docker
 
-The docker for XPU is under active development. Please stay tuned.
+[The SGLang XPU Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xpu.Dockerfile) is provided to facilitate the installation.
+Replace `<secret>` below with your [HuggingFace access token](https://huggingface.co/docs/hub/en/security-tokens).
+
+```bash Command
+# Clone the SGLang repository
+git clone https://github.com/sgl-project/sglang.git
+cd sglang/docker
+
+# Build the docker image
+docker build -t sglang-xpu:latest -f xpu.Dockerfile .
+
+# Initiate a docker container
+docker run \
+    -it \
+    --privileged \
+    --ipc=host \
+    --network=host \
+    --group-add $(getent group video | cut -d: -f3) \
+    --device /dev/dri \
+    -v /dev/dri/by-path:/dev/dri/by-path \
+    -v /dev/shm:/dev/shm \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -p 30000:30000 \
+    -e "HF_TOKEN=<secret>" \
+    sglang-xpu:latest /bin/bash
+```
 
 ## Launch of the Serving Engine
 
 Example command to launch SGLang serving:
 
 ```bash
-python -m sglang.launch_server       \
-    --model <MODEL_ID_OR_PATH>       \
+sglang serve                         \
+    --model-path <MODEL_ID_OR_PATH>  \
     --trust-remote-code              \
     --disable-overlap-schedule       \
     --device xpu                     \

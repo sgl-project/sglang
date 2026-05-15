@@ -24,13 +24,15 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionResponseChoice,
     ChatMessage,
     CompletionRequest,
+    Function,
     ModelCard,
     ModelList,
+    Tool,
     UsageInfo,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
 
 
 class TestModelCard(unittest.TestCase):
@@ -189,7 +191,10 @@ class TestChatCompletionRequest(unittest.TestCase):
             },
         )
         self.assertEqual(request.reasoning_effort, "high")
-        self.assertEqual(request.chat_template_kwargs, {"thinking": True})
+        self.assertEqual(
+            request.chat_template_kwargs,
+            {"thinking": True, "enable_thinking": True},
+        )
 
     def test_chat_completion_reasoning_effort_none(self):
         """Test reasoning_effort='none' disables thinking"""
@@ -214,6 +219,37 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.reasoning_effort, "none")
         self.assertFalse(request.chat_template_kwargs.get("thinking"))
         self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
+
+    def test_chat_completion_reasoning_effort_max(self):
+        """`max` is an sglang extension on chat completion's top-level
+        `reasoning_effort` only; the Responses-API-style nested
+        `reasoning.effort` path stays aligned with OpenAI's three levels."""
+        from pydantic import ValidationError
+
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning_effort="max",
+        )
+        self.assertEqual(request.reasoning_effort, "max")
+
+        # Unknown values still rejected.
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=messages,
+                reasoning_effort="ultra",
+            )
+
+        # Nested reasoning.effort=max is NOT promoted by normalize_reasoning_inputs:
+        # the Responses API path keeps the OpenAI low/medium/high contract.
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning={"effort": "max"},
+        )
+        self.assertNotEqual(request.reasoning_effort, "max")
 
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""
@@ -334,6 +370,72 @@ class TestModelSerialization(unittest.TestCase):
         data = response.model_dump(exclude_none=True)
         self.assertIn("hidden_states", data["choices"][0])
         self.assertEqual(data["choices"][0]["hidden_states"], [0.1, 0.2, 0.3])
+
+
+class TestFunctionDeferLoading(unittest.TestCase):
+    """Test defer_loading field behavior on Function/Tool."""
+
+    def test_function_defaults_preserve_strict(self):
+        """strict must default to False and be present in dumps so downstream
+        code (function_call_parser, chat templates) sees the expected shape."""
+        f = Function(name="foo")
+        data = f.model_dump()
+        self.assertEqual(data["name"], "foo")
+        self.assertEqual(data["strict"], False)
+        self.assertNotIn("defer_loading", data)
+
+    def test_function_defer_loading_true_serialized(self):
+        f = Function(name="foo", defer_loading=True)
+        data = f.model_dump()
+        self.assertTrue(data["defer_loading"])
+        self.assertEqual(data["strict"], False)
+
+    def test_function_defer_loading_false_serialized(self):
+        """defer_loading=False is an explicit value and must be preserved."""
+        f = Function(name="foo", defer_loading=False)
+        data = f.model_dump()
+        self.assertIn("defer_loading", data)
+        self.assertFalse(data["defer_loading"])
+
+    def test_tool_level_defer_loading_propagates_to_function(self):
+        """defer_loading at the Tool level should propagate to Function."""
+        tool = Tool(
+            type="function",
+            defer_loading=True,
+            function={"name": "search_db"},
+        )
+        self.assertTrue(tool.function.defer_loading)
+        data = tool.model_dump()
+        self.assertTrue(data["function"]["defer_loading"])
+
+    def test_function_level_defer_loading_wins_over_tool_level(self):
+        """Explicit function-level value is preserved when both set."""
+        tool = Tool(
+            type="function",
+            defer_loading=True,
+            function={"name": "search_db", "defer_loading": False},
+        )
+        self.assertFalse(tool.function.defer_loading)
+
+    def test_tool_reference_content_part_accepted(self):
+        """Chat completion should accept tool_reference content on tool-role
+        messages (GLM-specific extension consumed by the chat template)."""
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": [
+                    {"type": "tool_reference", "name": "search_db"},
+                    {"type": "text", "text": "ok"},
+                ],
+            },
+        ]
+        request = ChatCompletionRequest(model="test-model", messages=messages)
+        parts = request.messages[0].content
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(parts[0].type, "tool_reference")
+        self.assertEqual(parts[0].name, "search_db")
+        self.assertEqual(parts[1].type, "text")
 
 
 class TestValidationEdgeCases(unittest.TestCase):
