@@ -2,8 +2,9 @@
 
 runner_configs.py <runner_config>
     Per-field `key=value` lines (install / artifact_version /
-    install_timeout / runs_on / rdma_devices). Called per stage by
-    _pr-test-stage.yml.
+    install_timeout / rdma_devices). `runs_on` is intentionally omitted —
+    it carries the `$b200_runner` sentinel and is resolved via --map.
+    Called per stage by _pr-test-stage.yml.
 
 runner_configs.py --map <b200_runner_label>
     `runs_on_map={json}` — flat dict {runner_config: runs_on}, with
@@ -26,10 +27,14 @@ def load() -> dict:
 
 
 def _emit_single(rc: str) -> None:
+    # runs_on goes through --map (resolves $b200_runner). Suppress it here so a
+    # consumer can't accidentally read the raw sentinel value.
     cfg = load().get(rc)
     if cfg is None:
         sys.exit(f"unknown runner_config: {rc!r}")
     for key, value in cfg.items():
+        if key == "runs_on":
+            continue
         print(f"{key}={value}")
 
 
