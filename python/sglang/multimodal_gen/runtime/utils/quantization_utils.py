@@ -127,12 +127,13 @@ def get_quant_config(
     model_config,
     component_model_path: str,
     packed_modules_mapping: Dict[str, List[str]] = {},
+    reverse_param_names_mapping: Dict[str, List[str]] = {},
     remap_prefix: Dict[str, str] | None = None,
 ) -> QuantizationConfig:
     quant_cfg = find_quant_modelslim_config(model_config, component_model_path)
     if quant_cfg is not None:
         quant_cls = _load_quant_cls(quant_cfg)
-        return quant_cls.from_config(quant_cfg)
+        return quant_cls.from_config(quant_cfg, reverse_param_names_mapping)
 
     if "quantization_config" not in model_config:
         return None
