@@ -81,7 +81,7 @@ class TextEncoderLoader(ComponentLoader):
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
-    def load_customized_kwargs(
+    def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
     ) -> dict[str, bool]:
         if ComponentLoader._is_component_set_as_layerwise_load(
