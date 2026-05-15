@@ -219,3 +219,41 @@ async fn concurrent_streams_are_isolated() {
     assert!(!body_a.windows(3).any(|w| w == b"BBB"));
     assert!(!body_b.windows(3).any(|w| w == b"AAA"));
 }
+
+#[tokio::test]
+async fn streaming_upstream_5xx_preserves_content_type() {
+    // Regression: when the worker returns a 5xx with JSON body to a
+    // streaming request, the router must preserve upstream content-type
+    // (application/json), not lie and say text/event-stream. OpenAI
+    // clients gate parsing on content-type.
+    let worker = common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({"error": {"type": "upstream", "message": "boom"}}),
+    )
+    .await;
+    let cfg = config(&worker.url);
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone()));
+    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        res.headers().get("content-type").unwrap().to_str().unwrap(),
+        "application/json",
+        "router must preserve upstream content-type on error, not force text/event-stream"
+    );
+}

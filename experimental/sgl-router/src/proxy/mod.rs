@@ -86,12 +86,25 @@ impl Proxy {
             .map_err(|e| ApiError::UpstreamWorker(format!("{e}")))?;
         let status =
             StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        // Capture content-type BEFORE consuming resp via bytes_stream().
+        let upstream_ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+        let content_type = if status.is_success() {
+            "text/event-stream".to_string()
+        } else {
+            upstream_ct
+        };
         let body = sse::bytes_stream_to_body(resp.bytes_stream());
         let mut out = Response::new(body);
         *out.status_mut() = status;
         out.headers_mut().insert(
             HeaderName::from_static("content-type"),
-            HeaderValue::from_static("text/event-stream"),
+            HeaderValue::from_str(&content_type)
+                .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
         );
         Ok(out)
     }
