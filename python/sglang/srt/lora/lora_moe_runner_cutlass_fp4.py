@@ -6,9 +6,8 @@ GEMMs so we can inject the standard ``after_gate_up`` / ``after_down`` LoRA
 hooks between w13 and w2, mirroring ``MarlinLoraRunnerCore``.
 
 Layout bridge: ``cutlass_fp4_group_mm`` writes expert-sorted ``[M*topk, *]``.
-Classic LoRA hooks consume ``c_map`` directly so the hot path stays sorted
-until the final combine; virtual-expert hooks still use small scratch shuffles
-because that kernel family has no native ``c_map`` indirection.
+Classic and virtual-expert LoRA hooks consume ``c_map`` directly so the hot
+path stays sorted until the final combine.
 """
 
 from __future__ import annotations

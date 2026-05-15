@@ -156,6 +156,7 @@ def _moe_lora_shrink_splitk_kernel(
     sorted_token_ids_ptr,  # type: ignore
     expert_ids_ptr,  # type: ignore
     num_tokens_post_padded_ptr,  # type: ignore
+    c_map_ptr,  # type: ignore  # NULL unless USE_C_MAP_INPUT
     # Dimensions
     N,  # type: ignore
     K,  # type: ignore
@@ -170,6 +171,7 @@ def _moe_lora_shrink_splitk_kernel(
     stride_cn,  # type: ignore
     # Constexprs
     top_k: tl.constexpr,
+    USE_C_MAP_INPUT: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -208,9 +210,16 @@ def _moe_lora_shrink_splitk_kernel(
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
 
-    a_ptrs = a_ptr + (
-        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-    )
+    if USE_C_MAP_INPUT:
+        # Input is already in expert-sorted pair layout. ``c_map[pair_idx]``
+        # gives the physical row that contains this logical pair.
+        a_row = tl.load(c_map_ptr + offs_token, mask=token_mask, other=0).to(tl.int64)
+    else:
+        # Existing token-major contract: gate_up reads the source token
+        # (pair_idx // top_k), while down with top_k == 1 reads pair_idx.
+        a_row = offs_token // top_k
+
+    a_ptrs = a_ptr + (a_row[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = (
         b_ptr
         + off_expert * stride_be
@@ -255,6 +264,8 @@ def _invoke_moe_lora_shrink_splitk(
     num_tokens_post_padded: torch.Tensor,
     top_k: int,
     config: dict[str, Any],
+    c_map: torch.Tensor | None = None,
+    input_is_sorted: bool = False,
 ) -> None:
     """Launch split-K shrink kernel for LoRA A with few virtual experts."""
     N = weight.shape[1]
@@ -279,6 +290,7 @@ def _invoke_moe_lora_shrink_splitk(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
+        c_map,
         N,
         K,
         topk_ids.numel(),
@@ -290,11 +302,171 @@ def _invoke_moe_lora_shrink_splitk(
         output.stride(0),
         output.stride(1),
         top_k=top_k,
+        USE_C_MAP_INPUT=input_is_sorted,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         GROUP_SIZE_M=GROUP_SIZE_M,
         SPLIT_K=SPLIT_K,
+        num_warps=config.get("num_warps", 4),
+        num_stages=config.get("num_stages", 4),
+    )
+
+
+@triton.jit
+def _moe_lora_expand_add_kernel(
+    # Pointers
+    a_ptr,  # type: ignore  # [num_tokens * top_k, K]
+    b_ptr,  # type: ignore  # [num_virtual_experts, N, K]
+    c_ptr,  # type: ignore  # [num_tokens * top_k, N]
+    topk_weights_ptr,  # type: ignore
+    sorted_token_ids_ptr,  # type: ignore
+    expert_ids_ptr,  # type: ignore
+    num_tokens_post_padded_ptr,  # type: ignore
+    token_lora_mask_ptr,  # type: ignore  # [num_tokens]
+    c_map_ptr,  # type: ignore  # NULL unless USE_C_MAP_OUTPUT
+    # Dimensions
+    N,  # type: ignore
+    K,  # type: ignore
+    num_valid_tokens,  # type: ignore
+    # Strides
+    stride_am,  # type: ignore
+    stride_ak,  # type: ignore
+    stride_be,  # type: ignore
+    stride_bn,  # type: ignore
+    stride_bk,  # type: ignore
+    stride_cm,  # type: ignore
+    stride_cn,  # type: ignore
+    # Constexprs
+    router_topk: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    USE_C_MAP_OUTPUT: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Grouped GEMM for the LoRA B stage that adds into an existing output."""
+    pid = tl.program_id(0)
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_expert == -1:
+        return
+
+    offs_cn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    a_ptrs = a_ptr + (offs_token[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = (
+        b_ptr
+        + off_expert * stride_be
+        + (offs_k[:, None] * stride_bk + offs_cn[None, :] * stride_bn)
+    )
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k_start in range(0, K, BLOCK_SIZE_K):
+        k_mask = offs_k < K - k_start
+        a = tl.load(a_ptrs, mask=token_mask[:, None] & k_mask[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
+        accumulator += tl.dot(a, b.to(a.dtype))
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
+        accumulator *= moe_weight[:, None]
+
+    offs_token_out = offs_token // router_topk
+    add_mask = tl.load(
+        token_lora_mask_ptr + offs_token_out, mask=token_mask, other=False
+    )
+    if USE_C_MAP_OUTPUT:
+        c_row = tl.load(c_map_ptr + offs_token, mask=token_mask, other=0).to(tl.int64)
+    else:
+        c_row = offs_token
+
+    accumulator = accumulator.to(c_ptr.dtype.element_ty)
+    offs_cn_raw = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * c_row[:, None] + stride_cn * offs_cn_raw[None, :]
+    c_mask = token_mask[:, None] & add_mask[:, None] & (offs_cn_raw[None, :] < N)
+    existing = tl.load(c_ptrs, mask=c_mask, other=0.0)
+    tl.store(c_ptrs, existing + accumulator, mask=c_mask)
+
+
+def _invoke_moe_lora_expand_add(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    token_lora_mask: torch.Tensor,
+    config: dict[str, Any],
+    mul_routed_weight: bool,
+    c_map: torch.Tensor | None = None,
+    output_is_sorted: bool = False,
+) -> None:
+    """Launch LoRA B expand-add, optionally writing through c_map."""
+    output_2d = output.view(-1, output.shape[-1])
+    N = weight.shape[1]
+    K = weight.shape[2]
+    BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
+    BLOCK_SIZE_N = min(config.get("BLOCK_SIZE_N", 64), max(16, N))
+    BLOCK_SIZE_K = config.get("BLOCK_SIZE_K", 64)
+    GROUP_SIZE_M = config.get("GROUP_SIZE_M", 1)
+
+    grid = (
+        triton.cdiv(sorted_token_ids.shape[0], BLOCK_SIZE_M)
+        * triton.cdiv(N, BLOCK_SIZE_N),
+    )
+
+    _moe_lora_expand_add_kernel[grid](
+        hidden_states,
+        weight,
+        output_2d,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        token_lora_mask,
+        c_map,
+        N,
+        K,
+        topk_ids.numel(),
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        weight.stride(2),
+        output_2d.stride(0),
+        output_2d.stride(1),
+        router_topk=topk_ids.shape[1],
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        USE_C_MAP_OUTPUT=output_is_sorted,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=GROUP_SIZE_M,
         num_warps=config.get("num_warps", 4),
         num_stages=config.get("num_stages", 4),
     )
@@ -507,6 +679,9 @@ def _merged_experts_fused_moe_lora_add_fake(
     mul_routed_weight: bool,
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
+    c_map: torch.Tensor | None = None,
+    input_is_sorted: bool = False,
+    output_is_sorted: bool = False,
 ) -> None:
     return
 
@@ -523,13 +698,19 @@ def _merged_experts_fused_moe_lora_add_impl(
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
     routing_cache: dict | None = None,
+    c_map: torch.Tensor | None = None,
+    input_is_sorted: bool = False,
+    output_is_sorted: bool = False,
 ) -> None:
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
     2. Flatten LoRA weights from [max_loras, num_experts, ...] to [max_loras * num_experts, ...].
-    3. Run regular SGLang fused-MoE kernels for LoRA A and LoRA B.
+    3. Run LoRA A shrink, then LoRA B expand/add with optional c_map layout.
     4. Mask out tokens with token_lora_mapping == -1 on the add path.
     """
+    if (input_is_sorted or output_is_sorted) and c_map is None:
+        raise ValueError("c_map is required when sorted virtual-expert layout is used")
+
     max_loras, _, max_lora_rank, _ = lora_a.shape
     input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
 
@@ -637,10 +818,6 @@ def _merged_experts_fused_moe_lora_add_impl(
 
         return result
 
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
-        invoke_fused_moe_kernel,
-    )
-
     lora_a_virtual = _merge_lora_expert_weight(lora_a)
     lora_b_virtual = _merge_lora_expert_weight(lora_b)
     num_experts_a = lora_a.shape[1]
@@ -676,6 +853,8 @@ def _merged_experts_fused_moe_lora_add_impl(
         num_tokens_post_padded,
         input_top_k,
         a_stage_config,
+        c_map=c_map,
+        input_is_sorted=input_is_sorted,
     )
 
     b_stage_config = _get_stage_config(lora_b_virtual, 1)
@@ -692,33 +871,54 @@ def _merged_experts_fused_moe_lora_add_impl(
         b_stage_config["BLOCK_SIZE_M"],
     )
 
-    invoke_fused_moe_kernel(
-        intermediate.view(-1, max_lora_rank),
-        lora_b_virtual,
-        None,
-        output,
-        None,
-        None,
-        None,
-        topk_weights,
-        topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        mul_routed_weight,
-        1,
-        b_stage_config,
-        tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
-        False,
-        False,
-        False,
-        False,
-        False,
-        None,
-        fuse_add_to_output=True,
-        add_output_mask=token_lora_mask,
-        router_topk=topk_ids.shape[1],
-    )
+    if output_is_sorted:
+        _invoke_moe_lora_expand_add(
+            intermediate.view(-1, max_lora_rank),
+            lora_b_virtual,
+            output,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            token_lora_mask,
+            b_stage_config,
+            mul_routed_weight,
+            c_map=c_map,
+            output_is_sorted=True,
+        )
+    else:
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+            invoke_fused_moe_kernel,
+        )
+
+        invoke_fused_moe_kernel(
+            intermediate.view(-1, max_lora_rank),
+            lora_b_virtual,
+            None,
+            output,
+            None,
+            None,
+            None,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            1,
+            b_stage_config,
+            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
+            False,
+            False,
+            False,
+            False,
+            False,
+            None,
+            fuse_add_to_output=True,
+            add_output_mask=token_lora_mask,
+            router_topk=topk_ids.shape[1],
+        )
 
 
 def _merged_experts_fused_moe_lora_add_op(
@@ -732,6 +932,9 @@ def _merged_experts_fused_moe_lora_add_op(
     mul_routed_weight: bool,
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
+    c_map: torch.Tensor | None = None,
+    input_is_sorted: bool = False,
+    output_is_sorted: bool = False,
 ) -> None:
     _merged_experts_fused_moe_lora_add_impl(
         output,
@@ -744,6 +947,9 @@ def _merged_experts_fused_moe_lora_add_op(
         mul_routed_weight,
         experts_shared_outer_loras_a,
         experts_shared_outer_loras_b,
+        c_map=c_map,
+        input_is_sorted=input_is_sorted,
+        output_is_sorted=output_is_sorted,
     )
 
 
@@ -769,6 +975,9 @@ def merged_experts_fused_moe_lora_add(
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
     routing_cache: dict | None = None,
+    c_map: torch.Tensor | None = None,
+    input_is_sorted: bool = False,
+    output_is_sorted: bool = False,
 ) -> None:
     """Public API: wraps the registered op with routing_cache support."""
     _merged_experts_fused_moe_lora_add_impl(
@@ -783,4 +992,7 @@ def merged_experts_fused_moe_lora_add(
         experts_shared_outer_loras_a,
         experts_shared_outer_loras_b,
         routing_cache,
+        c_map=c_map,
+        input_is_sorted=input_is_sorted,
+        output_is_sorted=output_is_sorted,
     )
