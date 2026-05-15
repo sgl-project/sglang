@@ -144,3 +144,61 @@ jobs:
         run: |
           echo "## Tier-2 results" >> "$GITHUB_STEP_SUMMARY"
           echo "- Build duration: \`${tier_2_build_duration_seconds:-(not recorded)}\` s" >> "$GITHUB_STEP_SUMMARY"
+
+  sgl-router-docker-build-test:
+    name: tier-3 — docker (placeholder)
+    needs: sgl-router-build-and-test
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Placeholder — populated in M6
+        run: |
+          echo "docker-build-test placeholder. To be populated in M6 (Observability + Docker)."
+          exit 0
+
+  sgl-router-k8s-integration:
+    name: tier-3 — k8s integration (placeholder)
+    needs: sgl-router-build-and-test
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Placeholder — populated in M2
+        run: |
+          echo "k8s-integration placeholder. To be populated in M2 (Service discovery)."
+          exit 0
+
+  sgl-router-e2e:
+    name: tier-3 — e2e (placeholder)
+    needs: sgl-router-build-and-test
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Placeholder — populated in M1
+        run: |
+          echo "e2e placeholder. To be populated in M1 (HTTP skeleton + tokenizer)."
+          exit 0
+
+  sgl-router-finish:
+    name: finish
+    needs:
+      - sgl-router-lint
+      - sgl-router-build-and-test
+      - sgl-router-docker-build-test
+      - sgl-router-k8s-integration
+      - sgl-router-e2e
+    runs-on: ubuntu-latest
+    steps:
+      - name: All required checks completed
+        run: echo "OK"
