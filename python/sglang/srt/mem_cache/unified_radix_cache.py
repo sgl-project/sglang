@@ -22,7 +22,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
@@ -221,9 +225,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._components_tuple: tuple[TreeComponent, ...] = tuple(
             self.components.values()
         )
-        self.hicache_anchor_kv_shared_indices_pools: list[
-            tuple[PoolName, PoolHitPolicy]
-        ] = []
+        self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
         # Streaming session: embedded StreamingSession with self as inner.
         # Always on -- zero overhead when no streaming session is open (the
@@ -309,7 +311,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
 
         self.load_cache_event = threading.Event()
-        self.hicache_anchor_kv_shared_indices_pools.clear()
+        self.sidecar_pool_specs.clear()
         attach_hybrid_pool_to_unified_cache(
             self,
             params,
@@ -333,12 +335,8 @@ class UnifiedRadixCache(BasePrefixCache):
             f"transfer_layer_num={self.cache_controller.layer_num}"
         )
 
-    def register_hicache_anchor_kv_shared_indices_pool(
-        self,
-        pool_name: PoolName,
-        hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES,
-    ) -> None:
-        self.hicache_anchor_kv_shared_indices_pools.append((pool_name, hit_policy))
+    def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
+        self.sidecar_pool_specs.append(spec)
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
@@ -1164,7 +1162,10 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return 0
 
-        # Build aux transfers, keyed per component
+        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
+
+        # Build aux transfers, keyed per component.
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1172,13 +1173,11 @@ class UnifiedRadixCache(BasePrefixCache):
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
                 comp_xfers[comp.component_type] = t
-        anchor_kv_shared_indices_xfers = [
-            PoolTransfer(name=pool_name, hit_policy=hit_policy)
-            for pool_name, hit_policy in self.hicache_anchor_kv_shared_indices_pools
-        ]
+        sidecar_xfers = self._build_sidecar_transfers(
+            CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
+        )
 
         # Pre-evict host if insufficient
-        device_value = node.component_data[BASE_COMPONENT_TYPE].value
         kv_tokens = len(device_value)
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
@@ -1188,7 +1187,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 return 0
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(anchor_kv_shared_indices_xfers)
+        aux_xfers.extend(sidecar_xfers)
         host_indices = self.cache_controller.write(
             device_value, node_id=node.id, extra_pools=aux_xfers or None
         )
@@ -1245,10 +1244,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if t:
                 comp_xfers[comp.component_type] = t
-        anchor_kv_shared_indices_xfers = [
-            PoolTransfer(name=pool_name, hit_policy=hit_policy)
-            for pool_name, hit_policy in self.hicache_anchor_kv_shared_indices_pools
-        ]
+        sidecar_xfers = self._build_sidecar_transfers(
+            CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
+        )
 
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
@@ -1269,7 +1267,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(anchor_kv_shared_indices_xfers)
+        aux_xfers.extend(sidecar_xfers)
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
             node_id=best_match_node.id,
@@ -1300,6 +1298,52 @@ class UnifiedRadixCache(BasePrefixCache):
             self.inc_lock_ref(best_match_node).to_dec_params(),
         )
         return device_indices
+
+    def _build_sidecar_transfers(
+        self,
+        phase: CacheTransferPhase,
+        kv_xfer: PoolTransfer,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    ) -> list[PoolTransfer]:
+        transfers: list[PoolTransfer] = []
+        for spec in self.sidecar_pool_specs:
+            if spec.indices_from_pool == PoolName.KV:
+                indices_source = kv_xfer
+            else:
+                source_component = {
+                    PoolName.SWA: ComponentType.SWA,
+                    PoolName.MAMBA: ComponentType.MAMBA,
+                }.get(spec.indices_from_pool)
+                if source_component is None:
+                    raise AssertionError(
+                        f"Unsupported sidecar indices source pool "
+                        f"{spec.indices_from_pool}."
+                    )
+                matching_sources = comp_xfers.get(source_component, ())
+                if not matching_sources:
+                    continue
+                indices_source = matching_sources[0]
+                if indices_source.name != spec.indices_from_pool:
+                    raise AssertionError(
+                        f"Sidecar indices source pool {spec.indices_from_pool} "
+                        f"resolved to {indices_source.name} during {phase}."
+                    )
+
+            indices = (
+                indices_source.device_indices
+                if phase == CacheTransferPhase.BACKUP_HOST
+                else indices_source.host_indices
+            )
+            if indices is None or len(indices) == 0:
+                continue
+            transfers.append(
+                PoolTransfer(
+                    name=spec.pool_name,
+                    hit_policy=spec.hit_policy,
+                    indices_from_pool=spec.indices_from_pool,
+                )
+            )
+        return transfers
 
     def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
         """Increment hit count; trigger write_backup when threshold reached."""

@@ -21,6 +21,10 @@ on:
       force_continue_on_error:
         type: boolean
         default: false
+      pr_test_yml:
+        description: 'Workflow YAML whose stage `run_timeout_minutes` drives partition sizing.'
+        type: string
+        default: '.github/workflows/pr-test.yml'
     outputs:
       main_package:
         value: ${{ jobs.run.outputs.main_package }}
@@ -274,6 +278,7 @@ jobs:
           python3 scripts/ci/utils/compute_partitions.py \
             --full-parallel ${{ steps.parallel-mode.outputs.full }} \
             --partition-model-file /tmp/partition-model.json \
+            --pr-test-yml ${{ inputs.pr_test_yml }} \
             >> "$GITHUB_OUTPUT"
 
       - name: Set B200 runner tag

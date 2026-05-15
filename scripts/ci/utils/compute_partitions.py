@@ -45,7 +45,7 @@ _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
 
 
 def load_run_timeouts(pr_test_yml_path: str) -> dict:
-    """Map `self_name -> run_timeout_minutes` from pr-test.yml. The input
+    """Map `self_name -> run_timeout_minutes` from one pr-test*.yml. The input
     is required in `_pr-test-stage.yml` -- KeyError surfaces missing.
     Inline stage-a-test-cpu is skipped (uses `_STAGE_A_OVERRIDES`)."""
     with open(pr_test_yml_path) as f:
@@ -202,7 +202,7 @@ def main():
     parser.add_argument(
         "--pr-test-yml",
         default=os.path.join(REPO_ROOT, ".github", "workflows", "pr-test.yml"),
-        help="Path to pr-test.yml; per-stage `run_timeout_minutes` is read from here.",
+        help="Path to pr-test*.yml; per-stage `run_timeout_minutes` is read from here.",
     )
     args = parser.parse_args()
 
