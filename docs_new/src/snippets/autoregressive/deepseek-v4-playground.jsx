@@ -311,6 +311,17 @@ export const DeepSeekV4Playground = () => {
     ],
   };
 
+  // Per-hardware Docker image. Mirrors the "Docker Images by Hardware Platform"
+  // table in §2 of DeepSeek-V4.mdx; if you change one, change both.
+  const DOCKER_IMAGES = {
+    h100:  "lmsysorg/sglang:dev",
+    h200:  "lmsysorg/sglang:deepseek-v4-hopper",
+    b200:  "lmsysorg/sglang:deepseek-v4-blackwell",
+    b300:  "lmsysorg/sglang:deepseek-v4-b300",
+    gb200: "lmsysorg/sglang:deepseek-v4-grace-blackwell",
+    gb300: "lmsysorg/sglang:deepseek-v4-grace-blackwell",
+  };
+
   // ==========================================================================
   const config = {
     modelName: "DeepSeek-V4",
@@ -362,6 +373,11 @@ export const DeepSeekV4Playground = () => {
       PORT:      { target: "command", label: "Bind port",       default: "30000"    },
       NODE0_IP:  { target: "command", label: "Head node IP",    default: "<node0-ip>"   },
       NODE_RANK: { target: "command", label: "This node rank",  default: "<node-rank>"  },
+      // HuggingFace access token — used only by the Docker output for the
+      // `--env "HF_TOKEN=..."` line; Python mode never injects it. Kept in the
+      // "command" group (not "curl") so it appears alongside HOST_IP / PORT in
+      // the Env modal, sharing the same persistence pathway.
+      HF_TOKEN:  { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
       CURL_HOST: { target: "curl",    label: "Server host",     default: "localhost" },
       CURL_PORT: { target: "curl",    label: "Server port",     default: "30000"     },
     },
@@ -370,6 +386,7 @@ export const DeepSeekV4Playground = () => {
   -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
     cells: allCells,
     multiNodeHints: MULTI_NODE_HINTS,
+    dockerImages: DOCKER_IMAGES,
   };
 
   // === KEEP IN SYNC WITH deepseek-v4-deployment.jsx (end) ===
@@ -671,7 +688,9 @@ export const DeepSeekV4Playground = () => {
   // the three PD-Disagg roles (prefill + decode + router). The renderer
   // intentionally only emits the role itself; the operator pairs it with the
   // sibling role and a router invocation separately.
-  const renderCommandLines = (cell, flags, sel, envValues, pdMode = null) => {
+  // `mode` is "python" (bare `sglang serve`) or "docker" (wrapped in `docker run`
+  // against the per-hardware image from config.dockerImages).
+  const renderCommandLines = (cell, flags, sel, envValues, pdMode = null, mode = "python") => {
     const modelName = resolveModelName(sel);
     const nnodes = parseNnodes(sel.nodes);
     const multinode = nnodes > 1;
@@ -683,9 +702,27 @@ export const DeepSeekV4Playground = () => {
         `--node-rank {{NODE_RANK}}`,
         `--dist-init-addr {{NODE0_IP}}:20000`);
     }
-    const flagBlock = f.map((x) => "  " + x).join(" \\\n");
-    const envBlock = cell.env.length ? cell.env.join(" \\\n") + " \\\n" : "";
-    let cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
+    let cmd;
+    if (mode === "docker") {
+      const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      const dockerLines = [
+        "docker run --gpus all",
+        "  --shm-size 32g",
+        "  -p {{PORT}}:{{PORT}}",
+        "  -v ~/.cache/huggingface:/root/.cache/huggingface",
+        `  --env "HF_TOKEN={{HF_TOKEN}}"`,
+        ...cell.env.map((e) => `  --env ${e}`),
+        "  --ipc=host",
+        `  ${image}`,
+        "  sglang serve",
+        ...f.map((x) => "    " + x),
+      ];
+      cmd = dockerLines.join(" \\\n");
+    } else {
+      const flagBlock = f.map((x) => "  " + x).join(" \\\n");
+      const envBlock = cell.env.length ? cell.env.join(" \\\n") + " \\\n" : "";
+      cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
+    }
     if (multinode && config.multiNodeHints && config.multiNodeHints[sel.hw]) {
       const hint = config.multiNodeHints[sel.hw]
         .map((line) => (line.length ? "# " + line : "#")).join("\n");
@@ -866,6 +903,31 @@ export const DeepSeekV4Playground = () => {
       display: "inline-flex", alignItems: "center", gap: "4px",
     },
     iconRow: { display: "inline-flex", gap: "6px" },
+    // Python | Docker toggle (mirrors the one in §3.1 deployment snippet so the
+    // two cards look like siblings).
+    runModeWrap: {
+      display: "inline-flex",
+      border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
+      borderRadius: "10px",
+      overflow: "hidden",
+      fontSize: "11px",
+      fontWeight: 600,
+      userSelect: "none",
+    },
+    runModeChip: (active) => ({
+      padding: "2px 10px",
+      cursor: "pointer",
+      background: active ? (isDark ? "#1f2937" : "#fff") : "transparent",
+      color: active ? (isDark ? "#e5e7eb" : "#111827") : (isDark ? "#9ca3af" : "#6b7280"),
+      borderRight: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
+    }),
+    runModeChipLast: (active) => ({
+      padding: "2px 10px",
+      cursor: "pointer",
+      background: active ? (isDark ? "#1f2937" : "#fff") : "transparent",
+      color: active ? (isDark ? "#e5e7eb" : "#111827") : (isDark ? "#9ca3af" : "#6b7280"),
+    }),
+    headerLeft: { display: "inline-flex", alignItems: "center", gap: "8px" },
     modalBackdrop: {
       position: "fixed", inset: 0,
       background: "rgba(0,0,0,0.5)",
@@ -1026,6 +1088,10 @@ export const DeepSeekV4Playground = () => {
   const [curlCopied, setCurlCopied] = useState(false);
   const [envDraft, setEnvDraft] = useState(env);
   useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
+  // "python" or "docker" — applied to BOTH baseCommand and playgroundCommand so
+  // the diff still highlights only the user's actual deltas (not the
+  // python→docker framing differences). Defaults to python, same as §3.1.
+  const [runMode, setRunMode] = useState("python");
 
   // ==========================================================================
   // Derived
@@ -1038,9 +1104,11 @@ export const DeepSeekV4Playground = () => {
   let playgroundCommand = "";
   let diffLines = [];
   if (baseCell) {
-    baseCommand = renderCommandLines(baseCell, baseCell.flags, base, env);
+    // Render BOTH base and playground in the user's chosen mode so the diff
+    // shows only the playground deltas — not the python/docker framing.
+    baseCommand = renderCommandLines(baseCell, baseCell.flags, base, env, null, runMode);
     const pgFlags = applyDeltas(baseCell.flags, deltas, base);
-    playgroundCommand = renderCommandLines(baseCell, pgFlags, base, env, deltas.pd.mode);
+    playgroundCommand = renderCommandLines(baseCell, pgFlags, base, env, deltas.pd.mode, runMode);
     diffLines = computeDiff(baseCommand, playgroundCommand);
   }
 
@@ -1262,9 +1330,29 @@ export const DeepSeekV4Playground = () => {
         <div style={s.title}>Playground Command (diff vs verified base)</div>
         <div style={s.commandWrap}>
           <div style={s.commandHeader}>
-            <div style={s.badge}>
-              <span style={s.badgeDot} />
-              Auto-Estimated
+            <div style={s.headerLeft}>
+              <div style={s.badge}>
+                <span style={s.badgeDot} />
+                Auto-Estimated
+              </div>
+              <div style={s.runModeWrap} role="tablist" aria-label="Output format">
+                <span
+                  style={s.runModeChip(runMode === "python")}
+                  onClick={() => setRunMode("python")}
+                  role="tab"
+                  aria-selected={runMode === "python"}
+                >
+                  Python
+                </span>
+                <span
+                  style={s.runModeChipLast(runMode === "docker")}
+                  onClick={() => setRunMode("docker")}
+                  role="tab"
+                  aria-selected={runMode === "docker"}
+                >
+                  Docker
+                </span>
+              </div>
             </div>
             <div style={s.iconRow}>
               <button style={s.iconButton} onClick={handleCopy}>
