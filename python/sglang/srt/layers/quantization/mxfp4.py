@@ -141,6 +141,7 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_sm120_mxfp4_min_warps_patched = False
 
 if _is_hip:
     # import aiter
@@ -156,6 +157,49 @@ if _is_hip:
         dynamic_mxfp4_quant = e8m0_shuffle = err
 
 
+def _patch_sm120_mxfp4_min_warps():
+    global _sm120_mxfp4_min_warps_patched
+    if _sm120_mxfp4_min_warps_patched:
+        return
+
+    import inspect
+
+    from triton_kernels.matmul_ogs_details.opt_flags_details import opt_flags_nvidia
+    from triton_kernels.tensor import get_layout
+    from triton_kernels.tensor_details.layout import StridedLayout
+
+    compute_num_warps = opt_flags_nvidia.compute_num_warps
+    params = inspect.signature(compute_num_warps).parameters
+
+    if "is_persistent" in params and not getattr(
+        compute_num_warps, "_sglang_sm120_mxfp4_patch", False
+    ):
+
+        def _compute_num_warps_sm120_mxfp4(
+            block_m, block_n, is_persistent, precision_config
+        ):
+            selected_num_warps = compute_num_warps(
+                block_m, block_n, is_persistent, precision_config
+            )
+            weight_scale = getattr(precision_config, "weight_scale", None)
+            weight_scale_layout = get_layout(weight_scale)
+            if (
+                not is_persistent
+                and weight_scale is not None
+                and (
+                    weight_scale_layout is StridedLayout
+                    or isinstance(weight_scale_layout, StridedLayout)
+                )
+            ):
+                return max(selected_num_warps, 4)
+            return selected_num_warps
+
+        _compute_num_warps_sm120_mxfp4._sglang_sm120_mxfp4_patch = True
+        opt_flags_nvidia.compute_num_warps = _compute_num_warps_sm120_mxfp4
+
+    _sm120_mxfp4_min_warps_patched = True
+
+
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
     import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
@@ -165,8 +209,8 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
 
     if is_sm120_supported():
         # SM120 desktop Blackwell does not support the persistent/TMA MXFP4 path.
-        # This MXFP4 path uses StridedLayout and the non-persistent kernel with
-        # block_k=128 so the selected tile stays within the per-block shared-memory budget.
+        # This MXFP4 path uses StridedLayout and the non-persistent kernel.
+        _patch_sm120_mxfp4_min_warps()
         from triton_kernels.tensor_details.layout import StridedLayout
 
         value_layout = StridedLayout
@@ -175,7 +219,6 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         scale_layout_opts = {}
         constraints = {
             "is_persistent": False,
-            "block_k": 128,
             "num_stages": 1,
         }
         opt_flags.update_opt_flags_constraints(constraints)
