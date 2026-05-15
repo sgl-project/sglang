@@ -742,6 +742,10 @@ def configure_layerwise_offload_modules(
             continue
         if id(module) in configured_module_ids:
             continue
+        if is_layerwise_offloaded_module(module):
+            configured_component_names.append(component_name)
+            configured_module_ids.add(id(module))
+            continue
 
         configured_module_ids.add(id(module))
         module.configure_layerwise_offload(server_args)

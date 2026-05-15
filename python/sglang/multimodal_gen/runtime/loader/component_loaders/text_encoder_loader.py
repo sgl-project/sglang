@@ -81,6 +81,17 @@ class TextEncoderLoader(ComponentLoader):
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
+    def load_customized_kwargs(
+        self, server_args: ServerArgs, component_name: str
+    ) -> dict[str, bool]:
+        if self._layerwise_component_is_selected(server_args, component_name):
+            logger.info(
+                "Loading %s on CPU first because it is selected for layerwise offload",
+                component_name,
+            )
+            return {"cpu_offload_flag": True}
+        return {}
+
     def load_native(
         self,
         component_model_path: str,

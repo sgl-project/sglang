@@ -213,17 +213,6 @@ class ServerArgsAutoTuner:
         if not changed:
             return
 
-        if args.num_gpus > 1 and (
-            args.dit_layerwise_offload or not args.dit_cpu_offload
-        ):
-            logger.info(
-                "Keeping CPU offload for components on multi-GPU %s because "
-                "DiT weights are not CPU-offloaded during pipeline loading: %s",
-                args.pipeline_config.__class__.__name__,
-                ", ".join(changed),
-            )
-            return
-
         args.dit_layerwise_offload = True
         args.layerwise_offload_components = layerwise_components
         logger.info(
