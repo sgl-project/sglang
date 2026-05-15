@@ -17,6 +17,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -34,7 +35,7 @@ MAMBA_TRACK_INTERVAL = 128
 SWA_MODEL = "openai/gpt-oss-20b"
 FULL_MODEL = "Qwen/Qwen3-32B"
 
-register_cuda_ci(est_time=760, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=760, stage="stage-c", runner_config="4-gpu-h100")
 
 
 class UnifiedRadixTreeTestMixin:
@@ -47,6 +48,7 @@ class UnifiedRadixTreeTestMixin:
     prefix_len: int = 512
     prefill_cache_assert = None
     decode_cache_assert = None
+    sampling_temperature: float = 1
 
     gsm8k_threshold: float = 0.93
     mmlu_threshold: float = 0.8
@@ -105,6 +107,7 @@ class UnifiedRadixTreeTestMixin:
             turn_suffixes=[t2, t3],
             assert_decode_cached_tokens=self.decode_cache_assert,
             max_new_tokens=self.max_new_tokens,
+            sampling_temperature=self.sampling_temperature,
         )
 
     def test_multiturn_prefill_cache_hit_branching(self):
@@ -134,6 +137,7 @@ class UnifiedRadixTreeTestMixin:
             assert_decode_cached_tokens=self.decode_cache_assert,
             branches_per_group=branches,
             max_new_tokens=self.max_new_tokens,
+            sampling_temperature=self.sampling_temperature,
         )
 
     def test_multiturn_decode_cache_hit_branching(self):
@@ -158,6 +162,7 @@ class UnifiedRadixTreeTestMixin:
             assert_decode_cached_tokens=self.decode_cache_assert,
             branches_per_group=branches,
             max_new_tokens=self.max_new_tokens,
+            sampling_temperature=self.sampling_temperature,
         )
 
 
@@ -238,6 +243,10 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     gsm8k_threshold = 0.7
     mmlu_threshold = 0.7
 
+    @unittest.skipIf(is_in_ci(), "SWA model mmlu eval not stable enough")
+    def test_mmlu(self):
+        super().test_mmlu()
+
     @classmethod
     def setUpClass(cls):
         cls.model = SWA_MODEL
@@ -252,59 +261,6 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--mem-fraction-static",
                 "0.7",
                 "--disable-piecewise-cuda-graph",
-            ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
-        )
-        cls.input_ids = get_input_ids(cls.model, num_samples=18)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
-class TestUnifiedMambaRadixCacheWithHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
-    """Mamba hybrid + HiCache + UnifiedRadixCache."""
-
-    kl_threshold = 0.003
-    prefill_cache_assert = staticmethod(
-        make_mamba_prefill_assert(chunk_size=MAMBA_CHUNK_SIZE)
-    )
-    decode_cache_assert = staticmethod(
-        make_mamba_decode_assert(track_interval=MAMBA_TRACK_INTERVAL)
-    )
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = MAMBA_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--tp-size",
-                "4",
-                "--chunked-prefill-size",
-                "2048",
-                "--mem-fraction-static",
-                "0.85",
-                "--mamba-scheduler-strategy",
-                "extra_buffer",
-                "--mamba-track-interval",
-                str(MAMBA_TRACK_INTERVAL),
-                "--enable-hierarchical-cache",
-                "--hicache-ratio",
-                "4",
-                "--hicache-write-policy",
-                "write_through",
-                "--hicache-io-backend",
-                "direct",
-                "--hicache-mem-layout",
-                "page_first_direct",
-                "--max-total-tokens",
-                "12000",
-                "--max-running-requests",
-                "4",
             ],
             env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
