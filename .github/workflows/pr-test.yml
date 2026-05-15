@@ -548,6 +548,58 @@ jobs:
       timeout_per_file: '1800'
     secrets: inherit
 
+  stage-c-test-dsv4-8-gpu-b200:
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-c-test-dsv4-8-gpu-b200') ||
+        (
+          !inputs.target_stage &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: 8-gpu-b200
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v6
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda*
+
+      - name: Install dependencies
+        timeout-minutes: 30
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-8-gpu-b200 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+
   stage-c-test-dsv4-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
@@ -592,6 +644,7 @@ jobs:
         stage-c-test-deepep-4-gpu-h100,
         stage-c-test-4-gpu-b200,
         stage-c-test-dsv4-4-gpu-b200,
+        stage-c-test-dsv4-8-gpu-b200,
         stage-c-test-dsv4-8-gpu-h200,
         # stage-c-test-4-gpu-gb200,  # Temporarily disabled — no GB200 runner
       ]

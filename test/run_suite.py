@@ -56,6 +56,7 @@ PER_COMMIT_SUITES = {
         "stage-c-test-8-gpu-b200",
         "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-dsv4-4-gpu-b200",
+        "stage-c-test-dsv4-8-gpu-b200",
         "stage-c-test-dsv4-8-gpu-h200",
         # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
         # (tests still tagged per-commit but skipped on default PR runs).
