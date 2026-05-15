@@ -2129,7 +2129,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_accept_rate"] = num_correct_drafts / num_proposed_drafts
                 # accept_length: completion_tokens / verify_ct (includes bonus token).
                 meta_info["spec_accept_length"] = (
-                    recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
+                    recv_obj.spec_accepted_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
 
                 meta_info["spec_num_correct_drafts"] = num_correct_drafts
