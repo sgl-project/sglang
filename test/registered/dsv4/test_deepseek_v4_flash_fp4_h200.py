@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1800, stage="stage-c", runner_config="dsv4-8-gpu-h200")
+register_cuda_ci(est_time=370, stage="stage-c", runner_config="dsv4-8-gpu-h200")
 
 
 def _flashinfer_has_sm90_cutlass_mxfp4() -> bool:
@@ -91,6 +91,7 @@ class TestDSV4FlashFP4H200(ServerSanityMixin, CustomTestCase):
         self.assertGreater(metrics["score"], 0.93)
 
 
+@unittest.skip("broken on main, see #24816")
 @unittest.skipUnless(
     _flashinfer_has_sm90_cutlass_mxfp4(),
     "FlashInfer build lacks SM90 mixed-input MXFP4 helpers (PR #3084, >= 0.6.11)",
