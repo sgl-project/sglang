@@ -823,21 +823,26 @@ class ServerArgs(DisaggArgsMixin):
         return bool(self.layerwise_offload_components)
 
     def _adjust_layerwise_offload_components(self):
-        component_names = normalize_layerwise_offload_components(
+        explicitly_set_component_names = normalize_layerwise_offload_components(
             self.layerwise_offload_components
         )
         if self.dit_layerwise_offload:
-            if component_names is None:
-                component_names = [LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS]
-            elif LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS not in component_names:
-                component_names = [
+            if explicitly_set_component_names is None:
+                explicitly_set_component_names = [LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS]
+            elif (
+                LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS
+                not in explicitly_set_component_names
+            ):
+                explicitly_set_component_names = [
                     LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
-                    *component_names,
+                    *explicitly_set_component_names,
                 ]
 
-        if component_names is not None:
-            self.layerwise_offload_components = component_names
-            self._disable_cpu_offload_for_layerwise_components(component_names)
+        if explicitly_set_component_names is not None:
+            self.layerwise_offload_components = explicitly_set_component_names
+            self._disable_cpu_offload_for_layerwise_components(
+                explicitly_set_component_names
+            )
             return
 
     def _disable_cpu_offload_for_layerwise_components(
@@ -1163,7 +1168,7 @@ class ServerArgs(DisaggArgsMixin):
             "--dit-layerwise-offload",
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
-            help="Enable layerwise CPU offload with async H2D prefetch overlap. "
+            help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
             "It only selects the legacy default DiT components. Cannot be used together with cache-dit "
             "(SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )

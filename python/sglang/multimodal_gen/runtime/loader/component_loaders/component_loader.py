@@ -6,7 +6,7 @@ import importlib
 import os
 import pkgutil
 import traceback
-from abc import ABC
+from abc import ABC, abstractmethod
 from typing import Any, Type
 
 import torch
@@ -205,7 +205,9 @@ class ComponentLoader(ABC):
             with component_attn_backend_context_manager(
                 attn_backend, component_name=component_attn_name
             ):
-                load_kwargs = self.customized_load_kwargs_for_component(server_args, component_name)
+                load_kwargs = self.customized_load_kwargs_for_component(
+                    server_args, component_name
+                )
                 component = self.load_customized(
                     component_model_path, server_args, component_name, **load_kwargs
                 )

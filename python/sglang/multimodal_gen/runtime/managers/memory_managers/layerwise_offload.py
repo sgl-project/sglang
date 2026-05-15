@@ -672,14 +672,12 @@ def configure_layerwise_offload_modules(
 ) -> list[str]:
     """Configure layerwise offload for the given modules, from the given component_names
 
-        Args:
-            modules: the dict of {component_name: component}, containing the components to be chosen from
-            component_names: list of component names. component with names not in this list shouldn't be configured
+    Args:
+        modules: the dict of {component_name: component}, containing the components to be chosen from
+        component_names: list of component names. component with names not in this list shouldn't be configured
 
-        Returns a list of component names of modules configured to be layerwise-offload
+    Returns a list of component names of modules configured to be layerwise-offload
     """
-
-
 
     # components which has already been configured to be layerwise-offload
     configured_component_names: list[str] = []
@@ -754,13 +752,16 @@ def configure_layerwise_offload_modules(
             continue
         module_id = id(module)
         if module_id in configured_module_ids:
+            # avoid multiple configures on a same module
             continue
 
         configured_module_ids.add(module_id)
-        if not is_layerwise_offloaded_module(module):
-            module.configure_layerwise_offload(server_args)
+
         if is_layerwise_offloaded_module(module):
+            # already offloaded
             configured_component_names.append(component_name)
+        else:
+            module.configure_layerwise_offload(server_args)
 
     if configured_component_names:
         logger.info(

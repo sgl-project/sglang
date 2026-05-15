@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    configure_layerwise_offload_modules,
+)
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.models.vision_utils import (
     normalize,
@@ -488,10 +491,6 @@ class LTX2ImageEncodingStage(PipelineStage):
         )
         self._condition_image_encoder_dir = encoder_dir
         if server_args.should_configure_layerwise_offload_for_lazy_component():
-            from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-                configure_layerwise_offload_modules,
-            )
-
             modules = {"condition_image_encoder": self._condition_image_encoder}
             configure_layerwise_offload_modules(
                 modules,

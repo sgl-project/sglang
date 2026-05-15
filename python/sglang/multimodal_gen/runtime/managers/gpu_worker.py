@@ -238,6 +238,7 @@ class GPUWorker:
         return ", ".join(suggestions) if suggestions else "None"
 
     def _is_dit_layerwise_offload_selected(self) -> bool:
+        """if dit is selected to be layerwise-offload"""
         component_names = self.server_args.layerwise_offload_components
         return bool(
             component_names
