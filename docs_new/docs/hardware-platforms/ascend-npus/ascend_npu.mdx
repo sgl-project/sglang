@@ -185,6 +185,10 @@ drun --env "HF_TOKEN=<secret>" \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
 ```
 
+<Tip>
+SGLang will serve on `http://127.0.0.1:30000` by default. You can change the host and port by `--host` and `--port` parameters.
+</Tip>
+
 ## System Settings
 
 ### CPU performance power scheme
@@ -221,7 +225,11 @@ cat /proc/sys/vm/swappiness # shows 10
 ```bash Command
 # Enabling CPU Affinity
 export SGLANG_SET_CPU_AFFINITY=1
-python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --attention-backend ascend \
+  --host 127.0.0.1 \
+  --port 8000
 ```
 
 #### PD Disaggregation Scene
@@ -295,4 +303,55 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --enable-multimodal \
     --sampling-backend ascend
+```
+
+## Testing the Service
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests.
+
+### Health Check
+
+```bash Command
+curl http://127.0.0.1:8000/health
+```
+
+A successful response returns HTTP 200 with an empty body.
+
+### Generate (Native Endpoint)
+
+```bash Command
+curl http://127.0.0.1:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Hello, who are you?",
+    "sampling_params": {"temperature": 0, "max_new_tokens": 128}
+  }'
+```
+
+### Chat Completions (OpenAI-Compatible)
+
+```bash Command
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [{"role": "user", "content": "Hello, who are you?"}]
+  }'
+```
+
+### Multimodal Chat Completions
+
+```bash Command
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-VL-30B-A3B-Instruct",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "image_url", "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"}},
+        {"type": "text", "text": "Describe this image."}
+      ]
+    }]
+  }'
 ```
