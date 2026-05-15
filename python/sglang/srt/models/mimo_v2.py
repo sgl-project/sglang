@@ -1185,18 +1185,14 @@ class MiMoV2ForCausalLM(nn.Module):
                 start = segment_starts_flat[unit_idx]
                 seg_len = segment_lens_flat[unit_idx]
                 trimmed_chunks.append(
-                    audio_embedding[
-                        emb_offset + start : emb_offset + start + seg_len
-                    ]
+                    audio_embedding[emb_offset + start : emb_offset + start + seg_len]
                 )
                 unit_idx += 1
             emb_offset += vid_audio_len
             audio_video_idx += 1
 
         return (
-            torch.cat(trimmed_chunks, dim=0)
-            if trimmed_chunks
-            else audio_embedding[:0]
+            torch.cat(trimmed_chunks, dim=0) if trimmed_chunks else audio_embedding[:0]
         )
 
     def get_input_embeddings(self) -> Optional[nn.Embedding]:
