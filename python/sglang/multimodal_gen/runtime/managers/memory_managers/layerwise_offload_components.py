@@ -52,6 +52,7 @@ def layerwise_component_matches_selection(
     component_name: str,
     selected_component_name: str,
 ) -> bool:
+    """if the provided component_name (unnormalized, e.g., text_encoder_2)  matches with the selected_component_name (normalized)"""
     if selected_component_name == "text_encoder":
         return is_text_encoder_component_name(component_name)
     if selected_component_name == "vae":

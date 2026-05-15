@@ -105,16 +105,17 @@ class ComponentLoader(ABC):
         else:
             return get_local_torch_device()
 
-    def load_customized_kwargs(
-        self, server_args: ServerArgs, component_name: str
+    @abstractmethod
+    def customized_load_kwargs_for_component(
+        self, _server_args: ServerArgs, _component_name: str
     ) -> dict[str, Any]:
         return {}
 
-    def _layerwise_component_is_selected(
-        self, server_args: ServerArgs, component_name: str
+    @staticmethod
+    def _is_component_set_as_layerwise_load(
+        server_args: ServerArgs, component_name: str
     ) -> bool:
-        if not server_args.dit_layerwise_offload:
-            return False
+        """if a component should be loaded in a layerwise-fashion"""
         selected_component_names = server_args.layerwise_offload_components
         if selected_component_names is None:
             return False
@@ -129,7 +130,7 @@ class ComponentLoader(ABC):
             for selected_component in explicit_component_names
         )
 
-    def _configure_layerwise_after_startup_cpu_staging(
+    def _maybe_configure_layerwise_after_startup_cpu_staging(
         self,
         component: AutoModel,
         server_args: ServerArgs,
@@ -141,6 +142,7 @@ class ComponentLoader(ABC):
         if not isinstance(component, nn.Module):
             return component
 
+        # try to configure layerwise-offload with the component
         configured_components = configure_layerwise_offload_modules(
             {component_name: component},
             server_args,
@@ -159,6 +161,7 @@ class ComponentLoader(ABC):
             "module did not enable layerwise offload. Moving it to GPU.",
             component_name,
         )
+        # ensures the module is on GPU
         if component_name in configured_components:
             return component
         return component.to(get_local_torch_device())
@@ -202,11 +205,12 @@ class ComponentLoader(ABC):
             with component_attn_backend_context_manager(
                 attn_backend, component_name=component_attn_name
             ):
-                load_kwargs = self.load_customized_kwargs(server_args, component_name)
+                load_kwargs = self.customized_load_kwargs_for_component(server_args, component_name)
                 component = self.load_customized(
                     component_model_path, server_args, component_name, **load_kwargs
                 )
-                component = self._configure_layerwise_after_startup_cpu_staging(
+                # configure layerwise to make enough VRAM headroom
+                component = self._maybe_configure_layerwise_after_startup_cpu_staging(
                     component, server_args, component_name, load_kwargs
                 )
             source = "sgl-diffusion"

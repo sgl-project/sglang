@@ -670,7 +670,18 @@ def configure_layerwise_offload_modules(
     component_names: Sequence[str] | None = None,
     warn_missing: bool = True,
 ) -> list[str]:
-    """Configure registered pipeline components that expose layerwise offload."""
+    """Configure layerwise offload for the given modules, from the given component_names
+
+        Args:
+            modules: the dict of {component_name: component}, containing the components to be chosen from
+            component_names: list of component names. component with names not in this list shouldn't be configured
+
+        Returns a list of component names of modules configured to be layerwise-offload
+    """
+
+
+
+    # components which has already been configured to be layerwise-offload
     configured_component_names: list[str] = []
     configured_module_ids: set[int] = set()
     selected_component_names = (
@@ -739,6 +750,7 @@ def configure_layerwise_offload_modules(
             )
             and not (select_default and module.layerwise_offload_default_enabled)
         ):
+            # if the current component is not selected to be layerwise-offload, skip
             continue
         if id(module) in configured_module_ids:
             continue
