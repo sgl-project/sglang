@@ -73,7 +73,6 @@ Defined in `python/sglang/test/test_utils.py`:
 | `stage-c-test-8-gpu-h200` | `8-gpu-h200` | Large 8-GPU H200 runs for big models and parallelism |
 | `stage-c-test-8-gpu-h20` | `8-gpu-h20` | Large 8-GPU H20 runs for big models |
 | `stage-c-test-deepep-4-gpu-h100` | `4-gpu-h100` | DeepEP expert-parallel and networking on four H100s |
-| `stage-c-test-deepep-8-gpu-h200` | `8-gpu-h200` | DeepEP at 8-GPU H200 scale |
 | `stage-c-test-8-gpu-b200` | `8-gpu-b200` | 8-GPU B200 suite (registered but not yet wired to a workflow) |
 | `stage-c-test-4-gpu-b200` | `4-gpu-b200` | 4-GPU B200 suite for large models on Blackwell |
 | `stage-c-test-4-gpu-b200-small` | `4-gpu-b200` | Smaller 4-GPU B200 suite split onto low-disk B200 runners |

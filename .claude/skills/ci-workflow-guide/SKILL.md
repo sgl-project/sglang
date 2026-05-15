@@ -284,7 +284,6 @@ Large suites are split across matrix jobs using the **LPT (Longest Processing Ti
 | `stage-c-test-8-gpu-h200` | 4 | `8-gpu-h200` | — |
 | `stage-c-test-8-gpu-h20` | 2 | `8-gpu-h20` | — |
 | `stage-c-test-deepep-4-gpu-h100` | 1 (no matrix) | `4-gpu-h100` | — |
-| `stage-c-test-deepep-8-gpu-h200` | 1 (no matrix) | `8-gpu-h200` | — |
 | `stage-c-test-4-gpu-b200` | 3 | `4-gpu-b200` | — |
 | `stage-c-test-4-gpu-b200-small` | 3 | `4-gpu-b200-low-disk` | — |
 | `stage-c-test-8-gpu-b200` | registered only | `8-gpu-b200` | — |
