@@ -515,6 +515,47 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestDeepEPWaterfillArgs(CustomTestCase):
+    def test_waterfill_enforces_shared_experts_fusion(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            enable_deepep_waterfill=True,
+            disable_shared_experts_fusion=True,
+        )
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
+        server_args._handle_a2a_moe()
+
+        self.assertFalse(server_args.disable_shared_experts_fusion)
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
+
+    def test_waterfill_overrides_moe_a2a_backend_to_deepep(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="none",
+            enable_deepep_waterfill=True,
+        )
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.moe_a2a_backend, "deepep")
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
+
+    def test_waterfill_supports_deepep_low_latency_mode(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            enable_deepep_waterfill=True,
+            deepep_mode="low_latency",
+        )
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.deepep_mode, "low_latency")
+        self.assertFalse(server_args.disable_cuda_graph)
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
+
+
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.
 

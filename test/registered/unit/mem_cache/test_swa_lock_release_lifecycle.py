@@ -30,7 +30,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=12, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=12, stage="stage-b", runner_config="1-gpu-small")
 
 
 def _build_tree(
