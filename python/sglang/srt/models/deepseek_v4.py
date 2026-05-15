@@ -1095,7 +1095,10 @@ class DeepseekV4ForCausalLM(nn.Module):
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from deep_gemm import transform_sf_into_required_layout
 
-        layers = self.model.layers
+        if is_nextn:
+            layers = [self.model.decoder]
+        else:
+            layers = self.model.layers
         for layer in layers:
             attn = layer.self_attn
             G = attn.n_local_groups

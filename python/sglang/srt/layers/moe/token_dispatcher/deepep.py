@@ -625,16 +625,19 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         use_nvfp4 = use_fp8 = False
         input_global_scale = self.quant_config.get("input_global_scale", None)
+        bf16_dispatch = self.quant_config.get("bf16_dispatch", False)
         if input_global_scale is not None:
             use_nvfp4 = True
         else:
             backend = get_moe_runner_backend()
             # BF16 dispatch is needed when:
+            #   - quant_config requests BF16 dispatch explicitly
             #   - flashinfer_cutedsl: kernel quantizes to NVFP4 internally
             #   - NPU with SGLANG_DEEPEP_BF16_DISPATCH: INT8 input + BF16 weight GMM not supported
             #   - deep_gemm with SGLANG_DEEPEP_BF16_DISPATCH: user requests BF16 dispatch
             need_bf16_dispatch = (
-                backend.is_flashinfer_cutedsl()
+                bf16_dispatch
+                or backend.is_flashinfer_cutedsl()
                 or (_is_npu and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
                 or (backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
             )

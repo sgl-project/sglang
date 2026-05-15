@@ -71,6 +71,14 @@ export const DeepSeekV4Deployment = () => {
         { id: "enabled",  label: "Enabled",  default: false, subtitle: "deepseekv4" },
       ],
     },
+    hicache: {
+      name: "hicache",
+      title: "HiCache",
+      items: [
+        { id: "disabled", label: "Disabled", default: true  },
+        { id: "l2",       label: "L2",       default: false, subtitle: "GPU+CPU" },
+      ],
+    },
   };
 
   // Recipes that are not supported on the Marlin (FP4) Hopper paths
@@ -295,7 +303,7 @@ export const DeepSeekV4Deployment = () => {
   // === SHARED END ===
 
   const generateCommand = () => {
-    const { hardware: rawHardware, modelSize, recipe, reasoningParser, toolcall } = values;
+    const { hardware: rawHardware, modelSize, recipe, reasoningParser, toolcall, hicache } = values;
     // B300 usage is identical to B200 — alias so we don't duplicate every spec entry.
     const hardware = rawHardware === "b300" ? "b200" : rawHardware;
     const specKey = `${hardware}|${modelSize}`;
@@ -338,10 +346,21 @@ export const DeepSeekV4Deployment = () => {
       if (isBig) fp4Flags.push("  --mem-fraction-static 0.88");
       if (toolcall === "enabled") fp4Flags.push("  --tool-call-parser deepseekv4");
       if (reasoningParser === "enabled") fp4Flags.push("  --reasoning-parser deepseek-v4");
+      if (hicache === "l2") {
+        fp4Flags.push("  --enable-hierarchical-cache");
+        fp4Flags.push("  --hicache-ratio 2");
+        fp4Flags.push("  --hicache-size 0");
+        fp4Flags.push("  --hicache-write-policy write_through");
+        fp4Flags.push("  --hicache-io-backend direct");
+        fp4Flags.push("  --hicache-mem-layout page_first_direct");
+      }
       fp4Flags.push("  --host 0.0.0.0");
       fp4Flags.push("  --port 30000");
 
-      const fp4Cmd = `sglang serve \\\n${fp4Flags.join(" \\\n")}`;
+      const fp4Env = [];
+      if (hicache === "l2") fp4Env.push("SGLANG_ENABLE_UNIFIED_RADIX_TREE=1");
+      const fp4EnvBlock = fp4Env.length ? fp4Env.join(" \\\n") + " \\\n" : "";
+      const fp4Cmd = `${fp4EnvBlock}sglang serve \\\n${fp4Flags.join(" \\\n")}`;
       return VERIFIED_RECIPES.has(verifyKey)
         ? fp4Cmd
         : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(fp4Cmd)}`;
@@ -676,11 +695,27 @@ export const DeepSeekV4Deployment = () => {
     if (toolcall === "enabled") flags.push("  --tool-call-parser deepseekv4");
     if (reasoningParser === "enabled") flags.push("  --reasoning-parser deepseek-v4");
 
+    // HiCache flags (opt-in toggle, not in allinone).
+    if (hicache === "l2") {
+      flags.push("  --enable-hierarchical-cache");
+      flags.push("  --hicache-ratio 2");
+      flags.push("  --hicache-size 0");
+      flags.push("  --hicache-write-policy write_through");
+      flags.push("  --hicache-io-backend direct");
+      flags.push("  --hicache-mem-layout page_first_direct");
+    }
+
     flags.push("  --host 0.0.0.0");
     flags.push("  --port 30000");
 
-    // Assemble: [HW env] [recipe env] \ sglang serve \ flags...
-    const envAll = [...HW_ENV, ...recipeEnv];
+    // HiCache env vars.
+    const hicacheEnv = [];
+    if (hicache === "l2") {
+      hicacheEnv.push("SGLANG_ENABLE_UNIFIED_RADIX_TREE=1");
+    }
+
+    // Assemble: [HW env] [recipe env] [hicache env] \ sglang serve \ flags...
+    const envAll = [...HW_ENV, ...recipeEnv, ...hicacheEnv];
     const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
     // B200/B300 Pro recipes carry many accuracy-verified env vars that will be
     // consolidated; prepend a shell comment so users know these are temporary.
