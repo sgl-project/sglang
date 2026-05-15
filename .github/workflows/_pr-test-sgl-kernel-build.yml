@@ -56,8 +56,6 @@ jobs:
         include:
           - python-version: "3.10"
             cuda-version: "13.0"
-          - python-version: "3.10"
-            cuda-version: "12.9"
     name: ${{ inputs.job_display_name }}
     steps:
       - name: Cleanup
