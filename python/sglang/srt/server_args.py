@@ -4303,6 +4303,12 @@ class ServerArgs:
                 )
                 self.enable_flashinfer_allreduce_fusion = False
 
+            if self.flashinfer_allreduce_fusion_backend is not None:
+                logger.warning(
+                    "Disable --flashinfer-allreduce-fusion-backend because deterministic inference is enabled."
+                )
+                self.flashinfer_allreduce_fusion_backend = None
+
             # Check sampling backend
             self.sampling_backend = "pytorch"
             logger.warning(
