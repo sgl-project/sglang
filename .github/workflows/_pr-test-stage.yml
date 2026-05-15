@@ -1,0 +1,185 @@
+name: PR Test Stage
+# Reusable workflow for one CUDA test stage. Caller pr-test.yml forwards
+# `check_changes` = toJson(needs.check-changes.outputs) and
+# `caller_inputs` = toJson(inputs) as bundles. `partitions` is forwarded
+# separately to keep matrix expressions single-fromJson — its value is itself
+# a JSON string, so reading it via `check_changes` would need double fromJson,
+# and matrix can't use step-resolved values. stage-a-test-cpu stays inline in
+# pr-test.yml (bespoke uv pip / protoc / rust-cache install).
+
+on:
+  workflow_call:
+    inputs:
+      self_name:
+        description: 'Caller job key; used for partitions[suite] lookup and target_stage gating.'
+        type: string
+        required: true
+      runner_config:
+        description: 'Key in scripts/ci/runner_configs.yml (install script / artifact version / install timeout).'
+        type: string
+        required: true
+      runs_on:
+        description: 'GHA runner label. B200 stages pass needs.check-changes.outputs.b200_runner for dynamic selection.'
+        type: string
+        required: true
+      check_changes:
+        description: 'toJson(needs.check-changes.outputs). Read via fromJson(...).main_package / sgl_kernel / continue_on_error etc.'
+        type: string
+        required: true
+      caller_inputs:
+        description: 'toJson(inputs) from pr-test.yml. Read via fromJson(...).target_stage / pr_head_sha / git_ref / skip_stage_health_check / test_parallel_dispatch.'
+        type: string
+        required: true
+      partitions:
+        description: 'check-changes.outputs.partitions raw — kept separate to avoid double-fromJson in matrix expressions.'
+        type: string
+        required: true
+      run_timeout_minutes:
+        description: 'timeout-minutes for the Run test step. Required so compute_partitions.py can read it from pr-test.yml without a duplicated default constant.'
+        type: string
+        required: true
+      timeout_per_file:
+        description: 'run_suite.py --timeout-per-file value (empty = unset).'
+        type: string
+        default: ''
+      warmup_deep_gemm_models:
+        description: 'Space-separated `model:gpus` list; empty skips DeepGEMM warmup.'
+        type: string
+        default: ''
+      warmup_server_models:
+        description: 'Space-separated `model:gpus` list; empty skips server-CUDA-graph warmup.'
+        type: string
+        default: ''
+      warmup_timeout_minutes:
+        description: 'timeout-minutes for each warmup step. Bump for stages with large cold-cache model lists.'
+        type: string
+        default: '25'
+      extra_pytest_path:
+        description: 'pytest path to run after the suite (b200 FA4 jit_kernel tests). Empty skips.'
+        type: string
+        default: ''
+
+# Mirror pr-test.yml top-level env. Reusable workflows do NOT inherit caller's
+# workflow-level env across the workflow_call boundary, so anything pr-test.yml
+# defines must be redeclared here for the called job to see the same context.
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  SKIP_STAGE_HEALTH_CHECK: ${{ fromJson(inputs.caller_inputs).skip_stage_health_check && 'true' || 'false' }}
+  FORCE_REBUILD_DEEPEP: '1'
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  USE_VENV: false
+
+jobs:
+  run:
+    # target_stage takes precedence; otherwise default per-commit gating
+    # runs on schedule / parallel-dispatch / non-failed PR with main_package
+    # or sgl_kernel changes.
+    if: |
+      always() &&
+      (
+        (fromJson(inputs.caller_inputs).target_stage == inputs.self_name) ||
+        (
+          !fromJson(inputs.caller_inputs).target_stage &&
+          ((github.event_name == 'schedule' || fromJson(inputs.caller_inputs).test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true')
+        )
+      )
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 240
+    env:
+      # Only stage-c-test-8-gpu-h20 needs the RDMA device list.
+      SGLANG_CI_RDMA_ALL_DEVICES: ${{ inputs.runner_config == '8-gpu-h20' && 'mlx5_1,mlx5_2,mlx5_3,mlx5_4' || '' }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.partitions)[inputs.self_name].max_parallel }}
+      matrix:
+        partition: ${{ fromJson(inputs.partitions)[inputs.self_name].arr }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJson(inputs.caller_inputs).pr_head_sha || fromJson(inputs.caller_inputs).git_ref || github.sha }}
+
+      - name: Resolve runner_config
+        id: rc
+        run: python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts (v4)
+        if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v4' }}
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda*
+
+      - name: Download artifacts (v6)
+        if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6' }}
+        uses: actions/download-artifact@v6
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda*
+
+      - name: Install dependencies
+        timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
+
+      - name: Warmup DeepGEMM JIT Compilation
+        if: inputs.warmup_deep_gemm_models != ''
+        timeout-minutes: ${{ fromJson(inputs.warmup_timeout_minutes) }}
+        run: |
+          # Activate venv if available (GITHUB_ENV may have failed to propagate)
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
+          python3 scripts/ci/cuda/warmup_deep_gemm.py ${{ inputs.warmup_deep_gemm_models }}
+
+      - name: Warmup Server CUDA Graphs
+        if: inputs.warmup_server_models != ''
+        timeout-minutes: ${{ fromJson(inputs.warmup_timeout_minutes) }}
+        run: |
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
+          python3 scripts/ci/cuda/warmup_server.py ${{ inputs.warmup_server_models }}
+
+      - name: Fetch live partition model
+        if: fromJson(inputs.check_changes).partition_model_sha != ''
+        run: |
+          # SHA resolved by check-changes -> require fetch (curl --retry)
+          # so all shards stay on the same snapshot.
+          rm -f /tmp/partition-model.json
+          URL="https://raw.githubusercontent.com/sgl-project/sglang-ci-stats/${{ fromJson(inputs.check_changes).partition_model_sha }}/model.json"
+          curl --fail --silent --show-error --max-time 15 --retry 3 --retry-delay 2 \
+            "$URL" -o /tmp/partition-model.json
+
+      - name: Run test
+        timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite ${{ inputs.self_name }} \
+            --auto-partition-id ${{ matrix.partition }} \
+            --auto-partition-size ${{ fromJson(inputs.partitions)[inputs.self_name].size }} \
+            --partition-model-file /tmp/partition-model.json \
+            ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
+            $CONTINUE_ON_ERROR_FLAG
+
+      - name: Run extra pytest
+        if: inputs.extra_pytest_path != ''
+        timeout-minutes: 10
+        run: python3 -m pytest -q ${{ inputs.extra_pytest_path }}
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+        with:
+          artifact-suffix: ${{ matrix.partition }}
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh

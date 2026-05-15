@@ -319,6 +319,8 @@ class Envs:
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
+    MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
+    MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
@@ -617,7 +619,7 @@ class Envs:
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)
 
     # GEMM / kernel fusion
-    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
+    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_USE_JIT_NORM = EnvBool(False)
