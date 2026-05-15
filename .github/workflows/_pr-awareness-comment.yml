@@ -92,7 +92,6 @@ jobs:
 
             const newBlock = [
               outerStart,
-              '---',
               '### CI Awareness',
               '',
               `Latest PR Test: ${ptStart}${newPrTest}${ptEnd}`,

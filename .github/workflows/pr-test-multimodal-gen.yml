@@ -16,15 +16,7 @@ on:
         required: false
         type: string
         default: 'false'
-      pr_head_sha:
-        required: false
-        type: string
-        default: ''
       git_ref:
-        required: false
-        type: string
-        default: ''
-      target_stage:
         required: false
         type: string
         default: ''
@@ -51,13 +43,7 @@ env:
 
 jobs:
   compute-diffusion-partitions:
-    if: |
-      (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
-      (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
-      (
-        !inputs.target_stage &&
-        inputs.multimodal_gen == 'true'
-      )
+    if: inputs.multimodal_gen == 'true'
     runs-on: ubuntu-latest
     outputs:
       matrix-1gpu: ${{ steps.compute.outputs.matrix-1gpu }}
@@ -70,7 +56,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -88,14 +74,8 @@ jobs:
       always() &&
       needs.compute-diffusion-partitions.result == 'success' &&
       needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"include":[]}' &&
-      (
-        (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-          inputs.multimodal_gen == 'true'
-        )
-      )
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     strategy:
@@ -105,7 +85,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
 
@@ -167,14 +147,8 @@ jobs:
       always() &&
       needs.compute-diffusion-partitions.result == 'success' &&
       needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"include":[]}' &&
-      (
-        (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-          inputs.multimodal_gen == 'true'
-        )
-      )
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
     runs-on: 2-gpu-h100
     timeout-minutes: 240
     strategy:
@@ -184,7 +158,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
 
@@ -243,23 +217,15 @@ jobs:
 
   multimodal-gen-component-accuracy:
     if: |
-      (
-        inputs.target_stage == 'multimodal-gen-component-accuracy' ||
-        inputs.target_stage == 'multimodal-gen-component-accuracy-1-gpu' ||
-        inputs.target_stage == 'multimodal-gen-component-accuracy-2-gpu'
-      ) ||
-      (
-        !inputs.target_stage &&
-        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-        inputs.multimodal_gen == 'true'
-      )
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
     runs-on: 2-gpu-h100
     timeout-minutes: 240
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
 
@@ -296,19 +262,15 @@ jobs:
 
   multimodal-gen-test-1-b200:
     if: |
-      (inputs.target_stage == 'multimodal-gen-test-1-b200') ||
-      (
-        !inputs.target_stage &&
-        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-        inputs.multimodal_gen == 'true'
-      )
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
     runs-on: ${{ inputs.b200_runner }}
     timeout-minutes: 240
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
 
@@ -352,19 +314,15 @@ jobs:
 
   multimodal-gen-unit-test:
     if: |
-      (inputs.target_stage == 'multimodal-gen-unit-test') ||
-      (
-        !inputs.target_stage &&
-        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-        inputs.multimodal_gen == 'true'
-      )
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
     runs-on: 1-gpu-h100
     timeout-minutes: 120
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
 
@@ -405,7 +363,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
