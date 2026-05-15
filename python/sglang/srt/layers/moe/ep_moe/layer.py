@@ -126,6 +126,11 @@ class DeepEPMoE(FusedMoE):
 
         self.deepep_mode = get_deepep_mode()
 
+        # TODO: move this logic to process_weigths_after_loading, like:
+        # def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        #    if hasattr(layer, "dispatcher"):
+        #       layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+
         if quant_config is None and hasattr(self.dispatcher, "set_quant_config"):
             self.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
