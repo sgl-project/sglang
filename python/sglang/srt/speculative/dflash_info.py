@@ -310,14 +310,16 @@ class DFlashVerifyInput(SpecInput):
                 self.custom_mask = mask
         return kv_indices, cum_kv_seq_len, qo_indptr, mask
 
-    def verify(
+    def sample(
         self,
         *,
         batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
         page_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
-        """DFlash verification for greedy and non-greedy sampling.
+        """DFlash sample + verification for greedy and non-greedy sampling.
+        dataclass-level counterpart of `DFlashWorker.verify` (worker-level
+        end-to-end entry, including target forward).
 
         Returns:
             new_bonus_tokens: int64 tensor [bs] (the new current token per request)

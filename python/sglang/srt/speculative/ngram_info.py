@@ -387,13 +387,16 @@ class NgramVerifyInput(SpecInput):
             deterministic=True,
         )
 
-    def verify(
+    def sample(
         self,
         batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
     ) -> torch.Tensor:
+        """dataclass-level sample + tree acceptance for Ngram. Worker-level
+        end-to-end entry is `NGRAMWorker.verify`.
+        """
         bs = self.retrieve_index.shape[0]
         sampling_info = batch.sampling_info
 

@@ -312,7 +312,7 @@ class NGRAMWorker:
                     # and will be applied to produce wrong results
                     batch.sampling_info.vocab_mask = None
 
-            logits_output, next_token_ids, num_correct_drafts = verify_input.verify(
+            logits_output, next_token_ids, num_correct_drafts = verify_input.sample(
                 batch, logits_output, self.page_size, vocab_mask
             )
             num_correct_drafts_per_req_cpu = (

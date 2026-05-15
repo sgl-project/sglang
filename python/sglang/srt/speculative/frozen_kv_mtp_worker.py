@@ -765,7 +765,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_verify")
 
         spec_info.hidden_states = logits_output.hidden_states
-        res: FrozenKVMTPVerifyOutput = spec_info.verify(
+        res: FrozenKVMTPVerifyOutput = spec_info.sample(
             batch,
             logits_output,
             self.token_to_kv_pool_allocator,
