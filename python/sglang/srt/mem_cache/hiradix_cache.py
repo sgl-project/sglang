@@ -737,7 +737,7 @@ class HiRadixCache(RadixCache):
         # skip the hit count update for chunked requests
         if self.cache_controller.write_policy == "write_back" or chunked:
             return
-        node.hit_count += 1
+        self.eviction_strategy.on_hit(node)
 
         if not node.backuped:
             if node.hit_count >= self.write_through_threshold:
@@ -867,8 +867,11 @@ class HiRadixCache(RadixCache):
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
+        # See RadixCache.evict for the rationale - amortise time.monotonic
+        # across the whole eviction scan.
+        now = time.monotonic()
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self.eviction_strategy.get_priority(node, now), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
@@ -899,7 +902,7 @@ class HiRadixCache(RadixCache):
                     break
             else:
                 # all children are evicted or no children
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                new_priority = self.eviction_strategy.get_priority(x.parent, now)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
         if self.cache_controller.write_policy == "write_back":
@@ -938,8 +941,9 @@ class HiRadixCache(RadixCache):
 
     def evict_host(self, num_tokens: int):
         leaves = list(self.evictable_host_leaves)
+        now = time.monotonic()
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self.eviction_strategy.get_priority(node, now), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
@@ -968,7 +972,7 @@ class HiRadixCache(RadixCache):
             self._update_host_leaf_status(x.parent)
 
             if len(x.parent.children) == 0 and x.parent.evicted:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                new_priority = self.eviction_strategy.get_priority(x.parent, now)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
     def load_back(
@@ -1390,6 +1394,8 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        new_node.last_access_time = child.last_access_time
+        new_node.last_accessed_timestamp = child.last_accessed_timestamp
 
         # split value and host value if exists
         if child.evicted:

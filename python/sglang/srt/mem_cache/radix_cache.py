@@ -217,6 +217,10 @@ class TreeNode:
         self.creation_time = time.monotonic()
 
         self.hit_count = 0
+        # SLRU's last counted-hit timestamp. This starts at creation time but
+        # can diverge from ``last_access_time`` because cache lookups and
+        # debounced hits still refresh LRU recency.
+        self.last_accessed_timestamp = self.last_access_time
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
         self.host_ref_counter = 0
@@ -275,7 +279,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
-        self.eviction_policy = params.eviction_policy.lower()
+        self.eviction_policy = params.eviction_config.policy.lower()
 
         self.kv_event_queue = []
 
@@ -304,8 +308,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         elif self.eviction_policy == "priority":
             self.eviction_strategy: EvictionStrategy = PriorityStrategy()
         elif self.eviction_policy == "slru":
-            self.eviction_strategy: EvictionStrategy = SLRUStrategy()
-
+            self.eviction_strategy: EvictionStrategy = SLRUStrategy(
+                **params.eviction_config.params
+            )
         else:
             raise ValueError(
                 f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
@@ -564,8 +569,13 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
+        # Snapshot the monotonic clock once and thread it through each
+        # ``get_priority`` call. With N leaves this turns N clock reads into 1,
+        # and incidentally guarantees all priorities in the initial heap are
+        # evaluated against a single, consistent "now" reference.
+        now = time.monotonic()
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self.eviction_strategy.get_priority(node, now), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
@@ -578,7 +588,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                new_priority = self.eviction_strategy.get_priority(x.parent, now)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
@@ -673,6 +683,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
         new_node.hit_count = child.hit_count
+        # Preserve the counted-hit timestamp across splits so lazy decay sees
+        # the represented prefix's real SLRU age.
+        new_node.last_access_time = child.last_access_time
+        new_node.last_accessed_timestamp = child.last_accessed_timestamp
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -696,7 +710,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # in previous chunks.
         if chunked:
             return
-        node.hit_count += 1
+        # Delegate to the eviction strategy so policy-specific accounting
+        # (e.g. SLRU debounce, future custom policies) stays out of the radix
+        # tree hot path.
+        self.eviction_strategy.on_hit(node)
 
     def _insert_helper(
         self,

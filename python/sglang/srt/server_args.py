@@ -33,6 +33,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.mem_cache.cache_init_params import EvictionConfig
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
@@ -433,6 +434,9 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    slru_protected_threshold: int = 2
+    slru_debounce_sec: float = 0.1
+    slru_decay_sec: float = 60.0
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -4941,6 +4945,31 @@ class ServerArgs:
             help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'priority' evicts lower-priority requests first.",
         )
         parser.add_argument(
+            "--slru-protected-threshold",
+            type=int,
+            default=ServerArgs.slru_protected_threshold,
+            help="SLRU: hit_count >= threshold promotes a node to the Protected tier. "
+            "Only active with --radix-eviction-policy slru. When "
+            "SGLANG_ENABLE_SLRU_OPTIMIZATION=1, hit_count is also capped at this value.",
+        )
+        parser.add_argument(
+            "--slru-debounce-sec",
+            type=float,
+            default=ServerArgs.slru_debounce_sec,
+            help="SLRU write-side debounce window. Hits within this many seconds of "
+            "the last counted hit do not bump hit_count. Only active when "
+            "SGLANG_ENABLE_SLRU_OPTIMIZATION=1.",
+        )
+        parser.add_argument(
+            "--slru-decay-sec",
+            type=float,
+            default=ServerArgs.slru_decay_sec,
+            help="SLRU lazy-decay half-life. At eviction time, effective hit_count is "
+            "hit_count >> floor(age / decay_sec), so a cold Protected node demotes "
+            "itself back to Probationary. Only active when "
+            "SGLANG_ENABLE_SLRU_OPTIMIZATION=1.",
+        )
+        parser.add_argument(
             "--enable-prefill-delayer",
             action="store_true",
             help="Enable prefill delayer for DP attention to reduce idle time.",
@@ -7179,6 +7208,19 @@ class ServerArgs:
 
     def enable_mamba_extra_buffer(self) -> bool:
         return self.mamba_scheduler_strategy == "extra_buffer"
+
+    def radix_eviction_config(self) -> EvictionConfig:
+        params = {}
+        if self.radix_eviction_policy.lower() == "slru":
+            params = {
+                "protected_threshold": self.slru_protected_threshold,
+                "debounce_sec": self.slru_debounce_sec,
+                "decay_sec": self.slru_decay_sec,
+            }
+        return EvictionConfig(
+            policy=self.radix_eviction_policy,
+            params=params,
+        )
 
     @property
     def mamba_cache_chunk_size(self) -> int:

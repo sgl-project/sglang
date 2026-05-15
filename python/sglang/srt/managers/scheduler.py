@@ -869,7 +869,7 @@ class Scheduler(
             ),
             attn_cp_cache_group=self.attn_cp_cpu_group,
             attn_tp_cache_group=self.attn_tp_cpu_group,
-            eviction_policy=server_args.radix_eviction_policy,
+            eviction_config=server_args.radix_eviction_config(),
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),

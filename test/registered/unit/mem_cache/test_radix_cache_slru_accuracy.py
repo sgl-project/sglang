@@ -8,7 +8,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.cache_init_params import (
+    CacheInitParams,
+    EvictionConfig,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -53,7 +56,7 @@ class TestSLRUAccuracy(unittest.TestCase):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool,
             page_size=1,
-            eviction_policy="slru",
+            eviction_config=EvictionConfig(policy="slru"),
             enable_kv_cache_events=False,
         )
 
