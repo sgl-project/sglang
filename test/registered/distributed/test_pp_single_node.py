@@ -385,6 +385,8 @@ class TestQwen35PPAccuracy(unittest.TestCase):
                 pp_size,
                 "--chunked-prefill-size",
                 256,
+                "--mem-fraction-static",
+                "0.9",
             ],
         )
 
