@@ -1115,12 +1115,12 @@ class KVEventsSubscriber:
     def _medium_to_tier(self, medium: Optional[str]) -> Any:
         """Map a KV event medium string to a UMBPTierType value.
 
-        ``MEDIUM_GPU`` ("GPU") maps to HBM (GPU on-chip memory).
+        ``StorageMedium.GPU`` ("GPU") maps to HBM (GPU on-chip memory).
         All other values (CPU pinned, unknown) map to DRAM.
         """
-        from sglang.srt.disaggregation.kv_events import MEDIUM_GPU
+        from sglang.srt.disaggregation.kv_events import StorageMedium
 
-        return self._tier_hbm if medium == MEDIUM_GPU else self._tier_dram
+        return self._tier_hbm if medium == StorageMedium.GPU.value else self._tier_dram
 
     def on_event(
         self, event: Any, batch_ts: float, attn_dp_rank: Optional[int]
