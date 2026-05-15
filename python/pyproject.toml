@@ -153,7 +153,8 @@ test = [
   "granian>=2.6.0",
 ]
 
-dev = ["sglang[test]"]
+dev = ["sglang[test]", "sglang[tracing]"]
+all = ["sglang[test]", "sglang[tracing]"]
 
 all = [
   "sglang[diffusion]",
