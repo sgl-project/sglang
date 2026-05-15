@@ -165,25 +165,26 @@ class SchedulerProfilerMixin:
 
             rpdTracerControl.skipCreate()
 
+            rpd_filename = os.environ.get("RPDT_FILENAME", "trace.rpd")
             self.rpd_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
                 "rpd-" + str(time.time()) + f"-TP-{self.tp_rank}" + ".trace.json.gz",
             )
 
             if self.tp_rank == 0:
-                import sqlite3
+                if not os.path.exists(rpd_filename):
+                    import sqlite3
 
-                from rocpd.schema import RocpdSchema
+                    from rocpd.schema import RocpdSchema
 
-                if os.path.exists("trace.rpd"):
-                    os.unlink("trace.rpd")
-                schema = RocpdSchema()
-                connection = sqlite3.connect("trace.rpd")
-                schema.writeSchema(connection)
-                connection.commit()
-                del connection
+                    schema = RocpdSchema()
+                    connection = sqlite3.connect(rpd_filename)
+                    schema.writeSchema(connection)
+                    connection.commit()
+                    del connection
             torch.distributed.barrier(self.dp_tp_cpu_group)
 
+            self.rpd_filename = rpd_filename
             self.rpd_profiler = rpdTracerControl()
             self.rpd_profiler.setPythonTrace(True)
             self.rpd_profiler.start()
@@ -304,7 +305,7 @@ class SchedulerProfilerMixin:
             if self.tp_rank == 0:
                 from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
-                rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
+                rpd_to_chrome_trace(self.rpd_filename, self.rpd_profile_path)
             self.rpd_profiler = None
             self.rpd_profile_path = None
 
