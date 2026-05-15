@@ -429,6 +429,7 @@ class C4IndexerBackendMixin:
             )
 
         assert len(q_fp8.shape) == 3
+        q_fp8_ragged = q_fp8
         q_fp8 = q_fp8.unsqueeze(1)
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
@@ -443,25 +444,35 @@ class C4IndexerBackendMixin:
             if total_k == 0:
                 core_metadata.c4_sparse_page_indices.fill_(-1)
                 return
+            lengths = indexer_metadata.c4_k_finish - indexer_metadata.c4_k_start
+            valid_rows = lengths > 0
+            core_metadata.c4_sparse_page_indices.fill_(-1)
+            if not valid_rows.any():
+                return
 
             import deep_gemm
 
             logits = deep_gemm.fp8_mqa_logits(
-                q_fp8,
+                q_fp8_ragged[valid_rows],
                 (k_fp8, k_scale),
-                weights,
-                indexer_metadata.c4_k_start,
-                indexer_metadata.c4_k_finish,
+                weights[valid_rows],
+                indexer_metadata.c4_k_start[valid_rows],
+                indexer_metadata.c4_k_finish[valid_rows],
                 clean_logits=False,
             )
-            lengths = indexer_metadata.c4_k_finish - indexer_metadata.c4_k_start
+            out_indices = torch.empty(
+                (int(valid_rows.sum().item()), core_metadata.c4_sparse_page_indices.shape[1]),
+                dtype=core_metadata.c4_sparse_page_indices.dtype,
+                device=core_metadata.c4_sparse_page_indices.device,
+            )
             topk_transform_ragged_pytorch_vectorized(
                 logits,
-                indexer_metadata.c4_k_start,
-                lengths,
-                core_metadata.c4_sparse_page_indices,
+                indexer_metadata.c4_k_start[valid_rows],
+                lengths[valid_rows],
+                out_indices,
                 topk=core_metadata.c4_sparse_topk,
             )
+            core_metadata.c4_sparse_page_indices[valid_rows] = out_indices
             return
 
         assert len(c4_indexer_kv_cache.shape) == 2

@@ -88,10 +88,7 @@ def _create_flashmla_metadata():
 
 
 def _dsv4_use_no_prefix_bf16_sparse_prefill() -> bool:
-    return (
-        envs.SGLANG_DSV4_USE_BF16_SPARSE_PREFILL.get()
-        and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get()
-    )
+    return envs.SGLANG_DSV4_USE_BF16_SPARSE_PREFILL.get()
 
 
 def _dsv4_shift_valid_indices(indices: torch.Tensor, offset: int) -> torch.Tensor:
@@ -177,7 +174,11 @@ def _dsv4_build_unified_prefill_inputs_no_prefix(
             return None
         if extra_k.dtype != torch.bfloat16:
             return None
+        if extra_k.shape[0] == 0:
+            extra_k = None
+            extra_indices = None
 
+    if extra_k is not None:
         extra_offset = kv_unified.shape[0]
         kv_unified = torch.cat([kv_unified, extra_k.contiguous()], dim=0).contiguous()
         indices_unified = torch.cat(
@@ -209,6 +210,27 @@ def _dsv4_run_bf16_sparse_prefill_attention(
         return None
     if q_prefill.shape[-1] != kv_unified.shape[-1]:
         return None
+    if indices_unified.ndim != 3 or indices_unified.shape[1] != 1:
+        return None
+
+    indices_flat = indices_unified.squeeze(1)
+    valid_mask = indices_flat >= 0
+    topk_length = valid_mask.sum(dim=-1).to(torch.int32).contiguous()
+    if topk_length.numel() == 0 or int(topk_length.max().item()) == 0:
+        return None
+
+    # FlashMLA accepts -1 padding, but no-prefix ragged concatenates SWA padding
+    # before compact KV indices. Pack valid indices first so topk_length is exact.
+    packed_indices = torch.full_like(indices_flat, -1)
+    ranks = valid_mask.to(torch.int32).cumsum(dim=-1) - 1
+    row_ids = torch.arange(
+        indices_flat.shape[0], device=indices_flat.device
+    ).unsqueeze(1).expand_as(indices_flat)
+    packed_indices[row_ids[valid_mask], ranks[valid_mask].long()] = indices_flat[
+        valid_mask
+    ]
+    indices_unified = packed_indices.unsqueeze(1).contiguous()
+
     return flash_mla.flash_mla_sparse_fwd(
         q_prefill,
         kv_unified,
@@ -216,7 +238,7 @@ def _dsv4_run_bf16_sparse_prefill_attention(
         sm_scale=sm_scale,
         d_v=d_v,
         attn_sink=attn_sink,
-        topk_length=None,
+        topk_length=topk_length,
     )[0]
 
 
@@ -863,6 +885,18 @@ class DeepseekV4AttnBackend(
                 and forward_batch.out_cache_loc.shape[0] == sum(extend_seq_lens_cpu)
                 and get_attention_cp_size() == 1
             )
+            if envs.SGLANG_DSV4_DEBUG_NO_PREFIX_RAGGED.get():
+                logger.warning(
+                    "DSV4 no-prefix ragged metadata: enabled=%s, mode=%s, "
+                    "prefix_lens=%s, out_tokens=%s, extend_tokens=%s, "
+                    "compressor_v2=%s",
+                    enable_no_prefix_ragged,
+                    forward_batch.forward_mode,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.out_cache_loc.shape[0],
+                    sum(extend_seq_lens_cpu),
+                    envs.SGLANG_OPT_USE_COMPRESSOR_V2.get(),
+                )
             metadata = self.init_forward_metadata_prefill(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -1173,29 +1207,49 @@ class DeepseekV4AttnBackend(
                 if compress_ratio == 0 or (
                     extra_k_bf16 is not None and extra_indices_ragged is not None
                 ):
-                    prefill_inputs = _dsv4_build_unified_prefill_inputs_no_prefix(
-                        q=q if q.ndim == 4 else q.unsqueeze(1),
-                        swa_k=(
-                            swa_k
-                            if swa_k.ndim == 3
-                            else swa_k.view(-1, 1, swa_k.shape[-1])
-                        ),
-                        swa_ragged_indices=core_attn_metadata.swa_ragged_indices,
-                        extra_k=extra_k_bf16,
-                        extra_indices=extra_indices_ragged,
-                    )
-                    if prefill_inputs is not None:
-                        q_prefill, kv_unified, indices_unified = prefill_inputs
-                        o_sparse = _dsv4_run_bf16_sparse_prefill_attention(
-                            q_prefill=q_prefill,
-                            kv_unified=kv_unified,
-                            indices_unified=indices_unified,
-                            sm_scale=self.softmax_scale,
-                            d_v=self.head_dim_v,
-                            attn_sink=attn_sink,
+                    if (
+                        compress_ratio == 128
+                        and extra_k_bf16 is not None
+                        and extra_k_bf16.shape[0] == 0
+                    ):
+                        extra_k_bf16 = None
+                        extra_indices_ragged = None
+                    if compress_ratio == 128 and extra_k_bf16 is None:
+                        pass
+                    else:
+                        prefill_inputs = _dsv4_build_unified_prefill_inputs_no_prefix(
+                            q=q if q.ndim == 4 else q.unsqueeze(1),
+                            swa_k=(
+                                swa_k
+                                if swa_k.ndim == 3
+                                else swa_k.view(-1, 1, swa_k.shape[-1])
+                            ),
+                            swa_ragged_indices=core_attn_metadata.swa_ragged_indices,
+                            extra_k=extra_k_bf16,
+                            extra_indices=extra_indices_ragged,
                         )
-                        if o_sparse is not None:
-                            return o_sparse
+                        if prefill_inputs is not None:
+                            q_prefill, kv_unified, indices_unified = prefill_inputs
+                            o_sparse = _dsv4_run_bf16_sparse_prefill_attention(
+                                q_prefill=q_prefill,
+                                kv_unified=kv_unified,
+                                indices_unified=indices_unified,
+                                sm_scale=self.softmax_scale,
+                                d_v=self.head_dim_v,
+                                attn_sink=attn_sink,
+                            )
+                            if o_sparse is not None:
+                                if envs.SGLANG_DSV4_DEBUG_NO_PREFIX_RAGGED.get():
+                                    logger.warning(
+                                        "DSV4 no-prefix ragged attention hit: "
+                                        "layer=%s, ratio=%s, q=%s, kv=%s, indices=%s",
+                                        layer_id,
+                                        compress_ratio,
+                                        tuple(q_prefill.shape),
+                                        tuple(kv_unified.shape),
+                                        tuple(indices_unified.shape),
+                                    )
+                                return o_sparse
 
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
 

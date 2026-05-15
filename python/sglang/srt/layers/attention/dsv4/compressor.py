@@ -137,6 +137,16 @@ class CompressorBackendMixin:
             if compact_kv.ndim == 2:
                 compact_kv = compact_kv.unsqueeze(1)
             self._current_ragged_extra_kv[compressor.ratio] = compact_kv.contiguous()
+            if envs.SGLANG_DSV4_DEBUG_NO_PREFIX_RAGGED.get():
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "DSV4 no-prefix ragged compact core kv: ratio=%s, "
+                    "new_kv=%s, compact_kv=%s",
+                    compressor.ratio,
+                    tuple(new_compressed_kv.shape),
+                    tuple(compact_kv.shape),
+                )
         out_loc = (
             core_metadata.c4_out_loc
             if compressor.ratio == 4
@@ -182,6 +192,16 @@ class CompressorBackendMixin:
                     self._current_ragged_indexer_kv_fp8,
                     self._current_ragged_indexer_kv_scale,
                 ) = act_quant(compact_kv)
+            if envs.SGLANG_DSV4_DEBUG_NO_PREFIX_RAGGED.get():
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "DSV4 no-prefix ragged compact indexer kv: ratio=%s, "
+                    "new_kv=%s, compact_kv=%s",
+                    compressor.ratio,
+                    tuple(new_compressed_kv.shape),
+                    tuple(compact_kv.shape),
+                )
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
