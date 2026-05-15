@@ -142,6 +142,41 @@ def _generate_bench_data(
     }
 
 
+def _choose_atom_split(
+    batch: int,
+    ctx: int,
+    next_n: int,
+    num_sms: int = 148,
+    split_kv_tokens: int = 256,
+    tie: str = "max_na",
+    kernel_atoms=(1, 2, 3, 4),
+):
+    """Pick (num_atoms, atom_size) decomposition of next_n minimizing wave count;
+    tie-break configurable via ``tie``:
+      - ``max_na``:  prefer LARGEST num_atoms = smallest atom = most SMs busy per
+                     wave; pays HBM cost of num_atoms× KV re-reads.
+      - ``max_atom``: prefer LARGEST atom = smallest num_atoms = least HBM cost.
+
+    FP8 kernel natively supports ``atom ∈ kernel_atoms`` (default ``(1, 2, 3, 4)``).
+    Returns ``(num_atoms, atom)``.
+    """
+    cands = []
+    for atom in kernel_atoms:
+        if next_n % atom == 0:
+            na = next_n // atom
+            ntask = batch * na * ((ctx + split_kv_tokens - 1) // split_kv_tokens)
+            waves = (ntask + num_sms - 1) // num_sms
+            cands.append((waves, na, atom))
+    if tie == "max_na":
+        cands.sort(key=lambda x: (x[0], -x[1]))
+    elif tie == "max_atom":
+        cands.sort(key=lambda x: (x[0], x[1]))
+    else:
+        raise ValueError(f"unknown tie={tie!r}; expected 'max_na' or 'max_atom'")
+    _, na, atom = cands[0]
+    return na, atom
+
+
 def benchmark(
     batch_sizes: list[int],
     next_ns: list[int],
@@ -176,14 +211,19 @@ def benchmark(
         f"timing={backend}{' + CUDA-Graph' if (use_cuda_graph and enable_cupti) else ''}"
     )
     hdr = (
-        f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} | "
-        f"{'DSL(us)':>9s} {'DG-exp(us)':>11s} {'DG-nat(us)':>11s} "
-        f"{'exp/DSL':>9s} {'nat/DSL':>9s}"
+        f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} {'ntask':>6s} | "
+        f"{'maxAtom':>7s} {'DSL(us)':>9s} | "
+        f"{'maxNa':>5s} {'DSL(us)':>9s} {'max_atom/max_na':>15s} | "
+        f"{'DG-exp(us)':>11s} {'DG-nat(us)':>11s} {'exp/DSL_maxA':>13s} {'nat/DSL_maxA':>13s}"
     )
     print(hdr)
     print("  exp = DG-expanded (q=[B*next_n,1,H,D]) — what SGLang's indexer uses today")
     print(
         "  nat = DG-native   (q=[B,next_n,H,D])   — TRT-LLM's path; not reachable from SGLang"
+    )
+    print("  maxAtom = baseline picker (min waves, tie-break largest atom = least HBM)")
+    print(
+        "  maxNa   = experimental picker (min waves, tie-break largest num_atoms = more SMs busy)"
     )
     print("-" * len(hdr))
 
@@ -197,6 +237,33 @@ def benchmark(
         for context_len in context_lens:
             for batch_size in batch_sizes:
                 nblk = batch_size * ((context_len + block_kv - 1) // block_kv)
+                SPLIT_KV_TOKENS = 256
+                # Pick both atom-split strategies for A/B comparison:
+                #   max_atom (baseline):     min waves, tie-break max atom (least HBM)
+                #   max_na (experimental):   min waves, tie-break max num_atoms (more SMs busy)
+                na_base, atom_base = _choose_atom_split(
+                    batch_size,
+                    context_len,
+                    next_n,
+                    num_sms=num_sms,
+                    split_kv_tokens=SPLIT_KV_TOKENS,
+                    tie="max_atom",
+                    kernel_atoms=(1, 2, 3, 4),
+                )
+                na_exp, atom_exp = _choose_atom_split(
+                    batch_size,
+                    context_len,
+                    next_n,
+                    num_sms=num_sms,
+                    split_kv_tokens=SPLIT_KV_TOKENS,
+                    tie="max_na",
+                    kernel_atoms=(1, 2, 3, 4),
+                )
+                ntask = (
+                    batch_size
+                    * na_base
+                    * ((context_len + SPLIT_KV_TOKENS - 1) // SPLIT_KV_TOKENS)
+                )
 
                 data = _generate_bench_data(
                     batch_size,
@@ -208,26 +275,65 @@ def benchmark(
                     varlen=varlen,
                 )
 
-                # DSL: 1 atom per batch -> schedule input shape (B, 1).
-                dsl_schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
-                    data["context_lens"].unsqueeze(-1),
+                # Reshape Q + repeat ctx/block_table per (na, atom). weights
+                # [B*next_n, H] = [B*na*atom, H] needs no reshape because the
+                # row layout is preserved under [B*na, atom, ...] view.
+                def _split(na, atom, data=data, B=batch_size):
+                    if na > 1:
+                        return {
+                            "q": data["q_fp8"].reshape(
+                                B * na, atom, num_heads, head_dim
+                            ),
+                            "ctx_lens": data["context_lens"].repeat_interleave(na),
+                            "block_table": data["block_table"].repeat_interleave(
+                                na, dim=0
+                            ),
+                        }
+                    return {
+                        "q": data["q_fp8"],
+                        "ctx_lens": data["context_lens"],
+                        "block_table": data["block_table"],
+                    }
+
+                base_t = _split(na_base, atom_base)
+                strats_diverge = (na_base, atom_base) != (na_exp, atom_exp)
+                exp_t = _split(na_exp, atom_exp) if strats_diverge else base_t
+
+                # DSL: schedule input shape (B*na, 1) — picker decides na.
+                dsl_schedule_meta_base = deep_gemm.get_paged_mqa_logits_metadata(
+                    base_t["ctx_lens"].unsqueeze(-1),
                     DG_METADATA_BLOCK_KV,
                     num_sms,
                 )
-
-                def _dsl():
-                    torch.ops.sglang.cute_dsl_fp8_paged_mqa_logits(
-                        data["q_fp8"],
-                        data["kv_fused"],
-                        data["weights"],
-                        data["context_lens"],
-                        data["block_table"],
-                        dsl_schedule_meta,
-                        data["max_model_len"],
-                        epi_dtype=output_dtype,
-                        acc_dtype=output_dtype,
-                        output_dtype=output_dtype,
+                dsl_schedule_meta_exp = (
+                    deep_gemm.get_paged_mqa_logits_metadata(
+                        exp_t["ctx_lens"].unsqueeze(-1),
+                        DG_METADATA_BLOCK_KV,
+                        num_sms,
                     )
+                    if strats_diverge
+                    else dsl_schedule_meta_base
+                )
+
+                def _make_dsl(t, schedule_meta, data=data):
+                    def _dsl(t=t, schedule_meta=schedule_meta, data=data):
+                        torch.ops.sglang.cute_dsl_fp8_paged_mqa_logits(
+                            t["q"],
+                            data["kv_fused"],
+                            data["weights"],
+                            t["ctx_lens"],
+                            t["block_table"],
+                            schedule_meta,
+                            data["max_model_len"],
+                            epi_dtype=output_dtype,
+                            acc_dtype=output_dtype,
+                            output_dtype=output_dtype,
+                        )
+
+                    return _dsl
+
+                _dsl_base = _make_dsl(base_t, dsl_schedule_meta_base)
+                _dsl_exp = _make_dsl(exp_t, dsl_schedule_meta_exp)
 
                 # DG-native: schedule input shape (B, next_n) — wrapper
                 # derives num_next_n_atoms = next_n. q stays [B, next_n, H, D].
@@ -296,21 +402,32 @@ def benchmark(
                     cold_l2_cache=True,
                 )
 
-                # First DSL call triggers JIT compile; do it outside timing.
-                _dsl()
+                # First DSL call(s) trigger JIT compile; do them outside timing.
+                _dsl_base()
+                if strats_diverge:
+                    _dsl_exp()
                 torch.cuda.synchronize()
 
-                dsl_ms = np.median(bench_gpu_time(_dsl, **bench_kwargs))
+                base_ms = np.median(bench_gpu_time(_dsl_base, **bench_kwargs))
+                exp_ms = (
+                    np.median(bench_gpu_time(_dsl_exp, **bench_kwargs))
+                    if strats_diverge
+                    else base_ms
+                )
                 dg_exp_ms = np.median(bench_gpu_time(_dg_expanded, **bench_kwargs))
                 dg_nat_ms = np.median(bench_gpu_time(_dg_native, **bench_kwargs))
 
-                exp_ratio = dg_exp_ms / dsl_ms if dsl_ms > 0 else float("nan")
-                nat_ratio = dg_nat_ms / dsl_ms if dsl_ms > 0 else float("nan")
+                strat_speedup = base_ms / exp_ms if exp_ms > 0 else float("nan")
+                exp_ratio = dg_exp_ms / base_ms if base_ms > 0 else float("nan")
+                nat_ratio = dg_nat_ms / base_ms if base_ms > 0 else float("nan")
+                base_lab = f"{na_base}/{atom_base}"
+                exp_lab = f"{na_exp}/{atom_exp}"
                 print(
-                    f"{batch_size:5d} {context_len:7d} {next_n:6d} "
-                    f"{nblk:7d} | {dsl_ms * 1e3:8.2f} "
-                    f"{dg_exp_ms * 1e3:10.2f} {dg_nat_ms * 1e3:10.2f} "
-                    f"{exp_ratio:8.3f}x {nat_ratio:8.3f}x"
+                    f"{batch_size:5d} {context_len:7d} {next_n:6d} {nblk:7d} {ntask:6d} | "
+                    f"{base_lab:>7s} {base_ms * 1e3:9.2f} | "
+                    f"{exp_lab:>5s} {exp_ms * 1e3:9.2f} {strat_speedup:14.3f}x | "
+                    f"{dg_exp_ms * 1e3:11.2f} {dg_nat_ms * 1e3:11.2f} "
+                    f"{exp_ratio:12.3f}x {nat_ratio:12.3f}x"
                 )
 
                 torch.cuda.empty_cache()

@@ -557,7 +557,30 @@ class Indexer(MultiPlatformOp):
             # 1D context_lens [B], q reshaped to [B, next_n, H, D] for verify
             # (or [B, 1, H, D] for decode), per-batch block_tables [B, max_blks].
             ctx_lens_1d = metadata.get_seqlens_int32()
-            if forward_batch.forward_mode.is_target_verify() and next_n >= 2:
+            schedule_metadata_dsl = schedule_metadata
+            # Wave-aware atom-split decision is computed once per forward batch
+            # in `nsa_backend.init_forward_metadata*` (CPU-side, cuda-graph
+            # safe). `factor > 1` means the picker chose to split; reshape Q +
+            # rebuild ctx_lens / block_tables / schedule_metadata to match.
+            factor = getattr(metadata, "dsl_expand_factor", 1)
+            atom = getattr(metadata, "dsl_atom", 1)
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and next_n >= 2
+                and factor > 1
+            ):
+                exp_B = B_per_batch * factor
+                q_dsl = q_fp8[:q_offset].view(
+                    exp_B, atom, q_fp8.shape[1], q_fp8.shape[2]
+                )
+                ctx_lens_1d = ctx_lens_1d.repeat_interleave(factor)
+                block_tables_dsl = block_tables[::next_n].repeat_interleave(
+                    factor, dim=0
+                )
+                schedule_metadata_dsl = deep_gemm.get_paged_mqa_logits_metadata(
+                    ctx_lens_1d.unsqueeze(-1), blocksize, self.sm_count
+                )
+            elif forward_batch.forward_mode.is_target_verify() and next_n >= 2:
                 q_dsl = q_fp8[:q_offset].view(
                     B_per_batch, next_n, q_fp8.shape[1], q_fp8.shape[2]
                 )
@@ -571,7 +594,7 @@ class Indexer(MultiPlatformOp):
                 weights[:q_offset],
                 ctx_lens_1d,
                 block_tables_dsl,
-                schedule_metadata,
+                schedule_metadata_dsl,
                 max_seq_len,
             )
         elif use_dg_native:

@@ -22,6 +22,58 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 
+
+def _pick_dsl_expand(
+    next_n: int,
+    batch_size: int = 0,
+    max_ctx: int = 0,
+    num_sms: int = 148,
+    kernel_atoms: Tuple[int, ...] = (1, 2, 3, 4),
+) -> Tuple[int, int]:
+    """Pick (expand_factor, effective_next_n) for the DSL paged kernel
+    using a wave-aware strategy.
+
+    The DSL FP8 kernel natively supports ``effective_next_n ∈ kernel_atoms``
+    (default ``(1, 2, 3, 4)``). When SM utilization can be improved, reshape
+    ``[B, next_n, ...]`` -> ``[B * expand_factor, effective_next_n, ...]``
+    caller-side.
+
+    Strategy: enumerate ``(expand_factor, effective_next_n)`` pairs with
+    ``expand_factor * effective_next_n == next_n`` and ``effective_next_n
+    in kernel_atoms``. Score each by ``(waves, -expand_factor)`` where
+    ``waves = ceil(B * expand_factor * ceil(max_ctx/256) / num_sms)``.
+    Pick min waves; on tie, prefer LARGER expand_factor (more SMs busy per
+    wave; pays HBM cost of expand_factor x KV re-reads).
+
+    When ``batch_size == 0`` or ``max_ctx == 0`` (workload unknown), fall
+    back to the legacy HBM-minimizing heuristic: largest effective_next_n
+    that divides next_n cleanly (still constrained to ``kernel_atoms``).
+    """
+    if batch_size <= 0 or max_ctx <= 0:
+        for eff in sorted(kernel_atoms, reverse=True):
+            if next_n % eff == 0:
+                return next_n // eff, eff
+        return next_n, 1
+
+    SPLIT_KV_TOKENS = 256
+    cands = []
+    for eff in kernel_atoms:
+        if next_n % eff == 0:
+            factor = next_n // eff
+            ntask = (
+                batch_size
+                * factor
+                * ((max_ctx + SPLIT_KV_TOKENS - 1) // SPLIT_KV_TOKENS)
+            )
+            waves = (ntask + num_sms - 1) // num_sms
+            cands.append((waves, factor, eff))
+    if not cands:
+        return next_n, 1
+    cands.sort(key=lambda x: (x[0], -x[1]))
+    _, factor, eff = cands[0]
+    return factor, eff
+
+
 IS_CUTLASS_DSL_AVAILABLE = False
 if _is_cuda:
     try:
