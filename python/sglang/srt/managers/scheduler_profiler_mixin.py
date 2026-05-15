@@ -35,6 +35,29 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerProfilerMixin:
+    def _get_profile_filename(
+        self: Scheduler, stage: Optional[ForwardMode], extension: str
+    ) -> str:
+        if self.profile_prefix:
+            stage_prefix = self.profile_prefix + "-"
+        else:
+            stage_prefix = ""
+
+        stage_suffix = f"-{stage.name}" if stage else ""
+
+        # Build filename with only non-zero ranks to maintain backward compatibility
+        filename_parts = [self.profile_id, f"TP-{self.tp_rank}"]
+
+        # Only add other ranks if parallelism is enabled (size > 1)
+        if getattr(self, "dp_size", 1) > 1:
+            filename_parts.append(f"DP-{getattr(self, 'dp_rank', 0)}")
+        if getattr(self, "pp_size", 1) > 1:
+            filename_parts.append(f"PP-{getattr(self, 'pp_rank', 0)}")
+        if getattr(self, "moe_ep_size", 1) > 1:
+            filename_parts.append(f"EP-{getattr(self, 'moe_ep_rank', 0)}")
+
+        return stage_prefix + "-".join(filename_parts) + stage_suffix + extension
+
     def init_profiler(self: Scheduler):
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
@@ -140,6 +163,28 @@ class SchedulerProfilerMixin:
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
             return self._profile_manager.manual_start()
+
+        from sglang.srt.utils.tensor_bridge import use_mlx
+
+        if use_mlx():
+            import mlx.core as mx
+
+            if self.torch_profiler_output_dir is None:
+                self.torch_profiler_output_dir = Path(
+                    os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+                ).expanduser()
+
+            os.makedirs(self.torch_profiler_output_dir, exist_ok=True)
+
+            filename = self._get_profile_filename(stage, ".gputrace")
+            trace_filename = os.path.join(
+                self.torch_profiler_output_dir,
+                filename,
+            )
+            mx.metal.start_capture(str(trace_filename))
+            self.profile_in_progress = True
+            logger.info(f"MLX Metal capture started directly to {trace_filename}")
+            return ProfileReqOutput(success=True, message="Succeeded")
 
         stage_str = f" for {stage.name}" if stage else ""
         logger.info(
@@ -262,34 +307,23 @@ class SchedulerProfilerMixin:
 
         self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
 
-        if self.profile_prefix:
-            stage_prefix = self.profile_prefix + "-"
-        else:
-            stage_prefix = ""
+        from sglang.srt.utils.tensor_bridge import use_mlx
+
+        if use_mlx():
+            import mlx.core as mx
+
+            mx.metal.stop_capture()
+            self.profile_in_progress = False
+            self.profiler_start_forward_ct = None
+            logger.info("MLX Metal capture stopped")
+            return ProfileReqOutput(success=True, message="Succeeded")
 
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
             if not _is_npu:
-                # Build filename with only non-zero ranks to maintain backward compatibility
-                filename_parts = [self.profile_id, f"TP-{self.tp_rank}"]
-
-                # Only add other ranks if parallelism is enabled (size > 1)
-                if getattr(self, "dp_size", 1) > 1:
-                    filename_parts.append(f"DP-{getattr(self, 'dp_rank', 0)}")
-                if getattr(self, "pp_size", 1) > 1:
-                    filename_parts.append(f"PP-{getattr(self, 'pp_rank', 0)}")
-                if getattr(self, "moe_ep_size", 1) > 1:
-                    filename_parts.append(f"EP-{getattr(self, 'moe_ep_rank', 0)}")
-
-                filename = (
-                    stage_prefix
-                    + "-".join(filename_parts)
-                    + stage_suffix
-                    + ".trace.json.gz"
-                )
-
+                filename = self._get_profile_filename(stage, ".trace.json.gz")
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
