@@ -660,9 +660,7 @@ def fused_rope(
         positions: [batch_size] int32 or int64, indices into freqs_cis
         inverse: if True, apply inverse rotation (conjugate freqs)
     """
-    from sglang.srt.utils import is_hip
-
-    if is_hip():
+    if _is_hip:
         from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 
         apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
@@ -1056,6 +1054,6 @@ def _dispatch_bf16_fp32_backend(
         deep_gemm.bf16_gemm_nt(x, y, z)
         return z
     elif _use_aiter:
-        return tgemm.mm(x, y, otype=x.dtype).float()
+        return tgemm.mm(x, y, otype=torch.float32)
     else:
         return torch.nn.functional.linear(x.float(), y.float())

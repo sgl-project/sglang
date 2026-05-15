@@ -1027,7 +1027,7 @@ class DeepseekV4HipRadixBackend(
 
             import os
 
-            from sglang.srt.layers.attention.debug_flash_mla_adapter import (
+            from sglang.srt.layers.attention.hip_flash_mla import (
                 flash_mla_with_kvcache_entrypoint,
             )
 
