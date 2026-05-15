@@ -681,9 +681,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         else:
             return super().init_forward_metadata(forward_batch)
 
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
-        super().init_mha_chunk_metadata(forward_batch, disable_flashinfer_ragged=True)
-
     def pad_draft_extend_query(
         self,
         q: torch.Tensor,
