@@ -1,0 +1,105 @@
+name: PR States
+# Maintains a CI-states block at the bottom of the PR body.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: pr-states-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  update-pr-body:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update CI states block in PR body
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.payload.pull_request.head.sha;
+            const labels = context.payload.pull_request.labels.map(l => l.name);
+            const hasExtra = labels.includes('run-ci-extra');
+
+            // Retry briefly: pr-test* may not be API-visible yet when we start.
+            async function findRunBySha(workflowFile) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflowFile,
+                head_sha: sha,
+                per_page: 1,
+              });
+              return data.workflow_runs[0] || null;
+            }
+            async function findRunWithRetry(workflowFile, maxAttempts = 6, delayMs = 5000) {
+              for (let i = 0; i < maxAttempts; i++) {
+                const run = await findRunBySha(workflowFile);
+                if (run) return run;
+                if (i < maxAttempts - 1) await new Promise(r => setTimeout(r, delayMs));
+              }
+              return null;
+            }
+
+            const ptRun = await findRunWithRetry('pr-test.yml');
+            const peRun = hasExtra ? await findRunWithRetry('pr-test-extra.yml') : null;
+
+            // Treat a fully-skipped run as "no real run" — happens when the PR
+            // was opened without the label and label was added later (GHA does
+            // not retrigger on `labeled`).
+            const isReal = (run) => run && run.conclusion !== 'skipped';
+
+            const notEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
+            const stalePushText = ':warning: **Not run on latest push** — push again or use `/rerun-failed-ci` to dispatch.';
+            const ptText = isReal(ptRun) ? `[Run #${ptRun.id}](${ptRun.html_url})` : '_Not run yet_';
+            const peText = !hasExtra
+              ? notEnabledText
+              : (isReal(peRun) ? `[Run #${peRun.id}](${peRun.html_url})` : stalePushText);
+
+            const outerStart = '<!-- pr-states:start -->';
+            const outerEnd   = '<!-- pr-states:end -->';
+            const ptStart    = '<!-- slot:pr-test:start -->';
+            const ptEnd      = '<!-- slot:pr-test:end -->';
+            const peStart    = '<!-- slot:pr-test-extra:start -->';
+            const peEnd      = '<!-- slot:pr-test-extra:end -->';
+
+            const newBlock = [
+              outerStart,
+              '---',
+              '### CI States',
+              '',
+              `Latest PR Test: ${ptStart}${ptText}${ptEnd}`,
+              `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
+              outerEnd,
+            ].join('\n');
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            const body = pr.body || '';
+
+            const blockRe = new RegExp(`(?:\\n+---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
+            let newBody;
+            if (blockRe.test(body)) {
+              newBody = body.replace(blockRe, `\n\n${newBlock}`);
+            } else {
+              const sep = body.length === 0
+                ? ''
+                : (body.endsWith('\n') ? '\n' : '\n\n');
+              newBody = `${body}${sep}${newBlock}`;
+            }
+
+            if (newBody !== body) {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                body: newBody,
+              });
+            }

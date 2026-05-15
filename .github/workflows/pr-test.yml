@@ -63,7 +63,7 @@ permissions:
   actions: write
   contents: read
   issues: read
-  pull-requests: write
+  pull-requests: read
 
 jobs:
   # =============================================== check changes ====================================================
@@ -73,16 +73,6 @@ jobs:
       git_ref: ${{ inputs.git_ref || '' }}
       run_all_tests: ${{ inputs.run_all_tests == true }}
       force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
-    secrets: inherit
-
-  # Runs right after check-changes so the awareness block is injected ~30s in
-  # rather than waiting for downstream stages.
-  call-pr-awareness:
-    needs: check-changes
-    if: always() && github.event_name == 'pull_request'
-    uses: ./.github/workflows/_pr-awareness-comment.yml
-    with:
-      workflow_kind: pr-test
     secrets: inherit
 
   call-pr-test-extra:
