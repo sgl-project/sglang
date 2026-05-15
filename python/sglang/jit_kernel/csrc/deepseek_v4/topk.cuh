@@ -24,6 +24,7 @@ struct TopK512Params {
   const int64_t score_stride;
   const int64_t page_table_stride;
   uint32_t page_bits;
+  bool canonical_order;
 };
 
 SGL_DEVICE uint8_t convert_to_uint8(float x) {
@@ -223,11 +224,49 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
   }
 }
 
+SGL_DEVICE void bitonic_sort_512_int32_pair(
+    int32_t* __restrict__ values,
+    int32_t* __restrict__ carried_values) {
+  static_assert(kTopK == 512);
+  static_assert(kTopKBlockSize == 512);
+  const uint32_t tx = threadIdx.x;
+  constexpr int32_t kInvalidIndexSortKey = 0x7fffffff;
+
+  // One thread owns one selected value. Sort ascending in shared memory so the
+  // native top-k producer emits a canonical order rather than atomic arrival
+  // order. When carried_values is present, carry raw indices with translated
+  // page indices so optional raw-index consumers keep pair correspondence.
+  for (uint32_t k = 2; k <= kTopK; k <<= 1) {
+    for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+      const uint32_t ixj = tx ^ j;
+      if (ixj > tx) {
+        const int32_t a = values[tx];
+        const int32_t b = values[ixj];
+        const int32_t a_key = a >= 0 ? a : kInvalidIndexSortKey;
+        const int32_t b_key = b >= 0 ? b : kInvalidIndexSortKey;
+        const int32_t carried_a = carried_values != nullptr ? carried_values[tx] : 0;
+        const int32_t carried_b = carried_values != nullptr ? carried_values[ixj] : 0;
+        const bool ascending = (tx & k) == 0;
+        const bool should_swap = (a_key > b_key || (a_key == b_key && carried_a > carried_b)) == ascending;
+        if (should_swap) {
+          values[tx] = b;
+          values[ixj] = a;
+          if (carried_values != nullptr) {
+            carried_values[tx] = carried_b;
+            carried_values[ixj] = carried_a;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
 template <bool kUsePDL>
 __global__ void topk_512_transform(const __grid_constant__ TopK512Params params) {
   const auto &[
     scores, seq_lens, page_table, page_indices, raw_indices, // pointers
-    score_stride, page_table_stride, page_bits // sizes
+    score_stride, page_table_stride, page_bits, canonical_order // sizes
   ] = params;
   const uint32_t work_id = blockIdx.x;
 
@@ -240,18 +279,42 @@ __global__ void topk_512_transform(const __grid_constant__ TopK512Params params)
 
   device::PDLWaitPrimary<kUsePDL>();
 
+  __shared__ int32_t s_page_indices[kTopK];
+  __shared__ int32_t s_raw_indices[kTopK];
+  const auto tx = threadIdx.x;
   if (seq_len <= kTopK) {
-    naive_transform(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits);
+    if (kTopK == kTopKBlockSize || tx < kTopK) {
+      if (tx < seq_len) {
+        s_page_indices[tx] = page_to_indices(page_ptr, tx, page_bits);
+        if (raw_indices_ptr != nullptr) {
+          s_raw_indices[tx] = tx;
+        }
+      } else {
+        s_page_indices[tx] = -1;
+        if (raw_indices_ptr != nullptr) {
+          s_raw_indices[tx] = -1;
+        }
+      }
+    }
   } else {
     __shared__ int32_t s_topk_indices[kTopK];
     radix_topk(score_ptr, s_topk_indices, seq_len);
     static_assert(kTopK <= kTopKBlockSize);
-    const auto tx = threadIdx.x;
     if (kTopK == kTopKBlockSize || tx < kTopK) {
-      indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
+      s_page_indices[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
       if (raw_indices_ptr != nullptr) {
-        raw_indices_ptr[tx] = s_topk_indices[tx];
+        s_raw_indices[tx] = s_topk_indices[tx];
       }
+    }
+  }
+  __syncthreads();
+  if (canonical_order) {
+    bitonic_sort_512_int32_pair(s_page_indices, raw_indices_ptr != nullptr ? s_raw_indices : nullptr);
+  }
+  if (kTopK == kTopKBlockSize || tx < kTopK) {
+    indices_ptr[tx] = s_page_indices[tx];
+    if (raw_indices_ptr != nullptr) {
+      raw_indices_ptr[tx] = s_raw_indices[tx];
     }
   }
 
@@ -278,7 +341,8 @@ struct TopK512Kernel {
       const tvm::ffi::TensorView page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      const bool canonical_order) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto S = SymbolicSize{"score_stride"};
@@ -326,6 +390,7 @@ struct TopK512Kernel {
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),
         .page_bits = page_bits,
+        .canonical_order = canonical_order,
     };
     constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little
     setup_kernel_smem_once<kernel, kSMEM_>();

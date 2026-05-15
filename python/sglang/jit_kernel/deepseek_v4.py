@@ -348,6 +348,16 @@ def topk_transform_512(
 ) -> None:
     if out_page_indices.shape[1] == 512:
         module = _jit_topk_module()
+        module.topk_transform(
+            scores,
+            seq_lens,
+            page_tables,
+            out_page_indices,
+            page_size,
+            out_raw_indices,
+            envs.SGLANG_DSV4_CANONICAL_TOPK_IN_KERNEL.get(),
+        )
+        return
     else:
         module = _jit_topk1024_module()
     module.topk_transform(

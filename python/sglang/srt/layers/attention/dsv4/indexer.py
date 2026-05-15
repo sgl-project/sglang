@@ -184,6 +184,24 @@ def topk_transform_512_pytorch_vectorized(
         out_raw_indices.copy_(raw_indices)
 
 
+def _sort_c4_sparse_indices_by_row(
+    page_indices: torch.Tensor,
+    topk_lengths: torch.Tensor,
+) -> None:
+    if page_indices.numel() == 0:
+        return
+    if topk_lengths.dim() != 1:
+        topk_lengths = topk_lengths.view(-1)
+
+    cols = page_indices.shape[-1]
+    positions = torch.arange(cols, device=page_indices.device).unsqueeze(0)
+    valid = positions < topk_lengths.unsqueeze(1)
+    sentinel = torch.iinfo(page_indices.dtype).max
+    sortable = torch.where(valid, page_indices, sentinel)
+    sorted_indices = torch.sort(sortable, dim=-1).values
+    page_indices.copy_(torch.where(valid, sorted_indices, -1))
+
+
 @triton.jit
 def _fused_scale_kernel(
     weight_ptr,
@@ -462,6 +480,19 @@ class C4IndexerBackendMixin:
                         core_metadata.c4_sparse_page_indices
                     )
                 )
+
+        in_kernel_canonical = (
+            envs.SGLANG_DSV4_CANONICAL_TOPK_IN_KERNEL.get()
+            and not envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and not envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+            and hisparse_coordinator is None
+            and core_metadata.c4_sparse_page_indices.shape[1] == 512
+        )
+        if not in_kernel_canonical:
+            _sort_c4_sparse_indices_by_row(
+                core_metadata.c4_sparse_page_indices,
+                core_metadata.c4_sparse_topk_lengths,
+            )
 
         if capture_enabled:
             compress_layer_id = token_to_kv_pool.layer_mapping[
