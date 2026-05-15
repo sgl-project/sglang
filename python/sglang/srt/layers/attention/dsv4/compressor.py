@@ -430,10 +430,6 @@ class Compressor(nn.Module):
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
-        if _is_hip:
-            self.forward_mode = forward_batch.forward_mode
-            return self.compress_dispatch(kv_score, forward_batch)
-
         # CUDA path: delegate to backend
         if nsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
@@ -848,6 +844,10 @@ class Compressor(nn.Module):
             return x.new_empty(0, self.head_dim)
 
         kv_score = self.compute_kv_score(x, forward_batch)
+
+        if _is_hip:
+            self.forward_mode = forward_batch.forward_mode
+            return self.compress_dispatch(kv_score, forward_batch)
 
         backend = forward_batch.attn_backend
         if TYPE_CHECKING:
