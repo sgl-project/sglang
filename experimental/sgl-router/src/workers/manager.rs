@@ -154,18 +154,13 @@ pub async fn run_with_http(
             }
             DiscoveryEvent::ModeChanged { id, mode } => {
                 tracing::info!("discovery: ~worker {id} mode→{mode:?}");
-                // Implement as remove + re-add with new mode.
-                // We need the original spec; pull from registry.
+                // Mutate mode in place — preserves active_requests counter
+                // (in-flight LoadGuards stay valid) and CircuitBreaker state
+                // (open/half-open survives PD role flips).
                 if let Some(w) = registry.get(&id) {
-                    let new_spec = WorkerSpec {
-                        id: id.clone(),
-                        url: w.url.clone(),
-                        mode,
-                        model_ids: w.model_ids.clone(),
-                    };
-                    let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&new_spec, c));
-                    registry.remove(&id);
-                    registry.add_with_cb(new_spec, cb);
+                    w.set_mode(mode);
+                    // workers_for_mode filters at query time via w.mode(), so
+                    // no secondary index needs updating.
                 }
             }
         }

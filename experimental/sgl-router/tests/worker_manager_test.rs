@@ -120,3 +120,72 @@ async fn manager_handles_mode_changed() {
     drop(tx);
     h.await.unwrap();
 }
+
+#[tokio::test]
+async fn mode_changed_preserves_active_requests_and_breaker() {
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Added(spec(
+        "w1",
+        "http://x:30000",
+        WorkerMode::Prefill,
+        &["m"],
+    )))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Grab a handle, bump active_requests, and open the breaker.
+    let w = registry.get(&WorkerId("w1".into())).unwrap();
+    w.active_requests
+        .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+    // Default threshold is 3 — record 10 failures to guarantee Open state.
+    for _ in 0..10 {
+        w.breaker.record_failure();
+    }
+    let breaker_open_before = !w.breaker.allow();
+    assert!(
+        breaker_open_before,
+        "breaker should be open after 10 failures"
+    );
+
+    // Flip mode via ModeChanged.
+    tx.send(DiscoveryEvent::ModeChanged {
+        id: WorkerId("w1".into()),
+        mode: WorkerMode::Decode,
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Re-fetch the Worker handle from the registry.
+    let w_after = registry.get(&WorkerId("w1".into())).unwrap();
+
+    assert_eq!(
+        w_after.mode(),
+        WorkerMode::Decode,
+        "mode should have flipped to Decode"
+    );
+    assert_eq!(
+        w_after
+            .active_requests
+            .load(std::sync::atomic::Ordering::Relaxed),
+        5,
+        "active_requests should be preserved across mode change"
+    );
+    assert!(
+        !w_after.breaker.allow(),
+        "breaker open state should be preserved across mode change"
+    );
+
+    // Critical: the Arc identity must be the same — mutation in place.
+    assert!(
+        Arc::ptr_eq(&w, &w_after),
+        "Worker handle should be the SAME Arc, not a fresh replacement"
+    );
+
+    drop(tx);
+    h.await.unwrap();
+}

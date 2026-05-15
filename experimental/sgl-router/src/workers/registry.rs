@@ -64,7 +64,7 @@ impl WorkerRegistry {
     pub fn workers_for_mode(&self, model: &ModelId, mode: WorkerMode) -> Vec<Arc<Worker>> {
         self.workers_for(model)
             .into_iter()
-            .filter(|w| w.mode == mode)
+            .filter(|w| w.mode() == mode)
             .collect()
     }
 
