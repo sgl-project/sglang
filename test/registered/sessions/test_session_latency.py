@@ -23,7 +23,7 @@ from tabulate import tabulate
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -32,11 +32,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=122, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(
-    est_time=122,
-    suite="stage-b-test-1-gpu-large-amd",
-    disabled="Uses gpt-oss-20b which is mxfp4-quantized; AMD does not yet accept mxfp4 quantization",
-)
 
 NUM_TURNS = 150
 INPUT_LEN = 16

@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.streaming_session_kit import (
     AbortLeakReproKitMixin,
     StreamingSessionKitMixin,
@@ -13,11 +13,6 @@ from sglang.test.server_fixtures.streaming_session_fixture import (
 )
 
 register_cuda_ci(est_time=519, stage="stage-b", runner_config="1-gpu-large")
-register_amd_ci(
-    est_time=519,
-    suite="stage-b-test-1-gpu-large-amd",
-    disabled="Uses gpt-oss-20b which is mxfp4-quantized; AMD does not yet accept mxfp4 quantization",
-)
 
 
 SWA_MODEL = "openai/gpt-oss-20b"
