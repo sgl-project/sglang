@@ -284,7 +284,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         config_ = copy.deepcopy(config)
         config_.vocab_size = (
             config_.draft_vocab_size
-        )  # draft logits processor has it's own vocab size
+        )  # draft logits processor has its own vocab size
         self.logits_processor = LogitsProcessor(config_)
 
         self.capture_aux_hidden_states = True

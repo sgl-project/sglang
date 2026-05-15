@@ -852,7 +852,7 @@ class FlashAttentionBackend(AttentionBackend):
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     # Here metadata_expand.page_table is not divided with page_size.
-                    # This is because we loose the fine control of  what token to attend,
+                    # This is because we lose the fine control of what token to attend,
                     # but has to attend to some block completely.
                     k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
                     v_cache=value_cache.view(
