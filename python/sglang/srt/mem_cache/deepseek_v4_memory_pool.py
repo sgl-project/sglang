@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Tuple, Union
+from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -18,8 +18,6 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     DeepSeekV4CompressState,
-    KVAndScore,
-    KVAndScoreSeparate,
 )
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import get_global_server_args
@@ -657,9 +655,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             else:
                 raise ValueError(f"Unsupported compression ratio: {ratio}")
 
-    def get_attention_compress_states(
-        self, layer_id: int
-    ) -> Union[CompressStatePool, KVAndScore, KVAndScoreSeparate]:
+    def wait_layer_transfer(self, layer_id: int) -> None:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+    def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
+        self.wait_layer_transfer(layer_id)
         if not (_is_cpu and _cpu_amx):
             compress_state_pool = self.compress_state_pools[layer_id]
             assert (
@@ -670,9 +671,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert compress_state is not None, "Only c4/c128 layers have attention states."
         return compress_state.get_state()
 
-    def get_indexer_compress_states(
-        self, layer_id: int
-    ) -> Union[CompressStatePool, KVAndScore, KVAndScoreSeparate]:
+    def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
+        self.wait_layer_transfer(layer_id)
         if not (_is_cpu and _cpu_amx):
             indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
             assert (
@@ -684,6 +684,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return compress_state.get_state()
 
     def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
         return self.swa_kv_pool.get_key_buffer(layer_id)
 
     def set_swa_key_buffer(
@@ -699,7 +700,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert compress_kv_pool is not None
         return compress_kv_pool.page_size
 
-    def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor:
+    def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor | None:
+        self.wait_layer_transfer(layer_id)
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         return compress_kv_pool.get_key_buffer(compress_layer_id)
@@ -720,6 +722,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self.c4_indexer_kv_pool.page_size
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(compress_layer_id)
@@ -730,6 +733,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.get_index_k_scale_buffer(
@@ -773,6 +777,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
         return self.swa_kv_pool.get_key_buffer(layer_id)
 
     def set_swa_key_buffer_radix_fused(
