@@ -10,11 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenizeRequest {
     pub model: String,
     pub prompt: String,
-    #[serde(default)]
-    pub add_special_tokens: bool,
 }
 
 #[derive(Serialize)]
@@ -26,6 +25,7 @@ pub struct TokenizeResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DetokenizeRequest {
     pub model: String,
     pub tokens: Vec<u32>,
@@ -143,6 +143,25 @@ mod tests {
         let bytes2 = res2.into_body().collect().await.unwrap().to_bytes();
         let r2: DetokenizeResponse = serde_json::from_slice(&bytes2).unwrap();
         assert_eq!(r2.text, "hello world");
+    }
+
+    #[tokio::test]
+    async fn tokenize_request_does_not_advertise_add_special_tokens() {
+        // Regression: TokenizeRequest must not have an `add_special_tokens` field.
+        // Background: dynamo-tokenizers cannot honor it. Silently ignoring it
+        // would be a footgun for clients that set it.
+        let req: TokenizeRequest =
+            serde_json::from_str(r#"{"model": "tiny", "prompt": "hi"}"#).unwrap();
+        let _ = req; // compiles → schema is correct minus that field
+
+        // If someone sets it anyway, serde should reject with deny_unknown_fields.
+        let parsed: Result<TokenizeRequest, _> = serde_json::from_str(
+            r#"{"model": "tiny", "prompt": "hi", "add_special_tokens": true}"#,
+        );
+        assert!(
+            parsed.is_err(),
+            "add_special_tokens should be rejected as unknown field"
+        );
     }
 
     #[tokio::test]
