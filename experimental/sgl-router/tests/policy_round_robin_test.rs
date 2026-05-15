@@ -20,7 +20,10 @@ fn worker(id: &str) -> Arc<Worker> {
 fn cycles_through_workers() {
     let p = RoundRobinPolicy::new();
     let ws = vec![worker("a"), worker("b"), worker("c")];
-    let ctx = SelectionContext { model: &ModelId("m".into()), request_body: None };
+    let ctx = SelectionContext {
+        model: &ModelId("m".into()),
+        request_body: None,
+    };
     let picks: Vec<_> = (0..6)
         .filter_map(|_| p.select(&ws, &ctx))
         .map(|w| w.id.0.clone())
@@ -32,7 +35,10 @@ fn cycles_through_workers() {
 fn empty_pool_returns_none() {
     let p = RoundRobinPolicy::new();
     let ws: Vec<Arc<Worker>> = vec![];
-    let ctx = SelectionContext { model: &ModelId("m".into()), request_body: None };
+    let ctx = SelectionContext {
+        model: &ModelId("m".into()),
+        request_body: None,
+    };
     assert!(p.select(&ws, &ctx).is_none());
 }
 
@@ -40,7 +46,10 @@ fn empty_pool_returns_none() {
 fn distribution_across_100_calls() {
     let p = RoundRobinPolicy::new();
     let ws = vec![worker("a"), worker("b"), worker("c")];
-    let ctx = SelectionContext { model: &ModelId("m".into()), request_body: None };
+    let ctx = SelectionContext {
+        model: &ModelId("m".into()),
+        request_body: None,
+    };
     let mut counts = std::collections::HashMap::new();
     for _ in 0..99 {
         let w = p.select(&ws, &ctx).unwrap();
