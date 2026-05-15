@@ -1790,6 +1790,7 @@ class DeepSeekV4PagedHostPool(HostKVCache):
             )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
                 alloc_func(
@@ -1810,7 +1811,6 @@ class DeepSeekV4PagedHostPool(HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-            self.data_refs = [self.kv_buffer[:, i, :] for i in range(self.layer_num)]
         elif self.layout == "page_first_direct":
             self.kv_buffer = alloc_func(
                 (num_host_pages, self.layer_num, 1, self.item_bytes),
@@ -1819,7 +1819,6 @@ class DeepSeekV4PagedHostPool(HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-            self.data_refs = []
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
@@ -2099,6 +2098,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
                 alloc_func(
@@ -2119,7 +2119,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-            self.data_refs = [self.kv_buffer[:, i, :] for i in range(self.layer_num)]
         elif self.layout == "page_first_direct":
             self.kv_buffer = alloc_func(
                 (num_host_pages, self.layer_num, 1, self.state_page_bytes),
@@ -2128,7 +2127,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-            self.data_refs = []
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         logger.info(
