@@ -40,6 +40,7 @@ from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
@@ -121,6 +122,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
@@ -243,6 +245,7 @@ MLA_ATTENTION_BACKENDS = [
     "flashmla",
     "cutlass_mla",
     "trtllm_mla",
+    "tokenspeed_mla",
     "ascend",
     "nsa",
     "intel_xpu",
@@ -255,6 +258,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "flashmla",
     "cutlass_mla",
     "trtllm_mla",
+    "tokenspeed_mla",
 ]
 
 TORCH_DTYPE_TO_KV_CACHE_STR = {
@@ -346,6 +350,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
+        # Set on target by `_resolve_memory_pool_config`; passed in for draft
+        # workers so they reuse target's resolved sizes (replaces legacy
+        # `server_args._draft_pool_config` mutation hack).
+        self.memory_pool_config = memory_pool_config
         self.device = server_args.device
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
@@ -364,7 +372,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
-        self.memory_pool_config = memory_pool_config
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -378,7 +385,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid_swa = model_config.is_hybrid_swa
-        self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
+        self.is_hybrid_swa_compress = getattr(
+            model_config, "is_hybrid_swa_compress", False
+        )
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         rope_scaling = getattr(
@@ -555,6 +564,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._model_update_group = {}
         self._weights_send_group = {}
 
+        if not hasattr(self, "hisparse_coordinator"):
+            self.hisparse_coordinator = None
+
     def _build_model_config(
         self, server_args, model_path=None, model_revision=None, is_draft_model=False
     ):
@@ -641,6 +653,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+        self._prepare_moe_topk()
 
         # Load the expert backup client
         self.expert_backup_client = (
@@ -738,26 +751,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
-        # Init hisparse coordinator (must happen before CUDA graph capture)
-        if self.enable_hisparse:
-            from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-            hisparse_cfg = parse_hisparse_config(self.server_args)
-            self.hisparse_coordinator = HiSparseCoordinator(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                top_k=hisparse_cfg.top_k,
-                device_buffer_size=hisparse_cfg.device_buffer_size,
-                device=self.device,
-                tp_group=(
-                    self.attention_tp_group.cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_group.cpu_group
-                ),
-                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
-            )
-
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
@@ -772,10 +765,46 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
+            # Init hisparse coordinator (must happen before CUDA graph capture)
+            if self.enable_hisparse:
+                from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                hisparse_cfg = parse_hisparse_config(self.server_args)
+                hisparse_top_k = getattr(
+                    self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
+                )
+                self.hisparse_coordinator = HiSparseCoordinator(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    top_k=hisparse_top_k,
+                    device_buffer_size=hisparse_cfg.device_buffer_size,
+                    device=self.device,
+                    tp_group=(
+                        self.attention_tp_group.cpu_group
+                        if self.server_args.enable_dp_attention
+                        else self.tp_group.cpu_group
+                    ),
+                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                )
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
-        elif self.device in ["npu", "cpu"]:
+        elif self.device == "cpu":
             self.init_attention_backend()
+            self.init_device_graphs()
+        elif self.device == "npu":
+            self.init_attention_backend()
+            # lazy init for zbal with mix mode(before graph capture when enable_cuda_graph)
+            if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 and not self.is_draft_worker:
+                from sglang.srt.hardware_backend.npu.utils import lazy_init_zbal_gva_mem
+
+                lazy_init_zbal_gva_mem(
+                    self.device,
+                    self.gpu_id,
+                    get_world_group().rank_in_group,
+                    get_world_group().world_size,
+                    get_world_group().cpu_group,
+                )
             self.init_device_graphs()
         elif current_platform.is_out_of_tree():
             self.init_attention_backend()
@@ -799,6 +828,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
+            return
+
+        if self.model_config.is_deepseek_v4_arch:
             return
 
         full_attention_layer_ids = [
@@ -1141,8 +1173,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
             if (
-                moe_intermediate_size // moe_tp_size
-            ) % weight_block_size_n != 0 and not _use_aiter:
+                not envs.SGLANG_SHARED_EXPERT_TP1.get()
+                and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
+                and not _use_aiter
+            ):
                 raise ValueError(
                     f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
                     f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
@@ -1461,7 +1495,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self._publish_modelexpress_metadata()
 
-        get_offloader().post_init()
+        if not self.is_draft_worker:
+            get_offloader().post_init()
 
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:
@@ -1566,6 +1601,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
+
+    def _prepare_moe_topk(self):
+        balancer_cls = None
+        num_prepared = 0
+        num_routed_experts = None
+        for module in self.model.modules():
+            if not isinstance(module, TopK):
+                continue
+            if (
+                not module.enable_deepep_waterfill
+                or module.deepep_waterfill_balancer is not None
+            ):
+                continue
+            if num_routed_experts is None:
+                num_routed_experts = getattr(
+                    self.model_config.hf_config, "n_routed_experts", None
+                )
+                if num_routed_experts is None:
+                    raise ValueError(
+                        "DeepEP waterfill requires model config n_routed_experts."
+                    )
+            if balancer_cls is None:
+                from sglang.srt.layers.moe.deepep_waterfill import (
+                    DeepEPWaterfillBalancer,
+                )
+
+                balancer_cls = DeepEPWaterfillBalancer
+            module.deepep_waterfill_balancer = balancer_cls(
+                num_routed_experts=num_routed_experts,
+                world_size=self.moe_ep_size,
+                rank=self.moe_ep_rank,
+                layer_id=module.layer_id,
+                routed_scaling_factor=(
+                    module.topk_config.routed_scaling_factor
+                    if module.topk_config.routed_scaling_factor is not None
+                    else 1.0
+                ),
+            )
+            num_prepared += 1
+        if num_prepared:
+            log_info_on_rank0(
+                logger, f"Prepared {num_prepared} DeepEP waterfill TopK modules."
+            )
 
     def update_expert_location(
         self,
@@ -2179,6 +2257,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             Qwen3NextConfig
             | Qwen3_5Config
             | Qwen3_5MoeConfig
+            | InternS2PreviewConfig
             | JetNemotronConfig
             | JetVLMConfig,
         ):
@@ -3313,10 +3392,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Hisparse coordinator
         if (
-            self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode()
+            forward_batch.forward_mode.is_decode()
+            and self.hisparse_coordinator is not None
         ):
+            forward_batch.hisparse_coordinator = self.hisparse_coordinator
             self.hisparse_coordinator.wait_for_pending_backup()
+            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
         # Replay cuda graph if applicable
         if can_run_graph:

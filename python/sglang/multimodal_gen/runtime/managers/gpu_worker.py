@@ -10,6 +10,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Union
 
+import numpy as np
 import torch
 from setproctitle import setproctitle
 
@@ -31,7 +32,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    post_process_sample,
+    save_outputs,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
     WeightsUpdater,
@@ -127,7 +131,7 @@ class GPUWorker:
         # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
-            enable_cfg_parallel=self.server_args.enable_cfg_parallel,
+            cfg_degree=self.server_args.cfg_parallel_degree or 1,
             ulysses_degree=self.server_args.ulysses_degree,
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
@@ -366,6 +370,9 @@ class GPUWorker:
                 if torch.cuda.is_initialized():
                     torch.cuda.empty_cache()
 
+            # Keep return_frames payloads off the scheduler's tensor ZMQ path.
+            self._materialize_frame_outputs_for_return(output_batch, req)
+
             if torch.cuda.is_initialized() and output_batch.output is None:
                 torch.cuda.empty_cache()
 
@@ -400,6 +407,72 @@ class GPUWorker:
             if torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
         return output_batch
+
+    def _materialize_frame_outputs_for_return(
+        self, output_batch: OutputBatch, req: Req
+    ) -> None:
+        if self.rank != 0 or output_batch.output is None or not req.return_frames:
+            return
+
+        if (
+            os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+            and torch.cuda.is_initialized()
+        ):
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        output_batch.output = [
+            self._materialize_frame_output(output, output_batch, req)
+            for output in output_batch.output
+        ]
+        if output_batch.metrics is not None:
+            if (
+                os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+                and torch.cuda.is_initialized()
+            ):
+                torch.cuda.synchronize()
+            output_batch.metrics.record_stage(
+                "GPUWorker.frame_materialize_for_return",
+                time.perf_counter() - start_time,
+            )
+
+    @staticmethod
+    def _materialize_frame_output(
+        output: Any, output_batch: OutputBatch, req: Req
+    ) -> np.ndarray:
+        if (
+            isinstance(output, torch.Tensor)
+            and not req.enable_frame_interpolation
+            and not req.enable_upscaling
+        ):
+            if output.dim() == 3:
+                output = output.unsqueeze(1)
+            output = (output * 255).clamp(0, 255).to(torch.uint8)
+            return output.permute(1, 2, 3, 0).cpu().numpy()
+
+        if (
+            isinstance(output, np.ndarray)
+            and output.dtype == np.uint8
+            and output.ndim == 4
+            and output.shape[-1] in (1, 3, 4)
+        ):
+            return output
+
+        frames = post_process_sample(
+            output,
+            req.data_type,
+            req.fps,
+            save_output=False,
+            audio_sample_rate=output_batch.audio_sample_rate,
+            output_compression=req.output_compression,
+            enable_frame_interpolation=req.enable_frame_interpolation,
+            frame_interpolation_exp=req.frame_interpolation_exp,
+            frame_interpolation_scale=req.frame_interpolation_scale,
+            frame_interpolation_model_path=req.frame_interpolation_model_path,
+            enable_upscaling=req.enable_upscaling,
+            upscaling_model_path=req.upscaling_model_path,
+            upscaling_scale=req.upscaling_scale,
+        )
+        return np.asarray(frames)
 
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
         if self.rank != 0 or current_platform.is_cpu():
@@ -492,6 +565,7 @@ class GPUWorker:
         first_req = reqs[0]
         shared_output_fields = (
             "save_output",
+            "return_frames",
             "return_file_paths_only",
             "data_type",
             "fps",
@@ -695,6 +769,7 @@ class GPUWorker:
         lora_path: Union[str, None, List[Union[str, None]]] = None,
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
+        merge_mode: str | None = None,
     ) -> OutputBatch:
         """
         Set the LoRA adapter(s) for the pipeline.
@@ -705,10 +780,13 @@ class GPUWorker:
             lora_path: Path(s) to the LoRA adapter(s). Can be a string, None, or a list of strings/None.
             target: Which transformer(s) to apply the LoRA to. Can be a string or a list of strings.
             strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
+            merge_mode: Optional per-request LoRA merge mode.
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.set_lora(lora_nickname, lora_path, target, strength)
+        self.pipeline.set_lora(
+            lora_nickname, lora_path, target, strength, merge_mode=merge_mode
+        )
         return OutputBatch()
 
     def merge_lora_weights(
@@ -794,16 +872,22 @@ class GPUWorker:
         return checksums
 
 
-OOM_MSG = f"""
+OOM_MSG = """
 OOM detected. Possible solutions:
   - If the OOM occurs during loading:
-    1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
+    1. Check available memory on every selected GPU, not only total capacity.
+       In multi-GPU runs, the least-free selected GPU is the bottleneck.
+    2. For single-GPU deployment, use `--performance-mode memory`, component CPU offload,
+       or `--dit-layerwise-offload` for supported Wan/MOVA DiTs.
+    3. For multi-GPU deployment, keep the default `--performance-mode auto` or set
+       `--use-fsdp-inference true` to shard DiT weights with FSDP. FSDP is not a
+       single-GPU substitute for CPU offload.
   - If the OOM occurs during runtime:
-    1. Enable SP and/or TP (in a multi-GPU setup)
-    2. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
-    3. Opt for a sparse-attention backend
-    4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
-    5. Enable quantization (e.g. nunchaku)
+    1. Reduce resolution, `--num-frames`, or batch size.
+    2. Use `--performance-mode memory` for lower memory usage.
+    3. Enable SP/Ulysses/Ring for sequence-heavy workloads in multi-GPU setups.
+    4. Use FSDP, with CFG parallelism when supported, for validated multi-GPU workloads.
+    5. Use a lower-memory attention backend or quantization when available.
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
 

@@ -16,7 +16,7 @@ import torch
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small")
 
 # ---------------------------------------------------------------------------
 # Test configuration (small-scale for fast CI runs)
@@ -45,6 +45,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         origin_input_ids=origin_input_ids,
         output_ids=output_ids,
         fill_ids=origin_input_ids + output_ids,
+        seqlen=len(origin_input_ids) + len(output_ids),
         req_pool_idx=None,
         kv_allocated_len=0,
         kv_committed_len=0,

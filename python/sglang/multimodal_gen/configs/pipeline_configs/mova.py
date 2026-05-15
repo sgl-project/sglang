@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import t5_postprocess_text
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -51,6 +54,12 @@ class MOVAPipelineConfig(PipelineConfig):
     # temporal alignment: MOVA expects (num_frames - 1) % 4 == 0
     time_division_factor: int = 4
     time_division_remainder: int = 1
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            auto_dit_layerwise_offload_high_memory_disable_gb=130,
+        )
 
     def _center_crop_and_resize(
         self, image: torch.Tensor | Image.Image, target_height: int, target_width: int

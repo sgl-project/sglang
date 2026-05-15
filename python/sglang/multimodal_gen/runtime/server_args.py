@@ -41,6 +41,10 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.server_args_auto_tune import (
+    PERFORMANCE_MODES,
+    ServerArgsAutoTuner,
+)
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
     is_valid_ipv6_address,
@@ -62,21 +66,11 @@ from sglang.multimodal_gen.utils import (
 
 logger = init_logger(__name__)
 
-# Derived from single-H200 benchmarking (~140.4 GiB total) at the maximum
-# supported 720p workloads with dit_layerwise_offload=False and
-# num_inference_steps=1:
-# - Wan-AI/Wan2.2-T2V-A14B-Diffusers, 1280x720, 81 frames:
-#   peak_reserved=108076 MB (~105.5 GiB), peak_allocated=97665 MB (~95.4 GiB)
-# - OpenMOSS-Team/MOVA-720p, 1280x720, 193 frames:
-#   peak_reserved=130264 MB (~127.2 GiB), peak_allocated=108819 MB (~106.3 GiB)
-# Also, on H200, enabling dit_layerwise_offload regressed latency noticeably on
-# our validated Wan/MOVA workloads, so use a 130 GiB cutoff to keep H200-class
-# GPUs on the faster no-offload default while preserving some headroom.
-WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
+LORA_MERGE_MODES = ("auto", "merge", "dynamic")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -148,6 +142,7 @@ class ServerArgs(DisaggArgsMixin):
 
     # Parallelism
     num_gpus: int = 1
+    performance_mode: str = "auto"
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
@@ -160,6 +155,8 @@ class ServerArgs(DisaggArgsMixin):
     dp_degree: int = 1
     # cfg parallel (None = auto-decide based on num_gpus)
     enable_cfg_parallel: Optional[bool] = None
+    # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
+    cfg_parallel_degree: Optional[int] = None
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -177,6 +174,7 @@ class ServerArgs(DisaggArgsMixin):
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_merge_mode: str = "auto"
     lora_weight_name: str | None = None
 
     # Component path overrides (key = model_index.json component name, value = path)
@@ -184,6 +182,12 @@ class ServerArgs(DisaggArgsMixin):
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
+
+    # Quantization method for online quantization
+    quantization: str | None = None
+    # Layer name patterns to skip during online quantization
+    quantization_ignored_layers: list[str] | None = None
+
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -195,7 +199,7 @@ class ServerArgs(DisaggArgsMixin):
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = False
-    use_fsdp_inference: bool = False
+    use_fsdp_inference: bool | None = None
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
 
@@ -211,6 +215,10 @@ class ServerArgs(DisaggArgsMixin):
     warmup_steps: int = 1
 
     disable_autocast: bool | None = None
+
+    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
+    # When set, the transformer loader will use this instead of auto-detection.
+    quantization: str | None = None
 
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
@@ -314,8 +322,15 @@ class ServerArgs(DisaggArgsMixin):
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
-        self._adjust_offload()
+        auto_tuner = ServerArgsAutoTuner(self)
+        auto_tuner.adjust()
+        if auto_tuner.could_override_server_args():
+            self._adjust_offload()
+            auto_tuner.maybe_adjust_auto_dit_layerwise_offload()
         self._adjust_ltx2_two_stage_device_mode()
+        if auto_tuner.could_override_server_args():
+            auto_tuner.maybe_adjust_auto_component_residency_after_offload()
+            auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
         self._adjust_path()
         self._adjust_quant_config()
         self._adjust_warmup()
@@ -325,6 +340,7 @@ class ServerArgs(DisaggArgsMixin):
         self._adjust_attention_backend()
         self._adjust_platform_specific()
         self._adjust_autocast()
+        auto_tuner.finalize_auto_flags()
         self.adjust_pipeline_config()
 
     def _validate_parameters(self):
@@ -471,6 +487,12 @@ class ServerArgs(DisaggArgsMixin):
             or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
         )
 
+    def _uses_ltx23_snapshot_two_stage_residency(self) -> bool:
+        return (
+            self.ltx2_two_stage_device_mode == "snapshot"
+            and self._is_ltx23_two_stage_pipeline()
+        )
+
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
@@ -608,9 +630,15 @@ class ServerArgs(DisaggArgsMixin):
             if component_name is None:
                 continue
             key = component_name.replace("-", "_")
-            backend = self.component_attention_backends.get(key)
-            if backend is not None:
-                return AttentionBackendEnum[backend.upper()], key
+            fallback_keys = [key]
+            if key.endswith("_2"):
+                # Secondary two-stage components inherit the base component
+                # backend unless explicitly overridden.
+                fallback_keys.append(key[:-2])
+            for backend_key in fallback_keys:
+                backend = self.component_attention_backends.get(backend_key)
+                if backend is not None:
+                    return AttentionBackendEnum[backend.upper()], backend_key
         return None, None
 
     def _adjust_warmup(self):
@@ -655,13 +683,12 @@ class ServerArgs(DisaggArgsMixin):
             self.master_port = self.settle_port(self.master_port, 37)
 
     def _adjust_parallelism(self):
-        tp_unspecified = self.tp_size is None
         sp_unspecified = self.sp_degree is None
         ulysses_unspecified = self.ulysses_degree is None
         ring_unspecified = self.ring_degree is None
         cfg_unspecified = self.enable_cfg_parallel is None
 
-        if current_platform.is_cpu() and self.tp_size > 1:
+        if current_platform.is_cpu() and (self.tp_size or 1) > 1:
             # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
             self.num_gpus = self.tp_size
 
@@ -671,6 +698,14 @@ class ServerArgs(DisaggArgsMixin):
         if self.tp_size is None:
             self.tp_size = 1
 
+        # --cfg-parallel-size takes precedence over --enable-cfg-parallel bool.
+        if self.cfg_parallel_degree is not None:
+            if self.cfg_parallel_degree == 1:
+                self.enable_cfg_parallel = False
+            elif self.cfg_parallel_degree > 1:
+                self.enable_cfg_parallel = True
+            cfg_unspecified = False
+
         # Auto-enable CFG parallel when user hasn't set any parallelism flags
         # and there are enough GPUs.  Only auto-enable for models whose default
         # SamplingParams use classifier-free guidance (negative_prompt is not None),
@@ -678,7 +713,8 @@ class ServerArgs(DisaggArgsMixin):
         if cfg_unspecified:
             cfg_group_size = self.dp_size * self.tp_size * 2
             if (
-                self.num_gpus >= 2
+                self.performance_mode != "manual"
+                and self.num_gpus >= 2
                 and self.num_gpus % cfg_group_size == 0
                 and sp_unspecified
                 and ulysses_unspecified
@@ -695,11 +731,15 @@ class ServerArgs(DisaggArgsMixin):
             else:
                 self.enable_cfg_parallel = False
 
+        # Resolve cfg_parallel_degree to a concrete int now that enable_cfg_parallel is settled.
+        if self.cfg_parallel_degree is None:
+            self.cfg_parallel_degree = 2 if self.enable_cfg_parallel else 1
+
         # adjust sp_degree: allocate all remaining GPUs after TP and DP
         if self.sp_degree is None:
             num_gpus_per_group = self.dp_size * self.tp_size
             if self.enable_cfg_parallel:
-                num_gpus_per_group *= 2
+                num_gpus_per_group *= self.cfg_parallel_degree
             if self.num_gpus % num_gpus_per_group == 0:
                 self.sp_degree = self.num_gpus // num_gpus_per_group
             else:
@@ -739,10 +779,6 @@ class ServerArgs(DisaggArgsMixin):
             return False
         default_params = model_info.sampling_param_cls()
 
-        # for ltx2.3, cfg-parallel performs worse than ulysses-sp
-        is_ltx = "ltx" in type(default_params).__name__.lower()
-        if is_ltx:
-            return False
         return (
             getattr(default_params, "negative_prompt", None) is not None
             and getattr(default_params, "guidance_scale", 0) > 1.0
@@ -766,38 +802,6 @@ class ServerArgs(DisaggArgsMixin):
         if current_platform.is_mps():
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
-
-        # automatically enable dit_layerwise_offload for Wan/MOVA models if appropriate
-        if not envs.SGLANG_CACHE_DIT_ENABLED:
-            pipeline_name_lower = self.pipeline_config.__class__.__name__.lower()
-            if (
-                "wan" in pipeline_name_lower or "mova" in pipeline_name_lower
-            ) and self.dit_layerwise_offload is None:
-                auto_enable_layerwise_offload = (
-                    current_platform.enable_dit_layerwise_offload_for_wan_by_default()
-                )
-                if auto_enable_layerwise_offload and current_platform.is_cuda():
-                    device_total_memory_gb = (
-                        current_platform.get_device_total_memory() / BYTES_PER_GB
-                    )
-                    if (
-                        device_total_memory_gb
-                        >= WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB
-                    ):
-                        logger.info(
-                            "Skipping automatic dit_layerwise_offload for %s on a high-memory CUDA GPU (e.g. H200/B200/B300-class, %.2f GiB total)",
-                            self.pipeline_config.__class__.__name__,
-                            device_total_memory_gb,
-                        )
-                        auto_enable_layerwise_offload = False
-                        self.dit_layerwise_offload = False
-
-                if auto_enable_layerwise_offload:
-                    logger.info(
-                        f"Automatically enable dit_layerwise_offload for {self.pipeline_config.__class__.__name__} "
-                        "for low memory and performance balance"
-                    )
-                    self.dit_layerwise_offload = True
 
     def _adjust_autocast(self):
         if self.disable_autocast is None:
@@ -947,6 +951,21 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.num_gpus,
             help="The number of GPUs to use.",
         )
+        parser.add_argument(
+            "--performance-mode",
+            "--mode",
+            type=str,
+            choices=PERFORMANCE_MODES,
+            default=ServerArgs.performance_mode,
+            help=(
+                "Preset for performance and memory defaults. "
+                "'manual' keeps performance-related server args under explicit user control; "
+                "'auto' keeps safe defaults and applies high-confidence FSDP/CFG improvements; "
+                "'speed' favors GPU-resident execution for lower latency and higher throughput, and may OOM; "
+                "'memory' favors lower GPU memory usage; "
+                "Explicit offload/FSDP/parallelism flags take precedence."
+            ),
+        )
 
         parser.add_argument(
             "--tp-size",
@@ -974,9 +993,20 @@ class ServerArgs(DisaggArgsMixin):
         )
         parser.add_argument(
             "--enable-cfg-parallel",
-            action="store_true",
+            action=StoreBoolean,
             default=None,
-            help="Enable cfg parallel. Auto-enabled when num_gpus >= 2 and no SP flags are set.",
+            help="Enable cfg parallel at degree 2. Auto-enabled when num_gpus >= 2 and no SP flags are set. Use false to disable it explicitly.",
+        )
+        parser.add_argument(
+            "--cfg-parallel-size",
+            dest="cfg_parallel_degree",
+            type=int,
+            default=None,
+            help=(
+                "Number of GPUs per CFG parallel group (1 = disabled, N > 1 = enabled at degree N). "
+                "Supersedes --enable-cfg-parallel. Allows 4-branch CFG parallel (e.g., --cfg-parallel-size 4) "
+                "for models with cond + neg + perturbed + modality branches."
+            ),
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -1075,7 +1105,7 @@ class ServerArgs(DisaggArgsMixin):
         parser.add_argument(
             "--use-fsdp-inference",
             action=StoreBoolean,
-            help="Use FSDP for inference by sharding the model weights. Latency is very low due to prefetch--enable if run out of memory.",
+            help="Use FSDP inference to shard DiT weights across GPUs. For single-GPU memory pressure, prefer CPU or layerwise offload.",
         )
         parser.add_argument(
             "--text-encoder-cpu-offload",
@@ -1115,6 +1145,31 @@ class ServerArgs(DisaggArgsMixin):
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
+        )
+
+        parser.add_argument(
+            "--quantization",
+            type=str,
+            default=ServerArgs.quantization,
+            help=(
+                "Quantization method for the transformer. If omitted, the method is "
+                "auto-detected from the checkpoint config or safetensors metadata when "
+                "possible. Applies to both pre-quantized checkpoints and online "
+                "quantization. Use this flag to override auto-detection. "
+                "Options: 'fp8', 'mxfp8', 'mxfp4', 'modelslim'. "
+                "Note: MXFP4 requires ROCm and MI350+ (gfx95x)."
+            ),
+        )
+        parser.add_argument(
+            "--quantization-ignored-layers",
+            type=str,
+            nargs="+",
+            default=ServerArgs.quantization_ignored_layers,
+            help=(
+                "Layer name patterns to keep unquantized during online quantization "
+                "(fp8/mxfp4). Each pattern is matched against the layer prefix. "
+                "Example: --quantization-ignored-layers img_mod txt_mod to_out"
+            ),
         )
 
         # Nunchaku SVDQuant quantization parameters
@@ -1230,6 +1285,17 @@ class ServerArgs(DisaggArgsMixin):
             type=float,
             default=ServerArgs.lora_scale,
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
+        )
+        parser.add_argument(
+            "--lora-merge-mode",
+            type=str,
+            choices=LORA_MERGE_MODES,
+            default=ServerArgs.lora_merge_mode,
+            help=(
+                "How LoRA is applied: auto keeps static merge for regular weights "
+                "and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather; "
+                "merge always merges into base weights; dynamic always applies LoRA at forward time."
+            ),
         )
         parser.add_argument(
             "--lora-weight-name",
@@ -1523,6 +1589,8 @@ class ServerArgs(DisaggArgsMixin):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
                 provided_arg_names.add(arg_name)
+        if "mode" in provided_arg_names:
+            provided_arg_names.add("performance_mode")
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
@@ -1627,11 +1695,13 @@ class ServerArgs(DisaggArgsMixin):
 
         num_gpus_per_group = self.dp_size * self.tp_size
         if self.enable_cfg_parallel:
-            num_gpus_per_group *= 2
+            num_gpus_per_group *= self.cfg_parallel_degree
 
         if self.num_gpus % num_gpus_per_group != 0:
             raise ValueError(
-                f"num_gpus ({self.num_gpus}) must be divisible by (dp_size * tp_size{' * 2' if self.enable_cfg_parallel else ''}) = {num_gpus_per_group}"
+                f"num_gpus ({self.num_gpus}) must be divisible by (dp_size * tp_size"
+                f"{f' * {self.cfg_parallel_degree}' if self.enable_cfg_parallel else ''}"
+                f") = {num_gpus_per_group}"
             )
 
         if self.sp_degree != self.ring_degree * self.ulysses_degree:

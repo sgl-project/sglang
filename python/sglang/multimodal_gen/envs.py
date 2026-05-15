@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
+    SGLANG_USE_ROCM_VAE_CONV2D: bool = False
+    SGLANG_USE_ROCM_VAE_CONV2D_BF16: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -294,6 +296,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
     # ROCm: enable cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers
     "SGLANG_USE_ROCM_CUDNN_BENCHMARK": _lazy_bool("SGLANG_USE_ROCM_CUDNN_BENCHMARK"),
+    # ROCm: replace CausalConv3d with temporal-unfolded batched Conv2D in VAE
+    "SGLANG_USE_ROCM_VAE_CONV2D": _lazy_bool("SGLANG_USE_ROCM_VAE_CONV2D"),
+    # ROCm: use BF16 compute for the Conv2D replacement (implies CONV2D=true)
+    "SGLANG_USE_ROCM_VAE_CONV2D_BF16": _lazy_bool("SGLANG_USE_ROCM_VAE_CONV2D_BF16"),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication
