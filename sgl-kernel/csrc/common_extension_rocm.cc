@@ -34,17 +34,17 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("gelu_quick(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_quick", torch::kCUDA, &gelu_quick);
 
-  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
+  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts, int topk) -> ()");
   m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
 
   m.def(
       "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
-      "cu_seqlens_q, Tensor? row_starts) -> ()");
+      "cu_seqlens_q, Tensor? row_starts, int topk) -> ()");
   m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
 
   m.def(
       "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
-      "topk_indices_offset, Tensor ? row_starts) -> ()");
+      "topk_indices_offset, Tensor ? row_starts, int topk) -> ()");
   m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
 
   /*
