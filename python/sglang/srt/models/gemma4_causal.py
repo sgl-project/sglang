@@ -31,6 +31,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.gemma4_fused_ops import (
     fused_kv_norm,
     gemma_dual_rmsnorm_residual_scalar,
+    gemma_q_keqv_rmsnorm,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
 )
@@ -371,20 +372,47 @@ class Gemma4Attention(nn.Module):
             qk, _ = self.qk_proj(hidden_states)
             q, k = qk.split([self.q_size, self.kv_size], dim=-1)
 
-            q = q.unflatten(-1, (self.num_heads, self.head_dim))
-            q = self.q_norm(q)
-            q = q.flatten(-2, -1)
-
             if is_kv_shared:
                 # For KV shared layers, we skip K/V computation and normalization
                 # The RadixAttention will handle retrieving shared KV from cache
+                q = q.unflatten(-1, (self.num_heads, self.head_dim))
+                q = self.q_norm(q)
+                q = q.flatten(-2, -1)
                 k = None
                 v = None
+            elif (
+                q.is_cuda
+                and self.q_norm.scale_shift == 0.0
+                and self.k_norm.scale_shift == 0.0
+                and not self.v_norm.with_scale
+            ):
+                # Fused Q-norm + (K=V)-norm in a single kernel launch.
+                # Q is normalised in-place on its 2D slice; K and V are
+                # produced as new tensors that share the kv input's strides
+                # (kv is itself a strided slice of the qk buffer, but the
+                # kernel respects stride(0) so no .contiguous() copy needed).
+                k_raw = k
+                k_out, v_out = gemma_q_keqv_rmsnorm(
+                    q,
+                    k_raw,
+                    self.q_norm.weight.data,
+                    self.k_norm.weight.data,
+                    num_q_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    eps=self.q_norm.eps,
+                )
+                # Match the previous output shapes: q stays 2D, k/v become 3D
+                # so the subsequent .flatten(-2, -1) (in shared-rope code below)
+                # works.
+                k = k_out.reshape(-1, self.num_kv_heads, self.head_dim)
+                v = v_out.reshape(-1, self.num_kv_heads, self.head_dim)
             else:
+                # Fallback path: no fused-Q+KV kernel available.
+                q = q.unflatten(-1, (self.num_heads, self.head_dim))
+                q = self.q_norm(q)
+                q = q.flatten(-2, -1)
                 k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-                # K and V share the same projection output.
-                # Fused kernel reads k_raw once, produces both k and v
-                # with shared RMS computation.
                 if k.is_cuda and k.dim() == 3:
                     k, v = fused_kv_norm(
                         k,
@@ -392,7 +420,6 @@ class Gemma4Attention(nn.Module):
                         eps=self.k_norm.eps,
                     )
                 else:
-                    # Fallback for non-CUDA / non-standard shapes
                     v = self.v_norm(k)
                     k = self.k_norm(k)
         else:
