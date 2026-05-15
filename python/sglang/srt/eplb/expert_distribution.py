@@ -415,7 +415,11 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             dict(
                 layer_id=layer_idx,
                 num_tokens_per_rank=num_tokens_per_rank.cpu().tolist(),
-                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.cpu().tolist(),
+                num_tokens_per_rdma_rank=(
+                    num_tokens_per_rdma_rank.cpu().tolist()
+                    if num_tokens_per_rdma_rank is not None
+                    else None
+                ),
                 num_tokens_per_expert=num_tokens_per_expert.cpu().tolist(),
             )
         )
