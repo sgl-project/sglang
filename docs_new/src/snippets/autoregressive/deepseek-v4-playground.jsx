@@ -411,6 +411,30 @@ export const DeepSeekV4Playground = () => {
   ];
   const EP_OPTS = [null, 1, 2, 4, 8, 16];
 
+  // PD-Disaggregation role chips. `off` means no PD wiring; `prefill` / `decode`
+  // emit the role-specific flags. Note that a full PD topology requires running
+  // both roles + a router — see the renderer for the role-banner comment.
+  const PD_MODES = [
+    { id: "off",     label: "Off" },
+    { id: "prefill", label: "Prefill role" },
+    { id: "decode",  label: "Decode role" },
+  ];
+  // IB device defaults differ per Blackwell variant: B200 typically uses
+  // mlx5_7, H200 uses mlx5_0, GB300 uses NVLink (no IB). Expose a few common
+  // values; `auto` (the default chip) emits no --disaggregation-ib-device flag.
+  const PD_IB_DEVICES = ["auto", "mlx5_0", "mlx5_7"];
+
+  // Hierarchical KV cache storage backend choices, mirroring server_args.py.
+  // `auto` (default) emits no --hicache-storage-backend flag — host RAM only.
+  const HICACHE_BACKENDS = [
+    { id: null,        label: "auto" },
+    { id: "file",      label: "file" },
+    { id: "mooncake",  label: "mooncake" },
+    { id: "hf3fs",     label: "hf3fs" },
+    { id: "nixl",      label: "nixl" },
+  ];
+  const HICACHE_WRITE_POLICIES = ["auto", "write_through", "write_back", "write_through_selective"];
+
   // ==========================================================================
   // Pure helpers (shape-identical to §3 where they overlap)
   // ==========================================================================
@@ -457,50 +481,80 @@ export const DeepSeekV4Playground = () => {
   };
 
   // Apply playground deltas on top of the base cell's flags.
-  const applyDeltas = (baseFlags, d) => {
+  // Insert one or more new flags right after the FIRST flag whose first token
+  // is in `afterAnyOf`. Falls back to right-after --model-path if none match.
+  // Used so the playground's overrides land near their conceptual siblings
+  // (e.g. --dp lands next to --tp).
+  const insertAfter = (flags, afterAnyOf, additions) => {
+    const set = new Set(afterAnyOf);
+    let idx = flags.findIndex((f) => set.has(f.split(/[\s=]/)[0]));
+    if (idx === -1) idx = flags.findIndex((f) => f.startsWith("--model-path"));
+    const out = flags.slice();
+    out.splice(idx + 1, 0, ...additions);
+    return out;
+  };
+
+  const applyDeltas = (baseFlags, d, sel) => {
     let flags = [...baseFlags];
 
     // --- Attention parallelism overrides ---
-    const attnTouched =
-      d.attn.tp !== null || d.attn.dp !== null || d.attn.cp !== null ||
-      d.attn.dpAttn !== null;
-    if (attnTouched) {
+    // Per-knob: only strip + re-emit knobs the user actually set. A null
+    // override means "inherit from base" — so the base's flag for that knob
+    // stays untouched. This fixes the earlier bug where toggling DP-Attention
+    // alone would also wipe out the inherited --tp.
+    if (d.attn.tp !== null) {
+      flags = stripFlagsByFirstToken(flags, ["--tp"]);
+      flags = insertAfter(flags, ["--model-path"], [`--tp ${d.attn.tp}`]);
+    }
+    if (d.attn.dp !== null) {
+      flags = stripFlagsByFirstToken(flags, ["--dp"]);
+      if (d.attn.dp > 1) {
+        flags = insertAfter(flags, ["--tp", "--model-path"], [`--dp ${d.attn.dp}`]);
+      }
+    }
+    if (d.attn.dpAttn !== null) {
+      flags = stripFlagsByFirstToken(flags, ["--enable-dp-attention"]);
+      if (d.attn.dpAttn === true) {
+        flags = insertAfter(flags, ["--dp", "--tp", "--model-path"],
+          ["--enable-dp-attention"]);
+      }
+    }
+    if (d.attn.cp !== null) {
       flags = stripFlagsByFirstToken(flags, [
-        "--tp", "--dp", "--enable-dp-attention",
         "--enable-nsa-prefill-context-parallel", "--nsa-prefill-cp-mode",
       ]);
-      const add = [];
-      if (d.attn.tp !== null) add.push(`--tp ${d.attn.tp}`);
-      if (d.attn.dp !== null && d.attn.dp > 1) add.push(`--dp ${d.attn.dp}`);
-      if (d.attn.dpAttn === true) add.push("--enable-dp-attention");
-      if (d.attn.cp !== null && d.attn.cp > 1) {
-        add.push("--enable-nsa-prefill-context-parallel");
-        add.push("--nsa-prefill-cp-mode round-robin-split");
+      if (d.attn.cp > 1) {
+        flags = insertAfter(flags,
+          ["--enable-dp-attention", "--dp", "--tp", "--model-path"],
+          ["--enable-nsa-prefill-context-parallel",
+           "--nsa-prefill-cp-mode round-robin-split"]);
       }
-      // Insert right after --model-path to mirror §3 ordering.
-      const at = flags.findIndex((f) => f.startsWith("--model-path")) + 1;
-      flags.splice(at, 0, ...add);
     }
 
-    // --- MoE parallelism overrides ---
-    const moeBackend = MOE_OPTS.find((o) => o.id === d.moe.backend);
-    if (d.moe.backend !== null || d.moe.ep !== null) {
+    // --- MoE parallelism overrides (also per-knob) ---
+    if (d.moe.backend !== null) {
       flags = stripFlagsByFirstToken(flags, [
-        "--moe-a2a-backend", "--moe-runner-backend", "--ep",
+        "--moe-a2a-backend", "--moe-runner-backend",
       ]);
-      const add = [];
-      if (moeBackend && moeBackend.kind === "a2a") {
-        add.push(`--moe-a2a-backend ${moeBackend.id}`);
-      } else if (moeBackend && moeBackend.kind === "runner") {
-        add.push(`--moe-runner-backend ${moeBackend.id}`);
+      const opt = MOE_OPTS.find((o) => o.id === d.moe.backend);
+      if (opt && opt.kind === "a2a") {
+        flags = insertAfter(flags,
+          ["--enable-dp-attention", "--dp", "--tp", "--model-path"],
+          [`--moe-a2a-backend ${opt.id}`]);
+      } else if (opt && opt.kind === "runner") {
+        flags = insertAfter(flags,
+          ["--enable-dp-attention", "--dp", "--tp", "--model-path"],
+          [`--moe-runner-backend ${opt.id}`]);
       }
-      if (d.moe.ep !== null && d.moe.ep > 1) add.push(`--ep ${d.moe.ep}`);
-      // Insert right after parallelism block (after --tp if present, else
-      // after --model-path).
-      let at = flags.findIndex((f) => f.startsWith("--enable-dp-attention"));
-      if (at === -1) at = flags.findIndex((f) => f.startsWith("--tp"));
-      if (at === -1) at = flags.findIndex((f) => f.startsWith("--model-path"));
-      flags.splice(at + 1, 0, ...add);
+    }
+    if (d.moe.ep !== null) {
+      flags = stripFlagsByFirstToken(flags, ["--ep"]);
+      if (d.moe.ep > 1) {
+        flags = insertAfter(flags,
+          ["--moe-a2a-backend", "--moe-runner-backend", "--enable-dp-attention",
+           "--dp", "--tp", "--model-path"],
+          [`--ep ${d.moe.ep}`]);
+      }
     }
 
     // --- Speculative decoding ---
@@ -522,11 +576,102 @@ export const DeepSeekV4Playground = () => {
     if (d.parsers.toolCall)  parserAdds.push("--tool-call-parser deepseekv4");
     if (parserAdds.length) flags = insertBeforeTail(flags, parserAdds);
 
+    // --- PD Disaggregation (role-specific flags for one of prefill/decode) ---
+    // The full PD topology is prefill + decode + router; the playground emits
+    // a single role's command. A comment is prepended (handled in the
+    // renderer) so users know to run prefill + decode separately and wire a
+    // router. The mode chip selects which role to emit.
+    //
+    // Wire alignment with upstream's deepseek-v4 PD recipe (the original
+    // 999-line buildPDDisaggCommand in deepseek-v4-deployment.jsx):
+    //   - --disaggregation-transfer-backend mooncake (always)
+    //   - --disaggregation-ib-device (per hardware: mlx5_0 / mlx5_7 / none on GB300)
+    //   - --dist-init-addr 127.0.0.1:<port> for single-host PD discovery, with
+    //     different ports per role (30335 prefill / 30435 decode) so prefill
+    //     and decode each form their own torch.distributed group on localhost.
+    //     For multi-node base, the renderer already emits a --dist-init-addr
+    //     line with NODE0_IP, so we don't add this localhost variant.
+    flags = stripFlagsByFirstToken(flags, [
+      "--disaggregation-mode", "--disaggregation-transfer-backend",
+      "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
+    ]);
+    if (d.pd.mode === "prefill" || d.pd.mode === "decode") {
+      const pdAdds = [
+        `--disaggregation-mode ${d.pd.mode}`,
+        "--disaggregation-transfer-backend mooncake",
+      ];
+      if (d.pd.ibDevice && d.pd.ibDevice !== "auto") {
+        pdAdds.push(`--disaggregation-ib-device ${d.pd.ibDevice}`);
+      }
+      // Single-host bootstrap port (only when base isn't already multi-node —
+      // the renderer adds NODE0_IP-based --dist-init-addr in that case and
+      // adding a second one here would collide).
+      if (sel.nodes === "single" && !flags.some((f) => f.startsWith("--dist-init-addr"))) {
+        const bootstrapPort = d.pd.mode === "prefill" ? 30335 : 30435;
+        pdAdds.push(`--dist-init-addr 127.0.0.1:${bootstrapPort}`);
+      }
+      flags = insertBeforeTail(flags, pdAdds);
+    }
+
+    // --- Hierarchical KV Cache ---
+    // Emission follows the canonical upstream form documented in
+    // docs/advanced_features/hicache_best_practices.mdx:
+    //   * Always (when enabled): --enable-hierarchical-cache, --hicache-ratio,
+    //     --hicache-size. Even though these have sensible defaults in
+    //     server_args.py, upstream examples ALWAYS list them for clarity, and
+    //     mirroring that helps users diff commands against the docs.
+    //   * When a storage backend is selected, upstream pairs it with
+    //     `--hicache-mem-layout page_first_direct` and `--hicache-io-backend
+    //     direct` (kernel-mode I/O can't talk to file/mooncake/hf3fs/nixl
+    //     storage), plus `--hicache-storage-prefetch-policy wait_complete`.
+    //     We emit these together as one block to keep the user's command
+    //     runnable out of the box.
+    flags = stripFlagsByFirstToken(flags, [
+      "--enable-hierarchical-cache", "--hicache-ratio", "--hicache-size",
+      "--hicache-write-policy", "--hicache-mem-layout", "--hicache-io-backend",
+      "--hicache-storage-backend", "--hicache-storage-prefetch-policy",
+    ]);
+    if (d.hicache.enable) {
+      // Order matches upstream docs/advanced_features/hicache_best_practices.mdx
+      // exactly so users can diff this command byte-for-byte against the doc's
+      // example: enable / ratio / size / [mem-layout / io-backend] / write-policy
+      // / [storage-backend / prefetch-policy]. The mem-layout + io-backend pair
+      // and the prefetch-policy only appear when a storage backend is selected
+      // (kernel-mode I/O can't talk to file/mooncake/hf3fs/nixl storage).
+      const hcAdds = [
+        "--enable-hierarchical-cache",
+        "--hicache-ratio 2",
+        "--hicache-size 0",
+      ];
+      if (d.hicache.backend) {
+        hcAdds.push(
+          "--hicache-mem-layout page_first_direct",
+          "--hicache-io-backend direct",
+        );
+      }
+      const writePolicy = d.hicache.writePolicy && d.hicache.writePolicy !== "auto"
+        ? d.hicache.writePolicy
+        : "write_through";
+      hcAdds.push(`--hicache-write-policy ${writePolicy}`);
+      if (d.hicache.backend) {
+        hcAdds.push(
+          `--hicache-storage-backend ${d.hicache.backend}`,
+          "--hicache-storage-prefetch-policy wait_complete",
+        );
+      }
+      flags = insertBeforeTail(flags, hcAdds);
+    }
+
     return flags;
   };
 
   // Renderer (same shape as §3 — multi-node prepending, env block, hints).
-  const renderCommandLines = (cell, flags, sel, envValues) => {
+  // `pdMode` is one of: null (skip banner), "prefill", "decode" — when present
+  // a banner is prepended explaining that the emitted command is only ONE of
+  // the three PD-Disagg roles (prefill + decode + router). The renderer
+  // intentionally only emits the role itself; the operator pairs it with the
+  // sibling role and a router invocation separately.
+  const renderCommandLines = (cell, flags, sel, envValues, pdMode = null) => {
     const modelName = resolveModelName(sel);
     const nnodes = parseNnodes(sel.nodes);
     const multinode = nnodes > 1;
@@ -553,6 +698,16 @@ export const DeepSeekV4Playground = () => {
         `#   <node-rank> = 0 on the head node, 1..${nnodes - 1} on the others\n` +
         `#   <node0-ip>  = IP of the head node (reachable from all others)`;
       cmd = `${header}\n${cmd}`;
+    }
+    if (pdMode === "prefill" || pdMode === "decode") {
+      const sibling = pdMode === "prefill" ? "decode" : "prefill";
+      const banner =
+        `# === PD Disaggregation: ${pdMode.toUpperCase()} role only ===\n` +
+        `# This command runs the ${pdMode} server. To complete the topology,\n` +
+        `# also run the ${sibling} role on its peer GPU host, then start the\n` +
+        `# sglang_router with --pd-disaggregation pointing at both. See the\n` +
+        `# §3.2 PD-Disagg notes above for IB device, ulimit, and MNNVL caveats.`;
+      cmd = `${banner}\n${cmd}`;
     }
     return cmd;
   };
@@ -850,6 +1005,8 @@ export const DeepSeekV4Playground = () => {
     moe:  { backend: null, ep: null },
     spec: "current",
     parsers: { reasoning: false, toolCall: false },
+    pd: { mode: "off", ibDevice: "auto" },
+    hicache: { enable: false, backend: null, writePolicy: "auto" },
   });
 
   const [modal, setModal] = useState(null);
@@ -882,8 +1039,8 @@ export const DeepSeekV4Playground = () => {
   let diffLines = [];
   if (baseCell) {
     baseCommand = renderCommandLines(baseCell, baseCell.flags, base, env);
-    const pgFlags = applyDeltas(baseCell.flags, deltas);
-    playgroundCommand = renderCommandLines(baseCell, pgFlags, base, env);
+    const pgFlags = applyDeltas(baseCell.flags, deltas, base);
+    playgroundCommand = renderCommandLines(baseCell, pgFlags, base, env, deltas.pd.mode);
     diffLines = computeDiff(baseCommand, playgroundCommand);
   }
 
@@ -894,6 +1051,8 @@ export const DeepSeekV4Playground = () => {
     moe:  { backend: null, ep: null },
     spec: "current",
     parsers: { reasoning: false, toolCall: false },
+    pd: { mode: "off", ibDevice: "auto" },
+    hicache: { enable: false, backend: null, writePolicy: "auto" },
   });
 
   const placeholderGroups = (() => {
@@ -943,6 +1102,8 @@ export const DeepSeekV4Playground = () => {
   const setAttn = (k, v) => setDeltas((d) => ({ ...d, attn: { ...d.attn, [k]: v } }));
   const setMoe  = (k, v) => setDeltas((d) => ({ ...d, moe:  { ...d.moe,  [k]: v } }));
   const setParser = (k, v) => setDeltas((d) => ({ ...d, parsers: { ...d.parsers, [k]: v } }));
+  const setPd     = (k, v) => setDeltas((d) => ({ ...d, pd: { ...d.pd, [k]: v } }));
+  const setHiCache = (k, v) => setDeltas((d) => ({ ...d, hicache: { ...d.hicache, [k]: v } }));
 
   // Format a hash-suffixed badge of the inherited base.
   const baseSummary = baseCell
@@ -1016,20 +1177,22 @@ export const DeepSeekV4Playground = () => {
       </div>
 
       {/* Axis 3: Parsers — one toggle per parser. Clicking the chip flips its
-          on/off state, no separate "off" button needed. */}
+          on/off state. Chip label is the human-readable kind, not the SGLang
+          internal slug (which becomes the emitted --reasoning-parser /
+          --tool-call-parser flag value). */}
       <div style={{ ...s.card, ...s.cardStack }}>
         <div style={s.title}>Parsers</div>
         <div style={s.subRow}>
           <span style={s.subLabel}>Reasoning</span>
           <div style={s.chipRow}>
-            {renderChip("deepseek-v4", deltas.parsers.reasoning, true,
+            {renderChip("Reasoning Parser", deltas.parsers.reasoning, true,
               () => setParser("reasoning", !deltas.parsers.reasoning))}
           </div>
         </div>
         <div style={s.subRow}>
           <span style={s.subLabel}>Tool Call</span>
           <div style={s.chipRow}>
-            {renderChip("deepseekv4", deltas.parsers.toolCall, true,
+            {renderChip("Tool Call Parser", deltas.parsers.toolCall, true,
               () => setParser("toolCall", !deltas.parsers.toolCall))}
           </div>
         </div>
@@ -1043,6 +1206,54 @@ export const DeepSeekV4Playground = () => {
             renderChip(p.label, deltas.spec, p.id,
               (v) => setDeltas((d) => ({ ...d, spec: v })),
               { disabled: p.disabled, disabledReason: p.disabledReason }))}
+        </div>
+      </div>
+
+      {/* Axis 5: PD Disaggregation — Mode row, IB Device row. */}
+      <div style={{ ...s.card, ...s.cardStack }}>
+        <div style={s.title}>PD Disaggregation</div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>Mode</span>
+          <div style={s.chipRow}>
+            {PD_MODES.map((m) =>
+              renderChip(m.label, deltas.pd.mode, m.id, (v) => setPd("mode", v)))}
+          </div>
+        </div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>IB Device</span>
+          <div style={s.chipRow}>
+            {PD_IB_DEVICES.map((v) =>
+              renderChip(v, deltas.pd.ibDevice, v, (nv) => setPd("ibDevice", nv)))}
+          </div>
+        </div>
+      </div>
+
+      {/* Axis 6: Hierarchical KV Cache — Enable row, Storage backend row,
+          Write policy row. */}
+      <div style={{ ...s.card, ...s.cardStack }}>
+        <div style={s.title}>Hierarchical KV Cache (HiCache)</div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>Enable</span>
+          <div style={s.chipRow}>
+            {renderChip("HiCache", deltas.hicache.enable, true,
+              () => setHiCache("enable", !deltas.hicache.enable))}
+          </div>
+        </div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>Storage</span>
+          <div style={s.chipRow}>
+            {HICACHE_BACKENDS.map((o) =>
+              renderChip(o.label, deltas.hicache.backend, o.id,
+                (v) => setHiCache("backend", v)))}
+          </div>
+        </div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>Write Policy</span>
+          <div style={s.chipRow}>
+            {HICACHE_WRITE_POLICIES.map((p) =>
+              renderChip(p, deltas.hicache.writePolicy, p,
+                (v) => setHiCache("writePolicy", v)))}
+          </div>
         </div>
       </div>
 
