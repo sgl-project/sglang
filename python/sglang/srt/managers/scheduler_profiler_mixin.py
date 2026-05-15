@@ -231,7 +231,7 @@ class SchedulerProfilerMixin:
 
         try:
             logger.info("Starting profile merge...")
-            merger = ProfileMerger(self.torch_profiler_output_dir, self.profile_id)
+            merger = ProfileMerger(self.torch_profiler_output_dir, self.profile_id, self.profile_prefix)
             merged_path = merger.merge_chrome_traces()
 
             summary = merger.get_merge_summary()
