@@ -40,6 +40,10 @@ else:
         (4096, 32768, 64, 512, 512),
     ]
 
+    # This official benchmark intentionally measures the no-sink path. Current
+    # DeepSeek NSA E2E does not pass a per-head attention sink into sparse MLA, so
+    # sink-enabled timings are kernel feature coverage rather than E2E proxy data.
+
 LINE_VALS = ["q8_fp8_jit"]
 LINE_NAMES = ["Q8 FP8 JIT"]
 STYLES = [("blue", "-")]
