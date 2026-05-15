@@ -209,8 +209,9 @@ jobs:
       needs.check-changes.outputs.sgl_kernel == 'true'
     uses: ./.github/workflows/pr-test-sgl-kernel.yml
     with:
+      runner_config: 4-gpu-b200
+      runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
       git_ref: ${{ inputs.git_ref || '' }}
       skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
@@ -227,9 +228,10 @@ jobs:
       needs.check-changes.outputs.jit_kernel == 'true'
     uses: ./.github/workflows/pr-test-jit-kernel.yml
     with:
+      runner_config: 4-gpu-b200
+      runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
       git_ref: ${{ inputs.git_ref || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
@@ -245,7 +247,6 @@ jobs:
     with:
       self_name: stage-a-test-1-gpu-small
       runner_config: 1-gpu-small
-      runs_on: 1-gpu-5090
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -325,7 +326,6 @@ jobs:
     with:
       self_name: stage-b-test-1-gpu-small
       runner_config: 1-gpu-small
-      runs_on: 1-gpu-5090
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -340,7 +340,6 @@ jobs:
     with:
       self_name: stage-b-test-1-gpu-large
       runner_config: 1-gpu-large
-      runs_on: 1-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -355,7 +354,6 @@ jobs:
     with:
       self_name: stage-b-test-2-gpu-large
       runner_config: 2-gpu-large
-      runs_on: 2-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -369,7 +367,6 @@ jobs:
     with:
       self_name: stage-b-test-4-gpu-b200
       runner_config: 4-gpu-b200
-      runs_on: ${{ needs.check-changes.outputs.b200_runner }}
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -386,9 +383,10 @@ jobs:
       needs.check-changes.outputs.multimodal_gen == 'true'
     uses: ./.github/workflows/pr-test-multimodal-gen.yml
     with:
+      runner_config: 4-gpu-b200
+      runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
       continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
       git_ref: ${{ inputs.git_ref || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
@@ -403,7 +401,6 @@ jobs:
     with:
       self_name: stage-c-test-4-gpu-h100
       runner_config: 4-gpu-h100
-      runs_on: 4-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -417,7 +414,6 @@ jobs:
     with:
       self_name: stage-c-test-8-gpu-h200
       runner_config: 8-gpu-h200
-      runs_on: 8-gpu-h200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -438,7 +434,6 @@ jobs:
     with:
       self_name: stage-c-test-8-gpu-h20
       runner_config: 8-gpu-h20
-      runs_on: 8-gpu-h20
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -452,7 +447,6 @@ jobs:
     with:
       self_name: stage-c-test-deepep-4-gpu-h100
       runner_config: deepep-4-gpu-h100
-      runs_on: 4-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -468,7 +462,6 @@ jobs:
     with:
       self_name: stage-c-test-4-gpu-b200
       runner_config: 4-gpu-b200
-      runs_on: ${{ needs.check-changes.outputs.b200_runner }}
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -483,7 +476,6 @@ jobs:
     with:
       self_name: stage-c-test-dsv4-4-gpu-b200
       runner_config: dsv4-4-gpu-b200
-      runs_on: ${{ needs.check-changes.outputs.b200_runner }}
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -498,7 +490,6 @@ jobs:
     with:
       self_name: stage-c-test-dsv4-8-gpu-h200
       runner_config: dsv4-8-gpu-h200
-      runs_on: 8-gpu-h200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}

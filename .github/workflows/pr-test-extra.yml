@@ -107,7 +107,6 @@ jobs:
     with:
       self_name: extra-a-test-1-gpu-small
       runner_config: 1-gpu-small
-      runs_on: 1-gpu-5090
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -121,7 +120,6 @@ jobs:
     with:
       self_name: extra-a-test-1-gpu-large
       runner_config: 1-gpu-large
-      runs_on: 1-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -136,7 +134,6 @@ jobs:
     with:
       self_name: extra-a-test-2-gpu-large
       runner_config: 2-gpu-large
-      runs_on: 2-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -151,7 +148,6 @@ jobs:
     with:
       self_name: extra-b-test-4-gpu-h100
       runner_config: 4-gpu-h100
-      runs_on: 4-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -165,7 +161,6 @@ jobs:
     with:
       self_name: extra-b-test-4-gpu-b200
       runner_config: 4-gpu-b200
-      runs_on: ${{ needs.check-changes.outputs.b200_runner }}
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -180,7 +175,6 @@ jobs:
     with:
       self_name: extra-b-test-8-gpu-h200
       runner_config: 8-gpu-h200
-      runs_on: 8-gpu-h200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -194,7 +188,6 @@ jobs:
     with:
       self_name: extra-b-test-deepep-8-gpu-h200
       runner_config: deepep-8-gpu-h200
-      runs_on: 8-gpu-h200-deepep
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}

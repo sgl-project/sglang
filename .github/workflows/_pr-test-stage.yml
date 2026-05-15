@@ -15,15 +15,11 @@ on:
         type: string
         required: true
       runner_config:
-        description: 'Key in scripts/ci/runner_configs.yml (install script / artifact version / install timeout).'
-        type: string
-        required: true
-      runs_on:
-        description: 'GHA runner label. B200 stages pass needs.check-changes.outputs.b200_runner for dynamic selection.'
+        description: 'Key in scripts/ci/runner_configs.yml. Resolves install script, artifact version, install timeout, runs-on label, and rdma_devices.'
         type: string
         required: true
       check_changes:
-        description: 'toJson(needs.check-changes.outputs). Read via fromJson(...).main_package / sgl_kernel / continue_on_error etc.'
+        description: 'toJson(needs.check-changes.outputs). Read via fromJson(...).main_package / sgl_kernel / continue_on_error / runs_on_map etc.'
         type: string
         required: true
       caller_inputs:
@@ -79,11 +75,11 @@ jobs:
       always() &&
       ((github.event_name == 'schedule' || fromJson(inputs.caller_inputs).test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
       (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true')
-    runs-on: ${{ inputs.runs_on }}
+    # runs-on resolved from runs_on_map; check-changes already substituted
+    # $b200_runner (see runner_configs.py --map). rdma_devices is exported
+    # below in a setup step via $GITHUB_ENV.
+    runs-on: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
     timeout-minutes: 240
-    env:
-      # Only stage-c-test-8-gpu-h20 needs the RDMA device list.
-      SGLANG_CI_RDMA_ALL_DEVICES: ${{ inputs.runner_config == '8-gpu-h20' && 'mlx5_1,mlx5_2,mlx5_3,mlx5_4' || '' }}
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJson(inputs.partitions)[inputs.self_name].max_parallel }}
@@ -97,6 +93,9 @@ jobs:
       - name: Resolve runner_config
         id: rc
         run: python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+
+      - name: Export rdma_devices to job env
+        run: echo "SGLANG_CI_RDMA_ALL_DEVICES=${{ steps.rc.outputs.rdma_devices || '' }}" >> "$GITHUB_ENV"
 
       - uses: ./.github/actions/check-stage-health
 
