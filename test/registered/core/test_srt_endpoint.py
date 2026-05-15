@@ -101,6 +101,27 @@ class TestSRTEndpoint(CustomTestCase):
     def test_simple_decode_batch(self):
         self.run_decode(batch=True)
 
+    def test_v1_loads_exposes_prefill_throughput(self):
+        prompt = "The capital of France is. " * 128
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 1,
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+
+        loads_response = requests.get(self.base_url + "/v1/loads")
+        self.assertEqual(loads_response.status_code, 200)
+        loads = loads_response.json()["loads"]
+        self.assertGreaterEqual(len(loads), 1)
+        self.assertIn("prefill_throughput", loads[0])
+        self.assertGreater(loads[0]["prefill_throughput"], 0.0)
+
     def test_parallel_sample(self):
         self.run_decode(n=3)
 

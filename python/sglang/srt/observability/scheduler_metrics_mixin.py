@@ -1098,6 +1098,7 @@ class SchedulerMetricsMixin:
             max_total_num_tokens=self.max_total_num_tokens,
             token_usage=round(kv_token_usage, 4),
             gen_throughput=round(self.stats.gen_throughput, 2),
+            prefill_throughput=round(self.last_input_throughput, 2),
             cache_hit_rate=round(self.stats.cache_hit_rate, 4),
             utilization=round(self.stats.utilization, 4),
             max_running_requests=self.max_running_requests,

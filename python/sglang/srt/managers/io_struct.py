@@ -2068,6 +2068,9 @@ class GetLoadsReqOutput(BaseReq):
     gen_throughput: float = field(
         metadata={"metric": ("gauge", "Generation throughput tokens/sec")}
     )
+    prefill_throughput: float = field(
+        metadata={"metric": ("gauge", "Prefill throughput tokens/sec")}
+    )
     cache_hit_rate: float = field(
         metadata={"metric": ("gauge", "Prefix cache hit rate")}
     )
