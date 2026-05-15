@@ -123,6 +123,11 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
         else:
             return CPU_QUANTIZATION_METHODS[quantization]
 
+    from sglang.srt.platforms import current_platform
+
+    if current_platform.is_out_of_tree():
+        return current_platform.get_quantization_config(quantization)
+
     return QUANTIZATION_METHODS[quantization]
 
 
