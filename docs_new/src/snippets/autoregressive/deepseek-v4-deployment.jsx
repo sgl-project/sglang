@@ -686,7 +686,7 @@ export const DeepSeekV4Deployment = () => {
 
     // MegaMoE env vars.
     const megamoeEnv = [];
-    if (megamoe !== "disabled") {
+    if (megamoe !== "disabled" && recipe === "max-throughput") {
       megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320");
     }
     if (megamoe === "w4a4") {
