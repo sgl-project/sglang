@@ -366,7 +366,7 @@ def build_accuracy_server_args(
     sgl_args.vae_cpu_offload = False
     sgl_args.image_encoder_cpu_offload = False
     sgl_args.enable_cache_dit = case.server_args.enable_cache_dit
-    sgl_args.dit_layerwise_offload = case.server_args.dit_layerwise_offload
+    sgl_args.layerwise_offload = case.server_args.layerwise_offload
     sgl_args.dit_offload_prefetch_size = case.server_args.dit_offload_prefetch_size
     return sgl_args
 

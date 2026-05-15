@@ -206,7 +206,7 @@ def test_layerwise_offload_keeps_shared_buffers_resident(monkeypatch):
 def test_modelopt_fp8_adapter_keeps_layerwise_offload_enabled():
     server_args = SimpleNamespace(
         dit_cpu_offload=True,
-        dit_layerwise_offload=True,
+        layerwise_offload=True,
     )
     quant_config = ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
 
@@ -216,7 +216,7 @@ def test_modelopt_fp8_adapter_keeps_layerwise_offload_enabled():
     )
 
     assert server_args.dit_cpu_offload is False
-    assert server_args.dit_layerwise_offload is True
+    assert server_args.layerwise_offload is True
 
 
 def test_layerwise_capability_selects_layerwise_strategy_for_any_component():

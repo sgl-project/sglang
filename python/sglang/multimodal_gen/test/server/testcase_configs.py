@@ -182,7 +182,7 @@ class DiffusionServerArgs:
         None  # Second LoRA adapter path for multi-LoRA testing
     )
 
-    dit_layerwise_offload: bool = False
+    layerwise_offload: bool = False
     dit_offload_prefetch_size: int | float | None = None
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False

@@ -129,7 +129,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "layerwise_offload",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            dit_layerwise_offload=True,
+            layerwise_offload=True,
             dit_offload_prefetch_size=2,
         ),
         T2I_sampling_params,
@@ -581,7 +581,7 @@ TWO_GPU_CASES = [
         DiffusionServerArgs(
             model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
             tp_size=2,
-            dit_layerwise_offload=True,
+            layerwise_offload=True,
         ),
         TI2V_sampling_params,
         run_perf_check=False,
@@ -592,7 +592,7 @@ TWO_GPU_CASES = [
             model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
             ring_degree=1,
             ulysses_degree=2,
-            dit_layerwise_offload=True,
+            layerwise_offload=True,
         ),
         TI2V_sampling_params,
         run_perf_check=False,
