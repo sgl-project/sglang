@@ -46,6 +46,15 @@ SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 WORKSPACE_DIM = DIM_NOPE + DIM_ROPE
 
 
+def combined_topk_width(topk: int, window_size: int) -> int:
+    """Width of the padded combined_indices last dim that
+    ``combine_topk_swa_indices`` would produce for these args."""
+    return (
+        (topk + window_size + SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        // SPARSE_PREFILL_TOPK_ALIGNMENT
+    ) * SPARSE_PREFILL_TOPK_ALIGNMENT
+
+
 def combine_topk_swa_indices(
     topk_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -56,6 +65,8 @@ def combine_topk_swa_indices(
     window_size: int,
     compress_ratio: int,
     topk: int,
+    out_indices: Optional[torch.Tensor] = None,
+    out_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Combine topk + SWA indices into a single ``flash_mla_sparse_fwd`` row.
 
@@ -79,6 +90,13 @@ def combine_topk_swa_indices(
         window_size: SWA window size.
         compress_ratio: must be ``>= 1`` even when topk==0.
         topk: configured topk; pass 0 for SWA-only layers.
+        out_indices: optional preallocated ``(num_tokens, combined_topk)``
+            int32 buffer. If provided, the kernel writes the per-query prefix
+            ``[0, topk_len + swa_len)``; positions beyond are not touched.
+            Caller must pre-fill with ``-1`` sentinels (and the chunk-invariant
+            valid-prefix length must hold across reuses).
+        out_lens: optional preallocated ``(num_tokens,)`` int32 buffer; the
+            kernel fully overwrites it, so any dtype-correct buffer works.
 
     Returns:
         combined_indices: (num_tokens, padded_topk_swa) int32, padded to a
@@ -95,19 +113,26 @@ def combine_topk_swa_indices(
 
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
-    combined_topk = (
-        (topk + window_size + SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
-        // SPARSE_PREFILL_TOPK_ALIGNMENT
-    ) * SPARSE_PREFILL_TOPK_ALIGNMENT
-    combined_indices = torch.full(
-        (num_tokens, combined_topk),
-        -1,
-        dtype=torch.int32,
-        device=topk_indices.device,
-    )
-    combined_lens = torch.empty(
-        num_tokens, dtype=torch.int32, device=topk_indices.device
-    )
+    combined_topk = combined_topk_width(topk, window_size)
+    if out_indices is None:
+        combined_indices = torch.full(
+            (num_tokens, combined_topk),
+            -1,
+            dtype=torch.int32,
+            device=topk_indices.device,
+        )
+    else:
+        assert out_indices.shape == (num_tokens, combined_topk)
+        assert out_indices.dtype == torch.int32
+        combined_indices = out_indices
+    if out_lens is None:
+        combined_lens = torch.empty(
+            num_tokens, dtype=torch.int32, device=topk_indices.device
+        )
+    else:
+        assert out_lens.shape == (num_tokens,)
+        assert out_lens.dtype == torch.int32
+        combined_lens = out_lens
 
     NUM_WORKERS = 128
     _combine_topk_swa_indices_kernel[(num_reqs, NUM_WORKERS)](
@@ -167,8 +192,7 @@ def remap_compressed_phys_to_workspace(
     max_blocks = page_table.shape[-1]
     out = torch.empty_like(phys_indices)
 
-    BLOCK_J = triton.next_power_of_2(topk)
-    BLOCK_J = max(BLOCK_J, 16)
+    BLOCK_J = max(triton.next_power_of_2(topk), 16)
     MAX_BLOCKS_POW2 = triton.next_power_of_2(max_blocks)
     _remap_compressed_phys_kernel[(num_qo_tokens,)](
         out,
@@ -456,6 +480,11 @@ class SparsePrefillChunkCache:
     c4_compressed_base: Optional[torch.Tensor] = None     # (num_reqs,) int32
     c4_swa_base: Optional[torch.Tensor] = None            # (num_reqs,) int32
     c4_workspace: Optional[torch.Tensor] = None
+    # Per-layer combine writes into these reusable buffers. Allocated on the
+    # first c4 layer with -1 fill; subsequent layers' kernel writes overwrite
+    # only the valid prefix (chunk-invariant length), leaving the tail at -1.
+    c4_combined_indices: Optional[torch.Tensor] = None
+    c4_combined_lens: Optional[torch.Tensor] = None
 
     @classmethod
     def build(
@@ -636,7 +665,21 @@ class SparsePrefillChunkCache:
         ``c4_sparse_page_indices`` each c4 forward, so the workspace
         ``topk_indices`` cannot be cached. Wraps ``remap + combine`` so the
         backend mirrors the c128 / c0 access pattern (read-only on cache).
+        Reuses preallocated ``c4_combined_indices`` / ``c4_combined_lens``
+        buffers across layers — the kernel only overwrites the valid prefix.
         """
+        topk = c4_sparse_page_indices.shape[-1]
+        if self.c4_combined_indices is None:
+            device = self.seq_lens.device
+            self.c4_combined_indices = torch.full(
+                (self.num_qo_tokens, combined_topk_width(topk, self.swa_window_size)),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.c4_combined_lens = torch.empty(
+                self.num_qo_tokens, dtype=torch.int32, device=device
+            )
         topk_indices = remap_compressed_phys_to_workspace(
             phys_indices=c4_sparse_page_indices,
             page_table=page_table,
@@ -651,5 +694,7 @@ class SparsePrefillChunkCache:
             swa_base=self.c4_swa_base,
             window_size=self.swa_window_size,
             compress_ratio=4,
-            topk=c4_sparse_page_indices.shape[-1],
+            topk=topk,
+            out_indices=self.c4_combined_indices,
+            out_lens=self.c4_combined_lens,
         )
