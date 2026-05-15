@@ -724,10 +724,27 @@ def fused_q_indexer_rope_hadamard_quant(
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
-    module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
-    module.forward(
-        q_input, q_fp8, weight, weights_out, float(weight_scale), freqs_real, positions
-    )
+    if is_hip_runtime():
+        torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant(
+            q_input,
+            q_fp8,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
+    else:
+        module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
+        module.forward(
+            q_input,
+            q_fp8,
+            weight,
+            weights_out,
+            float(weight_scale),
+            freqs_real,
+            positions,
+        )
     return q_fp8, weights_out
 
 
@@ -1078,3 +1095,28 @@ def _dispatch_bf16_fp32_backend(
         return tgemm.mm(x, y, otype=x.dtype).float()
     else:
         return torch.nn.functional.linear(x.float(), y.float())
+
+
+def fused_rope(
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    inverse: bool = False,
+) -> None:
+    """Apply rotary embeddings to both Q and K in a single fused CUDA kernel.
+
+    Args:
+        q: [batch_size, num_q_heads, rope_dim] bfloat16
+        k: [batch_size, num_k_heads, rope_dim] bfloat16 or None
+        freqs_cis: [max_seq_len, rope_dim // 2] complex64 (full table)
+        positions: [batch_size] int32 or int64, indices into freqs_cis
+        inverse: if True, apply inverse rotation (conjugate freqs)
+    """
+    if is_hip():
+        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+
+        apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
+        if k is not None:
+            apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
+        return

@@ -14,10 +14,15 @@ import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
+    fused_rope,
     fused_rope_inplace,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
@@ -37,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_global_dp_buffer,
@@ -347,6 +353,10 @@ class MQALayer(nn.Module):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
+        self.use_fused_qk_norm_rope = (
+            _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
+        )
+
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
@@ -369,52 +379,12 @@ class MQALayer(nn.Module):
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
-        if self.use_fused_qk_norm_rope and x.shape[0] <= 64:
-            from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
-                fused_reduce_qk_norm_rope_swa_write,
-            )
-
-            q = fused_reduce_qk_norm_rope_swa_write(
-                q=q,
-                kv=kv,
-                q_norm_weight=None,
-                kv_norm_weight=self.kv_norm.weight,
-                q_rms_eps=self.eps,
-                kv_rms_eps=self.eps,
-                rope_head_dim=self.qk_rope_head_dim,
-                cos_cache=self.cos_cache,
-                sin_cache=self.sin_cache,
-                positions=positions,
-                is_neox=False,
-                dtype=x.dtype,
-            )
-            return q
-        elif self.use_fused_qk_norm_rope:
-            from sglang.srt.layers.fused_qk_norm import fused_qk_norm
-
-            q = q.view(-1, self.n_local_heads, self.head_dim)
-            q, kv_normed = fused_qk_norm(
-                q,
-                kv.unsqueeze(1),
-                q_weight=None,
-                k_weight=self.kv_norm.weight,
-                eps=self.eps,
-            )
-            kv = kv_normed.squeeze(1)
-            fused_rope(
-                q[..., -self.qk_rope_head_dim :],
-                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-                self.freqs_cis,
-                positions=positions,
-            )
-            return q
-        else:
-            q = q.view(-1, self.n_local_heads, self.head_dim)
-            if q_out is None:
-                q_out = torch.empty_like(q)
-            # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
-            fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
-            return q_out
+        q = q.view(-1, self.n_local_heads, self.head_dim)
+        if q_out is None:
+            q_out = torch.empty_like(q)
+        # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
+        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+        return q_out
 
     def _compute_kv_to_cache(
         self,
@@ -540,28 +510,92 @@ class MQALayer(nn.Module):
             q_lora, _ = self.wq_a(x)
             qkv_a = None
         q_lora = self.q_norm(q_lora)
-        q = self._compute_q_b(q_lora, positions, q_out)
 
         use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
-        if use_cp:
-            # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
-            # write to the FlashMLA cache after gather.
-            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-            kv = cp_all_gather_rerange_output(
-                kv.contiguous(),
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
+
+        if self.use_fused_qk_norm_rope:
+            q, _ = self.wq_b(q_lora)
+            kv, _ = qkv_a[..., self.q_lora_rank :], (
+                None if qkv_a is not None else self.wkv(x)
             )
+
+            if x.shape[0] <= 64:
+                from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
+                    fused_reduce_qk_norm_rope_swa_write,
+                )
+
+                q = fused_reduce_qk_norm_rope_swa_write(
+                    q=q,
+                    kv=kv,
+                    q_norm_weight=None,
+                    kv_norm_weight=self.kv_norm.weight,
+                    q_rms_eps=self.eps,
+                    kv_rms_eps=self.eps,
+                    rope_head_dim=self.qk_rope_head_dim,
+                    cos_cache=self.cos_cache,
+                    sin_cache=self.sin_cache,
+                    positions=positions,
+                    is_neox=False,
+                    dtype=x.dtype,
+                )
+            else:
+                from sglang.srt.layers.fused_qk_norm import fused_qk_norm
+
+                q, _ = self.wq_b(q_lora)
+                kv, _ = qkv_a[..., self.q_lora_rank :], (
+                    None if qkv_a is not None else self.wkv(x)
+                )
+
+                q = q.view(-1, self.n_local_heads, self.head_dim)
+                q, kv_normed = fused_qk_norm(
+                    q,
+                    kv.unsqueeze(1),
+                    q_weight=None,
+                    k_weight=self.kv_norm.weight,
+                    eps=self.eps,
+                )
+                kv = kv_normed.squeeze(1)
+                fused_rope(
+                    q[..., -self.qk_rope_head_dim :],
+                    kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                    self.freqs_cis,
+                    positions=positions,
+                )
+
+            if use_cp:
+                kv = cp_all_gather_rerange_output(
+                    kv.contiguous(),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+
             attn_backend.store_cache(
                 layer_id=self.layer_id,
                 swa_k=kv,
                 forward_batch=forward_batch,
             )
         else:
-            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
-            kv = None
+            q = self._compute_q_b(q_lora, positions, q_out)
+            if use_cp:
+                # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
+                # write to the FlashMLA cache after gather.
+                kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+                kv = cp_all_gather_rerange_output(
+                    kv.contiguous(),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
+                )
+            else:
+                self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
+                kv = None
 
         del qkv_a
 
@@ -924,7 +958,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids = input_ids[cp_rank::cp_size].contiguous()
             input_ids_global = input_ids
         elif _use_tp_moe_gather:
-            hidden_states, local_hidden_states = get_global_dp_buffer(), hidden_states
+            hidden_states, local_hidden_states = (
+                get_global_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
@@ -940,7 +977,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids_global=input_ids_global,
         )
         if _use_tp_moe_gather:
-            hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(get_attention_tp_group()),
+                hidden_states,
+            )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None

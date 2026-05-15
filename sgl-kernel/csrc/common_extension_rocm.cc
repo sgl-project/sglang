@@ -216,6 +216,21 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
   m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
 
+  // DeepSeek-V4 fused norm + rope
+  m.def(
+      "dsv4_fused_q_norm_rope(Tensor q_input, Tensor! q_output, Tensor freqs_cis, Tensor positions, float eps) -> ()");
+  m.impl("dsv4_fused_q_norm_rope", torch::kCUDA, &dsv4_fused_q_norm_rope);
+
+  m.def(
+      "dsv4_fused_k_norm_rope_flashmla(Tensor kv, Tensor kv_weight, Tensor freqs_cis, Tensor positions, "
+      "Tensor out_loc, Tensor! kvcache, float eps, int page_size) -> ()");
+  m.impl("dsv4_fused_k_norm_rope_flashmla", torch::kCUDA, &dsv4_fused_k_norm_rope_flashmla);
+
+  m.def(
+      "dsv4_fused_q_indexer_rope_hadamard_quant(Tensor q_input, Tensor! q_fp8, Tensor weight, "
+      "Tensor! weights_out, float weight_scale, Tensor freqs_cis, Tensor positions) -> ()");
+  m.impl("dsv4_fused_q_indexer_rope_hadamard_quant", torch::kCUDA, &dsv4_fused_q_indexer_rope_hadamard_quant);
+
   /*
    * From csrc/elementwise
    */
