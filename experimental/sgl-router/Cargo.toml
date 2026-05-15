@@ -56,6 +56,9 @@ dashmap = "6"
 serde_yaml = "0.9"
 toml = "0.8"
 notify = "7"
+kube = { version = "0.96", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.23", features = ["v1_31"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 dirs = "5"
