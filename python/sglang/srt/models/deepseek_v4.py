@@ -704,40 +704,6 @@ class MQALayer(nn.Module):
         return o
 
 
-def _hc_split_sinkhorn_torch(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int,
-    sinkhorn_iters: int,
-    eps: float,
-):
-    """Pure-torch implementation of hc_split_sinkhorn (tilelang-free fallback)."""
-    b, s, _ = mixes.shape
-    hc = hc_mult
-    flat = mixes.reshape(b * s, (2 + hc) * hc)
-
-    pre = torch.sigmoid(flat[:, :hc] * hc_scale[0] + hc_base[:hc]) + eps
-    post = 2.0 * torch.sigmoid(
-        flat[:, hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc]
-    )
-    comb = (
-        flat[:, 2 * hc :] * hc_scale[2] + hc_base[2 * hc :]
-    ).reshape(b * s, hc, hc)
-
-    comb = torch.softmax(comb, dim=-1) + eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(sinkhorn_iters - 1):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-
-    return (
-        pre.view(b, s, hc),
-        post.view(b, s, hc),
-        comb.view(b, s, hc, hc),
-    )
-
-
 # -----------------------------------------------------------------------------
 # Triton fallback for `hc_split_sinkhorn` (TileLang kernel in
 # sglang.srt.layers.mhc). Used on platforms / builds where TileLang is
@@ -1006,7 +972,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
             )
         else:
-            # _hc_split_sinkhorn_torch also available
             pre, post, comb = _hc_split_sinkhorn_triton(
                 mixes,
                 hc_scale,
