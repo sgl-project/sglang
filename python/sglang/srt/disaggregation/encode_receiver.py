@@ -193,25 +193,29 @@ _MODALITY_GRID_ATTRS = {
     Modality.VIDEO: ("video_grid_thw", False),
     Modality.AUDIO: ("audio_feature_lens", True),
 }
-# Per-part video metadata propagated through EPD. Tensor attrs cat on dim=0
-# across parts; others chain as lists. To extend EPD for a new model, add the
-# per-part fields its processor emits at encode time to the appropriate tuple
-# below (and to _VIDEO_META_TENSOR_ATTRS if the value is a tensor).
+# Per-part video metadata for EPD. Tensor attrs cat on dim=0 across parts;
+# others chain as lists. video_meta_attrs_for(model_type) resolves the active
+# set per instance so non-MiMo runs skip the MiMo audio fields entirely.
 _GENERAL_VIDEO_META_ATTRS = (
-    # Common video timing metadata; shared by Qwen2/3-VL family and MiMo-VL.
     "video_timestamps",
     "second_per_grid_ts",
 )
+# MiMo-VL audio-in-video fields; appended only when model_type is MiMo.
 _MIMO_VIDEO_AUDIO_META_ATTRS = (
-    # Audio-in-video metadata; currently only emitted by MiMoProcessor
-    # (see preprocess_for_encoder), but the names are model-agnostic.
     "video_audio_feature_lens",
     "video_audio_segment_lens_flat",
     "video_audio_per_video_num_units",
     "video_audio_embedding",
 )
-VIDEO_META_ATTRS = _GENERAL_VIDEO_META_ATTRS + _MIMO_VIDEO_AUDIO_META_ATTRS
 _VIDEO_META_TENSOR_ATTRS = ("video_audio_feature_lens", "video_audio_embedding")
+
+
+def video_meta_attrs_for(model_type: Optional[str]) -> tuple:
+    """Video-meta attrs for model_type. MiMo appends its audio-in-video fields."""
+    attrs = _GENERAL_VIDEO_META_ATTRS
+    if model_type and "mimo" in model_type.lower():
+        attrs = attrs + _MIMO_VIDEO_AUDIO_META_ATTRS
+    return attrs
 
 
 def _cat_grid(dims, flatten_items=False):
@@ -249,6 +253,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         modality,
         embedding,
         embedding_shape,
+        model_type: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(
@@ -261,6 +266,7 @@ class MultiModalEmbeddingData(EmbeddingData):
             embedding_shape,
             **kwargs,
         )
+        self.video_meta_attrs = video_meta_attrs_for(model_type)
         self.img_grid_thw = [None] * num_parts
         self.video_grid_thw = [None] * num_parts
         self.audio_feature_lens = [None] * num_parts
@@ -274,7 +280,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         self.embedding_shape_list = [
             embedding_shape if i == part_idx else None for i in range(num_parts)
         ]
-        for attr in VIDEO_META_ATTRS:
+        for attr in self.video_meta_attrs:
             setattr(self, attr, [None] * num_parts)
 
         self._set_part_grid(part_idx, modality, self.get_grid())
@@ -292,7 +298,7 @@ class MultiModalEmbeddingData(EmbeddingData):
 
     def _set_video_meta_for_part(self, part_idx, source):
         """Copy video_timestamps and second_per_grid_ts from source (dict or object)."""
-        for attr_name in VIDEO_META_ATTRS:
+        for attr_name in self.video_meta_attrs:
             val = (
                 source.get(attr_name)
                 if isinstance(source, dict)
@@ -302,11 +308,15 @@ class MultiModalEmbeddingData(EmbeddingData):
                 getattr(self, attr_name)[part_idx] = val
 
     @classmethod
-    def from_embedding_data(cls, embedding_data: EmbeddingData):
+    def from_embedding_data(
+        cls,
+        embedding_data: EmbeddingData,
+        model_type: Optional[str] = None,
+    ):
         """Create MultiModalEmbeddingData from an EmbeddingData instance."""
         # Only forward known optional attrs (e.g. video metadata) so they land on the instance
         extra = {}
-        for attr in VIDEO_META_ATTRS:
+        for attr in video_meta_attrs_for(model_type):
             val = getattr(embedding_data, attr, None)
             if val is not None:
                 extra[attr] = val
@@ -318,6 +328,7 @@ class MultiModalEmbeddingData(EmbeddingData):
             modality=embedding_data.modality,
             embedding=embedding_data.embedding,
             embedding_shape=embedding_data.shape,
+            model_type=model_type,
             **extra,
         )
         mm_data.send_time = embedding_data.send_time
@@ -348,7 +359,7 @@ class MultiModalEmbeddingData(EmbeddingData):
                 self.audio_feature_lens, flatten_items=True
             ),
         }
-        for attr in VIDEO_META_ATTRS:
+        for attr in self.video_meta_attrs:
             lst = getattr(self, attr, None)
             if not lst:
                 continue
@@ -565,7 +576,7 @@ class WaitingImageRequest:
 
             if self.recv_embedding_data is None:
                 self.recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
-                    recv_obj
+                    recv_obj, model_type=self.model_type
                 )
             else:
                 self.recv_embedding_data.add(recv_obj)
@@ -655,6 +666,11 @@ class MMReceiverBase(ABC):
         self.encode_urls = server_args.encoder_urls
         self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.host = get_local_ip_auto(server_args.host)
+        self.model_type = (
+            getattr(hf_config, "model_type", "").lower()
+            if hf_config is not None
+            else None
+        )
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
             self.embeddings_engine = get_mooncake_transfer_engine()
@@ -827,7 +843,7 @@ class MMReceiverBase(ABC):
                     )
                 if recv_embedding_data is None:
                     recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
-                        recv_obj
+                        recv_obj, model_type=self.model_type
                     )
                 else:
                     recv_embedding_data.add(recv_obj)

@@ -25,8 +25,8 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import (
-    VIDEO_META_ATTRS,
     EmbeddingData,
+    video_meta_attrs_for,
 )
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
@@ -174,9 +174,9 @@ def _get_mm_feature(mm_inputs, modality):
     )
 
 
-def _build_mm_aux_data(mm_inputs):
-    # Video aux metadata; VIDEO_META_ATTRS is the single source of truth.
-    return {attr: mm_inputs.get(attr) for attr in VIDEO_META_ATTRS}
+def _build_mm_aux_data(mm_inputs, model_type=None):
+    # Video aux metadata, scoped to model_type's video-meta attrs.
+    return {attr: mm_inputs.get(attr) for attr in video_meta_attrs_for(model_type)}
 
 
 class MMEncoder:
@@ -830,7 +830,7 @@ class MMEncoder:
                 self.background_tasks.add(task)
                 task.add_done_callback(self.background_tasks.discard)
 
-            aux_data = _build_mm_aux_data(mm_inputs)
+            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
             self.embedding_to_send[req_id] = EmbeddingData(
                 req_id,
                 num_parts,
@@ -1103,7 +1103,7 @@ class MMEncoder:
             if self.profiler is not None:
                 self.profiler.step()
 
-            aux_data = _build_mm_aux_data(mm_inputs)
+            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
 
             if modality == Modality.VIDEO and mm_inputs.get("video_audio_features"):
                 target = (
