@@ -425,7 +425,7 @@ class Compressor(nn.Module):
         assert isinstance(ret, CompressStatePool)
 
         return ret
-      
+
     # NOTE: used by v2 compressor backend
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
@@ -443,7 +443,8 @@ class Compressor(nn.Module):
                 torch.cuda.current_stream(),
             )
         return kv_score
-# ===================== For HIP =====================
+
+    # ===================== For HIP =====================
     @cached_property
     def use_fused_compress(self) -> bool:
         if _is_hip:
@@ -838,8 +839,9 @@ class Compressor(nn.Module):
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
-#================================================
-    
+
+    # ================================================
+
     def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
