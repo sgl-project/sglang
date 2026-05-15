@@ -75,3 +75,9 @@ if current_platform.is_mps():
     @debug_kernel_api
     def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6):
         return triton_one_pass_rms_norm_native(x, w, eps)
+
+
+if current_platform.is_cpu():
+    from .torch_fallback import triton_one_pass_rms_norm_native
+
+    triton_one_pass_rms_norm = triton_one_pass_rms_norm_native

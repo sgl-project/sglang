@@ -276,10 +276,15 @@ class TextEncoderLoader(ComponentLoader):
         # Determine CPU offload behavior and target device
 
         local_torch_device = get_local_torch_device()
-        fsdp_cpu_offload = self.should_offload(server_args, model_config)
-        should_offload = (
-            cpu_offload_flag if cpu_offload_flag is not None else fsdp_cpu_offload
-        )
+
+        if not current_platform.is_cpu():
+            fsdp_cpu_offload = self.should_offload(server_args, model_config)
+            should_offload = (
+                cpu_offload_flag if cpu_offload_flag is not None else fsdp_cpu_offload
+            )
+        else:
+            fsdp_cpu_offload = False
+            should_offload = False
 
         if should_offload and not current_platform.is_mps():
             model_device = torch.device("cpu")

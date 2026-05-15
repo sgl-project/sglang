@@ -1035,8 +1035,6 @@ at::Tensor fp8_scaled_mm_cpu(
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni) {
-  RECORD_FUNCTION("sgl-kernel::fp8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales2, block_size, bias}));
-
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
@@ -1104,8 +1102,6 @@ at::Tensor fp8_scaled_mm_cpu(
 // scales2: [N, K / G], actual layout: [N / BLOCK_N, K / G, BLOCK_N]
 at::Tensor mxfp4_scaled_mm_cpu(
     at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2, const std::optional<at::Tensor>& bias, bool is_vnni) {
-  RECORD_FUNCTION("sgl-kernel::mxfp4_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales2, bias}));
-
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 
   CHECK_INPUT(mat1);

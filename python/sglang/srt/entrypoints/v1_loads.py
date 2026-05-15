@@ -19,6 +19,7 @@ metrics for load balancing, monitoring, and capacity planning.
 """
 
 import dataclasses
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -65,6 +66,8 @@ def _compute_aggregate(load_dicts: list) -> dict:
             "total_running_reqs": 0,
             "total_waiting_reqs": 0,
             "total_reqs": 0,
+            "total_used_tokens": 0,
+            "total_tokens": 0,
             "avg_token_usage": 0.0,
             "avg_throughput": 0.0,
             "avg_utilization": 0.0,
@@ -77,6 +80,8 @@ def _compute_aggregate(load_dicts: list) -> dict:
         "total_reqs": sum(
             d["num_running_reqs"] + d["num_waiting_reqs"] for d in load_dicts
         ),
+        "total_used_tokens": sum(d["num_used_tokens"] for d in load_dicts),
+        "total_tokens": sum(d["num_total_tokens"] for d in load_dicts),
         "avg_token_usage": round(sum(d["token_usage"] for d in load_dicts) / n, 4),
         "avg_throughput": round(sum(d["gen_throughput"] for d in load_dicts) / n, 2),
         "avg_utilization": round(sum(d["utilization"] for d in load_dicts) / n, 4),
@@ -149,6 +154,7 @@ async def get_loads(
     """
     include_list = [s.strip() for s in include.split(",")] if include else None
 
+    start = time.perf_counter()
     try:
         load_results = await tokenizer_manager.get_loads(
             include=include_list,
@@ -156,6 +162,12 @@ async def get_loads(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        mc = getattr(tokenizer_manager, "metrics_collector", None)
+        if mc is not None:
+            mc.get_loads_duration_seconds.labels(**mc.labels).observe(
+                time.perf_counter() - start
+            )
 
     if format == "prometheus":
         return _format_loads_prometheus(load_results)

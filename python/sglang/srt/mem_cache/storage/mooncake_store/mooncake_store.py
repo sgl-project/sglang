@@ -92,6 +92,8 @@ class MooncakeStoreConfig:
     check_server: bool
     standalone_storage: bool
     client_server_address: str
+    enable_ssd_offload: bool = False
+    ssd_offload_path: Optional[str] = None
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
@@ -142,6 +144,12 @@ class MooncakeStoreConfig:
             client_server_address=config.get(
                 "client_server_address", envs.MOONCAKE_CLIENT.default
             ),
+            enable_ssd_offload=config.get(
+                "enable_ssd_offload", envs.MOONCAKE_ENABLE_SSD_OFFLOAD.default
+            ),
+            ssd_offload_path=config.get(
+                "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
+            ),
         )
 
     @staticmethod
@@ -181,6 +189,8 @@ class MooncakeStoreConfig:
             check_server=envs.MOONCAKE_CHECK_SERVER.get(),
             standalone_storage=envs.MOONCAKE_STANDALONE_STORAGE.get(),
             client_server_address=envs.MOONCAKE_CLIENT.get(),
+            enable_ssd_offload=envs.MOONCAKE_ENABLE_SSD_OFFLOAD.get(),
+            ssd_offload_path=envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.get(),
         )
 
     @staticmethod
@@ -222,6 +232,12 @@ class MooncakeStoreConfig:
             ),
             client_server_address=extra_config.get(
                 "client_server_address", envs.MOONCAKE_CLIENT.default
+            ),
+            enable_ssd_offload=extra_config.get(
+                "enable_ssd_offload", envs.MOONCAKE_ENABLE_SSD_OFFLOAD.default
+            ),
+            ssd_offload_path=extra_config.get(
+                "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
             ),
         )
 
@@ -373,29 +389,55 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     client_hostname = self.config.local_hostname
                     transfer_engine = None
 
-                ret_code = self.store.setup(
-                    client_hostname,
-                    self.config.metadata_server,
-                    per_tp_global_segment_size,
-                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
-                    self.config.protocol,
-                    device_name,
-                    self.config.master_server_address,
-                    transfer_engine,
-                )
+                setup_kwargs = {}
+                if self.config.enable_ssd_offload:
+                    setup_kwargs["enable_ssd_offload"] = True
+                if self.config.ssd_offload_path is not None:
+                    setup_kwargs["ssd_offload_path"] = self.config.ssd_offload_path
+
+                while True:
+                    try:
+                        ret_code = self.store.setup(
+                            client_hostname,
+                            self.config.metadata_server,
+                            per_tp_global_segment_size,
+                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                            self.config.protocol,
+                            device_name,
+                            self.config.master_server_address,
+                            transfer_engine,
+                            **setup_kwargs,
+                        )
+                        break
+                    except TypeError as e:
+                        unsupported_kwargs = [
+                            key for key in list(setup_kwargs) if key in str(e)
+                        ]
+                        if not unsupported_kwargs:
+                            raise
+                        logger.warning(
+                            "The installed Mooncake version does not support the "
+                            f"{', '.join(unsupported_kwargs)} parameter(s) in setup(). "
+                            f"Retrying without {', '.join(unsupported_kwargs)}. "
+                            "Please upgrade Mooncake to enable SSD offload support."
+                        )
+                        for key in unsupported_kwargs:
+                            setup_kwargs.pop(key, None)
             if ret_code:
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"
                 )
             logger.info("Mooncake store setup successfully.")
 
+            self.local_rank = (
+                storage_config.tp_rank if storage_config is not None else 0
+            )
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
             self.enable_storage_metrics = False
             if storage_config is not None:
                 self.is_mla_backend = storage_config.is_mla_model
-                self.local_rank = storage_config.tp_rank
                 self.pp_rank = storage_config.pp_rank
                 self.pp_size = storage_config.pp_size
                 self.attn_cp_rank = storage_config.attn_cp_rank
@@ -410,12 +452,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.attn_cp_size = 1
 
             self.enable_pp = self.pp_size > 1
-            self.enable_cp = self.attn_cp_size > 1
-            if self.enable_pp or self.enable_cp:
-                self.mha_suffix = (
-                    f"{self.local_rank}_{self.pp_rank}_{self.attn_cp_rank}"
-                )
-                self.mla_suffix = f"{self.pp_rank}_{self.attn_cp_rank}"
+            if self.enable_pp:
+                self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
+                self.mla_suffix = f"{self.pp_rank}"
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
@@ -428,10 +467,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 base_rank = self.local_rank * self.split_factor
                 target_ranks = [base_rank + i for i in range(self.split_factor)]
-                if self.enable_pp or self.enable_cp:
+                if self.enable_pp:
                     self.mha_suffix = [
-                        f"{rank}_{self.pp_rank}_{self.attn_cp_rank}"
-                        for rank in target_ranks
+                        f"{rank}_{self.pp_rank}" for rank in target_ranks
                     ]
                 else:
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
@@ -487,7 +525,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
         warmup_value = bytes(4 * 1024)  # 4 KB
-        assert self.store.put(warmup_key, warmup_value) == 0
+
+        # Retry logic to handle Transfer Engine startup race condition
+        max_retries = 10
+        retry_delay = 1.0  # seconds
+
+        for attempt in range(max_retries):
+            ret = self.store.put(warmup_key, warmup_value)
+            if ret == 0:
+                break
+            logger.warning(
+                f"[TP{self.local_rank}] Warmup put failed (attempt {attempt + 1}/{max_retries}), "
+                f"ret={ret}, retrying in {retry_delay}s..."
+            )
+            time.sleep(retry_delay)
+        else:
+            raise RuntimeError(
+                f"[TP{self.local_rank}] Warmup put failed after {max_retries} attempts, "
+                "Transfer Engine might not be ready"
+            )
+
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
 
@@ -497,8 +554,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             "page_first",
             "page_first_direct",
             "page_head",
-            "page_first_kv_spilt",
-        ], "mooncake store storage backend only support page first, page first direct, page head and  page_first_kv_spilt layout"
+            "page_first_kv_split",
+        ], "mooncake store storage backend only support page first, page first direct, page head and  page_first_kv_split layout"
         buffer = self.mem_pool_host.kv_buffer
         try:
             super().register_buffer(buffer)

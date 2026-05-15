@@ -1,0 +1,124 @@
+name: PR Awareness Comment
+# Reusable workflow maintaining an "awareness block" at the bottom of the PR
+# body: extra-CI opt-in state + latest PR Test / PR Test Extra run URLs.
+# Called from pr-test.yml + pr-test-extra.yml after their check-changes job so
+# the block appears ~30s in, not after downstream stages. Each caller updates
+# only its own slot; the other slot is preserved verbatim.
+#
+# pulls.update fires `pull_request: edited`, which is NOT in the default
+# trigger types, so this does not loop back into the CI workflows.
+
+on:
+  workflow_call:
+    inputs:
+      workflow_kind:
+        description: "Which workflow is calling: 'pr-test' or 'pr-test-extra'"
+        required: true
+        type: string
+
+permissions:
+  pull-requests: write
+
+jobs:
+  update-pr-body:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # Serialize concurrent writers from pr-test + pr-test-extra: both race on
+    # get/modify/update of the PR body, and the later `pulls.update` clobbers
+    # the earlier writer's slot. Group is per-PR so unrelated PRs don't block.
+    # cancel-in-progress MUST be false — cancelling would drop the earlier update.
+    concurrency:
+      group: pr-awareness-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Update awareness block in PR body
+        uses: actions/github-script@v7
+        env:
+          # Pass input via env (process.env) instead of `${{ }}` interpolation
+          # into the JS body, so future user-controlled values can't inject JS.
+          KIND: ${{ inputs.workflow_kind }}
+        with:
+          script: |
+            const kind = process.env.KIND;
+            const labels = context.payload.pull_request.labels.map(l => l.name);
+            const hasExtra = labels.includes('run-ci-extra');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const outerStart = '<!-- pr-awareness:start -->';
+            const outerEnd   = '<!-- pr-awareness:end -->';
+            const ptStart    = '<!-- slot:pr-test:start -->';
+            const ptEnd      = '<!-- slot:pr-test:end -->';
+            const peStart    = '<!-- slot:pr-test-extra:start -->';
+            const peEnd      = '<!-- slot:pr-test-extra:end -->';
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            const body = pr.body || '';
+
+            // Extract existing block + slots so we preserve the other workflow's URL
+            const blockRe = new RegExp(`${outerStart}[\\s\\S]*?${outerEnd}`);
+            const existingBlock = (body.match(blockRe) || [''])[0];
+
+            function extractSlot(text, start, end) {
+              const re = new RegExp(`${start}([\\s\\S]*?)${end}`);
+              const m = text.match(re);
+              return m ? m[1] : null;
+            }
+            const prevPrTest  = extractSlot(existingBlock, ptStart, ptEnd);
+            const prevPrExtra = extractSlot(existingBlock, peStart, peEnd);
+
+            // Each caller updates only its own slot; the other slot is preserved.
+            // For pr-test-extra without the label: the rest of its graph is
+            // label-gate-skipped, so linking to that run would mislead — inline
+            // a warning notice in the slot instead.
+            // When kind=pr-test and hasExtra=false, force-reset the extra slot
+            // rather than carrying prevPrExtra forward — otherwise an old Run
+            // URL from a previous opt-in lingers after the label is removed,
+            // until pr-test-extra runs again and rewrites the slot.
+            const notEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
+            const newPrTest = (kind === 'pr-test')
+              ? `[Run #${context.runId}](${runUrl})`
+              : (prevPrTest || '_Not run yet_');
+            const newPrExtra = (kind === 'pr-test-extra')
+              ? (hasExtra
+                  ? `[Run #${context.runId}](${runUrl})`
+                  : notEnabledText)
+              : (hasExtra
+                  ? (prevPrExtra || '_Not run yet_')
+                  : notEnabledText);
+
+            const newBlock = [
+              outerStart,
+              '---',
+              '### CI Awareness',
+              '',
+              `Latest PR Test: ${ptStart}${newPrTest}${ptEnd}`,
+              `Latest PR Test (Extra): ${peStart}${newPrExtra}${peEnd}`,
+              outerEnd,
+            ].join('\n');
+
+            // Replace existing block in place, or append at body end.
+            let newBody;
+            if (blockRe.test(body)) {
+              newBody = body.replace(blockRe, newBlock);
+            } else {
+              const sep = body.length === 0
+                ? ''
+                : (body.endsWith('\n') ? '\n---\n\n' : '\n\n---\n\n');
+              newBody = `${body}${sep}${newBlock}`;
+            }
+
+            if (newBody !== body) {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                body: newBody,
+              });
+              core.info(`Updated PR body awareness block (caller=${kind}).`);
+            } else {
+              core.info(`PR body awareness block already up-to-date (caller=${kind}).`);
+            }
