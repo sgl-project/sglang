@@ -164,6 +164,39 @@ mod tests {
         );
     }
 
+    /// Ported from SMG tests/api/parser_endpoints_test.rs (parse_function_call_missing_fields):
+    /// DetokenizeRequest has `deny_unknown_fields`; an extra field must yield 422
+    /// Unprocessable Entity from axum's JSON extractor, not 200 with the field silently ignored.
+    /// Gap: the existing `tokenize_request_does_not_advertise_add_special_tokens` test only
+    /// exercises serde deserialization directly; this test exercises the HTTP layer.
+    #[tokio::test]
+    async fn detokenize_rejects_unknown_field() {
+        let app = crate::server::app::build_router(ctx_with_tiny());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny",
+            "tokens": [15496, 995],
+            "skip_special_tokens": false,
+            "add_special_tokens": true   // unknown field — must be rejected
+        }))
+        .unwrap();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/detokenize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DetokenizeRequest must reject unknown fields via deny_unknown_fields"
+        );
+    }
+
     #[tokio::test]
     async fn unknown_model_404() {
         let app = crate::server::app::build_router(ctx_with_tiny());
