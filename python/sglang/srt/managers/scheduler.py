@@ -380,6 +380,7 @@ class Scheduler(
         )
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
+        self.lora_sort_by_adapter = server_args.lora_sort_by_adapter
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
         self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
@@ -2810,6 +2811,11 @@ class Scheduler(
         self.running_bs = len(self.running_batch.reqs)
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+
+        # Sort by lora_id to group requests using the same adapter together,
+        # reducing the number of LoRA GEMM segments in the batch.
+        if self.lora_sort_by_adapter:
+            can_run_list.sort(key=lambda req: req.lora_id or "")
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(

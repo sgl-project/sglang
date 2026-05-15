@@ -549,6 +549,7 @@ class ServerArgs:
     max_loras_per_batch: int = 8
     lora_eviction_policy: str = "lru"
     lora_backend: str = "csgmv"
+    lora_sort_by_adapter: bool = False
     max_lora_chunk_size: Optional[int] = 16
     experts_shared_outer_loras: Optional[bool] = None
     lora_use_virtual_experts: bool = False
@@ -5604,6 +5605,12 @@ class ServerArgs:
             help="Choose the kernel backend for multi-LoRA serving.",
         )
         parser.add_argument(
+            "--lora-sort-by-adapter",
+            action="store_true",
+            default=ServerArgs.lora_sort_by_adapter,
+            help="Sort prefill requests by LoRA adapter ID to group same-adapter requests together, reducing the number of GEMM segments.",
+        )
+        parser.add_argument(
             "--max-lora-chunk-size",
             type=int,
             default=ServerArgs.max_lora_chunk_size,
@@ -7488,6 +7495,12 @@ class ServerArgs:
                 assert len(self.lora_paths) <= self.max_loaded_loras, (
                     "The number of LoRA paths should not exceed max_loaded_loras. "
                     f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
+                )
+
+            if self.lora_sort_by_adapter and self.enable_priority_scheduling:
+                raise ValueError(
+                    "--lora-sort-by-adapter cannot be used with --enable-priority-scheduling "
+                    "as it would override priority ordering and cause priority inversion."
                 )
 
             if self.max_lora_chunk_size is not None:
