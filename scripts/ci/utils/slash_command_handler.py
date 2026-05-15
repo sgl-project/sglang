@@ -593,12 +593,12 @@ def _extract_suite(content, func_name):
 
 
 def _extract_runner_config(content):
-    """Pull `runner_config` from a new-style `register_cuda_ci(...)` call."""
-    args = re.search(r"^[^#\n]*register_cuda_ci\(([^)]*)\)", content, re.MULTILINE)
+    """Pull `runner_config` and the args string from a new-style `register_cuda_ci(...)` call."""
+    args = re.search(r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE)
     if not args:
-        return None
+        return None, None
     m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
-    return m.group(1) if m else None
+    return (m.group(1), args.group(1)) if m else (None, None)
 
 
 def detect_suite(file_path_from_test):
@@ -619,11 +619,12 @@ def detect_suite(file_path_from_test):
         content = f.read()
 
     # New style: runner_config="..." -> look up runs_on from runner_configs.yml.
-    rc = _extract_runner_config(content)
+    rc, args_str = _extract_runner_config(content)
     if rc:
-        cfg = _runner_configs.load().get(rc)
+        configs = _runner_configs.load()
+        cfg = configs.get(rc)
         if cfg is None:
-            known = ", ".join(f"`{k}`" for k in sorted(_runner_configs.load()))
+            known = ", ".join(f"`{k}`" for k in sorted(configs))
             return (
                 rc,
                 None,
@@ -641,11 +642,7 @@ def detect_suite(file_path_from_test):
         if runs_on == "$b200_runner":
             runs_on = _B200_DEFAULT_RUNNER
         # Stage is informational for telemetry/messages; not used for dispatch.
-        stage_m = re.search(
-            r'^[^#\n]*register_cuda_ci\([^)]*stage\s*=\s*["\']([^"\']+)["\']',
-            content,
-            re.MULTILINE,
-        )
+        stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
         suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
         use_deepep = cfg.get("install", _DEFAULT_INSTALL) != _DEFAULT_INSTALL
         return suite, runs_on, use_deepep, False, None
