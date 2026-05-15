@@ -26,6 +26,7 @@ jobs:
           script: |
             const sha = context.payload.pull_request.head.sha;
             const labels = context.payload.pull_request.labels.map(l => l.name);
+            const hasCI = labels.includes('run-ci');
             const hasExtra = labels.includes('run-ci-extra');
 
             // Retry briefly: pr-test* may not be API-visible yet when we start.
@@ -48,7 +49,7 @@ jobs:
               return null;
             }
 
-            const ptRun = await findRunWithRetry('pr-test.yml');
+            const ptRun = hasCI ? await findRunWithRetry('pr-test.yml') : null;
             const peRun = hasExtra ? await findRunWithRetry('pr-test-extra.yml') : null;
 
             // Treat a fully-skipped run as "no real run" — happens when the PR
@@ -56,11 +57,14 @@ jobs:
             // not retrigger on `labeled`).
             const isReal = (run) => run && run.conclusion !== 'skipped';
 
-            const notEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
+            const missingCIText = ':x: **Missing `run-ci` label** — add it to run CI tests.';
+            const notExtraEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** — push again or use `/rerun-failed-ci` to dispatch.';
-            const ptText = isReal(ptRun) ? `[Run #${ptRun.id}](${ptRun.html_url})` : '_Not run yet_';
+            const ptText = !hasCI
+              ? missingCIText
+              : (isReal(ptRun) ? `[Run #${ptRun.id}](${ptRun.html_url})` : '_Not run yet_');
             const peText = !hasExtra
-              ? notEnabledText
+              ? notExtraEnabledText
               : (isReal(peRun) ? `[Run #${peRun.id}](${peRun.html_url})` : stalePushText);
 
             const outerStart = '<!-- pr-states:start -->';
