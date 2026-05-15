@@ -6,7 +6,7 @@ from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 
-register_cuda_ci(est_time=610, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=610, stage="stage-c", runner_config="8-gpu-h200")
 
 
 class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):

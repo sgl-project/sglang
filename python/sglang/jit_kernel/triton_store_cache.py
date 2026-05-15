@@ -10,15 +10,15 @@ _FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 _FP8_INFO = torch.finfo(_FP8_DTYPE)
 
 # DeepSeek-V4 MLA paged FP8 cache layout
-_MLA_HEAD_DIM = 512               # full MLA token dim (elements per input row)
-_MLA_NOPE_DIM = 448               # nope sub-dim (elements)
-_MLA_TILE_SIZE = 64               # FP8 tile width (also rope copy stride)
-_MLA_SLOT_BYTES = 576             # bytes per slot in the paged FP8 cache
-_MLA_BF16_SLOT_ELEMS = _MLA_SLOT_BYTES // 2     # bf16-view slot stride (elements)
-_MLA_BF16_ROPE_OFFSET = _MLA_NOPE_DIM // 2      # bf16-view rope offset (elements)
-_MLA_SCALES_PER_TOKEN = 8         # UE8M0 scales per token (7 nope tiles + 1 padding)
-_MLA_NUM_TILES = 8                # 7 nope quant tiles + 1 rope copy tile
-_MLA_ROPE_TILE_ID = 7             # tile id reserved for the rope copy
+_MLA_HEAD_DIM = 512  # full MLA token dim (elements per input row)
+_MLA_NOPE_DIM = 448  # nope sub-dim (elements)
+_MLA_TILE_SIZE = 64  # FP8 tile width (also rope copy stride)
+_MLA_SLOT_BYTES = 576  # bytes per slot in the paged FP8 cache
+_MLA_BF16_SLOT_ELEMS = _MLA_SLOT_BYTES // 2  # bf16-view slot stride (elements)
+_MLA_BF16_ROPE_OFFSET = _MLA_NOPE_DIM // 2  # bf16-view rope offset (elements)
+_MLA_SCALES_PER_TOKEN = 8  # UE8M0 scales per token (7 nope tiles + 1 padding)
+_MLA_NUM_TILES = 8  # 7 nope quant tiles + 1 rope copy tile
+_MLA_ROPE_TILE_ID = 7  # tile id reserved for the rope copy
 
 # C4 indexer paged FP8 cache layout
 _INDEXER_HEAD_DIM = 128
@@ -65,12 +65,17 @@ def _triton_fused_store_flashmla_kernel(
         rope_lane = tl.arange(0, TILE_SIZE)
         rope_vals = tl.load(input_ptr + token_id * HEAD_DIM + NOPE_DIM + rope_lane)
         rope_bf16_offset = (
-            page * BYTES_PER_PAGE_BF16 + slot * BF16_SLOT_ELEMS + BF16_ROPE_OFFSET + rope_lane
+            page * BYTES_PER_PAGE_BF16
+            + slot * BF16_SLOT_ELEMS
+            + BF16_ROPE_OFFSET
+            + rope_lane
         )
         tl.store(cache_bf16_ptr + rope_bf16_offset, rope_vals)
     else:
         tile_lane = tl.arange(0, TILE_SIZE)
-        x_bf16 = tl.load(input_ptr + token_id * HEAD_DIM + tile_id * TILE_SIZE + tile_lane)
+        x_bf16 = tl.load(
+            input_ptr + token_id * HEAD_DIM + tile_id * TILE_SIZE + tile_lane
+        )
         x_fp32 = x_bf16.to(tl.float32)
 
         abs_max = tl.max(tl.abs(x_fp32))
@@ -91,7 +96,9 @@ def _triton_fused_store_flashmla_kernel(
         tl.store(cache_fp8_ptr + nope_offset, x_fp8)
 
         ue8m0 = (ceil_log2.to(tl.int32) + UE8M0_BIAS).to(tl.uint8)
-        scale_offset = page * BYTES_PER_PAGE + S_OFFSET + slot * SCALES_PER_TOKEN + tile_id
+        scale_offset = (
+            page * BYTES_PER_PAGE + S_OFFSET + slot * SCALES_PER_TOKEN + tile_id
+        )
         tl.store(cache_u8_ptr + scale_offset, ue8m0)
 
 
