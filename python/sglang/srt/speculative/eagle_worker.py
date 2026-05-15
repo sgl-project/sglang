@@ -988,7 +988,7 @@ class EAGLEWorker(TpModelWorker):
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
 
         spec_info.hidden_states = logits_output.hidden_states
-        res: EagleVerifyOutput = spec_info.verify(
+        res: EagleVerifyOutput = spec_info.sample(
             batch,
             logits_output,
             self.token_to_kv_pool_allocator,
