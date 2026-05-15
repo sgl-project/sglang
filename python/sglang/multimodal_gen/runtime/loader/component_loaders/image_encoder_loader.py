@@ -57,7 +57,9 @@ class ImageEncoderLoader(TextEncoderLoader):
             encoder_config,
             server_args,
             server_args.pipeline_config.image_encoder_precision,
-            cpu_offload_flag=cpu_offload_flag
-            if cpu_offload_flag is not None
-            else server_args.image_encoder_cpu_offload,
+            cpu_offload_flag=(
+                cpu_offload_flag
+                if cpu_offload_flag is not None
+                else server_args.image_encoder_cpu_offload
+            ),
         )
