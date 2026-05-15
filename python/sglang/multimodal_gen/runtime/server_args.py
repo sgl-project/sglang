@@ -814,6 +814,22 @@ class ServerArgs(DisaggArgsMixin):
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
 
+    def should_configure_layerwise_offload_for_lazy_component(self) -> bool:
+        """Return whether a lazy-loaded component should try layerwise offload.
+
+        `dit_layerwise_offload` is the legacy global switch for the layerwise
+        offload system. Despite the name, it now gates component-level
+        layerwise offload when `layerwise_offload_components` selects more than
+        the default DiT modules.
+
+        `dit_layerwise_offload_auto_enabled` means auto-tune enabled the legacy
+        DiT/default layerwise policy for memory reasons. Lazy components should
+        not treat that as an explicit request to configure themselves.
+        """
+        return bool(
+            self.dit_layerwise_offload and not self.dit_layerwise_offload_auto_enabled
+        )
+
     def _adjust_layerwise_offload_components(self):
         component_names = normalize_layerwise_offload_components(
             self.layerwise_offload_components

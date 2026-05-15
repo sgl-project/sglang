@@ -487,10 +487,7 @@ class LTX2ImageEncodingStage(PipelineStage):
             safetensors_load_file(weights_path), strict=True
         )
         self._condition_image_encoder_dir = encoder_dir
-        if (
-            server_args.dit_layerwise_offload
-            and not server_args.dit_layerwise_offload_auto_enabled
-        ):
+        if server_args.should_configure_layerwise_offload_for_lazy_component():
             from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
                 configure_layerwise_offload_modules,
             )
