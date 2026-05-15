@@ -836,12 +836,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate input length
         if input_token_num >= self.context_len:
             if self.server_args.allow_auto_truncate:
+                # Reserve space for generation when truncating
+                max_new_tokens = obj.sampling_params.get("max_new_tokens")
+                reserve_tokens = min(max_new_tokens if max_new_tokens else 512, 512)
+                truncate_to = max(0, _max_req_len - reserve_tokens)
+                if truncate_to == 0:
+                    raise ValueError(
+                        f"Cannot truncate: context_len ({self.context_len}) is too small "
+                        f"to reserve any space for generation."
+                    )
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens). "
-                    "Truncating the input."
+                    f"Truncating the input to {truncate_to} tokens, reserving "
+                    f"{reserve_tokens} tokens for generation."
                 )
-                del input_ids[_max_req_len:]
+                del input_ids[truncate_to:]
                 input_token_num = len(input_ids)
             else:
                 raise ValueError(
@@ -2416,6 +2426,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
+            return
+        # Check if request exists to avoid KeyError when already completed
+        if recv_obj.rid not in self.rid_to_state:
+            logger.debug(f"Abort request for unknown/finished rid: {recv_obj.rid}")
             return
         state = self.rid_to_state[recv_obj.rid]
         state.finished = True
