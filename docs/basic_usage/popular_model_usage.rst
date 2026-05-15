@@ -17,3 +17,4 @@ For more usage examples and recipes, visit the `SGLang Cookbook <https://cookboo
    qwen3_vl.md
    deepseek_ocr.md
    llama4.md
+   mimo_v25_pro.md
