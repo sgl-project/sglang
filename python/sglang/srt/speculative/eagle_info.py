@@ -1013,6 +1013,10 @@ class EagleVerifyOutput:
     num_correct_drafts_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accept_indices: torch.Tensor
+    # Whether the target verify forward ran a captured cuda graph. Set by
+    # the worker after `EagleVerifyInput.sample` returns; default kept so
+    # idle / direct constructions don't have to pass it.
+    can_run_cuda_graph: bool = False
 
     @classmethod
     def create_idle(
