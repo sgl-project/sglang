@@ -157,6 +157,9 @@ class HiRadixCache(RadixCache):
                 pp_rank=self.pp_rank,
                 pp_size=self.pp_size,
                 enable_storage_metrics=self.enable_storage_metrics,
+                hicache_prefetch_capacity_tokens=getattr(
+                    server_args, "hicache_prefetch_capacity_tokens", 0
+                ),
             )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,

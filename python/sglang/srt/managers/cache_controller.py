@@ -260,6 +260,7 @@ class HiCacheController:
         pp_rank: int = 0,
         pp_size: int = 1,
         enable_storage_metrics: bool = False,
+        hicache_prefetch_capacity_tokens: int = 0,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
@@ -282,6 +283,9 @@ class HiCacheController:
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.enable_storage_metrics = enable_storage_metrics
+        # Patch F: override for the L3 prefetch in-flight capacity. 0 = auto
+        # (legacy formula + ratio=1.0 fallback). Used in attach_storage_backend.
+        self.hicache_prefetch_capacity_tokens = hicache_prefetch_capacity_tokens
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -332,6 +336,7 @@ class HiCacheController:
                     prefetch_threshold=prefetch_threshold,
                     model_name=model_name,
                     storage_backend_extra_config=storage_backend_extra_config,
+                    hicache_prefetch_capacity_tokens=hicache_prefetch_capacity_tokens,
                 )
             except ValueError as e:
                 # Preserve the historical error shape on init for unknown backends.
@@ -458,6 +463,7 @@ class HiCacheController:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        hicache_prefetch_capacity_tokens: int = 0,
     ):
         """Attach (enable) storage backend at runtime.
 
@@ -504,8 +510,23 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            self.prefetch_capacity_limit = max(
-                0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
+            # Patch F: explicit override wins; otherwise auto-resolve with a
+            # two-branch fallback so hicache-ratio=1.0 does not clamp to 0
+            # (which silently kills L3 reads via prefetch_rate_limited()).
+            if hicache_prefetch_capacity_tokens > 0:
+                self.prefetch_capacity_limit = hicache_prefetch_capacity_tokens
+            elif self.mem_pool_host.size > self.mem_pool_device.size:
+                self.prefetch_capacity_limit = int(
+                    0.8 * (self.mem_pool_host.size - self.mem_pool_device.size)
+                )
+            else:
+                self.prefetch_capacity_limit = int(0.5 * self.mem_pool_device.size)
+            logger.info(
+                "HiCache prefetch capacity_limit=%d (host=%d device=%d override=%d)",
+                self.prefetch_capacity_limit,
+                self.mem_pool_host.size,
+                self.mem_pool_device.size,
+                hicache_prefetch_capacity_tokens,
             )
             # granularity of batch storage IO operations, in number of pages
             self.storage_batch_size = 128

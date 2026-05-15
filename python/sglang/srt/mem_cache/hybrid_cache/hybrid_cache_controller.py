@@ -172,6 +172,7 @@ class HybridCacheController(BaseHiCacheController):
         pp_size: int = 1,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
+        hicache_prefetch_capacity_tokens: int = 0,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue] = {}
@@ -192,6 +193,7 @@ class HybridCacheController(BaseHiCacheController):
             pp_rank=pp_rank,
             pp_size=pp_size,
             enable_storage_metrics=enable_storage_metrics,
+            hicache_prefetch_capacity_tokens=hicache_prefetch_capacity_tokens,
         )
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
@@ -206,6 +208,7 @@ class HybridCacheController(BaseHiCacheController):
                 model_name=model_name,
                 storage_backend_extra_config=storage_backend_extra_config,
                 host_pools=getattr(mem_pool_host, "entries", None),
+                hicache_prefetch_capacity_tokens=hicache_prefetch_capacity_tokens,
             )
 
     def _start_storage_threads(self):
@@ -219,12 +222,14 @@ class HybridCacheController(BaseHiCacheController):
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
+        hicache_prefetch_capacity_tokens: int = 0,
     ):
         super().attach_storage_backend(
             storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
+            hicache_prefetch_capacity_tokens=hicache_prefetch_capacity_tokens,
         )
 
         for entry in host_pools or []:

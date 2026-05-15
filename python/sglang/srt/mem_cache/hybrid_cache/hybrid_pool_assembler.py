@@ -516,6 +516,7 @@ def build_hybrid_mamba_stack(
     pp_rank: int = 0,
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
+    hicache_prefetch_capacity_tokens: int = 0,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -569,6 +570,7 @@ def build_hybrid_mamba_stack(
         pp_size=pp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        hicache_prefetch_capacity_tokens=hicache_prefetch_capacity_tokens,
     )
     return host_pool_group, cache_controller
 
@@ -595,6 +597,7 @@ def build_anchor_sidecar_stack(
     pp_rank: int = 0,
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
+    hicache_prefetch_capacity_tokens: int = 0,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -641,6 +644,7 @@ def build_anchor_sidecar_stack(
         pp_size=pp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        hicache_prefetch_capacity_tokens=hicache_prefetch_capacity_tokens,
     )
     return host_pool_group, cache_controller
 
@@ -1181,6 +1185,9 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             pp_rank=radix_cache.pp_rank,
             pp_size=radix_cache.pp_size,
             enable_storage_metrics=enable_storage_metrics,
+            hicache_prefetch_capacity_tokens=getattr(
+                server_args, "hicache_prefetch_capacity_tokens", 0
+            ),
         )
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group
@@ -1238,6 +1245,9 @@ def attach_hybrid_pool_to_mamba_cache(
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
             enable_storage_metrics=enable_storage_metrics,
+            hicache_prefetch_capacity_tokens=getattr(
+                server_args, "hicache_prefetch_capacity_tokens", 0
+            ),
         )
         mamba_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         mamba_cache.mamba_pool_host = host_pool_group.get_pool(PoolName.MAMBA)
