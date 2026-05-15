@@ -1049,11 +1049,14 @@ class SchedulerOutputProcessorMixin:
         spec_num_correct_drafts = []
         spec_correct_drafts_histogram = []
         retraction_counts = []
-        output_hidden_states = None
+        output_hidden_states = []
         load = self.get_loads(GetLoadsReqInput(include=["core"]))
-        routed_experts = None
-        indexer_topk = None
+        routed_experts = []
+        indexer_topk = []
         customized_info = {}
+        should_output_reqs = []
+        should_output_send_token_offsets_start = []
+        should_output_send_token_offsets_end = []
 
         time_stats = []
 
@@ -1121,6 +1124,8 @@ class SchedulerOutputProcessorMixin:
                     req.send_output_token_logprobs_offset
                 )
                 rids.append(req.rid)
+                should_output_reqs.append(req)
+                should_output_send_token_offsets_start.append(send_token_offset)
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
@@ -1132,6 +1137,7 @@ class SchedulerOutputProcessorMixin:
 
                 # Exclude the tokens after stop condition
                 output_ids_ = req.output_ids_through_stop
+                should_output_send_token_offsets_end.append(len(output_ids_))
 
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
@@ -1231,25 +1237,17 @@ class SchedulerOutputProcessorMixin:
                         output_token_ids_logprobs_idx.append([])
 
                 if req.return_hidden_states:
-                    if output_hidden_states is None:
-                        output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
+                else:
+                    output_hidden_states.append(None)
                 if req.return_routed_experts:
-                    if routed_experts is None:
-                        routed_experts = []
                     routed_experts.append(req.routed_experts)
+                else:
+                    routed_experts.append(None)
                 if req.return_indexer_topk:
-                    if indexer_topk is None:
-                        indexer_topk = []
                     indexer_topk.append(req.indexer_topk)
-
-                if req.customized_info is not None:
-                    for k, v in req.customized_info.items():
-                        if k not in customized_info:
-                            customized_info[k] = []
-                        customized_info[k].append(
-                            v[send_token_offset : len(output_ids_)]
-                        )
+                else:
+                    indexer_topk.append(None)
 
             if (
                 req.finished()
@@ -1259,6 +1257,39 @@ class SchedulerOutputProcessorMixin:
                 req.log_time_stats()
 
         dp_ranks = [self.dp_rank] * len(rids) if rids else None
+
+        output_hidden_states = (
+            None
+            if all(s is None for s in output_hidden_states)
+            else output_hidden_states
+        )
+        routed_experts = (
+            None if all(e is None for e in routed_experts) else routed_experts
+        )
+        indexer_topk = None if all(k is None for k in indexer_topk) else indexer_topk
+
+        for req in should_output_reqs:
+            if req.customized_info is not None:
+                for k in req.customized_info:
+                    if k not in customized_info:
+                        customized_info[k] = []
+
+        for i, req in enumerate(should_output_reqs):
+            for k in customized_info:
+                if req.customized_info is not None:
+                    v = req.customized_info.get(k)
+                    if v is not None:
+                        customized_info[k].append(
+                            v[
+                                should_output_send_token_offsets_start[
+                                    i
+                                ] : should_output_send_token_offsets_end[i]
+                            ]
+                        )
+                    else:
+                        customized_info[k].append(None)
+                else:
+                    customized_info[k].append(None)
 
         # Send to detokenizer
         if reqs or is_idle_batch:

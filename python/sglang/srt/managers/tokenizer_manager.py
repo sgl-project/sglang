@@ -1721,7 +1721,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         i
                     ]
 
-            if getattr(recv_obj, "output_hidden_states", None):
+            if (
+                getattr(recv_obj, "output_hidden_states", None)
+                and recv_obj.output_hidden_states[i] is not None
+            ):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "routed_experts", None):
                 val = recv_obj.routed_experts[i]
@@ -1739,7 +1742,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["indexer_topk"] = val
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
-                    meta_info[k] = v[i]
+                    if v[i] is not None:
+                        meta_info[k] = v[i]
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
