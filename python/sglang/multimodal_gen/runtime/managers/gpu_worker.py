@@ -223,7 +223,7 @@ class GPUWorker:
             elif component in ("text_encoder", "text_encoder_2"):
                 arg = "--text-encoder-cpu-offload"
             elif component == "transformer":
-                if self.server_args.is_dit_layerwise_offload_selected():
+                if self.server_args.is_dit_layerwise_offload_selected:
                     arg = "--dit-layerwise-offload"
                 elif self.server_args.dit_cpu_offload:
                     arg = "--dit-cpu-offload"
@@ -729,7 +729,7 @@ class GPUWorker:
         # If the flag is True, it is currently offloaded, so it is a candidate to stay resident.
         offload_flags = {
             "transformer": self.server_args.dit_cpu_offload
-            or self.server_args.is_dit_layerwise_offload_selected(),
+            or self.server_args.is_dit_layerwise_offload_selected,
             "vae": self.server_args.vae_cpu_offload,
             "text_encoder": self.server_args.text_encoder_cpu_offload,
             "text_encoder_2": self.server_args.text_encoder_cpu_offload,

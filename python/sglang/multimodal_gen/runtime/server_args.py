@@ -1732,7 +1732,7 @@ class ServerArgs(DisaggArgsMixin):
                 )
                 self.use_fsdp_inference = False
 
-            should_disable_dit_cpu_offload = self.is_dit_layerwise_offload_selected()
+            should_disable_dit_cpu_offload = self.is_dit_layerwise_offload_selected
             if should_disable_dit_cpu_offload and self.dit_cpu_offload is not False:
                 logger.warning(
                     "layerwise offload is selected for DiT components, automatically disabling dit_cpu_offload."
