@@ -283,6 +283,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         rid=request.request_id,
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
+                        processor_kwargs=request.processor_kwargs,
+                        mm_process_config=request.mm_process_config,
+                        io_kwargs=request.io_kwargs,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -384,6 +387,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                processor_kwargs=request.processor_kwargs,
+                mm_process_config=request.mm_process_config,
+                io_kwargs=request.io_kwargs,
             )
 
             # Follow SGLang's _process_messages pattern

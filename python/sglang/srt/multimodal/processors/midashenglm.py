@@ -51,6 +51,7 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
         self, input_text, images=None, videos=None, audios=None, **kwargs
     ):
         """Override to use correct audio parameter name for MiDashengLM processor."""
+        audio_config = self._get_effective_modality_process_config("audio")
         if images:
             kwargs["images"] = images
         if videos:
@@ -59,8 +60,10 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             kwargs["audio"] = audios
             kwargs.setdefault("audio_kwargs", {})
             kwargs["audio_kwargs"].setdefault("truncation", False)
-            if self.audio_config:
-                kwargs["audio_kwargs"].update(self.audio_config)
+            if audio_config:
+                kwargs["audio_kwargs"].update(audio_config)
+
+        kwargs = self._merge_runtime_processor_kwargs(kwargs)
 
         processor = self._processor
         result = processor.__call__(

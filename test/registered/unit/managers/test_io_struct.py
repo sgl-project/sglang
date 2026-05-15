@@ -501,6 +501,9 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             text=["Hello", "World"],
             image_data=[["img1.jpg"], ["img2.jpg"]],
             audio_data=["audio1.mp3", "audio2.mp3"],
+            processor_kwargs={"images_kwargs": {"max_pixels": 1024}},
+            mm_process_config={"image": {"max_pixels": 2048}},
+            io_kwargs={"video": {"frame_count_limit": 8}},
             sampling_params=[{"temp": 0.7}, {"temp": 0.8}],
             rid=["id1", "id2"],
             return_logprob=[True, False],
@@ -533,6 +536,11 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(item0.lora_path, "path1")
         self.assertEqual(item0.custom_logit_processor, "processor1")
         self.assertEqual(item0.return_hidden_states, True)
+        self.assertEqual(
+            item0.processor_kwargs, {"images_kwargs": {"max_pixels": 1024}}
+        )
+        self.assertEqual(item0.mm_process_config, {"image": {"max_pixels": 2048}})
+        self.assertEqual(item0.io_kwargs, {"video": {"frame_count_limit": 8}})
 
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""

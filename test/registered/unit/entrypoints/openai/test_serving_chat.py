@@ -147,6 +147,32 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
 
+    def test_convert_to_internal_request_preserves_runtime_mm_kwargs(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            processor_kwargs={"images_kwargs": {"max_pixels": 1024}},
+            mm_process_config={"image": {"max_pixels": 2048}},
+            io_kwargs={"video": {"frame_count_limit": 8}},
+        )
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = MessageProcessingResult(
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+                None,
+            )
+            adapted, _ = self.chat._convert_to_internal_request(req)
+
+        self.assertEqual(
+            adapted.processor_kwargs, {"images_kwargs": {"max_pixels": 1024}}
+        )
+        self.assertEqual(adapted.mm_process_config, {"image": {"max_pixels": 2048}})
+        self.assertEqual(adapted.io_kwargs, {"video": {"frame_count_limit": 8}})
+
     def test_jinja_uses_openai_tool_schema_first(self):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
         self.template_manager.chat_template_name = None

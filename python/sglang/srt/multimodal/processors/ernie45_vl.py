@@ -290,14 +290,18 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         """
         process multimodal data with transformers AutoProcessor
         """
+        image_config = self._get_effective_modality_process_config("image")
+        video_config = self._get_effective_modality_process_config("video")
         if images:
             kwargs["images"] = images
-            if self.image_config:
-                kwargs.setdefault("images_kwargs", {}).update(self.image_config)
+            if image_config:
+                kwargs.setdefault("images_kwargs", {}).update(image_config)
         if videos:
             kwargs["videos"] = videos
-            if self.video_config:
-                kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
+            if video_config:
+                kwargs.setdefault("videos_kwargs", {}).update(video_config)
+
+        kwargs = self._merge_runtime_processor_kwargs(kwargs)
 
         processor = self._processor
         if (

@@ -238,6 +238,27 @@ class TestStreamingFusedAutodetect(CustomTestCase):
         self.assertFalse(any("<|" in d for d in deltas))
 
 
+class TestTranscriptionRequestConversion(CustomTestCase):
+    def test_convert_to_internal_request_preserves_runtime_mm_kwargs(self):
+        tm = _MockTokenizerManager([])
+        serving = OpenAIServingTranscription(tm)
+        request = TranscriptionRequest(
+            model="whisper",
+            processor_kwargs={"audio_kwargs": {"padding": "longest"}},
+            mm_process_config={"audio": {"sample_rate": 16000}},
+            io_kwargs={"audio": {"audio_sample_rate": 22050}},
+        )
+        request.audio_data = b"audio"
+
+        adapted, _ = serving._convert_to_internal_request(request)
+
+        self.assertEqual(
+            adapted.processor_kwargs, {"audio_kwargs": {"padding": "longest"}}
+        )
+        self.assertEqual(adapted.mm_process_config, {"audio": {"sample_rate": 16000}})
+        self.assertEqual(adapted.io_kwargs, {"audio": {"audio_sample_rate": 22050}})
+
+
 class TestStreamingIncrementalOutputMode(CustomTestCase):
     """Server runs with ``incremental_streaming_output=True``.
 

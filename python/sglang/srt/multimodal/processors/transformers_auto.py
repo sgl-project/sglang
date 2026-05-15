@@ -99,10 +99,12 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
         """Download / decode images from URLs, file paths, or base64."""
         if not image_data:
             return []
+        image_io = self._get_runtime_io_kwargs().get("image", {})
+        discard_alpha_channel = image_io.get("discard_alpha_channel", True)
         images = []
         for data in image_data:
             img, _ = load_image(data)
-            if img.mode != "RGB":
+            if discard_alpha_channel and img.mode != "RGB":
                 img = img.convert("RGB")
             images.append(img)
         return images
@@ -116,10 +118,17 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
         insertion, and tokenization in one shot.
         """
         kwargs = {}
+        image_config = self._get_effective_modality_process_config("image")
+        video_config = self._get_effective_modality_process_config("video")
         if images:
             kwargs["images"] = images
+            if image_config:
+                kwargs.setdefault("images_kwargs", {}).update(image_config)
         if videos:
             kwargs["videos"] = videos
+            if video_config:
+                kwargs.setdefault("videos_kwargs", {}).update(video_config)
+        kwargs = self._merge_runtime_processor_kwargs(kwargs)
         return self._processor(text=text, return_tensors="pt", **kwargs)
 
     def _build_mm_items(

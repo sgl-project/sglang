@@ -152,6 +152,12 @@ class GenerateReqInput(BaseReq):
     audio_data: Optional[MultimodalDataInputFormat] = None
     # Whether to extract and process audio from video inputs.
     use_audio_in_video: bool = False
+    # Runtime multimodal processor kwargs forwarded through the API server.
+    processor_kwargs: Optional[Dict[str, Any]] = None
+    # Runtime multimodal processing config overrides merged with server_args.mm_process_config.
+    mm_process_config: Optional[Dict[str, Any]] = None
+    # Runtime multimodal IO config overrides, keyed by modality (image/video/audio).
+    io_kwargs: Optional[Dict[str, Any]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Whether to return logprobs.
@@ -641,6 +647,9 @@ class GenerateReqInput(BaseReq):
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
+            processor_kwargs=copy.deepcopy(self.processor_kwargs),
+            mm_process_config=copy.deepcopy(self.mm_process_config),
+            io_kwargs=copy.deepcopy(self.io_kwargs),
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
             return_logprob=self.return_logprob[i],
