@@ -59,9 +59,6 @@ permissions:
   actions: write
   contents: read
   issues: read
-  # write (not read) is required by call-pr-awareness — reusable workflow
-  # permissions ceiling = caller workflow-level, job-level override is NOT
-  # honored for reusable calls. So this MUST live at workflow level.
   pull-requests: write
 
 jobs:
