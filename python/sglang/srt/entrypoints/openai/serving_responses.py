@@ -244,10 +244,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tool_sessions = {}
                 for i, engine_prompt in enumerate(engine_prompts):
                     # Calculate default max tokens from context length minus prompt length
-                    if hasattr(engine_prompt, "__len__"):
+                    if isinstance(engine_prompt, list):
                         prompt_length = len(engine_prompt)
-                    elif isinstance(engine_prompt, list):
-                        prompt_length = len(engine_prompt)
+                    elif isinstance(engine_prompt, str):
+                        # Multimodal text prompt: tokenize to get accurate
+                        # length so default_max_tokens doesn't exceed context_len.
+                        prompt_length = len(
+                            self.tokenizer_manager.tokenizer.encode(engine_prompt)
+                        )
                     else:
                         prompt_length = 0
 
@@ -276,8 +280,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                         context = SimpleContext()
 
                     # Create GenerateReqInput for SGLang
+                    # For multimodal models, engine_prompt is a text string;
+                    # for text-only models, it is a list of token IDs.
+                    if isinstance(engine_prompt, str):
+                        prompt_kwargs = {"text": engine_prompt}
+                    else:
+                        prompt_kwargs = {"input_ids": engine_prompt}
+
                     adapted_request = GenerateReqInput(
-                        input_ids=engine_prompt,
+                        **prompt_kwargs,
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
@@ -378,37 +389,24 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages(request, prev_response)
 
         # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
-        try:
-            # Convert ResponsesRequest to ChatCompletionRequest for processing
-            chat_request = ChatCompletionRequest(
-                model=request.model,
-                messages=messages,
-                stream=request.stream,
-            )
+        # Convert ResponsesRequest to ChatCompletionRequest for processing
+        chat_request = ChatCompletionRequest(
+            model=request.model,
+            messages=messages,
+            stream=request.stream,
+        )
 
-            # Follow SGLang's _process_messages pattern
-            is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-            processed_messages = self._process_messages(chat_request, is_multimodal)
+        # Follow SGLang's _process_messages pattern
+        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
+        processed_messages = self._process_messages(chat_request, is_multimodal)
 
-            # Extract the results
-            if is_multimodal:
-                request_prompts = [processed_messages.prompt]
-                engine_prompts = [processed_messages.prompt]
-            else:
-                request_prompts = [processed_messages.prompt_ids]
-                engine_prompts = [processed_messages.prompt_ids]
-
-        except Exception as e:
-            logger.warning(f"Chat processing failed, using fallback: {e}")
-            # Fallback to simple encoding
-            prompt_text = ""
-            for msg in messages:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                prompt_text += f"{role}: {content}\n"
-            prompt_ids = tokenizer.encode(prompt_text)
-            request_prompts = [prompt_ids]
-            engine_prompts = [prompt_ids]
+        # Extract the results
+        if is_multimodal:
+            request_prompts = [processed_messages.prompt]
+            engine_prompts = [processed_messages.prompt]
+        else:
+            request_prompts = [processed_messages.prompt_ids]
+            engine_prompts = [processed_messages.prompt_ids]
 
         return messages, request_prompts, engine_prompts
 
