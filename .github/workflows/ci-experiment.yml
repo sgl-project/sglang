@@ -1,0 +1,124 @@
+name: CI Experiment
+# Manually-triggered workflow for running a specific job (or set of jobs) inside
+# any of our downstream test workflows. The `experiment_name` input is surfaced
+# in the run-name so each experiment is identifiable on the Actions page.
+run-name: "[exp] ${{ inputs.experiment_name }} | ${{ inputs.target_workflow }} | jobs=${{ inputs.job_filter == '' && 'all' || inputs.job_filter }}${{ inputs.sglang_ref != '' && format(' @ sglang={0}', inputs.sglang_ref) || '' }}${{ inputs.aiter_ref != '' && format(' @ aiter={0}', inputs.aiter_ref) || '' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment_name:
+        description: 'Short label for this experiment (shown in the run name on the Actions page).'
+        required: true
+        type: string
+      target_workflow:
+        description: 'Which downstream workflow to call.'
+        required: true
+        type: choice
+        options:
+          - nightly-test-amd
+          - nightly-test-amd-rocm720
+          - nightly-test-nvidia
+          - nightly-test-npu
+      job_filter:
+        description: 'Comma-separated job names to run (leave empty or "all" to run every job in the target workflow).'
+        required: false
+        type: string
+        default: 'all'
+      sglang_ref:
+        description: 'SGLang git ref (branch, tag, or SHA) to test. Leave empty to use the workflow''s checkout commit.'
+        required: false
+        type: string
+        default: ''
+      aiter_ref:
+        description: 'AITER git ref override (AMD targets only; ignored otherwise).'
+        required: false
+        type: string
+        default: ''
+      continue_on_error:
+        description: 'Continue running remaining jobs even if one fails.'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  # Each manual run is its own experiment; never cancel a sibling experiment.
+  group: ci-experiment-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  call-nightly-test-amd:
+    if: inputs.target_workflow == 'nightly-test-amd'
+    uses: ./.github/workflows/nightly-test-amd.yml
+    secrets: inherit
+    with:
+      ref: ${{ inputs.sglang_ref || github.sha }}
+      job_filter: ${{ inputs.job_filter }}
+      aiter_ref: ${{ inputs.aiter_ref }}
+      continue_on_error: ${{ inputs.continue_on_error }}
+
+  call-nightly-test-amd-rocm720:
+    if: inputs.target_workflow == 'nightly-test-amd-rocm720'
+    uses: ./.github/workflows/nightly-test-amd-rocm720.yml
+    secrets: inherit
+    with:
+      ref: ${{ inputs.sglang_ref || github.sha }}
+      job_filter: ${{ inputs.job_filter }}
+      aiter_ref: ${{ inputs.aiter_ref }}
+      continue_on_error: ${{ inputs.continue_on_error }}
+
+  call-nightly-test-nvidia:
+    if: inputs.target_workflow == 'nightly-test-nvidia'
+    uses: ./.github/workflows/nightly-test-nvidia.yml
+    secrets: inherit
+    with:
+      ref: ${{ inputs.sglang_ref || github.sha }}
+      job_filter: ${{ inputs.job_filter }}
+
+  call-nightly-test-npu:
+    if: inputs.target_workflow == 'nightly-test-npu'
+    uses: ./.github/workflows/nightly-test-npu.yml
+    secrets: inherit
+    with:
+      ref: ${{ inputs.sglang_ref || github.sha }}
+      job_filter: ${{ inputs.job_filter }}
+
+  summary:
+    if: always()
+    needs:
+      - call-nightly-test-amd
+      - call-nightly-test-amd-rocm720
+      - call-nightly-test-nvidia
+      - call-nightly-test-npu
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## CI Experiment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Experiment:** \`${{ inputs.experiment_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target workflow:** \`${{ inputs.target_workflow }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Job filter:** \`${{ inputs.job_filter || 'all' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **SGLang ref:** \`${{ inputs.sglang_ref || github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          if [[ -n "${{ inputs.aiter_ref }}" ]]; then
+            echo "- **AITER ref:** \`${{ inputs.aiter_ref }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Target | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-test-amd | \`${{ needs.call-nightly-test-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-test-amd-rocm720 | \`${{ needs.call-nightly-test-amd-rocm720.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-test-nvidia | \`${{ needs.call-nightly-test-nvidia.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| nightly-test-npu | \`${{ needs.call-nightly-test-npu.result }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Fail if the dispatched target failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "Target workflow failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "Target workflow was cancelled"
+            exit 1
+          fi
+          echo "Experiment completed"
