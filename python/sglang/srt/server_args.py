@@ -990,7 +990,7 @@ class ServerArgs:
             and not legacy_grpc_requested
             and not self.use_ray
             and not self.encoder_only
-            and importlib.util.find_spec("sglang_grpc") is not None
+            and importlib.util.find_spec("sglang.srt.grpc._core") is not None
         )
         if native_grpc_requested and self.tokenizer_worker_num > 1:
             raise ValueError(
@@ -6809,7 +6809,6 @@ class ServerArgs:
         # TODO: Also validate grpc_port != metrics_http_port and grpc_port != nccl_port
         # to avoid opaque bind errors at runtime. Deferred because metrics_http_port
         # and nccl_port have dynamic defaults that may not be resolved yet here.
-
 
         if self.gc_threshold:
             if not (1 <= len(self.gc_threshold) <= 3):

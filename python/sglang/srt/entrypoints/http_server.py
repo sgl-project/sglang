@@ -378,10 +378,7 @@ async def lifespan(fast_api_app: FastAPI):
         traceback = get_exception_traceback()
         logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
 
-    if (
-        envs.SGLANG_GRANIAN_PARENT_PID.get() is not None
-        and server_args.enable_grpc
-    ):
+    if envs.SGLANG_GRANIAN_PARENT_PID.get() is not None and server_args.enable_grpc:
         grpc_handle = _start_native_grpc_server_for_runtime(
             server_args=server_args,
             tokenizer_manager=_global_state.tokenizer_manager,
@@ -2331,12 +2328,12 @@ def _start_native_grpc_server_for_runtime(
 ):
     """Attempt to start the native Rust gRPC server for a live runtime.
 
-    Returns a GrpcServerHandle on success, or None if sglang-grpc is not installed.
+    Returns a GrpcServerHandle on success, or None if the native gRPC
+    extension is not present in this wheel.
     """
     try:
-        import sglang_grpc
-
         from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+        from sglang.srt.grpc import _core as grpc_native
 
         runtime_handle = RuntimeHandle(
             tokenizer_manager=tokenizer_manager,
@@ -2345,7 +2342,7 @@ def _start_native_grpc_server_for_runtime(
             scheduler_info=scheduler_info or {},
         )
 
-        grpc_handle = sglang_grpc.start_server(
+        grpc_handle = grpc_native.start_server(
             host=server_args.host,
             port=server_args.grpc_port,
             runtime_handle=runtime_handle,
@@ -2358,8 +2355,9 @@ def _start_native_grpc_server_for_runtime(
         return grpc_handle
     except ImportError:
         logger.info(
-            "sglang-grpc package not installed; native gRPC server disabled. "
-            "Install with: pip install sglang-grpc"
+            "Native gRPC extension (sglang.srt.grpc._core) not found in this wheel; "
+            "native gRPC server disabled. The extension is built from rust/sglang-grpc/ "
+            "via setuptools-rust during wheel build."
         )
         return None
     except Exception as e:
