@@ -1098,10 +1098,6 @@ def main():
             print("Combined command finished, but no actions were taken.")
 
     elif first_line.startswith("/rerun-stage"):
-        # /rerun-stage is deprecated. Stage-level granularity is too coarse to map to
-        # a specific feature, and a stage rerun re-pays the cost of all unrelated tests
-        # in that stage. Use /rerun-test for selective UT runs, or /rerun-failed-ci /
-        # `run-ci` / `run-ci-extra` labels for a full rerun.
         print("/rerun-stage is deprecated; posting deprecation notice.")
         comment.create_reaction("-1")
         pr.create_issue_comment(
