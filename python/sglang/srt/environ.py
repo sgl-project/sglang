@@ -319,6 +319,8 @@ class Envs:
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
+    MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
+    MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
@@ -406,12 +408,16 @@ class Envs:
 
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
+    SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
 
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
+    # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
+    # default static local-batch path.
+    SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
 
     # NIXL-EP
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
@@ -519,6 +525,9 @@ class Envs:
 
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
+    # too short when many workers cold-start and load tokenizers in parallel.
+    SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
 
     # HTTP/2 Server
     SGLANG_GRANIAN_PARENT_PID = EnvInt(None)
@@ -554,6 +563,10 @@ class Envs:
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
+    # ZBAL, zero buffer accelerate library, currently worked only in npu
+    SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
+    SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
+
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
     # ====================================================================
@@ -573,6 +586,7 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
 
@@ -586,6 +600,17 @@ class Envs:
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
+
+    # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
+    # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
+    # Setting this also exports DG_USE_FP4_ACTS=1 so DeepGEMM's symm-buffer
+    # sizing + fp8_fp4_mega_moe pick up the FP4 layout.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS = EnvBool(False)
+    # Switches the L1+L2 mainloops from kind::mxf8f6f4 (K=32 with-padding) to
+    # kind::mxf4 (K=64 dense) inside fp8_fp4_mega_moe. No effect unless
+    # SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
+    # this combination on the host side.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
     # TopK
@@ -594,7 +619,7 @@ class Envs:
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)
 
     # GEMM / kernel fusion
-    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
+    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_USE_JIT_NORM = EnvBool(False)
@@ -603,7 +628,6 @@ class Envs:
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
-    SGLANG_OPT_USE_OVERLAP_STORE_CACHE = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # CUDA graph
@@ -611,7 +635,7 @@ class Envs:
 
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
-
+    SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)

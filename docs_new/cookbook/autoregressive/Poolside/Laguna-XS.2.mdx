@@ -1,0 +1,324 @@
+---
+title: Laguna-XS.2
+metatags:
+    description: "Deploy Poolside's Laguna-XS.2 hybrid SWA + MoE model with SGLang on NVIDIA H200 / B200 — agentic coding with hybrid reasoning and tool calling."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[Laguna-XS.2](https://huggingface.co/poolside/Laguna-XS.2) is an open-source hybrid sliding-window-attention MoE model from [Poolside](https://poolside.ai), built for agentic coding and long-horizon software engineering work.
+
+**Key Features:**
+
+- **MoE**: 33.4B total parameters, 3.0B active per token, 256 routed experts (top-8) plus 1 shared.
+- **Long context**: 131,072 tokens.
+- **Agentic coding**: Tuned for tool-using software engineering agents and long-horizon execution.
+- **Hybrid reasoning**: `<think>...</think>` segments toggled per request via `chat_template_kwargs={"enable_thinking": ...}`.
+
+**Available Quantizations:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "20%"}} />
+    <col style={{width: "80%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Variant</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Hugging Face path</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>BF16</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[`poolside/Laguna-XS.2`](https://huggingface.co/poolside/Laguna-XS.2)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>FP8</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[`poolside/Laguna-XS.2-FP8`](https://huggingface.co/poolside/Laguna-XS.2-FP8)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>NVFP4</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[`poolside/Laguna-XS.2-NVFP4`](https://huggingface.co/poolside/Laguna-XS.2-NVFP4)</td>
+    </tr>
+  </tbody>
+</table>
+
+**License:** Apache 2.0
+
+For details, see the [Hugging Face model card](https://huggingface.co/poolside/Laguna-XS.2) and the [Laguna deeper-dive blog post](https://poolside.ai/blog/laguna-a-deeper-dive).
+
+## 2. SGLang Installation
+
+Laguna-XS.2 support is on `main` but not yet in a tagged release; install from the SGLang nightly wheel index, or pull a pre-built Docker image:
+
+```bash Command
+# Install SGLang via pip (CUDA 13) — requires Python 3.10 (nightly wheels are cp310 only)
+python3 -m pip install --upgrade pip
+python3 -m pip install --extra-index-url https://docs.sglang.ai/whl/cu130 \
+  "sglang[all]==0.5.12.dev20260509+g096ad02b0"
+
+# CUDA 12: swap to the cu129 index
+python3 -m pip install --extra-index-url https://docs.sglang.ai/whl/cu129 \
+  "sglang[all]==0.5.12.dev20260509+g096ad02b0"
+
+# Or use Docker (multi-arch amd64/arm64)
+docker pull lmsysorg/sglang:dev-cu13-laguna-xs2 # CUDA 13 (H200 / B200)
+docker pull lmsysorg/sglang:dev-cu12-laguna-xs2 # CUDA 12 (H200)
+```
+
+For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
+
+## 3. Model Deployment
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to generate a launch command for your hardware.
+
+import { LagunaXS2Deployment } from '/src/snippets/autoregressive/laguna-xs2-deployment.jsx';
+
+<LagunaXS2Deployment />
+
+### 3.2 Configuration Tips
+
+- **Quantization**: NVFP4 requires Blackwell (B200 / B300); BF16 and FP8 run on either H200 or B200. FP8's first launch triggers a multi-session DeepGEMM JIT pre-compile (~10-20 min); pre-warm with `python3 -m sglang.compile_deep_gemm --model poolside/Laguna-XS.2-FP8` to avoid that cost on every restart.
+- **Reasoning parser** (`--reasoning-parser poolside_v1`): Splits `<think>...</think>` segments into `reasoning_content` so `content` holds only the final answer. Disable only if you want the raw `<think>` tags in `content`.
+- **Tool call parser** (`--tool-call-parser poolside_v1`): Required for OpenAI-compatible tool-call streaming. Disable only for chat-only deployments.
+- **DP attention**: For higher-throughput deployments, enable the DP-Attention toggle — it emits `--dp <N> --enable-dp-attention` with `--dp` matching `--tp` (tune independently if needed).
+- **Thinking default**: Thinking is **off by default** at the model level. Opt in per request with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`.
+
+## 4. Model Invocation
+
+The samples below assume the server is reachable at `http://localhost:30000/v1`.
+
+### 4.1 Basic Chat
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+resp = client.chat.completions.create(
+    model="poolside/Laguna-XS.2",
+    messages=[
+        {"role": "user", "content": "What is the difference between TCP and UDP?"}
+    ],
+    max_tokens=1024,
+)
+print(resp.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text Output
+TCP (Transmission Control Protocol) and UDP (User Datagram Protocol) are two core protocols of the Internet Protocol (IP) suite, both used for network communication but with key differences:
+
+## Connection Handling
+- **TCP**: Connection-oriented protocol that establishes a connection before data transfer (like a phone call)
+- **UDP**: Connectionless protocol that sends data without establishing a connection (like sending a letter)
+
+## Reliability
+- **TCP**: Guaranteed delivery with error checking, retransmission of lost packets, and flow control
+- **UDP**: No guarantee of delivery; packets may be lost, duplicated, or arrive out of order
+
+## Speed & Overhead
+- **TCP**: Slower due to connection setup, acknowledgment overhead, and error correction mechanisms
+- **UDP**: Faster with minimal overhead since it doesn't wait for acknowledgments or retransmit lost data
+
+## Use Cases
+- **TCP**: Web browsing (HTTP/HTTPS), email (SMTP), file transfers (FTP), database connections
+- **UDP**: Video streaming, online gaming, VoIP calls, DNS queries, live broadcasts
+
+In essence, TCP prioritizes reliability over speed, while UDP prioritizes speed over reliability.
+```
+
+### 4.2 Reasoning (Thinking Mode)
+
+Laguna-XS.2 emits reasoning between `<think>...</think>` tags. The `--reasoning-parser poolside_v1` flag separates the thinking text into `reasoning_content` so `content` holds only the final answer. Thinking is opt-in per request:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+resp = client.chat.completions.create(
+    model="poolside/Laguna-XS.2",
+    messages=[
+        {"role": "user", "content": "If a train travels at 60 km/h for 2.5 hours, how far does it go?"}
+    ],
+    max_tokens=4096,
+    extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+)
+
+print("====== Reasoning Content ======")
+print(resp.choices[0].message.reasoning_content)
+print("====== Answer ======")
+print(resp.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text Output
+====== Reasoning Content ======
+The user is asking a straightforward math problem about distance, speed, and time. I need to calculate the distance using the formula:
+
+Distance = Speed × Time
+
+Given:
+- Speed = 60 km/h
+- Time = 2.5 hours
+
+So the calculation would be:
+Distance = 60 × 2.5 = 150 km
+
+This is a simple multiplication problem. I should provide a clear, direct answer and maybe explain the calculation briefly.
+
+====== Answer ======
+To find the distance, use the formula:
+
+Distance = Speed × Time
+Distance = 60 km/h × 2.5 h = 150 km
+
+The train travels **150 kilometers**.
+```
+
+To disable thinking, omit `extra_body` (off by default) or pass `chat_template_kwargs={"enable_thinking": False}` explicitly.
+
+### 4.3 Tool Calling
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "The city name"},
+                },
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+resp = client.chat.completions.create(
+    model="poolside/Laguna-XS.2",
+    messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
+    tools=tools,
+)
+
+msg = resp.choices[0].message
+print("====== Reasoning Content ======")
+print(msg.reasoning_content)
+print("====== Content ======")
+print(msg.content)
+print("====== Tool Calls ======")
+for tc in msg.tool_calls or []:
+    print(f"  Function: {tc.function.name}")
+    print(f"  Arguments: {tc.function.arguments}")
+```
+
+**Output Example:**
+
+```text Output
+====== Reasoning Content ======
+None
+====== Content ======
+
+I'll check the current weather in Tokyo for you.
+
+====== Tool Calls ======
+  Function: get_weather
+  Arguments: {"location": "Tokyo"}
+```
+
+`reasoning_content` is `None` because thinking is off by default; `content` carries the brief assistant message that precedes the tool call. Add `extra_body={"chat_template_kwargs": {"enable_thinking": True}}` if you want interleaved reasoning before the tool call.
+
+## 5. Benchmark
+
+### 5.1 Accuracy Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA H200 (4×H200)
+- Model: `poolside/Laguna-XS.2` (BF16)
+- Tensor Parallelism: 4
+- SGLang Version: `0.5.12.dev20260509+g096ad02b0` (nightly wheel containing the #24204 merge commit; same code path as the original PR runs)
+- Reasoning Parser: `poolside_v1`
+- Tool Call Parser: `poolside_v1`
+- Sampling: `temperature=0.6`, `max_tokens=16384`, `chat_template_kwargs={"enable_thinking": true}`, `n_repeats=1`
+- Grader: NeMo-Skills `math_verify` (math) and `eval_mcq` (multichoice)
+
+**Results (from [PR #24204](https://github.com/sgl-project/sglang/pull/24204)):**
+
+| Eval | Accuracy |
+| --- | ---: |
+| GPQA Diamond | 0.5556 |
+| AIME 25 | 0.5667 |
+| MMLU | 0.836 |
+| SWE-Bench Verified | 0.6540 |
+
+### 5.2 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA H200 (1×H200 for TP=1, 4×H200 for TP=4)
+- Model: `poolside/Laguna-XS.2` (BF16)
+- SGLang Version: `0.5.12.dev20260509+g096ad02b0` (nightly wheel containing the #24204 merge commit; same code path as the original PR runs)
+- Workload: `sglang.bench_serving --backend sglang --dataset-name random` (defaults: `--random-input-len 1024 --random-output-len 1024 --random-range-ratio 0.0`)
+- Server flags identical to the accuracy runs above.
+
+#### 5.2.1 Latency Benchmark (10 prompts, concurrency = 1)
+
+```bash Command
+python3 -m sglang.bench_serving --backend sglang \
+  --host 0.0.0.0 --port 30000 \
+  --dataset-name random --num-prompts 10 --max-concurrency 1
+```
+
+| Metric | TP=1 | TP=4 |
+| --- | ---: | ---: |
+| Successful requests | 10 | 10 |
+| Output token throughput (tok/s) | 193.10 | 238.88 |
+| Total token throughput (tok/s) | 471.82 | 583.68 |
+| Mean TTFT (ms) | 35.32 | 24.17 |
+| Mean TPOT (ms) | 5.10 | 4.13 |
+| Median ITL (ms) | 5.14 | 4.14 |
+
+#### 5.2.2 Throughput Benchmark (1000 prompts, concurrency = 100)
+
+```bash Command
+python3 -m sglang.bench_serving --backend sglang \
+  --host 0.0.0.0 --port 30000 \
+  --dataset-name random --num-prompts 1000 --max-concurrency 100
+```
+
+| Metric | TP=1 | TP=4 |
+| --- | ---: | ---: |
+| Successful requests | 1000 | 1000 |
+| Request throughput (req/s) | 7.32 | 14.61 |
+| Output token throughput (tok/s) | 3739.30 | 7465.18 |
+| Peak output token throughput (tok/s) | 4718.00 | 10133.00 |
+| Total token throughput (tok/s) | 7485.82 | 14944.81 |
+| Mean TTFT (ms) | 115.17 | 68.36 |
+| Mean TPOT (ms) | 25.51 | 12.71 |
+| Median ITL (ms) | 21.31 | 10.64 |
+
+TP=4 delivers roughly 2.0× total-token throughput and ~1.7× lower mean TTFT compared to TP=1 on the `cc=100` random workload.

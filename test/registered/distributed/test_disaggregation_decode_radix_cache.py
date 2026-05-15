@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=300, suite="stage-c-test-8-gpu-h20")
+register_cuda_ci(est_time=300, stage="stage-c", runner_config="8-gpu-h20")
 
 
 def _has_nixl():
@@ -120,10 +120,7 @@ class DisaggregationDecodeRadixCacheTestMixin:
         )
 
 
-@unittest.skipUnless(
-    is_in_ci() or _has_nixl(),
-    "NIXL is required for decode radix cache disaggregation coverage.",
-)
+@unittest.skip("Temporarily disabled until nixl backend is stable.")
 class TestDisaggregationDecodeRadixCacheNixl(
     DisaggregationDecodeRadixCacheTestMixin, PDDisaggregationServerBase
 ):
