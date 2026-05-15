@@ -250,7 +250,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         # Multimodal text prompt: tokenize to get accurate
                         # length so default_max_tokens doesn't exceed context_len.
                         prompt_length = len(
-                            self.tokenizer_manager.tokenizer.encode(engine_prompt)
+                            tokenizer.encode(engine_prompt, add_special_tokens=False)
                         )
                     else:
                         prompt_length = 0
