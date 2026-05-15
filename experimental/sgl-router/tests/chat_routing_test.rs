@@ -610,3 +610,76 @@ async fn malformed_json_returns_400_bad_request() {
         captured.last_body
     );
 }
+
+#[tokio::test]
+async fn forward_json_to_records_failure_on_5xx() {
+    use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use sgl_router::server::error::ApiError;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let worker = common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({"error": {"type": "x"}}),
+    )
+    .await;
+
+    let worker_url: reqwest::Url = worker.url.parse().unwrap();
+    let proxy = Proxy::new(worker_url.clone(), TEST_TIMEOUT).unwrap();
+    let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+        threshold: 1,
+        cool_down: Duration::from_secs(30),
+    }));
+
+    let headers = axum::http::HeaderMap::new();
+    let body = bytes::Bytes::from(b"{}".to_vec());
+    let _: Result<_, ApiError> = proxy
+        .forward_json_to(
+            &worker_url,
+            &breaker,
+            "/v1/chat/completions",
+            &headers,
+            body,
+        )
+        .await;
+
+    assert!(
+        !breaker.allow(),
+        "one 5xx with threshold=1 should open the breaker"
+    );
+}
+
+#[tokio::test]
+async fn forward_json_to_rejects_when_breaker_open() {
+    use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use sgl_router::server::error::ApiError;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let worker_url: reqwest::Url = worker.url.parse().unwrap();
+    let proxy = Proxy::new(worker_url.clone(), TEST_TIMEOUT).unwrap();
+    let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+        threshold: 1,
+        cool_down: Duration::from_secs(30),
+    }));
+    breaker.record_failure(); // open immediately
+
+    let headers = axum::http::HeaderMap::new();
+    let body = bytes::Bytes::from(b"{}".to_vec());
+    let res = proxy
+        .forward_json_to(
+            &worker_url,
+            &breaker,
+            "/v1/chat/completions",
+            &headers,
+            body,
+        )
+        .await;
+
+    let err = res.expect_err("breaker open → ApiError");
+    match err {
+        ApiError::ServiceUnavailable(_) => {}
+        other => panic!("expected ServiceUnavailable, got {other:?}"),
+    }
+}
