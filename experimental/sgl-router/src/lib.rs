@@ -9,6 +9,7 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod config;
+pub mod discovery;
 pub mod proxy;
 pub mod server;
 pub mod tokenizer;
