@@ -78,6 +78,32 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         event.query.return_value = query_return
         return event
 
+    def test_completed_stale_loads_are_reaped_before_capacity_check(self):
+        loader = self._create_loader()
+        events = [
+            self._create_mock_event(query_return=True),
+            self._create_mock_event(query_return=False),
+        ]
+        self.mock_device_module.Event.side_effect = events
+        self.mock_lora_manager.validate_lora_batch.side_effect = (
+            lambda lora_ids: len(lora_ids) <= 1
+        )
+
+        self.assertTrue(
+            loader._try_start_overlap_load("stale_lora", running_loras=set())
+        )
+        self.assertIn("stale_lora", loader.lora_to_overlap_load_event)
+
+        self.mock_lora_manager.fetch_new_loras.reset_mock()
+        result = loader.try_overlap_load_lora("new_lora", running_loras=set())
+
+        self.assertFalse(result)
+        self.assertNotIn("stale_lora", loader.lora_to_overlap_load_event)
+        self.assertIn("new_lora", loader.lora_to_overlap_load_event)
+        self.mock_lora_manager.fetch_new_loras.assert_called_once_with(
+            {"new_lora"}, set()
+        )
+
     def test_full_lifecycle_single_lora_load(self):
         loader = self._create_loader()
 
