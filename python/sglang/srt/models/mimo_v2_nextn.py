@@ -248,6 +248,14 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
 
+        # Which MTP layer in the checkpoint this instance owns. Multi-layer EAGLE creates
+        # one MiMoV2MTP per speculative step (idx in [0, speculative_num_steps)); single-
+        # layer EAGLE passes None and uses layer 0. Without this, the layer-stripping
+        # rewrite in `map_model_name_to_mtp_param_name` collapsed every checkpoint layer
+        # (`model.mtp.layers.{0,1,2}.*`) onto the same `model.mtp_block.*` params, so all
+        # draft runners loaded the same (last-write-wins) weights and accept rate cratered.
+        self.draft_model_idx = draft_model_idx if draft_model_idx is not None else 0
+
         self.model = MiMoV2ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -300,7 +308,10 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
-            name = self.map_model_name_to_mtp_param_name(name)
+            mapped = self.map_model_name_to_mtp_param_name(name)
+            if mapped is None:
+                continue
+            name = mapped
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
@@ -357,7 +368,7 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
 
-    def map_model_name_to_mtp_param_name(self, name: str) -> str:
+    def map_model_name_to_mtp_param_name(self, name: str) -> Optional[str]:
         import re
 
         if "pre_mlp_layernorm" in name:
@@ -372,6 +383,10 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         pattern = r"model.mtp.layers.(\d+)."
         group = re.match(pattern, name)
         if group is not None:
+            # Multi-layer EAGLE: each draft runner owns a single MTP layer. Skip checkpoint
+            # entries for the other layers so they don't overwrite this instance's params.
+            if int(group.group(1)) != self.draft_model_idx:
+                return None
             for sub_name in name_without_prefix:
                 if sub_name in name:
                     name = name.replace(group.group(), "model.")
