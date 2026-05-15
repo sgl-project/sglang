@@ -10,7 +10,6 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
-from sglang.srt.session.session_controller import SessionController
 
 import torch
 
@@ -119,6 +118,7 @@ class OmniVLMTextGenerationResult:
     token_ids: tuple[int, ...] = ()
     next_token_ids: tuple[int, ...] = ()
     position_ids: tuple[int, ...] = ()
+    streamed_text: bool = False
 
 
 @dataclass(slots=True)
@@ -798,7 +798,7 @@ class OmniSessionRuntime:
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput]:
         """
-            image -> [IMG_START?] + IMG_CONTEXT_TOKEN * N + [IMG_END]
+        image -> [IMG_START?] + IMG_CONTEXT_TOKEN * N + [IMG_END]
         """
         session_view = self._model_session_view(record)
         custom_inputs = self.model_policy.prepare_srt_ar_interleaved_inputs(

@@ -548,6 +548,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
         runtime: OmniSessionRuntime,
         session: OmniSessionHandle,
         max_new_tokens: int,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniVLMTextGenerationResult:
         """use SRT text decode for U1 image-understanding answers"""
         if runtime is None:
@@ -558,6 +559,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                 runtime=runtime,
                 session=session,
                 max_new_tokens=max_new_tokens,
+                stream_sink=stream_sink,
             )
         decoded = runtime.decode(
             session,
@@ -570,6 +572,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
             token_ids=decoded.input_ids,
             next_token_ids=decoded.output_ids,
             position_ids=decoded.position_ids,
+            streamed_text=False,
         )
 
     @staticmethod
@@ -584,6 +587,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
         runtime: OmniSessionRuntime,
         session: OmniSessionHandle,
         max_new_tokens: int,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniVLMTextGenerationResult:
         if self.native_tokenizer is None:
             raise RuntimeError("SenseNova U1 think decode requires a tokenizer")
@@ -591,6 +595,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
         eos_token_ids = _u1_eos_token_ids(self.native_tokenizer)
         think_end_token_id = _u1_token_id(self.native_tokenizer, "</think>")
         token_ids: list[int] = []
+        streamed_text = ""
         current_session = session
         u1_state = runtime.get_model_state(session, namespace="u1")
         next_output_position = int(
@@ -620,6 +625,16 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
             token_ids.append(token_id)
             output_position = ar_output_position(decode_input_position)
             decode_input_position = output_position
+            if stream_sink is not None:
+                current_text = _u1_decode_token_ids(self.native_tokenizer, token_ids)
+                delta = (
+                    current_text[len(streamed_text) :]
+                    if current_text.startswith(streamed_text)
+                    else current_text
+                )
+                streamed_text = current_text
+                # 2. t2i/edit think text is decoded before the image boundary reaches coordinator
+                stream_sink.text_delta(delta, token_id=token_id)
             if token_id == think_end_token_id:
                 break
 
@@ -654,6 +669,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
             token_ids=(),
             next_token_ids=tuple(token_ids),
             position_ids=(),
+            streamed_text=stream_sink is not None,
         )
 
     def append_generated_image(

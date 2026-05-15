@@ -245,6 +245,28 @@ class TestSenseNovaU1Context(unittest.TestCase):
         self.assertEqual([34, 35, 36], runtime.appended_position_ids)
         self.assertTrue(runtime.model_state_updates[-1]["u1"]["open_image_marker"])
 
+    def test_t2i_think_decode_streams_tokens_before_image_marker(self):
+        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
+        runtime = _NativeThinkRuntime(output_ids=[42, 124])
+        session = OmniSessionHandle(
+            session_id="s0",
+            anchor_request_id="r0",
+            context_length=32,
+            context_version=1,
+        )
+        stream_sink = _TextDeltaSink()
+
+        result = policy.decode_vlm_text(
+            runtime=runtime,
+            session=session,
+            max_new_tokens=8,
+            stream_sink=stream_sink,
+        )
+
+        self.assertTrue(result.streamed_text)
+        self.assertEqual(["42", "124"], stream_sink.deltas)
+        self.assertEqual([10, 10, 123], runtime.appended_token_ids)
+
     def test_load_native_image_accepts_data_url(self):
         image = Image.new("RGB", (4, 4), (255, 0, 0))
         buffer = BytesIO()
@@ -514,6 +536,14 @@ class _NativeThinkRuntime:
         self.appended_position_ids.extend(position_ids)
         self.model_state_updates.append(model_state_updates)
         return session
+
+
+class _TextDeltaSink:
+    def __init__(self):
+        self.deltas = []
+
+    def text_delta(self, delta, *, token_id=None):
+        self.deltas.append(delta)
 
 
 if __name__ == "__main__":

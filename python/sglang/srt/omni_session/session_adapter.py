@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from sglang.omni.core.interleaved import STREAMED_TEXT_METADATA_KEY
 from sglang.omni.core.protocol import GeneratedSegment
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
@@ -71,20 +72,23 @@ class SRTBackedOmniSessionAdapter:
                 thinking = self._decode_thinking_text(
                     session,
                     max_new_tokens=think_max_new_tokens,
+                    stream_sink=stream_sink,
                 )
                 session = thinking.session
                 if thinking.text:
+                    metadata: dict[str, Any] = {
+                        "role": "think",
+                        "token_ids": [
+                            int(token_id) for token_id in thinking.next_token_ids
+                        ],
+                    }
+                    if thinking.streamed_text:
+                        metadata[STREAMED_TEXT_METADATA_KEY] = True
                     pre_image_segments.append(
                         {
                             "type": "text",
                             "text": thinking.text,
-                            "metadata": {
-                                "role": "think",
-                                "token_ids": [
-                                    int(token_id)
-                                    for token_id in thinking.next_token_ids
-                                ],
-                            },
+                            "metadata": metadata,
                         }
                     )
 
@@ -202,6 +206,7 @@ class SRTBackedOmniSessionAdapter:
         session: OmniSessionHandle,
         *,
         max_new_tokens: int | None,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniVLMTextGenerationResult:
         if max_new_tokens is None:
             max_new_tokens = DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS
@@ -215,6 +220,7 @@ class SRTBackedOmniSessionAdapter:
                 runtime=self.runtime,
                 session=session,
                 max_new_tokens=max_new_tokens,
+                stream_sink=stream_sink,
             )
         except NotImplementedError as exc:
             raise RuntimeError(
