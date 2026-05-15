@@ -72,7 +72,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
+  SKIP_STAGE_HEALTH_CHECK: ${{ (inputs.skip_stage_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true) && 'true' || 'false' }}
   # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
   FORCE_REBUILD_DEEPEP: '1'
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
