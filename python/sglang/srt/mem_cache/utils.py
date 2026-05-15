@@ -91,103 +91,21 @@ def set_mla_kv_buffer_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.jit
-def set_mla_kv_buffer_per_loc_kernel(
-    kv_buffer_ptr,
-    cache_k_nope_ptr,
-    cache_k_rope_ptr,
-    loc_ptr,
-    buffer_stride: tl.constexpr,
-    nope_stride: tl.constexpr,
-    rope_stride: tl.constexpr,
-    nope_dim: tl.constexpr,
-    rope_dim: tl.constexpr,
-    USE_GDC: tl.constexpr = False,
-):
-    """Each CTA writes one full loc (nope + rope). Grid = (n_loc,).
-
-    Compared to the BLOCK-tiled kernel, this trades multi-CTA SM coverage for fewer
-    launches and an unambiguous in-bounds layout (no mask, no nope/rope boundary
-    branch). Faster at bs ≥ ~32 where SMs are already saturated by the loc count.
-    """
-    pid = tl.program_id(0)
-
-    if USE_GDC:
-        tl.extra.cuda.gdc_wait()
-
-    loc = tl.load(loc_ptr + pid).to(tl.int64)
-    dst_base = kv_buffer_ptr + loc * buffer_stride
-
-    nope_offs = tl.arange(0, nope_dim)
-    src_nope = tl.load(cache_k_nope_ptr + pid * nope_stride + nope_offs)
-    tl.store(dst_base + nope_offs, src_nope)
-
-    rope_offs = tl.arange(0, rope_dim)
-    src_rope = tl.load(cache_k_rope_ptr + pid * rope_stride + rope_offs)
-    tl.store(dst_base + nope_dim + rope_offs, src_rope)
-
-    if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-# Crossover where the JIT CUDA kernel starts beating Triton on GB300 (148 SMs).
-# Below this, Triton's lower launch overhead wins; at and above, the JIT kernel's
-# packed multi-item-per-CTA design wins.
-_JIT_DISPATCH_THRESHOLD = 256
-
-
 def set_mla_kv_buffer_triton(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
 ):
-    """Four-way dispatch tuned on GB300 (148 SMs):
-      - bs ≤ 1:    block-tiled BLOCK=128 (5 CTAs/loc for max SM coverage at tiny bs).
-      - bs ≤ 48:   block-tiled BLOCK=256 (3 CTAs/loc — bs*3 still fits comfortably).
-      - bs < _JIT_DISPATCH_THRESHOLD: per-loc kernel (1 CTA/loc — fewest launches once
-        bs alone is enough to saturate SMs; no mask, no nope/rope boundary).
-      - bs ≥ _JIT_DISPATCH_THRESHOLD: JIT CUDA kernel (packs multiple locs per CTA,
-        bandwidth-bound regime).
-    """
-    from sglang.jit_kernel.set_mla_kv_buffer import (
-        can_use_set_mla_kv_buffer,
-        set_mla_kv_buffer as jit_set_mla_kv_buffer,
-    )
-
-    n_loc = loc.numel()
-    nope_bytes = cache_k_nope.shape[-1] * cache_k_nope.element_size()
-    rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size()
-    if n_loc >= _JIT_DISPATCH_THRESHOLD and can_use_set_mla_kv_buffer(
-        nope_bytes, rope_bytes
-    ):
-        jit_set_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
-        return
-
     nope_dim = cache_k_nope.shape[-1]
     rope_dim = cache_k_rope.shape[-1]
+    total_dim = nope_dim + rope_dim
+    BLOCK = 128
+    n_loc = loc.numel()
+    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
+
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
-    if n_loc > 48:
-        set_mla_kv_buffer_per_loc_kernel[(n_loc,)](
-            kv_buffer,
-            cache_k_nope,
-            cache_k_rope,
-            loc,
-            kv_buffer.stride(0),
-            cache_k_nope.stride(0),
-            cache_k_rope.stride(0),
-            nope_dim,
-            rope_dim,
-            num_warps=1,
-            num_stages=2,
-            **pdl_kwargs,
-        )
-        return
-
-    total_dim = nope_dim + rope_dim
-    BLOCK = 128 if n_loc <= 1 else 256
-    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
     set_mla_kv_buffer_kernel[grid](
         kv_buffer,
         cache_k_nope,
