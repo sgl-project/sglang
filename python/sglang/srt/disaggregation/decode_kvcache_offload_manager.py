@@ -1,27 +1,26 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.environ import envs
-from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-    ReqToTokenPool,
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    build_kv_only_stack,
+    build_shared_anchor_stack,
 )
-from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,
-    MLATokenToKVPoolHost,
-)
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool_host import NSAIndexerPoolHost
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
 
@@ -29,6 +28,128 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class DecodeOffloadStackSpec:
+    use_mla: bool
+    override_kv_cache_dim: int | None = None
+    shared_pool_name: PoolName | None = None
+    shared_host_pool_factory: Callable[[Any], Any] | None = None
+    extra_pool_specs: tuple[tuple[PoolName, PoolHitPolicy], ...] = ()
+
+
+def _parse_storage_backend_extra_config(server_args: ServerArgs) -> dict:
+    hicache_storage_backend_extra_config = {}
+    if server_args.hicache_storage_backend_extra_config:
+        try:
+            hicache_storage_backend_extra_config = json.loads(
+                server_args.hicache_storage_backend_extra_config
+            )
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Invalid hicache storage backend extra config JSON: {e}"
+            ) from e
+    return hicache_storage_backend_extra_config
+
+
+def _has_decode_offload_attrs(kv_cache: Any, attrs: tuple[str, ...]) -> bool:
+    return all(hasattr(kv_cache, attr) for attr in attrs)
+
+
+def _supports_mha_decode_offload(kv_cache: Any) -> bool:
+    return _has_decode_offload_attrs(
+        kv_cache,
+        ("head_num", "head_dim", "layer_num"),
+    )
+
+
+def _supports_mla_decode_offload(kv_cache: Any) -> bool:
+    return _has_decode_offload_attrs(
+        kv_cache,
+        ("kv_lora_rank", "qk_rope_head_dim", "kv_cache_dim", "layer_num"),
+    )
+
+
+def _supports_indexer_sidecar(kv_cache: Any) -> bool:
+    return _supports_mla_decode_offload(kv_cache) and _has_decode_offload_attrs(
+        kv_cache,
+        ("index_k_with_scale_buffer", "index_head_dim", "quant_block_size"),
+    )
+
+
+def _get_decode_offload_stack_spec(
+    kv_cache: Any,
+    server_args: ServerArgs,
+) -> DecodeOffloadStackSpec | None:
+    if _supports_indexer_sidecar(kv_cache):
+        return DecodeOffloadStackSpec(
+            use_mla=True,
+            override_kv_cache_dim=kv_cache.kv_cache_dim,
+            shared_pool_name=PoolName.INDEXER,
+            shared_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
+                kv_cache,
+                kv_host_pool,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            ),
+            extra_pool_specs=((PoolName.INDEXER, PoolHitPolicy.ALL_PAGES),),
+        )
+    if _supports_mla_decode_offload(kv_cache):
+        return DecodeOffloadStackSpec(use_mla=True)
+    if _supports_mha_decode_offload(kv_cache):
+        return DecodeOffloadStackSpec(use_mla=False)
+    return None
+
+
+def _build_decode_offload_stack(
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    kv_cache: Any,
+    tp_group: torch.distributed.ProcessGroup,
+    server_args: ServerArgs,
+    storage_backend_extra_config: dict,
+):
+    spec = _get_decode_offload_stack_spec(kv_cache, server_args)
+    if spec is None:
+        raise ValueError(
+            "Unsupported KV cache for decode offload: missing a supported host-pool assembly capability."
+        )
+
+    params = CacheInitParams(
+        disable=False,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        page_size=server_args.page_size,
+    )
+    layer_mapping = {layer_id: layer_id for layer_id in range(kv_cache.layer_num)}
+    common_kwargs = dict(
+        params=params,
+        server_args=server_args,
+        kv_pool=kv_cache,
+        full_layer_mapping=layer_mapping,
+        page_size=server_args.page_size,
+        tp_group=tp_group,
+        load_cache_event=threading.Event(),
+        storage_backend=server_args.hicache_storage_backend,
+        use_mla=spec.use_mla,
+        override_kv_cache_dim=spec.override_kv_cache_dim,
+        model_name=server_args.served_model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+    )
+    if spec.shared_pool_name is None:
+        return (
+            *build_kv_only_stack(**common_kwargs),
+            spec.extra_pool_specs,
+        )
+    return (
+        *build_shared_anchor_stack(
+            shared_pool_name=spec.shared_pool_name,
+            shared_host_pool_factory=spec.shared_host_pool_factory,
+            **common_kwargs,
+        ),
+        spec.extra_pool_specs,
+    )
 
 
 class DecodeKVCacheOffloadManager:
@@ -56,55 +177,78 @@ class DecodeKVCacheOffloadManager:
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(kv_cache, MHATokenToKVPool):
-            self.decode_host_mem_pool = MHATokenToKVPoolHost(
-                kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-            )
-        elif isinstance(kv_cache, MLATokenToKVPool):
-            self.decode_host_mem_pool = MLATokenToKVPoolHost(
-                kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-            )
-        else:
-            raise ValueError("Unsupported KV cache type for decode offload")
-
-        self.tp_group = tp_group
-        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-
-        hicache_storage_backend_extra_config = {}
-        if server_args.hicache_storage_backend_extra_config:
-            try:
-                hicache_storage_backend_extra_config = json.loads(
-                    server_args.hicache_storage_backend_extra_config
-                )
-            except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"Invalid hicache storage backend extra config JSON: {e}"
-                )
-
-        self.cache_controller = HiCacheController(
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            mem_pool_host=self.decode_host_mem_pool,
-            page_size=self.page_size,
+        hicache_storage_backend_extra_config = _parse_storage_backend_extra_config(
+            server_args
+        )
+        (
+            self.decode_host_mem_pool,
+            self.cache_controller,
+            self._extra_pool_specs,
+        ) = _build_decode_offload_stack(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            kv_cache=kv_cache,
             tp_group=tp_group,
-            io_backend=server_args.hicache_io_backend,
-            load_cache_event=threading.Event(),
-            storage_backend=server_args.hicache_storage_backend,
-            model_name=server_args.served_model_name,
+            server_args=server_args,
             storage_backend_extra_config=hicache_storage_backend_extra_config,
         )
+        self.tp_group = tp_group
+        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         self.ongoing_offload = {}
         self.ongoing_backup = {}
         self.offloaded_state = {}
         logger.info("Enable offload kv cache for decode side")
+
+    def _build_extra_pools(self) -> list[PoolTransfer] | None:
+        if not self._extra_pool_specs:
+            return None
+        return [
+            PoolTransfer(
+                name=name,
+                hit_policy=hit_policy,
+            )
+            for name, hit_policy in self._extra_pool_specs
+        ]
+
+    def _write_device_to_host(
+        self,
+        *,
+        device_indices: torch.Tensor,
+        node_id: int,
+    ) -> torch.Tensor | None:
+        extra_pools = self._build_extra_pools()
+        if extra_pools is None:
+            return self.cache_controller.write(
+                device_indices=device_indices,
+                node_id=node_id,
+            )
+        return self.cache_controller.write(
+            device_indices=device_indices,
+            node_id=node_id,
+            extra_pools=extra_pools,
+        )
+
+    def _write_host_to_storage(
+        self,
+        *,
+        host_indices: torch.Tensor,
+        token_ids: list[int],
+        hash_value: list[str],
+    ) -> int:
+        extra_pools = self._build_extra_pools()
+        if extra_pools is None:
+            return self.cache_controller.write_storage(
+                host_indices,
+                token_ids,
+                hash_value=hash_value,
+            )
+        return self.cache_controller.write_storage(
+            host_indices,
+            token_ids,
+            hash_value=hash_value,
+            extra_pools=extra_pools,
+        )
 
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
@@ -160,7 +304,7 @@ class DecodeKVCacheOffloadManager:
         # Asynchronously offload incremental KV cache from device to host
         self.request_counter += 1
         ack_id = self.request_counter
-        host_indices = self.cache_controller.write(
+        host_indices = self._write_device_to_host(
             device_indices=incremental_indices.long(),
             node_id=ack_id,
         )
@@ -277,9 +421,9 @@ class DecodeKVCacheOffloadManager:
     ):
         """Trigger async backup from host to storage."""
         page_hashes = self._compute_prefix_hash(incremental_tokens, prior_hash)
-        ack_id = self.cache_controller.write_storage(
-            host_indices,
-            incremental_tokens,
+        ack_id = self._write_host_to_storage(
+            host_indices=host_indices,
+            token_ids=incremental_tokens,
             hash_value=page_hashes,
         )
         self.ongoing_backup[ack_id] = (req.rid, host_indices, start_time)

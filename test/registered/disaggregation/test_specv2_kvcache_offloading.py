@@ -8,13 +8,16 @@ Requires: torch, sglang (run in an environment with sglang installed)
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="stage-b", runner_config="1-gpu-small")
@@ -77,8 +80,52 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.page_size = page_size
     manager.tree_cache = tree_cache
     manager.offloaded_state = {}
+    manager._extra_pool_specs = ()
 
     return manager, freed_indices
+
+
+def _make_server_args(page_size: int):
+    return SimpleNamespace(
+        page_size=page_size,
+        hicache_ratio=2.0,
+        hicache_size=0,
+        hicache_mem_layout="layer_first",
+        hicache_storage_backend="file",
+        hicache_storage_backend_extra_config=None,
+        hicache_io_backend="kernel",
+        hicache_write_policy="write_through_selective",
+        served_model_name="test-model",
+    )
+
+
+def _make_mha_like_cache():
+    return SimpleNamespace(
+        head_num=8,
+        head_dim=128,
+        layer_num=16,
+    )
+
+
+def _make_mla_like_cache():
+    return SimpleNamespace(
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        kv_cache_dim=576,
+        layer_num=16,
+    )
+
+
+def _make_nsa_like_cache():
+    return SimpleNamespace(
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        kv_cache_dim=640,
+        layer_num=16,
+        index_k_with_scale_buffer=[MagicMock() for _ in range(16)],
+        index_head_dim=128,
+        quant_block_size=128,
+    )
 
 
 class TestReleaseFinishedReq(unittest.TestCase):
@@ -175,6 +222,251 @@ class TestReleaseFinishedReq(unittest.TestCase):
         manager._release_finished_req(req, start_offset=0)
 
         self.assertEqual(manager.tree_cache.protected_size_, 5)
+
+
+class TestDecodeKVCacheOffloadManagerStackAssembly(unittest.TestCase):
+    @patch(
+        "sglang.srt.disaggregation.decode_kvcache_offload_manager.torch.distributed.get_world_size",
+        return_value=1,
+    )
+    @patch(
+        "sglang.srt.disaggregation.decode_kvcache_offload_manager.build_shared_anchor_stack"
+    )
+    @patch(
+        "sglang.srt.disaggregation.decode_kvcache_offload_manager.build_kv_only_stack"
+    )
+    def test_init_uses_single_pool_hybrid_stack_for_mha_like_pool(
+        self,
+        mock_build_kv_only_stack,
+        mock_build_shared_anchor_stack,
+        _mock_world_size,
+    ):
+        req_to_token_pool = MagicMock()
+        token_to_kv_pool_allocator = MagicMock()
+        kv_cache = _make_mha_like_cache()
+        token_to_kv_pool_allocator.get_kvcache.return_value = kv_cache
+        tree_cache = MagicMock()
+        tp_group = MagicMock()
+
+        host_pool_group = MagicMock()
+        hybrid_controller = MagicMock()
+        mock_build_kv_only_stack.return_value = (
+            host_pool_group,
+            hybrid_controller,
+        )
+
+        manager = DecodeKVCacheOffloadManager(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            tp_group=tp_group,
+            tree_cache=tree_cache,
+            server_args=_make_server_args(page_size=64),
+        )
+
+        self.assertIs(manager.decode_host_mem_pool, host_pool_group)
+        self.assertIs(manager.cache_controller, hybrid_controller)
+        self.assertEqual(manager._extra_pool_specs, ())
+        called_kwargs = mock_build_kv_only_stack.call_args.kwargs
+        self.assertFalse(called_kwargs["use_mla"])
+        mock_build_kv_only_stack.assert_called_once()
+        mock_build_shared_anchor_stack.assert_not_called()
+
+    @patch(
+        "sglang.srt.disaggregation.decode_kvcache_offload_manager.torch.distributed.get_world_size",
+        return_value=1,
+    )
+    @patch(
+        "sglang.srt.disaggregation.decode_kvcache_offload_manager.build_shared_anchor_stack"
+    )
+    @patch(
+        "sglang.srt.disaggregation.decode_kvcache_offload_manager.build_kv_only_stack"
+    )
+    def test_init_uses_single_pool_hybrid_stack_for_mla_like_pool(
+        self,
+        mock_build_kv_only_stack,
+        mock_build_shared_anchor_stack,
+        _mock_world_size,
+    ):
+        req_to_token_pool = MagicMock()
+        token_to_kv_pool_allocator = MagicMock()
+        kv_cache = _make_mla_like_cache()
+        token_to_kv_pool_allocator.get_kvcache.return_value = kv_cache
+        tree_cache = MagicMock()
+        tp_group = MagicMock()
+
+        host_pool_group = MagicMock()
+        hybrid_controller = MagicMock()
+        mock_build_kv_only_stack.return_value = (
+            host_pool_group,
+            hybrid_controller,
+        )
+
+        manager = DecodeKVCacheOffloadManager(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            tp_group=tp_group,
+            tree_cache=tree_cache,
+            server_args=_make_server_args(page_size=64),
+        )
+
+        self.assertIs(manager.decode_host_mem_pool, host_pool_group)
+        self.assertIs(manager.cache_controller, hybrid_controller)
+        self.assertEqual(manager._extra_pool_specs, ())
+        called_kwargs = mock_build_kv_only_stack.call_args.kwargs
+        self.assertTrue(called_kwargs["use_mla"])
+        self.assertIsNone(called_kwargs["override_kv_cache_dim"])
+        mock_build_kv_only_stack.assert_called_once()
+        mock_build_shared_anchor_stack.assert_not_called()
+
+    @patch(
+        "sglang.srt.disaggregation.decode_kvcache_offload_manager.torch.distributed.get_world_size",
+        return_value=1,
+    )
+    @patch(
+        "sglang.srt.disaggregation.decode_kvcache_offload_manager.build_kv_only_stack"
+    )
+    @patch(
+        "sglang.srt.disaggregation.decode_kvcache_offload_manager.build_shared_anchor_stack"
+    )
+    def test_init_uses_hybrid_stack_for_nsa_sidecar_capability(
+        self,
+        mock_build_shared_anchor_stack,
+        mock_build_kv_only_stack,
+        _mock_world_size,
+    ):
+        req_to_token_pool = MagicMock()
+        token_to_kv_pool_allocator = MagicMock()
+        kv_cache = _make_nsa_like_cache()
+        token_to_kv_pool_allocator.get_kvcache.return_value = kv_cache
+        tree_cache = MagicMock()
+        tp_group = MagicMock()
+
+        host_pool_group = MagicMock()
+        hybrid_controller = MagicMock()
+        mock_build_shared_anchor_stack.return_value = (
+            host_pool_group,
+            hybrid_controller,
+        )
+
+        manager = DecodeKVCacheOffloadManager(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            tp_group=tp_group,
+            tree_cache=tree_cache,
+            server_args=_make_server_args(page_size=64),
+        )
+
+        self.assertIs(manager.decode_host_mem_pool, host_pool_group)
+        self.assertIs(manager.cache_controller, hybrid_controller)
+        self.assertEqual(
+            manager._extra_pool_specs,
+            ((PoolName.INDEXER, PoolHitPolicy.ALL_PAGES),),
+        )
+        called_kwargs = mock_build_shared_anchor_stack.call_args.kwargs
+        self.assertEqual(called_kwargs["shared_pool_name"], PoolName.INDEXER)
+        self.assertTrue(called_kwargs["use_mla"])
+        self.assertEqual(called_kwargs["override_kv_cache_dim"], kv_cache.kv_cache_dim)
+        mock_build_shared_anchor_stack.assert_called_once()
+        mock_build_kv_only_stack.assert_not_called()
+
+    def test_init_rejects_cache_without_supported_decode_offload_capability(self):
+        req_to_token_pool = MagicMock()
+        token_to_kv_pool_allocator = MagicMock()
+        token_to_kv_pool_allocator.get_kvcache.return_value = SimpleNamespace(
+            layer_num=16
+        )
+        tree_cache = MagicMock()
+        tp_group = MagicMock()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "supported host-pool assembly capability",
+        ):
+            DecodeKVCacheOffloadManager(
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+                tp_group=tp_group,
+                tree_cache=tree_cache,
+                server_args=_make_server_args(page_size=64),
+            )
+
+
+class TestDecodeKVCacheOffloadManagerNSA(unittest.TestCase):
+
+    def test_offload_kv_cache_emits_indexer_pool_transfer_for_nsa(self):
+        manager = object.__new__(DecodeKVCacheOffloadManager)
+        manager.cache_controller = MagicMock()
+        manager.decode_host_mem_pool = MagicMock()
+        manager.cache_controller.write.return_value = torch.arange(
+            0, 4, dtype=torch.int64
+        )
+        manager.req_to_token_pool = MagicMock()
+        manager.req_to_token_pool.req_to_token = torch.arange(
+            16, dtype=torch.int64
+        ).unsqueeze(0)
+        manager.token_to_kv_pool_allocator = MagicMock()
+        manager.page_size = 4
+        manager.offload_stride = 4
+        manager.offloaded_state = {}
+        manager.request_counter = 0
+        manager._extra_pool_specs = ((PoolName.INDEXER, PoolHitPolicy.ALL_PAGES),)
+
+        req = SimpleNamespace(
+            rid="rid-1",
+            req_pool_idx=0,
+            origin_input_ids=[1, 2, 3, 4],
+            output_ids=[5, 6, 7, 8, 9],
+        )
+
+        result = manager.offload_kv_cache(req)
+
+        self.assertTrue(result)
+        call_kwargs = manager.cache_controller.write.call_args.kwargs
+        self.assertIn("extra_pools", call_kwargs)
+        self.assertEqual(len(call_kwargs["extra_pools"]), 1)
+        self.assertEqual(call_kwargs["extra_pools"][0].name, PoolName.INDEXER)
+        manager.token_to_kv_pool_allocator.free.assert_called_once()
+        freed_indices = manager.token_to_kv_pool_allocator.free.call_args.args[0]
+        self.assertTrue(torch.equal(freed_indices, torch.arange(0, 4)))
+        self.assertEqual(manager.offloaded_state["rid-1"].inc_len, 4)
+
+    def test_trigger_backup_emits_indexer_pool_transfer_for_nsa(self):
+        manager = object.__new__(DecodeKVCacheOffloadManager)
+        manager.cache_controller = MagicMock()
+        manager.cache_controller.write_storage.return_value = 7
+        manager.cache_controller.get_hash_str.side_effect = (
+            lambda tokens, prior: f"{prior}|{','.join(map(str, tokens))}"
+        )
+        manager._extra_pool_specs = ((PoolName.INDEXER, PoolHitPolicy.ALL_PAGES),)
+        manager.page_size = 4
+        manager.ongoing_backup = {}
+
+        req = SimpleNamespace(rid="rid-2")
+        host_indices = torch.arange(0, 4, dtype=torch.int64)
+
+        last_hash = manager._trigger_backup(
+            req=req,
+            host_indices=host_indices,
+            incremental_tokens=[10, 11, 12, 13, 14, 15, 16, 17],
+            start_time=123.0,
+            prior_hash="seed",
+        )
+
+        call_args = manager.cache_controller.write_storage.call_args
+        self.assertTrue(torch.equal(call_args.args[0], host_indices))
+        self.assertEqual(call_args.args[1], [10, 11, 12, 13, 14, 15, 16, 17])
+        self.assertIn("extra_pools", call_args.kwargs)
+        self.assertEqual(len(call_args.kwargs["extra_pools"]), 1)
+        self.assertEqual(call_args.kwargs["extra_pools"][0].name, PoolName.INDEXER)
+        self.assertEqual(
+            call_args.kwargs["hash_value"],
+            [
+                "seed|10,11,12,13",
+                "seed|10,11,12,13|14,15,16,17",
+            ],
+        )
+        self.assertEqual(last_hash, "seed|10,11,12,13|14,15,16,17")
+        self.assertEqual(manager.ongoing_backup[7], ("rid-2", host_indices, 123.0))
 
 
 if __name__ == "__main__":
