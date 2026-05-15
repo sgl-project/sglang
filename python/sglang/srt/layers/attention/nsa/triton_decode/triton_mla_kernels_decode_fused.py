@@ -200,17 +200,18 @@ def _process_kv_block_aggressive(
 # ============================================================================
 @triton.autotune(
     configs=[
-        # Removed 3 exact duplicates
+        # Reduced from 10 to 6 configs. Fused gather+dequant+attention kernel.
+        # Two axes: BLOCK_H × BLOCK_N, with BLOCK_N being the key perf knob
+        # for small h_q (h_q=16 at TP=8 where BLOCK_H doesn't affect grid).
+        # BLOCK_N=64: better for large topk (less register pressure per iter).
+        # BLOCK_N=128: better for small topk (fewer iterations).
+        # num_warps=4: fused kernel is compute-bound.
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 256}, num_warps=4, num_stages=1),
     ],
     key=["total_tokens_bucket", "h_q", "topk"],
 )
@@ -740,33 +741,45 @@ def fused_gather_attn_decode_dsv4(
 
 # Uses helper function to eliminate code duplication
 # ============================================================================
+
+def _prune_dual_scope_configs(configs, named_args, **kwargs):
+    """Prune configs where BLOCK_H > h_q for the dual-scope kernel.
+
+    When BLOCK_H > h_q, cdiv(h_q, BLOCK_H) = 1 regardless of BLOCK_H value,
+    so larger BLOCK_H gives the same grid but may have worse register allocation.
+    Keep only the smallest BLOCK_H that gives cdiv(h_q, BLOCK_H) = 1, plus
+    any BLOCK_H <= h_q configs.
+
+    For h_q=16: keep only BLOCK_H=16 (removes 32, 64 which give same grid)
+    For h_q=64: keep BLOCK_H=16, 32, 64 (all give different grid sizes)
+    For h_q=128: keep all (all give different grid sizes)
+    """
+    h_q = named_args.get("h_q", 128)
+    pruned = [c for c in configs if c.kwargs.get("BLOCK_H", 16) <= h_q]
+    return pruned if pruned else configs
+
 @triton.autotune(
     configs=[
-        # num_warps=4, num_stages=1 configs
+        # Reduced from 20 to 10 configs. Dual-scope fused gather+dequant+attention.
+        # Three axes: BLOCK_H × BLOCK_N × (warps, stages).
+        # - BLOCK_H: {16, 32, 64} covers h_q=16 (TP=8), h_q=64 (TP=2), h_q=128 (TP=1).
+        # - BLOCK_N: {64, 128}. BLOCK_N=64 better for large topk, 128 for small topk.
+        # - _prune_dual_scope_configs removes BLOCK_H > h_q configs (they compile to
+        #   different binaries with worse register allocation despite same grid size).
+        # stages=1, warps=4: baseline configs
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        # num_warps=8, num_stages=1 configs
+        # warps=8: for memory-bound scenarios (small h_q, large topk)
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
-        # num_stages=2 configs (software pipelining)
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=2),
     ],
     key=["total_tokens_bucket", "h_q", "topk_main", "topk_extra"],
+    prune_configs_by={"early_config_prune": _prune_dual_scope_configs},
 )
 @triton.jit
 def _fused_gather_attn_dsv4_dual_scope_kernel(
@@ -1161,11 +1174,11 @@ def _fused_gather_attn_dsv4_dual_scope_kernel(
 
 def _prune_splitk_configs(configs, named_args, **kwargs):
     """Prune BLOCK_H=16 configs for large batch sizes to avoid CU oversubscription.
-    
+
     With h_q=128 and BLOCK_H=16, the grid has cdiv(128,16)=8 H-blocks.
     At bs=32 with split_k=2, this creates 8*32*2=512 blocks (200% CU),
     causing performance regression from oversubscription.
-    
+
     For small batch sizes (bucket <= 8), BLOCK_H=16 provides better
     parallelism and is ~10% faster in CUDA graph replay.
     """
@@ -1183,22 +1196,19 @@ def _prune_splitk_configs(configs, named_args, **kwargs):
 # ============================================================================
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        # BLOCK_H=16 for better parallelism at small batch sizes
-        # (pruned for large batch sizes by _prune_splitk_configs)
+        # Reduced from 11 to 6 configs. Split-K dual-scope fused kernel.
+        # - Split-K adds parallelism in K dim (2-8 splits).
+        # - BLOCK_N={64,128}: BLOCK_N=64 better for large topk_per_split.
+        # - num_warps=4: compute-bound fused kernel.
+        # - BLOCK_H={16,64}: covers small h_q (16) and large h_q (128).
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
     ],
     key=["total_tokens_bucket", "h_q", "topk_per_split"],
-    prune_configs_by={"early_config_prune": _prune_splitk_configs},
 )
 @triton.jit
 def _fused_gather_attn_dsv4_dual_scope_splitk_kernel(
@@ -1910,32 +1920,16 @@ SPLITK_DEFAULT = 4
 
 @triton.autotune(
     configs=[
-        # Tiny BLOCK_N=8 for minimal scattered access
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 8}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 8}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 8}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 8}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 8}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 8}, num_warps=8, num_stages=1),
-        # Very small BLOCK_N=16
+        # Reduced from 20 to 6 configs. Split-K fused kernel for large topk (≥8192).
+        # - BLOCK_N={16,32}: small blocks for scattered FP8 KV access pattern.
+        # - num_warps=4: balanced for fused dequant+attention compute.
+        # - BLOCK_H={16,64}: covers small h_q (16) and large h_q (128).
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 16}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_N": 32}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 16}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 16}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 16}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 16}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 16}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 16}, num_warps=8, num_stages=1),
-        # Small BLOCK_N=32
         triton.Config({"BLOCK_H": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 32}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 32}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 128, "BLOCK_N": 16}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 128, "BLOCK_N": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 32}, num_warps=8, num_stages=1),
-        # Medium BLOCK_N=64
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 64}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 64}, num_warps=8, num_stages=1),
     ],
     key=["total_tokens_bucket", "h_q", "topk_per_split"],
 )
@@ -2385,16 +2379,14 @@ def _combine_splitk_kernel(
 
 @triton.autotune(
     configs=[
-        # Reduced from 15 to 5 configs. This is a simple reduce kernel
-        # (weighted sum of 8 partial results), so performance is not
-        # sensitive to tile shape. BLOCK_D=512 covers d_v=512 in one
-        # pass; BLOCK_D=256 as fallback. BLOCK_H=16/32/64 covers the
-        # parallelism range for small batch sizes (split_k=8 → bs<=4).
+        # Reduced from 5 to 3 configs. Simple reduce kernel (weighted sum of 8 splits).
+        # - BLOCK_D=512: covers d_v=512 in one pass (no D-dimension loop).
+        # - num_warps=8: memory-bound reduce benefits from more warps.
+        # - split_k=8 is only used at very small batch sizes (≤4 tokens),
+        #   so BLOCK_H=16/32/64 covers the relevant parallelism range.
         triton.Config({"BLOCK_H": 16, "BLOCK_D": 512}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_D": 512}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_D": 512}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_D": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_D": 256}, num_warps=4, num_stages=1),
     ],
     key=["total_tokens_bucket", "h_q", "d_v"],
 )

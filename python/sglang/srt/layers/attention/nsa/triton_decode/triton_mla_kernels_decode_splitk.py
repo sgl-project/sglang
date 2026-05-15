@@ -24,106 +24,23 @@ from .triton_mla_kernels_decode_common import _bucket_total_tokens
 # ============================================================================
 @triton.autotune(
     configs=[
-        # num_stages=2 configs for software pipelining
+        # Reduced from 28 to 4 configs. Split-K attention on already-gathered BF16 KV.
+        # - BLOCK_N=256: amortizes memory access over KV tokens (memory-bound kernel).
+        # - BLOCK_D=128: matches KV tile structure.
+        # - num_warps=8, num_stages=2: memory-bound kernel benefits from more warps
+        #   and software pipelining (overlaps memory loads with compute).
+        # - BLOCK_H varies for different batch sizes:
         triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=2
+            {"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
         ),
         triton.Config(
             {"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
         ),
         triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
             {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
         ),
         triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
-        ),
-        # num_stages=1 baseline configs
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 8, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
-        ),
-        triton.Config(
-            {"BLOCK_H": 8, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
+            {"BLOCK_H": 128, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
         ),
     ],
     key=["total_tokens_bucket", "h_q", "topk_per_split", "d_qk"],
@@ -326,13 +243,13 @@ def _splitk_attention_kernel(
 # ============================================================================
 @triton.autotune(
     configs=[
+        # Reduced from 7 to 3 configs. Simple reduce kernel merging split-K results.
+        # - BLOCK_D=128: 4 iterations to cover d_v=512.
+        # - num_warps=4: sufficient for this simple reduce operation.
+        # - BLOCK_H varies for different batch sizes:
+        triton.Config({"BLOCK_H": 16, "BLOCK_D": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 32, "BLOCK_D": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 8, "BLOCK_D": 128}, num_warps=4, num_stages=1),
     ],
     key=["total_tokens_bucket", "h_q", "split_k"],
 )
