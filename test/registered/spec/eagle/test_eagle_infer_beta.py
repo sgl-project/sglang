@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=369, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=369, stage="stage-b", runner_config="1-gpu-small")
 
 
 class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
@@ -63,14 +63,11 @@ class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
             *[str(i) for i in range(1, cls.max_running_requests + 1)],
         ]
         launch_args.extend(cls.other_launch_args)
-        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(
-            1
-        ), envs.SGLANG_SPEC_NAN_DETECTION.override(
-            True
-        ), envs.SGLANG_SPEC_OOB_DETECTION.override(
-            True
-        ), envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(
-            True
+        with (
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+            envs.SGLANG_SPEC_NAN_DETECTION.override(True),
+            envs.SGLANG_SPEC_OOB_DETECTION.override(True),
+            envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True),
         ):
             cls.process = popen_launch_server(
                 cls.model,

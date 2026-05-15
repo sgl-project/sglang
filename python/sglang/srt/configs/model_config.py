@@ -174,6 +174,7 @@ class ModelConfig:
         encoder_only: bool = False,
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
+        model_config_parser: str = "auto",
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -185,6 +186,7 @@ class ModelConfig:
         self.quantize_and_serve = quantize_and_serve
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.disable_hybrid_swa_memory = disable_hybrid_swa_memory
+        self.model_config_parser = model_config_parser
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -201,6 +203,7 @@ class ModelConfig:
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
+            model_config_parser=model_config_parser,
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
@@ -403,6 +406,7 @@ class ModelConfig:
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
+            model_config_parser=server_args.model_config_parser,
             **kwargs,
         )
 
@@ -466,6 +470,7 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] in [
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "InternS2PreviewForConditionalGeneration",
         ]:
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
@@ -608,6 +613,7 @@ class ModelConfig:
             )
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
+            or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1521,6 +1527,7 @@ multimodal_model_archs = [
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "InternS2PreviewForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",

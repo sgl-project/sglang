@@ -499,7 +499,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
-        if enable_num_token_non_padded(model_runner.server_args):
+        if enable_num_token_non_padded():
             ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
                 device, non_blocking=True
             )
@@ -587,7 +587,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.spec_info is not None
                 and getattr(ret.spec_info, "positions", None) is not None
             ):
-                ret._compute_spec_mrope_positions(model_runner, batch)
+                ret.compute_spec_mrope_positions(model_runner, batch)
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
@@ -696,7 +696,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_lens=req_lens,
         )
 
-    def _compute_spec_mrope_positions(
+    def compute_spec_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
         # TODO support batched deltas
@@ -989,22 +989,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
         if self.spec_info is not None and self.spec_info.is_draft_input():
-            # FIXME(lsyin): remove this isinstance logic
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
             self.hidden_states_backup = spec_info.hidden_states
-            if spec_info.topk_p is not None:
+            # spec_info is EagleDraftInput | EagleDraftExtendInput; each carries
+            # a disjoint subset of the fields below, so getattr-guard each one.
+            if getattr(spec_info, "topk_p", None) is not None:
                 spec_info.topk_p = self._pad_tensor_to_size(spec_info.topk_p, bs)
-            if spec_info.topk_index is not None:
+            if getattr(spec_info, "topk_index", None) is not None:
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
                 )
-            if spec_info.num_accepted_drafts is not None:
-                spec_info.num_accepted_drafts = self._pad_tensor_to_size(
-                    spec_info.num_accepted_drafts, bs
+            if getattr(spec_info, "num_correct_drafts", None) is not None:
+                spec_info.num_correct_drafts = self._pad_tensor_to_size(
+                    spec_info.num_correct_drafts, bs
                 )
-                spec_info.num_accepted_tokens = self._pad_tensor_to_size(
-                    spec_info.num_accepted_tokens, bs
+                spec_info.num_accept_tokens = self._pad_tensor_to_size(
+                    spec_info.num_accept_tokens, bs
                 )
             spec_info.hidden_states = self._pad_tensor_to_size(
                 spec_info.hidden_states, num_tokens
@@ -1048,12 +1049,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_draft_extend():  # draft extend
-                self.spec_info.num_accepted_drafts = self.spec_info.num_accepted_drafts[
+                self.spec_info.num_correct_drafts = self.spec_info.num_correct_drafts[
                     :bs
                 ]
-                self.spec_info.num_accepted_tokens = self.spec_info.num_accepted_tokens[
-                    :bs
-                ]
+                self.spec_info.num_accept_tokens = self.spec_info.num_accept_tokens[:bs]
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
@@ -1086,7 +1085,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return self.tbo_split_seq_index is not None
 
 
-def enable_num_token_non_padded(server_args):
+def enable_num_token_non_padded():
     return get_moe_expert_parallel_world_size() > 1
 
 
