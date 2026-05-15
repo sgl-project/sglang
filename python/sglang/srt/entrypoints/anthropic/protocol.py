@@ -25,8 +25,8 @@ class AnthropicUsage(BaseModel):
 
     input_tokens: int
     output_tokens: int
-    cache_creation_input_tokens: Optional[int] = None
-    cache_read_input_tokens: Optional[int] = None
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
 
 class AnthropicContentBlock(BaseModel):
@@ -104,6 +104,13 @@ class AnthropicCountTokensResponse(BaseModel):
     input_tokens: int
 
 
+class AnthropicThinking(BaseModel):
+    """Thinking configuration for extended thinking"""
+
+    type: Literal["enabled", "disabled"] = "enabled"
+    budget_tokens: Optional[int] = None
+
+
 class AnthropicMessagesRequest(BaseModel):
     """Anthropic Messages API request"""
 
@@ -119,6 +126,7 @@ class AnthropicMessagesRequest(BaseModel):
     tools: Optional[list[AnthropicTool]] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
+    thinking: Optional[AnthropicThinking] = None
 
     @field_validator("model")
     @classmethod
