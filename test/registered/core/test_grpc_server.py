@@ -47,7 +47,7 @@ try:
 except ImportError:
     _HAS_GRANIAN = False
 
-_HAS_SGLANG_GRPC = importlib.util.find_spec("sglang_grpc") is not None
+_HAS_NATIVE_GRPC = importlib.util.find_spec("sglang.srt.grpc._core") is not None
 
 register_cuda_ci(est_time=300, suite="stage-b-test-small-1-gpu")
 
@@ -323,7 +323,9 @@ def _build_text_generate_request(
 
 
 @unittest.skipUnless(_HAS_GRPCIO, "grpcio not installed")
-@unittest.skipUnless(_HAS_SGLANG_GRPC, "sglang_grpc package not installed")
+@unittest.skipUnless(
+    _HAS_NATIVE_GRPC, "Native gRPC extension (sglang.srt.grpc._core) not built"
+)
 class GrpcEnabledServerBase(CustomTestCase):
     grpc_channel = None
     other_args = ("--mem-fraction-static", "0.7", "--enable-grpc")
@@ -811,7 +813,9 @@ class TestGrpcDisabledServer(CustomTestCase):
             socket.create_connection((self.grpc_host, self.grpc_port), timeout=5)
 
 
-@unittest.skipUnless(_HAS_SGLANG_GRPC, "sglang_grpc package not installed")
+@unittest.skipUnless(
+    _HAS_NATIVE_GRPC, "Native gRPC extension (sglang.srt.grpc._core) not built"
+)
 class TestGrpcServerArgs(CustomTestCase):
     def test_multi_tokenizer_requires_disabling_native_grpc(self):
         from sglang.srt.server_args import prepare_server_args
