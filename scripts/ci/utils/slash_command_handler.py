@@ -9,10 +9,6 @@ from datetime import datetime, timezone
 import requests
 from github import Auth, Github
 
-# Import scripts/ci/runner_configs.py (sibling-up dir) for runner_config -> runs_on lookup.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import runner_configs as _runner_configs  # noqa: E402
-
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 
@@ -817,59 +813,15 @@ def _extract_suite(content, func_name):
     return None
 
 
-def _extract_runner_config(content):
-    """Pull `runner_config` from a new-style `register_cuda_ci(...)` call."""
-    args = re.search(r"^[^#\n]*register_cuda_ci\(([^)]*)\)", content, re.MULTILINE)
-    if not args:
-        return None
-    m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
-    return m.group(1) if m else None
-
-
 def detect_suite(file_path_from_test):
     """
     Read a test file and extract the suite from register_cuda_ci or register_cpu_ci.
-
-    For new-style `register_cuda_ci(runner_config="...")`, resolves runner_label
-    from scripts/ci/runner_configs.yml — works for any stage (stage-a/b/c,
-    extra-a/b, etc.) without a hard-coded suite table.
-
-    Legacy `register_cuda_ci(suite="...")` (nightly/weekly/manual tests) still
-    uses CUDA_SUITE_TO_RUNNER.
 
     Returns (suite_name, runner_label, use_deepep, is_cpu, error_message).
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
         content = f.read()
-
-    # New style: runner_config="..." -> look up runs_on from runner_configs.yml.
-    rc = _extract_runner_config(content)
-    if rc:
-        config = _runner_configs.load().get(rc)
-        if not config or "runs_on" not in config:
-            known = ", ".join(f"`{k}`" for k in sorted(_runner_configs.load()))
-            return (
-                rc,
-                None,
-                False,
-                False,
-                (
-                    f"Unknown runner_config `{rc}` in `{full_path}` "
-                    f"— not in scripts/ci/runner_configs.yml.\n\n"
-                    f"Known runner_configs: {known}"
-                ),
-            )
-        # Derive suite for telemetry/messages; not used for dispatch.
-        stage_m = re.search(
-            r'^[^#\n]*register_cuda_ci\([^)]*stage\s*=\s*["\']([^"\']+)["\']',
-            content,
-            re.MULTILINE,
-        )
-        suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
-        runner = config["runs_on"]
-        use_deepep = config.get("install") != "scripts/ci/cuda/ci_install_dependency.sh"
-        return suite, runner, use_deepep, False, None
 
     suite = _extract_suite(content, "register_cuda_ci")
     if suite:
