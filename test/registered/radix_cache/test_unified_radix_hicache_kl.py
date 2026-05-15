@@ -179,7 +179,7 @@ class GSM8KTwoPassMixin:
 
     gsm8k_threshold: float = 0.90
     num_gsm8k_questions: int = 200
-    max_accuracy_diff: float = 0.03
+    max_accuracy_diff: float = 0.02
     gsm8k_parallel: int = 40
 
     def _run_gsm8k(self):
