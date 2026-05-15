@@ -28,6 +28,8 @@ class ErnieImageArchConfig(DiTArchConfig):
         default_factory=lambda: {
             r"(.*)\.mlp\.gate_proj\.(.*)": (r"\1.mlp.gate_up_proj.\2", 0, 2),
             r"(.*)\.mlp\.up_proj\.(.*)": (r"\1.mlp.gate_up_proj.\2", 1, 2),
+            r"^(layers\.\d+)\.adaLN_sa_ln\.weight$": r"\1.adaLN_sa_ln.norm.weight",
+            r"^(layers\.\d+)\.adaLN_mlp_ln\.weight$": r"\1.adaLN_mlp_ln.norm.weight",
         }
     )
 

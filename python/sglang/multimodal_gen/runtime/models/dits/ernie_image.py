@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
+from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.multimodal_gen.configs.models.dits.ernie_image import (
     ErnieImageDitConfig,
 )
@@ -26,7 +27,13 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNormScaleShift,
+    RMSNorm,
+    RMSNormScaleShift,
+    ScaleResidualRMSNormScaleShift,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -217,7 +224,7 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.adaLN_sa_ln = RMSNorm(hidden_size, eps=eps)
+        self.adaLN_sa_ln = RMSNormScaleShift(hidden_size, eps=eps)
         self.self_attention = ErnieImageSelfAttention(
             hidden_size,
             num_heads,
@@ -226,7 +233,7 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
             qk_layernorm,
             prefix=f"{prefix}.self_attention",
         )
-        self.adaLN_mlp_ln = RMSNorm(hidden_size, eps=eps)
+        self.adaLN_mlp_ln = ScaleResidualRMSNormScaleShift(hidden_size, eps=eps)
         self.mlp = ErnieImageMLP(hidden_size, ffn_hidden_size, prefix=f"{prefix}.mlp")
 
     def forward(
@@ -240,13 +247,18 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         scale_mlp: torch.Tensor,
         gate_mlp: torch.Tensor,
     ) -> torch.Tensor:
-        residual = x
-        x = self.adaLN_sa_ln(x) * (1 + scale_msa) + shift_msa
-        x = residual + gate_msa * self.self_attention(x, rotary_pos_emb)
+        normed = self.adaLN_sa_ln(x, shift_msa, scale_msa)
+        attn_out = self.self_attention(normed, rotary_pos_emb)
 
-        residual = x
-        x = self.adaLN_mlp_ln(x) * (1 + scale_mlp) + shift_mlp
-        x = residual + gate_mlp * self.mlp(x)
+        normed_mlp, residual = self.adaLN_mlp_ln(
+            x, attn_out, gate_msa, shift_mlp, scale_mlp
+        )
+        x = fuse_scale_shift_kernel(
+            self.mlp(normed_mlp),
+            gate_mlp,
+            residual,
+            scale_constant=0.0,
+        )
 
         return x
 
@@ -353,8 +365,10 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         self.final_norm = nn.ModuleDict(
             {
-                "norm": nn.LayerNorm(
-                    self.inner_dim, elementwise_affine=False, eps=arch.eps
+                "norm": LayerNormScaleShift(
+                    self.inner_dim,
+                    elementwise_affine=False,
+                    eps=arch.eps,
                 ),
                 "linear": nn.Linear(self.inner_dim, self.inner_dim * 2),
             }
@@ -447,7 +461,7 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         mod_params = self.adaLN_modulation(c)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            t.unsqueeze(1) for t in mod_params.chunk(6, dim=-1)
+            t.unsqueeze(1).float() for t in mod_params.chunk(6, dim=-1)
         )
 
         for layer in self.layers:
@@ -463,7 +477,7 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             )
 
         scale, shift = self.final_norm["linear"](c).chunk(2, dim=-1)
-        x = self.final_norm["norm"](x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        x = self.final_norm["norm"](x, shift.unsqueeze(1), scale.unsqueeze(1))
 
         patches, _ = self.final_linear(x[:, :N_img, :])
 
