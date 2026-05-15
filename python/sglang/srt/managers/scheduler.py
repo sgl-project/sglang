@@ -2609,21 +2609,15 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
-        prefill_delayer_single_pass = None
-        if self.prefill_delayer:
-            # Get max usage across all pools for prefill delay decision
-            max_pool_usage = self.get_pool_stats().get_max_pool_usage()
-            prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
-                self.prefill_delayer, token_usage=max_pool_usage
-            )
+        if self.prefill_delayer is None:
+            return self._get_new_batch_prefill_raw(prefill_delayer_single_pass=None)
 
-        ret = self._get_new_batch_prefill_raw(
-            prefill_delayer_single_pass=prefill_delayer_single_pass
+        executor = PrefillDelayerSinglePassExecutor(
+            self.prefill_delayer,
+            token_usage=self.get_pool_stats().get_max_pool_usage(),
         )
-
-        if self.prefill_delayer:
-            prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
-
+        ret = self._get_new_batch_prefill_raw(prefill_delayer_single_pass=executor)
+        executor.finalize(actual_prefill=ret is not None)
         return ret
 
     def _get_new_batch_prefill_raw(
