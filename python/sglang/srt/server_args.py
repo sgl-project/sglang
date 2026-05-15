@@ -169,6 +169,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "hpc",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
@@ -2691,6 +2692,23 @@ class ServerArgs:
                 "FlashMLA only supports a page_size of 64, change page_size to 64."
             )
             self.page_size = 64
+
+        if (
+            self.attention_backend == "hpc"
+            or self.decode_attention_backend == "hpc"
+            or self.prefill_attention_backend == "hpc"
+        ):
+            if self.page_size != 64:
+                logger.info(
+                    f"HPC attention backend requires page_size=64, "
+                    f"changing page_size from {self.page_size} to 64."
+                )
+                self.page_size = 64
+            if (
+                self.attention_backend == "hpc"
+                or self.decode_attention_backend == "hpc"
+            ):
+                self.disable_cuda_graph = True
 
         if (
             self.attention_backend == "cutlass_mla"
