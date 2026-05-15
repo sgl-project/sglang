@@ -586,6 +586,14 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
 
+            # Remap weight names for finetuned checkpoints (e.g. transformers
+            # v4.52+) that use "model.language_model." or "model.visual."
+            # prefixes instead of the original "model." / "visual." layout.
+            if name.startswith("model.language_model."):
+                name = name.replace("model.language_model.", "model.", 1)
+            elif name.startswith("model.visual."):
+                name = name.replace("model.visual.", "visual.", 1)
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
