@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -36,6 +35,16 @@ if _use_aiter_gfx95:
 
     from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+
+
+def _resolve_attn_backend(forward_batch: ForwardBatch):
+    """Unwrap TboAttnBackend so ``hasattr``-based hook dispatch works
+    regardless of whether two-batch overlap is on."""
+    backend = forward_batch.attn_backend
+    if isinstance(backend, TboAttnBackend):
+        backend = backend.primary
+    return backend
+
 
 # Configs for DeepSeek-V3:
 # num_local_heads = 128
@@ -370,19 +379,23 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
 
+        # Backend hook: when present, the backend owns the BF16->FP8 K/V
+        # build for the prefix chunk. kv_b_proj always needs BF16 input, so
+        # request BF16 from the cache fetch when a pack hook is supplied —
+        # the legacy ``q.dtype`` happens to be BF16 in default code but
+        # breaks once q is FP8.
+        backend = _resolve_attn_backend(forward_batch)
+        pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
+        kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
+
         assert forward_batch.num_prefix_chunks is not None
-        fp8_attn = (
-            _is_cuda
-            and self.current_attention_backend == "fa3"
-            and self.kv_cache_dtype != "auto"
-        )
         for i in range(forward_batch.num_prefix_chunks):
             forward_batch.set_prefix_chunk_idx(i)
 
             kv_indices = forward_batch.prefix_chunk_kv_indices[i]
             # Fetch latent cache from memory pool with precomputed chunked kv indices
             kv_a_normed, k_pe = self._get_mla_kv_buffer(
-                kv_indices, q.dtype, forward_batch
+                kv_indices, kv_a_dtype, forward_batch
             )
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
@@ -391,16 +404,8 @@ class DeepseekMHAForwardMixin:
             v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
 
-            if fp8_attn:
-                # Fused cat(k_nope, broadcast k_pe) + FP8 quantize for K + FP8
-                # quantize for V in a single kernel — saves two separate
-                # elementwise quantize launches and the K-cat alloc.
-                k, v = mla_kv_pack_quantize_fp8(
-                    k_nope,
-                    k_pe,
-                    v,
-                    fp8_dtype=forward_batch.token_to_kv_pool.dtype,
-                )
+            if pack_fn is not None:
+                k, v = pack_fn(k_nope, k_pe, v)
             else:
                 k = torch.empty(
                     (
