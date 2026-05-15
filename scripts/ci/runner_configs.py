@@ -6,9 +6,9 @@ runner_configs.py <runner_config>
     _pr-test-stage.yml.
 
 runner_configs.py --map --b200-runner <label>
-    `runner_map={json}` — full dict keyed by runner_config, with
-    `$b200_runner` substituted in `runs_on` fields. Called by
-    _pr-test-check-changes.yml to fan out to all stages.
+    `runs_on_map={json}` — flat dict {runner_config: runs_on}, with
+    `$b200_runner` substituted. Called once by _pr-test-check-changes.yml;
+    used by stage / non-stage workflow `runs-on:` expressions.
 """
 
 import json
@@ -26,14 +26,14 @@ def load() -> dict:
         return yaml.safe_load(f)["runner_configs"]
 
 
-def build_map(b200_runner: str) -> dict:
-    """Return the full runner_configs dict with `$b200_runner` substituted."""
+def build_runs_on_map(b200_runner: str) -> dict:
+    """Return flat {runner_config: runs_on} with `$b200_runner` substituted."""
     out = {}
     for name, cfg in load().items():
-        resolved = dict(cfg)
-        if resolved.get("runs_on") == _B200_SENTINEL:
-            resolved["runs_on"] = b200_runner
-        out[name] = resolved
+        runs_on = cfg.get("runs_on")
+        if runs_on == _B200_SENTINEL:
+            runs_on = b200_runner
+        out[name] = runs_on
     return out
 
 
@@ -46,7 +46,8 @@ def _print_single(rc: str) -> None:
 
 
 def _print_map(b200_runner: str) -> None:
-    print(f"runner_map={json.dumps(build_map(b200_runner), separators=(',', ':'))}")
+    payload = build_runs_on_map(b200_runner)
+    print(f"runs_on_map={json.dumps(payload, separators=(',', ':'))}")
 
 
 if __name__ == "__main__":

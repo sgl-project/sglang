@@ -19,7 +19,7 @@ on:
         type: string
         required: true
       check_changes:
-        description: 'toJson(needs.check-changes.outputs). Read via fromJson(...).main_package / sgl_kernel / continue_on_error / runner_map etc.'
+        description: 'toJson(needs.check-changes.outputs). Read via fromJson(...).main_package / sgl_kernel / continue_on_error / runs_on_map etc.'
         type: string
         required: true
       caller_inputs:
@@ -82,12 +82,11 @@ jobs:
           (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true')
         )
       )
-    # runs-on / rdma_devices resolved from runner_map (check-changes already
-    # substituted $b200_runner; see runner_configs.py --map).
-    runs-on: ${{ fromJson(fromJson(inputs.check_changes).runner_map)[inputs.runner_config].runs_on }}
+    # runs-on resolved from runs_on_map; check-changes already substituted
+    # $b200_runner (see runner_configs.py --map). rdma_devices is exported
+    # below in a setup step via $GITHUB_ENV.
+    runs-on: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
     timeout-minutes: 240
-    env:
-      SGLANG_CI_RDMA_ALL_DEVICES: ${{ fromJson(fromJson(inputs.check_changes).runner_map)[inputs.runner_config].rdma_devices || '' }}
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJson(inputs.partitions)[inputs.self_name].max_parallel }}
@@ -101,6 +100,9 @@ jobs:
       - name: Resolve runner_config
         id: rc
         run: python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+
+      - name: Export rdma_devices to job env
+        run: echo "SGLANG_CI_RDMA_ALL_DEVICES=${{ steps.rc.outputs.rdma_devices || '' }}" >> "$GITHUB_ENV"
 
       - uses: ./.github/actions/check-stage-health
 

@@ -9,7 +9,10 @@ on:
       sgl_kernel:
         required: true
         type: string
-      runs_on:
+      runner_config:
+        required: true
+        type: string
+      runs_on_map:
         required: true
         type: string
       continue_on_error:
@@ -302,7 +305,7 @@ jobs:
         ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
         inputs.multimodal_gen == 'true'
       )
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
     timeout-minutes: 240
     steps:
       - name: Checkout code
