@@ -33,6 +33,28 @@ class TestPrepareServerArgs(CustomTestCase):
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
 
+    def test_lmcache_mp_defaults(self):
+        server_args = ServerArgs(model_path="dummy")
+        self.assertFalse(server_args.enable_lmcache)
+        self.assertIsNone(server_args.lmcache_mp_host)
+        self.assertEqual(server_args.lmcache_mp_port, 5555)
+
+    def test_prepare_server_args_lmcache_mp(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--enable-lmcache",
+                "--lmcache-mp-host",
+                "127.0.0.1",
+                "--lmcache-mp-port",
+                "6000",
+            ]
+        )
+        self.assertTrue(server_args.enable_lmcache)
+        self.assertEqual(server_args.lmcache_mp_host, "127.0.0.1")
+        self.assertEqual(server_args.lmcache_mp_port, 6000)
+
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):

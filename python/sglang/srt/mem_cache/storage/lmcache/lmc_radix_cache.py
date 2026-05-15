@@ -15,6 +15,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 try:
+    from lmcache.integration.sglang.multi_process_adapter import (
+        LMCacheMPLayerwiseConnector,
+    )
     from lmcache.integration.sglang.sglang_adapter import (
         LMCacheLayerwiseConnector,
         LoadMetadata,
@@ -81,27 +84,28 @@ class LMCRadixCache(RadixCache):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(params)
+        from sglang.srt.server_args import get_global_server_args
+
+        global_server_args = get_global_server_args()
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-        self.lmcache_connector = LMCacheLayerwiseConnector(
+        connector_kwargs = dict(
             sgl_config=model_config,
             tp_size=tp_size,
             rank=rank,
-            # NOTE: The original implementation accessed private buffers via
-            # `_kvcache.k_buffer` / `.v_buffer`. We prefer public accessors when
-            # available; fall back to private fields if needed.
-            k_pool=getattr(
-                kvcache,
-                "k_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, "k_buffer"),
-            ),
-            v_pool=getattr(
-                kvcache,
-                "v_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, "v_buffer"),
-            ),
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            kvcache=kvcache,
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
+        if global_server_args.lmcache_mp_host is None:
+            self.lmcache_connector = LMCacheLayerwiseConnector(**connector_kwargs)
+        else:
+            self.lmcache_connector = LMCacheMPLayerwiseConnector(
+                page_size=params.page_size,
+                host=global_server_args.lmcache_mp_host,
+                port=global_server_args.lmcache_mp_port,
+                **connector_kwargs,
+            )
 
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
@@ -119,6 +123,10 @@ class LMCRadixCache(RadixCache):
         self._node_lock = threading.Lock()
 
     def reset(self):  # type: ignore[override]
+        if hasattr(self, "lmcache_connector") and isinstance(
+            self.lmcache_connector, LMCacheMPLayerwiseConnector
+        ):
+            self.lmcache_connector.reset()
         super().reset()
         if hasattr(self, "_in_flight_nodes"):
             with self._node_lock:

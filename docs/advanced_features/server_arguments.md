@@ -370,6 +370,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--enable-lmcache` | Using LMCache as an alternative hierarchical cache solution | `False` | bool flag (set to enable) |
+| `--lmcache-mp-host` | Hostname or IP of the LMCache multi-process daemon. If set together with `--enable-lmcache`, SGLang uses the LMCache MP connector instead of the in-process connector. | `None` | Type: str |
+| `--lmcache-mp-port` | Port of the LMCache multi-process daemon. Used together with `--lmcache-mp-host`. | `5555` | Type: int |
 
 ## Ktransformers
 | Argument | Description | Defaults | Options |
