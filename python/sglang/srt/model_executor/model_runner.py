@@ -1628,8 +1628,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
                 balancer_cls = DeepEPWaterfillBalancer
+            # Static EPLB remaps TopK ids to physical expert ids before Waterfill.
+            # Redundant experts therefore need to be included in the per-rank
+            # expert count used for Waterfill's shared-expert slot remapping.
+            num_physical_routed_experts = (
+                num_routed_experts + self.server_args.ep_num_redundant_experts
+            )
             module.deepep_waterfill_balancer = balancer_cls(
-                num_routed_experts=num_routed_experts,
+                num_routed_experts=num_physical_routed_experts,
                 world_size=self.moe_ep_size,
                 rank=self.moe_ep_rank,
                 layer_id=module.layer_id,
