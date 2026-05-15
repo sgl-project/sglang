@@ -1,25 +1,20 @@
-// DeepSeek-V4 deployment generator.
+// DeepSeek-V4 Playground.
 //
-// MINTLIFY CONSTRAINT (confirmed by experiment): Mintlify's `.jsx` snippet
-// loader strips ALL module-level statements — only the exported component
-// function survives — AND it replaces every capitalized JSX tag with a
-// `_provideComponents()` context lookup, ignoring `import` statements for
-// custom components. So we can't share a `<DeploymentGenerator/>` across
-// snippets; the entire generator engine has to live inside the wrapper
-// function. This file is the proof-of-concept of "config-driven, no bespoke
-// rendering logic per cookbook" — the generator code below is identical for
-// every model and is meant to be copy-pasted (or codegen'd) into each
-// cookbook's snippet. The only model-specific section is the
-// `config = { ... cells: [ ... ] }` literal further down.
-export const DeepSeekV4Deployment = () => {
+// Inherits the verified base from §3 (read from URL hash) and lets users layer
+// 3 feature axes on top: Attention+MoE Parallelism, Parsers, Speculative
+// Decoding. Live command regeneration with inline diff styling against the
+// verified base. Same Copy / cURL / Env action buttons as §3.
+//
+// === MINTLIFY CONSTRAINT ===
+// Mintlify's snippet loader strips module-level state and refuses to share
+// data across `.jsx` files. So the cell catalog + config object below is
+// DUPLICATED from deepseek-v4-deployment.jsx — when you edit cells in one
+// file, update the other. Both blocks are marked with "KEEP IN SYNC" sentinels.
+export const DeepSeekV4Playground = () => {
   // ==========================================================================
-  // === KEEP IN SYNC WITH deepseek-v4-playground.jsx (begin) ===
-  // The cell catalog and per-cookbook config below are duplicated verbatim in
-  // the §3.3 Playground snippet. When changing one, update the other. Mintlify
-  // can't share data across `.jsx` snippets so duplication is unavoidable.
-  // ==========================================================================
-  // 1. Hardware catalog (shared across cookbooks — keep identical when copying)
-  // VRAM is reported as per-GPU on-chip memory (HBM3/3e/E), not per-module.
+  // === KEEP IN SYNC WITH deepseek-v4-deployment.jsx (begin) ===
+  // The cell catalog and per-cookbook config below are duplicated verbatim
+  // from the §3 deployment snippet. When changing one, update the other.
   // ==========================================================================
   const HARDWARE_CATALOG = {
     nvidia: [
@@ -317,8 +312,6 @@ export const DeepSeekV4Deployment = () => {
   };
 
   // ==========================================================================
-  // 3. Final config object
-  // ==========================================================================
   const config = {
     modelName: "DeepSeek-V4",
     // `supportedHardware` is the catalog-visibility list, NOT the
@@ -378,57 +371,291 @@ export const DeepSeekV4Deployment = () => {
     cells: allCells,
     multiNodeHints: MULTI_NODE_HINTS,
   };
-  // === KEEP IN SYNC WITH deepseek-v4-playground.jsx (end) ===
+
+  // === KEEP IN SYNC WITH deepseek-v4-deployment.jsx (end) ===
 
   // ==========================================================================
-  // 4. Style helper (dark-mode-aware)
+  // Playground-specific feature axis definitions
+  // ==========================================================================
+
+  // Speculative-decoding presets. `current` keeps the base cell's flags as-is.
+  // `off` strips them. Named presets re-emit a known-good combo.
+  const SPEC_PRESETS = [
+    { id: "current",   label: "Inherited from base" },
+    { id: "off",       label: "Off (greedy)" },
+    { id: "mtp-314",   label: "EAGLE / MTP 3-1-4",
+      flags: ["--speculative-algo EAGLE", "--speculative-num-steps 3",
+              "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
+    { id: "mtp-112",   label: "EAGLE / MTP 1-1-2",
+      flags: ["--speculative-algo EAGLE", "--speculative-num-steps 1",
+              "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"] },
+    // Placeholders for future algorithms — listed but disabled until implemented.
+    { id: "draftflash", label: "DraftFlash",  disabled: true,
+      disabledReason: "Coming soon — pending DraftFlash kernel integration." },
+    { id: "nextn",      label: "NextN",       disabled: true,
+      disabledReason: "Coming soon — pending NextN algorithm support." },
+  ];
+
+  // Parallelism chip options. `null` = "inherited from base" (no override).
+  const TP_OPTS = [null, 1, 2, 4, 8, 16];
+  const DP_OPTS = [null, 1, 2, 4, 8, 16];
+  const CP_OPTS = [null, 1, 2, 4];
+
+  // MoE backends. `null` = inherited.
+  const MOE_OPTS = [
+    { id: null,                label: "Inherited" },
+    { id: "deepep",            label: "DeepEP",            kind: "a2a" },
+    { id: "megamoe",           label: "MegaMoE",           kind: "a2a" },
+    { id: "flashinfer_mxfp4",  label: "FlashInfer (MXFP4)", kind: "runner" },
+    { id: "marlin",            label: "Marlin (W4A16)",    kind: "runner" },
+  ];
+  const EP_OPTS = [null, 1, 2, 4, 8, 16];
+
+  // ==========================================================================
+  // Pure helpers (shape-identical to §3 where they overlap)
+  // ==========================================================================
+  const DIMENSIONS = ["hw", "variant", "quant", "strategy", "nodes"];
+  const findCell = (cells, sel) =>
+    cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
+
+  const resolveModelName = (sel) => {
+    const triple = `${sel.hw}|${sel.variant}|${sel.quant}`;
+    const pair = `${sel.variant}|${sel.quant}`;
+    return config.modelNames[triple] ?? config.modelNames[pair] ?? "";
+  };
+
+  const interpolate = (text, env, modelName) =>
+    text.replace(/{{(\w+)}}/g, (_, key) =>
+      key === "MODEL_NAME" ? modelName : (env[key] ?? `{{${key}}}`));
+
+  const parseNnodes = (id) => {
+    if (id === "single") return 1;
+    const m = /^multi-(\d+)$/.exec(id);
+    return m ? parseInt(m[1], 10) : 1;
+  };
+
+  // Strip any flag whose first whitespace-delimited token equals one of
+  // `prefixes`. Used to remove the base's values for an axis before re-emitting
+  // the playground's choice. We must match exactly the first token because
+  // values may contain hyphens / equals (e.g. `--moe-runner-backend marlin`).
+  const stripFlagsByFirstToken = (flags, prefixes) => {
+    const set = new Set(prefixes);
+    return flags.filter((f) => {
+      const head = f.split(/[\s=]/)[0];
+      return !set.has(head);
+    });
+  };
+
+  // Insert a list of new flags just before the trailing --host/--port pair so
+  // the diff stays visually grouped with the existing structure.
+  const insertBeforeTail = (flags, additions) => {
+    const idx = flags.findIndex((f) => f.startsWith("--host"));
+    const at = idx === -1 ? flags.length : idx;
+    const out = flags.slice();
+    out.splice(at, 0, ...additions);
+    return out;
+  };
+
+  // Apply playground deltas on top of the base cell's flags.
+  const applyDeltas = (baseFlags, d) => {
+    let flags = [...baseFlags];
+
+    // --- Attention parallelism overrides ---
+    const attnTouched =
+      d.attn.tp !== null || d.attn.dp !== null || d.attn.cp !== null ||
+      d.attn.dpAttn !== null;
+    if (attnTouched) {
+      flags = stripFlagsByFirstToken(flags, [
+        "--tp", "--dp", "--enable-dp-attention",
+        "--enable-nsa-prefill-context-parallel", "--nsa-prefill-cp-mode",
+      ]);
+      const add = [];
+      if (d.attn.tp !== null) add.push(`--tp ${d.attn.tp}`);
+      if (d.attn.dp !== null && d.attn.dp > 1) add.push(`--dp ${d.attn.dp}`);
+      if (d.attn.dpAttn === true) add.push("--enable-dp-attention");
+      if (d.attn.cp !== null && d.attn.cp > 1) {
+        add.push("--enable-nsa-prefill-context-parallel");
+        add.push("--nsa-prefill-cp-mode round-robin-split");
+      }
+      // Insert right after --model-path to mirror §3 ordering.
+      const at = flags.findIndex((f) => f.startsWith("--model-path")) + 1;
+      flags.splice(at, 0, ...add);
+    }
+
+    // --- MoE parallelism overrides ---
+    const moeBackend = MOE_OPTS.find((o) => o.id === d.moe.backend);
+    if (d.moe.backend !== null || d.moe.ep !== null) {
+      flags = stripFlagsByFirstToken(flags, [
+        "--moe-a2a-backend", "--moe-runner-backend", "--ep",
+      ]);
+      const add = [];
+      if (moeBackend && moeBackend.kind === "a2a") {
+        add.push(`--moe-a2a-backend ${moeBackend.id}`);
+      } else if (moeBackend && moeBackend.kind === "runner") {
+        add.push(`--moe-runner-backend ${moeBackend.id}`);
+      }
+      if (d.moe.ep !== null && d.moe.ep > 1) add.push(`--ep ${d.moe.ep}`);
+      // Insert right after parallelism block (after --tp if present, else
+      // after --model-path).
+      let at = flags.findIndex((f) => f.startsWith("--enable-dp-attention"));
+      if (at === -1) at = flags.findIndex((f) => f.startsWith("--tp"));
+      if (at === -1) at = flags.findIndex((f) => f.startsWith("--model-path"));
+      flags.splice(at + 1, 0, ...add);
+    }
+
+    // --- Speculative decoding ---
+    if (d.spec !== "current") {
+      flags = stripFlagsByFirstToken(flags, [
+        "--speculative-algo", "--speculative-num-steps",
+        "--speculative-eagle-topk", "--speculative-num-draft-tokens",
+      ]);
+      const preset = SPEC_PRESETS.find((p) => p.id === d.spec);
+      if (preset && preset.flags && preset.flags.length) {
+        flags = insertBeforeTail(flags, preset.flags);
+      }
+    }
+
+    // --- Parsers (toggle) ---
+    flags = stripFlagsByFirstToken(flags, ["--reasoning-parser", "--tool-call-parser"]);
+    const parserAdds = [];
+    if (d.parsers.reasoning) parserAdds.push("--reasoning-parser deepseek-v4");
+    if (d.parsers.toolCall)  parserAdds.push("--tool-call-parser deepseekv4");
+    if (parserAdds.length) flags = insertBeforeTail(flags, parserAdds);
+
+    return flags;
+  };
+
+  // Renderer (same shape as §3 — multi-node prepending, env block, hints).
+  const renderCommandLines = (cell, flags, sel, envValues) => {
+    const modelName = resolveModelName(sel);
+    const nnodes = parseNnodes(sel.nodes);
+    const multinode = nnodes > 1;
+    let f = [...flags];
+    if (multinode && !f.some((x) => x.startsWith("--nnodes"))) {
+      const at = f.findIndex((x) => x.startsWith("--model-path")) + 1;
+      f.splice(at, 0,
+        `--nnodes ${nnodes}`,
+        `--node-rank {{NODE_RANK}}`,
+        `--dist-init-addr {{NODE0_IP}}:20000`);
+    }
+    const flagBlock = f.map((x) => "  " + x).join(" \\\n");
+    const envBlock = cell.env.length ? cell.env.join(" \\\n") + " \\\n" : "";
+    let cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
+    if (multinode && config.multiNodeHints && config.multiNodeHints[sel.hw]) {
+      const hint = config.multiNodeHints[sel.hw]
+        .map((line) => (line.length ? "# " + line : "#")).join("\n");
+      cmd = `${hint}\n${cmd}`;
+    }
+    cmd = interpolate(cmd, envValues, modelName);
+    if (multinode) {
+      const header =
+        `# Multi-node (${nnodes} nodes). Run the same command on every node with:\n` +
+        `#   <node-rank> = 0 on the head node, 1..${nnodes - 1} on the others\n` +
+        `#   <node0-ip>  = IP of the head node (reachable from all others)`;
+      cmd = `${header}\n${cmd}`;
+    }
+    return cmd;
+  };
+
+  // Line-level diff. Returns array of {line, kind: 'unchanged'|'added'|'removed'}.
+  // Greedy LCS-like: walk both sides, emit `unchanged` when they agree,
+  // `added` for playground-only, `removed` for base-only. This isn't optimal
+  // but produces readable output when the two share most lines (the common case).
+  const computeDiff = (baseStr, pgStr) => {
+    const a = baseStr.split("\n");
+    const b = pgStr.split("\n");
+    const aSet = new Set(a);
+    const bSet = new Set(b);
+    let i = 0, j = 0;
+    const out = [];
+    while (i < a.length || j < b.length) {
+      if (i < a.length && j < b.length && a[i] === b[j]) {
+        out.push({ line: b[j], kind: "unchanged" });
+        i++; j++;
+      } else if (j < b.length && !aSet.has(b[j])) {
+        out.push({ line: b[j], kind: "added" });
+        j++;
+      } else if (i < a.length && !bSet.has(a[i])) {
+        out.push({ line: a[i], kind: "removed" });
+        i++;
+      } else if (i < a.length) {
+        // Same line appears in both but at different positions — advance base
+        // without emitting (the same line will be matched later as unchanged).
+        i++;
+      } else {
+        j++;
+      }
+    }
+    return out;
+  };
+
+  const placeholderDefaults = (schema) => {
+    const out = {};
+    for (const [k, v] of Object.entries(schema || {})) out[k] = v.default ?? "";
+    return out;
+  };
+
+  // ==========================================================================
+  // Style helper (mostly shared with §3 — adds diff-line colors)
   // ==========================================================================
   const makeStyles = (isDark) => ({
-    container: { maxWidth: "900px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "4px" },
+    container: { maxWidth: "900px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "8px" },
     card: {
       padding: "8px 12px",
       border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
-      borderLeft: `3px solid ${isDark ? "#E85D4D" : "#D45D44"}`,
+      borderLeft: `3px solid ${isDark ? "#A78BFA" : "#8B5CF6"}`,
       borderRadius: "4px",
-      display: "flex", alignItems: "center", gap: "12px",
       background: isDark ? "#1f2937" : "#fff",
     },
-    cardColumn: {
+    cardRow: {
       padding: "8px 12px",
       border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
-      borderLeft: `3px solid ${isDark ? "#E85D4D" : "#D45D44"}`,
+      borderLeft: `3px solid ${isDark ? "#A78BFA" : "#8B5CF6"}`,
       borderRadius: "4px",
-      display: "flex", flexDirection: "column", gap: "6px",
       background: isDark ? "#1f2937" : "#fff",
+      display: "flex", alignItems: "center", gap: "12px",
     },
-    title: { fontSize: "13px", fontWeight: "600", minWidth: "140px", flexShrink: 0, color: isDark ? "#e5e7eb" : "inherit" },
-    vendorRow: { display: "flex", alignItems: "center", gap: "8px" },
-    vendorLabel: {
-      fontSize: "11px", fontWeight: "600",
+    baseStrip: {
+      padding: "8px 12px",
+      borderRadius: "4px",
+      background: isDark ? "#064e3b" : "#d1fae5",
+      color: isDark ? "#a7f3d0" : "#065f46",
+      fontSize: "12px",
+      display: "flex", alignItems: "center", gap: "10px",
+    },
+    title: { fontSize: "13px", fontWeight: "600", color: isDark ? "#e5e7eb" : "inherit", marginBottom: "8px" },
+    titleInline: { fontSize: "13px", fontWeight: "600", minWidth: "180px", flexShrink: 0, color: isDark ? "#e5e7eb" : "inherit" },
+    rowFlex: { display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center", flex: 1 },
+    // Stack multiple parameter sub-rows inside one card vertically.
+    cardStack: { display: "flex", flexDirection: "column", gap: "6px" },
+    // Each parameter sub-row: fixed-width label on the left, chips on the right.
+    subRow: { display: "flex", alignItems: "center", gap: "10px" },
+    subLabel: {
+      fontSize: "11px",
+      fontWeight: 600,
       color: isDark ? "#9ca3af" : "#6b7280",
-      minWidth: "48px", textTransform: "uppercase", letterSpacing: "0.04em",
+      minWidth: "96px",
+      flexShrink: 0,
+      letterSpacing: "0.02em",
     },
-    itemsGrid: (cols) => ({
-      display: "grid", gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
-      gap: "6px", flex: 1,
-    }),
-    labelBase: {
+    chipRow: { display: "flex", flexWrap: "wrap", gap: "6px", flex: 1 },
+    chip: {
       padding: "4px 10px",
       border: `1px solid ${isDark ? "#9ca3af" : "#d1d5db"}`,
-      borderRadius: "3px", cursor: "pointer",
-      display: "inline-flex", flexDirection: "column",
-      alignItems: "center", justifyContent: "center",
-      fontWeight: "500", fontSize: "13px",
-      transition: "all 0.2s", userSelect: "none",
-      minHeight: "32px", textAlign: "center",
+      borderRadius: "3px",
+      cursor: "pointer",
+      fontSize: "12px",
+      userSelect: "none",
       background: isDark ? "#374151" : "#fff",
       color: isDark ? "#e5e7eb" : "inherit",
+      minWidth: "44px",
+      textAlign: "center",
     },
-    checked: { background: "#D45D44", color: "white", borderColor: "#D45D44" },
-    disabled: { cursor: "not-allowed", opacity: 0.4 },
-    subtitle: { display: "block", fontSize: "9px", marginTop: "1px", lineHeight: "1.1", opacity: 0.7 },
+    chipChecked: { background: "#8B5CF6", color: "white", borderColor: "#8B5CF6" },
+    chipDisabled: { cursor: "not-allowed", opacity: 0.4 },
+    axisLabel: { fontSize: "11px", color: isDark ? "#9ca3af" : "#6b7280", marginRight: "6px" },
     commandWrap: {
-      position: "relative", flex: 1,
+      position: "relative",
       background: isDark ? "#111827" : "#f5f5f5",
       borderRadius: "6px",
       border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
@@ -447,19 +674,33 @@ export const DeepSeekV4Deployment = () => {
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
     },
-    badge: (verified) => ({
+    diffLineUnchanged: { display: "block" },
+    diffLineAdded: {
+      display: "block",
+      background: isDark ? "rgba(16,185,129,0.15)" : "rgba(16,185,129,0.18)",
+      color: isDark ? "#a7f3d0" : "#065f46",
+      borderLeft: `3px solid #10b981`,
+      paddingLeft: "8px", marginLeft: "-8px",
+    },
+    diffLineRemoved: {
+      display: "block",
+      background: isDark ? "rgba(239,68,68,0.10)" : "rgba(239,68,68,0.10)",
+      color: isDark ? "#fca5a5" : "#991b1b",
+      textDecoration: "line-through",
+      opacity: 0.7,
+      borderLeft: `3px solid #ef4444`,
+      paddingLeft: "8px", marginLeft: "-8px",
+    },
+    badge: {
       display: "inline-flex", alignItems: "center", gap: "6px",
       padding: "2px 8px", borderRadius: "10px",
-      background: verified ? (isDark ? "#064e3b" : "#d1fae5")
-                           : (isDark ? "#78350f" : "#fef3c7"),
-      color:      verified ? (isDark ? "#a7f3d0" : "#065f46")
-                           : (isDark ? "#fde68a" : "#92400e"),
+      background: isDark ? "#78350f" : "#fef3c7",
+      color: isDark ? "#fde68a" : "#92400e",
       fontSize: "11px", fontWeight: 600,
-    }),
-    badgeDot: (verified) => ({
-      width: "8px", height: "8px", borderRadius: "50%",
-      background: verified ? "#10b981" : "#f59e0b",
-    }),
+    },
+    badgeDot: {
+      width: "8px", height: "8px", borderRadius: "50%", background: "#f59e0b",
+    },
     iconButton: {
       padding: "4px 10px",
       border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
@@ -507,171 +748,24 @@ export const DeepSeekV4Deployment = () => {
       margin: "12px 0 6px 0",
     },
     primaryBtn: {
-      padding: "6px 14px", background: "#D45D44", color: "white",
+      padding: "6px 14px", background: "#8B5CF6", color: "white",
       border: "none", borderRadius: "4px", cursor: "pointer",
       fontSize: "13px", fontWeight: 500,
+    },
+    resetBtn: {
+      marginLeft: "auto",
+      padding: "2px 8px",
+      fontSize: "11px",
+      border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
+      borderRadius: "3px",
+      background: "transparent",
+      color: isDark ? "#9ca3af" : "#6b7280",
+      cursor: "pointer",
     },
   });
 
   // ==========================================================================
-  // 5. Pure helpers (no React state)
-  // ==========================================================================
-  // DIMENSIONS is ordered by priority — higher-index dims adapt to lower-index
-  // picks, never the other way around. Order is Hardware → Variant →
-  // Quantization → Strategy → Nodes, matching the on-screen sections from top
-  // to bottom and the user's mental model ("first I pick my GPU, then the
-  // model size, then quant, then how I want to serve, then how many nodes").
-  const DIMENSIONS = ["hw", "variant", "quant", "strategy", "nodes"];
-  const findCell = (cells, sel) =>
-    cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
-
-  // Grey-out predicate: a (dim, value) button is enabled iff there exists at
-  // least one cell that matches every HIGHER-priority dimension in the current
-  // selection AND has `dim === value`. Lower-priority dims are free to differ
-  // — they'll be adapted by snapToValidCell on click.
-  //
-  // Example: with sel = { hw:b200, variant:flash, quant:fp4, strategy:low-latency, nodes:single },
-  // the "Multi-Nodes" button on the Nodes section asks: is there a cell with
-  // hw=b200 AND variant=flash AND quant=fp4 AND strategy=low-latency AND nodes=multi-2?
-  // There isn't (B200 has no multi-node cells) → button is greyed out.
-  // It will NOT silently switch hardware to find a multi-node cell.
-  const isOptionAvailable = (cells, sel, dim, value) => {
-    const idx = DIMENSIONS.indexOf(dim);
-    const higher = DIMENSIONS.slice(0, idx);
-    return cells.some(
-      (c) => c.match[dim] === value && higher.every((d) => c.match[d] === sel[d]),
-    );
-  };
-
-  // When the user clicks an ENABLED button at `dim`, snap to a real cell:
-  //   - higher-priority dims (above `dim`) stay locked to `sel[d]`
-  //   - the clicked `dim` becomes `value`
-  //   - lower-priority dims (below `dim`) adopt the best-fit cell's values,
-  //     preferring the cell that keeps the most of the user's current lower-
-  //     priority choices (minimises perceived churn).
-  // If the button was correctly greyed out by isOptionAvailable, this function
-  // is never called for a value with no matching cell.
-  const snapToValidCell = (cells, sel, dim, value) => {
-    const idx = DIMENSIONS.indexOf(dim);
-    const higher = DIMENSIONS.slice(0, idx);
-    const lower = DIMENSIONS.slice(idx + 1);
-    let best = null, bestLowerMatches = -1;
-    for (const c of cells) {
-      if (c.match[dim] !== value) continue;
-      if (!higher.every((d) => c.match[d] === sel[d])) continue;
-      let s = 0;
-      for (const d of lower) if (c.match[d] === sel[d]) s++;
-      if (s > bestLowerMatches) { bestLowerMatches = s; best = c; }
-    }
-    if (!best) return sel; // defensive — shouldn't be reachable
-    const next = { ...sel, [dim]: value };
-    for (const d of lower) next[d] = best.match[d];
-    return next;
-  };
-
-  // Validate a selection from URL hash: walk dimensions in priority order,
-  // accept each parsed value if a matching cell exists with all already-
-  // accepted dims; otherwise adopt the value from the first cell consistent
-  // with the dims accepted so far. This guarantees the result is a real cell
-  // even if the URL hash names an impossible combination (e.g. a stale link
-  // after the catalog changed).
-  const validateSelection = (cells, parsed) => {
-    const valid = {};
-    for (const dim of DIMENSIONS) {
-      const want = parsed[dim];
-      const works = cells.some(
-        (c) =>
-          c.match[dim] === want &&
-          DIMENSIONS.slice(0, DIMENSIONS.indexOf(dim)).every((d) => c.match[d] === valid[d]),
-      );
-      if (works) {
-        valid[dim] = want;
-      } else {
-        const fallback = cells.find((c) =>
-          DIMENSIONS.slice(0, DIMENSIONS.indexOf(dim)).every((d) => c.match[d] === valid[d]),
-        );
-        valid[dim] = fallback ? fallback.match[dim] : want;
-      }
-    }
-    return valid;
-  };
-
-  const resolveModelName = (sel) => {
-    const triple = `${sel.hw}|${sel.variant}|${sel.quant}`;
-    const pair = `${sel.variant}|${sel.quant}`;
-    return config.modelNames[triple] ?? config.modelNames[pair] ?? "";
-  };
-
-  const interpolate = (text, env, modelName) =>
-    text.replace(/{{(\w+)}}/g, (_, key) =>
-      key === "MODEL_NAME" ? modelName : (env[key] ?? `{{${key}}}`));
-
-  const parseNnodes = (id) => {
-    if (id === "single") return 1;
-    const m = /^multi-(\d+)$/.exec(id);
-    return m ? parseInt(m[1], 10) : 1;
-  };
-
-  const renderCommand = (cell, sel, envValues) => {
-    if (!cell) return "# No command available for the current selection.";
-    const modelName = resolveModelName(sel);
-    const nnodes = parseNnodes(sel.nodes);
-    const multinode = nnodes > 1;
-    const flags = [...cell.flags];
-    if (multinode) {
-      const i = flags.findIndex((f) => f.startsWith("--model-path"));
-      flags.splice(i + 1, 0,
-        `--nnodes ${nnodes}`,
-        `--node-rank {{NODE_RANK}}`,
-        `--dist-init-addr {{NODE0_IP}}:20000`);
-    }
-    const flagBlock = flags.map((f) => "  " + f).join(" \\\n");
-    const envBlock = cell.env.length ? cell.env.join(" \\\n") + " \\\n" : "";
-    let cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
-    if (multinode && config.multiNodeHints && config.multiNodeHints[sel.hw]) {
-      const hint = config.multiNodeHints[sel.hw]
-        .map((line) => (line.length ? "# " + line : "#")).join("\n");
-      cmd = `${hint}\n${cmd}`;
-    }
-    cmd = interpolate(cmd, envValues, modelName);
-    if (multinode) {
-      const header =
-        `# Multi-node (${nnodes} nodes). Run the same command on every node with:\n` +
-        `#   <node-rank> = 0 on the head node, 1..${nnodes - 1} on the others\n` +
-        `#   <node0-ip>  = IP of the head node (reachable from all others)`;
-      cmd = `${header}\n${cmd}`;
-    }
-    return cmd;
-  };
-
-  const buildHardwareGroups = () => {
-    const supported = new Set(config.supportedHardware);
-    const groups = [];
-    for (const [vendor, list] of Object.entries(HARDWARE_CATALOG)) {
-      const items = list.filter((hw) => supported.has(hw.id))
-        .map((hw) => ({ id: hw.id, label: hw.label, subtitle: hw.vram }));
-      if (items.length) groups.push({ label: vendor.toUpperCase(), items });
-    }
-    return groups;
-  };
-
-  const initialSelectionFromCells = () => {
-    const first = config.cells[0];
-    if (!first) return Object.fromEntries(DIMENSIONS.map((d) => [d, ""]));
-    return {
-      hw: first.match.hw, variant: first.match.variant, quant: first.match.quant,
-      strategy: first.match.strategy, nodes: first.match.nodes,
-    };
-  };
-
-  const placeholderDefaults = (schema) => {
-    const out = {};
-    for (const [k, v] of Object.entries(schema || {})) out[k] = v.default ?? "";
-    return out;
-  };
-
-  // ==========================================================================
-  // 6. State + effects
+  // State + effects
   // ==========================================================================
   const [isDark, setIsDark] = useState(false);
   useEffect(() => {
@@ -692,6 +786,8 @@ export const DeepSeekV4Deployment = () => {
     return () => observer.disconnect();
   }, []);
 
+  // Shared env store with §3 (same localStorage key) so HOST/PORT/etc. are
+  // unified across the page.
   const STORAGE_KEY = "sglang-deploy-env";
   const [env, setEnv] = useState(() => placeholderDefaults(config.placeholders));
   useEffect(() => {
@@ -708,43 +804,55 @@ export const DeepSeekV4Deployment = () => {
     try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
   };
 
-  const [sel, setSel] = useState(() => initialSelectionFromCells());
+  // Base selection: live-link to §3. Two channels because of how browsers work:
+  //   1. The `sglang-deploy-sel` custom event — §3 dispatches this every time
+  //      its selection changes. This is the primary channel for in-page sync.
+  //      We need it because §3 mirrors state via `history.replaceState`, which
+  //      by spec does NOT fire `hashchange`.
+  //   2. The standard `hashchange` event — covers the case where someone
+  //      hand-edits the URL bar or follows a deep link in another tab.
+  // We also snapshot from the URL on mount so deep-linking still works.
+  const initialBaseFromHash = () => {
+    const fallback = config.cells[0].match;
+    if (typeof window === "undefined") return { ...fallback };
+    const raw = window.location.hash.replace(/^#/, "");
+    if (!raw) return { ...fallback };
+    const params = new URLSearchParams(raw);
+    const out = { ...fallback };
+    params.forEach((value, key) => { if (key in out) out[key] = value; });
+    return out;
+  };
+  const [base, setBase] = useState(() => initialBaseFromHash());
   useEffect(() => {
-    const hydrate = () => {
-      const raw = window.location.hash.replace(/^#/, "");
-      if (!raw) return;
-      const params = new URLSearchParams(raw);
-      const initial = initialSelectionFromCells();
-      const parsed = { ...initial };
-      let touched = false;
-      params.forEach((value, key) => {
-        if (key in parsed) { parsed[key] = value; touched = true; }
-      });
-      if (!touched) return;
-      // Snap to a real cell if the URL named an impossible combination
-      // (stale share link, manual edit, catalog changes). The hash mirror
-      // useEffect below rewrites the URL to match the validated state.
-      setSel(validateSelection(config.cells, parsed));
+    const onHash = () => setBase(initialBaseFromHash());
+    const onSelEvent = (e) => {
+      // Trust the event payload over re-parsing the hash so we pick up changes
+      // even before the browser has reflected the replaceState write.
+      const fallback = config.cells[0].match;
+      const incoming = (e && e.detail) || {};
+      const next = { ...fallback };
+      for (const k of Object.keys(next)) {
+        if (incoming[k] !== undefined) next[k] = incoming[k];
+      }
+      setBase(next);
     };
-    hydrate();
-    window.addEventListener("hashchange", hydrate);
-    return () => window.removeEventListener("hashchange", hydrate);
+    window.addEventListener("hashchange", onHash);
+    window.addEventListener("sglang-deploy-sel", onSelEvent);
+    return () => {
+      window.removeEventListener("hashchange", onHash);
+      window.removeEventListener("sglang-deploy-sel", onSelEvent);
+    };
   }, []);
-  // Mirror sel → hash AND notify in-page listeners (like the §3.3 Playground).
-  // `history.replaceState` does NOT fire a `hashchange` event by spec — that
-  // event only fires when the user navigates to a new fragment (anchor click,
-  // address-bar edit, back/forward). So we dispatch a custom event ourselves
-  // and let the Playground subscribe to it; Playground also still listens to
-  // `hashchange` for the manual-URL case.
-  useEffect(() => {
-    const target = "#" + new URLSearchParams(sel).toString();
-    if (window.location.hash !== target) {
-      window.history.replaceState(null, "", target);
-    }
-    window.dispatchEvent(new CustomEvent("sglang-deploy-sel", { detail: sel }));
-  }, [sel]);
 
-  const [modal, setModal] = useState(null); // 'curl' | 'env' | null
+  // Playground deltas. `null` = inherit from base for that knob.
+  const [deltas, setDeltas] = useState({
+    attn: { tp: null, dp: null, cp: null, dpAttn: null },
+    moe:  { backend: null, ep: null },
+    spec: "current",
+    parsers: { reasoning: false, toolCall: false },
+  });
+
+  const [modal, setModal] = useState(null);
   useEffect(() => {
     if (modal === null) return;
     const onKey = (e) => { if (e.key === "Escape") setModal(null); };
@@ -763,23 +871,41 @@ export const DeepSeekV4Deployment = () => {
   useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
 
   // ==========================================================================
-  // 7. Derived
+  // Derived
   // ==========================================================================
   const s = makeStyles(isDark);
-  const cell = findCell(config.cells, sel);
-  const command = renderCommand(cell, sel, env);
-  const modelName = resolveModelName(sel);
+  const baseCell = findCell(config.cells, base);
+  const modelName = resolveModelName(base);
+
+  let baseCommand = "";
+  let playgroundCommand = "";
+  let diffLines = [];
+  if (baseCell) {
+    baseCommand = renderCommandLines(baseCell, baseCell.flags, base, env);
+    const pgFlags = applyDeltas(baseCell.flags, deltas);
+    playgroundCommand = renderCommandLines(baseCell, pgFlags, base, env);
+    diffLines = computeDiff(baseCommand, playgroundCommand);
+  }
+
   const curlText = interpolate(config.curl || "", env, modelName);
-  const hwGroups = buildHardwareGroups();
 
-  const isEnabled = (dim, value) => isOptionAvailable(config.cells, sel, dim, value);
+  const resetAll = () => setDeltas({
+    attn: { tp: null, dp: null, cp: null, dpAttn: null },
+    moe:  { backend: null, ep: null },
+    spec: "current",
+    parsers: { reasoning: false, toolCall: false },
+  });
 
-  const handleSelect = (dim, value) => {
-    setSel((prev) => snapToValidCell(config.cells, prev, dim, value));
-  };
+  const placeholderGroups = (() => {
+    const out = { command: [], curl: [] };
+    for (const [key, meta] of Object.entries(config.placeholders || {})) {
+      (out[meta.target] || (out[meta.target] = [])).push({ key, ...meta });
+    }
+    return out;
+  })();
 
   const handleCopy = () => {
-    navigator.clipboard.writeText(command);
+    navigator.clipboard.writeText(playgroundCommand);
     setCopied(true);
     setTimeout(() => setCopied(false), 1200);
   };
@@ -789,88 +915,145 @@ export const DeepSeekV4Deployment = () => {
     setTimeout(() => setCurlCopied(false), 1200);
   };
 
-  // Group placeholders by `target` for the Env modal.
-  const placeholderGroups = (() => {
-    const out = { command: [], curl: [] };
-    for (const [key, meta] of Object.entries(config.placeholders || {})) {
-      (out[meta.target] || (out[meta.target] = [])).push({ key, ...meta });
-    }
-    return out;
-  })();
-
   // ==========================================================================
-  // 8. JSX render
+  // JSX render
   // ==========================================================================
-  const renderButton = (item, dim, selectedId) => {
-    const checked = selectedId === item.id;
-    const disabled = !isEnabled(dim, item.id);
+  // A row of chip selectors. `current` is the value bound to the chip group;
+  // `onPick(v)` is called when the user clicks a chip. Disabled chips are
+  // unclickable (used for placeholder spec algorithms).
+  const renderChip = (label, current, value, onPick, opts = {}) => {
+    const checked = current === value;
+    const disabled = !!opts.disabled;
     return (
-      <label
-        key={item.id}
+      <span
+        key={`${label}-${value === null ? "auto" : value}`}
         style={{
-          ...s.labelBase,
-          ...(checked ? s.checked : {}),
-          ...(disabled ? s.disabled : {}),
+          ...s.chip,
+          ...(checked ? s.chipChecked : {}),
+          ...(disabled ? s.chipDisabled : {}),
         }}
-        title={disabled ? "Not supported for current selection" : ""}
-        onClick={(e) => {
-          if (disabled) { e.preventDefault(); return; }
-          handleSelect(dim, item.id);
-        }}
+        title={disabled ? (opts.disabledReason || "Not available") : ""}
+        onClick={() => { if (!disabled) onPick(value); }}
       >
-        <input type="radio" checked={checked} disabled={disabled} readOnly style={{ display: "none" }} />
-        <span>{item.label}</span>
-        {item.subtitle && (
-          <small style={{ ...s.subtitle, color: checked ? "rgba(255,255,255,0.85)" : "inherit" }}>
-            {item.subtitle}
-          </small>
-        )}
-      </label>
+        {label}
+      </span>
     );
   };
 
-  const renderFlatSection = (title, options, dim, selectedId) => (
-    <div style={s.card}>
-      <div style={s.title}>{title}</div>
-      <div style={s.itemsGrid(options.length)}>
-        {options.map((item) => renderButton(item, dim, selectedId))}
-      </div>
-    </div>
-  );
+  const setAttn = (k, v) => setDeltas((d) => ({ ...d, attn: { ...d.attn, [k]: v } }));
+  const setMoe  = (k, v) => setDeltas((d) => ({ ...d, moe:  { ...d.moe,  [k]: v } }));
+  const setParser = (k, v) => setDeltas((d) => ({ ...d, parsers: { ...d.parsers, [k]: v } }));
 
-  const maxHwCols = Math.max(...hwGroups.map((x) => x.items.length));
+  // Format a hash-suffixed badge of the inherited base.
+  const baseSummary = baseCell
+    ? `${base.hw.toUpperCase()} · ${base.variant} · ${base.quant.toUpperCase()} · ${base.strategy} · ${base.nodes}`
+    : "(no verified cell at current §3 selection — showing playground only)";
 
   return (
     <div style={s.container} className="not-prose">
-      {/* Hardware section (2 vendor rows in one card, equal-width grid) */}
-      <div style={s.cardColumn}>
-        <div style={{ ...s.title, marginBottom: "2px" }}>Hardware Platform</div>
-        {hwGroups.map((g) => (
-          <div key={g.label} style={s.vendorRow}>
-            <div style={s.vendorLabel}>{g.label}</div>
-            <div style={s.itemsGrid(maxHwCols)}>
-              {g.items.map((item) => renderButton(item, "hw", sel.hw))}
-              {Array.from({ length: maxHwCols - g.items.length }).map((_, i) => (
-                <div key={`pad-${i}`} />
-              ))}
-            </div>
-          </div>
-        ))}
+      {/* Inherited base summary */}
+      <div style={s.baseStrip}>
+        <span style={{ fontWeight: 600 }}>Inherited base from §3:</span>
+        <code style={{ fontFamily: "Menlo, monospace" }}>{baseSummary}</code>
+        <button style={s.resetBtn} onClick={resetAll}>Reset all overrides</button>
       </div>
 
-      {renderFlatSection("Model Variant", config.variants,        "variant",  sel.variant)}
-      {renderFlatSection("Quantization",  config.quantizations,   "quant",    sel.quant)}
-      {renderFlatSection("Strategy",      config.strategies,      "strategy", sel.strategy)}
-      {renderFlatSection("Nodes",         config.nodesOptions,    "nodes",    sel.nodes)}
+      {/* Axis 1: Attention Parallelism — one parameter per sub-row */}
+      <div style={{ ...s.card, ...s.cardStack }}>
+        <div style={s.title}>Attention Parallelism</div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>TP</span>
+          <div style={s.chipRow}>
+            {TP_OPTS.map((v) =>
+              renderChip(v === null ? "auto" : String(v), deltas.attn.tp, v,
+                (nv) => setAttn("tp", nv)))}
+          </div>
+        </div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>DP</span>
+          <div style={s.chipRow}>
+            {DP_OPTS.map((v) =>
+              renderChip(v === null ? "auto" : String(v), deltas.attn.dp, v,
+                (nv) => setAttn("dp", nv)))}
+          </div>
+        </div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>CP</span>
+          <div style={s.chipRow}>
+            {CP_OPTS.map((v) =>
+              renderChip(v === null ? "auto" : String(v), deltas.attn.cp, v,
+                (nv) => setAttn("cp", nv)))}
+          </div>
+        </div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>DP-Attention</span>
+          <div style={s.chipRow}>
+            {renderChip("auto", deltas.attn.dpAttn, null,  (v) => setAttn("dpAttn", v))}
+            {renderChip("on",   deltas.attn.dpAttn, true,  (v) => setAttn("dpAttn", v))}
+            {renderChip("off",  deltas.attn.dpAttn, false, (v) => setAttn("dpAttn", v))}
+          </div>
+        </div>
+      </div>
+
+      {/* Axis 2: MoE Parallelism — Backend row, EP row */}
+      <div style={{ ...s.card, ...s.cardStack }}>
+        <div style={s.title}>MoE Parallelism</div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>Backend</span>
+          <div style={s.chipRow}>
+            {MOE_OPTS.map((o) =>
+              renderChip(o.label, deltas.moe.backend, o.id, (v) => setMoe("backend", v)))}
+          </div>
+        </div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>EP</span>
+          <div style={s.chipRow}>
+            {EP_OPTS.map((v) =>
+              renderChip(v === null ? "auto" : String(v), deltas.moe.ep, v,
+                (nv) => setMoe("ep", nv)))}
+          </div>
+        </div>
+      </div>
+
+      {/* Axis 3: Parsers — one toggle per parser. Clicking the chip flips its
+          on/off state, no separate "off" button needed. */}
+      <div style={{ ...s.card, ...s.cardStack }}>
+        <div style={s.title}>Parsers</div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>Reasoning</span>
+          <div style={s.chipRow}>
+            {renderChip("deepseek-v4", deltas.parsers.reasoning, true,
+              () => setParser("reasoning", !deltas.parsers.reasoning))}
+          </div>
+        </div>
+        <div style={s.subRow}>
+          <span style={s.subLabel}>Tool Call</span>
+          <div style={s.chipRow}>
+            {renderChip("deepseekv4", deltas.parsers.toolCall, true,
+              () => setParser("toolCall", !deltas.parsers.toolCall))}
+          </div>
+        </div>
+      </div>
+
+      {/* Axis 4: Speculative Decoding */}
+      <div style={s.card}>
+        <div style={s.title}>Speculative Decoding</div>
+        <div style={s.rowFlex}>
+          {SPEC_PRESETS.map((p) =>
+            renderChip(p.label, deltas.spec, p.id,
+              (v) => setDeltas((d) => ({ ...d, spec: v })),
+              { disabled: p.disabled, disabledReason: p.disabledReason }))}
+        </div>
+      </div>
 
       {/* Command box */}
       <div style={s.card}>
-        <div style={s.title}>Run this Command:</div>
+        <div style={s.title}>Playground Command (diff vs verified base)</div>
         <div style={s.commandWrap}>
           <div style={s.commandHeader}>
-            <div style={s.badge(Boolean(cell && cell.verified))}>
-              <span style={s.badgeDot(Boolean(cell && cell.verified))} />
-              {cell && cell.verified ? "Verified" : "Auto-Estimated"}
+            <div style={s.badge}>
+              <span style={s.badgeDot} />
+              Auto-Estimated
             </div>
             <div style={s.iconRow}>
               <button style={s.iconButton} onClick={handleCopy}>
@@ -880,45 +1063,22 @@ export const DeepSeekV4Deployment = () => {
               <button style={s.iconButton} onClick={() => setModal("env")}>⚙ Env</button>
             </div>
           </div>
-          <pre style={s.commandPre}>{command}</pre>
+          <pre style={s.commandPre}>
+            {baseCell ? diffLines.map((d, i) => (
+              <span
+                key={i}
+                style={
+                  d.kind === "added" ? s.diffLineAdded :
+                  d.kind === "removed" ? s.diffLineRemoved :
+                  s.diffLineUnchanged
+                }
+              >
+                {d.kind === "added" ? "+ " : d.kind === "removed" ? "- " : "  "}
+                {d.line}{"\n"}
+              </span>
+            )) : "# No verified base cell at the current §3 selection.\n# Pick a supported hardware/variant in §3 to populate the playground base."}
+          </pre>
         </div>
-      </div>
-
-      {/* Playground link. scrollIntoView (instead of an href anchor) so the
-          URL hash — which carries §3's selection — isn't overwritten. The
-          target id "3-3-playground" is auto-generated by Mintlify from the
-          "### 3.3 Playground" heading slug. */}
-      <div
-        style={{
-          padding: "6px 12px",
-          fontSize: "12px",
-          color: isDark ? "#9ca3af" : "#6b7280",
-          display: "flex",
-          alignItems: "center",
-          gap: "6px",
-        }}
-      >
-        <span>Need to go beyond the verified matrix?</span>
-        <button
-          type="button"
-          onClick={() => {
-            const el = document.getElementById("3-3-playground");
-            if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
-          }}
-          style={{
-            background: "transparent",
-            border: "none",
-            padding: 0,
-            color: isDark ? "#A78BFA" : "#8B5CF6",
-            cursor: "pointer",
-            fontSize: "12px",
-            fontWeight: 600,
-            textDecoration: "underline",
-            textUnderlineOffset: "2px",
-          }}
-        >
-          Open the Playground →
-        </button>
       </div>
 
       {/* cURL modal */}
@@ -994,7 +1154,7 @@ export const DeepSeekV4Deployment = () => {
               <button style={s.primaryBtn} onClick={() => { saveEnv(envDraft); setModal(null); }}>Save</button>
             </div>
             <p style={{ fontSize: 11, opacity: 0.7, marginTop: 10 }}>
-              Values persist in localStorage and are reused the next time you visit any cookbook.
+              Values persist in localStorage and are shared with §3.
             </p>
           </div>
         </div>
