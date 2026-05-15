@@ -1,4 +1,4 @@
-name: PR Test Basic
+name: PR Test Base
 
 on:
   schedule:
@@ -89,7 +89,7 @@ jobs:
   # For PRs with the `bypass-fastfail` label: wait jobs run but return success immediately
   # (handled inside the wait-for-jobs action), so downstream stages dispatch in parallel.
 
-  wait-for-basic-a:
+  wait-for-base-a:
     needs: [check-changes, call-gate]
     if: |
       always() &&
@@ -100,7 +100,7 @@ jobs:
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
-      basic_a_result: ${{ steps.wait.outputs.result }}
+      base_a_result: ${{ steps.wait.outputs.result }}
     steps:
       - uses: actions/checkout@v4
 
@@ -109,27 +109,27 @@ jobs:
       - uses: ./.github/actions/wait-for-jobs
         id: wait
         with:
-          stage-name: basic-a
+          stage-name: base-a
           jobs: |
             [
-              {"prefix": "basic-a-test-1-gpu-small", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['basic-a-test-1-gpu-small'].size }}},
-              {"prefix": "basic-a-test-cpu", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['basic-a-test-cpu'].size }}}
+              {"prefix": "base-a-test-1-gpu-small", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-1-gpu-small'].size }}},
+              {"prefix": "base-a-test-cpu", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].size }}}
             ]
           max-wait-minutes: '240'
 
-  wait-for-basic-b:
-    needs: [check-changes, call-gate, wait-for-basic-a]
+  wait-for-base-b:
+    needs: [check-changes, call-gate, wait-for-base-a]
     if: |
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.wait-for-basic-a.result == 'success' || needs.wait-for-basic-a.result == 'skipped') &&
+      (needs.wait-for-base-a.result == 'success' || needs.wait-for-base-a.result == 'skipped') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
-      basic_b_result: ${{ steps.wait.outputs.result }}
+      base_b_result: ${{ steps.wait.outputs.result }}
     steps:
       - uses: actions/checkout@v4
 
@@ -138,13 +138,13 @@ jobs:
       - uses: ./.github/actions/wait-for-jobs
         id: wait
         with:
-          stage-name: basic-b
+          stage-name: base-b
           jobs: |
             [
-              {"prefix": "basic-b-test-1-gpu-small", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['basic-b-test-1-gpu-small'].size }}},
-              {"prefix": "basic-b-test-1-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['basic-b-test-1-gpu-large'].size }}},
-              {"prefix": "basic-b-test-2-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['basic-b-test-2-gpu-large'].size }}},
-              {"prefix": "basic-b-test-4-gpu-b200", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['basic-b-test-4-gpu-b200'].size }}}
+              {"prefix": "base-b-test-1-gpu-small", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-1-gpu-small'].size }}},
+              {"prefix": "base-b-test-1-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-1-gpu-large'].size }}},
+              {"prefix": "base-b-test-2-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-2-gpu-large'].size }}},
+              {"prefix": "base-b-test-4-gpu-b200", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-4-gpu-b200'].size }}}
             ]
           max-wait-minutes: '480'
 
@@ -240,12 +240,12 @@ jobs:
   # =============================================== primary ====================================================
 
   # Runs on 5090 (32GB, SM120)
-  basic-a-test-1-gpu-small:
+  base-a-test-1-gpu-small:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: basic-a-test-1-gpu-small
+      self_name: base-a-test-1-gpu-small
       runner_config: 1-gpu-small
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
@@ -253,7 +253,7 @@ jobs:
       run_timeout_minutes: '10'
     secrets: inherit
 
-  basic-a-test-cpu:
+  base-a-test-cpu:
     needs: [check-changes, call-gate]
     if: |
       always() &&
@@ -263,9 +263,9 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['basic-a-test-cpu'].max_parallel }}
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].max_parallel }}
       matrix:
-        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['basic-a-test-cpu'].arr }}
+        partition: ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].arr }}
     steps:
       - name: Free disk space
         run: |
@@ -316,15 +316,15 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite basic-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['basic-a-test-cpu'].size }} $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite base-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size ${{ fromJson(needs.check-changes.outputs.partitions)['base-a-test-cpu'].size }} $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
-  basic-b-test-1-gpu-small:
-    needs: [check-changes, call-gate, wait-for-basic-a, sgl-kernel-build-wheels]
+  base-b-test-1-gpu-small:
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: basic-b-test-1-gpu-small
+      self_name: base-b-test-1-gpu-small
       runner_config: 1-gpu-small
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
@@ -333,12 +333,12 @@ jobs:
     secrets: inherit
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
-  basic-b-test-1-gpu-large:
-    needs: [check-changes, call-gate, wait-for-basic-a, sgl-kernel-build-wheels]
+  base-b-test-1-gpu-large:
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: basic-b-test-1-gpu-large
+      self_name: base-b-test-1-gpu-large
       runner_config: 1-gpu-large
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
@@ -347,12 +347,12 @@ jobs:
       timeout_per_file: '1800'
     secrets: inherit
 
-  basic-b-test-2-gpu-large:
-    needs: [check-changes, call-gate, wait-for-basic-a, sgl-kernel-build-wheels]
+  base-b-test-2-gpu-large:
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: basic-b-test-2-gpu-large
+      self_name: base-b-test-2-gpu-large
       runner_config: 2-gpu-large
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
@@ -360,12 +360,12 @@ jobs:
       run_timeout_minutes: '30'
     secrets: inherit
 
-  basic-b-test-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-basic-a, sgl-kernel-build-wheels]
+  base-b-test-4-gpu-b200:
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: basic-b-test-4-gpu-b200
+      self_name: base-b-test-4-gpu-b200
       runner_config: 4-gpu-b200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
@@ -394,12 +394,12 @@ jobs:
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
     secrets: inherit
 
-  basic-c-test-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-basic-b, sgl-kernel-build-wheels]
+  base-c-test-4-gpu-h100:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: basic-c-test-4-gpu-h100
+      self_name: base-c-test-4-gpu-h100
       runner_config: 4-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
@@ -407,12 +407,12 @@ jobs:
       run_timeout_minutes: '30'
     secrets: inherit
 
-  basic-c-test-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-basic-b, sgl-kernel-build-wheels]
+  base-c-test-8-gpu-h200:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: basic-c-test-8-gpu-h200
+      self_name: base-c-test-8-gpu-h200
       runner_config: 8-gpu-h200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
@@ -427,12 +427,12 @@ jobs:
       warmup_timeout_minutes: '60'
     secrets: inherit
 
-  basic-c-test-8-gpu-h20:
-    needs: [check-changes, call-gate, wait-for-basic-b, sgl-kernel-build-wheels]
+  base-c-test-8-gpu-h20:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: basic-c-test-8-gpu-h20
+      self_name: base-c-test-8-gpu-h20
       runner_config: 8-gpu-h20
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
@@ -440,12 +440,12 @@ jobs:
       run_timeout_minutes: '30'
     secrets: inherit
 
-  basic-c-test-deepep-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-basic-b, sgl-kernel-build-wheels]
+  base-c-test-deepep-4-gpu-h100:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: basic-c-test-deepep-4-gpu-h100
+      self_name: base-c-test-deepep-4-gpu-h100
       runner_config: deepep-4-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
@@ -455,12 +455,12 @@ jobs:
       warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
     secrets: inherit
 
-  basic-c-test-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-basic-b, sgl-kernel-build-wheels]
+  base-c-test-4-gpu-b200:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: basic-c-test-4-gpu-b200
+      self_name: base-c-test-4-gpu-b200
       runner_config: 4-gpu-b200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
@@ -469,12 +469,12 @@ jobs:
       timeout_per_file: '1800'
     secrets: inherit
 
-  basic-c-test-dsv4-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-basic-b, sgl-kernel-build-wheels]
+  base-c-test-dsv4-4-gpu-b200:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: basic-c-test-dsv4-4-gpu-b200
+      self_name: base-c-test-dsv4-4-gpu-b200
       runner_config: dsv4-4-gpu-b200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
@@ -483,12 +483,12 @@ jobs:
       timeout_per_file: '1800'
     secrets: inherit
 
-  basic-c-test-dsv4-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-basic-b, sgl-kernel-build-wheels]
+  base-c-test-dsv4-8-gpu-h200:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: basic-c-test-dsv4-8-gpu-h200
+      self_name: base-c-test-dsv4-8-gpu-h200
       runner_config: dsv4-8-gpu-h200
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
@@ -507,27 +507,27 @@ jobs:
         sgl-kernel-build-wheels-arm,
         call-sgl-kernel-tests,
 
-        wait-for-basic-a,
-        wait-for-basic-b,
+        wait-for-base-a,
+        wait-for-base-b,
 
         call-jit-kernel-tests,
 
         call-multimodal-gen-tests,
 
-        basic-a-test-1-gpu-small,
-        basic-a-test-cpu,
-        basic-b-test-1-gpu-small,
-        basic-b-test-1-gpu-large,
-        basic-b-test-2-gpu-large,
-        basic-b-test-4-gpu-b200,
-        basic-c-test-4-gpu-h100,
-        basic-c-test-8-gpu-h20,
-        basic-c-test-8-gpu-h200,
-        basic-c-test-deepep-4-gpu-h100,
-        basic-c-test-4-gpu-b200,
-        basic-c-test-dsv4-4-gpu-b200,
-        basic-c-test-dsv4-8-gpu-h200,
-        # basic-c-test-4-gpu-gb200,  # Temporarily disabled — no GB200 runner
+        base-a-test-1-gpu-small,
+        base-a-test-cpu,
+        base-b-test-1-gpu-small,
+        base-b-test-1-gpu-large,
+        base-b-test-2-gpu-large,
+        base-b-test-4-gpu-b200,
+        base-c-test-4-gpu-h100,
+        base-c-test-8-gpu-h20,
+        base-c-test-8-gpu-h200,
+        base-c-test-deepep-4-gpu-h100,
+        base-c-test-4-gpu-b200,
+        base-c-test-dsv4-4-gpu-b200,
+        base-c-test-dsv4-8-gpu-h200,
+        # base-c-test-4-gpu-gb200,  # Temporarily disabled — no GB200 runner
       ]
     if: always()
     runs-on: ubuntu-latest

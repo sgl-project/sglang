@@ -83,7 +83,7 @@ runs:
             // match so we cover both inline + reusable forms without confusing
             // 'h20' with the 'h200' prefix.
             const baseName = j.name.split(/[ /]/)[0];
-            if (baseName === 'basic-c-test-8-gpu-h20') {
+            if (baseName === 'base-c-test-8-gpu-h20') {
               return false;
             }
             // If the failing step is the health check, it's a cascade — skip it

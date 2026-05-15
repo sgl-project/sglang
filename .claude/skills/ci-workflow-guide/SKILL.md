@@ -11,7 +11,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 
 ## Naming Conventions
 
-- **Suite**: `stage-{a,b,c}-test-{gpu_count}-gpu-{hardware}` (e.g., `basic-b-test-1-gpu-small`)
+- **Suite**: `base-{a,b,c}-test-{gpu_count}-gpu-{hardware}` (e.g., `base-b-test-1-gpu-small`)
 - **Test group**: Directory-level registered test group under `test/registered/` (e.g., `hicache` maps to `test/registered/hicache/test_*.py`)
 - **CI runner**: `{gpu_count}-gpu-{hardware}` (e.g., `1-gpu-5090`, `4-gpu-h100`, `8-gpu-h200`)
 
@@ -53,11 +53,11 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
  │         pre-flight check            │                      │
  │                                     │                      │
  │  ┌─────────────────────────────┐    │                      │
- │  │ basic-a-test-1-gpu-small    │    │                      │
+ │  │ base-a-test-1-gpu-small    │    │                      │
  │  │ (small GPUs)                │    │                      │
  │  └─────────────────────────────┘    │                      │
  │  ┌─────────────────────────────┐    │                      │
- │  │ basic-a-test-cpu            │    │                      │
+ │  │ base-a-test-cpu            │    │                      │
  │  │ (CPU)                       │    │                      │
  │  └─────────────────────────────┘    │                      │
  └──────┬──────────────────────────────┘                      │
@@ -68,15 +68,15 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
  │           basic tests               │          └──────────────────────────┘
  │                                     │          ┌──────────────────────────┐
  │  ┌─────────────────────────────┐    │          │   multimodal gen test    │
- │  │ basic-b-test-1-gpu-small    │    │          └──────────────────────────┘
+ │  │ base-b-test-1-gpu-small    │    │          └──────────────────────────┘
  │  │ (small GPUs, e.g. 5090)     │    │
  │  └─────────────────────────────┘    │
  │  ┌─────────────────────────────┐    │
- │  │ basic-b-test-1-gpu-large    │    │
+ │  │ base-b-test-1-gpu-large    │    │
  │  │ (large GPUs, e.g. H100)     │    │
  │  └─────────────────────────────┘    │
  │  ┌─────────────────────────────┐    │
- │  │ basic-b-test-2-gpu-large    │    │
+ │  │ base-b-test-2-gpu-large    │    │
  │  │ (large GPUs, e.g. H100)     │    │
  │  └─────────────────────────────┘    │
  └──────┬──────────────────────────────┘
@@ -87,15 +87,15 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
  │          advanced tests             │
  │                                     │
  │  ┌─────────────────────────────┐    │
- │  │ basic-c-test-4-gpu-h100     │    │
+ │  │ base-c-test-4-gpu-h100     │    │
  │  │ (H100 GPUs)                 │    │
  │  └─────────────────────────────┘    │
  │  ┌─────────────────────────────┐    │
- │  │ basic-c-test-8-gpu-h200     │    │
+ │  │ base-c-test-8-gpu-h200     │    │
  │  │ (8 x H200 GPUs)             │    │
  │  └─────────────────────────────┘    │
  │  ┌─────────────────────────────┐    │
- │  │ basic-c-test-4-gpu-b200     │    │
+ │  │ base-c-test-4-gpu-b200     │    │
  │  │ (4 x B200 GPUs)             │    │
  │  └─────────────────────────────┘    │
  │  ┌─────────────────────────────┐    │
@@ -114,7 +114,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 
 **Every stage test job** includes a `check-pr-test-health` step after checkout — if any job in the run has already failed, the job fast-fails (red X) with a root cause annotation.
 
-**Scheduled runs** skip `wait-for-basic-*` jobs, running all stages in parallel. Fast-fail is also disabled.
+**Scheduled runs** skip `wait-for-base-*` jobs, running all stages in parallel. Fast-fail is also disabled.
 
 ---
 
@@ -127,12 +127,12 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 | **1. Test method → file** | `unittest -f` (failfast) | One test method fails → entire test file stops immediately | Yes |
 | **2. File → suite** | `run_unittest_files()` default | One test file fails → entire suite stops (`--continue-on-error` off) | Yes |
 | **3. Job → job (same stage)** | `check-pr-test-health` action | One job fails → other waiting jobs in same stage fast-fail (red X) | Yes |
-| **4. Stage → stage (cross-stage)** | `wait-for-basic-*` + `needs` | Basic A fails → basic B/C jobs skip entirely (never get a runner) | Yes (wait jobs skipped) |
+| **4. Stage → stage (cross-stage)** | `wait-for-base-*` + `needs` | Base A fails → base B/C jobs skip entirely (never get a runner) | Yes (wait jobs skipped) |
 
 - **Layer 1**: `-f` flag appended to all `python3 -m pytest` / `unittest` invocations in `ci_utils.py`
 - **Layer 2**: `--continue-on-error` flag in `run_suite.py` — off for PRs, on for scheduled runs
 - **Layer 3**: `check-pr-test-health` auto-detects `schedule` event and skips; filters out cascade failures to show only root cause jobs
-- **Layer 4**: `wait-for-basic-*` jobs are conditioned on `github.event_name == 'pull_request'` — skipped for scheduled runs
+- **Layer 4**: `wait-for-base-*` jobs are conditioned on `github.event_name == 'pull_request'` — skipped for scheduled runs
 
 ---
 
@@ -140,7 +140,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 
 | Aspect | PR (`pull_request`) | Scheduled (`cron`, every 6h) | `/rerun-stage` (`workflow_dispatch`) |
 |--------|---------------------|------------------------------|--------------------------------------|
-| **Stage ordering** | Sequential: A → B → C via `wait-for-basic-*` | Parallel (all at once) | Single target stage only |
+| **Stage ordering** | Sequential: A → B → C via `wait-for-base-*` | Parallel (all at once) | Single target stage only |
 | **Cross-job fast-fail** | Yes (`check-pr-test-health`) | Yes | Yes |
 | **continue-on-error** | No (stop at first failure within suite) | Yes (run all tests) | No |
 | **Retry** | Enabled | Enabled | Enabled |
@@ -152,23 +152,23 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 
 ## Stage Gating (`wait-for-jobs` action)
 
-`wait-for-basic-a` and `wait-for-basic-b` are lightweight `ubuntu-latest` jobs that poll the GitHub Actions API.
+`wait-for-base-a` and `wait-for-base-b` are lightweight `ubuntu-latest` jobs that poll the GitHub Actions API.
 
 **How it works:**
 1. Calls `listJobsForWorkflowRun` to list all jobs in the current run
-2. Matches jobs by exact name or prefix (for matrix jobs, e.g., `basic-b-test-1-gpu-small (3)`)
+2. Matches jobs by exact name or prefix (for matrix jobs, e.g., `base-b-test-1-gpu-small (3)`)
 3. If any matched job has `conclusion === 'failure'` → fail immediately (fast-fail)
 4. If all matched jobs are completed and count matches `expected_count` → success
 5. Otherwise → sleep `poll-interval-seconds` (default: 60s) and retry
-6. Timeout after `max-wait-minutes` (240 min for basic-a, 480 min for basic-b)
+6. Timeout after `max-wait-minutes` (240 min for base-a, 480 min for base-b)
 
-**Job specs example** (basic-b):
+**Job specs example** (base-b):
 ```json
 [
-  {"prefix": "basic-b-test-1-gpu-small", "expected_count": 8},
-  {"prefix": "basic-b-test-1-gpu-large", "expected_count": 14},
-  {"prefix": "basic-b-test-2-gpu-large", "expected_count": 4},
-  {"prefix": "basic-b-test-4-gpu-b200", "expected_count": 1}
+  {"prefix": "base-b-test-1-gpu-small", "expected_count": 8},
+  {"prefix": "base-b-test-1-gpu-large", "expected_count": 14},
+  {"prefix": "base-b-test-2-gpu-large", "expected_count": 4},
+  {"prefix": "base-b-test-4-gpu-b200", "expected_count": 1}
 ]
 ```
 
@@ -213,7 +213,7 @@ steps:
 
 **Error message example:**
 ```
-Fast-fail: skipping — root cause job(s): basic-b-test-1-gpu-small (0), basic-b-test-1-gpu-small (1)
+Fast-fail: skipping — root cause job(s): base-b-test-1-gpu-small (0), base-b-test-1-gpu-small (1)
 ```
 
 ---
@@ -270,26 +270,26 @@ Large suites are split across matrix jobs using the **LPT (Longest Processing Ti
 
 | Suite | Partitions | Runner | max_parallel |
 |-------|-----------|--------|-------------|
-| `basic-a-test-1-gpu-small` | 1 (no matrix) | `1-gpu-5090` | — |
-| `basic-a-test-cpu` | 4 | `ubuntu-latest` | — |
-| `basic-b-test-1-gpu-small` | 8 | `1-gpu-5090` | 8 |
-| `basic-b-test-1-gpu-large` | 14 | `1-gpu-h100` | dynamic (3 or 14) |
-| `basic-b-test-2-gpu-large` | 4 | `2-gpu-h100` | — |
-| `basic-b-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
-| `basic-b-kernel-unit-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
-| `basic-b-kernel-unit-1-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
-| `basic-b-kernel-unit-8-gpu-h200` | 1 (no matrix) | `8-gpu-h200` | — |
-| `basic-b-kernel-benchmark-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
-| `basic-c-test-4-gpu-h100` | 3 | `4-gpu-h100` | — |
-| `basic-c-test-8-gpu-h200` | 4 | `8-gpu-h200` | — |
-| `basic-c-test-8-gpu-h20` | 2 | `8-gpu-h20` | — |
-| `basic-c-test-deepep-4-gpu-h100` | 1 (no matrix) | `4-gpu-h100` | — |
-| `basic-c-test-4-gpu-b200` | 3 | `4-gpu-b200` | — |
-| `basic-c-test-4-gpu-b200-small` | 3 | `4-gpu-b200-low-disk` | — |
-| `basic-c-test-8-gpu-b200` | registered only | `8-gpu-b200` | — |
-| `basic-c-test-4-gpu-gb200` | registered only | `4-gpu-gb200` | — |
+| `base-a-test-1-gpu-small` | 1 (no matrix) | `1-gpu-5090` | — |
+| `base-a-test-cpu` | 4 | `ubuntu-latest` | — |
+| `base-b-test-1-gpu-small` | 8 | `1-gpu-5090` | 8 |
+| `base-b-test-1-gpu-large` | 14 | `1-gpu-h100` | dynamic (3 or 14) |
+| `base-b-test-2-gpu-large` | 4 | `2-gpu-h100` | — |
+| `base-b-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
+| `base-b-kernel-unit-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
+| `base-b-kernel-unit-1-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
+| `base-b-kernel-unit-8-gpu-h200` | 1 (no matrix) | `8-gpu-h200` | — |
+| `base-b-kernel-benchmark-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
+| `base-c-test-4-gpu-h100` | 3 | `4-gpu-h100` | — |
+| `base-c-test-8-gpu-h200` | 4 | `8-gpu-h200` | — |
+| `base-c-test-8-gpu-h20` | 2 | `8-gpu-h20` | — |
+| `base-c-test-deepep-4-gpu-h100` | 1 (no matrix) | `4-gpu-h100` | — |
+| `base-c-test-4-gpu-b200` | 3 | `4-gpu-b200` | — |
+| `base-c-test-4-gpu-b200-small` | 3 | `4-gpu-b200-low-disk` | — |
+| `base-c-test-8-gpu-b200` | registered only | `8-gpu-b200` | — |
+| `base-c-test-4-gpu-gb200` | registered only | `4-gpu-gb200` | — |
 
-> **Note**: Kernel suites (`basic-b-kernel-*`) run via `pr-test-jit-kernel.yml` and `pr-test-sgl-kernel.yml`, not the main `pr-test.yml`. `basic-c-test-8-gpu-b200` is registered in `test/run_suite.py` but not wired to PR CI. The GB200 job is currently commented out in `pr-test.yml` until a company-owned runner is provisioned. Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
+> **Note**: Kernel suites (`base-b-kernel-*`) run via `pr-test-jit-kernel.yml` and `pr-test-sgl-kernel.yml`, not the main `pr-test.yml`. `base-c-test-8-gpu-b200` is registered in `test/run_suite.py` but not wired to PR CI. The GB200 job is currently commented out in `pr-test.yml` until a company-owned runner is provisioned. Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
 
 **Workflow usage:**
 ```yaml
@@ -297,7 +297,7 @@ strategy:
   matrix:
     partition: [0, 1, 2, 3, 4, 5, 6, 7]
 steps:
-  - run: python3 run_suite.py --hw cuda --suite basic-b-test-1-gpu-small \
+  - run: python3 run_suite.py --hw cuda --suite base-b-test-1-gpu-small \
            --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8
 ```
 
@@ -347,7 +347,7 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 
 ## How To: Add a New Stage Job
 
-1. Define the job in `pr-test.yml` with `needs: [check-changes, call-gate, wait-for-basic-X, ...]`
+1. Define the job in `pr-test.yml` with `needs: [check-changes, call-gate, wait-for-base-X, ...]`
 2. Copy the `if:` condition pattern from an existing same-stage job (handles `target_stage`, `schedule`, `main_package`)
 3. Add `checkout` step
 4. Add `check-pr-test-health` step (after checkout) — if any prior job failed, `core.setFailed()` fires and all subsequent steps auto-skip via default `if: success()`
@@ -358,7 +358,7 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 9. Add `upload-cuda-coredumps` step with `if: always()`
 10. Register the suite name in `PER_COMMIT_SUITES` in `test/run_suite.py`
 11. If using matrix, add `--auto-partition-id` and `--auto-partition-size` to the run command
-12. **Update `wait-for-basic-X`** job spec with the new job name and `expected_count` (if matrix)
+12. **Update `wait-for-base-X`** job spec with the new job name and `expected_count` (if matrix)
 13. **Add the job to `pr-test-finish.needs`** list
 
 ---
@@ -368,7 +368,7 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | Symptom | Likely cause | What to check |
 |---------|-------------|---------------|
 | All stage-B/C jobs green but steps skipped | Earlier job failed, `check-pr-test-health` triggered | Find the actual failed job (red X) |
-| `wait-for-basic-b` timeout | `expected_count` doesn't match matrix size | Verify job spec counts match `matrix:` array length |
+| `wait-for-base-b` timeout | `expected_count` doesn't match matrix size | Verify job spec counts match `matrix:` array length |
 | `pr-test-finish` fails but all jobs green | A job was `cancelled` (counts as failure in finish) | Check concurrency cancellation |
 | Tests pass locally but fail in CI | Partition assignment, runner GPU type, or `est_time` inaccuracy | Check which partition the test lands in; verify runner label |
 | Flaky test retried and passed | Retriable failure (accuracy/perf) | Check `[CI Retry]` markers in job logs |

@@ -4,7 +4,7 @@ name: PR Test Stage
 # `caller_inputs` = toJson(inputs) as bundles. `partitions` is forwarded
 # separately to keep matrix expressions single-fromJson — its value is itself
 # a JSON string, so reading it via `check_changes` would need double fromJson,
-# and matrix can't use step-resolved values. basic-a-test-cpu stays inline in
+# and matrix can't use step-resolved values. base-a-test-cpu stays inline in
 # pr-test.yml (bespoke uv pip / protoc / rust-cache install).
 
 on:
