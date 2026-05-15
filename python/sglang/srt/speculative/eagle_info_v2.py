@@ -47,7 +47,12 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
     )
-    from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.eagle_info import (
+        EagleDraftExtendInput,
+        EagleDraftInput,
+        EagleVerifyInput,
+        EagleVerifyOutput,
+    )
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -217,8 +222,11 @@ class EagleDraftInputV2Mixin:
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
+
+@dataclass
+class EagleDraftExtendInputV2Mixin:
     def prepare_for_extend_to_fill_draft_kvcache(
-        self,
+        self: EagleDraftExtendInput,
         batch: ModelWorkerBatch,
         predict: torch.Tensor,
         num_draft_tokens: int,
@@ -335,20 +343,36 @@ class EagleVerifyInputV2Mixin:
         batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
         vocab_mask: torch.Tensor = None,
-    ):
+    ) -> "EagleVerifyOutput":
         """
         Verify and find accepted tokens based on logits output and batch
         (which contains spec decoding information).
+
+        `verify_output.accept_tokens` is the V1-style flat accepted slice;
+        `verify_output.predict` is the V2-only full padded per-position sample.
         """
+        from sglang.srt.speculative.eagle_info import (
+            EagleDraftExtendInput,
+            EagleVerifyOutput,
+        )
+
+        device = batch.input_ids.device
         if batch.forward_mode.is_idle():
-            predict = torch.empty(0, dtype=torch.int32, device=batch.input_ids.device)
-            num_correct_drafts = torch.empty(
-                0, dtype=torch.int32, device=batch.input_ids.device
+            predict = torch.empty(0, dtype=torch.int32, device=device)
+            num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
+            accept_index = torch.empty(0, dtype=torch.int32, device=device)
+            return EagleVerifyOutput(
+                draft_extend_input=EagleDraftExtendInput(
+                    hidden_states=logits_output.hidden_states,
+                    num_correct_drafts=num_correct_drafts,
+                    num_accept_tokens=num_correct_drafts + 1,
+                ),
+                logits_output=logits_output,
+                accept_tokens=torch.empty(0, dtype=torch.int32, device=device),
+                num_correct_drafts_per_req_cpu=[],
+                accept_indices=accept_index,
+                predict=predict,
             )
-            accept_index = torch.empty(
-                0, dtype=torch.int32, device=batch.input_ids.device
-            )
-            return predict, num_correct_drafts, accept_index
 
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
@@ -481,10 +505,25 @@ class EagleVerifyInputV2Mixin:
                 spec_steps=self.spec_steps,
             )
 
-        # `num_correct_drafts` stays drafts-only inside this function; the returned
-        # tensor includes the trailing/bonus token via out-of-place +1 so the
-        # name no longer flips semantics mid-function (naming doc C2).
-        return predict, num_correct_drafts + 1, accept_index
+        # `num_correct_drafts` is drafts-only here; bonus is added via out-of-place
+        # +1 when packaged into `EagleDraftExtendInput.num_accept_tokens`, so the
+        # local name does not flip semantics mid-function (naming doc C2).
+        return EagleVerifyOutput(
+            draft_extend_input=EagleDraftExtendInput(
+                # V2 keeps `hidden_states` as the full target output (shape
+                # `[bs * draft_token_num, hidden]`); V1 instead stores the
+                # accept-sliced view. The downstream V2 cuda-graph runner
+                # expects the full layout.
+                hidden_states=logits_output.hidden_states,
+                num_correct_drafts=num_correct_drafts,
+                num_accept_tokens=num_correct_drafts + 1,
+            ),
+            logits_output=logits_output,
+            accept_tokens=predict[accept_index],
+            num_correct_drafts_per_req_cpu=[],
+            accept_indices=accept_index,
+            predict=predict,
+        )
 
 
 @triton.jit
