@@ -152,7 +152,6 @@ from sglang.srt.managers.mm_utils import (
     unwrap_shm_features,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -1343,12 +1342,11 @@ class Scheduler(
             self.future_map = None
             return
 
-        self.future_map = FutureMap(
+        self.future_map = self.spec_algorithm.create_future_map(
             self.max_running_requests,
             self.chunked_prefill_size,
             self.model_config.context_len,
             self.device,
-            self.spec_algorithm,
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
