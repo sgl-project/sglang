@@ -14,6 +14,9 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+    outplace_fused_experts,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
     moe_forward_piecewise_cuda_graph_impl,
@@ -148,9 +151,14 @@ class DeepEPMoE(FusedMoE):
         ):
             # AMD HIP, NPU supports low_latency deepep without deepgemm
             # NV FP4 quantization with flashinfer_cutedsl also supports low_latency deepep without deepgemm
-            assert (
-                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+            if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                logger.warning(
+                    "DeepGEMM is not available. Falling back to Triton Fused MoE for DeepEP."
+                )
+            else:
+                assert (
+                    deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         if _use_aiter:
             # expert_mask is of size (self.num_local_experts + 1),
             # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1, but aiter does not allow -1, we use a mask to make those ids invalid)
@@ -239,6 +247,8 @@ class DeepEPMoE(FusedMoE):
         elif DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             if self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8(dispatch_output)
+            elif not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                output = self.forward_fused_moe_fallback(dispatch_output)
             else:
                 assert False, "forward_deepgemm_contiguous is deprecated"
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
@@ -262,6 +272,34 @@ class DeepEPMoE(FusedMoE):
             hidden_states=output,
             topk_ids=dispatch_output.topk_ids,
             topk_weights=dispatch_output.topk_weights,
+        )
+
+    def forward_fused_moe_fallback(self, dispatch_output):
+        hidden_states = dispatch_output.hidden_states
+        num_tokens_per_expert = dispatch_output.num_tokens_per_expert
+        topk_weights = dispatch_output.topk_weights
+
+        # Construct topk_ids
+        experts_range = torch.arange(
+            self.num_local_experts, device=hidden_states.device, dtype=torch.int32
+        )
+        topk_ids = torch.repeat_interleave(experts_range, num_tokens_per_expert).view(
+            -1, 1
+        )
+
+        return outplace_fused_experts(
+            hidden_states=hidden_states,
+            w1=self.w13_weight,
+            w2=self.w2_weight,
+            topk_weights=topk_weights.view(-1, 1),
+            topk_ids=topk_ids,
+            b1=getattr(self, "w13_weight_bias", None),
+            b2=getattr(self, "w2_weight_bias", None),
+            activation=self.moe_runner_config.activation,
+            is_gated=self.moe_runner_config.is_gated,
+            apply_router_weight_on_input=self.moe_runner_config.apply_router_weight_on_input,
+            no_combine=True,
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
 
     def combine(
