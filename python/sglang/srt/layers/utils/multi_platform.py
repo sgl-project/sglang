@@ -23,8 +23,7 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 
 
-class MultiPlatformOp(nn.Module):
-
+class _MultiPlatformBase:
     # OOT forward registry: maps dispatch_key -> {op_cls -> forward_fn}
     _oot_forward_registry: ClassVar[dict[str, dict[type, Callable]]] = {}
 
@@ -32,55 +31,6 @@ class MultiPlatformOp(nn.Module):
     def register_oot_forward(cls, op_cls: type, fn: Callable, platform_key: str):
         """Register an OOT forward implementation for a specific op class and platform."""
         cls._oot_forward_registry.setdefault(platform_key, {})[op_cls] = fn
-
-    def __init__(self):
-        super().__init__()
-        self._forward_method: Callable = self.dispatch_forward()
-
-        # States for torch.compile
-        self._original_forward_method = None
-        self.is_torch_compile = False
-
-    def enter_torch_compile(self, num_tokens: int):
-        # Skip if Op is already entered compile mode.
-        # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
-        # among layers and `enter_torch_compile` will be called many times.
-        # We should prevent `self._original_forward_method` from being overridden when
-        # it is not the first time `enter_torch_compile` called.
-        if self.is_torch_compile:
-            return
-
-        self._original_forward_method = self._forward_method
-        # NOTE: Temporarily workaround MoE
-        # The performance of torch.compile on this layer is not always good when bs > 1,
-        # so we decide to only use torch.compile when bs=1
-        if "FusedMoE" in self.__class__.__name__:
-            if num_tokens == 1:
-                from sglang.srt.layers.moe.fused_moe_native import (
-                    fused_moe_forward_native,
-                )
-
-                self._forward_method = fused_moe_forward_native
-        elif "TopK" in self.__class__.__name__:
-            if num_tokens == 1:
-                self._forward_method = self.forward_native
-        else:
-            self._forward_method = self.forward_native
-        self.is_torch_compile = True
-
-    def leave_torch_compile(self):
-        # Skip if Op is already exited compile mode.
-        if not self.is_torch_compile:
-            return
-
-        self._forward_method = self._original_forward_method
-        self._original_forward_method = None
-        self.is_torch_compile = False
-
-    # Please do not override this method, because `self._forward_method` can change when in torch compile mode
-    @debug_kernel_api
-    def forward(self, *args, **kwargs):
-        return self._forward_method(*args, **kwargs)
 
     def forward_native(self, *args, **kwargs):
         raise NotImplementedError
@@ -132,3 +82,63 @@ class MultiPlatformOp(nn.Module):
             return self.forward_musa
         else:
             return self.forward_native
+
+
+class MultiPlatformDispatcher(_MultiPlatformBase):
+    def __init__(self):
+        self._forward_method: Callable = self.dispatch_forward()
+
+    def __call__(self, *args, **kwargs):
+        return self._forward_method(*args, **kwargs)
+
+
+class MultiPlatformOp(nn.Module, _MultiPlatformBase):
+
+    def __init__(self):
+        super().__init__()
+        self._forward_method: Callable = self.dispatch_forward()
+
+        # States for torch.compile
+        self._original_forward_method = None
+        self.is_torch_compile = False
+
+    def enter_torch_compile(self, num_tokens: int):
+        # Skip if Op is already entered compile mode.
+        # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
+        # among layers and `enter_torch_compile` will be called many times.
+        # We should prevent `self._original_forward_method` from being overridden when
+        # it is not the first time `enter_torch_compile` called.
+        if self.is_torch_compile:
+            return
+
+        self._original_forward_method = self._forward_method
+        # NOTE: Temporarily workaround MoE
+        # The performance of torch.compile on this layer is not always good when bs > 1,
+        # so we decide to only use torch.compile when bs=1
+        if "FusedMoE" in self.__class__.__name__:
+            if num_tokens == 1:
+                from sglang.srt.layers.moe.fused_moe_native import (
+                    fused_moe_forward_native,
+                )
+
+                self._forward_method = fused_moe_forward_native
+        elif "TopK" in self.__class__.__name__:
+            if num_tokens == 1:
+                self._forward_method = self.forward_native
+        else:
+            self._forward_method = self.forward_native
+        self.is_torch_compile = True
+
+    def leave_torch_compile(self):
+        # Skip if Op is already exited compile mode.
+        if not self.is_torch_compile:
+            return
+
+        self._forward_method = self._original_forward_method
+        self._original_forward_method = None
+        self.is_torch_compile = False
+
+    # Please do not override this method, because `self._forward_method` can change when in torch compile mode
+    @debug_kernel_api
+    def forward(self, *args, **kwargs):
+        return self._forward_method(*args, **kwargs)

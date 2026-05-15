@@ -5,6 +5,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import get_device_capability, is_musa
 
 _is_musa = is_musa()
@@ -135,6 +136,12 @@ def create_flashmla_backend(runner):
 
 @register_attention_backend("fa3")
 def create_flashattention_v3_backend(runner):
+    if current_platform.is_out_of_tree():
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        return FlashAttentionBackend(runner)
 
     major, minor = get_device_capability()
     if not _is_musa:

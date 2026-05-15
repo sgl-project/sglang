@@ -17,6 +17,7 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
@@ -25,12 +26,236 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sgl_kernel import merge_state_v2
+from sglang.srt.layers.utils import MultiPlatformDispatcher
 
-from sglang.jit_kernel.flash_attention import (
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
-)
+
+class FlashAttnVarlenFuncOp(MultiPlatformDispatcher):
+
+    def __init__(self, fa_impl_ver: int = 3) -> None:
+        super().__init__()
+        self.fa_impl_ver = fa_impl_ver
+
+    def _resolve_impl(self):
+        if self.fa_impl_ver == 3:
+            from sgl_kernel.flash_attn import flash_attn_varlen_func
+        elif self.fa_impl_ver == 4:
+            from sglang.jit_kernel.flash_attention_v4 import flash_attn_varlen_func
+        else:
+            raise ValueError(f"Invalid fa_impl_ver: {self.fa_impl_ver}")
+        return flash_attn_varlen_func
+
+    def forward_native(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        window_size: tuple = (-1, -1),
+        softcap: float = 0.0,
+        num_splits: int = 1,
+        return_softmax_lse: bool = False,
+        sinks: Optional[torch.Tensor] = None,
+        ver: int = 3,
+        out: Optional[torch.Tensor] = None,
+    ):
+        return self._resolve_impl()(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            num_splits=num_splits,
+            return_softmax_lse=return_softmax_lse,
+            sinks=sinks,
+            ver=ver,
+            out=out,
+        )
+
+    def forward_cuda(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        window_size: tuple = (-1, -1),
+        softcap: float = 0.0,
+        num_splits: int = 1,
+        return_softmax_lse: bool = False,
+        sinks: Optional[torch.Tensor] = None,
+        ver: int = 3,
+        out: Optional[torch.Tensor] = None,
+    ):
+        return self._resolve_impl()(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            num_splits=num_splits,
+            return_softmax_lse=return_softmax_lse,
+            sinks=sinks,
+            ver=ver,
+            out=out,
+        )
+
+
+class FlashAttnWithKvcacheOp(MultiPlatformDispatcher):
+
+    def __init__(self, fa_impl_ver: int = 3) -> None:
+        super().__init__()
+        self.fa_impl_ver = fa_impl_ver
+
+    def _resolve_impl(self):
+        if self.fa_impl_ver == 3:
+            from sgl_kernel.flash_attn import flash_attn_with_kvcache
+        elif self.fa_impl_ver == 4:
+            from sglang.jit_kernel.flash_attention_v4 import flash_attn_with_kvcache
+        else:
+            raise ValueError(f"Invalid fa_impl_ver: {self.fa_impl_ver}")
+        return flash_attn_with_kvcache
+
+    def forward_native(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        qv: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
+        cache_seqlens: Optional[torch.Tensor] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_k_new: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[int] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        window_size: tuple = (-1, -1),
+        softcap: float = 0.0,
+        scheduler_metadata: Optional[torch.Tensor] = None,
+        num_splits: int = 0,
+        return_softmax_lse: bool = False,
+        sinks: Optional[torch.Tensor] = None,
+        ver: int = 3,
+        out: Optional[torch.Tensor] = None,
+    ):
+        return self._resolve_impl()(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            qv=qv,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            max_seqlen_q=max_seqlen_q,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            scheduler_metadata=scheduler_metadata,
+            num_splits=num_splits,
+            return_softmax_lse=return_softmax_lse,
+            sinks=sinks,
+            ver=ver,
+            out=out,
+        )
+
+    def forward_cuda(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        qv: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
+        cache_seqlens: Optional[torch.Tensor] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_k_new: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[int] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        window_size: tuple = (-1, -1),
+        softcap: float = 0.0,
+        scheduler_metadata: Optional[torch.Tensor] = None,
+        num_splits: int = 0,
+        return_softmax_lse: bool = False,
+        sinks: Optional[torch.Tensor] = None,
+        ver: int = 3,
+        out: Optional[torch.Tensor] = None,
+    ):
+        return self._resolve_impl()(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            qv=qv,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            max_seqlen_q=max_seqlen_q,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            scheduler_metadata=scheduler_metadata,
+            num_splits=num_splits,
+            return_softmax_lse=return_softmax_lse,
+            sinks=sinks,
+            ver=ver,
+            out=out,
+        )
+
+
+class MergeStateV2Op(MultiPlatformDispatcher):
+
+    def forward_native(
+        self,
+        o: torch.Tensor,
+        s_a: torch.Tensor,
+        o_exp: torch.Tensor,
+        s_b: torch.Tensor,
+    ):
+        from sgl_kernel import merge_state_v2
+
+        return merge_state_v2(o, s_a, o_exp, s_b)
+
+    def forward_cuda(
+        self,
+        o: torch.Tensor,
+        s_a: torch.Tensor,
+        o_exp: torch.Tensor,
+        s_b: torch.Tensor,
+    ):
+        from sgl_kernel import merge_state_v2
+
+        return merge_state_v2(o, s_a, o_exp, s_b)
 
 
 @dataclass
@@ -166,25 +391,27 @@ class FlashAttentionBackend(AttentionBackend):
         # Select version
         self.fa_impl_ver = fa_impl_ver
         if self.fa_impl_ver == 3:
-            from sgl_kernel.flash_attn import (
-                flash_attn_varlen_func,
-                flash_attn_with_kvcache,
-                get_scheduler_metadata,
-            )
+            if not current_platform.is_out_of_tree():
+                from sgl_kernel.flash_attn import get_scheduler_metadata
 
-            self._get_scheduler_metadata = get_scheduler_metadata
+                self._get_scheduler_metadata = get_scheduler_metadata
+            else:
+                self._get_scheduler_metadata = None
         elif self.fa_impl_ver == 4:
-            from sglang.jit_kernel.flash_attention_v4 import (
-                flash_attn_varlen_func,
-                flash_attn_with_kvcache,
-            )
-
             self._get_scheduler_metadata = None
         else:
             raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
 
-        self.flash_attn_varlen_func = flash_attn_varlen_func
-        self.flash_attn_with_kvcache = flash_attn_with_kvcache
+        # MultiPlatformOp wrappers around the underlying flash-attention kernels.
+        # OOT platforms register their own forward via
+        # ``MultiPlatformOp.register_oot_forward``.
+        self.flash_attn_varlen_func = FlashAttnVarlenFuncOp(
+            fa_impl_ver=self.fa_impl_ver
+        )
+        self.flash_attn_with_kvcache = FlashAttnWithKvcacheOp(
+            fa_impl_ver=self.fa_impl_ver
+        )
+        self.merge_state_v2 = MergeStateV2Op()
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
@@ -753,7 +980,7 @@ class FlashAttentionBackend(AttentionBackend):
                 def _fa_cp_attn(
                     q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
                 ):
-                    return flash_attn_with_kvcache(
+                    return self.flash_attn_with_kvcache(
                         q=q_chunk,
                         k_cache=key_cache,
                         v_cache=value_cache,
@@ -790,7 +1017,7 @@ class FlashAttentionBackend(AttentionBackend):
                     "fa_skip_kv_cache uses raw K/V tensors, "
                     "FP8 KV cache descaling is not supported in this mode"
                 )
-                result = flash_attn_varlen_func(
+                result = self.flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
@@ -807,7 +1034,7 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
-                result = flash_attn_with_kvcache(
+                result = self.flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -831,32 +1058,37 @@ class FlashAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    # Here metadata_expand.page_table is not divided with page_size.
-                    # This is because we loose the fine control of  what token to attend,
-                    # but has to attend to some block completely.
-                    k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
-                    v_cache=value_cache.view(
-                        -1, 1, layer.tp_v_head_num, layer.head_dim
-                    ),
-                    page_table=self.forward_metadata_spec_decode_expand.page_table,
-                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                    softmax_scale=layer.scaling,
-                    causal=False,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    return_softmax_lse=True,
-                    num_splits=self.num_splits,
-                    ver=self.fa_impl_ver,
-                    **kwargs,
+                o_expand, softmax_lse_expand, *rest_expand = (
+                    self.flash_attn_with_kvcache(
+                        q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        # Here metadata_expand.page_table is not divided with page_size.
+                        # This is because we loose the fine control of  what token to attend,
+                        # but has to attend to some block completely.
+                        k_cache=key_cache.view(
+                            -1, 1, layer.tp_k_head_num, layer.head_dim
+                        ),
+                        v_cache=value_cache.view(
+                            -1, 1, layer.tp_v_head_num, layer.head_dim
+                        ),
+                        page_table=self.forward_metadata_spec_decode_expand.page_table,
+                        cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                        cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                        cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                        max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                        softmax_scale=layer.scaling,
+                        causal=False,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        return_softmax_lse=True,
+                        num_splits=self.num_splits,
+                        ver=self.fa_impl_ver,
+                        **kwargs,
+                    )
                 )
                 o, _ = merge_state_v2_wrapper(
+                    self.merge_state_v2,
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,
@@ -882,7 +1114,7 @@ class FlashAttentionBackend(AttentionBackend):
                     assert chunk_idx >= 0
 
                     assert forward_batch.mha_return_lse
-                    output = flash_attn_varlen_func(
+                    output = self.flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -909,7 +1141,7 @@ class FlashAttentionBackend(AttentionBackend):
                         if not forward_batch.mha_one_shot
                         else metadata.max_seq_len_k
                     )
-                    output = flash_attn_varlen_func(
+                    output = self.flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -956,7 +1188,7 @@ class FlashAttentionBackend(AttentionBackend):
                     q_nope = q_all[:, :, : layer.v_head_dim]
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
-                result = flash_attn_with_kvcache(
+                result = self.flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
                     v_cache=c_kv_cache,
@@ -978,7 +1210,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
+                        self.flash_attn_with_kvcache(
                             q=q_rope,
                             k_cache=k_rope_cache,
                             v_cache=c_kv_cache,
@@ -1000,6 +1232,7 @@ class FlashAttentionBackend(AttentionBackend):
                         )
                     )
                     o, _ = merge_state_v2_wrapper(
+                        self.merge_state_v2,
                         o,
                         softmax_lse.T.contiguous(),
                         o_expand,
@@ -1107,7 +1340,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
-                o = flash_attn_with_kvcache(
+                o = self.flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -1128,7 +1361,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
-                o = flash_attn_with_kvcache(
+                o = self.flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -1175,7 +1408,7 @@ class FlashAttentionBackend(AttentionBackend):
                     and not use_cascade_attn
                 ):
                     sched_meta = metadata.scheduler_metadata
-                result = flash_attn_with_kvcache(
+                result = self.flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -1199,7 +1432,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
+                        self.flash_attn_with_kvcache(
                             q=q_reshaped,
                             k_cache=key_cache,
                             v_cache=value_cache,
@@ -1220,7 +1453,7 @@ class FlashAttentionBackend(AttentionBackend):
                             **kwargs,
                         )
                     )
-                    o, _ = merge_state_v2(
+                    o, _ = self.merge_state_v2(
                         o,
                         softmax_lse.T.contiguous(),
                         o_expand,
@@ -1256,7 +1489,7 @@ class FlashAttentionBackend(AttentionBackend):
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
 
-            result = flash_attn_with_kvcache(
+            result = self.flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
@@ -1277,27 +1510,29 @@ class FlashAttentionBackend(AttentionBackend):
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
-                    q=q_rope,
-                    k_cache=k_rope_cache,
-                    v_cache=c_kv_cache,
-                    qv=q_nope,
-                    page_table=self.forward_metadata_spec_decode_expand.page_table,
-                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                    softmax_scale=layer.scaling,
-                    causal=False,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    return_softmax_lse=True,
-                    num_splits=self.num_splits,
-                    ver=self.fa_impl_ver,
+                o_expand, softmax_lse_expand, *rest_expand = (
+                    self.flash_attn_with_kvcache(
+                        q=q_rope,
+                        k_cache=k_rope_cache,
+                        v_cache=c_kv_cache,
+                        qv=q_nope,
+                        page_table=self.forward_metadata_spec_decode_expand.page_table,
+                        cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                        cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                        cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                        max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                        softmax_scale=layer.scaling,
+                        causal=False,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        return_softmax_lse=True,
+                        num_splits=self.num_splits,
+                        ver=self.fa_impl_ver,
+                    )
                 )
-                o, _ = merge_state_v2(
+                o, _ = self.merge_state_v2(
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,
@@ -3202,5 +3437,5 @@ def cdiv(a: int, b: int) -> int:
 
 # TODO(hebiao064): remove this once we have a better way to handle the merge_state_v2 torch.compile issue
 @torch._dynamo.disable()
-def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
-    return merge_state_v2(o, s_a, o_exp, s_b)
+def merge_state_v2_wrapper(merge_op, o, s_a, o_exp, s_b):
+    return merge_op(o, s_a, o_exp, s_b)
