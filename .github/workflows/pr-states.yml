@@ -82,10 +82,7 @@ jobs:
               repo: context.repo.repo,
               pull_number: context.issue.number,
             });
-            let body = pr.body || '';
-
-            // One-time migration: strip the legacy `pr-awareness:` block.
-            body = body.replace(/(?:\n+---\n+)?<!-- pr-awareness:start -->[\s\S]*?<!-- pr-awareness:end -->/, '');
+            const body = pr.body || '';
 
             const blockRe = new RegExp(`(?:\\n+---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
             let newBody;
