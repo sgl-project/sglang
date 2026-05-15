@@ -51,9 +51,9 @@ impl AppContext {
                 },
                 observability: Default::default(),
                 models: vec![],
-                worker: crate::config::WorkerConfig {
+                workers: vec![crate::config::WorkerConfig {
                     url: "http://x".into(),
-                },
+                }],
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
             proxy: Arc::new(Proxy::new("http://x".into())),

@@ -27,8 +27,13 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.worker.url.is_empty() {
-            return Err(anyhow!("worker.url must be set"));
+        if self.workers.is_empty() {
+            return Err(anyhow!("at least one worker required"));
+        }
+        for w in &self.workers {
+            if w.url.is_empty() {
+                return Err(anyhow!("worker.url must be set"));
+            }
         }
         for m in &self.models {
             if m.id.is_empty() {
@@ -56,15 +61,15 @@ server:
 models:
   - id: "qwen3-0.6b"
     tokenizer_path: "/tmp/qwen.json"
-worker:
-  url: "http://127.0.0.1:30000"
+workers:
+  - url: "http://127.0.0.1:30000"
 "#,
         )
         .unwrap();
         let c = Config::from_path(&p).unwrap();
         assert_eq!(c.server.port, 8090);
         assert_eq!(c.models[0].id, "qwen3-0.6b");
-        assert_eq!(c.worker.url, "http://127.0.0.1:30000");
+        assert_eq!(c.workers[0].url, "http://127.0.0.1:30000");
     }
 
     #[test]
@@ -80,7 +85,7 @@ port = 8090
 [[models]]
 id = "qwen3-0.6b"
 tokenizer_path = "/tmp/qwen.json"
-[worker]
+[[workers]]
 url = "http://127.0.0.1:30000"
 "#,
         )
@@ -90,7 +95,46 @@ url = "http://127.0.0.1:30000"
     }
 
     #[test]
-    fn rejects_missing_worker() {
+    fn loads_workers_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "qwen3-0.6b"
+tokenizer_path = "/tmp/qwen.json"
+[[workers]]
+url = "http://127.0.0.1:30000"
+"#,
+        )
+        .unwrap();
+        let c = Config::from_path(&p).unwrap();
+        assert_eq!(c.workers.len(), 1);
+        assert_eq!(c.workers[0].url, "http://127.0.0.1:30000");
+    }
+
+    #[test]
+    fn rejects_empty_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            "server:\n  host: \"0.0.0.0\"\n  port: 8090\nmodels: []\nworkers: []\n",
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("worker"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_workers() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("c.yaml");
         std::fs::write(
@@ -99,7 +143,10 @@ url = "http://127.0.0.1:30000"
         )
         .unwrap();
         let err = Config::from_path(&p).unwrap_err();
-        assert!(err.to_string().contains("worker"), "got: {err}");
+        assert!(
+            err.to_string().to_lowercase().contains("worker"),
+            "got: {err}"
+        );
     }
 
     #[test]

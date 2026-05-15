@@ -6,7 +6,7 @@ pub struct Config {
     #[serde(default)]
     pub observability: ObservabilityConfig,
     pub models: Vec<ModelConfig>,
-    pub worker: WorkerConfig,
+    pub workers: Vec<WorkerConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

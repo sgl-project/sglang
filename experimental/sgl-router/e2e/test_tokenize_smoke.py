@@ -15,7 +15,7 @@ def test_tokenize_round_trip(router: str) -> None:
     # Tokenize
     tok_resp = httpx.post(
         f"{router}/v1/tokenize",
-        json={"model": MODEL, "text": TEXT},
+        json={"model": MODEL, "prompt": TEXT},
         timeout=30,
     )
     assert tok_resp.status_code == 200, tok_resp.text
