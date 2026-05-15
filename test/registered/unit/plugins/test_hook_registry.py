@@ -16,7 +16,7 @@ from sglang.srt.plugins.hook_registry import HookRegistry, HookType, plugin_hook
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
 
 # ---------------------------------------------------------------------------
 # Helpers: synthetic module creation

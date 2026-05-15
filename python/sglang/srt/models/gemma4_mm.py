@@ -221,8 +221,29 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
+        self.capture_aux_hidden_states = False
 
         self.post_init()
+
+    @property
+    def model(self):
+        # Alias .model to .language_model so this class satisfies the piecewise
+        # CUDA graph gate (which checks `hasattr(model, "model")`). Implemented
+        # as a property to avoid registering a duplicate submodule in
+        # `_modules`, which would double state_dict keys and disturb
+        # ShardedStateLoader / CPU-offload / dummy-init paths.
+        return self.language_model
+
+    def __setattr__(self, name, value):
+        # Block writes to "model" so the runner's
+        # `self.model.model = resolve_language_model(self.model)` (which for
+        # this class returns language_model itself) is a no-op rather than a
+        # nn.Module submodule registration. Without this, nn.Module.__setattr__
+        # would bypass the @property's setter for Module values and pollute
+        # `_modules` with a duplicate alias, doubling state_dict keys.
+        if name == "model":
+            return
+        super().__setattr__(name, value)
 
     def pad_input_ids(
         self,
@@ -235,6 +256,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
+
+    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Gemma 4 multimodal ties its LM head to the text embed_tokens
+        embed = self.language_model.embed_tokens.weight
+        return embed, embed
 
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
@@ -569,9 +595,18 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             **kwargs,
         )
 
+        # Unpack aux_hidden_states if Eagle3 capture is active
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         # Process hidden states through logits processor
         return self.logits_processor(
-            input_ids, hidden_states, self.language_model.embed_tokens, forward_batch
+            input_ids,
+            hidden_states,
+            self.language_model.embed_tokens,
+            forward_batch,
+            aux_hidden_states,
         )
 
     def tie_weights(self, recompute_mapping=False):
@@ -767,6 +802,41 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 and int(m.group(1)) in k_eq_v_layers
             )
 
+            # Per-expert checkpoint format used by compressed-tensors / FP8
+            # (e.g. RedHatAI/*-FP8-Dynamic). Each expert is stored as a
+            # separate key with shape (out, in):
+            #   experts.<id>.gate_proj.{weight,weight_scale}
+            #   experts.<id>.up_proj.{weight,weight_scale}
+            #   experts.<id>.down_proj.{weight,weight_scale}
+            # These need to be folded into sglang's fused FusedMoE params:
+            #   experts.w13_weight[_scale]  (gate->shard "w1", up->shard "w3")
+            #   experts.w2_weight[_scale]   (down->shard "w2")
+            per_expert_match = re.match(
+                r"^(.*?\.moe\.experts\.)(\d+)\.(gate_proj|up_proj|down_proj)"
+                r"\.(weight|weight_scale)$",
+                name,
+            )
+            if per_expert_match:
+                prefix = per_expert_match.group(1)
+                expert_id = int(per_expert_match.group(2))
+                proj = per_expert_match.group(3)
+                suffix = per_expert_match.group(4)
+                if proj == "gate_proj":
+                    base, sid = "w13_weight", "w1"
+                elif proj == "up_proj":
+                    base, sid = "w13_weight", "w3"
+                else:  # down_proj
+                    base, sid = "w2_weight", "w2"
+                if suffix == "weight_scale":
+                    base += "_scale"
+                fused_name = prefix + base
+                if fused_name in params_dict:
+                    param = params_dict[fused_name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, fused_name, sid, expert_id)
+                    loaded_params.add(fused_name)
+                continue
+
             # MoE expert weights checked first (gate_up_proj contains "up_proj"
             # which would false-match the stacked dense MLP mapping).
             orig_name = name
@@ -873,6 +943,29 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return self.config.intermediate_size[0], self.config.hidden_size
         else:
             raise NotImplementedError()
+
+    def get_embed(self):
+        return self.language_model.embed_tokens.weight
+
+    def get_embed_and_head(self):
+        embed = self.language_model.embed_tokens.weight
+        # Gemma4 ties word embeddings, so embed_tokens serves as lm_head
+        return embed, embed
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        text_config = self.config.text_config
+        if layer_ids is None:
+            num_layers = text_config.num_hidden_layers
+            self.language_model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]
+        else:
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.language_model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Gemma4ForConditionalGeneration

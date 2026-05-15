@@ -4,20 +4,23 @@ import threading
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
-from flash_attn import flash_attn_varlen_func
-from flash_attn import flash_attn_with_kvcache as mate_flash_attn_with_kvcache
-from flash_attn import get_scheduler_metadata
+from flash_attn_interface import flash_attn_varlen_func
+from flash_attn_interface import flash_attn_with_kvcache as mate_flash_attn_with_kvcache
+from flash_attn_interface import get_scheduler_metadata
 
 from sglang.srt.distributed import get_pp_group, get_pp_indices
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.musa.layers.utils.cp_utils import (
+    musa_cp_attn_forward_extend as cp_attn_forward_extend,
+)
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionBackend,
+    FlashAttentionMultiStepBackend,
     merge_state_v2_wrapper,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
-    cp_attn_forward_extend,
 )
 from sglang.srt.server_args import get_global_server_args
 
@@ -143,10 +146,15 @@ def flash_attn_with_kvcache(
     pack_gqa=None,
     sm_margin: int = 0,
     return_softmax_lse: bool = False,
-    ver: int = 3,
-    **kwargs,
+    sinks=None,
+    score_mod=None,
+    aux_tensors=None,
+    ver=3,
 ):
     """MUSA flash_attn_with_kvcache wrapper that auto-injects scheduler_metadata."""
+    if ver != 3:
+        raise ValueError("Only ver=3 is supported for MUSA FA3.")
+
     if scheduler_metadata is None and _CURRENT_BACKEND is not None:
         backend = _CURRENT_BACKEND
         # Ensure backend has been properly set up for this call
@@ -195,6 +203,7 @@ def flash_attn_with_kvcache(
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
         return_softmax_lse=return_softmax_lse,
+        sinks=sinks,
     )
 
 
@@ -211,6 +220,9 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         self._current_max_seqlen_k: int = 0
         self._current_can_run_tbo: bool = False
 
+        # Disable default scheduler metadata for fa3
+        self._get_scheduler_metadata = None
+
         # Register this backend as the global current instance for the wrapper
         global _CURRENT_BACKEND
         _CURRENT_BACKEND = self
@@ -223,17 +235,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         self._current_prefix = prefix
         self._current_max_seqlen_k = max_seqlen_k
         self._current_can_run_tbo = can_run_tbo
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        super().init_forward_metadata(forward_batch)
-        metadata = self.forward_metadata
-        if not hasattr(metadata, "extend_with_prefix"):
-            metadata.extend_with_prefix = False
-
-        if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
-            include_draft_extend_v2=True
-        ):
-            metadata.extend_with_prefix = any(forward_batch.extend_prefix_lens_cpu)
 
     def forward_extend(
         self,
@@ -402,13 +403,17 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     )
 
                 result = cp_attn_forward_extend(
+                    self,
                     forward_batch,
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     self.device,
                     _fa_cp_attn,
                 )
             elif (
-                metadata.extend_with_prefix
+                (
+                    forward_batch.extend_prefix_lens_cpu is not None
+                    and any(forward_batch.extend_prefix_lens_cpu)
+                )
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend()
             ):
@@ -431,50 +436,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
-
-                if use_cascade_attn:
-                    # Update state for the second call
-                    self._current_prefix = "forward_extend_use_cascade_attn"
-                    self._current_max_seqlen_k = (
-                        self.forward_metadata_spec_decode_expand.max_seq_len_k
-                    )
-
-                    o, softmax_lse, *rest = result
-                    o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
-                            q=q.contiguous().view(
-                                -1, layer.tp_q_head_num, layer.head_dim
-                            ),
-                            k_cache=key_cache.view(
-                                -1, 1, layer.tp_k_head_num, layer.head_dim
-                            ),
-                            v_cache=value_cache.view(
-                                -1, 1, layer.tp_v_head_num, layer.head_dim
-                            ),
-                            page_table=self.forward_metadata_spec_decode_expand.page_table,
-                            cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                            cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                            cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                            max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                            softmax_scale=layer.scaling,
-                            causal=False,
-                            window_size=window_size,
-                            softcap=layer.logit_cap,
-                            k_descale=k_descale,
-                            v_descale=v_descale,
-                            return_softmax_lse=True,
-                            num_splits=self.num_splits,
-                            **kwargs,
-                        )
-                    )
-                    o, _ = merge_state_v2_wrapper(
-                        o,
-                        softmax_lse.T.contiguous(),
-                        o_expand,
-                        softmax_lse_expand.T.contiguous(),
-                    )
-                else:
-                    o = result
             else:
                 output = flash_attn_varlen_func(
                     q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -487,6 +448,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     softmax_scale=layer.scaling,
                     causal=True,
                     return_softmax_lse=forward_batch.mha_return_lse,
+                    **kwargs,
                 )
                 if forward_batch.mha_return_lse:
                     output, lse, *rest = output
@@ -496,6 +458,44 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                         lse,
                     )
                 return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            if use_cascade_attn:
+                # Update state for the second call
+                self._current_prefix = "forward_extend_use_cascade_attn"
+                self._current_max_seqlen_k = (
+                    self.forward_metadata_spec_decode_expand.max_seq_len_k
+                )
+
+                o, softmax_lse, *rest = result
+                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
+                    v_cache=value_cache.view(
+                        -1, 1, layer.tp_v_head_num, layer.head_dim
+                    ),
+                    page_table=self.forward_metadata_spec_decode_expand.page_table,
+                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                    softmax_scale=layer.scaling,
+                    causal=False,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=True,
+                    num_splits=self.num_splits,
+                    **kwargs,
+                )
+                o, _ = merge_state_v2_wrapper(
+                    o,
+                    softmax_lse.T.contiguous(),
+                    o_expand,
+                    softmax_lse_expand.T.contiguous(),
+                )
+            else:
+                o = result
         else:
             if (
                 forward_batch.attn_attend_prefix_cache is not None
@@ -911,3 +911,28 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 o = result
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
+class MusaFlashAttentionMultiStepBackend(FlashAttentionMultiStepBackend):
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+        fa_impl_ver: int = 3,
+    ):
+        self.model_runner = model_runner
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends = []
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends.append(
+                MusaFlashAttentionBackend(
+                    model_runner,
+                    speculative_step_id=i,
+                    topk=self.topk,
+                    speculative_num_steps=self.speculative_num_steps,
+                    fa_impl_ver=fa_impl_ver,
+                )
+            )

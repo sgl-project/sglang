@@ -453,6 +453,15 @@ class LlavaBaseForCausalLM(nn.Module):
         elif forward_batch.forward_mode.is_decode():
             return self.language_model(input_ids, positions, forward_batch)
 
+    def get_embed_and_head(self):
+        # Spec-decode plumbing: expose the LM's embed/head so the EAGLE draft
+        # can share them with the target. self.language_model is a Llama-family
+        # CausalLM that defines this method.
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        self.language_model.set_embed_and_head(embed, head)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Load clip vision model by cfg['mm_vision_tower']:
         # huggingface_name or path_of_clip_relative_to_llava_model_dir
@@ -495,6 +504,9 @@ class LlavaBaseForCausalLM(nn.Module):
             "model.mm_projector.0": "multi_modal_projector.linear_1",
             "model.mm_projector.2": "multi_modal_projector.linear_2",
             "model.vision_tower.vision_tower": "vision_tower",
+            # transformers 5.6.0 flattened CLIPVisionModel/SiglipVisionModel,
+            # dropping the `vision_model` intermediate wrapper.
+            "vision_tower.vision_model.": "vision_tower.",
             # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
             "model.image_newline": "language_model.model.image_newline",
         }
