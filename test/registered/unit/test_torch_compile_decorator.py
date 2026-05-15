@@ -1,6 +1,12 @@
 import tempfile
 from unittest.mock import MagicMock, patch
 
+import torch
+
+from sglang.srt.compilation.export_artifact import (
+    make_export_artifact_spec,
+)
+from sglang.srt.compilation.export_backends import ExportRuntime
 from sglang.srt.compilation.torch_compile import TorchCompileConfig, sgl_compile
 from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
@@ -9,6 +15,16 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
+
+
+class _StubRuntime(ExportRuntime):
+    def __init__(self, runtime_callable):
+        self.runtime_callable = runtime_callable
+        self.calls = []
+
+    def prepare_runtime(self, exported_program, artifact, compile_config):
+        self.calls.append((exported_program, artifact, compile_config))
+        return self.runtime_callable
 
 
 class _StubPlatform(SRTPlatform):
@@ -25,6 +41,7 @@ class _StubPlatform(SRTPlatform):
         self.strategy = strategy
         self.defaults = defaults or TorchCompileConfig()
         self.runtime_callable = runtime_callable
+        self.runtime = _StubRuntime(runtime_callable) if runtime_callable else None
 
     def get_compile_backend(self, mode=None):
         return f"backend:{mode}" if mode else "backend"
@@ -35,10 +52,10 @@ class _StubPlatform(SRTPlatform):
     def torch_compile_defaults(self):
         return self.defaults
 
-    def make_exported_program_callable(self, exported_program, compile_config):
-        if self.runtime_callable is not None:
-            return self.runtime_callable
-        return exported_program.module()
+    def get_export_runtime(self, compile_config):
+        if self.runtime is not None:
+            return self.runtime
+        return super().get_export_runtime(compile_config)
 
     def get_device_total_memory(self, device_id=0):
         return 0
@@ -154,10 +171,11 @@ class TestSglCompile(CustomTestCase):
 
     def test_export_run_exported_uses_platform_runtime(self):
         runtime = MagicMock(return_value="runtime")
-        self.platforms._current_platform = _StubPlatform(
+        platform = _StubPlatform(
             strategy="export",
             runtime_callable=runtime,
         )
+        self.platforms._current_platform = platform
         exported_program = MagicMock()
 
         with patch("torch.export.export", return_value=exported_program):
@@ -169,6 +187,57 @@ class TestSglCompile(CustomTestCase):
             self.assertEqual(fn(1), "runtime")
 
         runtime.assert_called_once_with(1)
+        self.assertEqual(platform.runtime.calls[0][0], exported_program)
+        self.assertEqual(platform.runtime.calls[0][1].export_format, "torch")
+
+    def test_export_only_builds_artifacts_and_runs_original(self):
+        self.platforms._current_platform = _StubPlatform(strategy="export")
+        exported_program = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with envs.SGLANG_EXPORT_DIR.override(tmpdir):
+                with patch("torch.export.export", return_value=exported_program):
+                    with patch("torch.export.save") as mock_save:
+
+                        @sgl_compile(key="unit_export_only", export_artifact_mode="export_only")
+                        def fn(x):
+                            return x + 1
+
+                        self.assertEqual(fn(1), 2)
+
+        mock_save.assert_called_once()
+
+    def test_load_only_requires_prebuilt_torch_program(self):
+        self.platforms._current_platform = _StubPlatform(strategy="export")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with envs.SGLANG_EXPORT_DIR.override(tmpdir):
+
+                @sgl_compile(key="missing_export", export_artifact_mode="load_only")
+                def fn(x):
+                    return x + 1
+
+                with self.assertRaises(FileNotFoundError):
+                    fn(1)
+
+    def test_artifact_spec_records_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with envs.SGLANG_EXPORT_DIR.override(tmpdir):
+                spec = make_export_artifact_spec(
+                    key="pkg.fn",
+                    export_format="onnx",
+                    mode="build_if_missing",
+                    shape_policy="infer_dynamic",
+                    copy_output_to_arg_index=0,
+                    args=(torch.ones(2, 3),),
+                )
+                spec.write_metadata()
+                loaded = spec.load_metadata()
+
+        self.assertEqual(spec.safe_key, "pkg.fn")
+        self.assertEqual(loaded.format, "onnx")
+        self.assertEqual(loaded.copy_output_to_arg_index, 0)
+        self.assertEqual(loaded.input_schema[0].shape, (2, 3))
 
 
 if __name__ == "__main__":

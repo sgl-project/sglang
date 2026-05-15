@@ -238,6 +238,9 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
 | `get_paged_allocator_cls()` | `raise NotImplementedError` | Paged allocator class |
 | `get_piecewise_backend_cls()` | `raise NotImplementedError` | Piecewise compilation backend class |
 | `get_compile_backend(mode)` | `"inductor"` | Compilation backend string |
+| `torch_compile_strategy()` | `"compile"` | Per-callsite `@sgl_compile` policy: `compile`, `noop`, or `export` |
+| `torch_compile_defaults()` | `TorchCompileConfig()` | Platform defaults for decorated compile/export callsites |
+| `get_export_runtime(config)` | `TorchExportRuntime()` | Runtime backend for exported graph artifacts |
 | `get_dispatch_key_name()` | `"native"` | MultiPlatformOp dispatch key name |
 
 #### Lifecycle Hooks (from SRTPlatform)
@@ -247,12 +250,64 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
 | `apply_server_args_defaults(server_args)` | After ServerArgs parsing, in `__post_init__` | Set platform-specific defaults |
 | `init_backend()` | In each worker, before model construction | One-time backend initialization |
 
+### Platform-Controlled Compile And Export
+
+Platforms can control decorated callsites through `@sgl_compile`. This lets an
+in-tree or out-of-tree platform choose normal `torch.compile`, skip compilation,
+or export callsite graphs for another runtime such as ONNX Runtime.
+
+```python
+from sglang.srt.compilation.export_backends import OnnxExportRuntime
+from sglang.srt.compilation.torch_compile import TorchCompileConfig
+from sglang.srt.platforms.interface import SRTPlatform
+
+
+class MyOnnxOnlyPlatform(SRTPlatform):
+    device_name = "my_onnx_device"
+    device_type = "cpu"
+
+    def torch_compile_strategy(self):
+        return "export"
+
+    def torch_compile_defaults(self):
+        return TorchCompileConfig(
+            export_format="onnx",
+            run_exported=True,
+            forced_fields={"export_format", "run_exported"},
+        )
+
+    def get_export_runtime(self, compile_config):
+        return OnnxExportRuntime(providers=["CPUExecutionProvider"])
+```
+
+The export path writes artifacts under `SGLANG_EXPORT_DIR`:
+
+| Artifact | Purpose |
+|---|---|
+| `<key>.pt2` | `torch.export.ExportedProgram` |
+| `<key>.onnx` | ONNX artifact when `export_format="onnx"` |
+| `<key>.metadata.json` | Key, format, shape policy, input schema, version, and mutation metadata |
+
+`SGLANG_EXPORT_ARTIFACT_MODE` controls artifact lifecycle:
+
+| Mode | Behavior |
+|---|---|
+| `build_if_missing` | Load existing artifacts or export missing artifacts |
+| `export_only` | Build artifacts and run the original Python callable |
+| `load_only` | Require prebuilt artifacts and fail if they are missing |
+
+Callsites can override defaults with `@sgl_compile(...)`. Useful options include
+`key`, `dynamic_shapes`, `shape_policy`, `export_artifact_mode`,
+`copy_output_to_arg_index`, and `run_exported`.
+
 ### Environment Variables
 
 | Variable | Description |
 |---|---|
 | `SGLANG_PLATFORM` | Select the platform plugin by entry_point name (e.g. `kunlun`, `demo_cuda`). When set, **only** the named plugin's `activate()` is called (front-loading filter) — other plugins are not touched. Additionally, general plugins (`sglang.srt.plugins`) from unselected platform packages are automatically skipped to avoid importing their dependencies. Required when multiple plugins would activate. Errors if the name is not found or if the plugin's hardware is unavailable. |
 | `SGLANG_PLUGINS` | Comma-separated whitelist of general plugin names to load (group: `sglang.srt.plugins`). If unset, all discovered general plugins are loaded. |
+| `SGLANG_EXPORT_DIR` | Directory for `@sgl_compile` exported graph artifacts. |
+| `SGLANG_EXPORT_ARTIFACT_MODE` | Optional override for export artifact lifecycle: `build_if_missing`, `export_only`, or `load_only`. |
 
 ---
 

@@ -15,6 +15,7 @@ from sglang.srt.platforms.builtin import (
     CudaOnnxPlatform,
     CudaPlatform,
     NpuPlatform,
+    OnnxPlatform,
     resolve_builtin_platform,
     resolve_builtin_platform_by_name,
 )
@@ -251,6 +252,15 @@ class TestSRTPlatform(CustomTestCase):
             module,
         )
 
+    def test_get_export_runtime_default(self):
+        from sglang.srt.compilation.export_backends import TorchExportRuntime
+
+        base = SRTPlatform()
+        self.assertIsInstance(
+            base.get_export_runtime(TorchCompileConfig()),
+            TorchExportRuntime,
+        )
+
 
 class TestSRTPlatformOverrides(CustomTestCase):
     """Tests for SRTPlatform method overrides via plugins."""
@@ -295,12 +305,23 @@ class TestBuiltinPlatforms(CustomTestCase):
         self.assertEqual(platform.get_dispatch_key_name(), "cuda")
 
     def test_cuda_onnx_platform_exports(self):
+        from sglang.srt.compilation.export_backends import OnnxExportRuntime
+
         platform = CudaOnnxPlatform()
         self.assertTrue(platform.is_cuda())
         self.assertEqual(platform.torch_compile_strategy(), "export")
         defaults = platform.torch_compile_defaults()
         self.assertTrue(defaults.run_exported)
+        self.assertEqual(defaults.export_format, "onnx")
+        self.assertIn("export_format", defaults.forced_fields)
         self.assertIn("run_exported", defaults.forced_fields)
+        self.assertIsInstance(platform.get_export_runtime(defaults), OnnxExportRuntime)
+
+    def test_onnx_platform_has_conservative_graph_support(self):
+        platform = OnnxPlatform()
+        self.assertEqual(platform.torch_compile_strategy(), "export")
+        self.assertFalse(platform.support_cuda_graph())
+        self.assertFalse(platform.support_piecewise_cuda_graph())
 
     def test_npu_platform_noops_without_torchair(self):
         with patch.dict(sys.modules, {"torchair": None}):
@@ -500,6 +521,7 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
             result = _resolve_platform()
             # Only the good plugin activated; single activation succeeds
             mock_resolve.assert_called_once_with("pkg.Mod:GoodPlatform")
+            self.assertEqual(result, mock_instance)
 
 
 # ---------------------------------------------------------------------------

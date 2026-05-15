@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
+    from sglang.srt.compilation.export_backends.base import ExportRuntime
     from sglang.srt.compilation.torch_compile import TorchCompileConfig
 
 TorchCompileStrategy = Literal["compile", "noop", "export"]
@@ -93,12 +94,26 @@ class SRTPlatform(DeviceMixin):
 
         return TorchCompileConfig()
 
+    def get_export_runtime(
+        self,
+        compile_config: "TorchCompileConfig",
+    ) -> "ExportRuntime":
+        """Return the runtime backend for exported callsites."""
+        from sglang.srt.compilation.export_backends import TorchExportRuntime
+
+        return TorchExportRuntime()
+
     def make_exported_program_callable(
         self,
         exported_program: Any,
         compile_config: "TorchCompileConfig",
     ) -> Any:
-        """Build a runtime callable from a captured ExportedProgram."""
+        """Build a runtime callable from a captured ExportedProgram.
+
+        Prefer overriding :meth:`get_export_runtime` for new platforms. This
+        method remains for older platform plugins that implemented the initial
+        export prototype.
+        """
         return exported_program.module()
 
     def get_piecewise_backend_cls(self) -> type:

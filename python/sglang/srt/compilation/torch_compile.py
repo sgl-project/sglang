@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import functools
-import re
 import threading
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Literal
 
 import torch
 
+from sglang.srt.compilation.export_artifact import make_export_artifact_spec
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 
@@ -27,6 +26,9 @@ class TorchCompileConfig:
     key: str | None = None
     strategy_override: TorchCompileStrategy | None = None
     dynamic_shapes: Any | None = None
+    shape_policy: str | None = None
+    export_format: str | None = None
+    export_artifact_mode: str | None = None
     run_exported: bool | None = None
     copy_output_to_arg_index: int | None = None
     forced_fields: frozenset[str] = field(default_factory=frozenset)
@@ -54,6 +56,9 @@ _CONFIG_FIELDS = (
     "key",
     "strategy_override",
     "dynamic_shapes",
+    "shape_policy",
+    "export_format",
+    "export_artifact_mode",
     "run_exported",
     "copy_output_to_arg_index",
 )
@@ -61,6 +66,9 @@ _LIBRARY_DEFAULTS = TorchCompileConfig(
     enabled=True,
     dynamic=True,
     fullgraph=False,
+    shape_policy="infer_dynamic",
+    export_format="torch",
+    export_artifact_mode="build_if_missing",
     run_exported=False,
 )
 
@@ -196,18 +204,37 @@ def _export_callable(
     kwargs: dict[str, Any],
     platform,
 ) -> Callable:
-    if config.key is None:
-        config.key = _target_key(fn)
-    export_path = _export_artifact_path(fn, config)
-    if export_path is not None and export_path.exists():
-        exported_program = torch.export.load(export_path)
+    key = config.key or _target_key(fn)
+    config.key = key
+    artifact = make_export_artifact_spec(
+        key=key,
+        export_format=config.export_format,
+        mode=config.export_artifact_mode,
+        shape_policy=config.shape_policy,
+        copy_output_to_arg_index=config.copy_output_to_arg_index,
+        args=args,
+    )
+
+    torch_program_path = artifact.torch_program_path
+    if (
+        artifact.mode != "export_only"
+        and torch_program_path is not None
+        and torch_program_path.exists()
+    ):
+        artifact.validate_metadata()
+        exported_program = torch.export.load(torch_program_path)
     else:
+        if artifact.mode == "load_only":
+            raise FileNotFoundError(
+                f"Torch export artifact {torch_program_path} is required by "
+                "load_only mode."
+            )
         export_args = args
         call_kwargs = kwargs
         torch_export_kwargs = {}
         if config.dynamic_shapes is not None:
             torch_export_kwargs["dynamic_shapes"] = config.dynamic_shapes
-        elif config.dynamic:
+        elif config.dynamic and artifact.shape_policy == "infer_dynamic":
             export_args, call_kwargs = _prepare_dynamic_export_inputs(args, kwargs)
             dynamic_shapes = _infer_dynamic_shapes(export_args, call_kwargs)
             if dynamic_shapes is not None:
@@ -218,12 +245,19 @@ def _export_callable(
             kwargs=call_kwargs or None,
             **torch_export_kwargs,
         )
-        if export_path is not None:
-            export_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.export.save(exported_program, export_path)
+        if torch_program_path is not None and artifact.mode in (
+            "build_if_missing",
+            "export_only",
+        ):
+            artifact.ensure_export_dir()
+            torch.export.save(exported_program, torch_program_path)
 
-    if config.run_exported:
-        return platform.make_exported_program_callable(exported_program, config)
+    if config.run_exported or artifact.mode == "export_only":
+        runtime = platform.get_export_runtime(config)
+        runtime_callable = runtime.prepare_runtime(exported_program, artifact, config)
+        if artifact.mode == "export_only":
+            return fn
+        return runtime_callable
     return fn
 
 
@@ -287,15 +321,6 @@ def _dynamic_shape_spec(value: Any, dim_cache: dict[tuple[int, int], Any]) -> An
                 dim_cache[cache_key] = dim
             spec[dim_index] = dim
     return spec
-
-
-def _export_artifact_path(fn: Callable, config: TorchCompileConfig) -> Path | None:
-    export_dir = envs.SGLANG_EXPORT_DIR.get()
-    if not export_dir:
-        return None
-    artifact_key = config.key or _target_key(fn)
-    safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", artifact_key)
-    return Path(export_dir) / f"{safe_key}.pt2"
 
 
 def _target_key(fn: Callable) -> str:

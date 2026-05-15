@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
-import re
-from pathlib import Path
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform, TorchCompileStrategy
 
@@ -56,10 +53,8 @@ class CudaPlatform(BuiltinPlatform):
         return True
 
 
-class CudaOnnxPlatform(CudaPlatform):
-    """CUDA-backed test/plugin platform that runs decorated targets via ONNX Runtime."""
-
-    device_name = "cuda_onnx"
+class OnnxExportPlatformMixin:
+    """Mixin for platforms that execute exported callsites through ONNX."""
 
     def torch_compile_strategy(self) -> TorchCompileStrategy:
         return "export"
@@ -68,70 +63,29 @@ class CudaOnnxPlatform(CudaPlatform):
         from sglang.srt.compilation.torch_compile import TorchCompileConfig
 
         return TorchCompileConfig(
+            export_format="onnx",
             run_exported=True,
-            forced_fields={"run_exported"},
+            forced_fields={"export_format", "run_exported"},
         )
 
-    def make_exported_program_callable(self, exported_program, compile_config):
-        export_dir = envs.SGLANG_EXPORT_DIR.get()
-        if not export_dir:
-            raise RuntimeError("SGLANG_EXPORT_DIR is required for cuda_onnx export.")
+    def get_export_runtime(self, compile_config):
+        from sglang.srt.compilation.export_backends import OnnxExportRuntime
 
-        try:
-            import numpy as np
-            import onnxruntime as ort
-        except ImportError as exc:
-            raise ImportError(
-                "cuda_onnx requires optional packages: onnx, onnxscript, "
-                "onnxruntime-gpu, and numpy."
-            ) from exc
+        return OnnxExportRuntime()
 
-        if hasattr(ort, "preload_dlls"):
-            ort.preload_dlls()
 
-        onnx_path = Path(export_dir) / f"{_safe_artifact_key(compile_config.key)}.onnx"
-        if not onnx_path.exists():
-            onnx_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.onnx.export(exported_program, args=(), f=str(onnx_path), dynamo=True)
+class CudaOnnxPlatform(OnnxExportPlatformMixin, CudaPlatform):
+    """CUDA-backed demo platform that runs decorated targets through ONNX."""
 
-        providers = ort.get_available_providers()
-        selected_providers = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if "CUDAExecutionProvider" in providers
-            else ["CPUExecutionProvider"]
-        )
-        session = ort.InferenceSession(str(onnx_path), providers=selected_providers)
-        input_names = [input_info.name for input_info in session.get_inputs()]
+    device_name = "cuda_onnx"
 
-        def run_onnx(*args, **kwargs):
-            if kwargs:
-                raise TypeError("cuda_onnx runtime only supports positional arguments.")
 
-            tensor_args = [arg for arg in args if isinstance(arg, torch.Tensor)]
-            if len(tensor_args) != len(input_names):
-                raise TypeError(
-                    f"cuda_onnx expected {len(input_names)} tensor inputs, "
-                    f"got {len(tensor_args)}."
-                )
+class OnnxPlatform(OnnxExportPlatformMixin, BuiltinPlatform):
+    """Graph-runtime-only ONNX demo platform without CUDA graph assumptions."""
 
-            device = tensor_args[0].device if tensor_args else torch.device("cpu")
-            ort_inputs = {
-                name: tensor.detach().cpu().numpy()
-                for name, tensor in zip(input_names, tensor_args)
-            }
-            outputs = session.run(None, ort_inputs)
-            tensors = [
-                torch.as_tensor(np.asarray(output), device=device) for output in outputs
-            ]
-            if compile_config.copy_output_to_arg_index is not None:
-                dst = args[compile_config.copy_output_to_arg_index]
-                dst.copy_(tensors[0])
-                return None
-            return tensors[0] if len(tensors) == 1 else tuple(tensors)
-
-        run_onnx.onnx_path = onnx_path
-        run_onnx.providers = session.get_providers()
-        return run_onnx
+    _enum = PlatformEnum.CPU
+    device_name = "onnx"
+    device_type = "cpu"
 
 
 class RocmPlatform(BuiltinPlatform):
@@ -208,6 +162,7 @@ class NpuPlatform(BuiltinPlatform):
 _BUILTIN_PLATFORM_CLASSES = {
     "cuda": CudaPlatform,
     "cuda_onnx": CudaOnnxPlatform,
+    "onnx": OnnxPlatform,
     "rocm": RocmPlatform,
     "hip": RocmPlatform,
     "cpu": CpuPlatform,
@@ -236,7 +191,7 @@ def resolve_builtin_platform_by_name(name: str) -> SRTPlatform | None:
 
 
 def _is_builtin_platform_available(name: str) -> bool:
-    if name == "cpu":
+    if name in ("cpu", "onnx"):
         return _is_cpu()
     if name in ("cuda", "cuda_onnx"):
         return _is_cuda()
@@ -269,12 +224,6 @@ def resolve_builtin_platform() -> SRTPlatform:
 
     logger.debug("No built-in platform detected. Using base SRTPlatform with defaults.")
     return SRTPlatform()
-
-
-def _safe_artifact_key(key: str | None) -> str:
-    if not key:
-        raise ValueError("An export artifact key is required.")
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", key)
 
 
 def _is_cuda() -> bool:

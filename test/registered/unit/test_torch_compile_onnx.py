@@ -68,6 +68,53 @@ class TestTorchCompileOnnx(unittest.TestCase):
         finally:
             platforms._current_platform = saved_platform
 
+    def test_cuda_onnx_platform_handles_dynamic_batch_after_batch_one_export(self):
+        try:
+            import numpy  # noqa: F401
+            import onnx  # noqa: F401
+            import onnxruntime  # noqa: F401
+            import onnxscript  # noqa: F401
+        except ImportError as exc:
+            self.skipTest(f"ONNX optional dependency is unavailable: {exc}")
+
+        import sglang.srt.platforms as platforms
+
+        saved_platform = platforms._current_platform
+        platforms._current_platform = CudaOnnxPlatform()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with envs.SGLANG_EXPORT_DIR.override(tmpdir):
+
+                    @sgl_compile(
+                        key="unit_cuda_onnx_dynamic_mutate",
+                        copy_output_to_arg_index=0,
+                    )
+                    def scale_in_place(x, scale):
+                        x[:] = torch.where(x < 0, x * scale, x / scale)
+
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    x1 = torch.ones(1, 4, device=device)
+                    scale_in_place(x1, torch.full((1, 4), 2.0, device=device))
+                    torch.testing.assert_close(
+                        x1,
+                        torch.full((1, 4), 0.5, device=device),
+                    )
+
+                    x3 = torch.tensor(
+                        [[1.0, -1.0, 2.0, -2.0]] * 3,
+                        device=device,
+                    )
+                    scale_in_place(x3, torch.full((3, 4), 2.0, device=device))
+                    torch.testing.assert_close(
+                        x3,
+                        torch.tensor(
+                            [[0.5, -2.0, 1.0, -4.0]] * 3,
+                            device=device,
+                        ),
+                    )
+        finally:
+            platforms._current_platform = saved_platform
+
 
 if __name__ == "__main__":
     unittest.main()

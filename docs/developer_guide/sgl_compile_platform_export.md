@@ -1,19 +1,18 @@
 # Platform-Controlled Torch Compile And Export
 
-This note documents the platform compile/export prototype added for SRT
-platforms. It introduces a single decorator, `@sgl_compile`, so individual
-callsites can be compiled, skipped, or exported according to the active
-`SRTPlatform`.
+This note documents the platform compile/export path for SRT platforms. It
+introduces a single decorator, `@sgl_compile`, so individual callsites can be
+compiled, skipped, or exported according to the active `SRTPlatform`.
 
 ## Design
 
-The platform contract now includes three compile/export hooks:
+The platform contract includes declarative compile/export hooks:
 
 - `torch_compile_strategy()`: returns `compile`, `noop`, or `export`.
 - `torch_compile_defaults()`: returns default `TorchCompileConfig` values for
   the platform.
-- `make_exported_program_callable()`: converts a `torch.export.ExportedProgram`
-  into a runtime callable for platforms that run exported artifacts.
+- `get_export_runtime(config)`: returns an `ExportRuntime` backend for exported
+  artifacts.
 
 `@sgl_compile` is lazy. The wrapped callable is resolved on first use, after the
 active platform is known. The decorator merges library defaults, platform
@@ -21,17 +20,37 @@ defaults, and callsite options, then either:
 
 - returns the original function for `noop`,
 - calls `torch.compile` for `compile`, or
-- captures a `torch.export.ExportedProgram` for `export`.
+- captures a `torch.export.ExportedProgram` for `export`, then optionally builds
+  a runtime callable through the selected `ExportRuntime`.
 
 In-tree platforms are now represented by explicit `SRTPlatform` subclasses in
 `sglang.srt.platforms.builtin`. `SGLANG_PLATFORM` can select either an in-tree
 platform such as `cuda` or `cuda_onnx`, or an out-of-tree plugin registered via
 the existing platform entry point group.
 
-`CudaOnnxPlatform` demonstrates the export path. It exports decorated callsites
-to ONNX, loads them with ONNX Runtime, and executes them through
-`CUDAExecutionProvider` when available. It is intentionally scoped to decorated
-callsite kernels, not full-model ONNX export.
+`ExportArtifactSpec` records the graph key, artifact paths, export format,
+shape policy, input schema, mutation contract, SGLang version, and PyTorch
+version. Runtime conversion and execution live under
+`sglang.srt.compilation.export_backends`, not in platform classes.
+
+`CudaOnnxPlatform` demonstrates the export path. It selects the reusable
+`OnnxExportRuntime`, which exports decorated callsites to ONNX, loads them with
+ONNX Runtime, and executes them through `CUDAExecutionProvider` when available.
+The built-in `OnnxPlatform` shows the same ONNX runtime selection without
+inheriting CUDA graph support, which is the pattern ONNX-only vendors should
+copy in out-of-tree plugins.
+
+```mermaid
+flowchart TD
+    callsite["@sgl_compile Callsite"] --> decorator["Policy And Export Capture"]
+    decorator --> platform["SRTPlatform"]
+    platform --> runtime["ExportRuntime"]
+    decorator --> artifact["ExportArtifactSpec"]
+    artifact --> torchProgram["ExportedProgram"]
+    torchProgram --> runtime
+    runtime --> callable["Runtime Callable"]
+    callable --> scheduler["Existing Scheduler Path"]
+```
 
 ## In-Place Outputs
 
@@ -47,10 +66,12 @@ The Qwen3-14B benchmark exposed a dynamic-shape issue: the first ONNX export of
 `apply_scaling_penalties` could capture batch size 1, then fail when the SGLang
 scheduler batched later requests at batch size 3.
 
-For dynamic exports, `@sgl_compile` now infers dynamic tensor shape specs for
-positional tensor inputs. Batch-1 tensor examples are promoted during export so
-PyTorch does not specialize that dimension to a constant. The runtime still uses
-the real request tensors.
+For `shape_policy="infer_dynamic"`, `@sgl_compile` infers dynamic tensor shape
+specs for positional tensor inputs. Batch-1 tensor examples are promoted during
+export so PyTorch does not specialize that dimension to a constant. The runtime
+still uses the real request tensors. `shape_policy="static"` leaves shapes fixed,
+and callsites can still pass explicit `dynamic_shapes` for bounded or custom
+per-dimension policies.
 
 The exported Qwen3-14B ONNX artifact was verified to have symbolic input and
 output dimensions:
@@ -60,6 +81,34 @@ args_0 ['s33', 's50']
 args_1 ['s33', 's50']
 out slice_scatter ['s33', 's50']
 ```
+
+## Artifact Modes
+
+`TorchCompileConfig.export_artifact_mode` and `SGLANG_EXPORT_ARTIFACT_MODE`
+support three modes:
+
+- `build_if_missing`: load existing artifacts when present, otherwise export and
+  save. This is the default local development mode.
+- `export_only`: build artifacts, then run the original Python callable. This is
+  intended for cloud builders that precompute artifacts without changing serving
+  behavior.
+- `load_only`: require prebuilt artifacts. This is intended for serving
+  environments that should not run export/conversion work at startup.
+
+Artifacts are written under `SGLANG_EXPORT_DIR`:
+
+- `<safe_key>.pt2`: `torch.export.ExportedProgram`
+- `<safe_key>.onnx`: ONNX Runtime artifact for `export_format="onnx"`
+- `<safe_key>.metadata.json`: metadata used to validate key, format, shape
+  policy, input schema, versions, and mutation contract
+
+## ONNX Runtime Execution
+
+`OnnxExportRuntime` first tries CUDA I/O binding when all inputs are contiguous
+CUDA tensors, `CUDAExecutionProvider` is active, and the output buffer is known.
+The current zero-copy path is enabled for mutation-style callsites using
+`copy_output_to_arg_index`, such as `apply_scaling_penalties`. Other cases fall
+back to the copied CPU/NumPy path.
 
 ## Qwen3-14B Benchmark Results
 
@@ -75,14 +124,16 @@ Hardware and model:
 
 | Mode | Seq median latency | Seq completion tok/s | C4 median latency | C4 completion tok/s |
 | --- | ---: | ---: | ---: | ---: |
-| CUDA | `0.705s` | `90.8` | `0.718s` | `312.9` |
-| `cuda_onnx` | `0.784s` | `81.6` | `0.865s` | `290.8` |
+| CUDA | `0.704s` | `90.9` | `0.718s` | `348.4` |
+| `cuda_onnx` | `0.705s` | `90.8` | `0.718s` | `355.2` |
 
-The ONNX path is slower in this benchmark: about 10% lower sequential throughput
-and 7% lower concurrency-4 throughput. This is expected for the current
-prototype because ONNX is only running a small sampling-side penalty kernel and
-the runtime path copies tensors through CPU/NumPy around ONNX Runtime. This is
-not measuring a full-model ONNX deployment.
+The initial ONNX prototype was slower because it copied tensors through
+CPU/NumPy around a small sampling-side penalty kernel. After moving ONNX into
+`OnnxExportRuntime` and adding CUDA I/O binding for in-place output callsites,
+the same Qwen3-14B workload is effectively at parity with the default CUDA path
+for sequential requests and slightly faster in this small concurrency-4 run.
+This still measures a decorated sampling-side kernel, not full-model ONNX
+deployment.
 
 ## Artifacts
 
@@ -90,7 +141,11 @@ Local benchmark outputs from the H100 run:
 
 - `/tmp/qwen14_cuda_bench.json`
 - `/tmp/qwen14_cuda_onnx_bench.json`
+- `/tmp/qwen14_cuda_runtime_abstraction_bench.json`
+- `/tmp/qwen14_cuda_onnx_runtime_abstraction_bench.json`
 - `/tmp/sglang-qwen14-onnx-artifacts-dyn2/sglang.srt.sampling.penaltylib.repetition_penalty.apply_scaling_penalties.onnx`
+- `/tmp/sglang-qwen14-onnx-runtime-abstraction/sglang.srt.sampling.penaltylib.repetition_penalty.apply_scaling_penalties.onnx`
+- `/tmp/sglang-qwen14-onnx-runtime-abstraction/sglang.srt.sampling.penaltylib.repetition_penalty.apply_scaling_penalties.metadata.json`
 
 The ONNX artifact is generated output and is not checked into the repository.
 
@@ -159,6 +214,7 @@ LD_LIBRARY_PATH="$LIB_PATHS:${LD_LIBRARY_PATH:-}" \
 SGLANG_ENABLE_JIT_DEEPGEMM=0 \
 SGLANG_PLATFORM=cuda_onnx \
 SGLANG_EXPORT_DIR=/tmp/sglang-qwen14-onnx-artifacts \
+SGLANG_EXPORT_ARTIFACT_MODE=build_if_missing \
 uv run --no-project --with-requirements /tmp/sglang-pyproject-reqs.txt \
   --with onnxruntime-gpu \
   --with onnxscript \
@@ -173,6 +229,18 @@ uv run --no-project --with-requirements /tmp/sglang-pyproject-reqs.txt \
   --cuda-graph-max-bs 4 \
   --disable-piecewise-cuda-graph \
   --trust-remote-code
+```
+
+For an export-only artifact build, set:
+
+```bash
+SGLANG_EXPORT_ARTIFACT_MODE=export_only
+```
+
+For serving with prebuilt artifacts only, set:
+
+```bash
+SGLANG_EXPORT_ARTIFACT_MODE=load_only
 ```
 
 Run the client benchmark against either port by changing `URL`:
