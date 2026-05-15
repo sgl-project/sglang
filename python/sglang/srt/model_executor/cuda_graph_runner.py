@@ -357,10 +357,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
 # Detect whether the current forward pass is in capture mode
 is_capture_mode = False
 
+_capture_lora_variant: Optional[str] = None
+
 
 def get_is_capture_mode():
     return is_capture_mode
 
+
+def get_capture_lora_variant() -> Optional[str]:
+    """Return the lora variant being captured, or None if not in dual capture."""
+    return _capture_lora_variant
 
 @contextmanager
 def model_capture_mode():
