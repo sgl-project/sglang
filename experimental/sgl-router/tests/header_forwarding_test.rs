@@ -3,13 +3,13 @@
 
 mod common;
 
+use axum::body::Body;
+use axum::http::Request;
 use sgl_router::config::{Config, ModelConfig, ObservabilityConfig, ServerConfig, WorkerConfig};
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
-use axum::body::Body;
-use axum::http::Request;
 use std::sync::Arc;
 use tower::ServiceExt;
 

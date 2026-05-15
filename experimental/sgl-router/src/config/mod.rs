@@ -1,23 +1,26 @@
 pub mod types;
 pub use types::*;
 
-use anyhow::{anyhow, Result};
 use anyhow::Context as _;
+use anyhow::{anyhow, Result};
 use std::path::Path;
 
 impl Config {
     pub fn from_path(p: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(p)
-            .with_context(|| format!("read config {}", p.display()))?;
+        let raw =
+            std::fs::read_to_string(p).with_context(|| format!("read config {}", p.display()))?;
         let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
         let cfg: Config = match ext {
             "yaml" | "yml" => serde_yaml::from_str(&raw)
                 .map_err(|e| anyhow!("parse yaml {}: {e}", p.display()))?,
-            "toml" => toml::from_str(&raw)
-                .map_err(|e| anyhow!("parse toml {}: {e}", p.display()))?,
-            other => return Err(anyhow!(
-                "unsupported config extension {other:?}; want yaml/yml/toml"
-            )),
+            "toml" => {
+                toml::from_str(&raw).map_err(|e| anyhow!("parse toml {}: {e}", p.display()))?
+            }
+            other => {
+                return Err(anyhow!(
+                    "unsupported config extension {other:?}; want yaml/yml/toml"
+                ))
+            }
         };
         cfg.validate()?;
         Ok(cfg)
@@ -44,7 +47,9 @@ mod tests {
     fn loads_minimal_yaml() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("c.yaml");
-        std::fs::write(&p, r#"
+        std::fs::write(
+            &p,
+            r#"
 server:
   host: "0.0.0.0"
   port: 8090
@@ -53,7 +58,9 @@ models:
     tokenizer_path: "/tmp/qwen.json"
 worker:
   url: "http://127.0.0.1:30000"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let c = Config::from_path(&p).unwrap();
         assert_eq!(c.server.port, 8090);
         assert_eq!(c.models[0].id, "qwen3-0.6b");
@@ -64,7 +71,9 @@ worker:
     fn loads_minimal_toml() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("c.toml");
-        std::fs::write(&p, r#"
+        std::fs::write(
+            &p,
+            r#"
 [server]
 host = "0.0.0.0"
 port = 8090
@@ -73,7 +82,9 @@ id = "qwen3-0.6b"
 tokenizer_path = "/tmp/qwen.json"
 [worker]
 url = "http://127.0.0.1:30000"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let c = Config::from_path(&p).unwrap();
         assert_eq!(c.server.port, 8090);
     }
@@ -82,7 +93,11 @@ url = "http://127.0.0.1:30000"
     fn rejects_missing_worker() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("c.yaml");
-        std::fs::write(&p, "server:\n  host: \"0.0.0.0\"\n  port: 8090\nmodels: []\n").unwrap();
+        std::fs::write(
+            &p,
+            "server:\n  host: \"0.0.0.0\"\n  port: 8090\nmodels: []\n",
+        )
+        .unwrap();
         let err = Config::from_path(&p).unwrap_err();
         assert!(err.to_string().contains("worker"), "got: {err}");
     }

@@ -21,7 +21,9 @@ pub struct ObservabilityConfig {
     pub log_level: String,
 }
 
-fn default_log_level() -> String { "info".to_string() }
+fn default_log_level() -> String {
+    "info".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
