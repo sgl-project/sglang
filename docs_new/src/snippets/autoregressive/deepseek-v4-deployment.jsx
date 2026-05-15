@@ -316,6 +316,17 @@ export const DeepSeekV4Deployment = () => {
     ],
   };
 
+  // Per-hardware Docker image. Mirrors the "Docker Images by Hardware Platform"
+  // table in §2 of DeepSeek-V4.mdx; if you change one, change both.
+  const DOCKER_IMAGES = {
+    h100:  "lmsysorg/sglang:dev",
+    h200:  "lmsysorg/sglang:deepseek-v4-hopper",
+    b200:  "lmsysorg/sglang:deepseek-v4-blackwell",
+    b300:  "lmsysorg/sglang:deepseek-v4-b300",
+    gb200: "lmsysorg/sglang:deepseek-v4-grace-blackwell",
+    gb300: "lmsysorg/sglang:deepseek-v4-grace-blackwell",
+  };
+
   // ==========================================================================
   // 3. Final config object
   // ==========================================================================
@@ -369,6 +380,11 @@ export const DeepSeekV4Deployment = () => {
       PORT:      { target: "command", label: "Bind port",       default: "30000"    },
       NODE0_IP:  { target: "command", label: "Head node IP",    default: "<node0-ip>"   },
       NODE_RANK: { target: "command", label: "This node rank",  default: "<node-rank>"  },
+      // HuggingFace access token — used only by the Docker output for the
+      // `--env "HF_TOKEN=..."` line; Python mode never injects it. Kept in the
+      // "command" group (not "curl") so it appears alongside HOST_IP / PORT in
+      // the Env modal, sharing the same persistence pathway.
+      HF_TOKEN:  { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
       CURL_HOST: { target: "curl",    label: "Server host",     default: "localhost" },
       CURL_PORT: { target: "curl",    label: "Server port",     default: "30000"     },
     },
@@ -377,6 +393,7 @@ export const DeepSeekV4Deployment = () => {
   -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
     cells: allCells,
     multiNodeHints: MULTI_NODE_HINTS,
+    dockerImages: DOCKER_IMAGES,
   };
   // === KEEP IN SYNC WITH deepseek-v4-playground.jsx (end) ===
 
@@ -470,6 +487,39 @@ export const DeepSeekV4Deployment = () => {
       display: "inline-flex", alignItems: "center", gap: "4px",
     },
     iconRow: { display: "inline-flex", gap: "6px" },
+    // Two-segment "Python | Docker" pill that sits next to the verified badge.
+    // Reuses the badge's pill silhouette so it visually groups with it.
+    runModeWrap: {
+      display: "inline-flex",
+      border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
+      borderRadius: "10px",
+      overflow: "hidden",
+      fontSize: "11px",
+      fontWeight: 600,
+      userSelect: "none",
+    },
+    runModeChip: (active) => ({
+      padding: "2px 10px",
+      cursor: "pointer",
+      background: active
+        ? (isDark ? "#1f2937" : "#fff")
+        : "transparent",
+      color: active
+        ? (isDark ? "#e5e7eb" : "#111827")
+        : (isDark ? "#9ca3af" : "#6b7280"),
+      borderRight: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
+    }),
+    runModeChipLast: (active) => ({
+      padding: "2px 10px",
+      cursor: "pointer",
+      background: active
+        ? (isDark ? "#1f2937" : "#fff")
+        : "transparent",
+      color: active
+        ? (isDark ? "#e5e7eb" : "#111827")
+        : (isDark ? "#9ca3af" : "#6b7280"),
+    }),
+    headerLeft: { display: "inline-flex", alignItems: "center", gap: "8px" },
     modalBackdrop: {
       position: "fixed", inset: 0,
       background: "rgba(0,0,0,0.5)",
@@ -612,7 +662,11 @@ export const DeepSeekV4Deployment = () => {
     return m ? parseInt(m[1], 10) : 1;
   };
 
-  const renderCommand = (cell, sel, envValues) => {
+  // Render a cell as either a bare `sglang serve` invocation (python mode) or
+  // wrapped in `docker run` against the per-hardware image (docker mode). Both
+  // share the multi-node flag injection, hint comments, and {{placeholder}}
+  // interpolation; only the outer framing differs.
+  const renderCommand = (cell, sel, envValues, mode = "python") => {
     if (!cell) return "# No command available for the current selection.";
     const modelName = resolveModelName(sel);
     const nnodes = parseNnodes(sel.nodes);
@@ -625,9 +679,34 @@ export const DeepSeekV4Deployment = () => {
         `--node-rank {{NODE_RANK}}`,
         `--dist-init-addr {{NODE0_IP}}:20000`);
     }
-    const flagBlock = flags.map((f) => "  " + f).join(" \\\n");
-    const envBlock = cell.env.length ? cell.env.join(" \\\n") + " \\\n" : "";
-    let cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
+
+    let cmd;
+    if (mode === "docker") {
+      // Wrap as `docker run`. The port mapping uses the same {{PORT}} that the
+      // --port flag will resolve to, so they stay in sync when the user edits
+      // PORT in the Env modal. Image picked by hardware from config.dockerImages
+      // (mirrors §2 "Docker Images by Hardware Platform" table). If the hw isn't
+      // mapped (shouldn't happen for supported cells), we fall back to `:dev`.
+      const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      const dockerLines = [
+        "docker run --gpus all",
+        "  --shm-size 32g",
+        "  -p {{PORT}}:{{PORT}}",
+        "  -v ~/.cache/huggingface:/root/.cache/huggingface",
+        `  --env "HF_TOKEN={{HF_TOKEN}}"`,
+        ...cell.env.map((e) => `  --env ${e}`),
+        "  --ipc=host",
+        `  ${image}`,
+        "  sglang serve",
+        ...flags.map((f) => "    " + f),
+      ];
+      cmd = dockerLines.join(" \\\n");
+    } else {
+      const flagBlock = flags.map((f) => "  " + f).join(" \\\n");
+      const envBlock = cell.env.length ? cell.env.join(" \\\n") + " \\\n" : "";
+      cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
+    }
+
     if (multinode && config.multiNodeHints && config.multiNodeHints[sel.hw]) {
       const hint = config.multiNodeHints[sel.hw]
         .map((line) => (line.length ? "# " + line : "#")).join("\n");
@@ -760,6 +839,11 @@ export const DeepSeekV4Deployment = () => {
   const [copied, setCopied] = useState(false);
   const [curlCopied, setCurlCopied] = useState(false);
   const [envDraft, setEnvDraft] = useState(env);
+  // Output framing: "python" emits a bare `sglang serve ...`, "docker" wraps
+  // the same args in `docker run` against the per-hardware image. The Copy /
+  // cURL / Env buttons all behave identically — the toggle only changes the
+  // text inside the <pre>.
+  const [runMode, setRunMode] = useState("python");
   useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
 
   // ==========================================================================
@@ -767,7 +851,7 @@ export const DeepSeekV4Deployment = () => {
   // ==========================================================================
   const s = makeStyles(isDark);
   const cell = findCell(config.cells, sel);
-  const command = renderCommand(cell, sel, env);
+  const command = renderCommand(cell, sel, env, runMode);
   const modelName = resolveModelName(sel);
   const curlText = interpolate(config.curl || "", env, modelName);
   const hwGroups = buildHardwareGroups();
@@ -868,9 +952,29 @@ export const DeepSeekV4Deployment = () => {
         <div style={s.title}>Run this Command:</div>
         <div style={s.commandWrap}>
           <div style={s.commandHeader}>
-            <div style={s.badge(Boolean(cell && cell.verified))}>
-              <span style={s.badgeDot(Boolean(cell && cell.verified))} />
-              {cell && cell.verified ? "Verified" : "Auto-Estimated"}
+            <div style={s.headerLeft}>
+              <div style={s.badge(Boolean(cell && cell.verified))}>
+                <span style={s.badgeDot(Boolean(cell && cell.verified))} />
+                {cell && cell.verified ? "Verified" : "Auto-Estimated"}
+              </div>
+              <div style={s.runModeWrap} role="tablist" aria-label="Output format">
+                <span
+                  style={s.runModeChip(runMode === "python")}
+                  onClick={() => setRunMode("python")}
+                  role="tab"
+                  aria-selected={runMode === "python"}
+                >
+                  Python
+                </span>
+                <span
+                  style={s.runModeChipLast(runMode === "docker")}
+                  onClick={() => setRunMode("docker")}
+                  role="tab"
+                  aria-selected={runMode === "docker"}
+                >
+                  Docker
+                </span>
+              </div>
             </div>
             <div style={s.iconRow}>
               <button style={s.iconButton} onClick={handleCopy}>
