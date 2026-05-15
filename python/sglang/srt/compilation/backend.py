@@ -224,16 +224,42 @@ def split_graph(
     subgraph_id = 0
     node_to_subgraph_id = {}
     split_op_graphs = []
+    # Base policy: every split-op call lives in its own eager submodule;
+    # every other node lives in the surrounding compiled submodule.
+    #
+    # On top of that, two strictly adjacent split-op calls (no FX node between
+    # them) share a single eager submodule. This removes the tiny host hop that
+    # would otherwise sit between back-to-back split ops.
+    last_split_id: Optional[int] = None
+    num_adjacent_split_op_merges = 0
     for node in graph.graph.nodes:
         if node.op in ("output", "placeholder"):
             continue
-        if node.op == "call_function" and str(node.target) in ops:
-            subgraph_id += 1
-            node_to_subgraph_id[node] = subgraph_id
-            split_op_graphs.append(subgraph_id)
-            subgraph_id += 1
+        is_split_op = node.op == "call_function" and str(node.target) in ops
+        if is_split_op:
+            if last_split_id is not None:
+                # Strictly adjacent split op: reuse the previous eager
+                # submodule id. ``keep_original_order=True`` below preserves
+                # FX order, so any mutation by the first call is visible to
+                # the second one.
+                node_to_subgraph_id[node] = last_split_id
+                num_adjacent_split_op_merges += 1
+            else:
+                subgraph_id += 1
+                node_to_subgraph_id[node] = subgraph_id
+                split_op_graphs.append(subgraph_id)
+                last_split_id = subgraph_id
+                subgraph_id += 1
         else:
+            last_split_id = None
             node_to_subgraph_id[node] = subgraph_id
+
+    if num_adjacent_split_op_merges:
+        logger.info(
+            "split_graph merged %d adjacent split-op call(s) into shared "
+            "eager submodules",
+            num_adjacent_split_op_merges,
+        )
 
     # `keep_original_order` is important!
     # otherwise pytorch might reorder the nodes and
