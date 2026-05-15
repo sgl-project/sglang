@@ -74,14 +74,37 @@ def check_sglang_ready(
 def split_checkpoint_files(
     checkpoint_path: str, rank: int, world_size: int
 ) -> list[str]:
-    checkpoint_files = [
+    checkpoint_files = sorted(
         os.path.join(checkpoint_path, f)
-        for f in filter(
-            lambda x: x.endswith(".safetensors"), os.listdir(checkpoint_path)
-        )
-    ]
+        for f in os.listdir(checkpoint_path)
+        if f.endswith(".safetensors")
+    )
     files_per_rank = (len(checkpoint_files) + world_size - 1) // world_size
     return checkpoint_files[rank * files_per_rank : (rank + 1) * files_per_rank]
+
+
+def split_checkpoint_files_from_list(
+    checkpoint_files: list[str], rank: int, world_size: int
+) -> list[str]:
+    files_per_rank = (len(checkpoint_files) + world_size - 1) // world_size
+    return checkpoint_files[rank * files_per_rank : (rank + 1) * files_per_rank]
+
+
+def collect_checkpoint_files(
+    checkpoint_path: str, rank: int, world_size: int
+) -> list[str]:
+    checkpoint_files = (
+        sorted(
+            os.path.join(checkpoint_path, f)
+            for f in os.listdir(checkpoint_path)
+            if f.endswith(".safetensors")
+        )
+        if rank == 0
+        else []
+    )
+    object_list = [checkpoint_files]
+    dist.broadcast_object_list(object_list, src=0)
+    return split_checkpoint_files_from_list(object_list[0], rank, world_size)
 
 
 def split_tensors(
@@ -149,7 +172,8 @@ def update_weights(
     ps.register_checkpoint(
         checkpoint_name, files=checkpoint_files, named_tensors=named_tensors
     )
-    ps.init_process_group()
+    if not dist.is_initialized():
+        ps.init_process_group()
     check_sglang_ready(endpoint, inference_parallel_size, uds)
     dist.barrier()
     with timer("Gather metas"):
@@ -184,7 +208,8 @@ def join(
     assert load_metas_file, "load_metas_file is required"
     with open(load_metas_file, "rb") as f:
         metas = pickle.load(f)
-    ps.init_process_group()
+    if not dist.is_initialized():
+        ps.init_process_group()
     check_sglang_ready(endpoint, inference_parallel_size, uds)
     dist.barrier()
     with timer("Gather metas before join"):
@@ -286,14 +311,20 @@ def main():
             args.uds,
         )
     else:
-        if args.checkpoint_path and os.path.exists(
-            os.path.join(args.checkpoint_path, "model.safetensors.index.json")
+        if args.checkpoint_path:
+            ps.init_process_group()
+        if (
+            args.checkpoint_path
+            and os.path.exists(
+                os.path.join(args.checkpoint_path, "model.safetensors.index.json")
+            )
+            and not args.checkpoint_path.startswith("/dev/shm")
         ):
             named_tensors = split_tensors(args.checkpoint_path, rank, world_size)
             checkpoint_files = []
         else:
             checkpoint_files = (
-                split_checkpoint_files(args.checkpoint_path, rank, world_size)
+                collect_checkpoint_files(args.checkpoint_path, rank, world_size)
                 if args.checkpoint_path
                 else []
             )

@@ -787,6 +787,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
             for _ in stream_language_weights():
                 pass
 
+    def post_load_weights(self):
+        # Dummy loading initializes parameter tensors directly on the wrapper
+        # model and then only calls the wrapper's post_load_weights(). The
+        # MLA runtime path depends on the inner language model packing kv_b_proj
+        # into per-layer tensors like w_kc/w_vc before CUDA graph capture.
+        self.language_model.post_load_weights()
+
     @classmethod
     def get_model_config_for_expert_location(cls, config: KimiK25Config):
         text_config = config.text_config

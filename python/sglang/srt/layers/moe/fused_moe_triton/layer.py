@@ -751,10 +751,13 @@ class FusedMoE(torch.nn.Module):
         if method.__class__.__name__ == "KTEPWrapperMethod":
             method = method.gpu_method
 
-        # For flashinfer TRT-LLM BF16 path, process_weights_after_loading reshapes
-        # expert weights into block layout. During weight update, we must restore
-        # canonical load-time shapes before copying checkpoint tensors.
-        if isinstance(method, UnquantizedFusedMoEMethod):
+        # Some MoE backends reshape or repack expert weights after loading.
+        # During hot updates, restore canonical load-time shapes before copy.
+        if hasattr(method, "restore_weights_before_loading"):
+            method.restore_weights_before_loading(self)
+        elif isinstance(method, UnquantizedFusedMoEMethod):
+            # For flashinfer TRT-LLM BF16 path, process_weights_after_loading
+            # reshapes expert weights into block layout.
             method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
                 layer=self,
                 param=param,
