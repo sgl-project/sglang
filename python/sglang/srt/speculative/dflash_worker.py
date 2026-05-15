@@ -155,10 +155,10 @@ class DFlashWorker:
             memory_pool_config=target_worker.model_runner.memory_pool_config,
         )
         set_global_server_args_for_scheduler(saved_server_args)
-        self.draft_model_runner = self.draft_worker.model_runner
-        self.draft_model = self.draft_model_runner.model
+        self.draft_runner = self.draft_worker.model_runner
+        self.draft_model = self.draft_runner.model
         draft_config = parse_dflash_draft_config(
-            draft_hf_config=self.draft_model_runner.model_config.hf_config
+            draft_hf_config=self.draft_runner.model_config.hf_config
         )
         if server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
@@ -596,7 +596,7 @@ class DFlashWorker:
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
-        allocator = self.draft_model_runner.token_to_kv_pool_allocator
+        allocator = self.draft_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
             if self.page_size == 1:
@@ -604,7 +604,7 @@ class DFlashWorker:
             else:
                 block_end_cpu = seq_lens_cpu + int(self.block_size)
                 last_loc = get_last_loc(
-                    self.draft_model_runner.req_to_token_pool.req_to_token,
+                    self.draft_runner.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
                     block_start,
                 )
@@ -623,7 +623,7 @@ class DFlashWorker:
 
             assign_req_to_token_pool_func(
                 batch.req_pool_indices,
-                self.draft_model_runner.req_to_token_pool.req_to_token,
+                self.draft_runner.req_to_token_pool.req_to_token,
                 block_start,
                 block_end,
                 block_cache_loc,
@@ -646,9 +646,9 @@ class DFlashWorker:
                 seq_lens_sum=seq_lens_sum,
                 seq_lens_cpu=seq_lens_cpu,
                 positions=positions,
-                req_to_token_pool=self.draft_model_runner.req_to_token_pool,
-                token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
-                attn_backend=self.draft_model_runner.attn_backend,
+                req_to_token_pool=self.draft_runner.req_to_token_pool,
+                token_to_kv_pool=self.draft_runner.token_to_kv_pool,
+                attn_backend=self.draft_runner.attn_backend,
                 input_embeds=input_embeds,
                 spec_algorithm=SpeculativeAlgorithm.DFLASH,
                 spec_info=draft_spec_info,
@@ -656,7 +656,7 @@ class DFlashWorker:
             )
 
             with torch.inference_mode():
-                draft_logits_output = self.draft_model_runner.forward(
+                draft_logits_output = self.draft_runner.forward(
                     forward_batch
                 ).logits_output
         finally:
@@ -906,7 +906,7 @@ class DFlashWorker:
             return
 
         target_req_to_token = batch.req_to_token_pool.req_to_token
-        draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
+        draft_req_to_token = self.draft_runner.req_to_token_pool.req_to_token
 
         req_pool_indices = batch.req_pool_indices
         if req_pool_indices.dtype != torch.int64:
@@ -1024,7 +1024,7 @@ class DFlashWorker:
             k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
+            self.draft_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
                 ctx_cache_loc,
                 k,
@@ -1040,7 +1040,7 @@ class DFlashWorker:
         ctx_cache_loc: torch.Tensor,
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
-        token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
+        token_to_kv_pool = self.draft_runner.token_to_kv_pool
         layers = self.draft_model.layers
 
         def _write_layer_kv(

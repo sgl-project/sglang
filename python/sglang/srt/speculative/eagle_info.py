@@ -52,18 +52,6 @@ if is_cuda() or is_musa():
 logger = logging.getLogger(__name__)
 
 
-def _draft_runner_of(worker):
-    """Draft model_runner accessor that handles v1 / v2 worker naming.
-
-    v1 (`EAGLEWorker` and subclasses) exposes the draft model_runner as
-    `model_runner` (the worker itself runs the draft model);
-    v2 (`EagleDraftWorker` and subclasses) exposes it as `draft_runner`.
-    """
-    return (
-        worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
-    )
-
-
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
@@ -729,13 +717,13 @@ class EagleDraftInput(SpecInput):
         consume the field (e.g., STANDALONE)."""
         if worker.speculative_algorithm.is_standalone():
             return None
-        return _draft_runner_of(worker).model_config.spec_hidden_size
+        return worker.draft_runner.model_config.spec_hidden_size
 
     @classmethod
     def dtype_for(cls, worker) -> Optional[torch.dtype]:
         if worker.speculative_algorithm.is_standalone():
             return None
-        return _draft_runner_of(worker).model_config.dtype
+        return worker.draft_runner.model_config.dtype
 
     @classmethod
     def create_idle_input(

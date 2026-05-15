@@ -179,16 +179,16 @@ class EAGLEWorker(TpModelWorker):
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
             if (
-                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
-                and self.draft_model_runner.model.load_lm_head_from_target
+                hasattr(self.draft_runner.model, "load_lm_head_from_target")
+                and self.draft_runner.model.load_lm_head_from_target
             ):
-                self.draft_model_runner.model.set_embed_and_head(embed, head)
+                self.draft_runner.model.set_embed_and_head(embed, head)
             else:
-                self.draft_model_runner.model.set_embed(embed)
+                self.draft_runner.model.set_embed(embed)
 
             # grab hot token ids
-            if self.draft_model_runner.model.hot_token_id is not None:
-                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
+            if self.draft_runner.model.hot_token_id is not None:
+                self.hot_token_id = self.draft_runner.model.hot_token_id.to(
                     embed.device
                 )
 
@@ -199,12 +199,10 @@ class EAGLEWorker(TpModelWorker):
                 head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
-            self.draft_model_runner.model.set_embed_and_head(embed, head)
+            self.draft_runner.model.set_embed_and_head(embed, head)
 
         # Init attention backend and cuda graphs
-        self.draft_model_runner.server_args.disable_cuda_graph = (
-            backup_disable_cuda_graph
-        )
+        self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -212,13 +210,13 @@ class EAGLEWorker(TpModelWorker):
         if self.speculative_algorithm.is_eagle3():
             self.eagle_use_aux_hidden_state = True
             eagle_config = getattr(
-                self.draft_model_runner.model_config.hf_config, "eagle_config", {}
+                self.draft_runner.model_config.hf_config, "eagle_config", {}
             )
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
         with (
-            self.draft_tp_context(self.draft_model_runner.tp_group),
+            self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -249,7 +247,7 @@ class EAGLEWorker(TpModelWorker):
         # Create multi-step attn backends and cuda graph runners
         draft_backend_factory = DraftBackendFactory(
             self.server_args,
-            self.draft_model_runner,
+            self.draft_runner,
             self.topk,
             self.speculative_num_steps,
         )
@@ -262,7 +260,7 @@ class EAGLEWorker(TpModelWorker):
             draft_backend_factory.create_draft_extend_backend()
         )
 
-        self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.draft_runner.draft_attn_backend = self.draft_attn_backend
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -328,7 +326,7 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
         # Draft stage
         self.draft_attn_backend = state.draft_attn_backend
-        self.draft_model_runner.draft_attn_backend = state.draft_attn_backend
+        self.draft_runner.draft_attn_backend = state.draft_attn_backend
         self.cuda_graph_runner = state.cuda_graph_runner
         # Verify stage
         self.target_worker.model_runner.attn_backend = state.target_attn_backend
@@ -412,7 +410,7 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_draft_tokens,
             self.draft_attn_backend,
             self.draft_extend_attn_backend,
-            self.draft_model_runner.draft_attn_backend,
+            self.draft_runner.draft_attn_backend,
             self.cuda_graph_runner,
             self.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
@@ -430,7 +428,7 @@ class EAGLEWorker(TpModelWorker):
                 self.speculative_num_draft_tokens,
                 self.draft_attn_backend,
                 self.draft_extend_attn_backend,
-                self.draft_model_runner.draft_attn_backend,
+                self.draft_runner.draft_attn_backend,
                 self.cuda_graph_runner,
                 self.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
@@ -438,7 +436,7 @@ class EAGLEWorker(TpModelWorker):
             ) = backup
 
     @property
-    def draft_model_runner(self):
+    def draft_runner(self):
         return self.model_runner
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
@@ -461,7 +459,7 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph,
             ) = self.forward_target_extend(batch)
             with (
-                self.draft_tp_context(self.draft_model_runner.tp_group),
+                self.draft_tp_context(self.draft_runner.tp_group),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
@@ -483,7 +481,7 @@ class EAGLEWorker(TpModelWorker):
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
             with (
-                self.draft_tp_context(self.draft_model_runner.tp_group),
+                self.draft_tp_context(self.draft_runner.tp_group),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
@@ -510,7 +508,7 @@ class EAGLEWorker(TpModelWorker):
             )
 
             with (
-                self.draft_tp_context(self.draft_model_runner.tp_group),
+                self.draft_tp_context(self.draft_runner.tp_group),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
@@ -747,7 +745,7 @@ class EAGLEWorker(TpModelWorker):
 
         if self.page_size > 1 and self.topk > 1:
             if duplicate_cache_len > 0:
-                self.draft_model_runner.token_to_kv_pool.move_kv_cache(
+                self.draft_runner.token_to_kv_pool.move_kv_cache(
                     target_cache_loc, source_cache_loc
                 )
             # Remove padded slots
@@ -799,9 +797,7 @@ class EAGLEWorker(TpModelWorker):
         # Get forward batch
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.capture_hidden_mode == draft_capture_mode
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_runner)
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
@@ -926,7 +922,7 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output = self.draft_model_runner.forward(
+            logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
@@ -1166,13 +1162,11 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch = batch.get_model_worker_batch(
                 seq_lens_cpu_cache=seq_lens_cpu
             )
-            forward_batch = ForwardBatch.init_new(
-                model_worker_batch, self.draft_model_runner
-            )
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_runner)
             forward_batch.return_logprob = False
             if mm_input_embeds is not None:
                 forward_batch.mm_input_embeds = mm_input_embeds
-            logits_output = self.draft_model_runner.forward(forward_batch).logits_output
+            logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(
                 logits_output.next_token_logits, "draft_extend_for_prefill"
             )
@@ -1225,9 +1219,7 @@ class EAGLEWorker(TpModelWorker):
         draft_extend_input.capture_hidden_mode = draft_extend_capture_mode
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.capture_hidden_mode == draft_extend_capture_mode
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_runner)
         if forward_batch.seq_lens_cpu is not None:
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
         else:
@@ -1250,12 +1242,11 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():
                 attn_backend = (
-                    self.draft_extend_attn_backend
-                    or self.draft_model_runner.attn_backend
+                    self.draft_extend_attn_backend or self.draft_runner.attn_backend
                 )
                 attn_backend.init_forward_metadata(forward_batch)
                 forward_batch.attn_backend = attn_backend
-            logits_output = self.draft_model_runner.forward(
+            logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
             # Non-cuda-graph path: compute topk_p / topk_index inline.

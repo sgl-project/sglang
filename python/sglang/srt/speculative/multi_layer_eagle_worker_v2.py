@@ -146,8 +146,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Alias for better readability
         self.draft_runner_list: List[ModelRunner] = self.draft_worker.model_runner_list
-        # Match `EagleDraftWorker.draft_runner` so `_draft_runner_of(self)` works
-        # for the EagleDraftInput shape classmethods.
+        # `draft_runner` (single) is the canonical shape entry expected by the
+        # `EagleDraftInput` shape classmethods in eagle_info.py.
         self.draft_runner: ModelRunner = self.draft_runner_list[0]
 
         # Chain-style MTP: each step propagates its own output hidden states to the
