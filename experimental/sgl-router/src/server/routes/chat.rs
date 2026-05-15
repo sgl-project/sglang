@@ -19,7 +19,7 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
-    let streaming = parse_streaming(&body);
+    let streaming = parse_streaming(&body)?;
     if streaming {
         ctx.proxy
             .forward_streaming("/v1/chat/completions", &headers, body)
@@ -31,10 +31,8 @@ pub async fn chat_completions(
     }
 }
 
-fn parse_streaming(body: &Bytes) -> bool {
-    let v: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    v.get("stream").and_then(|x| x.as_bool()).unwrap_or(false)
+fn parse_streaming(body: &Bytes) -> Result<bool, ApiError> {
+    let v: Value = serde_json::from_slice(body)
+        .map_err(|e| ApiError::BadRequest(format!("invalid JSON body: {e}")))?;
+    Ok(v.get("stream").and_then(|x| x.as_bool()).unwrap_or(false))
 }

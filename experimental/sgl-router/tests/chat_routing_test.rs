@@ -257,3 +257,34 @@ async fn streaming_upstream_5xx_preserves_content_type() {
         "router must preserve upstream content-type on error, not force text/event-stream"
     );
 }
+
+#[tokio::test]
+async fn malformed_json_returns_400_bad_request() {
+    // Regression: a malformed JSON request body must return 400 with
+    // bad_request envelope from the router itself; we must NOT forward
+    // the bad payload to the worker.
+    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&worker.url);
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone()));
+    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from("{not json}"))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        res.headers().get("x-router-error-code").unwrap(),
+        "bad_request"
+    );
+    // Also: worker must NOT have received a body for this request
+    let captured = worker.captured.lock().unwrap();
+    assert!(
+        captured.last_body.is_none(),
+        "router must not forward malformed JSON to upstream worker; got body: {:?}",
+        captured.last_body
+    );
+}
