@@ -84,9 +84,8 @@ jobs:
               outerStart,
               '### CI Awareness',
               '',
-              '**Latest CI runs:**',
-              `- PR Test: ${ptStart}${newPrTest}${ptEnd}`,
-              `- PR Test Extra: ${peStart}${newPrExtra}${peEnd}`,
+              `Latest PR Test: ${ptStart}${newPrTest}${ptEnd}`,
+              `Latest PR Test (Extra): ${peStart}${newPrExtra}${peEnd}`,
               outerEnd,
             ].join('\n');
 
