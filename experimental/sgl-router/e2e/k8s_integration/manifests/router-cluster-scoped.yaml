@@ -1,0 +1,60 @@
+# sgl-router deployment with ClusterRole for cross-namespace discovery test.
+# Watches workers in ALL namespaces via cluster-scoped EndpointSlice access.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sgl-router-cluster
+  namespace: sgl-router-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sgl-router-cluster
+  template:
+    metadata:
+      labels:
+        app: sgl-router-cluster
+    spec:
+      serviceAccountName: sgl-router-cluster
+      containers:
+        - name: router
+          image: sgl-router:e2e
+          imagePullPolicy: Never
+          args:
+            - "--config"
+            - "/etc/config/router-cluster.toml"
+          ports:
+            - containerPort: 8091
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8091
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8091
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/config
+      volumes:
+        - name: config
+          configMap:
+            name: sgl-router-cluster-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sgl-router-cluster
+  namespace: sgl-router-test
+spec:
+  selector:
+    app: sgl-router-cluster
+  ports:
+    - name: http
+      port: 8091
+      targetPort: 8091
