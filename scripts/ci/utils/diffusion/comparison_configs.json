@@ -149,7 +149,9 @@
             "frameworks": {
                 "sglang": {
                     "serve_args": "--enable-torch-compile --warmup --pipeline-class-name LTX2TwoStagePipeline --cfg-parallel-size 2 --vae-cpu-offload",
-                    "extra_env": {}
+                    "extra_env": {
+                        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+                    }
                 }
             }
         },
