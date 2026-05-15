@@ -18,6 +18,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import get_int_env_var
 
+_MORI_MOE_MAX_INPUT_TOKENS = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -259,13 +261,12 @@ def _pre_permute_deepep_to_aiter(
         # Truncate dispatch tensors to the configured cap; mori combine only
         # reads [0, totalRecvTokenNum), so the truncated result needs no
         # padding back.
-        mori_max = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
-        if mori_max > 0:
-            hidden_states = hidden_states[:mori_max]
+        if _MORI_MOE_MAX_INPUT_TOKENS > 0:
+            hidden_states = hidden_states[:_MORI_MOE_MAX_INPUT_TOKENS]
             if a1_scale is not None:
-                a1_scale = a1_scale[:mori_max]
-            topk_ids = topk_ids[:mori_max]
-            topk_weights = topk_weights[:mori_max]
+                a1_scale = a1_scale[:_MORI_MOE_MAX_INPUT_TOKENS]
+            topk_ids = topk_ids[:_MORI_MOE_MAX_INPUT_TOKENS]
+            topk_weights = topk_weights[:_MORI_MOE_MAX_INPUT_TOKENS]
 
         # Upscale dispatched activations when there is no AITER kernel for the
         # weight/activation dtype pair.
