@@ -50,7 +50,9 @@ impl Config {
                 if k.namespace.is_empty() {
                     return Err(anyhow!("discovery.k8s.namespace must be set"));
                 }
-                // label_selector may be empty (matches everything in namespace)
+                // Reject invalid selector combinations at load time (no
+                // selectors, mixed plain+PD, partial PD).
+                k.mode().map_err(|e| anyhow!("{e}"))?;
             }
         }
         Ok(())
@@ -201,9 +203,211 @@ label_selector = "app=sglang"
         match &c.discovery.backend {
             DiscoveryBackend::K8s(k) => {
                 assert_eq!(k.namespace, "default");
-                assert_eq!(k.label_selector, "app=sglang");
+                assert_eq!(k.label_selector.as_deref(), Some("app=sglang"));
+                assert!(k.prefill_selector.is_none());
+                assert!(k.decode_selector.is_none());
             }
             _ => panic!("expected k8s backend"),
+        }
+    }
+
+    #[test]
+    fn loads_k8s_pd_discovery_with_prefill_and_decode_selectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "qwen3-0.6b"
+tokenizer_path = "/tmp/qwen.json"
+[discovery]
+backend = "k8s"
+[discovery.k8s]
+namespace = "default"
+prefill_selector = "app=sglang,role=prefill"
+decode_selector = "app=sglang,role=decode"
+"#,
+        )
+        .unwrap();
+        let c = Config::from_path(&p).unwrap();
+        match &c.discovery.backend {
+            DiscoveryBackend::K8s(k) => {
+                assert!(k.label_selector.is_none());
+                assert_eq!(
+                    k.prefill_selector.as_deref(),
+                    Some("app=sglang,role=prefill")
+                );
+                assert_eq!(k.decode_selector.as_deref(), Some("app=sglang,role=decode"));
+                match k.mode().unwrap() {
+                    K8sDiscoveryMode::PdDisaggregation {
+                        prefill_selector,
+                        decode_selector,
+                    } => {
+                        assert_eq!(prefill_selector, "app=sglang,role=prefill");
+                        assert_eq!(decode_selector, "app=sglang,role=decode");
+                    }
+                    other => panic!("expected PdDisaggregation, got {other:?}"),
+                }
+            }
+            _ => panic!("expected k8s backend"),
+        }
+    }
+
+    #[test]
+    fn rejects_k8s_config_with_no_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "qwen"
+tokenizer_path = "/tmp/qwen.json"
+[discovery]
+backend = "k8s"
+[discovery.k8s]
+namespace = "default"
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("selector"), "got: {err}");
+    }
+
+    fn k8s_cfg(
+        label: Option<&str>,
+        prefill: Option<&str>,
+        decode: Option<&str>,
+    ) -> K8sDiscoveryConfig {
+        K8sDiscoveryConfig {
+            namespace: "default".into(),
+            label_selector: label.map(str::to_string),
+            prefill_selector: prefill.map(str::to_string),
+            decode_selector: decode.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn k8s_mode_rejects_when_no_selector_is_set() {
+        let err = k8s_cfg(None, None, None).mode().unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("selector"),
+            "expected selector error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn k8s_mode_rejects_mixed_plain_and_pd_selectors() {
+        let err = k8s_cfg(
+            Some("app=sglang"),
+            Some("role=prefill"),
+            Some("role=decode"),
+        )
+        .mode()
+        .unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("label_selector") && msg.contains("prefill"),
+            "expected mixed-mode error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn k8s_mode_rejects_partial_pd_selectors() {
+        let err = k8s_cfg(None, Some("role=prefill"), None)
+            .mode()
+            .unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("prefill_selector") && msg.contains("decode_selector"),
+            "expected partial-PD error, got: {err}"
+        );
+
+        let err = k8s_cfg(None, None, Some("role=decode")).mode().unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("prefill_selector") && msg.contains("decode_selector"),
+            "expected partial-PD error, got: {err}"
+        );
+    }
+
+    /// An empty PD selector matches every endpoint (per k8s label-selector
+    /// grammar — no terms == always-true) and silently collapses the
+    /// prefill/decode distinction. Reject at config-load so operators see
+    /// the error instead of every worker being classified as Prefill.
+    #[test]
+    fn k8s_mode_rejects_empty_prefill_selector() {
+        let err = k8s_cfg(None, Some(""), Some("role=decode"))
+            .mode()
+            .unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("prefill_selector") && msg.contains("empty"),
+            "expected empty-prefill-selector error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn k8s_mode_rejects_empty_decode_selector() {
+        let err = k8s_cfg(None, Some("role=prefill"), Some(""))
+            .mode()
+            .unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("decode_selector") && msg.contains("empty"),
+            "expected empty-decode-selector error, got: {err}"
+        );
+    }
+
+    /// Plain `label_selector = Some("")` STAYS valid — empty selector
+    /// matches every EndpointSlice in the namespace, which is a documented
+    /// k8s behavior and the user explicitly opts in to "match all" by
+    /// setting plain mode. The empty-rejection is a PD-mode-only safeguard.
+    #[test]
+    fn k8s_mode_accepts_empty_plain_label_selector() {
+        let mode = k8s_cfg(Some(""), None, None).mode().expect("plain mode valid");
+        match mode {
+            K8sDiscoveryMode::Plain { label_selector } => {
+                assert_eq!(label_selector, "");
+            }
+            other => panic!("expected Plain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn k8s_mode_accepts_plain_with_label_selector() {
+        let mode = k8s_cfg(Some("app=sglang"), None, None).mode().unwrap();
+        match mode {
+            K8sDiscoveryMode::Plain { label_selector } => {
+                assert_eq!(label_selector, "app=sglang")
+            }
+            other => panic!("expected Plain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn k8s_mode_accepts_pd_with_both_selectors() {
+        let mode = k8s_cfg(None, Some("role=prefill"), Some("role=decode"))
+            .mode()
+            .unwrap();
+        match mode {
+            K8sDiscoveryMode::PdDisaggregation {
+                prefill_selector,
+                decode_selector,
+            } => {
+                assert_eq!(prefill_selector, "role=prefill");
+                assert_eq!(decode_selector, "role=decode");
+            }
+            other => panic!("expected PdDisaggregation, got {other:?}"),
         }
     }
 
