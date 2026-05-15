@@ -73,6 +73,7 @@ try:
 
     have_deepep_v2 = True
 except ImportError:
+    ElasticBuffer = None
     have_deepep_v2 = False
 
 from enum import Enum, IntEnum, auto
@@ -226,7 +227,6 @@ class DeepEPBuffer:
             cls._buffer = cls._build_v2_buffer(
                 group,
                 hidden_size,
-                param_bytes,
                 deepep_mode,
                 num_max_dispatch_tokens_per_rank,
                 num_experts,
@@ -322,7 +322,6 @@ class DeepEPBuffer:
         cls,
         group: dist.ProcessGroup,
         hidden_size: int,
-        param_bytes: int,
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int,
         num_experts: int,
