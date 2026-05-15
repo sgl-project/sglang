@@ -376,7 +376,7 @@ class MambaPool:
         )
         t[:, select_index] = z
 
-        return select_index
+        return select_index.clone()
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
