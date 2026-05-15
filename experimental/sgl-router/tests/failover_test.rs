@@ -3,6 +3,8 @@
 
 mod common;
 
+use axum::body::Body;
+use axum::http::Request;
 use sgl_router::config::*;
 use sgl_router::discovery::{spawn_discovery, ModelId};
 use sgl_router::policies::factory::build_registry as build_policy_registry;
@@ -12,8 +14,6 @@ use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::manager;
 use sgl_router::workers::WorkerRegistry;
-use axum::body::Body;
-use axum::http::Request;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -67,7 +67,7 @@ model_ids = ["tiny"]
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: "round_robin".into(),
             circuit_breaker: Some(CircuitBreakerConfig {
-                threshold: 1,       // open after first failure
+                threshold: 1, // open after first failure
                 cool_down_secs: 30,
             }),
         }],
