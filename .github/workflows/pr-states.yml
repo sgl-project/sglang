@@ -63,7 +63,7 @@ jobs:
             const missingCIText = ':x: **Missing `run-ci` label** — add it to run CI tests.';
             const peBlockedByCIText = ':x: **Blocked** — `run-ci` is required first.';
             const notExtraEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
-            const stalePushText = ':warning: **Not run on latest push** — push again or use `/rerun-failed-ci` to dispatch.';
+            const stalePushText = ':warning: **Not run on latest push** — push again to dispatch.';
             const ptText = !hasCI
               ? missingCIText
               : (isReal(ptRun) ? `[Run #${ptRun.id}](${ptRun.html_url})` : '_Not run yet_');
