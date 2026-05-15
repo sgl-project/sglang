@@ -508,12 +508,11 @@ class TpModelWorker(BaseTpWorker):
                     logits_output, forward_batch
                 )
             else:
-                # For prefill-only requests, create dummy token IDs on CPU
-                # The size should match the batch size (number of sequences), not total tokens
+                # For prefill-only requests, create dummy token IDs directly on CPU
+                # to avoid unnecessary GPU→CPU transfer and synchronization.
                 batch_result.next_token_ids = torch.zeros(
                     len(model_worker_batch.seq_lens),
                     dtype=torch.long,
-                    device=model_worker_batch.input_ids.device,
                 )
                 if (
                     model_worker_batch.return_logprob

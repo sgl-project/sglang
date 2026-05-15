@@ -11,6 +11,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
+    BatchStrOutput,
     BatchTokenIDOutput,
     GetLoadsReqInput,
 )
@@ -207,8 +208,12 @@ class SchedulerOutputProcessorMixin:
                 result.extend_logprob_start_len_per_req,
             )
 
-            # Move next_token_ids and logprobs to cpu
-            next_token_ids = next_token_ids.tolist()
+            # Move next_token_ids to cpu. For prefill-only, they are already
+            # on CPU (dummy zeros), so use a pre-built list to skip tolist().
+            if next_token_ids.is_cpu and batch.is_prefill_only:
+                next_token_ids = [0] * next_token_ids.shape[0]
+            else:
+                next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 if logits_output.next_token_logprobs is not None:
                     logits_output.next_token_logprobs = (
@@ -1260,8 +1265,61 @@ class SchedulerOutputProcessorMixin:
 
         dp_ranks = [self.dp_rank] * len(rids) if rids else None
 
-        # Send to detokenizer
-        if reqs or is_idle_batch:
+        # For prefill-only batches where all requests are finished with no output
+        # tokens (max_new_tokens=0), bypass the detokenizer and send results
+        # directly to the tokenizer manager. This saves one ZMQ round-trip +
+        # detokenization of empty outputs.
+        all_prefill_only_finished = (
+            rids
+            and not is_idle_batch
+            and not self.server_args.skip_tokenizer_init
+            and all(
+                req.finished() and req.sampling_params.max_new_tokens == 0
+                for req in reqs
+                if req is not skip_req
+            )
+        )
+        if all_prefill_only_finished:
+            self.send_to_tokenizer.send_output(
+                BatchStrOutput(
+                    rids=rids,
+                    http_worker_ipcs=http_worker_ipcs,
+                    finished_reasons=finished_reasons,
+                    output_strs=[""] * len(rids),
+                    output_ids=output_ids,
+                    prompt_tokens=prompt_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    completion_tokens=completion_tokens,
+                    cached_tokens=cached_tokens,
+                    cached_tokens_details=cached_tokens_details,
+                    spec_verify_ct=spec_verify_ct,
+                    spec_accepted_tokens=spec_accepted_tokens,
+                    spec_acceptance_histogram=spec_acceptance_histogram,
+                    input_token_logprobs_val=input_token_logprobs_val,
+                    input_token_logprobs_idx=input_token_logprobs_idx,
+                    output_token_logprobs_val=output_token_logprobs_val,
+                    output_token_logprobs_idx=output_token_logprobs_idx,
+                    input_top_logprobs_val=input_top_logprobs_val,
+                    input_top_logprobs_idx=input_top_logprobs_idx,
+                    output_top_logprobs_val=output_top_logprobs_val,
+                    output_top_logprobs_idx=output_top_logprobs_idx,
+                    input_token_ids_logprobs_val=input_token_ids_logprobs_val,
+                    input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+                    output_token_ids_logprobs_val=output_token_ids_logprobs_val,
+                    output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
+                    output_token_entropy_val=None,
+                    output_hidden_states=output_hidden_states,
+                    routed_experts=routed_experts,
+                    customized_info=customized_info,
+                    placeholder_tokens_idx=None,
+                    placeholder_tokens_val=None,
+                    retraction_counts=retraction_counts,
+                    load=load,
+                    dp_ranks=dp_ranks,
+                    time_stats=time_stats,
+                )
+            )
+        elif reqs or is_idle_batch:
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,
