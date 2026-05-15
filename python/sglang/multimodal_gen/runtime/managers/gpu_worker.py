@@ -45,9 +45,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     configure_layerwise_offload_modules,
     iter_materialized_weights,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
-    cpu_offload_flags_for_layerwise_components,
-)
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -226,7 +223,7 @@ class GPUWorker:
             elif component in ("text_encoder", "text_encoder_2"):
                 arg = "--text-encoder-cpu-offload"
             elif component == "transformer":
-                if self._is_dit_layerwise_offload_selected():
+                if self.server_args.is_dit_layerwise_offload_selected():
                     arg = "--dit-layerwise-offload"
                 elif self.server_args.dit_cpu_offload:
                     arg = "--dit-cpu-offload"
@@ -236,15 +233,6 @@ class GPUWorker:
                 seen_args.add(arg)
 
         return ", ".join(suggestions) if suggestions else "None"
-
-    def _is_dit_layerwise_offload_selected(self) -> bool:
-        """if dit is selected to be layerwise-offload"""
-        component_names = self.server_args.layerwise_offload_components
-        return bool(
-            component_names
-            and "dit_cpu_offload"
-            in cpu_offload_flags_for_layerwise_components(component_names)
-        )
 
     def execute_forward(
         self, batch: List[Req], return_req: bool = False
@@ -741,7 +729,7 @@ class GPUWorker:
         # If the flag is True, it is currently offloaded, so it is a candidate to stay resident.
         offload_flags = {
             "transformer": self.server_args.dit_cpu_offload
-            or self._is_dit_layerwise_offload_selected(),
+            or self.server_args.is_dit_layerwise_offload_selected(),
             "vae": self.server_args.vae_cpu_offload,
             "text_encoder": self.server_args.text_encoder_cpu_offload,
             "text_encoder_2": self.server_args.text_encoder_cpu_offload,

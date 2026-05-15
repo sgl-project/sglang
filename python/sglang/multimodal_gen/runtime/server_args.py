@@ -822,6 +822,14 @@ class ServerArgs(DisaggArgsMixin):
         """
         return bool(self.layerwise_offload_components)
 
+    def is_dit_layerwise_offload_selected(self) -> bool:
+        component_names = self.layerwise_offload_components
+        return bool(
+            component_names
+            and "dit_cpu_offload"
+            in cpu_offload_flags_for_layerwise_components(component_names)
+        )
+
     def _adjust_layerwise_offload_components(self):
         explicitly_set_component_names = normalize_layerwise_offload_components(
             self.layerwise_offload_components
@@ -1722,13 +1730,7 @@ class ServerArgs(DisaggArgsMixin):
                 )
                 self.use_fsdp_inference = False
 
-            layerwise_components = self.layerwise_offload_components
-            layerwise_cpu_offload_flags = cpu_offload_flags_for_layerwise_components(
-                layerwise_components
-            )
-            should_disable_dit_cpu_offload = (
-                "dit_cpu_offload" in layerwise_cpu_offload_flags
-            )
+            should_disable_dit_cpu_offload = self.is_dit_layerwise_offload_selected()
             if should_disable_dit_cpu_offload and self.dit_cpu_offload is not False:
                 logger.warning(
                     "layerwise offload is selected for DiT components, automatically disabling dit_cpu_offload."
