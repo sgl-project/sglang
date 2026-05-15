@@ -423,6 +423,16 @@ def prepare_request(
     if diffusers_kwargs and "max_sequence_length" in diffusers_kwargs:
         req.max_sequence_length = diffusers_kwargs["max_sequence_length"]
 
+    enable_teacache = getattr(sampling_params, "enable_teacache", False)
+    if enable_teacache:
+        teacache_params = getattr(sampling_params, "teacache_params", None)
+        if teacache_params is not None:
+            req.teacache_params = teacache_params
+            logger.debug(
+                f"TeaCache enabled: cache_type={teacache_params.cache_type}, "
+                f"teacache_thresh={teacache_params.teacache_thresh}"
+            )
+
     req.adjust_size(server_args)
 
     if not isinstance(req.prompt, str):
