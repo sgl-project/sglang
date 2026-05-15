@@ -85,7 +85,7 @@ if _HAS_XPU:
         dtype_str = dtype_map[dtype]
         
         # Supported hidden sizes (must match C API instantiations in rmsnorm.hpp)
-        supported_sizes = [512, 1024, 1536, 2048, 3072, 4096, 5120, 6144, 7168, 8192]
+        supported_sizes = [64, 128, 256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 4096, 5120, 6144, 7168, 8192, 12288, 16384]
         if hidden_size not in supported_sizes:
             raise ValueError(f"Unsupported hidden_size for XPU RMSNorm: {hidden_size}. Supported: {supported_sizes}")
         
