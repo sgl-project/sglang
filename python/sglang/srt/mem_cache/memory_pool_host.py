@@ -1851,7 +1851,12 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         self.clear()
 
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        return torch.unique_consecutive(indices.to(torch.int64) // self.slot_page_size)
+        if indices.numel() % self.slot_page_size != 0:
+            raise ValueError(
+                f"{self.pool_name} transfer indices must be page-aligned, "
+                f"got numel={indices.numel()}, slot_page_size={self.slot_page_size}"
+            )
+        return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
 
     def get_size_per_token(self):
         return self.item_bytes
@@ -2185,7 +2190,12 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.state_page_bytes = expected_state_page_bytes or 0
 
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        return torch.unique_consecutive(indices.to(torch.int64) // self.swa_page_size)
+        if indices.numel() % self.swa_page_size != 0:
+            raise ValueError(
+                f"{self.pool_name} transfer indices must be SWA-page-aligned, "
+                f"got numel={indices.numel()}, swa_page_size={self.swa_page_size}"
+            )
+        return indices.reshape(-1, self.swa_page_size)[:, 0] // self.swa_page_size
 
     def get_size_per_token(self):
         return self.state_page_bytes
