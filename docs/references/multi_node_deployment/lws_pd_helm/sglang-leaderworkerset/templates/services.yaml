@@ -1,0 +1,45 @@
+{{- if .Values.service.enabled }}
+{{- if .Values.prefill.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.global.namePrefix }}-prefill
+  labels:
+    app.kubernetes.io/name: {{ include "sglang-leaderworkerset.name" . }}-prefill-service
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ include "sglang-leaderworkerset.chart" . }}
+spec:
+  selector:
+    leaderworkerset.sigs.k8s.io/name: {{ .Values.global.namePrefix }}-prefill
+    role: leader
+  ports:
+    - protocol: {{ .Values.service.prefill.protocol }}
+      port: {{ .Values.service.prefill.port }}
+      targetPort: {{ .Values.service.prefill.targetPort }}
+{{- end }}
+
+{{- if .Values.decode.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.global.namePrefix }}-decode
+  labels:
+    app.kubernetes.io/name: {{ include "sglang-leaderworkerset.name" . }}-decode-service
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ include "sglang-leaderworkerset.chart" . }}
+spec:
+  selector:
+    leaderworkerset.sigs.k8s.io/name: {{ .Values.global.namePrefix }}-decode
+    role: leader
+  ports:
+    - protocol: {{ .Values.service.decode.protocol }}
+      port: {{ .Values.service.decode.port }}
+      targetPort: {{ .Values.service.decode.targetPort }}
+{{- end }}
+{{- end }}
