@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from PIL import Image, ImageOps
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 from transformers import (
     AutoProcessor,
     LlamaTokenizerFast,
@@ -17,6 +19,8 @@ from sglang.srt.multimodal.customized_mm_processor_utils import (
 from sglang.srt.sampling.custom_logit_processor import (
     DeepseekOCRNoRepeatNGramLogitProcessor,
 )
+
+DeepseekOCRImage = Union[Image.Image, torch.Tensor]
 
 BASE_SIZE = 1024
 IMAGE_SIZE = 640
@@ -48,7 +52,77 @@ def get_default_ngram_custom_params() -> Dict[str, Any]:
 
 
 PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
-ImageInput = Union[Image.Image, torch.Tensor]
+
+
+def get_image_size(img: DeepseekOCRImage) -> Tuple[int, int]:
+    """Return (width, height) for both PIL.Image and torch.Tensor (CHW)."""
+    if isinstance(img, Image.Image):
+        return img.size
+    if isinstance(img, torch.Tensor):
+        if img.ndim != 3:
+            raise TypeError(f"Expected CHW image tensor, got shape {tuple(img.shape)}")
+        return int(img.shape[-1]), int(img.shape[-2])
+    raise TypeError(f"Unsupported image type: {type(img)}")
+
+
+def resize_image(img: DeepseekOCRImage, size: Tuple[int, int]) -> DeepseekOCRImage:
+    """Resize image to (width, height) for both PIL and tensor."""
+    if isinstance(img, Image.Image):
+        return img.resize(size)
+    return TF.resize(
+        img,
+        [size[1], size[0]],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
+    ).contiguous()
+
+
+def crop_image(
+    img: DeepseekOCRImage, box: Tuple[int, int, int, int]
+) -> DeepseekOCRImage:
+    """Crop image with box=(left, upper, right, lower) for both PIL and tensor."""
+    if isinstance(img, Image.Image):
+        return img.crop(box)
+    left, upper, right, lower = box
+    return img[:, upper:lower, left:right].contiguous()
+
+
+def pad_image(
+    img: DeepseekOCRImage,
+    target_size: Tuple[int, int],
+    fill_color: Tuple[int, int, int],
+) -> DeepseekOCRImage:
+    """Fit-and-center-pad image to target_size=(width, height).
+
+    Replaces ImageOps.pad for tensor inputs.
+    """
+    if isinstance(img, Image.Image):
+        return ImageOps.pad(img, target_size, color=fill_color)
+    # tensor path: CHW format
+    _, h, w = img.shape
+    target_w, target_h = target_size
+    scale = min(target_w / w, target_h / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    resized = TF.resize(
+        img,
+        [new_h, new_w],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
+    )
+    pad_left = (target_w - new_w) // 2
+    pad_top = (target_h - new_h) // 2
+    if img.dtype == torch.uint8:
+        fill_tensor = torch.tensor(
+            list(fill_color), device=img.device, dtype=torch.uint8
+        ).view(3, 1, 1)
+    else:
+        fill_tensor = torch.tensor(
+            [c / 255.0 for c in fill_color], device=img.device, dtype=img.dtype
+        ).view(3, 1, 1)
+    result = fill_tensor.expand(3, target_h, target_w).clone()
+    result[:, pad_top : pad_top + new_h, pad_left : pad_left + new_w] = resized
+    return result.contiguous()
 
 
 class DictOutput(object):
@@ -83,96 +157,6 @@ class VLChatProcessorOutput(DictOutput):
         return len(self.input_ids)
 
 
-def _get_image_size(image: ImageInput) -> Tuple[int, int]:
-    if isinstance(image, Image.Image):
-        return image.size
-    if isinstance(image, torch.Tensor):
-        if image.ndim != 3:
-            raise TypeError(
-                f"Expected CHW image tensor, got shape {tuple(image.shape)}"
-            )
-        return int(image.shape[-1]), int(image.shape[-2])
-    raise TypeError(f"Unsupported image type: {type(image)}")
-
-
-def _to_float_chw_rgb_tensor(
-    image: torch.Tensor, make_contiguous: bool = True
-) -> torch.Tensor:
-    if not isinstance(image, torch.Tensor):
-        raise TypeError(f"Expected torch.Tensor, got {type(image)}")
-    if image.ndim != 3:
-        raise TypeError(f"Expected CHW image tensor, got shape {tuple(image.shape)}")
-    if image.shape[0] == 1:
-        image = image.repeat(3, 1, 1)
-    elif image.shape[0] != 3:
-        raise TypeError(
-            f"Expected CHW image tensor with 1 or 3 channels, got shape {tuple(image.shape)}"
-        )
-    if image.dtype == torch.uint8:
-        image = image.to(torch.float32).div_(255)
-    elif not image.is_floating_point():
-        image = image.to(torch.float32)
-    return image.contiguous() if make_contiguous else image
-
-
-def _resize_image(image: ImageInput, size: Tuple[int, int]) -> ImageInput:
-    # print(image)
-    if isinstance(image, Image.Image):
-        return image.resize(size)
-    if not isinstance(image, torch.Tensor):
-        raise TypeError(f"Unsupported image type: {type(image)}")
-
-    from torchvision.transforms import InterpolationMode
-    from torchvision.transforms import functional as F
-
-    image = _to_float_chw_rgb_tensor(image)
-    return F.resize(
-        image,
-        [size[1], size[0]],
-        interpolation=InterpolationMode.BICUBIC,
-        antialias=True,
-    ).contiguous()
-
-
-def _crop_image(image: ImageInput, box: Tuple[int, int, int, int]) -> ImageInput:
-    if isinstance(image, Image.Image):
-        return image.crop(box)
-    if not isinstance(image, torch.Tensor):
-        raise TypeError(f"Unsupported image type: {type(image)}")
-    if image.ndim != 3:
-        raise TypeError(f"Expected CHW image tensor, got shape {tuple(image.shape)}")
-    left, top, right, bottom = box
-    return image[:, top:bottom, left:right]
-
-
-def _pad_image(
-    image: ImageInput, size: Tuple[int, int], color: Tuple[int, int, int]
-) -> ImageInput:
-    if isinstance(image, Image.Image):
-        return ImageOps.pad(image, size, color=color)
-    if not isinstance(image, torch.Tensor):
-        raise TypeError(f"Unsupported image type: {type(image)}")
-
-    width, height = _get_image_size(image)
-    target_width, target_height = size
-    scale = min(target_width / width, target_height / height)
-    resized_width = int(round(width * scale))
-    resized_height = int(round(height * scale))
-    resized = _resize_image(image, (resized_width, resized_height))
-    assert isinstance(resized, torch.Tensor)
-
-    color_tensor = torch.tensor(
-        [channel / 255 for channel in color],
-        dtype=resized.dtype,
-        device=resized.device,
-    ).view(3, 1, 1)
-    padded = color_tensor.expand(3, target_height, target_width).clone()
-    left = int(round((target_width - resized_width) * 0.5))
-    top = int(round((target_height - resized_height) * 0.5))
-    padded[:, top : top + resized_height, left : left + resized_width] = resized
-    return padded.contiguous()
-
-
 class ImageTransform(object):
     def __init__(
         self,
@@ -201,47 +185,19 @@ class ImageTransform(object):
 
         self.transform = T.Compose(transform_pipelines)
 
-    def _get_tensor_normalize_stats(
-        self, dtype: torch.dtype, device: torch.device, batched: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        shape = (1, 3, 1, 1) if batched else (3, 1, 1)
-        ret = (
-            torch.tensor(self.mean, dtype=dtype, device=device).view(*shape),
-            torch.tensor(self.std, dtype=dtype, device=device).view(*shape),
-        )
-
-        return ret
-
-    def batch(self, images: List[ImageInput]) -> List[torch.Tensor]:
-        if not images:
-            return []
-        if not all(isinstance(image, torch.Tensor) for image in images):
-            return [self(image) for image in images]
-
-        x = torch.stack(
-            [
-                _to_float_chw_rgb_tensor(image, make_contiguous=False)
-                for image in images
-            ],
-            dim=0,
-        )
-        if self.normalize:
-            mean, std = self._get_tensor_normalize_stats(
-                x.dtype, x.device, batched=True
-            )
-            x.sub_(mean).div_(std)
-        return list(x.unbind(0))
-
-    def __call__(self, image: ImageInput):
-        if isinstance(image, torch.Tensor):
-            x = _to_float_chw_rgb_tensor(image, make_contiguous=False)
+    def __call__(self, img):
+        if isinstance(img, torch.Tensor):
+            x = img
+            if x.dtype == torch.uint8:
+                x = x.to(torch.float32).div(255)
+            elif not x.is_floating_point():
+                x = x.to(torch.float32)
             if self.normalize:
-                mean, std = self._get_tensor_normalize_stats(x.dtype, x.device)
-                x = x.sub(mean).div_(std)
-            return x.contiguous()
+                import torchvision.transforms as T
 
-        x = self.transform(image)
+                x = T.Normalize(self.mean, self.std)(x)
+            return x
+        x = self.transform(img)
         return x
 
 
@@ -262,13 +218,9 @@ def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_
 
 
 def dynamic_preprocess(
-    image: ImageInput,
-    min_num=MIN_CROPS,
-    max_num=MAX_CROPS,
-    image_size=640,
-    use_thumbnail=False,
+    image, min_num=MIN_CROPS, max_num=MAX_CROPS, image_size=640, use_thumbnail=False
 ):
-    orig_width, orig_height = _get_image_size(image)
+    orig_width, orig_height = get_image_size(image)
     aspect_ratio = orig_width / orig_height
 
     # calculate the existing image aspect ratio
@@ -292,7 +244,7 @@ def dynamic_preprocess(
     blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
 
     # resize the image
-    resized_img = _resize_image(image, (target_width, target_height))
+    resized_img = resize_image(image, (target_width, target_height))
     processed_images = []
     for i in range(blocks):
         box = (
@@ -302,11 +254,11 @@ def dynamic_preprocess(
             ((i // (target_width // image_size)) + 1) * image_size,
         )
         # split the image
-        split_img = _crop_image(resized_img, box)
+        split_img = crop_image(resized_img, box)
         processed_images.append(split_img)
     assert len(processed_images) == blocks
     if use_thumbnail and len(processed_images) != 1:
-        thumbnail_img = _resize_image(image, (image_size, image_size))
+        thumbnail_img = resize_image(image, (image_size, image_size))
         processed_images.append(thumbnail_img)
     return processed_images, target_aspect_ratio
 
@@ -385,9 +337,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
             **kwargs,
         )
 
-    def format_messages_v2(
-        self, messages: str, pil_images: List[ImageInput], max_req_input_len=-1
-    ):
+    def format_messages_v2(self, messages: str, pil_images, max_req_input_len=-1):
         """play the role of format_messages_v2 and get_images_info in the last version"""
         tokenized_data = []
         masked_tokenized_data = []  # labels
@@ -456,7 +406,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         self,
         prompt: str = None,
         conversations: List[Dict[str, str]] = None,
-        images: List[ImageInput] = None,
+        images: List[Image.Image] = None,
         apply_sft_format: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
@@ -531,7 +481,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         *,
         prompt: str = None,
         conversations: List[Dict[str, str]] = None,
-        images: List[ImageInput] = None,
+        images: List[Image.Image] = None,
         apply_sft_format: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
@@ -564,7 +514,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
     def tokenize_with_images(
         self,
         conversation: str,
-        images: List[ImageInput],
+        images: List[Image.Image],
         bos: bool = True,
         eos: bool = True,
         cropping: bool = True,
@@ -590,10 +540,10 @@ class DeepseekOCRProcessor(ProcessorMixin):
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
 
-            image_size = _get_image_size(image)
-            image_shapes.append(image_size)
+            image_shapes.append(get_image_size(image))
 
-            if image_size[0] <= 640 and image_size[1] <= 640:
+            img_w, img_h = get_image_size(image)
+            if img_w <= 640 and img_h <= 640:
                 crop_ratio = [1, 1]
             else:
                 if cropping:
@@ -605,12 +555,12 @@ class DeepseekOCRProcessor(ProcessorMixin):
 
             """process the global view"""
             if self.image_size <= 640 and not cropping:
-                image = _resize_image(image, (self.image_size, self.image_size))
+                image = resize_image(image, (self.image_size, self.image_size))
 
-            global_view = _pad_image(
+            global_view = pad_image(
                 image,
                 (self.base_size, self.base_size),
-                color=tuple(int(x * 255) for x in self.image_transform.mean),
+                tuple(int(x * 255) for x in self.image_transform.mean),
             )
             images_list.append(self.image_transform(global_view))
 
@@ -618,7 +568,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
             images_spatial_crop.append([num_width_tiles, num_height_tiles])
 
             if num_width_tiles > 1 or num_height_tiles > 1:
-                images_crop_list.extend(self.image_transform.batch(images_crop_raw))
+                for i in range(len(images_crop_raw)):
+                    images_crop_list.append(self.image_transform(images_crop_raw[i]))
 
             """add image tokens"""
             num_queries = math.ceil(
