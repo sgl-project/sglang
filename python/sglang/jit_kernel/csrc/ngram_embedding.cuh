@@ -129,10 +129,8 @@ __global__ void UpdateTokenTableDecodeKernel(
     long* row_indices,    // [batch_size]
     int* column_starts    // [batch_size]
 ) {
-  for (int req_id = blockIdx.x * blockDim.x + threadIdx.x; req_id < batch_size;
-       req_id += blockDim.x * gridDim.x) {
-    const int current_token_table_index =
-        row_indices[req_id] * max_context_len + column_starts[req_id];
+  for (int req_id = blockIdx.x * blockDim.x + threadIdx.x; req_id < batch_size; req_id += blockDim.x * gridDim.x) {
+    const int current_token_table_index = row_indices[req_id] * max_context_len + column_starts[req_id];
     ne_token_table[current_token_table_index] = tokens[req_id];
   }
 }
@@ -346,8 +344,7 @@ struct NgramEmbeddingKernel {
     const auto stream = LaunchKernel::resolve_device(device_.unwrap());
 
     constexpr int BLOCK_THREADS = 256;
-    const int grid_size =
-        std::min(1024, static_cast<int>(host::div_ceil(bs, BLOCK_THREADS)));
+    const int grid_size = std::min(1024, static_cast<int>(host::div_ceil(bs, BLOCK_THREADS)));
 
     LaunchKernel(grid_size, BLOCK_THREADS, stream)(
         device::ngram_embedding::UpdateTokenTableDecodeKernel,
