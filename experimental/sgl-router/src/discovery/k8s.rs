@@ -83,9 +83,16 @@ fn labels_match_selector(labels: &BTreeMap<String, String>, selector: &str) -> b
 /// Convert an `EndpointSlice` into a list of [`WorkerSpec`]s with the
 /// supplied [`WorkerMode`].
 ///
-/// Skips endpoints that are not ready (`conditions.ready != Some(true)`).
+/// Skips endpoints whose `conditions.ready` is explicitly `Some(false)`.
+/// Per the EndpointSlice API spec, `conditions.ready = None` (absent) means
+/// the endpoint **should be considered ready** (BLOCK 4 fix).
+///
 /// The worker URL is `http://<addr>:<port>` where port comes from
 /// `EndpointSlice.ports[0].port`, defaulting to `30000` if absent.
+///
+/// The [`WorkerId`] includes the slice's namespace and name to avoid
+/// cross-namespace IP collisions on overlay networks or with service-mesh
+/// sidecars: `{ns}/{slice_name}/{addr}:{port}` (IMPORTANT-10 fix).
 ///
 /// `model_ids` is intentionally left empty — model membership is resolved
 /// by the worker manager via `/server_info` introspection after the
@@ -98,19 +105,22 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
         .and_then(|p| p.port)
         .unwrap_or(30000);
 
+    // IMPORTANT-10: include namespace + slice name in the ID so that pods
+    // with identical IPs in different namespaces (overlay nets, sidecars)
+    // never share a WorkerId.
+    let ns = es.metadata.namespace.as_deref().unwrap_or("");
+    let slice_name = es.metadata.name.as_deref().unwrap_or("");
+
     let mut out = Vec::new();
     for ep in es.endpoints.iter() {
-        let is_ready = ep
-            .conditions
-            .as_ref()
-            .and_then(|c| c.ready)
-            .unwrap_or(false);
+        // BLOCK 4: None → true per EndpointSlice API spec.
+        let is_ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
         if !is_ready {
             continue;
         }
         for addr in &ep.addresses {
             let url = format!("http://{addr}:{port}");
-            let id = WorkerId(format!("{addr}:{port}"));
+            let id = WorkerId(format!("{ns}/{slice_name}/{addr}:{port}"));
             out.push(WorkerSpec {
                 id,
                 url,
@@ -132,6 +142,20 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
 /// side; in PD mode the watch is unfiltered and per-slice classification
 /// happens client-side via `classify_mode`.
 ///
+/// **BLOCK 2:** if `cfg.namespace` is empty, `Api::all(client)` is used so
+/// that the watcher is truly cluster-wide. `Api::namespaced(client, "")` is
+/// namespace-scoped to the empty-named namespace, which is almost never what
+/// callers intend.
+///
+/// **BLOCK 1:** state is tracked as a two-level map
+/// `per_slice: HashMap<SliceUid, HashMap<WorkerId, WorkerSpec>>`.
+/// K8s auto-shards Services with >100 endpoints and CNIs often shard per
+/// AZ, emitting multiple `EndpointSlice` objects per Service.  Using a
+/// flat state map meant each slice's event would silently drop all workers
+/// from sibling slices.  Now each slice's submap is replaced independently;
+/// the global union is recomputed from all submaps and diffed against
+/// `prev_union`.
+///
 /// The returned `JoinHandle` runs until the channel is closed or the watcher
 /// stream ends (server restart, etc.).
 pub async fn spawn(
@@ -143,7 +167,13 @@ pub async fn spawn(
     let client = Client::try_default()
         .await
         .context("kube client default config")?;
-    let api: Api<EndpointSlice> = Api::namespaced(client, &cfg.namespace);
+
+    // BLOCK 2: empty namespace → cluster-wide watch.
+    let api: Api<EndpointSlice> = if cfg.namespace.is_empty() {
+        Api::all(client)
+    } else {
+        Api::namespaced(client, &cfg.namespace)
+    };
 
     // Plain mode pushes the single selector to the server side so the LIST
     // is already filtered.  PD mode leaves the server-side selector empty
@@ -157,22 +187,36 @@ pub async fn spawn(
     let watcher_cfg = watcher::Config::default().labels(&server_side_selector);
 
     let handle = tokio::spawn(async move {
-        let mut state: HashMap<WorkerId, WorkerSpec> = HashMap::new();
+        // BLOCK 1: per-slice state to handle multi-slice Services correctly.
+        // Key: EndpointSlice UID (String).  Value: workers in that slice.
+        let mut per_slice: HashMap<String, HashMap<WorkerId, WorkerSpec>> = HashMap::new();
+        let mut prev_union: HashMap<WorkerId, WorkerSpec> = HashMap::new();
+
         let stream = watcher(api, watcher_cfg).applied_objects();
         tokio::pin!(stream);
         while let Some(event) = stream.next().await {
             match event {
                 Ok(es) => {
-                    let next: HashMap<WorkerId, WorkerSpec> = match classify_mode(&es, &mode) {
-                        Some(wm) => extract_workers(&es, wm)
-                            .into_iter()
-                            .map(|w| (w.id.clone(), w))
-                            .collect(),
-                        None => HashMap::new(),
-                    };
-                    let prev = std::mem::take(&mut state);
-                    for (id, spec) in &next {
-                        if let Some(p) = prev.get(id) {
+                    let slice_uid = es.metadata.uid.clone().unwrap_or_default();
+                    let next_slice: HashMap<WorkerId, WorkerSpec> =
+                        match classify_mode(&es, &mode) {
+                            Some(wm) => extract_workers(&es, wm)
+                                .into_iter()
+                                .map(|w| (w.id.clone(), w))
+                                .collect(),
+                            None => HashMap::new(),
+                        };
+                    per_slice.insert(slice_uid, next_slice);
+
+                    // Recompute union across all slices.
+                    let union: HashMap<WorkerId, WorkerSpec> = per_slice
+                        .values()
+                        .flat_map(|s| s.iter().map(|(k, v)| (k.clone(), v.clone())))
+                        .collect();
+
+                    // Diff union against prev_union.
+                    for (id, spec) in &union {
+                        if let Some(p) = prev_union.get(id) {
                             if p.mode != spec.mode {
                                 let _ = tx
                                     .send(DiscoveryEvent::ModeChanged {
@@ -189,12 +233,12 @@ pub async fn spawn(
                             let _ = tx.send(DiscoveryEvent::Added(spec.clone())).await;
                         }
                     }
-                    for id in prev.keys() {
-                        if !next.contains_key(id) {
+                    for id in prev_union.keys() {
+                        if !union.contains_key(id) {
                             let _ = tx.send(DiscoveryEvent::Removed { id: id.clone() }).await;
                         }
                     }
-                    state = next;
+                    prev_union = union;
                 }
                 Err(e) => {
                     tracing::warn!("k8s watcher error: {e:?}");
@@ -211,14 +255,36 @@ mod tests {
     use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort};
     use kube::core::ObjectMeta;
 
+    /// Helper: build a minimal EndpointSlice with predictable metadata.
     fn make_slice(addrs: &[&str], port: i32, ready: bool) -> EndpointSlice {
-        make_slice_with_labels(addrs, port, ready, &[])
+        make_slice_full(addrs, port, ready, "testns", "test-slice", &[])
+    }
+
+    fn make_slice_ns(
+        addrs: &[&str],
+        port: i32,
+        ready: bool,
+        ns: &str,
+        slice_name: &str,
+    ) -> EndpointSlice {
+        make_slice_full(addrs, port, ready, ns, slice_name, &[])
     }
 
     fn make_slice_with_labels(
         addrs: &[&str],
         port: i32,
         ready: bool,
+        labels: &[(&str, &str)],
+    ) -> EndpointSlice {
+        make_slice_full(addrs, port, ready, "testns", "test-slice", labels)
+    }
+
+    fn make_slice_full(
+        addrs: &[&str],
+        port: i32,
+        ready: bool,
+        ns: &str,
+        slice_name: &str,
         labels: &[(&str, &str)],
     ) -> EndpointSlice {
         let label_map: BTreeMap<String, String> = labels
@@ -232,7 +298,12 @@ mod tests {
                 } else {
                     Some(label_map)
                 },
-                name: Some("slice".into()),
+                name: if slice_name.is_empty() {
+                    None
+                } else {
+                    Some(slice_name.into())
+                },
+                namespace: if ns.is_empty() { None } else { Some(ns.into()) },
                 ..Default::default()
             },
             address_type: "IPv4".into(),
@@ -315,6 +386,7 @@ mod tests {
         assert_eq!(ws.len(), 1);
         assert_eq!(ws[0].mode, WorkerMode::Plain);
         assert_eq!(ws[0].url, "http://10.0.0.1:30000");
+        assert_eq!(ws[0].id.0, "testns/test-slice/10.0.0.1:30000");
         assert!(
             ws[0].model_ids.is_empty(),
             "model_ids are resolved via /server_info, not at extract time"
@@ -331,5 +403,49 @@ mod tests {
     fn skips_not_ready_endpoints() {
         let s = make_slice(&["10.0.0.1"], 30000, false);
         assert!(extract_workers(&s, WorkerMode::Plain).is_empty());
+    }
+
+    /// BLOCK 4: conditions.ready = None must default to ready=true per
+    /// EndpointSlice API spec ("undefined → endpoint should be considered
+    /// ready").
+    #[test]
+    fn is_ready_none_defaults_to_ready() {
+        let mut s = make_slice(&["10.0.0.1"], 30000, false /* overridden below */);
+        s.endpoints[0].conditions.as_mut().unwrap().ready = None;
+        let ws = extract_workers(&s, WorkerMode::Plain);
+        assert_eq!(
+            ws.len(),
+            1,
+            "endpoint with None ready should be treated as ready"
+        );
+    }
+
+    /// IMPORTANT 10: WorkerId must include namespace + slice name to avoid
+    /// cross-namespace IP collisions.
+    #[test]
+    fn worker_id_includes_namespace_and_slice_name() {
+        let mut s = make_slice(&["10.0.0.1"], 30000, true);
+        s.metadata.namespace = Some("prod".to_string());
+        s.metadata.name = Some("svc-abc-xyz".to_string());
+        let ws = extract_workers(&s, WorkerMode::Plain);
+        assert_eq!(ws[0].id.0, "prod/svc-abc-xyz/10.0.0.1:30000");
+    }
+
+    /// IMPORTANT 10: WorkerId with no namespace (cluster-scoped) should
+    /// produce a valid ID with empty-namespace prefix (leading slash).
+    #[test]
+    fn worker_id_handles_missing_namespace() {
+        // make_slice_ns with empty ns leaves metadata.namespace = None.
+        let s = make_slice_ns(&["10.0.0.1"], 30000, true, "", "my-slice");
+        let ws = extract_workers(&s, WorkerMode::Plain);
+        assert!(
+            ws[0].id.0.contains("10.0.0.1:30000"),
+            "id must contain addr:port"
+        );
+        assert!(
+            ws[0].id.0.starts_with('/'),
+            "empty ns => id starts with '/', got: {}",
+            ws[0].id.0
+        );
     }
 }
