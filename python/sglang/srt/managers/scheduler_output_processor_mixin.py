@@ -549,19 +549,50 @@ class SchedulerOutputProcessorMixin:
 
             # Non-spec and V2: full post-processing
             next_token_id = next_token_ids[i]
+            grammar_accepted = False
+            finish_checked = False
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
+            elif batch.is_spec_v2 and req.grammar is not None:
+                accepted_token_ids = []
+                try:
+                    for token_id in next_token_id:
+                        req.output_ids.append(token_id)
+                        accepted_token_ids.append(token_id)
+                        self._maybe_update_reasoning_tokens(req, token_id)
+                        req.grammar.accept_token(token_id)
+                        req.check_finished()
+                        if req.finished():
+                            break
+                except ValueError as e:
+                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                    # This can happen if the grammar is not set correctly or the token is invalid.
+                    logger.error(
+                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                    )
+                    self.abort_request(AbortReq(rid=req.rid))
+
+                # Drop speculative tokens accepted after grammar reached a
+                # terminal state. The request is finished, so the over-advanced
+                # KV/draft state will be released instead of reused.
+                next_token_id = accepted_token_ids
+                next_token_ids[i] = accepted_token_ids
+                new_accepted_len = len(accepted_token_ids)
+                grammar_accepted = True
+                finish_checked = True
             else:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
-            self._maybe_update_reasoning_tokens(req, next_token_id)
+            if not finish_checked:
+                self._maybe_update_reasoning_tokens(req, next_token_id)
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
-            req.check_finished(new_accepted_len)
+            if not finish_checked:
+                req.check_finished(new_accepted_len)
 
             self._handle_finished_req(req, i, logits_output)
 
@@ -602,7 +633,7 @@ class SchedulerOutputProcessorMixin:
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
 
-            if req.grammar is not None:
+            if req.grammar is not None and not grammar_accepted:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
                     if batch.spec_algorithm.is_none():
@@ -619,6 +650,7 @@ class SchedulerOutputProcessorMixin:
                         f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                     )
                     self.abort_request(AbortReq(rid=req.rid))
+            if req.grammar is not None:
                 req.grammar.finished = req.finished()
 
         self.stream_output(batch.reqs, batch.return_logprob)
