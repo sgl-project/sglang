@@ -125,7 +125,7 @@ if _is_cuda:
 
     try:
         from sgl_kernel import kimi_k2_moe_fused_gate
-    except ImportError as e:
+    except ImportError:
         pass
 
 if _is_cuda or _is_hip or _is_xpu:
@@ -144,7 +144,7 @@ if _use_aiter:
 if _is_musa:
     try:
         from mate import moe_fused_gate
-    except ImportError as e:
+    except ImportError:
         raise ImportError("mate is required for the biased grouped topk.")
 
     from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax
@@ -631,7 +631,7 @@ def fused_topk(
 
 
 # This is used by the Deepseek V2/V3/R1 series models
-@sgl_compile(dynamic=True)
+@sgl_compile(dynamic=True, requires_cuda_graph_safe=True)
 def grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -722,7 +722,7 @@ def grouped_topk_cpu(
     )
 
 
-@sgl_compile(dynamic=True)
+@sgl_compile(dynamic=True, requires_cuda_graph_safe=True)
 def kimi_k2_biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -760,7 +760,7 @@ def kimi_k2_biased_topk_impl(
     return topk_weights, topk_ids
 
 
-@sgl_compile(dynamic=True)
+@sgl_compile(dynamic=True, requires_cuda_graph_safe=True)
 def biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -855,7 +855,7 @@ def biased_topk_jit_kernel_impl(
     return topk_weights, topk_ids
 
 
-@sgl_compile(dynamic=True)
+@sgl_compile(dynamic=True, requires_cuda_graph_safe=True)
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -946,7 +946,7 @@ def _mask_topk_ids_padded_region(
         topk_ids[indices >= num_token_non_padded, :] = -1
 
 
-@sgl_compile(dynamic=True)
+@sgl_compile(dynamic=True, requires_cuda_graph_safe=True)
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):

@@ -130,7 +130,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@sgl_compile(dynamic=True)
+@sgl_compile(dynamic=True, requires_cuda_graph_safe=True)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,

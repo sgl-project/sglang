@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 import torch
 
+from sglang.srt.compilation.export_context import DistributedExportContext
 from sglang.srt.environ import envs
 from sglang.version import __version__ as sglang_version
 
@@ -47,6 +48,7 @@ class ExportArtifactMetadata:
     torch_version: str
     input_schema: tuple[TensorSchema | None, ...] = field(default_factory=tuple)
     copy_output_to_arg_index: int | None = None
+    distributed_context: dict[str, Any] = field(default_factory=dict)
 
     def to_json_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -77,6 +79,7 @@ class ExportArtifactMetadata:
             torch_version=data.get("torch_version", "unknown"),
             input_schema=schema,
             copy_output_to_arg_index=data.get("copy_output_to_arg_index"),
+            distributed_context=data.get("distributed_context", {}),
         )
 
 
@@ -89,6 +92,9 @@ class ExportArtifactSpec:
     export_dir: Path | None
     copy_output_to_arg_index: int | None = None
     input_schema: tuple[TensorSchema | None, ...] = field(default_factory=tuple)
+    distributed_context: DistributedExportContext = field(
+        default_factory=DistributedExportContext
+    )
 
     @property
     def safe_key(self) -> str:
@@ -124,6 +130,7 @@ class ExportArtifactSpec:
             torch_version=torch.__version__,
             input_schema=self.input_schema,
             copy_output_to_arg_index=self.copy_output_to_arg_index,
+            distributed_context=self.distributed_context.to_metadata(),
         )
 
     def ensure_export_dir(self) -> None:
@@ -175,6 +182,7 @@ def make_export_artifact_spec(
     shape_policy: str | None,
     copy_output_to_arg_index: int | None,
     args: tuple[Any, ...],
+    distributed_context: DistributedExportContext | None = None,
 ) -> ExportArtifactSpec:
     export_dir = envs.SGLANG_EXPORT_DIR.get()
     return ExportArtifactSpec(
@@ -190,6 +198,8 @@ def make_export_artifact_spec(
             TensorSchema.from_tensor(arg) if isinstance(arg, torch.Tensor) else None
             for arg in args
         ),
+        distributed_context=distributed_context
+        or DistributedExportContext.current(args),
     )
 
 

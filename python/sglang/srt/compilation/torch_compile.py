@@ -10,10 +10,12 @@ from typing import Any, Callable, Literal
 import torch
 
 from sglang.srt.compilation.export_artifact import make_export_artifact_spec
+from sglang.srt.compilation.export_context import DistributedExportContext
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 
 TorchCompileStrategy = Literal["compile", "noop", "export"]
+ExportFallbackStrategy = Literal["compile", "noop", "error"]
 
 
 @dataclass
@@ -29,6 +31,12 @@ class TorchCompileConfig:
     shape_policy: str | None = None
     export_format: str | None = None
     export_artifact_mode: str | None = None
+    export_fallback_strategy: ExportFallbackStrategy | None = None
+    requires_cuda_graph_safe: bool | None = None
+    requires_tp_safe: bool | None = None
+    requires_pp_safe: bool | None = None
+    requires_dp_safe: bool | None = None
+    requires_ep_safe: bool | None = None
     run_exported: bool | None = None
     copy_output_to_arg_index: int | None = None
     forced_fields: frozenset[str] = field(default_factory=frozenset)
@@ -59,6 +67,12 @@ _CONFIG_FIELDS = (
     "shape_policy",
     "export_format",
     "export_artifact_mode",
+    "export_fallback_strategy",
+    "requires_cuda_graph_safe",
+    "requires_tp_safe",
+    "requires_pp_safe",
+    "requires_dp_safe",
+    "requires_ep_safe",
     "run_exported",
     "copy_output_to_arg_index",
 )
@@ -69,6 +83,12 @@ _LIBRARY_DEFAULTS = TorchCompileConfig(
     shape_policy="infer_dynamic",
     export_format="torch",
     export_artifact_mode="build_if_missing",
+    export_fallback_strategy="compile",
+    requires_cuda_graph_safe=False,
+    requires_tp_safe=True,
+    requires_pp_safe=True,
+    requires_dp_safe=True,
+    requires_ep_safe=True,
     run_exported=False,
 )
 
@@ -156,17 +176,7 @@ def _build_callable(
     if strategy == "noop":
         return fn
     if strategy == "compile":
-        backend = config.backend
-        if backend is None:
-            backend = platform.get_compile_backend(config.mode)
-        compile_kwargs = {
-            "dynamic": config.dynamic,
-            "fullgraph": config.fullgraph,
-            "backend": backend,
-        }
-        if config.mode is not None:
-            compile_kwargs["mode"] = config.mode
-        return torch.compile(fn, **compile_kwargs)
+        return _build_compile_callable(fn, config, platform)
     if strategy == "export":
         return _export_callable(fn, config, args, kwargs, platform)
 
@@ -206,6 +216,12 @@ def _export_callable(
 ) -> Callable:
     key = config.key or _target_key(fn)
     config.key = key
+    context = DistributedExportContext.current(args)
+    runtime = platform.get_export_runtime(config)
+    incompatibility = _export_runtime_incompatibility(runtime, config, context)
+    if incompatibility is not None:
+        return _build_export_fallback(fn, config, platform, incompatibility)
+
     artifact = make_export_artifact_spec(
         key=key,
         export_format=config.export_format,
@@ -213,6 +229,7 @@ def _export_callable(
         shape_policy=config.shape_policy,
         copy_output_to_arg_index=config.copy_output_to_arg_index,
         args=args,
+        distributed_context=context,
     )
 
     torch_program_path = artifact.torch_program_path
@@ -253,12 +270,64 @@ def _export_callable(
             torch.export.save(exported_program, torch_program_path)
 
     if config.run_exported or artifact.mode == "export_only":
-        runtime = platform.get_export_runtime(config)
         runtime_callable = runtime.prepare_runtime(exported_program, artifact, config)
         if artifact.mode == "export_only":
             return fn
         return runtime_callable
     return fn
+
+
+def _build_compile_callable(fn: Callable, config: TorchCompileConfig, platform) -> Callable:
+    backend = config.backend
+    if backend is None:
+        backend = platform.get_compile_backend(config.mode)
+    compile_kwargs = {
+        "dynamic": config.dynamic,
+        "fullgraph": config.fullgraph,
+        "backend": backend,
+    }
+    if config.mode is not None:
+        compile_kwargs["mode"] = config.mode
+    return torch.compile(fn, **compile_kwargs)
+
+
+def _build_export_fallback(
+    fn: Callable,
+    config: TorchCompileConfig,
+    platform,
+    reason: str,
+) -> Callable:
+    fallback = config.export_fallback_strategy or "compile"
+    if fallback == "compile":
+        return _build_compile_callable(fn, config, platform)
+    if fallback == "noop":
+        return fn
+    if fallback == "error":
+        raise RuntimeError(reason)
+    raise ValueError(f"Unknown export fallback strategy: {fallback}")
+
+
+def _export_runtime_incompatibility(
+    runtime,
+    config: TorchCompileConfig,
+    context: DistributedExportContext,
+) -> str | None:
+    capabilities = runtime.capabilities(config, context)
+    key = config.key or "unknown"
+    if config.requires_cuda_graph_safe and not capabilities.supports_cuda_graph_capture:
+        return (
+            f"Export runtime {runtime.__class__.__name__} is not CUDA graph "
+            f"capture safe for {key}."
+        )
+    if context.tp_size > 1 and config.requires_tp_safe and not capabilities.supports_tp:
+        return f"Export runtime {runtime.__class__.__name__} does not support TP."
+    if context.pp_size > 1 and config.requires_pp_safe and not capabilities.supports_pp:
+        return f"Export runtime {runtime.__class__.__name__} does not support PP."
+    if context.dp_size > 1 and config.requires_dp_safe and not capabilities.supports_dp:
+        return f"Export runtime {runtime.__class__.__name__} does not support DP."
+    if context.ep_size > 1 and config.requires_ep_safe and not capabilities.supports_ep:
+        return f"Export runtime {runtime.__class__.__name__} does not support EP."
+    return None
 
 
 def _prepare_dynamic_export_inputs(
@@ -336,6 +405,15 @@ def _get_current_platform():
 def _is_transient_compile_context() -> bool:
     if is_in_piecewise_cuda_graph():
         return True
+
+    cuda = getattr(torch, "cuda", None)
+    is_current_stream_capturing = getattr(cuda, "is_current_stream_capturing", None)
+    if callable(is_current_stream_capturing):
+        try:
+            if is_current_stream_capturing():
+                return True
+        except RuntimeError:
+            pass
 
     compiler = getattr(torch, "compiler", None)
     is_compiling = getattr(compiler, "is_compiling", None)

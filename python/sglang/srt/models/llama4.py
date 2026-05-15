@@ -72,7 +72,7 @@ logger = logging.getLogger(__name__)
 
 class Llama4MoE(nn.Module):
 
-    @sgl_compile(dynamic=True)
+    @sgl_compile(dynamic=True, requires_cuda_graph_safe=True)
     @staticmethod
     def custom_routing_function(
         hidden_states: torch.Tensor,
@@ -319,7 +319,7 @@ class Llama4Attention(nn.Module):
         attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
         return attn_scale.unsqueeze(-1)
 
-    @sgl_compile(dynamic=True)
+    @sgl_compile(dynamic=True, requires_cuda_graph_safe=True)
     def _mul_attn_scale(self, positions, q):
         attn_scale = self._get_attn_scale(positions)
         return (q * attn_scale).to(q.dtype)

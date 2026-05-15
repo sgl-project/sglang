@@ -238,6 +238,44 @@ class TestSglCompile(CustomTestCase):
         self.assertEqual(loaded.format, "onnx")
         self.assertEqual(loaded.copy_output_to_arg_index, 0)
         self.assertEqual(loaded.input_schema[0].shape, (2, 3))
+        self.assertEqual(loaded.distributed_context["tp_size"], 1)
+
+    def test_export_runtime_requirement_falls_back_to_compile(self):
+        runtime = MagicMock(return_value="runtime")
+        self.platforms._current_platform = _StubPlatform(
+            strategy="export",
+            runtime_callable=runtime,
+        )
+
+        with patch("torch.compile", side_effect=lambda fn, **_: fn) as mock_compile:
+            with patch("torch.export.export") as mock_export:
+
+                @sgl_compile(run_exported=True, requires_cuda_graph_safe=True)
+                def fn(x):
+                    return x + 1
+
+                self.assertEqual(fn(1), 2)
+
+        mock_compile.assert_called_once()
+        mock_export.assert_not_called()
+        runtime.assert_not_called()
+
+    def test_export_runtime_requirement_can_error(self):
+        self.platforms._current_platform = _StubPlatform(
+            strategy="export",
+            runtime_callable=MagicMock(),
+        )
+
+        @sgl_compile(
+            run_exported=True,
+            requires_cuda_graph_safe=True,
+            export_fallback_strategy="error",
+        )
+        def fn(x):
+            return x + 1
+
+        with self.assertRaisesRegex(RuntimeError, "not CUDA graph capture safe"):
+            fn(1)
 
 
 if __name__ == "__main__":

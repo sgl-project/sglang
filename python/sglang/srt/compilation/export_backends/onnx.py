@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from sglang.srt.compilation.export_backends.base import ExportRuntime
+from sglang.srt.compilation.export_backends.base import (
+    ExportRuntime,
+    ExportRuntimeCapabilities,
+)
 
 
 class OnnxExportRuntime(ExportRuntime):
@@ -20,6 +23,16 @@ class OnnxExportRuntime(ExportRuntime):
     ):
         self.providers = providers
         self.prefer_cuda_iobinding = prefer_cuda_iobinding
+
+    def capabilities(self, compile_config, context):
+        return ExportRuntimeCapabilities(
+            supports_cuda_graph_capture=False,
+            supports_tp=True,
+            supports_pp=True,
+            supports_dp=True,
+            supports_ep=True,
+            supports_non_alias_outputs=True,
+        )
 
     def prepare_runtime(self, exported_program, artifact, compile_config):
         onnx_path = artifact.runtime_artifact_path
