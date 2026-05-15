@@ -15,8 +15,7 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 
-os.environ["LMCACHE_USE_EXPERIMENTAL"] = "True"
-os.environ["LMCACHE_CONFIG_FILE"] = "example_config.yaml"
+os.environ["LMCACHE_CONFIG_FILE"] = "example_config_ip.yaml"
 
 
 def test_load_store_metadata():
