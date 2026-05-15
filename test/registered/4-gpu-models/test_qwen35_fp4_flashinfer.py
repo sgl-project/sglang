@@ -1,10 +1,9 @@
 import unittest
 
+import torch
+
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
-
-# This eval harness applies the chat_template, which is critical for qwen3.5
-# to get good accuracy on gsm8k
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -16,8 +15,17 @@ register_cuda_ci(est_time=720, suite="stage-c-test-4-gpu-b200")
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}
 
+_cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
 
-class TestQwen35FP4(CustomTestCase):
+_is_sm100_cuda13 = (
+    torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] >= 10
+    and _cuda_major >= 13
+)
+
+
+@unittest.skipUnless(_is_sm100_cuda13, "requires SM100+ GPU and CUDA 13+")
+class TestQwen35FP4FlashInfer(CustomTestCase):
     def test_gsm8k(self):
         base_args = [
             "--tp-size",
@@ -40,13 +48,17 @@ class TestQwen35FP4(CustomTestCase):
             "modelopt_fp4",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
+            "--linear-attn-decode-backend",
+            "flashinfer",
+            "--linear-attn-prefill-backend",
+            "flashinfer",
         ]
 
         variants = [
             ModelLaunchSettings(
                 QWEN35_FP4_MODEL,
                 extra_args=base_args,
-                variant="Triton",
+                variant="FlashInfer",
             ),
         ]
 
