@@ -769,6 +769,7 @@ class GPUWorker:
         lora_path: Union[str, None, List[Union[str, None]]] = None,
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
+        merge_mode: str | None = None,
     ) -> OutputBatch:
         """
         Set the LoRA adapter(s) for the pipeline.
@@ -779,10 +780,13 @@ class GPUWorker:
             lora_path: Path(s) to the LoRA adapter(s). Can be a string, None, or a list of strings/None.
             target: Which transformer(s) to apply the LoRA to. Can be a string or a list of strings.
             strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
+            merge_mode: Optional per-request LoRA merge mode.
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.set_lora(lora_nickname, lora_path, target, strength)
+        self.pipeline.set_lora(
+            lora_nickname, lora_path, target, strength, merge_mode=merge_mode
+        )
         return OutputBatch()
 
     def merge_lora_weights(
@@ -868,16 +872,22 @@ class GPUWorker:
         return checksums
 
 
-OOM_MSG = f"""
+OOM_MSG = """
 OOM detected. Possible solutions:
   - If the OOM occurs during loading:
-    1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
+    1. Check available memory on every selected GPU, not only total capacity.
+       In multi-GPU runs, the least-free selected GPU is the bottleneck.
+    2. For single-GPU deployment, use `--performance-mode memory`, component CPU offload,
+       or `--dit-layerwise-offload` for supported Wan/MOVA DiTs.
+    3. For multi-GPU deployment, keep the default `--performance-mode auto` or set
+       `--use-fsdp-inference true` to shard DiT weights with FSDP. FSDP is not a
+       single-GPU substitute for CPU offload.
   - If the OOM occurs during runtime:
-    1. Enable SP and/or TP (in a multi-GPU setup)
-    2. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
-    3. Opt for a sparse-attention backend
-    4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
-    5. Enable quantization (e.g. nunchaku)
+    1. Reduce resolution, `--num-frames`, or batch size.
+    2. Use `--performance-mode memory` for lower memory usage.
+    3. Enable SP/Ulysses/Ring for sequence-heavy workloads in multi-GPU setups.
+    4. Use FSDP, with CFG parallelism when supported, for validated multi-GPU workloads.
+    5. Use a lower-memory attention backend or quantization when available.
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
 
