@@ -49,6 +49,7 @@ from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
+    aligned_zeros,
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
     set_mla_kv_buffer_triton,
@@ -904,18 +905,18 @@ class MHATokenToKVPool(KVCache):
                 # [size, head_num, head_dim] for each layer
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.k_buffer = [
-                    torch.zeros(
+                    aligned_zeros(
                         (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                        self.store_dtype,
+                        self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
                 self.v_buffer = [
-                    torch.zeros(
+                    aligned_zeros(
                         (self.size + self.page_size, self.head_num, self.v_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                        self.store_dtype,
+                        self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
@@ -1261,35 +1262,35 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 scale_block_size = 16
                 self.store_dtype = torch.uint8
                 self.k_buffer = [
-                    torch.zeros(
+                    aligned_zeros(
                         (m, n, k // 2),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                        self.store_dtype,
+                        self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
                 self.v_buffer = [
-                    torch.zeros(
+                    aligned_zeros(
                         (m, n, k // 2),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                        self.store_dtype,
+                        self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
 
                 self.k_scale_buffer = [
-                    torch.zeros(
+                    aligned_zeros(
                         (m, (n * k) // scale_block_size),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                        self.store_dtype,
+                        self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
                 self.v_scale_buffer = [
-                    torch.zeros(
+                    aligned_zeros(
                         (m, (n * k) // scale_block_size),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                        self.store_dtype,
+                        self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
@@ -1678,10 +1679,10 @@ class MLATokenToKVPool(KVCache):
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.kv_buffer = [
-                    torch.zeros(
+                    aligned_zeros(
                         (self.size + self.page_size, 1, self.kv_cache_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                        self.store_dtype,
+                        self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
@@ -1867,19 +1868,19 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 self.store_dtype = torch.uint8
 
                 self.kv_buffer = [
-                    torch.zeros(
+                    aligned_zeros(
                         (m, n, k // 2),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                        self.store_dtype,
+                        self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
 
                 self.kv_scale_buffer = [
-                    torch.zeros(
+                    aligned_zeros(
                         (m, k // scale_block_size),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                        self.store_dtype,
+                        self.device,
                     )
                     for _ in range(self.layer_num)
                 ]

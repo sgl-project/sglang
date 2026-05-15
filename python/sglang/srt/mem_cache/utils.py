@@ -14,14 +14,107 @@
 """Common utilities."""
 
 import hashlib
+import math
+import mmap
 from typing import Any, List, Optional, Tuple
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
+
+# CUDA buffer alignment for ibv_reg_dmabuf_mr / GDR registration.
+#
+# Discrete x86: GPU memory is exposed via PCIe BAR1; ``nvidia_p2p_get_pages()``
+# returns 64 KB pages. NVIDIA hardcodes this in NCCL and gdrcopy:
+#   https://github.com/NVIDIA/nccl/blob/1933fdd6360a8bfccaa0166bd71bce363d32e5b6/src/transport/net_ib/gdaki/doca-gpunetio/src/doca_gpunetio_gdrcopy.cpp#L50
+#   https://github.com/NVIDIA/gdrcopy/blob/737708f3b5955cb6ef6b47bba35600a31bce4222/include/gdrapi.h#L42
+#   https://github.com/NVIDIA/nccl/blob/1933fdd6360a8bfccaa0166bd71bce363d32e5b6/src/transport/net_ib/gdaki/doca-gpunetio/include/common/doca_gpunetio_verbs_def.h#L105
+#
+# Unified-memory GB200/GB300: dmabuf registration enforces kernel-page
+# alignment, which is also 64 KB on aarch64 64K kernels.
+#
+# Both regimes land on 64 KB today, so this is a constant.
+CUDA_REG_ALIGN_BYTES = 64 * 1024
+# Host-side ``ibv_reg_mr`` / ``cudaHostRegister`` require kernel-page alignment:
+# 4 KB on x86, 64 KB on aarch64 64K kernels.
+HOST_REG_ALIGN_BYTES = mmap.PAGESIZE
+
+
+def ibv_reg_align_bytes(device) -> int:
+    """Address/length alignment ``ibv_reg_mr``/``ibv_reg_dmabuf_mr`` requires
+    when registering a buffer of `device`'s type for NIXL/UCX RDMA."""
+    if isinstance(device, torch.device):
+        device_type = device.type
+    else:
+        device_type = str(device).split(":", 1)[0]
+    return CUDA_REG_ALIGN_BYTES if device_type == "cuda" else HOST_REG_ALIGN_BYTES
+
+
+def aligned_empty(
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    device,
+    *,
+    pin_memory: bool = False,
+) -> torch.Tensor:
+    """``torch.empty(shape, dtype=dtype, device=device)`` with ``data_ptr()``
+    and ``nbytes`` rounded up to the RDMA registration alignment for `device`
+    (CUDA: 64 KB; host: kernel page size). Pads the leading dim so the
+    returned tensor has shape ``(N', *shape[1:])`` with ``N' >= shape[0]``;
+    callers can ``[idx]`` into it as before — trailing pad rows are unused.
+
+    Required so per-layer KV buffers can be registered with NIXL/UCX
+    (``ibv_reg_dmabuf_mr`` for CUDA, ``ibv_reg_mr`` for host) on aarch64
+    64 KB-page kernels (e.g. GB300), which require page-aligned offset and
+    length. Per-buffer slack is bounded by ``align`` (≤64 KB), negligible
+    against multi-GB KV pools.
+    """
+    if not shape or shape[0] <= 0:
+        return torch.empty(shape, dtype=dtype, device=device, pin_memory=pin_memory)
+
+    align = ibv_reg_align_bytes(device)
+    per_row = int(np.prod(shape[1:])) * dtype.itemsize
+    if per_row <= 0:
+        return torch.empty(shape, dtype=dtype, device=device, pin_memory=pin_memory)
+
+    # The returned tensor must satisfy two constraints simultaneously:
+    #   (1) nbytes % align == 0     -- for ibv_reg_*_mr length.
+    #   (2) nbytes % per_row == 0   -- so .view((N', *shape[1:])) succeeds.
+    # Both hold iff nbytes is a multiple of lcm(align, per_row).
+    chunk = (align // math.gcd(align, per_row)) * per_row  # = lcm(align, per_row)
+    padded_nbytes = ((shape[0] * per_row + chunk - 1) // chunk) * chunk
+    new_dim0 = padded_nbytes // per_row
+
+    # Allocate flat uint8 storage with extra slack, then slice out a region
+    # whose start address lands on an `align`-byte boundary. The slice keeps
+    # the allocation alive via storage refcount.
+    raw = torch.empty(
+        padded_nbytes + align,
+        dtype=torch.uint8,
+        device=device,
+        pin_memory=pin_memory,
+    )
+    shift = (-raw.data_ptr()) & (align - 1)
+    return (
+        raw[shift : shift + padded_nbytes]
+        .view(dtype)
+        .view((new_dim0,) + tuple(shape[1:]))
+    )
+
+
+def aligned_zeros(
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    device,
+    *,
+    pin_memory: bool = False,
+) -> torch.Tensor:
+    """``torch.zeros``-equivalent of :func:`aligned_empty`. See its docstring."""
+    return aligned_empty(shape, dtype, device, pin_memory=pin_memory).zero_()
 
 
 @triton.jit
