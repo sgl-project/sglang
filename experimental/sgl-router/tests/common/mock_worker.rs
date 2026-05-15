@@ -143,6 +143,85 @@ impl MockWorker {
         }
     }
 
+    /// Bind to a random port and start a worker that streams `chunks` with a
+    /// fixed `delay` between each chunk.  Used to test that load guards survive
+    /// the full body lifetime for streaming responses.
+    #[allow(dead_code)]
+    pub async fn start_slow_stream(chunks: Vec<&'static str>, delay: Duration) -> Self {
+        let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
+
+        #[derive(Clone)]
+        struct SlowState {
+            captured: Arc<Mutex<CapturedHeaders>>,
+            chunks: Arc<Vec<&'static str>>,
+            delay: Duration,
+        }
+
+        async fn slow_chat(
+            State(s): State<SlowState>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Response<Body> {
+            {
+                let mut g = s.captured.lock().unwrap();
+                g.last_body = Some(body.clone());
+                for (k, v) in headers.iter() {
+                    g.seen.insert(k.as_str().to_string());
+                    if let Ok(val) = v.to_str() {
+                        g.headers.insert(k.as_str().to_string(), val.to_string());
+                    }
+                }
+            }
+            let chunks = s.chunks.clone();
+            let delay = s.delay;
+            // Stream chunks via a channel, sleeping between each send.
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            tokio::spawn(async move {
+                for chunk in chunks.iter() {
+                    tokio::time::sleep(delay).await;
+                    if tx.send(Ok(Bytes::from(*chunk))).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+            let mut r = Response::new(body);
+            *r.status_mut() = StatusCode::OK;
+            r.headers_mut().insert(
+                HeaderName::from_static("content-type"),
+                "text/event-stream".parse().unwrap(),
+            );
+            r
+        }
+
+        let state = SlowState {
+            captured: captured.clone(),
+            chunks: Arc::new(chunks),
+            delay,
+        };
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", post(slow_chat))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        Self {
+            url,
+            captured,
+            _shutdown: tx,
+        }
+    }
+
     /// Bind to a raw TCP listener and start a worker that writes a status
     /// line + headers with a large declared `Content-Length`, then writes
     /// only `partial_body_bytes` of body before closing the connection.

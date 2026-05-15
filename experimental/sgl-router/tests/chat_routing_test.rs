@@ -13,7 +13,7 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::WorkerRegistry;
+use sgl_router::workers::{Worker, WorkerRegistry};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -687,4 +687,90 @@ async fn forward_json_to_rejects_when_breaker_open() {
         ApiError::ServiceUnavailable(_) => {}
         other => panic!("expected ServiceUnavailable, got {other:?}"),
     }
+}
+
+/// Regression test: LoadGuard must be held for the *body* lifetime of a
+/// streaming response, not just for the handler lifetime.
+///
+/// Before the fix, the handler dropped `_guard` as soon as it returned
+/// (which happens when headers arrive), so `active_load()` was 0 while
+/// the SSE pump was still relaying bytes. This test catches that bug.
+#[tokio::test]
+async fn streaming_load_guard_persists_for_body_lifetime() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    // Each chunk is delayed by 50ms, total ~200ms of streaming.
+    let worker = common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        std::time::Duration::from_millis(50),
+    )
+    .await;
+
+    let cfg = config_for(&worker.url);
+    let registry = Arc::new(WorkerRegistry::default());
+    registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let placeholder_url = reqwest::Url::parse("http://placeholder.invalid").unwrap();
+    let proxy = Arc::new(Proxy::new(placeholder_url, TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(
+        cfg,
+        tokenizers,
+        proxy,
+        registry.clone(),
+        policies,
+    ));
+    let app = build_router(ctx);
+
+    // Grab the Worker handle so we can assert active_load().
+    let w_handle: Arc<Worker> = registry
+        .workers_for(&ModelId("tiny".into()))
+        .into_iter()
+        .next()
+        .expect("worker registered");
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "tiny",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true,
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+
+    // The handler has returned (headers arrived).  Wait a moment for the
+    // first chunk's delay to pass, then assert load is still held.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        w_handle.active_load() >= 1,
+        "load should be >= 1 mid-stream, got {}",
+        w_handle.active_load()
+    );
+
+    // Drain the entire body — this drives the SSE pump to completion.
+    let _bytes = BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
+
+    // After the body is fully consumed and dropped, the guard must be
+    // released.  Give the spawned task a brief moment to clean up.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(
+        w_handle.active_load(),
+        0,
+        "load should be 0 after stream completes"
+    );
 }
