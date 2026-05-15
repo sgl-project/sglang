@@ -16,10 +16,11 @@ from sglang.test.test_utils import (
 )
 
 # DeepSeek-V3 MLA tests with torch compile, FA3, and MTP speculative decoding
-register_cuda_ci(est_time=543, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=543, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(
     est_time=221,
-    suite="stage-b-test-1-gpu-small-amd",
+    stage="stage-b",
+    runner_config="1-gpu-small-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/12574",
 )
 

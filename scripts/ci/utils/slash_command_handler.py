@@ -397,22 +397,11 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         return False
 
 
+# Legacy `suite="..."` table — only nightly / weekly entries left; stage / extra
+# tests use the new-style `register_cuda_ci(stage=..., runner_config=...)` form,
+# which resolves runs_on via scripts/ci/runner_configs.yml (see detect_suite).
 CUDA_SUITE_TO_RUNNER = {
-    # PR test suites
-    "stage-a-test-1-gpu-small": "1-gpu-5090",
     "stage-a-test-cpu": "ubuntu-latest",
-    "stage-b-test-1-gpu-small": "1-gpu-5090",
-    "stage-b-test-1-gpu-large": "1-gpu-h100",
-    "stage-b-test-2-gpu-large": "2-gpu-h100",
-    "stage-b-test-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-4-gpu-h100": "4-gpu-h100",
-    "stage-c-test-8-gpu-h200": "8-gpu-h200",
-    "stage-c-test-8-gpu-h20": "8-gpu-h20",
-    "stage-c-test-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
-    "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200-deepep",
-    "stage-c-test-dsv4-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-dsv4-8-gpu-h200": "8-gpu-h200",
     # Nightly test suites (NVIDIA)
     "nightly-1-gpu": "1-gpu-h100",
     "nightly-4-gpu": "4-gpu-h100",
@@ -431,13 +420,9 @@ CUDA_SUITE_TO_RUNNER = {
     "weekly-8-gpu-h200": "8-gpu-h200",
 }
 
-DEEPEP_SUITES = {
-    "stage-c-test-8-gpu-h20",
-    "stage-c-test-deepep-4-gpu-h100",
-    "stage-c-test-deepep-8-gpu-h200",
-    "stage-c-test-dsv4-4-gpu-b200",
-    "stage-c-test-dsv4-8-gpu-h200",
-}
+# Legacy suite-name set for stage-c-test-8-gpu-h20-ish patterns; left empty
+# now that all stage tests use the new-style yml-derived path (see detect_suite).
+DEEPEP_SUITES = set()
 
 
 MULTIMODAL_TEST_DIR = "python/sglang/multimodal_gen/test"

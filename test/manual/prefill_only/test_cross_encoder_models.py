@@ -11,8 +11,8 @@ from sglang.test.test_utils import CustomTestCase, is_in_ci
 # Cross encoder model tests
 
 
-register_cuda_ci(est_time=125, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=125, stage="stage-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=150, stage="stage-b", runner_config="1-gpu-small-amd")
 
 MODELS = [
     ("cross-encoder/ms-marco-MiniLM-L6-v2", 1, 1e-2),
