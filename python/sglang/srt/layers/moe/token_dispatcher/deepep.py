@@ -821,8 +821,6 @@ class DeepEPDispatcher(BaseDispatcher):
         # which is masked off here.
         self.expert_mask_gpu = None
         if _use_aiter and num_local_experts is not None:
-            import torch
-
             expert_mask = torch.zeros(
                 num_local_experts + 1,
                 device=torch.cuda.current_device(),
