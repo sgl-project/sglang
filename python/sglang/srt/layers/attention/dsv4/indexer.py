@@ -109,6 +109,46 @@ def fp8_paged_mqa_logits_torch(
     return scores
 
 
+def _aiter_fp8_paged_mqa_logits(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = False,
+) -> torch.Tensor:
+    """Wrapper adapting aiter's deepgemm_fp8_paged_mqa_logits to SGLang's interface."""
+    from aiter.ops.triton.attention.pa_mqa_logits import (
+        deepgemm_fp8_paged_mqa_logits,
+    )
+
+    batch_size = q_fp8.shape[0]
+    next_n = q_fp8.shape[1]
+    total_tokens = batch_size * next_n
+    _sl = seq_lens.squeeze(-1) if seq_lens.dim() == 2 else seq_lens
+    kv_block_size = kvcache_fp8.shape[1]
+    logits = torch.empty(
+        total_tokens,
+        max_seq_len,
+        dtype=torch.float32,
+        device=q_fp8.device,
+    )
+    deepgemm_fp8_paged_mqa_logits(
+        q_fp8,
+        kvcache_fp8,
+        weight,
+        logits,
+        _sl.to(torch.int32),
+        page_table.to(torch.int32),
+        max_seq_len,
+        KVBlockSize=kv_block_size,
+        Preshuffle=True,
+    )
+    return logits
+
+
 def topk_transform_512_pytorch_vectorized(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -384,6 +424,8 @@ class C4IndexerBackendMixin:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
+        elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
+            fn = _aiter_fp8_paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             fn = fp8_paged_mqa_logits_torch
         else:
@@ -391,7 +433,8 @@ class C4IndexerBackendMixin:
 
         _c4sl = indexer_metadata.c4_seq_lens
         _use_tilelang = envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
-        if _c4sl.dim() == 1 and not _use_tilelang:
+        _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+        if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
             _c4sl = _c4sl.unsqueeze(-1)
         logits = fn(
             q_fp8,
