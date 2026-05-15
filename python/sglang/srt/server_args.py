@@ -3539,6 +3539,22 @@ class ServerArgs:
             trust_remote_code=self.trust_remote_code,
         )
 
+        # Validate --speculative-draft-window-size once, regardless of algorithm.
+        # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
+        if self.speculative_draft_window_size is not None:
+            window_size = int(self.speculative_draft_window_size)
+            if window_size <= 0:
+                raise ValueError(
+                    f"--speculative-draft-window-size must be positive, got {window_size}."
+                )
+            self.speculative_draft_window_size = window_size
+            if self.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
+                logger.warning(
+                    "--speculative-draft-window-size has no effect with "
+                    "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
+                    self.speculative_algorithm,
+                )
+
         if self.speculative_algorithm is not None:
             from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
             from sglang.srt.speculative.spec_registry import CustomSpecAlgo
@@ -3616,15 +3632,6 @@ class ServerArgs:
                     self.speculative_dflash_block_size
                 )
 
-            window_size = None
-            if self.speculative_draft_window_size is not None:
-                window_size = int(self.speculative_draft_window_size)
-                if window_size <= 0:
-                    raise ValueError(
-                        f"--speculative-draft-window-size must be positive, got {window_size}."
-                    )
-                self.speculative_draft_window_size = window_size
-
             if self.speculative_num_draft_tokens is None:
                 from sglang.srt.speculative.dflash_utils import (
                     parse_dflash_draft_config,
@@ -3659,13 +3666,13 @@ class ServerArgs:
                     )
                 self.speculative_num_draft_tokens = inferred_block_size
 
-            if window_size is not None:
+            if self.speculative_draft_window_size is not None:
                 draft_tokens = int(self.speculative_num_draft_tokens)
-                if window_size < draft_tokens:
+                if self.speculative_draft_window_size < draft_tokens:
                     raise ValueError(
                         "--speculative-draft-window-size must be >= "
                         "--speculative-num-draft-tokens (block_size). "
-                        f"window_size={window_size}, block_size={draft_tokens}."
+                        f"window_size={self.speculative_draft_window_size}, block_size={draft_tokens}."
                     )
 
             if self.max_running_requests is None:
@@ -5831,16 +5838,25 @@ class ServerArgs:
         )
         parser.add_argument(
             "--speculative-draft-window-size",
-            "--speculative-dflash-draft-window-size",
             type=int,
             dest="speculative_draft_window_size",
-            help="Sliding window size for the draft model (honored by EAGLE-3 and DFLASH). "
-            "For EAGLE-3, the drafter only attends to the most recent N keys "
+            help="Sliding window size for the draft model. Honored by Llama EAGLE-3 "
+            "(`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. "
+            "MLA-based drafters) silently ignore it. "
+            "For Llama EAGLE-3, the drafter only attends to the most recent N keys "
             "(verifier hidden states + its own outputs); the verifier is unaffected. "
             "For DFLASH, the draft worker keeps a recent target-token window in its "
             "local KV cache (paged backends may retain up to one extra page on the "
             "left for alignment). Default is full attention/context.",
             default=ServerArgs.speculative_draft_window_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-draft-window-size",
+            type=int,
+            dest="speculative_draft_window_size",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--speculative-draft-window-size",
+            help=argparse.SUPPRESS,
         )
         parser.add_argument(
             "--speculative-moe-runner-backend",
@@ -7883,6 +7899,21 @@ class DeprecatedStoreTrueAction(argparse.Action):
             f"'{option_string}' is deprecated and will be removed in a future release.{replacement}"
         )
         setattr(namespace, self.dest, True)
+
+
+class DeprecatedAliasStoreAction(argparse.Action):
+    """Deprecated alias that stores its value and prints a warning."""
+
+    def __init__(self, option_strings, dest, new_flag=None, **kwargs):
+        self.new_flag = new_flag
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        replacement = f" Use '{self.new_flag}' instead." if self.new_flag else ""
+        print_deprecated_warning(
+            f"'{option_string}' is deprecated and will be removed in a future release.{replacement}"
+        )
+        setattr(namespace, self.dest, values)
 
 
 def auto_choose_speculative_params(self: ServerArgs):
