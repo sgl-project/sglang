@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration — large suite to fit the integration test's server startup.
-register_cuda_ci(est_time=79, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=79, stage="stage-b", runner_config="1-gpu-large")
 
 
 def _skip_if_no_cuda(test_func):
