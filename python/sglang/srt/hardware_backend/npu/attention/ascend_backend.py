@@ -1317,6 +1317,37 @@ class AscendAttnBackend(AttentionBackend):
                     scale=layer.scaling,
                     sparse_mode=3,
                 )
+                q_len_offset = 0
+                for q_len in forward_batch.extend_seq_lens_cpu:
+                    # SWA layers: banded causal (sparse_mode=4)
+                    if self._is_swa_layer(layer):
+                        sparse_mode = 4
+                        pre_tokens = layer.sliding_window_size
+                    else:
+                        sparse_mode = 3 if q_len != 1 else 0
+                        pre_tokens = None
+
+                    fia_kwargs = dict(
+                        num_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                        atten_mask=self.fia_mask.unsqueeze(0),
+                        sparse_mode=sparse_mode,
+                        scale=layer.scaling,
+                        next_tokens=0,
+                    )
+                    if pre_tokens is not None:
+                        fia_kwargs["pre_tokens"] = pre_tokens
+
+                    attn_output[q_len_offset : q_len_offset + q_len] = (
+                        torch.ops.npu.npu_fused_infer_attention_score(
+                            q[None, q_len_offset : q_len_offset + q_len],
+                            k[None, q_len_offset : q_len_offset + q_len],
+                            v[None, q_len_offset : q_len_offset + q_len],
+                            **fia_kwargs,
+                        )[0]
+                    )
+                    q_len_offset += q_len
                 attn_output = attn_output.view(
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
@@ -1607,18 +1638,32 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 q_len_offset = 0
                 for q_len in forward_batch.extend_seq_lens_cpu:
+                    # SWA layers: banded causal (sparse_mode=4)
+                    if self._is_swa_layer(layer):
+                        sparse_mode = 4
+                        pre_tokens = layer.sliding_window_size
+                    else:
+                        sparse_mode = 3 if q_len != 1 else 0
+                        pre_tokens = None
+
+                    fia_kwargs = dict(
+                        num_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                        atten_mask=self.fia_mask.unsqueeze(0),
+                        sparse_mode=sparse_mode,
+                        scale=layer.scaling,
+                        next_tokens=0,
+                    )
+                    if pre_tokens is not None:
+                        fia_kwargs["pre_tokens"] = pre_tokens
+
                     attn_output[q_len_offset : q_len_offset + q_len] = (
                         torch.ops.npu.npu_fused_infer_attention_score(
                             q[None, q_len_offset : q_len_offset + q_len],
                             k[None, q_len_offset : q_len_offset + q_len],
                             v[None, q_len_offset : q_len_offset + q_len],
-                            num_heads=layer.tp_q_head_num,
-                            num_key_value_heads=layer.tp_k_head_num,
-                            input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                            atten_mask=self.fia_mask.unsqueeze(0),
-                            sparse_mode=3 if q_len != 1 else 0,
-                            scale=layer.scaling,
-                            next_tokens=0,
+                            **fia_kwargs,
                         )[0]
                     )
                     q_len_offset += q_len
