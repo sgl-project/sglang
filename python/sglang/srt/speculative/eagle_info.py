@@ -233,7 +233,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
-    def verify(
+    def sample(
         self,
         batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
@@ -242,8 +242,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
     ) -> torch.Tensor:
         """
-        Verify and find accepted tokens based on logits output and batch
-        (which contains spec decoding information).
+        Sample tokens, run tree acceptance, and allocate cache slots for the
+        accepted slice. dataclass-level counterpart of `EAGLEWorker.verify`
+        (which is the worker-level end-to-end entry, including target forward).
 
         WARNING: This API in-place modifies the states of logits_output
 
@@ -827,7 +828,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 class EagleDraftExtendInput(SpecInput):
     """Inputs to the draft-extend forward (the per-accepted-token pass after verify).
 
-    Produced by `EagleVerifyInput.verify`, installed on `batch.spec_info` for
+    Produced by `EagleVerifyInput.sample`, installed on `batch.spec_info` for
     the draft-extend forward, then replaced with a fresh `EagleDraftInput` for
     the next iter's draft.
     """
