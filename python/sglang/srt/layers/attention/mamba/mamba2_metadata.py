@@ -198,14 +198,21 @@ class Mamba2Metadata(ForwardMetadata):
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
                 draft_token_num=draft_token_num,
             )
-        num_prefills = len(forward_batch.extend_seq_lens)
-        num_prefill_tokens = forward_batch.extend_num_tokens
-        num_decodes = len(forward_batch.seq_lens) - num_prefills
+        # In MIXED mode (enable_mixed_chunk),We derive num_prefills by subtracting the number
+        # of decode requests (= total seq_lens count - extend_seq_lens count) from
+        # the total extend count.  In non-MIXED mode the two counts are equal.
+        num_extend_reqs = len(forward_batch.extend_seq_lens)
+        num_decodes = len(forward_batch.seq_lens) - num_extend_reqs
+        num_prefills = num_extend_reqs - num_decodes
+        num_prefill_tokens = int(
+            forward_metadata.query_start_loc[num_prefills].item()
+        )
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
         # precompute flag to avoid device syncs later
-        has_initial_states = context_lens_tensor > 0
-        prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
+        # Only look at the prefix lengths of REAL prefill requests.
+        has_initial_states = context_lens_tensor[:num_prefills] > 0
+        prep_initial_states = torch.any(has_initial_states).item()
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
         seq_idx = torch.repeat_interleave(
@@ -216,6 +223,12 @@ class Mamba2Metadata(ForwardMetadata):
             output_size=num_prefill_tokens,
         )
         seq_idx.unsqueeze_(0)
+        # Only pass seq lens for REAL prefill requests to causal_conv1d kernels.
+        extend_seq_lens_cpu_prefill = (
+            forward_batch.extend_seq_lens_cpu[:num_prefills]
+            if forward_batch.extend_seq_lens_cpu is not None
+            else None
+        )
 
         # We compute metadata for chunked prefill once at the top level model
         # forward and reuse them in mamba layers. If not needed, they will be
@@ -251,6 +264,6 @@ class Mamba2Metadata(ForwardMetadata):
                 seq_idx=seq_idx,
                 chunk_indices=chunk_indices,
                 chunk_offsets=chunk_offsets,
-                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                extend_seq_lens_cpu=extend_seq_lens_cpu_prefill,
             ),
         )

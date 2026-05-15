@@ -1,4 +1,5 @@
 import logging
+import types
 from typing import Optional, Union
 
 import torch
@@ -207,8 +208,26 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.mamba_track_mask is not None
                     and forward_batch.mamba_track_mask.any()
                 ):
+                    # In MIXED mode (enable_mixed_chunk), slice query_start_loc and
+                    # mamba_cache_indices to the prefill-only prefix so that the
+                    # tracking helpers see a consistent, prefill-only view.
+                    if forward_batch.forward_mode.is_mixed():
+                        num_prefills = forward_batch.mamba_track_mask.shape[0]
+                        query_start_loc_for_track = query_start_loc[: num_prefills + 1]
+                        mamba_cache_indices_for_track = mamba_cache_indices[:num_prefills]
+                        prefill_proxy = types.SimpleNamespace(
+                            mamba_track_mask=forward_batch.mamba_track_mask,
+                            mamba_track_seqlens=forward_batch.mamba_track_seqlens,
+                            mamba_track_indices=forward_batch.mamba_track_indices,
+                            extend_seq_lens=forward_batch.extend_seq_lens[:num_prefills],
+                            extend_prefix_lens=forward_batch.extend_prefix_lens[:num_prefills],
+                        )
+                    else:
+                        query_start_loc_for_track = query_start_loc
+                        mamba_cache_indices_for_track = mamba_cache_indices
+                        prefill_proxy = forward_batch
                     track_conv_indices = self._init_track_conv_indices(
-                        query_start_loc, forward_batch
+                        query_start_loc_for_track, prefill_proxy
                     )
 
                     (
@@ -216,7 +235,7 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_ssm_h_dst,
                         track_ssm_final_src,
                         track_ssm_final_dst,
-                    ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
+                    ) = self._init_track_ssm_indices(mamba_cache_indices_for_track, prefill_proxy)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
 

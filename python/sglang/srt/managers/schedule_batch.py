@@ -2088,7 +2088,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
-        self.merge_batch(running_batch)
+        self.merge_batch(running_batch, self.mamba_track_indices, self.mamba_track_mask, self.mamba_track_seqlens)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
 
@@ -2481,7 +2481,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 has_been_filtered=has_been_filtered,
             )
 
-    def merge_batch(self, other: "ScheduleBatch"):
+    def merge_batch(
+        self, 
+        other: "ScheduleBatch", 
+        mamba_track_indices: torch.Tensor = None,
+        mamba_track_mask: torch.Tensor = None,
+        mamba_track_seqlens: torch.Tensor = None,
+    ):
         # In the regular scheduler path:
         # 1) self is always prefill, whose seq_lens is not a future
         # 2) other is always decode, which is finished in previous step
@@ -2510,9 +2516,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
-        self.mamba_track_indices = None
-        self.mamba_track_mask = None
-        self.mamba_track_seqlens = None
+        self.mamba_track_indices = mamba_track_indices
+        self.mamba_track_mask = mamba_track_mask
+        self.mamba_track_seqlens = mamba_track_seqlens
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
