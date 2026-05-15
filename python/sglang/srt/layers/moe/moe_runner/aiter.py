@@ -369,6 +369,10 @@ def _post_permute_aiter_to_deepep(
 
         cls = DeepEPNormalCombineInput if is_normal else DeepEPLLCombineInput
 
+    assert (
+        "aiter_combine_topk_ids" in running_state
+        and "aiter_combine_topk_weights" in running_state
+    ), "post_permute called without a prior pre_permute; running_state keys missing"
     return cls(
         hidden_states=runner_output.hidden_states,
         topk_ids=running_state["aiter_combine_topk_ids"],
