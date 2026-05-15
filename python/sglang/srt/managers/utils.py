@@ -16,7 +16,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyOutput
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,10 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
+    # V2 only: passed from worker.verify to worker._draft_extend_for_decode in
+    # the same forward_batch_generation call. Carries `draft_extend_input` +
+    # `predict` (the V2 raw target output). Not consumed by scheduler.
+    verify_output: Optional[EagleVerifyOutput] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
