@@ -1109,9 +1109,9 @@ class MMEncoder:
                 target = (
                     self.model.thinker if hasattr(self.model, "thinker") else self.model
                 )
-                hook = getattr(target, "encode_video_audio", None)
-                if hook is not None:
-                    audio_embedding = hook(mm_inputs)
+                encode_video_audio_fn = getattr(target, "encode_video_audio", None)
+                if encode_video_audio_fn is not None:
+                    audio_embedding = encode_video_audio_fn(mm_inputs)
                     if audio_embedding is not None:
                         aux_data["video_audio_embedding"] = audio_embedding
                 else:
