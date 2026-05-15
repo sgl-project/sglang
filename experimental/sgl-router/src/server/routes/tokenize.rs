@@ -96,7 +96,7 @@ mod tests {
             }],
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();
-        let proxy = Arc::new(crate::proxy::Proxy::new("http://x".into()));
+        let proxy = Arc::new(crate::proxy::Proxy::new("http://x".into()).expect("stub proxy"));
         Arc::new(AppContext::new(cfg, Arc::new(registry), proxy))
     }
 

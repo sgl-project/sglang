@@ -7,23 +7,25 @@ pub mod sse;
 
 use crate::server::error::ApiError;
 use crate::server::header_utils::should_forward_request_header;
+use anyhow::Context;
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use reqwest::Client;
 
+#[derive(Debug)]
 pub struct Proxy {
     pub worker_url: String,
     pub client: Client,
 }
 
 impl Proxy {
-    pub fn new(worker_url: String) -> Self {
+    pub fn new(worker_url: String) -> Result<Self, anyhow::Error> {
         let client = Client::builder()
             .pool_max_idle_per_host(64)
             .build()
-            .expect("reqwest::Client::builder");
-        Self { worker_url, client }
+            .context("build reqwest client")?;
+        Ok(Self { worker_url, client })
     }
 
     /// Forward a JSON POST to the worker and return the buffered response.
@@ -47,8 +49,7 @@ impl Proxy {
             .send()
             .await
             .map_err(|e| ApiError::UpstreamWorker(format!("{e}")))?;
-        let status =
-            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let status = resp.status();
         let bytes = resp
             .bytes()
             .await
@@ -100,8 +101,7 @@ impl Proxy {
             .send()
             .await
             .map_err(|e| ApiError::UpstreamWorker(format!("{e}")))?;
-        let status =
-            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let status = resp.status();
         // Capture content-type BEFORE consuming resp via bytes_stream().
         let upstream_ct = resp
             .headers()
@@ -147,10 +147,17 @@ mod tests {
                 .await;
         });
 
-        let p = Proxy::new(format!("http://{addr}"));
+        let p = Proxy::new(format!("http://{addr}")).unwrap();
         let res = p.probe_health(Duration::from_secs(2)).await;
         assert!(res.is_ok(), "expected probe to succeed, got: {res:?}");
         let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn new_returns_result_not_panic() {
+        // Smoke: Proxy::new returns Result<Self>; the happy path works.
+        let p = Proxy::new("http://127.0.0.1:1".to_string()).unwrap();
+        assert_eq!(p.worker_url, "http://127.0.0.1:1");
     }
 
     #[tokio::test]
@@ -160,7 +167,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let p = Proxy::new(format!("http://{addr}"));
+        let p = Proxy::new(format!("http://{addr}")).unwrap();
         let res = p.probe_health(Duration::from_millis(500)).await;
         let err = res.expect_err("expected probe to fail against a closed port");
         assert!(
