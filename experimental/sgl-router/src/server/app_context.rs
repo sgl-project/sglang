@@ -26,11 +26,13 @@ impl AppContext {
     }
 
     pub fn mark_ready(&self) {
-        self.ready.store(true, Ordering::SeqCst);
+        // Relaxed: this flag does not synchronize other state; readers only
+        // care about eventual visibility, not happens-before with surrounding ops.
+        self.ready.store(true, Ordering::Relaxed);
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::SeqCst)
+        self.ready.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
