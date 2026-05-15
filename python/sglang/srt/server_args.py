@@ -3012,7 +3012,54 @@ class ServerArgs:
                 f"got {self.mamba_ssm_dtype!r}"
             )
 
+    # Model architectures that have been verified to work with context parallelism.
+    CONTEXT_PARALLEL_SUPPORTED_ARCHS = [
+        "DeepseekV32ForCausalLM",
+        "Qwen3MoeForCausalLM",
+    ]
+
+    # Substrings used to identify supported models from model_path when
+    # hf_config is unavailable (e.g. remote instance connectors).
+    CONTEXT_PARALLEL_SUPPORTED_PATH_KEYWORDS = [
+        "deepseek-v3",
+        "deepseek-r1",
+        "deepseek_v3",
+        "deepseek_r1",
+        "qwen3-moe",
+        "qwen3_moe",
+        "qwen3-30b-a3b",
+        "qwen3-235b-a22b",
+    ]
+
+    def _is_cp_supported_by_path(self) -> bool:
+        path_lower = self.model_path.lower()
+        return any(
+            kw in path_lower for kw in self.CONTEXT_PARALLEL_SUPPORTED_PATH_KEYWORDS
+        )
+
     def _handle_context_parallelism(self):
+        cp_enabled = (
+            self.attn_cp_size > 1
+            or self.enable_prefill_context_parallel
+            or self.enable_nsa_prefill_context_parallel
+        )
+        if cp_enabled:
+            if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
+                if not self._is_cp_supported_by_path():
+                    raise ValueError(
+                        f"Context parallelism is not supported for model at '{self.model_path}'. "
+                        f"Supported architectures: {self.CONTEXT_PARALLEL_SUPPORTED_ARCHS}. "
+                        f"If this is a supported model, ensure the model path contains one of: "
+                        f"{self.CONTEXT_PARALLEL_SUPPORTED_PATH_KEYWORDS}"
+                    )
+            else:
+                model_arch = self.get_model_config().hf_config.architectures[0]
+                if model_arch not in self.CONTEXT_PARALLEL_SUPPORTED_ARCHS:
+                    raise ValueError(
+                        f"Context parallelism is not supported for model architecture '{model_arch}'. "
+                        f"Supported architectures: {self.CONTEXT_PARALLEL_SUPPORTED_ARCHS}"
+                    )
+
         if self.attn_cp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
             assert (
