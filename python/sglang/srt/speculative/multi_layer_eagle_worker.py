@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
@@ -136,7 +135,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                pp_rank=0,  # FIXME
+                pp_rank=0,  # spec workers don't support pipeline parallelism
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
                 attn_cp_rank=attn_cp_rank,
@@ -372,24 +371,6 @@ class MultiLayerEagleWorker(TpModelWorker):
                 can_run_cuda_graph=verify_output.can_run_cuda_graph,
                 next_draft_input=next_draft_input,
             )
-
-    def check_forward_draft_extend_after_decode(self, verify_output: EagleVerifyOutput):
-        local_need_forward = verify_output.draft_extend_input.input_ids.shape[0] > 0
-        if not self.server_args.enable_dp_attention:
-            return local_need_forward
-
-        global_need_forward = torch.tensor(
-            [
-                (local_need_forward),
-            ],
-            dtype=torch.int64,
-        )
-        torch.distributed.all_reduce(
-            global_need_forward, group=get_tp_group().cpu_group
-        )
-        global_need_forward_cnt = global_need_forward[0].item()
-        need_forward = global_need_forward_cnt > 0
-        return need_forward
 
     def forward_target_extend(
         self, batch: ScheduleBatch
