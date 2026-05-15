@@ -2,6 +2,76 @@
 
 This guide covers profiling techniques for multimodal generation pipelines in SGLang.
 
+## Benchmarking
+
+Benchmarking provides an end-to-end view of overall performance, including latency, throughput, and scalability.
+
+### Server Benchmarking
+
+We run benchmarking against a running server to obtain user-side metrics.
+
+Firstly, start a server on your machine with your target model:
+```bash
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers --backend sglang
+```
+For detailed documentation on `sglang.serve` please see [cli.md](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/cli.md#serve)
+
+With a server fully started and serving models, we can then trigger `bench_serving` as:
+```bash
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 10 --width 512 --height 512 --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers --num-frames 16
+```
+
+**Parameters:**
+- `--base-url`: Base URL of the server (e.g., http://myhost:12345). Overrides host/port if provided.
+- `--host`: Server host. (default: `localhost`)
+- `--port`: Server port. (default: `3000`)
+- `--model`: Name of model to be profiled, must match the model served from the running server.
+- `--dataset`: Dataset to use. (Supported values: `vbench`, `random`)
+- `--task`: The task will be inferred from huggingface pipeline_tag. When huggingface pipeline_tag is not provided, --task will be used. (Supported values: `text-to-video`, `image-to-video`, `text-to-image`, `image-to-image`, `video-to-video`)
+- `--dataset-path`: Path to local dataset file (optional).
+- `--num-prompts`: Number of prompts to benchmark. (Default: 10)
+- `--max-concurrency`: Maximum number of concurrent requests, default to `1`. This can be used to help simulate an environment where a higher level component is enforcing a maximum number of concurrent requests. While the --request-rate argument controls the rate at which requests are initiated, this argument will control how many are actually allowed to execute at a time. This means that when used in combination, the actual request rate may be lower than specified with --request-rate, if the server is not processing requests fast enough to keep up.
+- `--request-rate`: Number of requests per second. If this is inf, then all the requests are sent at time 0. Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.
+- `--width`: Width of image/video. If not provided, will use the model's default setting.
+- `--height`: Height of image/video. If not provided, will use the model's default setting.
+- `--num-frames`: Number of frames (for video). If not provided, will use the model's default setting.
+- `--fps`: Frames Per Second (FPS) (for video). If not provided, will use the model's default setting.
+- `--output-file`: Output JSON file for metrics.
+- `--disable-tqdm`: Disable progress bar.
+- `--log-level`: Log level. (Supported values: `DEBUG`, `INFO`, `WARNING`, `ERROR`)
+
+
+### Offline Benchmarking
+
+We can also run offline benchmarking without starting a server, so that we can focus on model inference performance.
+
+To do this, use the bench_offline_throughput.py instead as:
+```bash
+python3 -m sglang.multimodal_gen.benchmarks.bench_offline_throughput --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers --backend sglang --num-prompts 1 --batch-size 1 --num-runs 1 --num-inference-steps 10 --height 512 --width 512
+```
+
+**Parameters:**
+- All server arguments can also be specified for setting up offline model, for details please refer to [`serve` documentation](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/cli.md#serve)
+- `--model-path`: The path of the model weights. This can be a local folder or a Hugging Face repo ID.
+- `--num-inference-steps`: Number of denoising steps (Default: 20)
+- `--guidance-scale`: Classifier-free guidance scale (Default: 7.5)
+- `--seed`: Random seed (Default: 42)
+- `--disable-safety-checker`: Disable NSFW detection. (Default: False)
+- `--width`: Width of image/video. If not provided, will use the model's default setting.
+- `--height`: Height of image/video. If not provided, will use the model's default setting.
+- `--num-frames`: Number of frames (for video). If not provided, will use the model's default setting.
+- `--fps`: Frames Per Second (FPS) (for video). If not provided, will use the model's default setting.
+- `--dataset`: Dataset to use. (Supported values: `vbench`, `random`)
+- `--dataset-path`: Path to user-provided dataset (prompts file or image directory)
+- `--num-prompts`: Total number of prompts to benchmark. (Default: 10)
+- `--batch-size`: Batch size per generation call (Default: 1)
+- `--skip-warmup`: Skip warmup batch. (Default: False)
+- `--profile`: Enable torch profiler (use env var SGLANG_TORCH_PROFILER_DIR)
+- `--num-runs`: Number of benchmark runs (Default: 1)
+- `--output-file`: Output JSON file for results (append mode)
+- `--disable-tqdm`: Disable progress bar
+
+
 ## PyTorch Profiler
 
 PyTorch Profiler provides detailed kernel execution time, call stack, and GPU utilization metrics.
