@@ -684,6 +684,7 @@ def latency_test_run_once(
     tp_rank,
     profile_start_step=None,
     profile_steps=None,
+    save_trace=True,
 ):
     max_batch_size = model_runner.max_batch_size(input_len, output_len)
     if batch_size > max_batch_size:
@@ -728,7 +729,7 @@ def latency_test_run_once(
             profiler,
             profile_activities,
             rank_print=rank_print,
-            save_trace=True,
+            save_trace=save_trace,
             trace_filename=trace_filename_prefill,
             stage="prefill",
         )
@@ -775,7 +776,7 @@ def latency_test_run_once(
                 profiler,
                 profile_activities,
                 rank_print=rank_print,
-                save_trace=True,
+                save_trace=save_trace,
                 trace_filename=trace_filename_decode,
                 stage="decode",
             )
@@ -849,15 +850,18 @@ def latency_test(
         bench_args.batch_size[0],
         bench_args.input_len[0],
         min(32, bench_args.output_len[0]),  # shorter decoding to speed up the warmup
-        log_decode_step=0,
-        profile=False,
-        profile_record_shapes=False,
-        profile_activities=("CPU", "GPU"),
-        profile_filename_prefix="",
-        profile_stage="all",
+        log_decode_step=bench_args.log_decode_step,
+        profile=bench_args.profile if tp_rank == 0 else None,
+        profile_record_shapes=(
+            bench_args.profile_record_shapes if tp_rank == 0 else None
+        ),
+        profile_activities=bench_args.profile_activities,
+        profile_filename_prefix=bench_args.profile_filename_prefix,
+        profile_stage=bench_args.profile_stage,
         tp_rank=tp_rank,
-        profile_start_step=None,
-        profile_steps=None,
+        profile_start_step=bench_args.profile_start_step,
+        profile_steps=bench_args.profile_steps,
+        save_trace=False,
     )
 
     rank_print("Benchmark ...")
