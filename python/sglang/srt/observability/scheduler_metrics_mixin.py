@@ -925,14 +925,14 @@ class SchedulerMetricsMixin:
             active_lora_ids = set()
 
             # For PP mode, check all running micro batches
-            if hasattr(self, "running_mbs") and self.running_mbs:
+            if self.server_args.pp_size > 1:
                 for batch in self.running_mbs:
                     if batch and hasattr(batch, "reqs"):
                         for req in batch.reqs:
                             if hasattr(req, "lora_id") and req.lora_id is not None:
                                 active_lora_ids.add(req.lora_id)
             # For normal mode, check running_batch
-            elif hasattr(self, "running_batch") and self.running_batch:
+            elif self.running_batch:
                 if hasattr(self.running_batch, "reqs"):
                     for req in self.running_batch.reqs:
                         if hasattr(req, "lora_id") and req.lora_id is not None:
