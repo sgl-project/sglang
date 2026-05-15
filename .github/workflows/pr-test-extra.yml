@@ -105,10 +105,9 @@ jobs:
       pr_test_yml: '.github/workflows/pr-test-extra.yml'
     secrets: inherit
 
-  # Fires regardless of check-changes outcome (always() handles the label-gate
-  # skip case). On a PR without `run-ci-extra` the rest of this workflow's
-  # graph is skipped, but the awareness block still needs updating so the
-  # author sees this run was a no-op.
+  # always(): on a PR without `run-ci-extra` the rest of this workflow's graph
+  # is skipped, but we still want the awareness block updated so the author
+  # sees this run was a no-op.
   call-pr-awareness:
     needs: check-changes
     if: always() && github.event_name == 'pull_request'

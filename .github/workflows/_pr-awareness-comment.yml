@@ -1,16 +1,12 @@
 name: PR Awareness Comment
-# Reusable workflow that maintains an "awareness block" at the bottom of the
-# PR body, surfacing:
-#   - Extra-CI opt-in state (whether `run-ci-extra` label is present)
-#   - Latest workflow run URLs for PR Test and PR Test Extra
+# Reusable workflow maintaining an "awareness block" at the bottom of the PR
+# body: extra-CI opt-in state + latest PR Test / PR Test Extra run URLs.
+# Called from pr-test.yml + pr-test-extra.yml after their check-changes job so
+# the block appears ~30s in, not after downstream stages. Each caller updates
+# only its own slot; the other slot is preserved verbatim.
 #
-# Called from pr-test.yml and pr-test-extra.yml after their check-changes job
-# completes, so the block appears within ~30s of PR sync instead of waiting
-# for downstream stages. Each caller updates its own slot in the block; the
-# other workflow's slot is preserved verbatim.
-#
-# Editing the PR body via pulls.update triggers a `pull_request: edited`
-# event, not `synchronize`, so it does not loop back into the CI workflows.
+# pulls.update fires `pull_request: edited`, which is NOT in the default
+# trigger types, so this does not loop back into the CI workflows.
 
 on:
   workflow_call:
@@ -27,12 +23,10 @@ jobs:
   update-pr-body:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    # Serialize concurrent writers across both callers (pr-test.yml + pr-test-extra.yml)
-    # for the same PR. Without this, both instances race on get/modify/update of the
-    # PR body and the second writer's `pulls.update` clobbers the first writer's slot
-    # change. group is scoped to PR number so different PRs do not block each other.
-    # cancel-in-progress MUST be false — cancelling would lose the earlier writer's
-    # update entirely.
+    # Serialize concurrent writers from pr-test + pr-test-extra: both race on
+    # get/modify/update of the PR body, and the later `pulls.update` clobbers
+    # the earlier writer's slot. Group is per-PR so unrelated PRs don't block.
+    # cancel-in-progress MUST be false — cancelling would drop the earlier update.
     concurrency:
       group: pr-awareness-${{ github.event.pull_request.number }}
       cancel-in-progress: false
@@ -53,7 +47,6 @@ jobs:
             const peStart    = '<!-- slot:pr-test-extra:start -->';
             const peEnd      = '<!-- slot:pr-test-extra:end -->';
 
-            // Fetch current PR body
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -73,12 +66,10 @@ jobs:
             const prevPrTest  = extractSlot(existingBlock, ptStart, ptEnd);
             const prevPrExtra = extractSlot(existingBlock, peStart, peEnd);
 
-            // Update only this caller's slot; preserve the other slot's value.
-            // For pr-test-extra: only attribute the run URL when the PR carries
-            // `run-ci-extra` and the extra graph actually executed. Without the
-            // label the run is label-gate-skipped and contains nothing but
-            // call-pr-awareness itself — linking to it would be misleading, so
-            // we inline a warning notice in the slot instead.
+            // Each caller updates only its own slot; the other slot is preserved.
+            // For pr-test-extra without the label: the rest of its graph is
+            // label-gate-skipped, so linking to that run would mislead — inline
+            // a warning notice in the slot instead.
             const notEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
             const newPrTest = (kind === 'pr-test')
               ? `[Run #${context.runId}](${runUrl})`
@@ -98,7 +89,7 @@ jobs:
               outerEnd,
             ].join('\n');
 
-            // Replace existing block in place, or append at the end of the body
+            // Replace existing block in place, or append at body end.
             let newBody;
             if (blockRe.test(body)) {
               newBody = body.replace(blockRe, newBlock);
