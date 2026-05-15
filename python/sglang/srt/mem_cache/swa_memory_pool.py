@@ -455,9 +455,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         previous_full_indices = full_indices[previous_valid]
         previous_owners = self.swa_to_full_index_mapping[previous_swa_indices]
         previous_same_owner = previous_owners == previous_full_indices
-        self.swa_to_full_index_mapping[
-            previous_swa_indices[previous_same_owner]
-        ] = 0
+        self.swa_to_full_index_mapping[previous_swa_indices[previous_same_owner]] = 0
 
         old_full_indices = self.swa_to_full_index_mapping[swa_indices]
         old_full_indices = old_full_indices[old_full_indices > 0]
@@ -661,9 +659,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if pages.numel() == 0:
             return indices[:0]
 
-        offsets = torch.arange(
-            self.page_size, dtype=torch.int64, device=indices.device
-        )
+        offsets = torch.arange(self.page_size, dtype=torch.int64, device=indices.device)
         expanded = (pages[:, None] * self.page_size + offsets[None, :]).reshape(-1)
         return expanded[(expanded > 0) & (expanded < limit)]
 
