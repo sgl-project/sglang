@@ -383,6 +383,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         return block_kv_indices
 
+    def init_mha_chunk_metadata(self, forward_batch: "ForwardBatch") -> None:
+        """Skip parent's flashinfer wrapper plan()."""
+        return None
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
