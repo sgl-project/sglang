@@ -37,6 +37,7 @@ except ImportError:
     pass
 
 from sglang.jit_kernel.deepseek_v4 import mask_topk_ids
+from sglang.srt.compilation.torch_compile import sgl_compile
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -60,7 +61,6 @@ from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
-    get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
@@ -631,7 +631,7 @@ def fused_topk(
 
 
 # This is used by the Deepseek V2/V3/R1 series models
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@sgl_compile(dynamic=True)
 def grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -722,7 +722,7 @@ def grouped_topk_cpu(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@sgl_compile(dynamic=True)
 def kimi_k2_biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -760,7 +760,7 @@ def kimi_k2_biased_topk_impl(
     return topk_weights, topk_ids
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@sgl_compile(dynamic=True)
 def biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -855,7 +855,7 @@ def biased_topk_jit_kernel_impl(
     return topk_weights, topk_ids
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@sgl_compile(dynamic=True)
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -946,7 +946,7 @@ def _mask_topk_ids_padded_region(
         topk_ids[indices >= num_token_non_padded, :] = -1
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@sgl_compile(dynamic=True)
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):

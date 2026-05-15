@@ -382,6 +382,8 @@ class Envs:
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
+    SGLANG_DISABLE_TORCH_COMPILE = EnvBool(False)
+    SGLANG_EXPORT_DIR = EnvStr("")
 
     # EPLB
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)

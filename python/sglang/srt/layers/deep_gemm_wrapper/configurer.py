@@ -20,13 +20,15 @@ def _compute_enable_deep_gemm():
         return False
     if not (_is_cuda or _is_musa):
         return False
+    if not envs.SGLANG_ENABLE_JIT_DEEPGEMM.get():
+        return False
 
     try:
         import deep_gemm  # noqa: F401
     except ImportError:
         return False
 
-    return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()
+    return True
 
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()

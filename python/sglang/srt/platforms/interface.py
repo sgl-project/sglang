@@ -10,15 +10,17 @@ Out-of-tree platforms register via setuptools entry_points under the
 "sglang.platform_plugins" group and should subclass SRTPlatform.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
-    pass
+    from sglang.srt.compilation.torch_compile import TorchCompileConfig
+
+TorchCompileStrategy = Literal["compile", "noop", "export"]
 
 # Re-export for convenience
-__all__ = ["SRTPlatform", "PlatformEnum"]
+__all__ = ["SRTPlatform", "PlatformEnum", "TorchCompileStrategy"]
 
 
 class SRTPlatform(DeviceMixin):
@@ -80,6 +82,24 @@ class SRTPlatform(DeviceMixin):
         ``mode`` is an optional hint for the platform (e.g. "npugraph_ex").
         """
         return "inductor"
+
+    def torch_compile_strategy(self) -> TorchCompileStrategy:
+        """Return how decorated per-callsite torch compile targets should run."""
+        return "compile"
+
+    def torch_compile_defaults(self) -> "TorchCompileConfig":
+        """Return platform defaults for per-callsite torch compile targets."""
+        from sglang.srt.compilation.torch_compile import TorchCompileConfig
+
+        return TorchCompileConfig()
+
+    def make_exported_program_callable(
+        self,
+        exported_program: Any,
+        compile_config: "TorchCompileConfig",
+    ) -> Any:
+        """Build a runtime callable from a captured ExportedProgram."""
+        return exported_program.module()
 
     def get_piecewise_backend_cls(self) -> type:
         """Return the piecewise compilation backend class for this platform."""

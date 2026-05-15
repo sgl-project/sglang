@@ -25,6 +25,7 @@ import torch
 from torch import nn
 from transformers import Llama4TextConfig
 
+from sglang.srt.compilation.torch_compile import sgl_compile
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -57,7 +58,6 @@ from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.utils import (
     add_prefix,
     fast_topk,
-    get_compiler_backend,
     is_cuda,
     is_npu,
     make_layers,
@@ -72,7 +72,7 @@ logger = logging.getLogger(__name__)
 
 class Llama4MoE(nn.Module):
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
+    @sgl_compile(dynamic=True)
     @staticmethod
     def custom_routing_function(
         hidden_states: torch.Tensor,
@@ -319,7 +319,7 @@ class Llama4Attention(nn.Module):
         attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
         return attn_scale.unsqueeze(-1)
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
+    @sgl_compile(dynamic=True)
     def _mul_attn_scale(self, positions, q):
         attn_scale = self._get_attn_scale(positions)
         return (q * attn_scale).to(q.dtype)

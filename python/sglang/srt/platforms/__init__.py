@@ -31,6 +31,7 @@ def _resolve_platform() -> SRTPlatform:
     1. Branch on SGLANG_PLATFORM:
 
        SGLANG_PLATFORM set (front-loading filter):
+         - If it names an in-tree platform, activate that platform
          - Enumerate entry_points without importing any plugin modules
          - Only ep.load() + activate() the named plugin
          - Other plugins are never imported (avoids pulling their dependencies)
@@ -39,7 +40,7 @@ def _resolve_platform() -> SRTPlatform:
 
        SGLANG_PLATFORM unset (auto-discover):
          - Import and activate all discovered plugins
-         - 0 activated → fallback base SRTPlatform
+         - 0 activated → detect in-tree platform
          - 1 activated → use it
          - N activated → RuntimeError (must set SGLANG_PLATFORM)
 
@@ -48,13 +49,28 @@ def _resolve_platform() -> SRTPlatform:
     selected = envs.SGLANG_PLATFORM.get()
 
     if selected:
+        from sglang.srt.platforms.builtin import (
+            get_builtin_platform_names,
+            resolve_builtin_platform_by_name,
+        )
+
+        builtin_platform = resolve_builtin_platform_by_name(selected)
+        if builtin_platform is not None:
+            logger.info("In-tree platform selected: %s -> %s", selected, builtin_platform)
+            return builtin_platform
+
         # Front-loading filter: only import and activate the specified plugin.
         # Other plugins' modules are never loaded — avoids pulling their deps.
         discovered = entry_points(group=PLATFORM_PLUGINS_GROUP)
         ep_map = {ep.name: ep for ep in discovered}
 
         if selected not in ep_map:
-            available = ", ".join(f"'{n}'" for n in ep_map) if ep_map else "none"
+            available_names = list(get_builtin_platform_names()) + list(ep_map)
+            available = (
+                ", ".join(f"'{n}'" for n in available_names)
+                if available_names
+                else "none"
+            )
             raise RuntimeError(
                 f"SGLANG_PLATFORM={selected!r} not found in discovered platform plugins "
                 f"(available: {available}). Install the plugin with 'pip install -e' "
@@ -90,8 +106,11 @@ def _resolve_platform() -> SRTPlatform:
             logger.exception("Failed to activate platform plugin: %s", name)
 
     if len(activated) == 0:
-        logger.debug("No platform detected. Using base SRTPlatform with defaults.")
-        return SRTPlatform()
+        from sglang.srt.platforms.builtin import resolve_builtin_platform
+
+        platform = resolve_builtin_platform()
+        logger.debug("In-tree platform resolved: %s", platform)
+        return platform
 
     if len(activated) == 1:
         name, qualname = next(iter(activated.items()))

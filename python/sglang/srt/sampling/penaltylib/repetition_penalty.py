@@ -1,10 +1,10 @@
 import torch
 
+from sglang.srt.compilation.torch_compile import sgl_compile
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
-from sglang.srt.utils import get_compiler_backend
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@sgl_compile(dynamic=True, copy_output_to_arg_index=0)
 def apply_scaling_penalties(logits, scaling_penalties):
     logits[:] = torch.where(
         logits < 0,

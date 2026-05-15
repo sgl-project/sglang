@@ -5,9 +5,19 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.compilation.torch_compile import TorchCompileConfig
 from sglang.srt.platforms import _load_platform_class, _resolve_platform
+from sglang.srt.platforms.builtin import (
+    CudaOnnxPlatform,
+    CudaPlatform,
+    NpuPlatform,
+    resolve_builtin_platform,
+    resolve_builtin_platform_by_name,
+)
 from sglang.srt.platforms.device_mixin import (
     CpuArchEnum,
     DeviceCapability,
@@ -222,6 +232,25 @@ class TestSRTPlatform(CustomTestCase):
         base = SRTPlatform()
         self.assertEqual(base.get_compile_backend(mode="npugraph_ex"), "inductor")
 
+    def test_torch_compile_defaults(self):
+        base = SRTPlatform()
+        self.assertEqual(base.torch_compile_strategy(), "compile")
+        self.assertIsInstance(base.torch_compile_defaults(), TorchCompileConfig)
+
+    def test_make_exported_program_callable_default(self):
+        module = MagicMock()
+        exported_program = MagicMock()
+        exported_program.module.return_value = module
+
+        base = SRTPlatform()
+        self.assertEqual(
+            base.make_exported_program_callable(
+                exported_program,
+                TorchCompileConfig(),
+            ),
+            module,
+        )
+
 
 class TestSRTPlatformOverrides(CustomTestCase):
     """Tests for SRTPlatform method overrides via plugins."""
@@ -248,6 +277,68 @@ class TestSRTPlatformOverrides(CustomTestCase):
 
         self.assertEqual(P().get_compile_backend(mode="npugraph_ex"), "inductor")
 
+    def test_custom_torch_compile_strategy(self):
+        class P(_StubPlatform):
+            def torch_compile_strategy(self):
+                return "export"
+
+        self.assertEqual(P().torch_compile_strategy(), "export")
+
+
+class TestBuiltinPlatforms(CustomTestCase):
+    """Tests for in-tree platform implementations."""
+
+    def test_cuda_platform_compile_defaults(self):
+        platform = CudaPlatform()
+        self.assertTrue(platform.is_cuda())
+        self.assertEqual(platform.torch_compile_strategy(), "compile")
+        self.assertEqual(platform.get_dispatch_key_name(), "cuda")
+
+    def test_cuda_onnx_platform_exports(self):
+        platform = CudaOnnxPlatform()
+        self.assertTrue(platform.is_cuda())
+        self.assertEqual(platform.torch_compile_strategy(), "export")
+        defaults = platform.torch_compile_defaults()
+        self.assertTrue(defaults.run_exported)
+        self.assertIn("run_exported", defaults.forced_fields)
+
+    def test_npu_platform_noops_without_torchair(self):
+        with patch.dict(sys.modules, {"torchair": None}):
+            self.assertEqual(NpuPlatform().torch_compile_strategy(), "noop")
+
+    def test_npu_platform_compiles_with_torchair(self):
+        with patch.dict(sys.modules, {"torchair": types.ModuleType("torchair")}):
+            self.assertEqual(NpuPlatform().torch_compile_strategy(), "compile")
+
+    @patch("sglang.srt.platforms.builtin._is_cpu", return_value=False)
+    @patch("sglang.srt.platforms.builtin._is_npu", return_value=False)
+    @patch("sglang.srt.platforms.builtin._is_xpu", return_value=False)
+    @patch("sglang.srt.platforms.builtin._is_musa", return_value=False)
+    @patch("sglang.srt.platforms.builtin._is_hip", return_value=False)
+    @patch("sglang.srt.platforms.builtin._is_cuda", return_value=True)
+    def test_resolve_builtin_cuda(
+        self,
+        _mock_cuda,
+        _mock_hip,
+        _mock_musa,
+        _mock_xpu,
+        _mock_npu,
+        _mock_cpu,
+    ):
+        self.assertIsInstance(resolve_builtin_platform(), CudaPlatform)
+
+    @patch("sglang.srt.platforms.builtin._is_cuda", return_value=True)
+    def test_resolve_builtin_platform_by_name(self, _mock_cuda):
+        self.assertIsInstance(resolve_builtin_platform_by_name("cuda"), CudaPlatform)
+        self.assertIsInstance(
+            resolve_builtin_platform_by_name("cuda_onnx"), CudaOnnxPlatform
+        )
+
+    @patch("sglang.srt.platforms.builtin._is_cuda", return_value=False)
+    def test_resolve_builtin_platform_by_name_unavailable(self, _mock_cuda):
+        with self.assertRaises(RuntimeError):
+            resolve_builtin_platform_by_name("cuda")
+
 
 # ---------------------------------------------------------------------------
 # Platform Discovery: _resolve_platform
@@ -256,6 +347,20 @@ class TestSRTPlatformOverrides(CustomTestCase):
 
 class TestResolvePlatformWithEnv(CustomTestCase):
     """Tests for _resolve_platform when SGLANG_PLATFORM is set."""
+
+    @patch("sglang.srt.platforms.entry_points")
+    @patch("sglang.srt.platforms.envs")
+    @patch("sglang.srt.platforms.builtin.resolve_builtin_platform_by_name")
+    def test_selected_builtin_platform_activates(
+        self, mock_builtin, mock_envs, mock_ep
+    ):
+        """When SGLANG_PLATFORM names a built-in platform, no entry points load."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = "cuda"
+        builtin = CudaPlatform()
+        mock_builtin.return_value = builtin
+        result = _resolve_platform()
+        self.assertEqual(result, builtin)
+        mock_ep.assert_not_called()
 
     @patch("sglang.srt.platforms.entry_points")
     @patch("sglang.srt.platforms.envs")
@@ -337,11 +442,17 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms.envs")
     def test_no_plugin_activates_fallback(self, mock_envs, mock_load):
-        """When no plugin activates, return base SRTPlatform with warning."""
+        """When no plugin activates, return the detected built-in platform."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         mock_load.return_value = {}
-        result = _resolve_platform()
-        self.assertIsInstance(result, SRTPlatform)
+        builtin = CudaPlatform()
+        with patch(
+            "sglang.srt.platforms.builtin.resolve_builtin_platform",
+            return_value=builtin,
+        ) as mock_resolve_builtin:
+            result = _resolve_platform()
+            mock_resolve_builtin.assert_called_once()
+            self.assertEqual(result, builtin)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms.envs")
