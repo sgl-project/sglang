@@ -438,7 +438,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_drafts=0,
+                num_correct_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
                 next_draft_input=next_draft_input,
             )
@@ -457,8 +457,10 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         if get_global_tracing_enabled():
             for idx, req in enumerate(batch.reqs):
-                accepted = verify_output.num_accepted_drafts_per_req_cpu[idx]
-                req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+                num_correct_drafts = verify_output.num_correct_drafts_per_req_cpu[idx]
+                req.time_stats.set_spec_verify_end_time(
+                    num_correct_drafts=num_correct_drafts
+                )
 
         set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
         next_draft_input = None
@@ -468,7 +470,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             draft_extend_input = verify_output.draft_extend_input
             if (
                 self.server_args.enable_dp_attention
-                or draft_extend_input.input_ids.numel() > 0
+                or draft_extend_input.input_ids.shape[0] > 0
             ):
                 # Install draft_extend_input as batch.spec_info for the seed
                 # step; the assembled next-iter FrozenKVMTPDraftInput is
@@ -481,8 +483,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         return GenerationBatchResult(
             logits_output=verify_output.logits_output,
             next_token_ids=verify_output.accept_tokens,
-            num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
-            num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
+            num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
+            num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=verify_output.can_run_cuda_graph,
             next_draft_input=next_draft_input,
         )
@@ -531,7 +533,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         # Idle / all-finished short-circuit: idle DraftExtendInput leaves
         # `bonus_tokens=None`, so we can't run `_select_last_verified_seed`.
         # Return an idle FrozenKVMTPDraftInput for the next iter's draft.
-        if batch.forward_mode.is_idle() or draft_extend_input.input_ids.numel() == 0:
+        if batch.forward_mode.is_idle() or draft_extend_input.input_ids.shape[0] == 0:
             return FrozenKVMTPDraftInput.create_idle_input(
                 device=self.device,
                 hidden_size=self._recurrent_hidden_size,
@@ -764,9 +766,9 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
 
         logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepted_indices
+            res.accept_indices
         ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+        logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None

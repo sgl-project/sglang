@@ -471,7 +471,7 @@ class EAGLEWorker(TpModelWorker):
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_drafts=0,
+                num_correct_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
                 next_draft_input=next_draft_input,
             )
@@ -492,8 +492,12 @@ class EAGLEWorker(TpModelWorker):
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
-                    accepted = verify_output.num_accepted_drafts_per_req_cpu[idx]
-                    req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+                    num_correct_drafts = verify_output.num_correct_drafts_per_req_cpu[
+                        idx
+                    ]
+                    req.time_stats.set_spec_verify_end_time(
+                        num_correct_drafts=num_correct_drafts
+                    )
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_start_time", trace_only=True
@@ -554,14 +558,14 @@ class EAGLEWorker(TpModelWorker):
 
             if self.adaptive_controller is not None:
                 self.adaptive_controller.on_verify_complete(
-                    verify_output.num_accepted_drafts_per_req_cpu
+                    verify_output.num_correct_drafts_per_req_cpu
                 )
 
             return GenerationBatchResult(
                 logits_output=verify_output.logits_output,
                 next_token_ids=verify_output.accept_tokens,
-                num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
-                num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
+                num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
+                num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
                 can_run_cuda_graph=verify_output.can_run_cuda_graph,
                 next_draft_input=next_draft_input,
             )
@@ -583,7 +587,12 @@ class EAGLEWorker(TpModelWorker):
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        model_worker_batch.capture_hidden_mode = capture_mode
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
         logits_output, next_token_ids = (
             batch_result.logits_output,
@@ -736,12 +745,17 @@ class EAGLEWorker(TpModelWorker):
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
-            hidden_size=self.model_config.spec_hidden_size,
-            dtype=self.model_config.dtype,
+            hidden_size=EagleDraftInput.hidden_size_for(self),
+            dtype=EagleDraftInput.dtype_for(self),
             topk=self.topk,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+            capture_hidden_mode=capture_mode,
         )
 
     def draft(self, batch: ScheduleBatch):
@@ -754,14 +768,19 @@ class EAGLEWorker(TpModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
 
-        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        draft_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
+        spec_info.capture_hidden_mode = draft_capture_mode
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
         batch.return_hidden_states = False
 
         # Get forward batch
         model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
+        assert model_worker_batch.capture_hidden_mode == draft_capture_mode
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -811,6 +830,11 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_draft_tokens,
         )
 
+        target_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -822,7 +846,7 @@ class EAGLEWorker(TpModelWorker):
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=target_capture_mode,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
@@ -978,9 +1002,12 @@ class EAGLEWorker(TpModelWorker):
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
         logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepted_indices
+            res.accept_indices
         ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = logits_output.hidden_states[
+                res.accept_indices
+            ]
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
@@ -1015,24 +1042,21 @@ class EAGLEWorker(TpModelWorker):
         if batch.forward_mode.is_idle():
             return
 
-        accepted_length = (
-            torch.tensor(
-                res.num_accepted_drafts_per_req_cpu,
-                device=logits_output.hidden_states.device,
-                dtype=torch.int64,
-            )
-            + 1
+        num_correct_drafts = torch.tensor(
+            res.num_correct_drafts_per_req_cpu,
+            device=logits_output.next_token_logits.device,
+            dtype=torch.int64,
         )
-        cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
-        # prepend 0 to the cumulative_accepted_lengths
+        cumulative_num_accept_tokens = torch.cumsum(num_correct_drafts + 1, dim=0)
+        # prepend 0 to the cumulative_num_accept_tokens
         accepted_indices_start = torch.cat(
             [
                 torch.zeros(
                     1,
-                    dtype=cumulative_accepted_lengths.dtype,
-                    device=cumulative_accepted_lengths.device,
+                    dtype=cumulative_num_accept_tokens.dtype,
+                    device=cumulative_num_accept_tokens.device,
                 ),
-                cumulative_accepted_lengths[:-1],
+                cumulative_num_accept_tokens[:-1],
             ]
         )
         accepted_indices_offset = torch.arange(
@@ -1044,19 +1068,20 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        # res.accepted_indices.shape[0] > 0 skips DP attn idle batch
-        if spec_info.topk > 1 and res.accepted_indices.shape[0] > 0:
-            # accepted_indices=[0,2,3,4,5,7,9,10,11], accepted_length=[4, 3, 2], cumulative_accepted_lengths=[4, 7, 9]
-            # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_accepted_lengths[:-1]]) = [0, 5, 10]
-            # last_token_indices_per_req=accepted_indices[cumulative_accepted_lengths - 1] = [4, 9, 11] (last token ID of each req)
-            # max_relative_indices_per_req = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
-            # first_token_indices_per_req = res.accepted_indices[accepted_indices_start]
-            accepted_steps = (
-                res.accepted_indices[cumulative_accepted_lengths - 1]
+        # res.accept_indices.shape[0] > 0 skips DP attn idle batch
+        if spec_info.topk > 1 and res.accept_indices.shape[0] > 0:
+            # accept_indices=[0,2,3,4,5,7,9,10,11], num_accept_tokens=[4, 3, 2], cumulative_num_accept_tokens=[4, 7, 9]
+            # first_token_indices_per_req=prepend(0, accept_indices[cumulative_num_accept_tokens[:-1]]) = [0, 5, 10]
+            # last_token_indices_per_req=accept_indices[cumulative_num_accept_tokens - 1] = [4, 9, 11] (last token ID of each req)
+            # last_correct_step_indices = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
+            # equivalent: last_correct_step_indices = last_token_indices_per_req - first_token_indices_per_req;
+            # `accepted_indices_offset` equals `first_token_indices_per_req` because the first accepted slot of each req is its "current token" at logical position i * draft_token_num.
+            last_correct_step_indices = (
+                res.accept_indices[cumulative_num_accept_tokens - 1]
                 - accepted_indices_offset
             )
         else:
-            accepted_steps = accepted_length - 1
+            last_correct_step_indices = num_correct_drafts
 
         if batch.mamba_track_indices is not None:
             # If after verify, the request's seq_lens has crossed a mamba track interval,
@@ -1072,7 +1097,7 @@ class EAGLEWorker(TpModelWorker):
             to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
             mamba_steps_to_track = torch.where(
                 to_track_mask,
-                res.accepted_indices[to_track_ith + accepted_indices_start]
+                res.accept_indices[to_track_ith + accepted_indices_start]
                 - accepted_indices_offset,
                 -1,
             )
@@ -1080,7 +1105,7 @@ class EAGLEWorker(TpModelWorker):
             mamba_steps_to_track = None
 
         self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-            accepted_steps=accepted_steps,
+            last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
@@ -1113,7 +1138,12 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = next_draft_input
         batch.return_hidden_states = False
         next_draft_input.prepare_for_extend(batch)
-        next_draft_input.capture_hidden_mode = CaptureHiddenMode.LAST
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
+        next_draft_input.capture_hidden_mode = capture_mode
         try:
             model_worker_batch = batch.get_model_worker_batch(
                 seq_lens_cpu_cache=seq_lens_cpu
@@ -1151,6 +1181,12 @@ class EAGLEWorker(TpModelWorker):
 
         input_is_idle = batch.forward_mode.is_idle()
 
+        draft_extend_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
+
         # Phase 1: prepare extend (kernel writes draft_extend_input.{positions, bonus_tokens})
         draft_extend_input.num_tokens_per_req = self.speculative_num_steps + 1
         draft_extend_input.num_tokens_for_logprob_per_req = 1
@@ -1165,8 +1201,12 @@ class EAGLEWorker(TpModelWorker):
         )
 
         batch.return_hidden_states = False
+        # Verify-time construction of EagleDraftExtendInput uses the dataclass
+        # default (LAST); the worker overrides here so get_model_worker_batch()
+        # propagates the correct mode (NULL for STANDALONE).
+        draft_extend_input.capture_hidden_mode = draft_extend_capture_mode
         model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
+        assert model_worker_batch.capture_hidden_mode == draft_extend_capture_mode
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -1211,12 +1251,17 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Phase 3: assemble next-iter EagleDraftInput from extend output
+        next_decode_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
         next_draft_input = EagleDraftInput(
             bonus_tokens=draft_extend_input.bonus_tokens,
             hidden_states=hidden_states,
             topk_p=topk_p,
             topk_index=topk_index,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=next_decode_capture_mode,
         )
 
         # Restore batch fields. `seq_lens` etc. were modified by

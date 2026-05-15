@@ -211,7 +211,12 @@ class EagleDraftInputV2Mixin:
         # Get a forward batch
         self.num_tokens_per_req = topk
         self.num_tokens_for_logprob_per_req = topk
-        batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if draft_model_runner.spec_algorithm.is_standalone()
+            else CaptureHiddenMode.LAST
+        )
+        batch.capture_hidden_mode = capture_mode
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
@@ -240,7 +245,12 @@ class EagleDraftExtendInputV2Mixin:
         batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
-        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if draft_model_runner.spec_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        batch.capture_hidden_mode = capture_mode
         batch.forward_mode = (
             ForwardMode.IDLE
             if batch.forward_mode.is_idle()
@@ -306,7 +316,12 @@ class EagleVerifyInputV2Mixin:
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if target_worker.model_runner.spec_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        batch.capture_hidden_mode = capture_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
         # Run attention backend plan and cuda graph preparation
@@ -349,17 +364,18 @@ class EagleVerifyInputV2Mixin:
         device = batch.input_ids.device
         if batch.forward_mode.is_idle():
             predict = torch.empty(0, dtype=torch.int32, device=device)
-            num_accepted_drafts = torch.empty(0, dtype=torch.int32, device=device)
+            num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
             accept_index = torch.empty(0, dtype=torch.int32, device=device)
             verify_output = EagleVerifyOutput(
                 draft_extend_input=EagleDraftExtendInput(
                     hidden_states=logits_output.hidden_states,
-                    num_accepted_drafts=num_accepted_drafts,
-                    num_accepted_tokens=num_accepted_drafts + 1,
+                    num_correct_drafts=num_correct_drafts,
+                    num_accept_tokens=num_correct_drafts + 1,
                 ),
                 logits_output=logits_output,
                 accept_tokens=torch.empty(0, dtype=torch.int32, device=device),
-                accepted_indices=accept_index,
+                num_correct_drafts_per_req_cpu=[],
+                accept_indices=accept_index,
             )
             return verify_output, predict
 
@@ -403,16 +419,16 @@ class EagleVerifyInputV2Mixin:
         accept_index = torch.full(
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
         )
-        num_accepted_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Sample tokens
         if sampling_info.is_all_greedy or _is_npu or _is_hip:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
-            predict, accept_index, num_accepted_drafts = verify_tree_greedy_func(
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
-                accept_token_num=num_accepted_drafts,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
                 candidates=candidates,
                 retrieve_index=self.retrieve_index,
                 retrieve_next_token=self.retrieve_next_token,
@@ -454,7 +470,7 @@ class EagleVerifyInputV2Mixin:
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
-                accept_token_num=num_accepted_drafts,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
                 candidates=candidates,
                 # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
                 retrive_index=self.retrieve_index,
@@ -481,21 +497,21 @@ class EagleVerifyInputV2Mixin:
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_accepted_drafts, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
 
         if SIMULATE_ACC_LEN > 0:
             # Do simulation
             accept_index = generate_simulated_accept_index(
                 accept_index=accept_index,
                 predict=predict,  # mutable
-                num_accepted_drafts=num_accepted_drafts,  # mutable
+                num_correct_drafts=num_correct_drafts,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
 
-        # `num_accepted_drafts` is drafts-only here; bonus is added via out-of-place
-        # +1 when packaged into `EagleDraftExtendInput.num_accepted_tokens`, so the
+        # `num_correct_drafts` is drafts-only here; bonus is added via out-of-place
+        # +1 when packaged into `EagleDraftExtendInput.num_accept_tokens`, so the
         # local name does not flip semantics mid-function (naming doc C2).
         verify_output = EagleVerifyOutput(
             draft_extend_input=EagleDraftExtendInput(
@@ -504,12 +520,13 @@ class EagleVerifyInputV2Mixin:
                 # accept-sliced view. The downstream V2 cuda-graph runner
                 # expects the full layout.
                 hidden_states=logits_output.hidden_states,
-                num_accepted_drafts=num_accepted_drafts,
-                num_accepted_tokens=num_accepted_drafts + 1,
+                num_correct_drafts=num_correct_drafts,
+                num_accept_tokens=num_correct_drafts + 1,
             ),
             logits_output=logits_output,
             accept_tokens=predict[accept_index],
-            accepted_indices=accept_index,
+            num_correct_drafts_per_req_cpu=[],
+            accept_indices=accept_index,
         )
         return verify_output, predict
 

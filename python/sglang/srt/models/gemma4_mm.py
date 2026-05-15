@@ -802,6 +802,41 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 and int(m.group(1)) in k_eq_v_layers
             )
 
+            # Per-expert checkpoint format used by compressed-tensors / FP8
+            # (e.g. RedHatAI/*-FP8-Dynamic). Each expert is stored as a
+            # separate key with shape (out, in):
+            #   experts.<id>.gate_proj.{weight,weight_scale}
+            #   experts.<id>.up_proj.{weight,weight_scale}
+            #   experts.<id>.down_proj.{weight,weight_scale}
+            # These need to be folded into sglang's fused FusedMoE params:
+            #   experts.w13_weight[_scale]  (gate->shard "w1", up->shard "w3")
+            #   experts.w2_weight[_scale]   (down->shard "w2")
+            per_expert_match = re.match(
+                r"^(.*?\.moe\.experts\.)(\d+)\.(gate_proj|up_proj|down_proj)"
+                r"\.(weight|weight_scale)$",
+                name,
+            )
+            if per_expert_match:
+                prefix = per_expert_match.group(1)
+                expert_id = int(per_expert_match.group(2))
+                proj = per_expert_match.group(3)
+                suffix = per_expert_match.group(4)
+                if proj == "gate_proj":
+                    base, sid = "w13_weight", "w1"
+                elif proj == "up_proj":
+                    base, sid = "w13_weight", "w3"
+                else:  # down_proj
+                    base, sid = "w2_weight", "w2"
+                if suffix == "weight_scale":
+                    base += "_scale"
+                fused_name = prefix + base
+                if fused_name in params_dict:
+                    param = params_dict[fused_name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, fused_name, sid, expert_id)
+                    loaded_params.add(fused_name)
+                continue
+
             # MoE expert weights checked first (gate_up_proj contains "up_proj"
             # which would false-match the stacked dense MLP mapping).
             orig_name = name
