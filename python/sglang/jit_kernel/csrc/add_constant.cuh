@@ -69,9 +69,8 @@ void add_constant(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
 
   const auto* src_ptr = static_cast<const int32_t*>(src.data_ptr());
   auto* dst_ptr = static_cast<int32_t*>(dst.data_ptr());
-  const bool is_vec4_aligned =
-      (reinterpret_cast<uintptr_t>(src_ptr) % alignof(int4) == 0) &&
-      (reinterpret_cast<uintptr_t>(dst_ptr) % alignof(int4) == 0);
+  const bool is_vec4_aligned = (reinterpret_cast<uintptr_t>(src_ptr) % alignof(int4) == 0) &&
+                               (reinterpret_cast<uintptr_t>(dst_ptr) % alignof(int4) == 0);
 
   // 3. Launch the kernel. Error code will be automatically checked.
   if (num_elements >= kVec4MinElements && is_vec4_aligned) {
