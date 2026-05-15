@@ -91,7 +91,6 @@ class TestDSV4FlashFP4H200(ServerSanityMixin, CustomTestCase):
         self.assertGreater(metrics["score"], 0.93)
 
 
-@unittest.skip("broken on main, see #24816")
 @unittest.skipUnless(
     _flashinfer_has_sm90_cutlass_mxfp4(),
     "FlashInfer build lacks SM90 mixed-input MXFP4 helpers (PR #3084, >= 0.6.11)",
