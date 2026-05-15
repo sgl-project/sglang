@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(
-    est_time=720, stage="stage-c", runner_config="8-gpu-h200", nightly=True
+    est_time=720, stage="basic-c", runner_config="8-gpu-h200", nightly=True
 )
 
 GLM5_MODEL_PATH = "zai-org/GLM-5-FP8"

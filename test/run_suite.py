@@ -22,9 +22,12 @@ HW_MAPPING = {
     "npu": HWBackend.NPU,
 }
 
-# Per-commit test suites (run on every PR)
+# Per-commit test suites (run on every PR).
+# Includes both basic-a/b/c (always-on; pr-test.yml) and extra-a/b
+# (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
+# pr-test-extra.yml's `run-ci-extra` PR label decides whether extra-* dispatches.
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["stage-a-test-cpu", "stage-b-test-cpu"],
+    HWBackend.CPU: ["basic-a-test-cpu", "basic-b-test-cpu"],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",
@@ -39,24 +42,24 @@ PER_COMMIT_SUITES = {
         "stage-c-test-large-8-gpu-amd-mi35x",
     ],
     HWBackend.CUDA: [
-        "stage-a-test-1-gpu-small",
-        "stage-b-test-1-gpu-small",
-        "stage-b-test-1-gpu-large",
-        "stage-b-test-2-gpu-large",
-        "stage-b-test-4-gpu-b200",
-        "stage-b-kernel-unit-1-gpu-large",
-        "stage-b-kernel-unit-1-gpu-b200",
-        "stage-b-kernel-unit-8-gpu-h200",
-        "stage-b-kernel-benchmark-1-gpu-large",
-        "stage-c-test-4-gpu-h100",
-        "stage-c-test-4-gpu-b200",
-        "stage-c-test-4-gpu-gb200",
-        "stage-c-test-8-gpu-h20",
-        "stage-c-test-8-gpu-h200",
-        "stage-c-test-8-gpu-b200",
-        "stage-c-test-deepep-4-gpu-h100",
-        "stage-c-test-dsv4-4-gpu-b200",
-        "stage-c-test-dsv4-8-gpu-h200",
+        "basic-a-test-1-gpu-small",
+        "basic-b-test-1-gpu-small",
+        "basic-b-test-1-gpu-large",
+        "basic-b-test-2-gpu-large",
+        "basic-b-test-4-gpu-b200",
+        "basic-b-kernel-unit-1-gpu-large",
+        "basic-b-kernel-unit-1-gpu-b200",
+        "basic-b-kernel-unit-8-gpu-h200",
+        "basic-b-kernel-benchmark-1-gpu-large",
+        "basic-c-test-4-gpu-h100",
+        "basic-c-test-4-gpu-b200",
+        "basic-c-test-4-gpu-gb200",
+        "basic-c-test-8-gpu-h20",
+        "basic-c-test-8-gpu-h200",
+        "basic-c-test-8-gpu-b200",
+        "basic-c-test-deepep-4-gpu-h100",
+        "basic-c-test-dsv4-4-gpu-b200",
+        "basic-c-test-dsv4-8-gpu-h200",
         # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
         # (tests still tagged per-commit but skipped on default PR runs).
         "extra-a-test-1-gpu-small",
@@ -68,7 +71,7 @@ PER_COMMIT_SUITES = {
         "extra-b-test-deepep-8-gpu-h200",
     ],
     HWBackend.NPU: [
-        "stage-a-test-1-gpu-small",
+        "basic-a-test-1-gpu-small",
         "stage-b-test-1-npu-a2",
         "stage-b-test-2-npu-a2",
         "stage-b-test-4-npu-a3",

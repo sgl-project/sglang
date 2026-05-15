@@ -2,7 +2,7 @@
 keyed by suite name. Consumed by pr-test.yml stage jobs as
 `fromJson(needs.check-changes.outputs.partitions)['<suite>']`.
 
-    partitions={"stage-b-test-1-gpu-small": {"size": 8, "arr": [0,...,7], "max_parallel": 2}, ...}
+    partitions={"basic-b-test-1-gpu-small": {"size": 8, "arr": [0,...,7], "max_parallel": 2}, ...}
 """
 
 import argparse
@@ -34,11 +34,11 @@ HWBackend = _ci_register.HWBackend
 # pr-test-amd.yml / pr-test-npu.yml have their own dispatch.
 _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
-# stage-a is the critical-path entry gate; pin its fanout to smoke-coverage
+# basic-a is the critical-path entry gate; pin its fanout to smoke-coverage
 # defaults instead of est_time. max_parallel = size (no throttle).
 _STAGE_A_OVERRIDES = {
-    "stage-a-test-cpu": 4,
-    "stage-a-test-1-gpu-small": 1,
+    "basic-a-test-cpu": 4,
+    "basic-a-test-1-gpu-small": 1,
 }
 
 _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
@@ -47,7 +47,7 @@ _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
 def load_run_timeouts(pr_test_yml_path: str) -> dict:
     """Map `self_name -> run_timeout_minutes` from one pr-test*.yml. The input
     is required in `_pr-test-stage.yml` -- KeyError surfaces missing.
-    Inline stage-a-test-cpu is skipped (uses `_STAGE_A_OVERRIDES`)."""
+    Inline basic-a-test-cpu is skipped (uses `_STAGE_A_OVERRIDES`)."""
     with open(pr_test_yml_path) as f:
         wf = yaml.safe_load(f)
     timeouts = {}
