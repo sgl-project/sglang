@@ -821,60 +821,73 @@ class DeepEPDispatcher(BaseDispatcher):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ) -> DispatchOutput:
-        self.dispatch_a(hidden_states, topk_output)
+        allow_ll = (
+            hidden_states.shape[0]
+            <= envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        )
+        self.dispatch_a(hidden_states, topk_output, allow_ll)
         if self._deepep_dispatch_hooks is not None:
             self._deepep_dispatch_hooks(self)
-        ret = self.dispatch_b()
+        ret = self.dispatch_b(allow_ll)
         return ret
 
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        allow_ll: bool = True,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-        inner_state = self._get_impl().dispatch_a(
+        inner_state = self._get_impl(allow_ll).dispatch_a(
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
         self._dispatch_intermediate_state = inner_state
 
-    def dispatch_b(self):
+    def dispatch_b(
+        self,
+        allow_ll: bool = True,
+    ):
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
         inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_impl().dispatch_b(*inner_state)
+        return self._get_impl(allow_ll).dispatch_b(*inner_state)
 
     def combine(
         self,
         combine_input: CombineInput,
     ) -> torch.Tensor:
-        self.combine_a(combine_input)
-        ret = self.combine_b()
+        allow_ll = combine_input.format == CombineInputFormat.DEEPEP_LL
+        self.combine_a(combine_input, allow_ll=allow_ll)
+        ret = self.combine_b(allow_ll=allow_ll)
         return ret
 
     def combine_a(
         self,
         combine_input: CombineInput,
+        allow_ll: bool = True,
     ):
         hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        inner_state = self._get_impl().combine_a(
+        inner_state = self._get_impl(allow_ll).combine_a(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
         self._combine_intermediate_state = inner_state
 
-    def combine_b(self):
+    def combine_b(
+        self,
+        allow_ll: bool = True,
+    ):
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
         inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
-        return self._get_impl().combine_b(*inner_state)
+        return self._get_impl(allow_ll).combine_b(*inner_state)
 
-    def _get_impl(self) -> _DeepEPDispatcherImplBase:
+    def _get_impl(self, allow_ll: bool = True) -> _DeepEPDispatcherImplBase:
         is_extend_in_batch = get_is_extend_in_batch()
-        resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
+        resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch, allow_ll)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             return self._normal_dispatcher
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:

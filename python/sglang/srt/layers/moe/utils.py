@@ -13,11 +13,14 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 class MoeA2ABackend(Enum):
@@ -129,11 +132,11 @@ class DeepEPMode(Enum):
     def enable_low_latency(self) -> bool:
         return self in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]
 
-    def resolve(self, is_extend_in_batch: bool) -> DeepEPMode:
+    def resolve(self, is_extend_in_batch: bool, allow_ll: bool = True) -> DeepEPMode:
         if self != DeepEPMode.AUTO:
             return self
 
-        if is_extend_in_batch:
+        if is_extend_in_batch or (_is_npu and not allow_ll):
             return DeepEPMode.NORMAL
         else:
             return DeepEPMode.LOW_LATENCY
