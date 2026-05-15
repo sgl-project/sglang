@@ -209,8 +209,12 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
-            k_layer = self.k_buffer[local_layer_id].view(-1, self.head_num, self.head_dim)
-            v_layer = self.v_buffer[local_layer_id].view(-1, self.head_num, self.head_dim)
+            k_layer = self.k_buffer[local_layer_id].view(
+                -1, self.head_num, self.head_dim
+            )
+            v_layer = self.v_buffer[local_layer_id].view(
+                -1, self.head_num, self.head_dim
+            )
             layer_chunks = []
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
@@ -225,8 +229,12 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
-            k_layer = self.k_buffer[local_layer_id].view(-1, self.head_num, self.head_dim)
-            v_layer = self.v_buffer[local_layer_id].view(-1, self.head_num, self.head_dim)
+            k_layer = self.k_buffer[local_layer_id].view(
+                -1, self.head_num, self.head_dim
+            )
+            v_layer = self.v_buffer[local_layer_id].view(
+                -1, self.head_num, self.head_dim
+            )
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 k_cpu, v_cpu = (
