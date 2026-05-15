@@ -96,9 +96,22 @@ fn parity_matrix() {
             checked += 1;
         }
     }
-    assert!(
-        checked + skipped.len() == 12,
-        "expected 12 fixtures, found {}",
+    let expected = std::fs::read_dir(fixture_root())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| {
+            std::fs::read_dir(e.path())
+                .unwrap()
+                .filter_map(|f| f.ok())
+                .filter(|f| f.path().extension().and_then(|s| s.to_str()) == Some("json"))
+                .count()
+        })
+        .sum::<usize>();
+    assert_eq!(
+        checked + skipped.len(),
+        expected,
+        "expected {expected} fixtures, found {}",
         checked + skipped.len()
     );
     if checked == 0 {

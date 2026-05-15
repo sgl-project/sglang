@@ -31,7 +31,7 @@ async fn forwards_whitelisted_headers_strips_others() {
         }],
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.clone()));
+    let proxy = Arc::new(Proxy::new(worker.url.clone()).unwrap());
     let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
 
     let body = serde_json::to_vec(&serde_json::json!({

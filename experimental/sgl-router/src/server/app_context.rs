@@ -7,20 +7,12 @@ use crate::tokenizer::TokenizerRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[derive(Debug)]
 pub struct AppContext {
     pub config: Config,
     pub tokenizers: Arc<TokenizerRegistry>,
     pub proxy: Arc<Proxy>,
     ready: AtomicBool,
-}
-
-// `dynamo_tokenizers::Tokenizer` is not Debug, so we implement it manually.
-impl std::fmt::Debug for AppContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AppContext")
-            .field("ready", &self.ready.load(Ordering::SeqCst))
-            .finish_non_exhaustive()
-    }
 }
 
 impl AppContext {
@@ -56,7 +48,7 @@ impl AppContext {
                 }],
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
-            proxy: Arc::new(Proxy::new("http://x".into())),
+            proxy: Arc::new(Proxy::new("http://x".into()).expect("stub proxy")),
             ready: AtomicBool::new(false),
         }
     }

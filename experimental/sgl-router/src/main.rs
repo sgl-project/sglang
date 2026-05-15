@@ -39,7 +39,9 @@ async fn main() -> Result<()> {
         sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
             .context("load tokenizers")?,
     );
-    let proxy = Arc::new(sgl_router::proxy::Proxy::new(cfg.workers[0].url.clone()));
+    let proxy = Arc::new(
+        sgl_router::proxy::Proxy::new(cfg.workers[0].url.clone()).context("build proxy client")?,
+    );
 
     match proxy.probe_health(std::time::Duration::from_secs(2)).await {
         Ok(()) => tracing::info!("worker probe ok"),
