@@ -469,12 +469,14 @@ class EagleDraftWorker(BaseDraftWorker):
 
         model_worker_batch.forward_mode = ForwardMode.DECODE
         model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
-        # DSA models (e.g. DeepSeek-V3.2) no longer depend on seq_lens_cpu, so
-        # skipping the sync below does not affect acceptance rate. For other models
-        # that still rely on seq_lens_cpu, skipping it may degrade acceptance rate.
-        # To test: uncomment the line below to enable seq_lens_cpu sync, which
-        # restores accurate acceptance rate at the cost of some performance.
-        # model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.to("cpu")
+        # When cuda graph is disabled, seq_lens_cpu must be synced because
+        # init_forward_metadata derives actual_seq_lengths_kv from it, while
+        # block_tables are derived from seq_lens (GPU). A mismatch between the
+        # two causes an NPU kernel error. When cuda graph is enabled, the graph
+        # replay path tolerates the stale value (both sides are consistently
+        # off), so we skip the D2H copy to avoid the overhead.
+        if self.server_args.disable_cuda_graph:
+            model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.to("cpu")
 
         try:
             forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
