@@ -64,6 +64,12 @@ class CustomSpecAlgo:
     def is_ngram(self) -> bool:
         return False
 
+    def is_decoupled_verify(self) -> bool:
+        return False
+
+    def is_decoupled_draft(self) -> bool:
+        return False
+
     def supports_spec_v2(self) -> bool:
         return self.supports_overlap
 

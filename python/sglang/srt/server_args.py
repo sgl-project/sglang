@@ -34,6 +34,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -591,6 +592,12 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+
+    decoupled_spec_bind_endpoint: Optional[str] = None
+    decoupled_spec_connect_endpoints: Optional[List[str]] = None
+    decoupled_spec_rank: Optional[int] = None
+    decoupled_spec_trace_dir: Optional[str] = None
+
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
     speculative_skip_dp_mlp_sync: bool = False
@@ -1568,7 +1575,11 @@ class ServerArgs:
                 if self.speculative_algorithm == "STANDALONE":
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
-                elif self.speculative_algorithm != "NGRAM":
+                elif self.speculative_algorithm not in (
+                    "NGRAM",
+                    "DECOUPLED_VERIFY",
+                    "DECOUPLED_DRAFT",
+                ):
                     # eagle draft models and cuda graphs
                     reserved_mem += 4 * 1024
 
@@ -5863,6 +5874,43 @@ class ServerArgs:
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
         )
+        parser.add_argument(
+            "--decoupled-spec-bind-endpoint",
+            type=str,
+            default=ServerArgs.decoupled_spec_bind_endpoint,
+            help=(
+                "ZMQ endpoint that the current decoupled-spec entry scheduler "
+                "binds. For verifier this is the result endpoint; for drafter "
+                "this is the control endpoint."
+            ),
+        )
+        parser.add_argument(
+            "--decoupled-spec-connect-endpoints",
+            type=json_list_type,
+            default=ServerArgs.decoupled_spec_connect_endpoints,
+            help=(
+                "JSON list of peer decoupled-spec entry scheduler endpoints to "
+                "connect to, ordered by peer rank."
+            ),
+        )
+        parser.add_argument(
+            "--decoupled-spec-rank",
+            type=int,
+            default=ServerArgs.decoupled_spec_rank,
+            help=(
+                "Global rank of the current instance within its decoupled-spec "
+                "role. Peer ranks are connect endpoint list indices."
+            ),
+        )
+        parser.add_argument(
+            "--decoupled-spec-trace-dir",
+            type=str,
+            default=ServerArgs.decoupled_spec_trace_dir,
+            help=(
+                "Directory for decoupled speculative decoding CSV trace files. "
+                "Tracing is enabled when this flag is provided."
+            ),
+        )
 
         # Speculative decoding (ngram)
         parser.add_argument(
@@ -7741,6 +7789,9 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
+    # The ipc endpoints between verifier scheduler and drafter scheduler
+    decoupled_spec_ipc_config: Optional[DecoupledSpecIpcConfig]
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
@@ -7759,6 +7810,24 @@ class PortArgs:
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
 
+        decoupled_spec_ipc_config = None
+        if server_args.speculative_algorithm in ("DECOUPLED_VERIFY", "DECOUPLED_DRAFT"):
+            if (
+                server_args.decoupled_spec_bind_endpoint is None
+                or server_args.decoupled_spec_connect_endpoints is None
+                or server_args.decoupled_spec_rank is None
+            ):
+                raise ValueError(
+                    "--decoupled-spec-bind-endpoint, "
+                    "--decoupled-spec-connect-endpoints, and "
+                    "--decoupled-spec-rank are required for decoupled speculative decoding."
+                )
+            decoupled_spec_ipc_config = DecoupledSpecIpcConfig(
+                bind_endpoint=server_args.decoupled_spec_bind_endpoint,
+                connect_endpoints=tuple(server_args.decoupled_spec_connect_endpoints),
+                rank=int(server_args.decoupled_spec_rank),
+            )
+
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -7769,6 +7838,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                decoupled_spec_ipc_config=decoupled_spec_ipc_config,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -7820,6 +7890,7 @@ class PortArgs:
                 rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                decoupled_spec_ipc_config=decoupled_spec_ipc_config,
             )
 
 

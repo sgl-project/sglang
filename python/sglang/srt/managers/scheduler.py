@@ -169,6 +169,9 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_decoupled_spec_mixin import (
+    SchedulerDecoupledSpecMixin,
+)
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -323,6 +326,7 @@ def validate_dflash_request(req: Req) -> Optional[str]:
 
 class Scheduler(
     SchedulerOutputProcessorMixin,
+    SchedulerDecoupledSpecMixin,
     SchedulerUpdateWeightsMixin,
     SchedulerProfilerMixin,
     SchedulerMetricsMixin,
@@ -389,6 +393,11 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        if self.spec_algorithm.is_decoupled_draft():
+            if self.enable_overlap:
+                raise ValueError(
+                    "decoupled drafter does not support overlap scheduler."
+                )
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -407,6 +416,14 @@ class Scheduler(
                 self.attn_cp_size,
             )
         )
+        self.decoupled_spec_tracer = self.create_spec_tracer()
+
+        self.enable_kv_cache_events = bool(
+            server_args.kv_events_config and self.attn_tp_rank == 0
+        )
+        self.draft_tail_buffer = None
+        if self.spec_algorithm.is_decoupled_verify():
+            self.draft_tail_buffer = self.create_draft_tail_buffer()
 
         # Init model configs
         self.init_model_config()
@@ -531,7 +548,9 @@ class Scheduler(
                     self.page_size = self.dllm_config.block_size
 
     def init_ipc_channels(self, port_args: PortArgs):
+        self.port_args = port_args
         context = zmq.Context(2)
+        self.zmq_context = context
         self.idle_sleeper = None
 
         if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
@@ -559,6 +578,9 @@ class Scheduler(
             self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
             self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
 
+            if self.spec_algorithm.is_decoupled_verify():
+                self.start_verify_proxy(context)
+
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
                     [
@@ -580,6 +602,8 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
+        if self.spec_algorithm.is_decoupled_verify() and not self.is_generation:
+            raise ValueError("decoupled_verify only supports generation models.")
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -673,7 +697,7 @@ class Scheduler(
             self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft():
             self.draft_worker = None
             self.external_corpus_manager = None
             return
@@ -719,7 +743,7 @@ class Scheduler(
         self.maybe_init_draft_worker()
 
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft():
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -1061,6 +1085,13 @@ class Scheduler(
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.session_controller = SessionController(self.tree_cache)
+        if self.spec_algorithm.is_decoupled_draft():
+            self.start_token_sync_thread()
+        if (
+            self.spec_algorithm.is_decoupled_verify()
+            or self.spec_algorithm.is_decoupled_draft()
+        ):
+            self.init_draft_state_tables()
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -1540,6 +1571,8 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self.spec_algorithm.is_decoupled_draft():
+                self.sync_draft_requests()
             if self._engine_paused:
                 continue
 
@@ -2696,6 +2729,10 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            ignore_decode_budget=(
+                self.spec_algorithm.is_decoupled_verify()
+                or self.spec_algorithm.is_decoupled_draft()
+            ),
         )
 
         if self.chunked_req is not None:
@@ -3012,9 +3049,18 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        if self.spec_algorithm.is_decoupled_verify():
+            self.prepare_verify_inputs(batch)
+
+        decoupled_forward_start_ns = self.start_forward_timer(batch)
+
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap:
+            if (
+                self.spec_algorithm.is_none()
+                or self.enable_overlap
+                or self.spec_algorithm.is_decoupled_draft()
+            ):
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:
@@ -3124,6 +3170,9 @@ class Scheduler(
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                 )
 
+        if decoupled_forward_start_ns is not None:
+            self.record_forward_latency(batch, decoupled_forward_start_ns, ret)
+
         if (
             self.server_args.enable_dp_attention
             and self.server_args.elastic_ep_backend is not None
@@ -3186,6 +3235,8 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
 
+        if self.spec_algorithm.is_decoupled_verify():
+            self.submit_verify_updates(batch)
         self.log_batch_result_stats(batch, result)
 
         # Emit forward pass metrics (every iteration when enabled)
@@ -3568,6 +3619,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            if self.spec_algorithm.is_decoupled_verify():
+                self.abort_verify_request(req.rid)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)

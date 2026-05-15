@@ -475,6 +475,9 @@ class Envs:
     SGLANG_SPEC_NAN_DETECTION = EnvBool(False)
     SGLANG_SPEC_OOB_DETECTION = EnvBool(False)
 
+    # Decoupled Speculation
+    SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL = EnvBool(True)
+
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)

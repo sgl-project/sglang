@@ -861,6 +861,12 @@ class Req(ReqDllmMixin):
         # Per-request count of accepted draft tokens (excludes the bonus token).
         self.spec_num_correct_drafts = 0
 
+        # Decoupled-speculation metric: Number of valid draft tokens in verifier snapshots.
+        self.spec_valid_draft_tokens: int = 0
+
+        # Decoupled-speculation metric: Number of accepted tokens among valid draft tokens (excludes the bonus token).
+        self.spec_valid_accepted_tokens: int = 0
+
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
@@ -2118,7 +2124,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else [self.reqs[i] for i in selected_indices]
         )
 
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft():
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
             return new_pages * page_size
 
@@ -2172,6 +2178,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
+        if (
+            self.spec_algorithm.is_decoupled_draft()
+            or self.spec_algorithm.is_decoupled_verify()
+        ):
+            raise RuntimeError(
+                "Retract decode is not supported for decoupled draft/verify algorithm"
+            )
+
         sorted_indices = list(range(len(self.reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
@@ -2299,7 +2313,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
-        if not self.spec_algorithm.is_none():
+        if not (
+            self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft()
+        ):
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return

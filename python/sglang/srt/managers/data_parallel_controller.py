@@ -247,6 +247,9 @@ class DataParallelController:
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            tmp_port_args.decoupled_spec_ipc_config = (
+                port_args.decoupled_spec_ipc_config
+            )
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port
@@ -497,6 +500,11 @@ class DataParallelController:
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
+
+                    # For decoupled-spec, every dp rank should know the same peer ipc config.
+                    rank_port_args.decoupled_spec_ipc_config = (
+                        port_args.decoupled_spec_ipc_config
+                    )
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (

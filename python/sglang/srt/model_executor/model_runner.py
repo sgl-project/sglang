@@ -2537,7 +2537,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if major < 9:
             return False
 
-        if self.spec_algorithm.is_speculative():
+        if (
+            self.spec_algorithm.is_speculative()
+            and not self.spec_algorithm.is_decoupled_draft()
+        ):
             return not self.is_draft_worker
 
         return True
@@ -2602,7 +2605,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
-        if self.spec_algorithm.is_speculative():
+        if (
+            self.spec_algorithm.is_speculative()
+            and not self.spec_algorithm.is_decoupled_draft()
+        ):
             if self.is_draft_worker:
                 if not self.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")
@@ -2750,6 +2756,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
                     )
+            elif self.spec_algorithm.is_decoupled_verify():
+                from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+                spec_info = EagleVerifyInput(
+                    draft_token=None,
+                    custom_mask=buffers.custom_mask,
+                    positions=None,
+                    retrieve_index=None,
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
+                    retrieve_cum_len=None,
+                    spec_steps=self.server_args.speculative_num_steps,
+                    topk=self.server_args.speculative_eagle_topk,
+                    draft_token_num=num_tokens_per_bs,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                    seq_lens_sum=None,
+                    seq_lens_cpu=None,
+                )
             elif self.spec_algorithm.is_dflash():
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
@@ -2974,8 +2998,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # Draft models use decode CUDA graphs, not PCG
-        if self.is_draft_worker:
+        # Non-decoupled draft models use decode CUDA graphs, not PCG.  A
+        # decoupled draft worker still runs normal prefill batches, so keep PCG
+        # enabled for its EXTEND path.
+        if self.is_draft_worker and not self.spec_algorithm.is_decoupled_draft():
             return
 
         # Disable piecewise CUDA graph for non-language models

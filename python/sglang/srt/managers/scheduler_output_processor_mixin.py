@@ -184,6 +184,10 @@ class SchedulerOutputProcessorMixin:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        is_decoupled_draft = bool(
+            self.is_generation and batch.spec_algorithm.is_decoupled_draft()
+        )
+        decoded_draft_tokens = [None] * len(batch.reqs) if is_decoupled_draft else []
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -245,11 +249,17 @@ class SchedulerOutputProcessorMixin:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
+                    if is_decoupled_draft:
+                        decoded_draft_tokens[i] = (
+                            len(req.output_ids),
+                            int(next_token_id),
+                        )
                     req.output_ids.append(next_token_id)
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
-                    req.check_finished()
+                    if not is_decoupled_draft:
+                        req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         self.maybe_collect_indexer_topk(req)
@@ -341,6 +351,9 @@ class SchedulerOutputProcessorMixin:
                             logprob_pt += num_input_logprobs
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
+
+            if is_decoupled_draft:
+                self.flush_draft_updates(batch, decoded_draft_tokens)
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -470,6 +483,8 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        is_decoupled_draft = batch.spec_algorithm.is_decoupled_draft()
+        is_decoupled_verify = batch.spec_algorithm.is_decoupled_verify()
         if result.copy_done is not None:
             result.copy_done.synchronize()
         if result.routed_experts_output is not None:
@@ -485,8 +500,8 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
-        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
-            if batch.is_spec_v2:
+        if batch.spec_algorithm.is_none() or is_decoupled_draft or batch.is_spec_v2:
+            if batch.is_spec_v2 and not is_decoupled_draft:
                 next_token_ids = self._resolve_spec_overlap_tokens(result, batch)
             elif isinstance(next_token_ids, list):
                 pass  # MLX path: already a list[int], skip torch round-trip
@@ -508,6 +523,10 @@ class SchedulerOutputProcessorMixin:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
+
+        if is_decoupled_verify:
+            self.validate_verify_outputs(batch, result)
+
         # else: Spec V1 — output_ids, check_finished, grammar, and reasoning tokens
         # are already handled in the verify phase (eagle_info.py / ngram_info.py).
 
@@ -523,9 +542,16 @@ class SchedulerOutputProcessorMixin:
 
         # Spec V1 handles output_ids, check_finished, grammar, and reasoning tokens
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
-        is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
+        is_spec_v1 = (
+            not batch.spec_algorithm.is_none()
+            and not is_decoupled_draft
+            and not batch.is_spec_v2
+        )
 
-        for i, req in enumerate(batch.reqs):
+        decoded_draft_tokens = [None] * len(batch.reqs) if is_decoupled_draft else []
+
+        # Check finish condition
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 
             if (self.enable_overlap or self.enable_overlap_mlx) and (
@@ -551,6 +577,12 @@ class SchedulerOutputProcessorMixin:
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
+                req.output_ids.append(next_token_id)
+            elif is_decoupled_draft:
+                decoded_draft_tokens[i] = (
+                    len(req.output_ids),
+                    int(next_token_id),
+                )
                 req.output_ids.append(next_token_id)
             else:
                 req.output_ids.extend(next_token_id)
@@ -605,7 +637,7 @@ class SchedulerOutputProcessorMixin:
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
-                    if batch.spec_algorithm.is_none():
+                    if batch.spec_algorithm.is_none() or is_decoupled_draft:
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
                     elif batch.is_spec_v2:
@@ -620,6 +652,9 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
+
+        if is_decoupled_draft:
+            self.flush_draft_updates(batch, decoded_draft_tokens)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -1000,6 +1035,8 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
+        if self.spec_algorithm.is_decoupled_draft():
+            return
         if self.is_generation:
             self.stream_output_generation(reqs, return_logprob, skip_req)
         else:  # embedding or reward model
@@ -1048,6 +1085,9 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         spec_num_correct_drafts = []
         spec_correct_drafts_histogram = []
+        is_decoupled_verify = self.spec_algorithm.is_decoupled_verify()
+        spec_valid_draft_tokens = [] if is_decoupled_verify else None
+        spec_valid_accepted_tokens = [] if is_decoupled_verify else None
         retraction_counts = []
         output_hidden_states = None
         load = self.get_loads(GetLoadsReqInput(include=["core"]))
@@ -1154,12 +1194,22 @@ class SchedulerOutputProcessorMixin:
 
                 time_stats.append(req.time_stats)
 
-                if not self.spec_algorithm.is_none():
+                if (
+                    not self.spec_algorithm.is_none()
+                    and not self.spec_algorithm.is_decoupled_draft()
+                ):
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_num_correct_drafts.append(req.spec_num_correct_drafts)
                     spec_correct_drafts_histogram.append(
                         req.spec_correct_drafts_histogram
                     )
+                    if is_decoupled_verify:
+                        assert spec_valid_draft_tokens is not None
+                        assert spec_valid_accepted_tokens is not None
+                        spec_valid_draft_tokens.append(req.spec_valid_draft_tokens)
+                        spec_valid_accepted_tokens.append(
+                            req.spec_valid_accepted_tokens
+                        )
 
                 if return_logprob:
                     if (
@@ -1269,6 +1319,8 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct=spec_verify_ct,
                     spec_num_correct_drafts=spec_num_correct_drafts,
                     spec_correct_drafts_histogram=spec_correct_drafts_histogram,
+                    spec_valid_draft_tokens=spec_valid_draft_tokens,
+                    spec_valid_accepted_tokens=spec_valid_accepted_tokens,
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,

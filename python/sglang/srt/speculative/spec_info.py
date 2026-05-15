@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
@@ -20,6 +21,8 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
+
+logger = logging.getLogger(__name__)
 
 
 class SpeculativeAlgorithm(Enum):
@@ -109,6 +112,12 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_decoupled_verify(self) -> bool:
+        return False
+
+    def is_decoupled_draft(self) -> bool:
+        return False
+
     def supports_spec_v2(self) -> bool:
         return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
 
@@ -189,6 +198,186 @@ class SpeculativeAlgorithm(Enum):
             return NGRAMWorker
 
         raise ValueError("Unreachable code path in create_worker.")
+
+
+class DecoupledVerifySpecAlgo(CustomSpecAlgo):
+    def is_decoupled_verify(self) -> bool:
+        return True
+
+    def supports_spec_v2(self) -> bool:
+        return False
+
+    @staticmethod
+    def validate_server_args(server_args: ServerArgs) -> None:
+        if server_args.enable_dp_attention:
+            raise ValueError(
+                "decoupled speculative decoding does not support dp attention."
+            )
+        if server_args.dp_size != 1:
+            raise ValueError("decoupled verifier currently requires dp_size == 1.")
+        if not server_args.decoupled_spec_bind_endpoint:
+            raise ValueError(
+                "decoupled speculative decoding requires --decoupled-spec-bind-endpoint."
+            )
+        if not server_args.decoupled_spec_connect_endpoints:
+            raise ValueError(
+                "decoupled speculative decoding requires a non-empty "
+                "--decoupled-spec-connect-endpoints list."
+            )
+        if server_args.decoupled_spec_rank is None:
+            raise ValueError(
+                "decoupled speculative decoding requires --decoupled-spec-rank."
+            )
+        if int(server_args.decoupled_spec_rank) < 0:
+            raise ValueError("--decoupled-spec-rank must be non-negative.")
+        if server_args.page_size is not None and server_args.page_size > 1:
+            raise ValueError(
+                "decoupled drafter currently requires page_size == 1 because "
+                "token rollback is token-granular."
+            )
+
+        if server_args.max_running_requests is None:
+            server_args.max_running_requests = 64
+            logger.warning(
+                "Max running requests is reset to 64 for decoupled speculative decoding. "
+                "You can override this by explicitly setting --max-running-requests."
+            )
+
+        if not server_args.disable_overlap_schedule:
+            server_args.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled for decoupled speculative decoding."
+            )
+
+        if server_args.enable_mixed_chunk:
+            server_args.enable_mixed_chunk = False
+            logger.warning(
+                "Mixed chunked prefill is disabled for decoupled speculative decoding."
+            )
+
+        if server_args.speculative_num_steps is None:
+            raise ValueError(
+                "decoupled speculative decoding requires speculative_num_steps to be set."
+            )
+
+        if (
+            server_args.speculative_eagle_topk is not None
+            and server_args.speculative_eagle_topk != 1
+        ):
+            raise ValueError(
+                "decoupled speculative decoding currently only supports "
+                "speculative_eagle_topk == 1."
+            )
+        server_args.speculative_eagle_topk = 1
+
+        expected_num_draft_tokens = int(server_args.speculative_num_steps) + 1
+        if server_args.speculative_num_draft_tokens != expected_num_draft_tokens:
+            logger.warning(
+                "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
+                "for decoupled speculative decoding."
+            )
+            server_args.speculative_num_draft_tokens = expected_num_draft_tokens
+
+
+class DecoupledDraftSpecAlgo(CustomSpecAlgo):
+    def is_decoupled_draft(self) -> bool:
+        return True
+
+    def supports_spec_v2(self) -> bool:
+        return False
+
+    @staticmethod
+    def validate_server_args(server_args: ServerArgs) -> None:
+        if server_args.enable_dp_attention:
+            raise ValueError(
+                "decoupled speculative decoding does not support dp attention."
+            )
+        if server_args.dp_size != 1:
+            raise ValueError("decoupled drafter currently requires dp_size == 1.")
+        if not server_args.decoupled_spec_bind_endpoint:
+            raise ValueError(
+                "decoupled speculative decoding requires --decoupled-spec-bind-endpoint."
+            )
+        if not server_args.decoupled_spec_connect_endpoints:
+            raise ValueError(
+                "decoupled speculative decoding requires a non-empty "
+                "--decoupled-spec-connect-endpoints list."
+            )
+        if server_args.decoupled_spec_rank is None:
+            raise ValueError(
+                "decoupled speculative decoding requires --decoupled-spec-rank."
+            )
+        if int(server_args.decoupled_spec_rank) < 0:
+            raise ValueError("--decoupled-spec-rank must be non-negative.")
+
+        if server_args.max_running_requests is None:
+            server_args.max_running_requests = 64
+            logger.warning(
+                "Max running requests is reset to 64 for decoupled speculative decoding. "
+                "You can override this by explicitly setting --max-running-requests."
+            )
+
+        if not server_args.disable_overlap_schedule:
+            server_args.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled for decoupled speculative decoding."
+            )
+
+        if server_args.enable_mixed_chunk:
+            server_args.enable_mixed_chunk = False
+            logger.warning(
+                "Mixed chunked prefill is disabled for decoupled speculative decoding."
+            )
+
+        if server_args.speculative_num_steps is None:
+            raise ValueError(
+                "decoupled speculative decoding requires speculative_num_steps to be set."
+            )
+
+        if (
+            server_args.speculative_eagle_topk is not None
+            and server_args.speculative_eagle_topk != 1
+        ):
+            raise ValueError(
+                "decoupled speculative decoding currently only supports "
+                "speculative_eagle_topk == 1."
+            )
+        server_args.speculative_eagle_topk = 1
+
+        expected_num_draft_tokens = int(server_args.speculative_num_steps) + 1
+        if server_args.speculative_num_draft_tokens != expected_num_draft_tokens:
+            logger.warning(
+                "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
+                "for decoupled speculative decoding."
+            )
+            server_args.speculative_num_draft_tokens = expected_num_draft_tokens
+
+    def create_worker(self, server_args: ServerArgs) -> Type:
+        raise ValueError(
+            "decoupled_draft uses the normal TP worker instead of create_worker()."
+        )
+
+
+@SpeculativeAlgorithm.register(
+    "DECOUPLED_VERIFY",
+    validate_server_args=DecoupledVerifySpecAlgo.validate_server_args,
+    spec_class=DecoupledVerifySpecAlgo,
+)
+def _decoupled_verify_worker_factory(server_args: ServerArgs) -> Type:
+    from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+    return VerifyWorker
+
+
+@SpeculativeAlgorithm.register(
+    "DECOUPLED_DRAFT",
+    validate_server_args=DecoupledDraftSpecAlgo.validate_server_args,
+    spec_class=DecoupledDraftSpecAlgo,
+)
+def _decoupled_draft_worker_factory(server_args: ServerArgs) -> Type:
+    raise ValueError(
+        "decoupled_draft uses the normal TP worker instead of create_worker()."
+    )
 
 
 class SpecInputType(IntEnum):

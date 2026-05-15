@@ -97,6 +97,15 @@ class SpeculativeDecodingMetricsMixin:
     # (strict drafts-only count, excludes the bonus token).
     spec_num_correct_drafts: List[int]
 
+    # Decoupled-speculation metric: Number of actual draft tokens in verifier snapshots.
+    # None when decoupled speculative decoding is disabled.
+    spec_valid_draft_tokens: Optional[List[int]]
+
+    # Decoupled-speculation metric: Number of accepted tokens among actual draft tokens.
+    # None when decoupled speculative decoding is disabled.
+    # (excludes the bonus token)
+    spec_valid_accepted_tokens: Optional[List[int]]
+
     # Acceptance histogram: List of lists, where each inner list represents histogram counts.
     # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
     # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.

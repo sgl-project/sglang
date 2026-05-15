@@ -674,7 +674,7 @@ class SchedulerMetricsMixin:
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft():
             spec_accept_length = 0
             spec_accept_rate = 0
         else:
@@ -1029,7 +1029,11 @@ class SchedulerMetricsMixin:
 
         speculative = None
         if include_all or "spec" in include:
-            if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
+            if (
+                not self.spec_algorithm.is_none()
+                and not self.spec_algorithm.is_decoupled_draft()
+                and self.spec_total_num_forward_ct > 0
+            ):
                 speculative = SpeculativeMetrics(
                     accept_length=(
                         self.spec_total_num_accept_tokens

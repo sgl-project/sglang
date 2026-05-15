@@ -633,7 +633,10 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        if model_runner.spec_algorithm.is_speculative():
+        if (
+            model_runner.spec_algorithm.is_speculative()
+            and not model_runner.spec_algorithm.is_decoupled_draft()
+        ):
             if self.model_runner.is_draft_worker:
                 # DFLASH draft workers reuse this runner for TARGET_VERIFY mode.
                 if not self.model_runner.spec_algorithm.is_dflash():
@@ -761,6 +764,7 @@ class CudaGraphRunner:
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_decoupled_verify()
                 or self.model_runner.spec_algorithm.is_dflash()
                 else max(forward_batch.global_num_tokens_cpu)
             )
@@ -1238,6 +1242,7 @@ class CudaGraphRunner:
                 max_num_tokens / self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_decoupled_verify()
                 or self.model_runner.spec_algorithm.is_dflash()
                 else max_num_tokens
             )
@@ -1380,6 +1385,7 @@ class CudaGraphRunner:
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_decoupled_verify()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -1389,7 +1395,10 @@ class CudaGraphRunner:
 
                 capture_mode = (
                     CaptureHiddenMode.NULL
-                    if self.model_runner.spec_algorithm.is_standalone()
+                    if (
+                        self.model_runner.spec_algorithm.is_standalone()
+                        or self.model_runner.spec_algorithm.is_decoupled_verify()
+                    )
                     else CaptureHiddenMode.FULL
                 )
                 spec_info = EagleVerifyInput(
