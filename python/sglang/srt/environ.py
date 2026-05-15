@@ -475,6 +475,8 @@ class Envs:
     SGLANG_SPEC_NAN_DETECTION = EnvBool(False)
     SGLANG_SPEC_OOB_DETECTION = EnvBool(False)
 
+    SGLANG_EAGLE3_NO_AUX_LAYER_OFFSET = EnvBool(False)
+
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
