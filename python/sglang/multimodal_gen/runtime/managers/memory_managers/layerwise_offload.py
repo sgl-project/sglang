@@ -752,15 +752,13 @@ def configure_layerwise_offload_modules(
         ):
             # if the current component is not selected to be layerwise-offload, skip
             continue
-        if id(module) in configured_module_ids:
-            continue
-        if is_layerwise_offloaded_module(module):
-            configured_component_names.append(component_name)
-            configured_module_ids.add(id(module))
+        module_id = id(module)
+        if module_id in configured_module_ids:
             continue
 
-        configured_module_ids.add(id(module))
-        module.configure_layerwise_offload(server_args)
+        configured_module_ids.add(module_id)
+        if not is_layerwise_offloaded_module(module):
+            module.configure_layerwise_offload(server_args)
         if is_layerwise_offloaded_module(module):
             configured_component_names.append(component_name)
 
