@@ -147,10 +147,7 @@ class BaseGrammarBackend:
     def is_support_token_filter(self):
         """Whether backend-level strict-thinking token filtering is supported.
 
-        Backends that return True must implement set_token_filter and the
-        backend-level vocab-mask hooks below. These hooks are used when strict
-        thinking creates a reasoner object without a wrapped grammar object, so
-        the reasoner cannot delegate mask allocation/application to a grammar.
+        Backends that return True must implement set_token_filter
         """
         return False
 
