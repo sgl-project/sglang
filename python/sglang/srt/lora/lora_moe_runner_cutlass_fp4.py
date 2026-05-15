@@ -5,11 +5,10 @@ kernel called from ``ModelOptNvFp4FusedMoEMethod.apply``) into its FP4 group
 GEMMs so we can inject the standard ``after_gate_up`` / ``after_down`` LoRA
 hooks between w13 and w2, mirroring ``MarlinLoraRunnerCore``.
 
-Layout bridge: ``cutlass_fp4_group_mm`` writes expert-sorted ``[M*topk, *]``,
-the hooks expect token-major ``[M, topk, *]``. We round-trip via
-``shuffle_rows(.., c_map)`` (un-sort) and ``shuffle_rows(.., inv_c_map)``
-(re-sort) around ``after_gate_up``; for ``after_down`` the un-sort doubles
-as the combine permutation.
+Layout bridge: ``cutlass_fp4_group_mm`` writes expert-sorted ``[M*topk, *]``.
+Classic LoRA hooks consume ``c_map`` directly so the hot path stays sorted
+until the final combine; virtual-expert hooks still use small scratch shuffles
+because that kernel family has no native ``c_map`` indirection.
 """
 
 from __future__ import annotations
@@ -75,8 +74,8 @@ class CutlassFp4MoeQuantInfo(MoeQuantInfo):
 class CutlassFp4LoraRunnerCore:
     """LoRA-aware NVFP4 MoE forward on the FlashInfer-CUTLASS GEMM primitives.
 
-    Pipeline: EP local-id remap → FP4 GEMM 1 → un-sort → ``after_gate_up`` →
-    re-sort → silu_and_mul → FP4 GEMM 2 → un-sort → ``after_down`` → combine.
+    Pipeline: EP local-id remap → FP4 GEMM 1 → ``after_gate_up`` →
+    silu_and_mul → FP4 GEMM 2 → ``after_down`` → un-sort/combine.
     """
 
     def __init__(self, config: MoeRunnerConfig):

@@ -337,6 +337,18 @@ def _compute_lora_alignment(
     )
 
 
+def _sorted_layout_active(lora_info: LoRAInfo) -> bool:
+    return lora_info.sorted_layout and lora_info.c_map is not None
+
+
+def _invert_c_map(c_map: torch.Tensor) -> torch.Tensor:
+    inv_c_map = torch.empty_like(c_map)
+    inv_c_map[c_map.long()] = torch.arange(
+        c_map.numel(), device=c_map.device, dtype=c_map.dtype
+    )
+    return inv_c_map
+
+
 def _add_lora_gate_up_delta(
     hidden_states: torch.Tensor,
     intermediate_cache: torch.Tensor,
@@ -406,9 +418,7 @@ def _add_lora_gate_up_delta(
         # used by ``CutlassFp4LoraRunnerCore``), redirect the write into a
         # token-major scratch and shuffle the result into the expert-sorted
         # output. Keeps the virtual-experts kernels untouched.
-        sorted_layout_active = (
-            lora_info.sorted_layout and lora_info.c_map is not None
-        )
+        sorted_layout_active = _sorted_layout_active(lora_info)
         if sorted_layout_active:
             from sglang.srt.layers.moe.cutlass_moe import shuffle_rows
 
@@ -437,10 +447,7 @@ def _add_lora_gate_up_delta(
             # ``c_map[pair_idx] = sorted_pos``; shuffle_rows then gathers
             # the right scratch row for each expert-sorted destination row.
             c_map = lora_info.c_map
-            inv_c_map = torch.empty_like(c_map)
-            inv_c_map[c_map.long()] = torch.arange(
-                c_map.numel(), device=c_map.device, dtype=c_map.dtype
-            )
+            inv_c_map = _invert_c_map(c_map)
             M, top_k_dim, dim = scratch.shape
             sorted_delta = shuffle_rows(
                 scratch.view(M * top_k_dim, dim),
@@ -527,11 +534,12 @@ def _add_lora_down_delta(
         #   2. run the kernel into a token-major scratch output
         #   3. shuffle the scratch from token-major -> expert-sorted and add
         #      to the real output.
+        # In sorted layout, the Cutlass runner applies router weights after
+        # this hook over ``base + delta``; token-major callers keep the legacy
+        # in-kernel weighting.
         # Costs ~2 extra shuffles per call (vs the non-virtual-experts path
         # which uses c_map indirection inside the kernel and pays none).
-        sorted_layout_active = (
-            lora_info.sorted_layout and lora_info.c_map is not None
-        )
+        sorted_layout_active = _sorted_layout_active(lora_info)
         if sorted_layout_active:
             from sglang.srt.layers.moe.cutlass_moe import shuffle_rows
 
@@ -560,7 +568,7 @@ def _add_lora_down_delta(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             token_lora_mapping=token_lora_mapping,
-            mul_routed_weight=True,
+            mul_routed_weight=not sorted_layout_active,
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
             routing_cache=routing_cache,
@@ -568,10 +576,7 @@ def _add_lora_down_delta(
 
         if sorted_layout_active:
             # 3. token-major scratch -> expert-sorted (via inv_c_map gather)
-            inv_c_map = torch.empty_like(c_map)
-            inv_c_map[c_map.long()] = torch.arange(
-                c_map.numel(), device=c_map.device, dtype=c_map.dtype
-            )
+            inv_c_map = _invert_c_map(c_map)
             sorted_delta = shuffle_rows(
                 scratch.view(M_ * top_k_dim, hidden_dim_out),
                 inv_c_map,
@@ -584,7 +589,7 @@ def _add_lora_down_delta(
         # accumulated into the expert-sorted output; running mul_routed_weight
         # inside the kernel here would double-weight (Bug 4 reborn under the
         # new layout). Token-major callers keep the existing single-weighting.
-        kernel_mul_routed_weight = not lora_info.sorted_layout
+        kernel_mul_routed_weight = not _sorted_layout_active(lora_info)
         fused_moe_lora(
             output=intermediate_cache,
             qcurr_hidden_states=intermediate_input,
