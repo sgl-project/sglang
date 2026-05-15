@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
-use crate::health::circuit_breaker::CircuitBreaker;
+use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -36,12 +36,25 @@ pub struct Worker {
 
 impl Worker {
     pub fn new(spec: crate::discovery::WorkerSpec) -> Self {
+        Self::with_cb_config(spec, None)
+    }
+
+    /// Construct a worker with an explicit circuit-breaker configuration.
+    /// Pass `None` to use the default config (threshold = 3, cool_down = 30 s).
+    pub fn with_cb_config(
+        spec: crate::discovery::WorkerSpec,
+        cb: Option<CircuitBreakerConfig>,
+    ) -> Self {
+        let breaker = match cb {
+            Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
+            None => Arc::new(CircuitBreaker::new()),
+        };
         Self {
             id: spec.id,
             url: spec.url,
             mode: spec.mode,
             model_ids: spec.model_ids,
-            breaker: Arc::new(CircuitBreaker::new()),
+            breaker,
             active_requests: Arc::new(AtomicUsize::new(0)),
         }
     }
