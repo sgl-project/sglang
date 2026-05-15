@@ -48,6 +48,9 @@ pub enum ApiError {
     #[error("upstream timed out: worker {worker}")]
     UpstreamTimeout { worker: reqwest::Url },
 
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error("internal: {0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -62,6 +65,9 @@ impl ApiError {
             }
             ApiError::UpstreamStatus { .. } => (StatusCode::BAD_GATEWAY, "upstream_status"),
             ApiError::UpstreamTimeout { .. } => (StatusCode::BAD_GATEWAY, "upstream_timeout"),
+            ApiError::ServiceUnavailable(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
+            }
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         }
     }
@@ -114,6 +120,10 @@ impl IntoResponse for ApiError {
             ApiError::UpstreamTimeout { worker } => {
                 tracing::warn!(upstream = %worker, "upstream request timed out");
                 "upstream request timed out".to_string()
+            }
+            ApiError::ServiceUnavailable(reason) => {
+                tracing::warn!(reason = %reason, "service unavailable");
+                "service unavailable".to_string()
             }
             ApiError::BadRequest(_) | ApiError::ModelNotFound(_) => self.to_string(),
         };

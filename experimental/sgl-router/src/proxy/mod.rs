@@ -5,6 +5,7 @@
 
 pub mod sse;
 
+use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
 use crate::server::header_utils::should_forward_request_header;
 use anyhow::Context;
@@ -122,10 +123,14 @@ impl Proxy {
     /// misses both the wrapped reqwest timeout and the `io::ErrorKind::TimedOut`
     /// cases.
     fn classify_reqwest_error(&self, e: reqwest::Error, path: &str) -> ApiError {
-        // Carry the typed `Url` end-to-end — `Display` on `Url` is the same
-        // canonical form as `as_str()`, so logs render identically and we
-        // avoid an unnecessary re-stringify.
-        let worker = self.worker_url.clone();
+        Self::classify_reqwest_error_for(self.worker_url.clone(), e, path)
+    }
+
+    /// Classify a reqwest error into the right `ApiError` variant, given an
+    /// explicit worker URL. Used by both the legacy methods (which thread
+    /// `self.worker_url`) and the M2 breaker-gated `_to` methods (which take
+    /// per-request worker URLs).
+    fn classify_reqwest_error_for(worker: Url, e: reqwest::Error, path: &str) -> ApiError {
         let source = anyhow::Error::new(e).context(format!("worker {worker}: post {path}"));
         let is_timeout = source.chain().any(|c| {
             c.downcast_ref::<reqwest::Error>()
@@ -158,6 +163,130 @@ impl Proxy {
                 url, timeout
             )),
         }
+    }
+
+    /// Breaker-gated JSON POST: checks `breaker.allow()` first, records
+    /// success/failure based on response status, and returns
+    /// `ApiError::ServiceUnavailable` immediately when the breaker is Open.
+    ///
+    /// `worker_url` is the typed `reqwest::Url` per M1's typed-URL contract;
+    /// joining with `path` uses [`Url::join`] which handles trailing-slash
+    /// normalization cleanly. Transport failures map to the split
+    /// `UpstreamUnreachable` / `UpstreamTimeout` / `UpstreamStatus` variants
+    /// from M1, NOT a flat `UpstreamWorker(String)`.
+    pub async fn forward_json_to(
+        &self,
+        worker_url: &Url,
+        breaker: &CircuitBreaker,
+        path: &str,
+        headers: &HeaderMap,
+        body: Bytes,
+    ) -> Result<Response<Body>, ApiError> {
+        if !breaker.allow() {
+            return Err(ApiError::ServiceUnavailable(
+                "worker circuit breaker open".into(),
+            ));
+        }
+        let url = worker_url.join(path).map_err(|e| {
+            ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
+        })?;
+        let mut req = self.client.post(url.clone()).body(body);
+        for (k, v) in headers {
+            if should_forward_request_header(k) {
+                req = req.header(k, v);
+            }
+        }
+        req = req
+            .header("content-type", "application/json")
+            .timeout(self.request_timeout);
+        let resp = req.send().await.map_err(|e| {
+            breaker.record_failure();
+            Self::classify_reqwest_error_for(worker_url.clone(), e, path)
+        })?;
+        let status = resp.status();
+        if status.is_server_error() {
+            breaker.record_failure();
+        } else {
+            breaker.record_success();
+        }
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    upstream = %url,
+                    status = %status,
+                    error = ?e,
+                    "upstream dropped connection mid-body",
+                );
+                return Err(ApiError::UpstreamStatus { status });
+            }
+        };
+        let mut out = Response::new(Body::from(bytes));
+        *out.status_mut() = status;
+        out.headers_mut().insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        Ok(out)
+    }
+
+    /// Breaker-gated streaming POST: checks `breaker.allow()` first, records
+    /// success/failure, and returns `ApiError::ServiceUnavailable` when Open.
+    pub async fn forward_streaming_to(
+        &self,
+        worker_url: &Url,
+        breaker: &CircuitBreaker,
+        path: &str,
+        headers: &HeaderMap,
+        body: Bytes,
+    ) -> Result<Response<Body>, ApiError> {
+        if !breaker.allow() {
+            return Err(ApiError::ServiceUnavailable(
+                "worker circuit breaker open".into(),
+            ));
+        }
+        let url = worker_url.join(path).map_err(|e| {
+            ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
+        })?;
+        let mut req = self.client.post(url.clone()).body(body);
+        for (k, v) in headers {
+            if should_forward_request_header(k) {
+                req = req.header(k, v);
+            }
+        }
+        req = req
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream");
+        let resp = req.send().await.map_err(|e| {
+            breaker.record_failure();
+            Self::classify_reqwest_error_for(worker_url.clone(), e, path)
+        })?;
+        let status = resp.status();
+        if status.is_server_error() {
+            breaker.record_failure();
+        } else {
+            breaker.record_success();
+        }
+        let upstream_ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+        let content_type = if status.is_success() {
+            "text/event-stream".to_string()
+        } else {
+            upstream_ct
+        };
+        let body = sse::bytes_stream_to_body(resp.bytes_stream());
+        let mut out = Response::new(body);
+        *out.status_mut() = status;
+        out.headers_mut().insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_str(&content_type)
+                .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
+        );
+        Ok(out)
     }
 
     /// Forward a JSON POST and stream the SSE response back unmodified.
