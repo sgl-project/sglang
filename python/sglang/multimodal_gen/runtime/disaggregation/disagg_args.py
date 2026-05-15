@@ -24,6 +24,11 @@ DISAGG_RESULT_PORT_OFFSETS: dict[RoleType, int] = {
 }
 
 
+def derive_group_result_port_offset(group_index: int) -> int:
+    """Derive a result port offset for the N-th placement group (1-based)."""
+    return group_index + 1
+
+
 class DisaggArgsMixin:
     """Methods for disaggregated diffusion, mixed into ``ServerArgs``.
 
@@ -31,6 +36,40 @@ class DisaggArgsMixin:
     ordering issues with ``@dataclass`` inheritance).  This mixin only
     provides the methods that operate on those fields.
     """
+
+    def resolve_placement_groups(self):
+        """Resolve the placement group config from CLI args.
+
+        Returns a ``PlacementGroupConfig`` if N-group disagg is active,
+        or ``None`` for monolithic / classic 3-role mode.
+        """
+        from sglang.multimodal_gen.runtime.disaggregation.placement_group import (
+            PlacementGroupConfig,
+        )
+
+        disagg_groups = getattr(self, "disagg_groups", None)
+        if disagg_groups is not None:
+            return PlacementGroupConfig.from_json(disagg_groups)
+
+        encoder_urls = getattr(self, "encoder_urls", None)
+        denoiser_urls = getattr(self, "denoiser_urls", None)
+        decoder_urls = getattr(self, "decoder_urls", None)
+        if encoder_urls or denoiser_urls or decoder_urls:
+            return PlacementGroupConfig.classic_3_role()
+
+        return None
+
+    def derive_group_result_endpoint(self, group_index: int) -> str:
+        """Derive the result PUSH endpoint for the N-th group."""
+        if self.disagg_server_addr is None:
+            raise ValueError("disagg_server_addr is required for per-role launch")
+        addr = self.disagg_server_addr
+        if addr.startswith("tcp://"):
+            addr = addr[len("tcp://") :]
+        host, port_str = addr.rsplit(":", 1)
+        base_port = int(port_str)
+        offset = derive_group_result_port_offset(group_index)
+        return f"tcp://{host}:{base_port + offset}"
 
     def get_role_parallelism(self, role_type: RoleType) -> dict[str, int | None]:
         """Return per-role parallelism overrides for the given role.
@@ -90,6 +129,23 @@ def add_disagg_cli_args(parser: argparse.ArgumentParser) -> None:
         "Split the pipeline into independent Encoder / Denoiser / Decoder "
         "roles, each on its own GPU(s).  A DiffusionServer head node routes "
         "requests.  See docs/disaggregation.md for details.",
+    )
+
+    # N-group placement
+    g.add_argument(
+        "--disagg-groups",
+        type=str,
+        default=None,
+        help="JSON placement-group config or @filepath for N-group disagg. "
+        "When set, overrides --encoder-urls/--denoiser-urls/--decoder-urls. "
+        'Format: {"groups": [{"name": "...", "stage_patterns": [...], '
+        '"modules": [...]}]}.',
+    )
+    g.add_argument(
+        "--disagg-group-name",
+        type=str,
+        default=None,
+        help="Placement group name for this role instance (used with --disagg-groups).",
     )
 
     # Core

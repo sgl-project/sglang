@@ -360,6 +360,30 @@ def _unpack_tensor_fields_from_broadcast(packed: dict) -> dict:
 class SchedulerDisaggMixin:
     """Disaggregated diffusion scheduling: transfer, compute, event loops."""
 
+    def _is_sender_role(self: "Scheduler") -> bool:
+        """True if this role sends data to the next group (first or middle)."""
+        if self._group_position is not None:
+            return self._group_position in ("first", "middle")
+        return self._disagg_role in (RoleType.ENCODER, RoleType.DENOISER)
+
+    def _is_receiver_role(self: "Scheduler") -> bool:
+        """True if this role receives data from the previous group (middle or last)."""
+        if self._group_position is not None:
+            return self._group_position in ("middle", "last")
+        return self._disagg_role in (RoleType.DENOISER, RoleType.DECODER)
+
+    def _is_first_role(self: "Scheduler") -> bool:
+        """True if this role receives raw pickled requests (first group)."""
+        if self._group_position is not None:
+            return self._group_position == "first"
+        return self._disagg_role == RoleType.ENCODER
+
+    def _is_last_role(self: "Scheduler") -> bool:
+        """True if this role returns final output to the client (last group)."""
+        if self._group_position is not None:
+            return self._group_position == "last"
+        return self._disagg_role == RoleType.DECODER
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
@@ -381,6 +405,20 @@ class SchedulerDisaggMixin:
         self._rdma_push_zmq = None
         self._compute_ready_queue = None
         self._recv_prefetch_thread = None
+
+        self._group_position: str | None = None
+        self._disagg_group_name: str | None = getattr(
+            server_args, "disagg_group_name", None
+        )
+        if self._disagg_group_name is not None:
+            placement = server_args.resolve_placement_groups()
+            if placement is not None:
+                if placement.is_first(self._disagg_group_name):
+                    self._group_position = "first"
+                elif placement.is_last(self._disagg_group_name):
+                    self._group_position = "last"
+                else:
+                    self._group_position = "middle"
 
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_metrics = DisaggMetrics(role=self._disagg_role.value)
@@ -466,7 +504,7 @@ class SchedulerDisaggMixin:
         # Pre-allocate receive slots for receivers (denoiser/decoder)
         self._preallocated_slots: dict[int, object] = {}
         preallocated_slot_info = []
-        if self._disagg_role in (RoleType.DENOISER, RoleType.DECODER):
+        if self._is_receiver_role():
             capacity = getattr(sa, "disagg_prealloc_slots", 2)
             typical_size = 64 * 1024 * 1024  # 64 MiB per slot
             for i in range(capacity):
@@ -509,8 +547,8 @@ class SchedulerDisaggMixin:
             len(preallocated_slot_info),
         )
 
-        # RDMA push thread for sender roles (encoder/denoiser)
-        if self._disagg_role in (RoleType.ENCODER, RoleType.DENOISER):
+        # RDMA push thread for sender roles (first/middle groups)
+        if self._is_sender_role():
             self._rdma_push_queue = queue.Queue(maxsize=4)
             self._rdma_push_zmq, _ = get_zmq_socket(
                 self.context,
@@ -529,10 +567,10 @@ class SchedulerDisaggMixin:
                 self._disagg_role.value.upper(),
             )
 
-        # Recv prefetch thread for receiver roles (denoiser/decoder)
+        # Recv prefetch thread for receiver roles (middle/last groups)
         # Rank 0 only (bg thread does ZMQ recv + load; multi-rank gets
         # scalar fields via broadcast_pyobj from the main thread).
-        if self._disagg_role in (RoleType.DENOISER, RoleType.DECODER):
+        if self._is_receiver_role():
             self._compute_ready_queue = queue.Queue(maxsize=4)
             self._recv_prefetch_thread = threading.Thread(
                 target=self._recv_prefetch_loop,
@@ -997,11 +1035,7 @@ class SchedulerDisaggMixin:
             return
 
         # Non-rank-0 receiver in multi-rank → broadcast-based loop
-        if (
-            not is_rank0
-            and is_multi_rank
-            and self._disagg_role in (RoleType.DENOISER, RoleType.DECODER)
-        ):
+        if not is_rank0 and is_multi_rank and self._is_receiver_role():
             self._disagg_non_rank0_event_loop()
             return
 
@@ -1018,7 +1052,7 @@ class SchedulerDisaggMixin:
                     else:
                         # Non-rank-0: only participate in transfer_ready compute
                         self._handle_transfer_non_rank0(frames)
-                elif self._disagg_role == RoleType.ENCODER:
+                elif self._is_first_role():
                     self._disagg_encoder_step(
                         send_tensors,
                         frames=frames,

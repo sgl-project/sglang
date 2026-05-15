@@ -292,6 +292,8 @@ class ServerArgs(DisaggArgsMixin):
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
     disagg_p2p_hostname: str = "127.0.0.1"
     disagg_ib_device: str | None = None
+    disagg_groups: str | None = None
+    disagg_group_name: str | None = None
     pool_work_endpoint: str | None = None
     pool_result_endpoint: str | None = None
 

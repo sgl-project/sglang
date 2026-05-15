@@ -13,11 +13,14 @@ logger = logging.getLogger(__name__)
 class RequestState(enum.Enum):
     """Lifecycle states for a disagg pipeline request.
 
-    *_WAITING: request queued, awaiting a free buffer slot.
-    *_RUNNING: request dispatched to a specific instance.
+    Classic 3-role states (ENCODER_*/DENOISING_*/DECODER_*) are kept for
+    backward compatibility.  Generic N-group pipelines use GROUP_WAITING,
+    GROUP_RUNNING, and GROUP_DONE with the ``current_group`` field on
+    ``RequestRecord`` to identify the active group.
     """
 
     PENDING = "pending"
+    # Classic 3-role states
     ENCODER_WAITING = "encoder_waiting"
     ENCODER_RUNNING = "encoder_running"
     ENCODER_DONE = "encoder_done"
@@ -26,6 +29,11 @@ class RequestState(enum.Enum):
     DENOISING_DONE = "denoising_done"
     DECODER_WAITING = "decoder_waiting"
     DECODER_RUNNING = "decoder_running"
+    # Generic N-group states
+    GROUP_WAITING = "group_waiting"
+    GROUP_RUNNING = "group_running"
+    GROUP_DONE = "group_done"
+    # Terminal
     DONE = "done"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
@@ -37,7 +45,13 @@ _ACTIVE_STATES = set(RequestState) - _TERMINAL_STATES
 # Normal (non-failure) transitions.  FAILED and TIMED_OUT are handled
 # separately in transition() — any active state can reach them.
 _VALID_TRANSITIONS: dict[RequestState, set[RequestState]] = {
-    RequestState.PENDING: {RequestState.ENCODER_WAITING, RequestState.ENCODER_RUNNING},
+    # Classic 3-role chain
+    RequestState.PENDING: {
+        RequestState.ENCODER_WAITING,
+        RequestState.ENCODER_RUNNING,
+        RequestState.GROUP_WAITING,
+        RequestState.GROUP_RUNNING,
+    },
     RequestState.ENCODER_WAITING: {RequestState.ENCODER_RUNNING},
     RequestState.ENCODER_RUNNING: {RequestState.ENCODER_DONE},
     RequestState.ENCODER_DONE: {
@@ -52,6 +66,10 @@ _VALID_TRANSITIONS: dict[RequestState, set[RequestState]] = {
     },
     RequestState.DECODER_WAITING: {RequestState.DECODER_RUNNING},
     RequestState.DECODER_RUNNING: {RequestState.DONE},
+    # Generic N-group cycle
+    RequestState.GROUP_WAITING: {RequestState.GROUP_RUNNING},
+    RequestState.GROUP_RUNNING: {RequestState.GROUP_DONE},
+    RequestState.GROUP_DONE: {RequestState.GROUP_WAITING, RequestState.DONE},
 }
 
 
@@ -61,9 +79,13 @@ class RequestRecord:
     state: RequestState = RequestState.PENDING
     submit_time: float = field(default_factory=time.monotonic)
     last_transition_time: float = field(default_factory=time.monotonic)
+    # Classic 3-role fields (backward compat)
     encoder_instance: int | None = None
     denoiser_instance: int | None = None
     decoder_instance: int | None = None
+    # Generic N-group fields
+    current_group: str | None = None
+    group_instances: dict[str, int] = field(default_factory=dict)
     error: str | None = None
 
     def elapsed_s(self) -> float:
@@ -97,6 +119,8 @@ class RequestTracker:
         encoder_instance: int | None = None,
         denoiser_instance: int | None = None,
         decoder_instance: int | None = None,
+        current_group: str | None = None,
+        group_instance: tuple[str, int] | None = None,
     ) -> RequestRecord:
         with self._lock:
             record = self._requests.get(request_id)
@@ -128,6 +152,11 @@ class RequestTracker:
                 record.denoiser_instance = denoiser_instance
             if decoder_instance is not None:
                 record.decoder_instance = decoder_instance
+            if current_group is not None:
+                record.current_group = current_group
+            if group_instance is not None:
+                group_name, instance_idx = group_instance
+                record.group_instances[group_name] = instance_idx
 
             logger.debug(
                 "Request %s: %s -> %s", request_id, old_state.value, new_state.value

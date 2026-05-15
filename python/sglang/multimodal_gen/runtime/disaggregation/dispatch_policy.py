@@ -112,8 +112,34 @@ class MaxFreeSlotsFirst(DispatchPolicy):
             return best_id
 
 
-class PoolDispatcher:
-    """Wraps three independent dispatch policies for encoder/denoiser/decoder pools."""
+class GroupDispatcher:
+    """Dispatch policies for N placement groups, keyed by group name."""
+
+    def __init__(
+        self,
+        group_instances: dict[str, int],
+        policy_name: str = "round_robin",
+        **kwargs,
+    ):
+        self._policies: dict[str, DispatchPolicy] = {
+            name: create_dispatch_policy(policy_name, count, **kwargs)
+            for name, count in group_instances.items()
+        }
+
+    def select(self, group_name: str, active_counts: list[int] | None = None) -> int:
+        return self._policies[group_name].select(active_counts)
+
+    def select_with_capacity(
+        self, group_name: str, free_slots: list[int]
+    ) -> int | None:
+        return self._policies[group_name].select_with_capacity(free_slots)
+
+    def has_group(self, group_name: str) -> bool:
+        return group_name in self._policies
+
+
+class PoolDispatcher(GroupDispatcher):
+    """Backward-compatible wrapper: 3-role encoder/denoiser/decoder dispatch."""
 
     def __init__(
         self,
@@ -123,15 +149,27 @@ class PoolDispatcher:
         policy_name: str = "round_robin",
         **kwargs,
     ):
-        self.encoder_policy = create_dispatch_policy(
-            policy_name, num_encoders, **kwargs
+        super().__init__(
+            group_instances={
+                "encoder": num_encoders,
+                "denoiser": num_denoisers,
+                "decoder": num_decoders,
+            },
+            policy_name=policy_name,
+            **kwargs,
         )
-        self.denoiser_policy = create_dispatch_policy(
-            policy_name, num_denoisers, **kwargs
-        )
-        self.decoder_policy = create_dispatch_policy(
-            policy_name, num_decoders, **kwargs
-        )
+
+    @property
+    def encoder_policy(self) -> DispatchPolicy:
+        return self._policies["encoder"]
+
+    @property
+    def denoiser_policy(self) -> DispatchPolicy:
+        return self._policies["denoiser"]
+
+    @property
+    def decoder_policy(self) -> DispatchPolicy:
+        return self._policies["decoder"]
 
     def select_encoder(self, active_counts: list[int] | None = None) -> int:
         return self.encoder_policy.select(active_counts)

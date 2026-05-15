@@ -76,3 +76,26 @@ def filter_modules_for_role(module_names: list[str], role: "RoleType") -> list[s
             filtered.append(name)
 
     return filtered
+
+
+def filter_modules_for_group(
+    module_names: list[str],
+    group_modules: list[str] | None,
+) -> list[str]:
+    """Filter module names to only those needed by a placement group.
+
+    Args:
+        module_names: All available module names from the pipeline config.
+        group_modules: Explicit list of modules this group needs, or None
+            to keep all modules.
+    """
+    if group_modules is None:
+        return module_names
+
+    filtered = []
+    for name in module_names:
+        if any(name == m or name.startswith(m + "_") for m in group_modules):
+            filtered.append(name)
+        elif get_module_role(name) is None:
+            filtered.append(name)
+    return filtered

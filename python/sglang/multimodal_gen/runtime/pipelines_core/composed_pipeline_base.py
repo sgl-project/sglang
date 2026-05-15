@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
+    filter_modules_for_group,
     filter_modules_for_role,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
@@ -96,6 +97,15 @@ class ComposedPipelineBase(ABC):
         self.server_args = server_args
         self._disagg_role = server_args.disagg_role
 
+        self._placement_config = None
+        self._my_group_name: str | None = getattr(
+            server_args, "disagg_group_name", None
+        )
+        if self._my_group_name is not None:
+            placement = server_args.resolve_placement_groups()
+            if placement is not None:
+                self._placement_config = placement
+
         self.model_path: str = model_path
         self._stages: list[PipelineStage] = []
         self._stage_name_mapping: dict[str, PipelineStage] = {}
@@ -109,8 +119,23 @@ class ComposedPipelineBase(ABC):
         if self._required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
 
-        # Filter modules based on disaggregation role
-        if self._disagg_role != RoleType.MONOLITHIC:
+        # Filter modules based on disaggregation role or placement group
+        if self._placement_config is not None and self._my_group_name is not None:
+            original_modules = list(self._required_config_modules)
+            group_modules = self._placement_config.get_group_modules(
+                self._my_group_name
+            )
+            self._required_config_modules = filter_modules_for_group(
+                self._required_config_modules, group_modules
+            )
+            skipped = set(original_modules) - set(self._required_config_modules)
+            if skipped:
+                logger.info(
+                    "Disagg group=%s: skipping modules %s",
+                    self._my_group_name,
+                    sorted(skipped),
+                )
+        elif self._disagg_role != RoleType.MONOLITHIC:
             original_modules = list(self._required_config_modules)
             self._required_config_modules = filter_modules_for_role(
                 self._required_config_modules, self._disagg_role
@@ -470,11 +495,22 @@ class ComposedPipelineBase(ABC):
 
         assert self.modules is not None, "No modules are registered"
 
-        # Filter stages based on disaggregation role
-        if self._disagg_role != RoleType.MONOLITHIC:
+        if stage_name is None:
+            stage_name = self._infer_stage_name(stage)
+
+        # Filter stages based on placement group or disaggregation role
+        if self._placement_config is not None and self._my_group_name is not None:
+            if not self._placement_config.stage_belongs_to_group(
+                stage_name, self._my_group_name
+            ):
+                logger.info(
+                    "Disagg group=%s: skipping stage %s",
+                    self._my_group_name,
+                    stage_name,
+                )
+                return self
+        elif self._disagg_role != RoleType.MONOLITHIC:
             if stage.role_affinity != self._disagg_role:
-                if stage_name is None:
-                    stage_name = self._infer_stage_name(stage)
                 logger.info(
                     "Disagg role=%s: skipping stage %s (affinity=%s)",
                     self._disagg_role.value,
@@ -483,8 +519,6 @@ class ComposedPipelineBase(ABC):
                 )
                 return self
 
-        if stage_name is None:
-            stage_name = self._infer_stage_name(stage)
         if stage_name in self._stage_name_mapping:
             raise ValueError(f"Duplicate stage name detected: {stage_name}")
 

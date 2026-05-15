@@ -386,7 +386,7 @@ def launch_pool_disagg_server(
     # Start DiffusionServer
     frontend_endpoint = f"tcp://{host}:{server_args.scheduler_port}"
 
-    diffusion_server = DiffusionServer(
+    diffusion_server = DiffusionServer.from_classic_args(
         frontend_endpoint=frontend_endpoint,
         encoder_work_endpoints=encoder_work_endpoints,
         denoiser_work_endpoints=denoiser_work_endpoints,
@@ -518,7 +518,7 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_ep,
     )
 
-    diffusion_server = DiffusionServer(
+    diffusion_server = DiffusionServer.from_classic_args(
         frontend_endpoint=frontend_endpoint,
         encoder_work_endpoints=encoder_work_endpoints,
         denoiser_work_endpoints=denoiser_work_endpoints,
