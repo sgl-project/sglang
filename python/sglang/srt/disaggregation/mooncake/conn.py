@@ -249,15 +249,19 @@ class MooncakeKVManager(CommonKVManager):
                     ),
                     daemon=True,
                 ).start()
-            self.failed_session_probe_interval = float(
-                os.environ.get("SGLANG_FAILED_SESSION_PROBE_INTERVAL_S", "30.0")
+            self.enable_failed_session_probe = (
+                envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
             )
-            self._failed_session_probe_shutdown = threading.Event()
-            threading.Thread(
-                target=self._failed_session_probe_loop,
-                name="MooncakeFailedSessionProbe",
-                daemon=True,
-            ).start()
+            if self.enable_failed_session_probe:
+                self.failed_session_probe_interval = (
+                    envs.SGLANG_FAILED_SESSION_PROBE_INTERVAL_S.get()
+                )
+                self._failed_session_probe_shutdown = threading.Event()
+                threading.Thread(
+                    target=self._failed_session_probe_loop,
+                    name="MooncakeFailedSessionProbe",
+                    daemon=True,
+                ).start()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
