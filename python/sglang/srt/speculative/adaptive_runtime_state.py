@@ -100,6 +100,7 @@ class AdaptiveController:
 
         self._init_per_bs(cfg, bs_config)
         self._states: Dict[int, SpecRuntimeState] = {}
+        self._cuda_graph_bs: List[int] | None = None
 
         logger.info(
             f"AdaptiveController initialized: bs_list={self._bs_list}, "
@@ -142,9 +143,23 @@ class AdaptiveController:
         idx = bisect.bisect_right(self._bs_list, target) - 1
         return self._bs_list[max(0, idx)]
 
+    def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
+        """Round batch_size up to the nearest CUDA graph batch size.
+
+        The actual compute cost is determined by the padded CUDA graph size,
+        not the raw batch size.  Config lookup should use the padded value so
+        that the step ceiling matches the real cost.
+        """
+        if self._cuda_graph_bs is None:
+            return batch_size
+        idx = bisect.bisect_left(self._cuda_graph_bs, batch_size)
+        if idx < len(self._cuda_graph_bs):
+            return self._cuda_graph_bs[idx]
+        return self._cuda_graph_bs[-1]
+
     def get_steps_for_batch(self, batch_size: int) -> int:
         """Get the current optimal step count for a given batch size."""
-        bs = self._find_closest_bs(batch_size)
+        bs = self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
         return self._bs_params[bs].current_steps
 
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
@@ -200,6 +215,8 @@ class AdaptiveController:
                 When ``None``, all batch sizes are captured for every step
                 (original behaviour).
         """
+        self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs is not None else None
+
         # All steps share the same init_max_bs so that each draft attention
         # backend allocates _sched_meta_buf with a consistent shape.
         init_max_bs = max(cuda_graph_bs) if cuda_graph_bs is not None else None
@@ -244,7 +261,7 @@ class AdaptiveController:
         if batch_size <= 0:
             return
 
-        bs = self._find_closest_bs(batch_size)
+        bs = self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
         params = self._bs_params[bs]
         old_steps = params.current_steps
 
