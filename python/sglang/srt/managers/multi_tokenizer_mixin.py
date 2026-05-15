@@ -28,7 +28,6 @@ import signal
 import sys
 import threading
 import zlib
-from functools import partialmethod
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
