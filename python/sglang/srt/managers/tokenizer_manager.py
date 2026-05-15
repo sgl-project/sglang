@@ -2417,7 +2417,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        state = self.rid_to_state.get(recv_obj.rid)
+        if state is None:
+            return
         state.finished = True
         state.time_stats.set_finished_time()
 
