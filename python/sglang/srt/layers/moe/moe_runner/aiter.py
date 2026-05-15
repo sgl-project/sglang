@@ -306,6 +306,10 @@ def _pre_permute_deepep_to_aiter(
         # negative ids, so reroute them to the sink slot at index
         # num_local_experts (masked off by quant_info.expert_mask which has
         # shape (num_local_experts + 1,)).
+        assert quant_info.expert_mask is not None, (
+            "expert_mask must be set for DeepEP/Mooncake/Nixl AITER dispatch; "
+            "DeepEPDispatcher.__init__ sets it when _use_aiter is True"
+        )
         topk_ids = torch.where(
             topk_ids == -1,
             torch.full_like(topk_ids, runner_config.num_local_experts),
