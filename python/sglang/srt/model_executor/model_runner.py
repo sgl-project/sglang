@@ -79,6 +79,9 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    get_ib_devices_for_gpu,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -922,8 +925,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
         self.remote_instance_transfer_engine = TransferEngine()
         local_ip = get_local_ip_auto()
+        device_name = envs.MOONCAKE_DEVICE.get() or (
+            get_ib_devices_for_gpu(
+                self.server_args.mooncake_ib_device,
+                self.gpu_id,
+            )
+            or ""
+        )
+
         self.remote_instance_transfer_engine.initialize(
-            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
+            local_ip, "P2PHANDSHAKE", "rdma", device_name
         )
         self.remote_instance_transfer_engine_session_id = NetworkAddress(
             local_ip, self.remote_instance_transfer_engine.get_rpc_port()
