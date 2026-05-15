@@ -12,6 +12,8 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
@@ -111,6 +113,51 @@ class SRTPlatform(DeviceMixin):
         (torch.compile backend).
         """
         return False
+
+    def supports_torch_compile(self) -> bool:
+        """Whether this platform supports generic torch.compile usage."""
+        return True
+
+    def use_pynccl_by_default(self, backend: str) -> bool:
+        """Return whether model-parallel groups should enable PyNccl by default.
+
+        The base implementation preserves the existing built-in platform checks.
+        OOT platforms may override this method to adjust that decision.
+        """
+        return not (self.is_npu() or self.is_xpu() or backend == "mooncake")
+
+    def should_use_fallback_rotary_embedding(self, *, head_size: int) -> bool:
+        """Return whether RotaryEmbedding should use the fallback implementation."""
+        return (
+            (not self.is_cuda() or head_size not in [64, 128, 256, 512])
+            and not self.is_cpu()
+            and not self.is_xpu()
+            and not self.is_npu()
+            and not self.is_musa()
+            and not self.is_mps()
+        )
+
+    def get_group_coordinator_device(
+        self, local_rank: int, *, one_visible_device_per_process: bool = False
+    ) -> torch.device:
+        """Return the device used by GroupCoordinator metadata tensors."""
+        if self.is_cuda_alike():
+            device_id = 0 if one_visible_device_per_process else local_rank
+            return torch.device(f"cuda:{device_id}")
+        if self.is_npu():
+            return torch.device(f"npu:{local_rank}")
+        if self.is_xpu():
+            return torch.device(f"xpu:{local_rank}")
+        if self.is_musa():
+            return torch.device(f"musa:{local_rank}")
+        return torch.device("cpu")
+
+    def stream_context(self, device_module, stream):
+        """Return a context manager that selects the given stream."""
+        stream_context = getattr(device_module, "StreamContext", None)
+        if stream_context is not None:
+            return stream_context(stream)
+        return device_module.stream(stream)
 
     # ------------------------------------------------------------------
     # Initialization

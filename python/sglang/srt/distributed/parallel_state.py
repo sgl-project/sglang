@@ -46,13 +46,12 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
-    is_cuda_alike,
     is_hip,
-    is_musa,
     is_npu,
     is_shm_available,
     is_xpu,
@@ -63,7 +62,6 @@ from sglang.srt.utils.network import get_local_ip_auto
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
-_is_musa = is_musa()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -266,19 +264,10 @@ class GroupCoordinator:
         self.cpu_group = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
-        if is_cuda_alike():
-            device_id = (
-                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
-            )
-            self.device = torch.device(f"cuda:{device_id}")
-        elif _is_npu:
-            self.device = torch.device(f"npu:{local_rank}")
-        elif _is_xpu:
-            self.device = torch.device(f"xpu:{local_rank}")
-        elif _is_musa:
-            self.device = torch.device(f"musa:{local_rank}")
-        else:
-            self.device = torch.device("cpu")
+        self.device = current_platform.get_group_coordinator_device(
+            local_rank,
+            one_visible_device_per_process=envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get(),
+        )
         self.device_module = torch.get_device_module(self.device)
 
         for ranks in group_ranks:
@@ -1444,7 +1433,7 @@ def init_model_parallel_group(
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=(
-            not (_is_npu or _is_xpu or backend == "mooncake")
+            current_platform.use_pynccl_by_default(backend)
             if use_pynccl is None
             else use_pynccl
         ),

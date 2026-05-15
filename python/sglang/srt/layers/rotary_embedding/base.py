@@ -8,17 +8,15 @@ import torch
 
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
-    is_cpu,
     is_cuda,
     is_hip,
-    is_mps,
     is_musa,
     is_npu,
-    is_xpu,
 )
 
 if TYPE_CHECKING:
@@ -28,11 +26,8 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
-_is_xpu = is_xpu()
 _is_musa = is_musa()
-_is_mps = is_mps()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
     from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
@@ -72,13 +67,8 @@ class RotaryEmbedding(MultiPlatformOp):
         if not _is_cuda:
             cache = cache.to(dtype)
 
-        if (
-            (not (_is_cuda) or self.head_size not in [64, 128, 256, 512])
-            and not (_is_cpu)
-            and not (_is_xpu)
-            and not (_is_npu)
-            and not (_is_musa)
-            and not (_is_mps)
+        if current_platform.should_use_fallback_rotary_embedding(
+            head_size=self.head_size,
         ):
             # rotary_embedding from sglang.jit_kernel.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
