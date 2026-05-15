@@ -34,7 +34,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -145,35 +145,6 @@ class DeepEPMoE(FusedMoE):
             assert (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
-
-        if _use_aiter:
-            self._init_aiter_expert_mask()
-
-    def _init_aiter_expert_mask(self) -> None:
-        if get_moe_a2a_backend().is_mori():
-            # mori dispatch produces global topk_ids in [0, num_experts);
-            # mask out experts that are not local to this rank.
-            expert_mask = torch.zeros(
-                self.num_experts,
-                device=torch.cuda.current_device(),
-                dtype=torch.int32,
-            )
-            start = self.moe_ep_rank * self.num_local_experts
-            expert_mask[start : start + self.num_local_experts] = 1
-            self.mori_moe_max_input_tokens = get_int_env_var(
-                "SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0
-            )
-        else:
-            # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
-            # pre_permute reroutes them to the sink slot at index
-            # num_local_experts, which is masked off here.
-            expert_mask = torch.zeros(
-                self.num_local_experts + 1,
-                device=torch.cuda.current_device(),
-                dtype=torch.int,
-            )
-            expert_mask[:-1] = 1
-        self.dispatcher.expert_mask_gpu = expert_mask
 
     def forward(
         self,
