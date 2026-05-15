@@ -1343,6 +1343,19 @@ class Scheduler(
             self.future_map = None
             return
 
+        # batch_record_buf is consumed by record_batch_in_overlap on both the
+        # generation and embedding/classification/reward forward paths, so it
+        # must be initialized before the is_generation early-return below.
+        self.batch_record_buf = [None] * 2
+        self.batch_record_ct = 0
+
+        # Only generation models need future-token tracking. Embedding,
+        # classification, and reward models produce their output in a single
+        # forward pass, so a FutureMap would be allocated but never used.
+        if not self.is_generation:
+            self.future_map = None
+            return
+
         self.future_map = FutureMap(
             self.max_running_requests,
             self.chunked_prefill_size,
@@ -1350,8 +1363,6 @@ class Scheduler(
             self.device,
             self.spec_algorithm,
         )
-        self.batch_record_buf = [None] * 2
-        self.batch_record_ct = 0
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
@@ -2547,6 +2558,13 @@ class Scheduler(
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
+            elif self.last_batch.is_prefill_only:
+                # Prefill-only batches (embedding/classification/reward) are
+                # never merged into running_batch, so batch_is_full — once set
+                # by get_new_batch_prefill — would stay True forever and stop
+                # the scheduler from admitting new batches. Reset it here so
+                # admission control recovers after each prefill-only batch.
+                self.running_batch.batch_is_full = False
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
