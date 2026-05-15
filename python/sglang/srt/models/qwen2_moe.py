@@ -218,6 +218,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.is_nextn = is_nextn
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
