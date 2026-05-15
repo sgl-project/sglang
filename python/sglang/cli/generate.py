@@ -28,6 +28,6 @@ def generate(args, extra_argv):
         parsed_args, unknown_args = parser.parse_known_args(extra_argv)
         generate_cmd(parsed_args, unknown_args)
     else:
-        raise Exception(
+        raise NotImplementedError(
             f"Generate subcommand is not yet supported for model: {model_path}"
         )
