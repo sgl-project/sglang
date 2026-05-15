@@ -17,7 +17,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -443,10 +443,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     try:
                         req.grammar.accept_token(id)
                     except ValueError as e:
-                        logger.info(
-                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
+                        logger.error(
+                            f"Grammar accept_token failed in EAGLE verify for req {req.rid} "
+                            f"with token {id}: {e}"
                         )
-                        raise e
+                        # Mark request as aborted instead of crashing the scheduler.
+                        # This can happen with invalid grammars (e.g. circular $ref).
+                        req.finished_reason = FINISH_ABORT(
+                            message=f"Grammar accept_token failed: {e}"
+                        )
+                        has_finished = True
+                        accept_index[i, j + 1 :] = -1
+                        break
                     req.check_finished()
                 if req.finished():
                     has_finished = True

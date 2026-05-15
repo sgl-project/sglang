@@ -16,6 +16,7 @@ use axum::{
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use validator::Validate;
 use smg_mesh::{
     rate_limit_window::RateLimitWindow, MeshServerConfig, MeshServerHandler, MeshSyncManager,
 };
@@ -184,8 +185,51 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    Json(mut body): Json<Value>,
 ) -> Response {
+    // Helper closure to create error responses.
+    let create_error = |message: String, code: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "code": code
+                }
+            })),
+        )
+            .into_response()
+    };
+
+    // Normalize tool definitions: add default "parameters" if missing.
+    // The OpenAI API spec treats "parameters" as optional, but the
+    // ChatCompletionRequest struct requires it.  Patch the raw JSON so
+    // that callers who omit the field are not rejected.
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for tool in tools {
+            if let Some(func) = tool.get_mut("function") {
+                if func.get("parameters").is_none() {
+                    if let Some(map) = func.as_object_mut() {
+                        map.insert("parameters".to_string(), json!({}));
+                    }
+                }
+            }
+        }
+    }
+
+    let body: ChatCompletionRequest = match serde_json::from_value(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return create_error(format!("Invalid JSON data: {}", e), "json_parse_error");
+        }
+    };
+
+    // Run the same validation that ValidatedJson would perform.
+    if let Err(e) = body.validate() {
+        return create_error(format!("Validation error: {}", e), "validation_error");
+    }
+
     state
         .router
         .route_chat(Some(&headers), &body, Some(&body.model))
