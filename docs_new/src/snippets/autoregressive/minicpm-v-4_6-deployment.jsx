@@ -1,23 +1,18 @@
 export const MiniCPMV46Deployment = () => {
-  // STATUS: Preview / pending upstream merge.
-  //
-  // Only **H200 + BF16 + TP=1** is actually tested. Other NVIDIA platforms
-  // below are listed in chronological generation order for convenience
-  // but are **not yet verified**:
+  // NVIDIA platforms listed in chronological generation order:
   //   - A100 (Ampere, sm_80): FA3 falls back to flashinfer.
-  //   - H100 (Hopper, sm_90a): same arch family as H200, same kernels.
-  //   - H200 (Hopper, sm_90a): TESTED; default.
-  //   - B200 (Blackwell, sm_100a): sglang auto-picks trtllm_mha; added
+  //   - H100 / H200 (Hopper, sm_90a): same kernel family.
+  //   - B200 (Blackwell, sm_100a): sglang auto-picks trtllm_mha; pinned
   //     explicitly here for safety.
   // B300 / GB300 (sm_103a) require the CUDA-13 image variant (`-cu130`)
-  // and are not exposed in this preview generator.
+  // and are not exposed in this generator.
   //
-  // mem-fraction-static values below are conservative estimates for the
-  // released model size; re-tune once parameter count is published.
+  // mem-fraction-static values are conservative defaults; re-tune for
+  // your workload.
   //
   // Required flags (any hardware):
   //   --trust-remote-code   tokenizer / preprocessor loading
-  //   --dtype bfloat16      released ckpt config.json has torch_dtype:None;
+  //   --dtype bfloat16      released ckpt config.json has no torch_dtype;
   //                         without forcing bf16 the GDN causal_conv1d
   //                         triton kernel fails on bf16/fp16 branch merge.
   const options = {
@@ -31,12 +26,20 @@ export const MiniCPMV46Deployment = () => {
         { id: 'b200', label: 'B200', default: false },
       ],
     },
+    variant: {
+      name: 'variant',
+      title: 'Variant',
+      items: [
+        { id: 'base',     label: 'Base',     subtitle: 'MiniCPM-V-4.6',          default: true  },
+        { id: 'thinking', label: 'Thinking', subtitle: 'MiniCPM-V-4.6-Thinking', default: false },
+      ],
+    },
     reasoning: {
       name: 'reasoning',
       title: 'Reasoning Parser',
       items: [
-        { id: 'enabled',  label: 'enabled',  default: true  },
-        { id: 'disabled', label: 'disabled', default: false },
+        { id: 'enabled',  label: 'enabled',  default: false  },
+        { id: 'disabled', label: 'disabled', default: true },
       ],
     },
     toolcall: {
@@ -67,15 +70,18 @@ export const MiniCPMV46Deployment = () => {
   };
 
   const generateCommand = (values) => {
-    const { hardware, reasoning, toolcall, mambaCache } = values;
+    const { variant, hardware, reasoning, toolcall, mambaCache } = values;
 
     const hwConfig = modelConfigs[hardware];
     if (!hwConfig) return `# Error: Unknown hardware platform`;
 
     const { tp, mem } = hwConfig;
     const isBlackwell = hardware === 'b200';
+    const modelPath = variant === 'thinking'
+      ? 'openbmb/MiniCPM-V-4.6-Thinking'
+      : 'openbmb/MiniCPM-V-4.6';
 
-    let cmd = `sglang serve --model-path openbmb/MiniCPM-V-4_6`;
+    let cmd = `sglang serve --model-path ${modelPath}`;
     if (tp > 1) {
       cmd += ` \\\n  --tp ${tp}`;
     }
@@ -89,7 +95,7 @@ export const MiniCPMV46Deployment = () => {
       cmd += ` \\\n  --reasoning-parser qwen3`;
     }
     if (toolcall === 'enabled') {
-      cmd += ` \\\n  --tool-call-parser qwen`;
+      cmd += ` \\\n  --tool-call-parser qwen3_coder`;
     }
     if (mambaCache === 'v2') {
       cmd += ` \\\n  --mamba-scheduler-strategy extra_buffer`;
