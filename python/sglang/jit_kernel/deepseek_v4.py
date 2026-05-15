@@ -263,8 +263,10 @@ def _jit_silu_and_mul_clamp_module(dtype: torch.dtype) -> Module:
 
 
 @cache_once
-def _jit_mega_moe_pre_dispatch_module(quant_group_size: int) -> Module:
-    args = make_cpp_args(quant_group_size, is_arch_support_pdl())
+def _jit_mega_moe_pre_dispatch_module(
+    quant_group_size: int, topk_dtype: torch.dtype
+) -> Module:
+    args = make_cpp_args(quant_group_size, is_arch_support_pdl(), topk_dtype)
     return load_jit(
         make_name("mega_moe_pre_dispatch"),
         *args,
@@ -797,7 +799,7 @@ def mega_moe_pre_dispatch(
     buf_topk_weights: torch.Tensor,
     quant_group_size: int = 32,
 ) -> None:
-    module = _jit_mega_moe_pre_dispatch_module(quant_group_size)
+    module = _jit_mega_moe_pre_dispatch_module(quant_group_size, topk_idx.dtype)
     module.run(
         x,
         topk_idx,

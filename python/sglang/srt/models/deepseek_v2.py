@@ -657,12 +657,15 @@ class DeepseekV2MoE(nn.Module):
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
-            return forward_mega_moe(
-                self,
-                hidden_states,
-                forward_batch,
-                input_ids_global=input_ids_global,
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                return forward_mega_moe(
+                    self,
+                    hidden_states,
+                    forward_batch,
+                    input_ids_global=input_ids_global,
+                )
 
         if not self._enable_a2a_moe:
             if (
