@@ -105,10 +105,19 @@ transport class).
 - #25050 *Add `--model-config-parser` registry for pluggable config
   formats* — precedent for a small registry indirection.
 
-## Reference implementation (fork-side, against v0.5.8.post1)
+## What landed in this PR
 
-The exact fork-side patch we run today is checked in alongside this
-RFC as
+| File | Status |
+|---|---|
+| `python/sglang/srt/distributed/torchspec_colocate.py` | **Added** (387 lines). Self-contained helper module: env-var reading, union-PG init, engine-rank computation, the `dist.new_group` "local-only" wrapper that defangs world-collective deadlocks against the trainer half, and the hidden-states writer factory. Module-level imports are stdlib-only; `torch` and `torchspec` imports are lazy (inside functions) so `import sglang.srt.distributed.torchspec_colocate` is safe with or without colocate active. |
+| `python/sglang/srt/distributed/parallel_state.py` | **Not yet wired.** The `initialize_model_parallel` extension (`tp_world_ranks` parameter + colocate branches at each group-construction site) needs careful porting against current main's expanded attn/MoE group structure. Deferred to a follow-up PR once names are agreed. |
+| `python/sglang/srt/managers/scheduler.py`, `scheduler_output_processor_mixin.py`, `model_executor/model_runner.py` | **Not yet wired.** The scheduler-side hooks reference symbols (`batch.spec_training_info`, `enable_spec_training_mooncake`, `_send_hidden_states_to_mooncake`) introduced by a separate base disagg patch that isn't in upstream. Will land after the transport-registry API shape is agreed in this issue. |
+
+The new module uses TorchSpec-namespaced symbol names (`TORCHSPEC_COLOCATE_*`, `torchspec_colocate`) because that's what the fork-side code looks like today. **Renaming to neutral names is part of what this issue should settle** — the RFC's "Proposed shape" section above is the upstream target.
+
+## Reference implementation (full fork-side patch, against v0.5.8.post1)
+
+The complete fork-side patch is checked in alongside this RFC as
 [`rfc_colocate_spec_training_transport.v0.5.8.post1.patch`](rfc_colocate_spec_training_transport.v0.5.8.post1.patch)
 (836 lines, against `v0.5.8.post1`). It is provided as a *reference
 artifact* so reviewers can see the exact shape of the change without
