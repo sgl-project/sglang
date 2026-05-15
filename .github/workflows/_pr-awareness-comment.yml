@@ -64,12 +64,18 @@ jobs:
             const prevPrTest  = extractSlot(existingBlock, ptStart, ptEnd);
             const prevPrExtra = extractSlot(existingBlock, peStart, peEnd);
 
-            // Update only this caller's slot; preserve the other slot's value
+            // Update only this caller's slot; preserve the other slot's value.
+            // For pr-test-extra: only attribute the run URL when the PR carries
+            // `run-ci-extra` and the extra graph actually executed. Without the
+            // label the run is label-gate-skipped and contains nothing but
+            // call-pr-awareness itself — linking to it would be misleading.
             const newPrTest = (kind === 'pr-test')
               ? `[Run #${context.runId}](${runUrl})`
               : (prevPrTest || '_Not run yet_');
             const newPrExtra = (kind === 'pr-test-extra')
-              ? `[Run #${context.runId}](${runUrl})`
+              ? (hasExtra
+                  ? `[Run #${context.runId}](${runUrl})`
+                  : '_Skipped (no run-ci-extra label)_')
               : (prevPrExtra || (hasExtra ? '_Not run yet_' : '_Skipped (no run-ci-extra label)_'));
 
             // Label-status notice
