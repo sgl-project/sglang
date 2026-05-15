@@ -1,0 +1,47 @@
+# Localhost / internal network URLs used in examples and code snippets
+^http://localhost
+^http://127\.0\.0\.1
+^http://0\.0\.0\.0
+^http://worker\d*
+^http://P_IP
+^http://D_IP
+
+# Placeholder / templated URLs
+^http://.*\{port\}
+^http://.*\{.*\}
+
+# Sites that block automated requests or require authentication
+^https://platform\.openai\.com
+^https://api\.openai\.com
+^https://www\.nvidia\.com
+^https://www\.intel\.com
+
+# Download links that are large or redirect
+^https://download\.pytorch\.org
+
+# Relative links resolved as file:// paths (cannot be checked in CI)
+^file://
+
+# GitHub pages that require authentication or have been moved/deleted
+^https://github\.com/sgl-project/sglang/settings/
+
+# Pre-existing broken links in documentation (tracked for future cleanup)
+# GitHub 404s - files renamed, moved, or deleted
+^https://github\.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/
+^https://github\.com/sgl-project/sglang/blob/main/test/srt/test_eval_accuracy_large\.py
+^https://github\.com/sgl-project/sglang/blob/main/test/srt/test_moe_eval_accuracy_large\.py
+^https://github\.com/sgl-project/sglang/blob/main/test/srt/test_gpt_oss_1gpu\.py
+^https://github\.com/sgl-project/sglang/blob/main/python/sglang/srt/conversation\.py
+^https://github\.com/sgl-project/sglang/tree/main/python/sglang/srt/conversation\.py
+^https://github\.com/sgl-project/sglang/blob/main/test/srt/models/test_generation_models\.py
+^https://github\.com/sgl-project/sglang/blob/main/test/srt/test_vision_openai_server_a\.py
+^https://github\.com/sgl-project/sglang/blob/main/test/srt/test_vision_openai_server_b\.py
+
+# External sites returning 404
+^https://sgl-project\.github\.io/sglang$
+^https://docs\.sglang\.io/basic_usage/deepseek\.html
+^https://lmsys\.org/blog/2025-05-05-deepseek-pd-ep/
+
+# External sites returning 403 (blocking automated requests)
+^https://aflah02\.substack\.com/
+^https://gamma\.app/docs/

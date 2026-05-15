@@ -1,0 +1,40 @@
+name: Documentation Link Check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "*.md"
+      - ".lycheeignore"
+      - ".github/workflows/link-check.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "*.md"
+      - ".lycheeignore"
+      - ".github/workflows/link-check.yml"
+
+concurrency:
+  group: link-check-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  link-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check documentation links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --no-progress
+            --max-retries 3
+            --max-concurrency 5
+            --timeout 30
+            docs/
+            README.md
+          fail: true
+          jobSummary: true
