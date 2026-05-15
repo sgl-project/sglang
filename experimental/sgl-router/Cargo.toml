@@ -54,6 +54,7 @@ tokio-stream = "0.1"
 dashmap = "6"
 serde_yaml = "0.9"
 toml = "0.8"
+notify = "7"
 
 [dev-dependencies]
 dirs = "5"
