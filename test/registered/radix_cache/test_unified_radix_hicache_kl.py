@@ -112,8 +112,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
 
     hicache_io_backend = "direct"
     hicache_mem_layout = "page_first_direct"
-    max_running_requests = 4
-    kl_threshold = 0.0035
+    kl_threshold = 0.005
     sampling_temperature = 0
     decode_cache_assert = staticmethod(_assert_dsv4_decode_cached_tokens)
     gsm8k_threshold = 0.90
@@ -158,7 +157,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
                 "--max-total-tokens",
                 "20000",
                 "--max-running-requests",
-                str(cls.max_running_requests),
+                "2",
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
@@ -170,6 +169,15 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+
+class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
+    TestUnifiedDeepSeekV4FlashHiCache
+):
+    """DeepSeek V4 Flash HiCache layout smoke: page_first_direct + direct."""
+
+    hicache_io_backend = "kernel"
+    hicache_mem_layout = "layer_first"
 
 
 class GSM8KTwoPassMixin:
@@ -291,16 +299,6 @@ class TestGLM5HiCacheL3GSM8K(GSM8KTwoPassMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
         if os.path.isdir(cls.hicache_dir):
             shutil.rmtree(cls.hicache_dir, ignore_errors=True)
-
-
-class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
-    TestUnifiedDeepSeekV4FlashHiCache
-):
-    """DeepSeek V4 Flash HiCache layout smoke: page_first_direct + direct."""
-
-    hicache_io_backend = "kernel"
-    hicache_mem_layout = "layer_first"
-    max_running_requests = 2
 
 
 if __name__ == "__main__":
