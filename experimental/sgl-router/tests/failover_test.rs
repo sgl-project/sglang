@@ -139,9 +139,9 @@ model_ids = ["tiny"]
             errs += 1;
         }
     }
-    // We expect at most 1 error — the first call routed to w2 fails and opens
+    // We expect exactly 1 error — the first call routed to w2 fails and opens
     // its breaker; subsequent round-robin picks rotate among the 2 healthy
     // workers since registry.healthy_workers_for filters out the open breaker.
-    assert!(errs <= 1, "expected ≤1 error, got {errs}");
-    assert!(oks >= 4, "expected ≥4 successes, got {oks}");
+    assert_eq!(errs, 1, "exactly the first w2 pick should error");
+    assert_eq!(oks, 5, "remaining 5 picks should succeed via filtered RR");
 }
