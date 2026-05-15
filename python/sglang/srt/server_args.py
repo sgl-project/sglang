@@ -3786,6 +3786,17 @@ class ServerArgs:
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
+            else:
+                # When the user manually sets speculative_num_steps but omits
+                # eagle_topk / num_draft_tokens, fill in safe defaults so that
+                # downstream comparisons (e.g. `topk > 1`) don't crash with
+                # TypeError: '>' not supported between NoneType and int.
+                if self.speculative_eagle_topk is None:
+                    self.speculative_eagle_topk = 1
+                if self.speculative_num_draft_tokens is None:
+                    self.speculative_num_draft_tokens = (
+                        self.speculative_num_steps + 1
+                    )
 
             if (
                 self.attention_backend == "trtllm_mha"
