@@ -155,13 +155,14 @@ class BreakableCudaGraphRunner:
         from sglang.srt.utils import is_npu
 
         with torch.device(self.device):
+            cache_loc_dtype = torch.int64 if not is_npu() else torch.int32
             input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
             out_cache_loc = torch.zeros(
                 (self.max_num_tokens,),
-                dtype=torch.int64 if not is_npu() else torch.int32,
+                dtype=cache_loc_dtype,
             )
             out_cache_loc_swa = (
-                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+                torch.zeros((self.max_num_tokens,), dtype=cache_loc_dtype)
                 if model_runner.is_hybrid_swa
                 else None
             )
