@@ -376,12 +376,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for (
-                    _,
-                    finish_event,
-                    ack_list,
-                    _nt,
-                ) in self.cache_controller.ack_write_queue:
+                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
@@ -398,7 +393,7 @@ class HiMambaRadixCache(MambaRadixCache):
             return
 
         finish_count = 0
-        for _, finish_event, ack_list, _nt in self.cache_controller.ack_write_queue:
+        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
             if not finish_event.query():
                 break
             finish_count += 1
@@ -413,9 +408,7 @@ class HiMambaRadixCache(MambaRadixCache):
         finish_count = int(queue_size.item())
 
         while finish_count > 0:
-            _, finish_event, ack_list, _nt = self.cache_controller.ack_write_queue.pop(
-                0
-            )
+            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
@@ -427,7 +420,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def loading_check(self):
         finish_count = 0
-        for _, finish_event, ack_list, _nt in self.cache_controller.ack_load_queue:
+        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
             if not finish_event.query():
                 # the KV cache loading is still ongoing
                 break

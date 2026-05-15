@@ -4,11 +4,8 @@ services:
     image: prom/prometheus:latest
     container_name: prometheus
     network_mode: host
-    user: root
-    restart: unless-stopped
     volumes:
       - ./prometheus.yaml:/etc/prometheus/prometheus.yml
-      - prometheus-data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -17,8 +14,6 @@ services:
     image: grafana/grafana:latest
     container_name: grafana
     network_mode: host
-    tmpfs:
-      - /var/lib/grafana
     volumes:
       - ./grafana/datasources:/etc/grafana/provisioning/datasources
       - ./grafana/dashboards/config:/etc/grafana/provisioning/dashboards
@@ -31,6 +26,3 @@ services:
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/sglang-dashboard.json
     depends_on:
       - prometheus
-
-volumes:
-  prometheus-data:

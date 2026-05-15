@@ -3908,10 +3908,6 @@ def configure_scheduler_process(
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
-    elif dp_rank is not None:
-        os.environ["SGLANG_DP_RANK"] = str(dp_rank)
-
-    os.environ["SGLANG_DP_SIZE"] = str(server_args.dp_size)
 
     prefix = ""
     if dp_rank is not None:

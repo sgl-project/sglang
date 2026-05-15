@@ -447,12 +447,6 @@ class PrefillAdder:
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
 
-        # Per-tier cache hit breakdown
-        self.log_l1_hit_tokens = 0
-        self.log_l2_hit_tokens = 0
-        self.log_l3_hit_tokens = 0
-        self.log_miss_tokens = 0
-
         if running_batch is not None:
             # Estimate the offset in the remaining token space
             self.rem_total_token_offset += sum(
@@ -609,13 +603,6 @@ class PrefillAdder:
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
 
-    def _accumulate_per_tier_hits(self, l1: int, l2: int, l3: int, miss: int) -> None:
-        """Accumulate per-tier cache hit tokens for this batch."""
-        self.log_l1_hit_tokens += l1
-        self.log_l2_hit_tokens += l2
-        self.log_l3_hit_tokens += l3
-        self.log_miss_tokens += miss
-
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
             self.rem_dllm_tokens,
@@ -708,8 +695,6 @@ class PrefillAdder:
                 else 0
             ),
         )
-        # Subsequent chunks are pure compute (no cache hits)
-        self._accumulate_per_tier_hits(0, 0, 0, req.extend_input_len)
 
         # Return if chunked prefill not finished
         return req if truncated else None
@@ -798,7 +783,6 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             self._add_dllm_req(req, 0)
-            self._accumulate_per_tier_hits(0, 0, 0, req.extend_input_len)
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
@@ -810,7 +794,6 @@ class PrefillAdder:
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
-            self._accumulate_per_tier_hits(0, 0, 0, req.extend_input_len)
         else:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
@@ -823,7 +806,6 @@ class PrefillAdder:
             self.can_run_list.append(req)
             self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0)
-            self._accumulate_per_tier_hits(0, 0, 0, trunc_len)
 
         return self.budget_state()
 
@@ -891,10 +873,6 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
-            # Per-tier breakdown: L1 hits are device_indices before load_back
-            l1_hit = len(req.prefix_indices)
-            loaded_back = 0
-
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
@@ -907,13 +885,6 @@ class PrefillAdder:
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
-                loaded_back = len(new_indices)
-
-            # Compute per-tier: L3 is storage-prefetched portion of loaded_back
-            l3_hit = min(getattr(req, "storage_hit_length", 0), loaded_back)
-            l2_hit = loaded_back - l3_hit
-            # Miss = raw extend_input_len (no page alignment)
-            miss_tokens = req.extend_input_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
@@ -930,7 +901,6 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-                self._accumulate_per_tier_hits(l1_hit, l2_hit, l3_hit, miss_tokens)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
@@ -944,7 +914,6 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                 )
-                self._accumulate_per_tier_hits(l1_hit, l2_hit, l3_hit, miss_tokens)
             else:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
@@ -979,8 +948,6 @@ class PrefillAdder:
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
-                # For chunked prefill, miss = trunc_len (actual compute this round)
-                self._accumulate_per_tier_hits(l1_hit, l2_hit, l3_hit, trunc_len)
 
         return self.budget_state()
 

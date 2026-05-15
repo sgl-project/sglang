@@ -4250,7 +4250,7 @@ class ServerArgs:
         if self.dummy_forward:
             logger.info(
                 "Dummy forward mode enabled: cuda graph, server warmup disabled; "
-                "load format forced to 'dummy'."
+                "load format forced to '"'dummy'"'."
             )
             self.disable_cuda_graph = True
             self.skip_server_warmup = True

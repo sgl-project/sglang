@@ -84,6 +84,15 @@ class SchedulerStats:
     mamba_usage: float = 0.0
 
     # Absolute token counts for the full-attention KV cache pool.
+    # Invariant: kv_available_tokens + kv_evictable_tokens + kv_used_tokens <= max_total_num_tokens
+    # (the gap accounts for protected/session-held tokens not exposed here).
+    # max_total_num_tokens is emitted once at startup via emit_constants.
+    #
+    # kv_available_tokens:  free (unallocated) slots in the pool.
+    # kv_evictable_tokens:  slots holding radix-cached KV data that can be evicted for new requests.
+    # kv_used_tokens:       actively used slots (locked by running requests). Equals full_num_used.
+    # num_used_tokens:      max(full_num_used, swa_num_used) for hybrid-SWA models, else full_num_used.
+    #                       Does NOT include the mamba pool.
     num_used_tokens: int = 0
     kv_available_tokens: int = 0
     kv_evictable_tokens: int = 0
@@ -95,14 +104,6 @@ class SchedulerStats:
     mamba_available_tokens: int = 0
     mamba_evictable_tokens: int = 0
     mamba_used_tokens: int = 0
-
-    # UMBP/feat: gpu_kv_cache_occupancy + per-tier hit tokens (pending_prealloc_token_usage already declared below)
-    gpu_kv_cache_occupancy: float = 0.0
-    l1_hit_tokens: int = 0
-    l2_hit_tokens: int = 0
-    l3_hit_tokens: int = 0
-    cache_miss_tokens: int = 0
-    max_total_num_tokens: int = 0
 
     # Speculative decoding
     spec_accept_length: float = 0.0
@@ -240,29 +241,6 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
-        # UMBP/feat: per-tier cache hit counters
-        self.cache_hit_tokens_l1_total = Counter(
-            name="sglang:cache_hit_tokens_l1_total",
-            documentation="Total tokens matched from L1 GPU device cache (radix tree).",
-            labelnames=labels.keys(),
-        )
-        self.cache_hit_tokens_l2_total = Counter(
-            name="sglang:cache_hit_tokens_l2_total",
-            documentation="Total tokens loaded back from L2 Host DRAM cache (excluding L3 storage-promoted tokens).",
-            labelnames=labels.keys(),
-        )
-        self.cache_hit_tokens_l3_total = Counter(
-            name="sglang:cache_hit_tokens_l3_total",
-            documentation="Total tokens prefetched from L3 storage backend (promoted through Host to GPU).",
-            labelnames=labels.keys(),
-        )
-        self.cache_miss_tokens_total = Counter(
-            name="sglang:cache_miss_tokens_total",
-            documentation="Total tokens not found in any cache tier, requiring full prefill compute.",
-            labelnames=labels.keys(),
-        )
-
 
         # =================================================================
         # Memory pool usage ratios
@@ -1152,17 +1130,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.mamba_evictable_tokens, stats.mamba_evictable_tokens)
         self._log_gauge(self.mamba_used_tokens, stats.mamba_used_tokens)
 
-        # UMBP/feat: per-tier cache hit counters
-        self.cache_hit_tokens_l1_total.labels(**self.labels).inc(stats.l1_hit_tokens)
-        self.cache_hit_tokens_l2_total.labels(**self.labels).inc(stats.l2_hit_tokens)
-        self.cache_hit_tokens_l3_total.labels(**self.labels).inc(stats.l3_hit_tokens)
-        self.cache_miss_tokens_total.labels(**self.labels).inc(stats.cache_miss_tokens)
-        stats.l1_hit_tokens = 0
-        stats.l2_hit_tokens = 0
-        stats.l3_hit_tokens = 0
-        stats.cache_miss_tokens = 0
-        self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
-
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
@@ -1600,26 +1567,10 @@ class StorageMetricsCollector:
             documentation="Number of prefetched prompt tokens.",
             labelnames=labels.keys(),
         )
-        self.prefetched_bytes_total = Counter(
-            name="sglang:prefetched_bytes_total",
-            documentation=(
-                "Logical KV cache bytes prefetched from storage to host "
-                "(aligned with prefetched tokens)."
-            ),
-            labelnames=labels.keys(),
-        )
 
         self.backuped_tokens_total = Counter(
             name="sglang:backuped_tokens_total",
             documentation="Number of backuped tokens.",
-            labelnames=labels.keys(),
-        )
-        self.backuped_bytes_total = Counter(
-            name="sglang:backuped_bytes_total",
-            documentation=(
-                "Logical KV cache bytes backuped from host to storage "
-                "(aligned with backuped tokens)."
-            ),
             labelnames=labels.keys(),
         )
 
@@ -1673,17 +1624,9 @@ class StorageMetricsCollector:
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
 
-    def log_prefetched_bytes(self, prefetched_bytes: int):
-        if prefetched_bytes > 0:
-            self.prefetched_bytes_total.labels(**self.labels).inc(prefetched_bytes)
-
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
-
-    def log_backuped_bytes(self, backuped_bytes: int):
-        if backuped_bytes > 0:
-            self.backuped_bytes_total.labels(**self.labels).inc(backuped_bytes)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
@@ -1777,56 +1720,20 @@ class RadixCacheMetricsCollector:
             ]
         self.eviction_duration_seconds = Histogram(
             name="sglang:eviction_duration_seconds",
-            documentation=(
-                "Eviction wall-clock duration in seconds. "
-                "write_through: CPU-side only (tree walk + index free). "
-                "write_back: includes blocking D2H transfer wait."
-            ),
+            documentation="Time taken to evict memory from GPU to CPU in seconds.",
             labelnames=labels.keys(),
             buckets=bucket_eviction_duration,
         )
 
         self.eviction_num_tokens = Counter(
             name="sglang:evicted_tokens_total",
-            documentation=(
-                "Total tokens evicted from L1 GPU "
-                "(backuped: freed to L2, regular: deleted entirely)."
-            ),
-            labelnames=labels.keys(),
-        )
-        self.eviction_num_bytes = Counter(
-            name="sglang:evicted_bytes_total",
-            documentation=(
-                "Logical KV bytes freed from L1 GPU (backuped + regular). "
-                "Note: regular-path bytes are deleted, not transferred to host."
-            ),
-            labelnames=labels.keys(),
-        )
-
-        # Split counters: backuped (GPU freed, data kept in L2) vs regular (data deleted)
-        self.evicted_backuped_tokens = Counter(
-            name="sglang:evicted_backuped_tokens_total",
-            documentation=(
-                "Tokens evicted via backuped path: GPU memory freed, "
-                "data remains in L2 Host for future load-back."
-            ),
-            labelnames=labels.keys(),
-        )
-        self.evicted_regular_tokens = Counter(
-            name="sglang:evicted_regular_tokens_total",
-            documentation=(
-                "Tokens evicted via regular path: data deleted from "
-                "radix tree entirely (not backed up to L2 Host)."
-            ),
+            documentation="The number of tokens evicted from GPU to CPU.",
             labelnames=labels.keys(),
         )
 
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
-            documentation=(
-                "Load-back enqueue duration in seconds "
-                "(device alloc + queue push; actual H2D transfer is async)."
-            ),
+            documentation="Time taken to load memory from CPU to GPU in seconds.",
             labelnames=labels.keys(),
             buckets=bucket_load_back_duration,
         )
@@ -1836,91 +1743,18 @@ class RadixCacheMetricsCollector:
             documentation="The number of tokens loaded from CPU to GPU.",
             labelnames=labels.keys(),
         )
-        self.load_back_num_bytes = Counter(
-            name="sglang:load_back_bytes_total",
-            documentation=(
-                "Logical KV cache bytes loaded from host to GPU "
-                "(aligned with load-back tokens)."
-            ),
-            labelnames=labels.keys(),
-        )
-        bucket_bandwidth_gb_s = [
-            0.1,
-            0.2,
-            0.5,
-            1,
-            2,
-            5,
-            10,
-            20,
-            40,
-            60,
-            80,
-            100,
-            120,
-            160,
-            200,
-            240,
-            320,
-            400,
-            512,
-            640,
-            768,
-            896,
-            1024,
-            1280,
-            1536,
-            1792,
-            2048,
-        ]
-        self.eviction_bandwidth_gb_s = Histogram(
-            name="sglang:eviction_bandwidth_gb_s",
-            documentation=(
-                "Per-batch L1→L2 write bandwidth in GB/s "
-                "(logical KV bytes / CUDA event elapsed time)."
-            ),
-            labelnames=labels.keys(),
-            buckets=bucket_bandwidth_gb_s,
-        )
-        self.load_back_bandwidth_gb_s = Histogram(
-            name="sglang:load_back_bandwidth_gb_s",
-            documentation=(
-                "Per-batch L2→L1 load bandwidth in GB/s "
-                "(logical KV bytes / CUDA event elapsed time)."
-            ),
-            labelnames=labels.keys(),
-            buckets=bucket_bandwidth_gb_s,
-        )
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
-    def increment_eviction_num_bytes(self, num_bytes: int) -> None:
-        self.eviction_num_bytes.labels(**self.labels).inc(num_bytes)
-
-    def increment_evicted_backuped_tokens(self, num_tokens: int) -> None:
-        self.evicted_backuped_tokens.labels(**self.labels).inc(num_tokens)
-
-    def increment_evicted_regular_tokens(self, num_tokens: int) -> None:
-        self.evicted_regular_tokens.labels(**self.labels).inc(num_tokens)
-
     def increment_load_back_num_tokens(self, num_tokens: int) -> None:
         self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
-
-    def increment_load_back_num_bytes(self, num_bytes: int) -> None:
-        self.load_back_num_bytes.labels(**self.labels).inc(num_bytes)
 
     def observe_eviction_duration(self, duration_seconds: float) -> None:
         self.eviction_duration_seconds.labels(**self.labels).observe(duration_seconds)
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
-
-    def observe_eviction_bandwidth_gb_s(self, bandwidth_gb_s: float) -> None:
-        self.eviction_bandwidth_gb_s.labels(**self.labels).observe(bandwidth_gb_s)
-
-    def observe_load_back_bandwidth_gb_s(self, bandwidth_gb_s: float) -> None:
-        self.load_back_bandwidth_gb_s.labels(**self.labels).observe(bandwidth_gb_s)
 
 
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
@@ -1930,6 +1764,7 @@ def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
     """
     if env_var_name not in os.environ:
         return None
+    # if the env var is not set or empty, return None
     env_var_value = os.environ[env_var_name]
     if not env_var_value:
         return None
