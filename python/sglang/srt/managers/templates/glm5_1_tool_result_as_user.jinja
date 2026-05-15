@@ -1,0 +1,115 @@
+[gMASK]<sop>
+{%- if tools -%}
+{%- macro tool_to_json(tool) -%}
+    {%- set ns_tool = namespace(first=true) -%}
+    {{ '{' -}}
+    {%- for k, v in tool.items() -%}
+        {%- if k != 'defer_loading' and k != 'strict' -%}
+            {%- if not ns_tool.first -%}{{- ', ' -}}{%- endif -%}
+            {%- set ns_tool.first = false -%}
+            "{{ k }}": {{ v | tojson(ensure_ascii=False) }}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- '}' -}}
+{%- endmacro -%}
+<|system|>
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{% for tool in tools %}
+{%- if 'function' in tool -%}
+    {%- set tool = tool['function'] -%}
+{%- endif -%}
+{% if tool.defer_loading is not defined or not tool.defer_loading %}
+{{ tool_to_json(tool) }}
+{% endif %}
+{% endfor %}
+</tools>
+
+For each function call, output the function name and arguments within the following XML format:
+<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>{%- endif -%}
+{%- macro visible_text(content) -%}
+    {%- if content is string -%}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for item in content -%}
+            {%- if item is mapping and item.type == 'text' -%}
+                {{- item.text }}
+            {%- elif item is string -%}
+                {{- item }}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- else -%}
+        {{- content }}
+    {%- endif -%}
+{%- endmacro -%}
+{%- set ns = namespace(last_user_index=-1, thinking_indices='') -%}
+{%- for m in messages %}
+    {%- if m.role == 'user' or m.role == 'tool' %}
+        {%- set ns.last_user_index = loop.index0 -%}
+    {%- elif m.role == 'assistant' %}
+        {%- if m.reasoning_content is string %}
+            {%- set ns.thinking_indices = ns.thinking_indices ~ ',' ~ ns.last_user_index ~ ',' -%}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- set ns.has_thinking = false -%}
+{%- for m in messages -%}
+{%- if m.role == 'user' -%}<|user|>{{ visible_text(m.content) }}{% set ns.has_thinking = (',' ~ loop.index0 ~ ',') in ns.thinking_indices -%}
+{%- elif m.role == 'assistant' -%}
+<|assistant|>
+{%- set content = visible_text(m.content) %}
+{%- if m.reasoning_content is string %}
+    {%- set reasoning_content = m.reasoning_content %}
+{%- elif '</think>' in content %}
+    {%- set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}
+    {%- set content = content.split('</think>')[-1] %}
+{%- elif loop.index0 > ns.last_user_index and not (enable_thinking is defined and not enable_thinking) %}
+    {%- set reasoning_content = '' %}
+{%- elif loop.index0 < ns.last_user_index and ns.has_thinking %}
+    {%- set reasoning_content = '' %}
+{%- endif %}
+{%- if ((clear_thinking is defined and not clear_thinking) or loop.index0 > ns.last_user_index) and reasoning_content is defined -%}
+{{ '<think>' + reasoning_content +  '</think>'}}
+{%- else -%}
+{{ '</think>' }}
+{%- endif -%}
+{%- if content.strip() -%}
+{{ content.strip() }}
+{%- endif -%}
+{% if m.tool_calls %}
+{% for tc in m.tool_calls %}
+{%- if tc.function %}
+    {%- set tc = tc.function %}
+{%- endif %}
+{{- '<tool_call>' + tc.name -}}
+{% set _args = tc.arguments %}{% for k, v in _args.items() %}<arg_key>{{ k }}</arg_key><arg_value>{{ v | tojson(ensure_ascii=False) if v is not string else v }}</arg_value>{% endfor %}</tool_call>{% endfor %}
+{% endif %}
+{%- elif m.role == 'tool' -%}
+<|user|>Here are the tool execution results. Continue the task using this information:
+{%- if m.content is string -%}
+{{- m.content -}}
+{%- elif m.content is iterable and m.content is not mapping and m.content and m.content.0.type == "tool_reference" -%}
+{% for tr in m.content %}
+    {%- for tool in tools -%}
+        {%- if 'function' in tool -%}
+            {%- set tool = tool['function'] -%}
+        {%- endif -%}
+        {%- if tool.name == tr.name -%}
+{{- tool_to_json(tool) + '\n' -}}
+        {%- endif -%}
+    {%- endfor -%}
+{% endfor %}
+{%- else -%}
+{{- visible_text(m.content) -}}
+{% endif -%}
+{%- elif m.role == 'system' -%}
+<|system|>{{ visible_text(m.content) }}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    <|assistant|>{{- '</think>' if (enable_thinking is defined and not enable_thinking) else '<think>' -}}
+{%- endif -%}
