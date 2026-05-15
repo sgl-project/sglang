@@ -123,6 +123,31 @@ We provide two different options for running DeepSeek-V4 models on Hopper device
 - Original FP4 checkpoints: To run original FP4 checkpoints, apply the w4a16 MoE kernels (marlin) as in interactive command generator. For this option we only support TP method. Complete Pro model can be run on a single H200 node with this option.
 - Converted FP8 checkpoints: We also provide pre-converted FP8 checkpoints (`sgl-project/DeepSeek-V4-Flash-FP8`, `sgl-project/DeepSeek-V4-Pro-FP8`), which support more parallelism and features.
 
+**L40S (SM89) experimental note**
+
+L40S does not support the Hopper/Blackwell-only DeepGEMM or FP4 fast paths used by the primary DeepSeek-V4 recipes. For L40S, use the converted FP8 Flash checkpoint with Triton backends and the DSV4 PyTorch top-k transform fallback:
+
+```bash Command
+export SGLANG_TOPK_TRANSFORM_512_TORCH=1
+export SGLANG_OPT_USE_FUSED_HASH_TOPK=0
+export SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0
+export SGLANG_NSA_FUSE_TOPK=0
+
+sglang serve sgl-project/DeepSeek-V4-Flash-FP8 \
+  --served-model-name deepseek-ai/DeepSeek-V4-Flash \
+  --tp-size 8 \
+  --attention-backend dsv4 \
+  --fp8-gemm-backend triton \
+  --moe-runner-backend triton \
+  --sampling-backend pytorch \
+  --cuda-graph-max-bs 32 \
+  --cuda-graph-bs 1 2 4 8 16 32 \
+  --reasoning-parser deepseek-v4 \
+  --tool-call-parser deepseekv4
+```
+
+The L40S path is optimized for compatibility and single-node availability rather than matching the H200/B200 throughput recipes. It relies on L40S-specific FP8 W8A8 and Triton MoE tuning configs when available.
+
 PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=-1`
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake
 can discover the IB HCAs; without IB exposure mooncake silently falls back to
