@@ -1,10 +1,6 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.gpt_oss_common import BaseTestGptOss
-
-register_cuda_ci(est_time=408, stage="stage-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=750, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 
 class TestGptOss1Gpu(BaseTestGptOss):
