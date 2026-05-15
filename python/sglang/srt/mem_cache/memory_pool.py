@@ -45,6 +45,7 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
@@ -249,10 +250,13 @@ class MambaPool:
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
-            torch.cuda.use_mem_pool(self.custom_mem_pool)
-            if self.enable_custom_mem_pool
-            else nullcontext()
+        with (
+            self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
+            (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ),
         ):
             conv_state = [
                 torch.zeros(
@@ -2023,7 +2027,14 @@ class NSATokenToKVPool(MLATokenToKVPool):
         assert index_head_dim == 128
 
         if _is_hip:
-            assert self.page_size == 1
+            if aiter_can_use_preshuffle_paged_mqa():
+                assert (
+                    self.page_size % 16 == 0
+                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+            else:
+                assert (
+                    self.page_size == 1
+                ), f"HIP legacy NSA path requires page_size == 1, got {self.page_size}"
         else:
             assert self.page_size == 64
         with (

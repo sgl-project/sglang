@@ -740,8 +740,10 @@ class Req(ReqDllmMixin):
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
+        # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
         self.last_host_node: Any = None
+        self.best_match_node: Any = None
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
@@ -1041,12 +1043,14 @@ class Req(ReqDllmMixin):
                 self.prefix_indices,
                 self.last_node,
                 self.last_host_node,
+                self.best_match_node,
                 self.host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
                 match_result.last_host_node,
+                match_result.best_match_node,
                 match_result.host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
@@ -1473,6 +1477,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_forward_count: int = 1
     split_forward_batch: ForwardBatch = None
     seq_lens_cpu_cache: torch.Tensor = None
+
+    # Forward-pass metrics
+    fpm_start_time: float = 0.0
 
     # Stream
     has_stream: bool = False
@@ -2638,6 +2645,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
+            fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
         )
 

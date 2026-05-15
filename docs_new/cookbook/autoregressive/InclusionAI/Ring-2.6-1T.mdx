@@ -1,0 +1,320 @@
+---
+title: Ring-2.6-1T
+metatags:
+    description: "Deploy Ring-2.6-1T with SGLang - a trillion-parameter InclusionAI reasoning model for agent workflows, high/xhigh reasoning effort, and tool use."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[Ring-2.6-1T](https://huggingface.co/inclusionAI/Ring-2.6-1T) is InclusionAI's trillion-parameter flagship reasoning model for real-world complex task execution. It targets agent workflows, engineering development, scientific research analysis, enterprise automation, and other long-horizon settings where the model must plan, use tools, recover from intermediate errors, and keep context across multiple steps.
+
+**Key Features:**
+
+- **Trillion-Scale Reasoning Model**: `BailingMoeV2_5ForCausalLM` with a `bailing_hybrid` architecture, 80 hidden layers, 256 routed experts, 8 selected experts per token, and FP8 compressed-tensors weights.
+- **Agent Execution**: Designed for multi-step task decomposition, tool collaboration, context continuation, and long-horizon execution. The model card reports 87.60 on PinchBench, 63.82 on ClawEval, and 95.32 on Tau2-Bench Telecom for the `high` setting.
+- **Reasoning Effort**: The model card describes `high` and `xhigh` reasoning-effort modes. In SGLang's OpenAI-compatible chat API, use top-level `reasoning_effort: "high"` for production agent workflows. To request the model-card `xhigh` prompt path, pass it through `chat_template_kwargs.reasoning_effort`.
+- **Hybrid Attention**: Uses the Bailing hybrid stack with MLA plus Lightning linear attention kernels in SGLang.
+- **Context Length**: Native 128K in the released config. Configure YaRN separately if you need a 256K deployment.
+
+**Available Models:**
+
+- **FP8 (E4M3 compressed-tensors)**: [inclusionAI/Ring-2.6-1T](https://huggingface.co/inclusionAI/Ring-2.6-1T)
+
+**License:** MIT
+
+## 2. SGLang Installation
+
+Ring-2.6-1T requires recent SGLang builds with Bailing hybrid model support. Start with the latest SGLang Docker image when validating this cookbook:
+
+```bash Command
+docker pull lmsysorg/sglang:latest
+```
+
+For other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
+
+## 3. Model Deployment
+
+Use the selector below to generate a single-node command for the tested hardware targets.
+
+import { Ring261TDeployment } from '/src/snippets/autoregressive/ring-26-1t-deployment.jsx'
+
+<Ring261TDeployment />
+
+### Configuration Tips
+
+- `--trust-remote-code` is required for the model's custom Bailing hybrid implementation.
+- Use `--tp-size 4` on a single 4-GPU GB300 node.
+- Use `--tp-size 8` on a single 8-GPU B200 node.
+- Use `--mem-fraction-static 0.95` on GB300 x4. The model uses about 238.5GB/GPU after loading, so lower values can fail during KV-pool initialization.
+- Use `--mem-fraction-static 0.8` on B200 x8.
+- `--model-loader-extra-config '{"enable_multithread_load":"true","num_threads":64}'` is recommended because the model has 175 large safetensors shards.
+- Keep `--tool-call-parser glm` enabled by default for OpenAI-compatible tool calls. Ring's template emits XML `<arg_key>/<arg_value>` tool calls, which the `qwen` parser does not convert into `message.tool_calls`.
+- Keep `--reasoning-parser deepseek-r1` enabled by default so `<think>...</think>` content is split into `message.reasoning_content`.
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For example, launch the server on a single 4-GPU GB300 node:
+
+```bash Command
+export PORT=30000
+
+sglang serve \
+  --model-path inclusionAI/Ring-2.6-1T \
+  --tp-size 4 \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port ${PORT} \
+  --mem-fraction-static 0.95 \
+  --model-loader-extra-config '{"enable_multithread_load":"true","num_threads":64}' \
+  --tool-call-parser glm \
+  --reasoning-parser deepseek-r1
+```
+
+Send a basic chat request:
+
+```bash Command
+curl -s http://localhost:${PORT}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "max_tokens": 128
+  }'
+```
+
+### 4.2 Reasoning Effort
+
+Ring-2.6-1T exposes two reasoning-effort levels in the model card: `high` and `xhigh`. In SGLang's OpenAI-compatible chat API, start with top-level `reasoning_effort: "high"` for agent and production workflows:
+
+```bash Command
+curl -s http://localhost:${PORT}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "Solve: if 3x + 7 = 52, what is x?"}],
+    "reasoning_effort": "high",
+    "max_tokens": 512
+}'
+```
+
+For the model-card `xhigh` path, pass the template value explicitly:
+
+```bash Command
+curl -s http://localhost:${PORT}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "Solve: if 3x + 7 = 52, what is x?"}],
+    "chat_template_kwargs": {"reasoning_effort": "xhigh"},
+    "max_tokens": 512
+  }'
+```
+
+With the default deployment command, thinking text is separated into `message.reasoning_content` when the model emits `<think>...</think>` blocks.
+
+### 4.3 Tool Calling Example
+
+```bash Command
+curl -s http://localhost:${PORT}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "What is the weather in Beijing?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a location",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string", "description": "The city name"}
+          },
+          "required": ["location"]
+        }
+      }
+    }],
+    "tool_choice": "auto",
+    "max_tokens": 512
+  }'
+```
+
+For more API examples, see the [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request).
+
+## 5. Benchmark
+
+### 5.1 Speed Benchmark
+
+- Hardware: NVIDIA B200 GPU (8x) and NVIDIA GB300 GPU (4x)
+- Model: `inclusionAI/Ring-2.6-1T`
+- Docker image: `lmsysorg/sglang:latest`
+- SGLang version tested: `0.5.11`
+- Tensor Parallelism: 8 on B200 x8, 4 on GB300 x4
+
+Use the deployment command from [Section 3](#3-model-deployment), then confirm that the server is healthy before running benchmarks:
+
+```bash Command
+curl -s http://localhost:${PORT}/health
+curl -s http://localhost:${PORT}/v1/models
+```
+
+#### 5.1.1 Latency-Sensitive Benchmark
+
+- Test Command:
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port ${PORT} \
+  --model inclusionAI/Ring-2.6-1T \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+- Test Results (B200 x8):
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  207.18
+Total input tokens:                      6101
+Total generated tokens:                  4220
+Request throughput (req/s):              0.05
+Input token throughput (tok/s):          29.45
+Output token throughput (tok/s):         20.37
+Total token throughput (tok/s):          49.82
+Mean E2E Latency (ms):                   20715.16
+Mean TTFT (ms):                          187.86
+Mean TPOT (ms):                          44.65
+Mean ITL (ms):                           48.76
+==================================================
+```
+
+- Test Results (GB300 x4):
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  62.21
+Total input tokens:                      6101
+Total generated tokens:                  4220
+Request throughput (req/s):              0.16
+Input token throughput (tok/s):          98.07
+Output token throughput (tok/s):         67.83
+Total token throughput (tok/s):          165.91
+Mean E2E Latency (ms):                   6218.57
+Mean TTFT (ms):                          233.04
+Mean TPOT (ms):                          14.21
+Mean ITL (ms):                           14.22
+==================================================
+```
+
+#### 5.1.2 Throughput-Sensitive Benchmark
+
+- Test Command:
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port ${PORT} \
+  --model inclusionAI/Ring-2.6-1T \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 100 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+- Test Results (B200 x8):
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     100
+Benchmark duration (s):                  46.30
+Total input tokens:                      50561
+Total generated tokens:                  52444
+Request throughput (req/s):              2.16
+Input token throughput (tok/s):          1092.10
+Output token throughput (tok/s):         1132.77
+Total token throughput (tok/s):          2224.86
+Mean E2E Latency (ms):                   27581.74
+Mean TTFT (ms):                          1710.53
+Mean TPOT (ms):                          51.27
+Mean ITL (ms):                           49.43
+==================================================
+```
+
+- Test Results (GB300 x4):
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     100
+Benchmark duration (s):                  55.80
+Total input tokens:                      50561
+Total generated tokens:                  52444
+Request throughput (req/s):              1.79
+Input token throughput (tok/s):          906.10
+Output token throughput (tok/s):         939.84
+Total token throughput (tok/s):          1845.94
+Mean E2E Latency (ms):                   33736.85
+Mean TTFT (ms):                          2156.40
+Mean TPOT (ms):                          63.09
+Mean ITL (ms):                           60.33
+==================================================
+```
+
+### 5.2 Accuracy Benchmark
+
+#### 5.2.1 GSM8K Benchmark
+
+- Benchmark Command:
+
+```bash Command
+python3 -m sglang.test.run_eval \
+  --eval-name gsm8k \
+  --host 127.0.0.1 \
+  --port ${PORT} \
+  --model auto \
+  --num-examples 200 \
+  --num-threads 64 \
+  --max-tokens 2048 \
+  --reasoning-effort high
+```
+
+- Test Results (B200 x8):
+
+```text Output
+Total latency: 100.378 s
+Score: 0.990
+Output throughput: 627.401 token/s
+```
+
+- Test Results (GB300 x4):
+
+```text Output
+Total latency: 98.386 s
+Score: 0.990
+Output throughput: 621.469 token/s
+```
