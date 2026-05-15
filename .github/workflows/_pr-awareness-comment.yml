@@ -70,7 +70,7 @@ jobs:
             // label the run is label-gate-skipped and contains nothing but
             // call-pr-awareness itself — linking to it would be misleading, so
             // we inline a warning notice in the slot instead.
-            const notEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt into nightly-class coverage.';
+            const notEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
             const newPrTest = (kind === 'pr-test')
               ? `[Run #${context.runId}](${runUrl})`
               : (prevPrTest || '_Not run yet_');
