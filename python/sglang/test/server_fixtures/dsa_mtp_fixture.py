@@ -1,15 +1,17 @@
 """DSA model + MTP (EAGLE) speculative-decoding server fixture.
 
-Variants combine this base with `GSM8KMixin` and `SpecDecodingMixin`, set
-`model` and any per-variant overrides (e.g. `enable_dp_attention`,
-`mem_fraction_static`), and provide a `bs_1_speed_thres`.
+Variants combine `DsaMtpServerBase` (server lifecycle) with
+`DsaMtpEvalConfigDefaults` (shared eval thresholds/params),
+`GSM8KMixin` and `SpecDecodingMixin`, then set `model` and per-variant
+overrides (`enable_dp_attention`, `mem_fraction_static`, `bs_1_speed_thres`).
 
 Example:
-    from sglang.test.server_fixtures.dsa_mtp_fixture import DsaMtpServerBase
-    from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-    from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
-
-    class TestDsv32DP(DsaMtpServerBase, GSM8KMixin, SpecDecodingMixin):
+    class TestDsv32DP(
+        DsaMtpServerBase,
+        DsaMtpEvalConfigDefaults,
+        GSM8KMixin,
+        SpecDecodingMixin,
+    ):
         model = "deepseek-ai/DeepSeek-V3.2"
         enable_dp_attention = True
         bs_1_speed_thres = 90
@@ -27,6 +29,20 @@ from sglang.test.test_utils import (
 )
 
 
+class DsaMtpEvalConfigDefaults:
+    """Eval thresholds & params shared across DSA-MTP regression variants."""
+
+    # GSM8KMixin defaults.
+    gsm8k_accuracy_thres = 0.94
+    gsm8k_accept_length_thres = 2.7
+    gsm8k_num_questions = 500
+    gsm8k_num_threads = 500
+    gsm8k_num_shots = 20
+
+    # SpecDecodingMixin default; per-variant subclasses set `bs_1_speed_thres`.
+    accept_length_thres = 2.7
+
+
 class DsaMtpServerBase(CustomTestCase):
     base_url = DEFAULT_URL_FOR_TEST
 
@@ -40,16 +56,6 @@ class DsaMtpServerBase(CustomTestCase):
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int = 4
-
-    # GSM8KMixin defaults tuned for DSA MTP accuracy regression.
-    gsm8k_accuracy_thres = 0.94
-    gsm8k_accept_length_thres = 2.7
-    gsm8k_num_questions = 500
-    gsm8k_num_threads = 500
-    gsm8k_num_shots = 20
-
-    # SpecDecodingMixin default; per-variant subclasses set `bs_1_speed_thres`.
-    accept_length_thres = 2.7
 
     @classmethod
     def get_server_args(cls):
