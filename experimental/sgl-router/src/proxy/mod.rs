@@ -174,6 +174,12 @@ impl Proxy {
 
     /// Breaker-gated streaming POST: checks `breaker.allow()` first, records
     /// success/failure, and returns `ApiError::ServiceUnavailable` when Open.
+    ///
+    /// `load_guard` — when `Some`, the guard is threaded into the SSE pump
+    /// task and held for the entire body lifetime (headers → last byte /
+    /// client disconnect).  This ensures `worker.active_load()` stays > 0 for
+    /// long-running streams, which is required for power-of-two routing
+    /// accuracy.  Pass `None` if the caller manages the guard externally.
     pub async fn forward_streaming_to(
         &self,
         worker_url: &str,
@@ -181,6 +187,7 @@ impl Proxy {
         path: &str,
         headers: &HeaderMap,
         body: Bytes,
+        load_guard: Option<crate::workers::LoadGuard>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::ServiceUnavailable(
@@ -225,7 +232,7 @@ impl Proxy {
         } else {
             upstream_ct
         };
-        let body = sse::bytes_stream_to_body(resp.bytes_stream());
+        let body = sse::bytes_stream_to_body(resp.bytes_stream(), load_guard);
         let mut out = Response::new(body);
         *out.status_mut() = status;
         out.headers_mut().insert(

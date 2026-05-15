@@ -6,4 +6,5 @@ pub mod registry;
 pub mod worker;
 
 pub use registry::WorkerRegistry;
+pub use worker::LoadGuard;
 pub use worker::Worker;

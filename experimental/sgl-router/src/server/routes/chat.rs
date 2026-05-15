@@ -78,9 +78,12 @@ pub async fn chat_completions(
         .select(&workers, &selection_ctx)
         .ok_or_else(|| ApiError::ServiceUnavailable("policy returned no worker".into()))?;
 
-    let _guard = worker.load_guard();
+    let guard = worker.load_guard();
 
     if streaming {
+        // Hand the guard to the streaming body task; it is held until the
+        // SSE pump finishes (last byte or client disconnect), not just until
+        // this handler returns (which happens when headers arrive).
         ctx.proxy
             .forward_streaming_to(
                 &worker.url,
@@ -88,9 +91,13 @@ pub async fn chat_completions(
                 "/v1/chat/completions",
                 &headers,
                 body,
+                Some(guard),
             )
             .await
     } else {
+        // Non-streaming: the handler awaits the full buffered response, so
+        // the guard lives correctly in this scope.
+        let _hold = guard;
         ctx.proxy
             .forward_json_to(
                 &worker.url,
