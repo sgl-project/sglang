@@ -76,7 +76,7 @@ permissions:
   actions: write
   contents: read
   issues: read
-  pull-requests: write
+  pull-requests: read
 
 jobs:
   # =============================================== check changes ====================================================
@@ -111,6 +111,8 @@ jobs:
   call-pr-awareness:
     needs: check-changes
     if: always() && github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
     uses: ./.github/workflows/_pr-awareness-comment.yml
     with:
       workflow_kind: pr-test-extra
