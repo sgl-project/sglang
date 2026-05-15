@@ -518,6 +518,24 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.image_encoder_cpu_offload)
         self.assertIsNone(args.layerwise_offload_components)
 
+    def test_auto_multi_gpu_ltx_keeps_component_cpu_offload_with_resident_dit(self):
+        args = self._from_dict_with_pipeline_config(
+            LTX2PipelineConfig(),
+            available_memory_gb=76,
+            kwargs={
+                "model_path": "Lightricks/LTX-2",
+                "num_gpus": 2,
+                "pipeline_class_name": "LTX2TwoStagePipeline",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.image_encoder_cpu_offload)
+        self.assertIsNone(args.layerwise_offload_components)
+
     def test_auto_multi_gpu_qwen_replaces_text_encoder_offload_with_cfg(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
