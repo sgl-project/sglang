@@ -3,4 +3,5 @@
 
 pub mod app;
 pub mod app_context;
+pub mod error;
 pub mod routes;
