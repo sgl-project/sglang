@@ -1197,7 +1197,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.moe_runner.aiter import (
                 AiterMoeQuantInfo,
                 AiterQuantType,
-                get_aiter_expert_mask,
             )
 
             if hasattr(torch, "float4_e2m1fn_x2"):
@@ -1218,7 +1217,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_scale=layer.w2_weight_scale,
                 b13=layer.w13_weight_bias,
                 b2=layer.w2_weight_bias,
-                expert_mask=get_aiter_expert_mask(layer),
+                expert_mask=layer.dispatcher.expert_mask_gpu,
                 doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
@@ -1378,7 +1377,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
-            get_aiter_expert_mask,
         )
 
         if hasattr(torch, "float4_e2m1fn_x2"):
@@ -1398,6 +1396,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
             quant_type=AiterQuantType.PER_1X32,
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            expert_mask=get_aiter_expert_mask(layer),
+            expert_mask=layer.dispatcher.expert_mask_gpu,
         )
         return self.runner.run(dispatch_output, quant_info)

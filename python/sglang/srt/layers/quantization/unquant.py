@@ -491,14 +491,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             if self._aiter_runner is not None:
                 from sglang.srt.layers.moe.moe_runner.aiter import (
                     AiterMoeQuantInfo,
-                    get_aiter_expert_mask,
                 )
 
                 try:
                     quant_info = AiterMoeQuantInfo(
                         w13_weight=layer.w13_weight,
                         w2_weight=layer.w2_weight,
-                        expert_mask=get_aiter_expert_mask(layer),
+                        expert_mask=layer.dispatcher.expert_mask_gpu,
                     )
                     return self._aiter_runner.run(dispatch_output, quant_info)
                 except RuntimeError as e:

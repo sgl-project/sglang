@@ -102,10 +102,6 @@ def _aiter_quant_type(quant_type: AiterQuantType):
     return getattr(QuantType, quant_type.value)
 
 
-def get_aiter_expert_mask(layer) -> Optional[torch.Tensor]:
-    return getattr(layer.dispatcher, "expert_mask_gpu", None)
-
-
 class AiterRunnerCore(MoeRunnerCore):
     def run(
         self,

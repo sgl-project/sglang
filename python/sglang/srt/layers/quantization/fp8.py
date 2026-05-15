@@ -1929,7 +1929,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
-            get_aiter_expert_mask,
         )
 
         if _use_aiter and self.block_quant:
@@ -1946,7 +1945,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_type=quant_type,
             w13_scale=w13_scale,
             w2_scale=w2_scale,
-            expert_mask=get_aiter_expert_mask(layer) if _use_aiter else None,
+            expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
         )
 
 
