@@ -757,11 +757,10 @@ def configure_layerwise_offload_modules(
 
         configured_module_ids.add(module_id)
 
-        if is_layerwise_offloaded_module(module):
-            # already offloaded
-            configured_component_names.append(component_name)
-        else:
+        if not is_layerwise_offloaded_module(module):
             module.configure_layerwise_offload(server_args)
+        if is_layerwise_offloaded_module(module):
+            configured_component_names.append(component_name)
 
     if configured_component_names:
         logger.info(

@@ -30,6 +30,9 @@ class ServerArgsAutoTuner:
     def __init__(self, server_args: "ServerArgs"):
         self.server_args = server_args
         self._explicit_memory_policy = self._has_explicit_memory_policy()
+        self._explicit_layerwise_replacement_policy = (
+            self._has_explicit_layerwise_replacement_policy()
+        )
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
@@ -186,7 +189,7 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if (
             not self.could_override_server_args()
-            or self._explicit_memory_policy
+            or self._explicit_layerwise_replacement_policy
             or current_platform.is_cpu()
             or not current_platform.is_cuda()
             or envs.SGLANG_CACHE_DIT_ENABLED
@@ -343,6 +346,16 @@ class ServerArgsAutoTuner:
             or args.layerwise_offload_components is not None
             or args.text_encoder_cpu_offload is not None
             or args.image_encoder_cpu_offload is not None
+        )
+
+    def _has_explicit_layerwise_replacement_policy(self) -> bool:
+        args = self.server_args
+        return (
+            args.dit_layerwise_offload is not None
+            or args.layerwise_offload_components is not None
+            or args.text_encoder_cpu_offload is not None
+            or args.image_encoder_cpu_offload is not None
+            or args.vae_cpu_offload is True
         )
 
     def _has_explicit_parallel_policy(self) -> bool:
