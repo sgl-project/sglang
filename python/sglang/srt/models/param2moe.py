@@ -18,7 +18,6 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    parallel_state,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -44,13 +43,11 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
-    get_deepep_mode,
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -360,21 +357,11 @@ class Param2MoESparseMoeBlock(nn.Module):
         else:
             self.shared_experts = None
 
-        # ---- DeepEP all-to-all dispatcher (optional) --------------------- #
-        if get_moe_a2a_backend().is_deepep():
-            self.ep_size = get_tensor_model_parallel_world_size()
-            self.deepep_dispatcher = DeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
-                router_topk=self.top_k,
-                permute_fusion=True,
-                num_experts=self.num_experts,
-                num_local_experts=config.num_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                deepep_mode=get_deepep_mode(),
-                async_finish=True,
-                return_recv_hook=True,
-            )
+        # NOTE: No standalone DeepEPDispatcher is created here.
+        # The DeepEPMoE expert layer (self.experts) creates its own internal
+        # dispatcher. A second dispatcher would waste GPU memory due to the
+        # large communication buffers allocated by DeepEP and is never used
+        # by forward_deepep (which delegates directly to self.experts).
 
     def forward(
         self,
@@ -401,7 +388,7 @@ class Param2MoESparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor
     ) -> Optional[torch.Tensor]:
         """Return shared-expert output, or None when there are no shared experts."""
-        if self.num_shared_experts > 0:
+        if self.num_shared_experts:
             return self.shared_experts(hidden_states)
         return None
 
@@ -452,7 +439,7 @@ class Param2MoESparseMoeBlock(nn.Module):
             shared_output = self._forward_shared_experts(hidden_states)
             final_hidden_states = self._forward_router_experts(hidden_states)
 
-        if self.num_shared_experts > 0:
+        if self.num_shared_experts:
             final_hidden_states = final_hidden_states + shared_output
 
         if (
@@ -474,7 +461,7 @@ class Param2MoESparseMoeBlock(nn.Module):
         forward_mode = forward_batch.forward_mode
         if is_non_idle_and_non_empty(forward_mode, hidden_states):
             router_logits = self.gate(hidden_states)
-            if self.num_shared_experts > 0:
+            if self.num_shared_experts:
                 shared_output = self.shared_experts(hidden_states)
 
             topk_output = self.topk(
