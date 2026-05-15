@@ -2146,19 +2146,19 @@ class DeepseekV2Model(nn.Module):
         if (
             _use_aiter_gfx95
             and config.n_routed_experts == 256
-            and self.embed_tokens.embedding_dim == 7168
+            and getattr(self.embed_tokens, "embedding_dim", None) == 7168
         ):
             num_moe_layers = sum(
                 [
                     1
                     for i in range(len(self.layers))
-                    if isinstance(self.layers[i].mlp, DeepseekV2MoE)
+                    if isinstance(getattr(self.layers[i], "mlp", None), DeepseekV2MoE)
                 ]
             )
 
             allocate_size = 0
             for i in range(len(self.layers)):
-                if isinstance(self.layers[i].mlp, DeepseekV2MoE):
+                if isinstance(getattr(self.layers[i], "mlp", None), DeepseekV2MoE):
                     # tp_size = get_tensor_model_parallel_world_size()
                     is_a2a_moe = is_deepep_class_backend()
                     tp_size = (
@@ -2178,7 +2178,7 @@ class DeepseekV2Model(nn.Module):
                     config.n_routed_experts,
                     num_moe_layers,
                     allocate_size,
-                    self.embed_tokens.embedding_dim,
+                    getattr(self.embed_tokens, "embedding_dim", 0),
                 )
             )
         self.layers_to_capture = []
