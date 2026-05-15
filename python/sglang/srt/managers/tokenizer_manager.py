@@ -2417,7 +2417,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        state = self.rid_to_state.get(recv_obj.rid, None)
+        if state is None:
+            # Request already cleaned up (race condition)
+            logger.debug(f"Abort request for unknown rid {recv_obj.rid}, already cleaned up")
+            return
         state.finished = True
         state.time_stats.set_finished_time()
 
