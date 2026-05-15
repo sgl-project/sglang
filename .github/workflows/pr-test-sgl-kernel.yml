@@ -6,7 +6,7 @@ on:
       sgl_kernel:
         required: true
         type: string
-      b200_runner:
+      runs_on:
         required: true
         type: string
       pr_head_sha:
@@ -114,7 +114,7 @@ jobs:
           echo "All benchmark tests completed!"
 
   sgl-kernel-b200-test:
-    runs-on: ${{ inputs.b200_runner }}
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4

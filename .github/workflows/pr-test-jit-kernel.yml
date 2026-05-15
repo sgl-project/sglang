@@ -9,7 +9,7 @@ on:
       sgl_kernel:
         required: true
         type: string
-      b200_runner:
+      runs_on:
         required: true
         type: string
       pr_head_sha:
@@ -169,7 +169,7 @@ jobs:
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != 'true' &&
       !inputs.target_stage
-    runs-on: ${{ inputs.b200_runner }}
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
