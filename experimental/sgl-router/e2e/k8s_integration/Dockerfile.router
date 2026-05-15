@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1.6
+# Build sgl-router binary for k8s integration E2E.
+# Context root: repo root (one level above experimental/sgl-router/).
+
+FROM rust:1.83-bookworm AS builder
+
+RUN apt-get update && apt-get install -y libssl-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy just the sgl-router crate (context is the repo root)
+COPY sgl-router /build/sgl-router
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cd experimental/sgl-router \
+    && cargo build --release --bin sgl-router \
+    && cp target/release/sgl-router /usr/local/bin/sgl-router
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/sgl-router /usr/local/bin/sgl-router
+
+# Tiny tokenizer fixture used by the E2E config
+COPY experimental/sgl-router/tests/fixtures/tiny_tokenizer.json /etc/tokenizer/tiny.json
+
+EXPOSE 8090
+
+CMD ["sgl-router"]
