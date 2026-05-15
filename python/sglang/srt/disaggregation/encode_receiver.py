@@ -193,16 +193,24 @@ _MODALITY_GRID_ATTRS = {
     Modality.VIDEO: ("video_grid_thw", False),
     Modality.AUDIO: ("audio_feature_lens", True),
 }
-# Per-part video metadata; keys must match MiMoProcessor.preprocess_for_encoder.
-# Tensor attrs cat on dim=0 across parts; others chain as lists.
-VIDEO_META_ATTRS = (
+# Per-part video metadata propagated through EPD. Tensor attrs cat on dim=0
+# across parts; others chain as lists. To extend EPD for a new model, add the
+# per-part fields its processor emits at encode time to the appropriate tuple
+# below (and to _VIDEO_META_TENSOR_ATTRS if the value is a tensor).
+_GENERAL_VIDEO_META_ATTRS = (
+    # Common video timing metadata; shared by Qwen2/3-VL family and MiMo-VL.
     "video_timestamps",
     "second_per_grid_ts",
+)
+_MIMO_VIDEO_AUDIO_META_ATTRS = (
+    # Audio-in-video metadata; currently only emitted by MiMoProcessor
+    # (see preprocess_for_encoder), but the names are model-agnostic.
     "video_audio_feature_lens",
     "video_audio_segment_lens_flat",
     "video_audio_per_video_num_units",
     "video_audio_embedding",
 )
+VIDEO_META_ATTRS = _GENERAL_VIDEO_META_ATTRS + _MIMO_VIDEO_AUDIO_META_ATTRS
 _VIDEO_META_TENSOR_ATTRS = ("video_audio_feature_lens", "video_audio_embedding")
 
 
