@@ -15,18 +15,17 @@ import logging
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.lfm2 import Lfm2Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -72,32 +71,28 @@ class Lfm2MLP(nn.Module):
                     // config.block_multiple_of
                 )
 
-        self.w1 = ColumnParallelLinear(
+        # w1 (gate) + w3 (up) are merged into gate_up_proj so the LoRA system
+        # can wrap them with a single MergedColumnParallelLinearWithLoRA.
+        self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
-            intermediate_size,
+            [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("w1", prefix),
+            prefix=add_prefix("gate_up_proj", prefix),
         )
-        self.w3 = ColumnParallelLinear(
-            config.hidden_size,
-            intermediate_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("w3", prefix),
-        )
-        self.w2 = RowParallelLinear(
+        self.down_proj = RowParallelLinear(
             intermediate_size,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("w2", prefix),
+            prefix=add_prefix("down_proj", prefix),
         )
+        self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, _ = self.w1(x)
-        up, _ = self.w3(x)
-        out, _ = self.w2(F.silu(gate) * up)
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        out, _ = self.down_proj(x)
         return out
 
 
@@ -453,6 +448,14 @@ class Lfm2ForCausalLM(nn.Module):
 
     fall_back_to_pt_during_load = False
 
+    supported_lora_modules = [
+        "qkv_proj",
+        "out_proj",
+        "gate_up_proj",
+        "down_proj",
+        "in_proj",
+    ]
+
     def __init__(
         self,
         config: Lfm2Config,
@@ -482,6 +485,60 @@ class Lfm2ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """Return (input_dim, output_dim) for each LoRA-supported module.
+
+        Used by SGLang's LoRA system to size the per-rank GPU buffers.
+        Mirrors the dim logic in Lfm2MLP / Lfm2Attention / Lfm2ShortConv.
+        """
+        config = self.config
+        hidden_size = config.hidden_size
+        head_dim = getattr(config, "head_dim", None) or (
+            hidden_size // config.num_attention_heads
+        )
+
+        intermediate_size = config.intermediate_size
+        if config.block_auto_adjust_ff_dim:
+            intermediate_size = int(2 * intermediate_size / 3)
+            if config.block_ffn_dim_multiplier is not None:
+                intermediate_size = int(
+                    config.block_ffn_dim_multiplier * intermediate_size
+                )
+                intermediate_size = config.block_multiple_of * (
+                    (intermediate_size + config.block_multiple_of - 1)
+                    // config.block_multiple_of
+                )
+
+        if module_name == "qkv_proj":
+            q_dim = head_dim * config.num_attention_heads
+            kv_dim = head_dim * config.num_key_value_heads
+            return hidden_size, q_dim + 2 * kv_dim
+        elif module_name == "out_proj":
+            # Same shape for attention out_proj and ShortConv out_proj.
+            return hidden_size, hidden_size
+        elif module_name == "gate_up_proj":
+            return hidden_size, 2 * intermediate_size
+        elif module_name == "down_proj":
+            return intermediate_size, hidden_size
+        elif module_name == "in_proj":
+            # ShortConv in_proj: hidden -> 3*hidden (B, C, x gates stacked).
+            return hidden_size, 3 * hidden_size
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
+
+    def get_stacked_multiply(self, module_name: str) -> int:
+        """Override the global stacked_rank for LFM2-specific module shapes."""
+        if module_name == "in_proj":
+            # ShortConv in_proj packs 3 sub-projections (B, C, x). The
+            # adapter's B matrix is full-width (3*hidden); its single A
+            # gets replicated 3× by lora.py's _replicate_merged_in_proj_lora_a.
+            return 3
+        from sglang.srt.lora.utils import get_stacked_multiply
+
+        return get_stacked_multiply(module_name)
+
     @torch.no_grad()
     def forward(
         self,
@@ -503,6 +560,9 @@ class Lfm2ForCausalLM(nn.Module):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            # MLP w1/w3 -> merged gate_up_proj (shard 0 = gate, 1 = up).
+            ("gate_up_proj", "w1", 0),
+            ("gate_up_proj", "w3", 1),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -523,7 +583,11 @@ class Lfm2ForCausalLM(nn.Module):
             if ".conv.conv.bias" in name:
                 name = name.replace(".conv.conv.bias", ".conv.conv_bias")
 
-            # Handle QKV stacking
+            # Rename HF down projection (w2) to down_proj (our merged MLP convention).
+            if ".feed_forward.w2." in name:
+                name = name.replace(".feed_forward.w2.", ".feed_forward.down_proj.")
+
+            # Handle QKV + gate_up stacking
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue

@@ -3568,6 +3568,12 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "gate_up_proj",
     "embed_tokens",
     "lm_head",
+    "w1",
+    "w2",
+    "w3",
+    "in_proj",
+    "out_proj",
+    "gate",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

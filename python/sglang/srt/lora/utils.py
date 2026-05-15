@@ -209,6 +209,9 @@ def get_normalized_target_modules(
         "unembed_tokens": "lm_head",
         "q_a_proj": "fused_qkv_a_proj_with_mqa",
         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
+        "w1": "gate_up_proj",
+        "w3": "gate_up_proj",
+        "w2": "down_proj",
     }
 
     result = set()
@@ -288,6 +291,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "fused_qkv_a_proj_with_mqa",
         "q_b_proj",
         "kv_b_proj",
+        "gate",
     }
 )
 
