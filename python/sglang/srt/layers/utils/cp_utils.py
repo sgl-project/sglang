@@ -550,3 +550,56 @@ def prepare_context_parallel_metadata(
         total_seq_lens=kv_len_origin,
     )
     return attn_cp_metadata
+
+
+def owner_for_page(global_page_idx: int, total_pages: int, cp_size: int) -> int:
+    """Return the CP rank that owns ``global_page_idx`` under contiguous
+    partitioning.
+
+    Inverse of ``page_indices_to_cp_rank_page_indices``
+    (``sglang/srt/disaggregation/utils.py:page_indices_to_cp_rank_page_indices``).
+    With ``rem = total_pages % cp_size``, the first ``rem`` ranks each own
+    ``base + 1`` pages and the rest own ``base`` pages. Per-request imbalance
+    is at most one page; aggregate skew across many requests is bounded by
+    ``cp_size - 1`` pages per rank, which is well within tolerance for v1.
+
+    Identical on every CP rank because both inputs and the rule are
+    deterministic - this is the SPMD-safe source of truth for ``cp_owner``.
+    """
+    if cp_size <= 0:
+        raise ValueError(f"cp_size must be positive, got {cp_size}")
+    if not (0 <= global_page_idx < total_pages):
+        raise IndexError(
+            f"global_page_idx={global_page_idx} out of range for total_pages={total_pages}"
+        )
+    base = total_pages // cp_size
+    rem = total_pages % cp_size
+    if rem == 0:
+        return global_page_idx // base
+    boundary = rem * (base + 1)
+    if global_page_idx < boundary:
+        return global_page_idx // (base + 1)
+    return rem + (global_page_idx - boundary) // base
+
+
+def compute_cp_owner_per_page(
+    total_tokens: int, page_size: int, cp_size: int
+) -> torch.Tensor:
+    """Build the per-page CP-owner tensor for a request of ``total_tokens``.
+
+    Returns an int8 tensor of length ``total_tokens // page_size`` where entry
+    ``i`` is the CP rank that owns the i-th page. Mirrored across CP ranks -
+    every rank computes the same result given the same inputs.
+
+    The trailing partial page (``total_tokens % page_size``) is not included
+    because the radix tree only caches page-aligned tokens.
+    """
+    if cp_size <= 0:
+        raise ValueError(f"cp_size must be positive, got {cp_size}")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    total_pages = total_tokens // page_size
+    if total_pages == 0:
+        return torch.empty((0,), dtype=torch.int8)
+    owners = [owner_for_page(i, total_pages, cp_size) for i in range(total_pages)]
+    return torch.tensor(owners, dtype=torch.int8)

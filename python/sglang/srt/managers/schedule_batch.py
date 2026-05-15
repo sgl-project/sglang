@@ -752,6 +752,12 @@ class Req(ReqDllmMixin):
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
+        # CP KV-resharding (v4): per-page owner array. Populated at admission
+        # when --enable-cp-kv-reshard is set; None otherwise. Covers the
+        # page-aligned input length and is locked at admission so the same
+        # logical page maps to the same CP rank across chunked-prefill chunks.
+        self.cp_owner_per_page: Optional[torch.Tensor] = None
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.

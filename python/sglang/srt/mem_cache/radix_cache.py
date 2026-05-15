@@ -24,6 +24,7 @@ The radix tree data structure for managing the KV cache.
 import hashlib
 import heapq
 import logging
+import os
 import sys
 import time
 from collections import defaultdict
@@ -227,6 +228,12 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
+        # CP KV-resharding (v4): per-page CP owner. int8 tensor of length
+        # len(key) // page_size, or None when not in CP-resharding mode.
+        # Mirrored across CP ranks (every rank stores the same array per
+        # node); only node.value differs per rank.
+        self.cp_owner_per_page: Optional[torch.Tensor] = None
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -264,6 +271,21 @@ class TreeNode:
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
+
+
+def _filter_pool_rows(indices: torch.Tensor) -> torch.Tensor:
+    """Drop slot-0 sentinels before passing a TreeNode.value (or any per-rank
+    page-table slice) to ``allocator.free``.
+
+    Under CP KV-resharding (v4), positions a CP rank does not own are
+    represented by slot-0 sentinels in the per-rank value projection. The
+    KV-pool allocator reserves slot 0; freeing it would corrupt the free
+    list. Non-CP mode never produces zero indices (real pool rows start at
+    1), so this filter is a no-op there and safe to apply unconditionally.
+    """
+    if indices is None:
+        return indices
+    return indices[indices != 0]
 
 
 class RadixCache(KVCacheEventMixin, BasePrefixCache):
@@ -312,7 +334,35 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         self.evictable_leaves = set()
+
+        # CP KV-resharding (v4): IPC eviction consensus. When the
+        # scheduler enables this via enable_cp_consensus(), evict() runs
+        # the rank-0 leader-driven protocol from DESIGN_kv_reshard.md §5:
+        # rank 0 picks victims locally and broadcasts their root-to-node
+        # paths; every CP rank then frees the same set so MirroredCpAvailability
+        # stays in sync with actual pool state. Default (None) keeps the
+        # local-only eviction path used everywhere outside CP-resharding.
+        self.cp_attn_group: Optional[Any] = None
+        self.cp_rank: int = 0
+        self.cp_size: int = 1
+
         self.reset()
+
+    def enable_cp_consensus(
+        self, attn_cp_group: Any, cp_rank: int, cp_size: int
+    ) -> None:
+        """Activate the rank-0 IPC eviction consensus path.
+
+        ``attn_cp_group`` must expose ``broadcast_object(obj, src=int)``
+        (matching ``sglang.srt.distributed.parallel_state.GroupCoordinator``).
+        Called once at scheduler init when ``--enable-cp-kv-reshard`` is
+        set. A no-op when ``cp_size <= 1`` so callers don't need to branch.
+        """
+        if cp_size <= 1:
+            return
+        self.cp_attn_group = attn_cp_group
+        self.cp_rank = cp_rank
+        self.cp_size = cp_size
 
     @classmethod
     def create_simulated(
@@ -423,6 +473,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         value = params.value
         priority = params.priority
         chunked = params.chunked
+        cp_owner_per_page = params.cp_owner_per_page
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
         key = key.page_aligned(self.page_size)
@@ -431,8 +482,13 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
+        if cp_owner_per_page is not None:
+            # Truncate cp_owner_per_page to match the page-aligned key length.
+            cp_owner_per_page = cp_owner_per_page[: len(key) // self.page_size]
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
+        prefix_len = self._insert_helper(
+            self.root_node, key, value, priority, chunked, cp_owner_per_page
+        )
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
@@ -446,7 +502,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free(_filter_pool_rows(kv_indices))
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
@@ -460,23 +516,37 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
+        # CP KV-resharding (v4): slice the per-page owner array to cover the
+        # page-aligned radix key. None when CP resharding is disabled or for
+        # legacy Req-like mocks that don't carry the field.
+        cp_owner_per_page = getattr(req, "cp_owner_per_page", None)
+        if cp_owner_per_page is not None:
+            cp_owner_per_page = cp_owner_per_page[: key_len // self.page_size]
+
         # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    priority=priority,
+                    cp_owner_per_page=cp_owner_per_page,
+                )
             )
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : result.prefix_len]
+                _filter_pool_rows(
+                    kv_indices[req.cache_protected_len : result.prefix_len]
+                )
             )
         else:
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : key_len]
+                _filter_pool_rows(kv_indices[req.cache_protected_len : key_len])
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
+        self.token_to_kv_pool_allocator.free(_filter_pool_rows(kv_indices[key_len:]))
 
         # Remove req slot release the cache lock
         if req.last_node is not None:
@@ -497,6 +567,13 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
+        # CP KV-resharding (v4): slice the per-page owner array to cover the
+        # page-aligned radix key. None when CP resharding is disabled or for
+        # legacy Req-like mocks that don't carry the field.
+        cp_owner_per_page = getattr(req, "cp_owner_per_page", None)
+        if cp_owner_per_page is not None:
+            cp_owner_per_page = cp_owner_per_page[: len(radix_key) // self.page_size]
+
         # Radix Cache takes one ref in memory pool
         result = self.insert(
             InsertParams(
@@ -504,12 +581,13 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 value=values,
                 chunked=chunked,
                 priority=getattr(req, "priority", 0) or 0,
+                cp_owner_per_page=cp_owner_per_page,
             )
         )
         new_prefix_len = result.prefix_len
 
         self.token_to_kv_pool_allocator.free(
-            kv_indices[req.cache_protected_len : new_prefix_len]
+            _filter_pool_rows(kv_indices[req.cache_protected_len : new_prefix_len])
         )
 
         # The prefix indices could be updated, reuse it
@@ -558,7 +636,48 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
+        if self.cp_attn_group is not None:
+            return self._evict_cp_consensus(params)
+        return self._evict_local(params)
 
+    def _iter_eviction_victims(self, num_tokens: int) -> Iterator[TreeNode]:
+        """Yield evictable leaves in eviction-priority order until the
+        total ``len(victim.value)`` reaches ``num_tokens``. Mirrors
+        ``_evict_local``'s heap-pop loop without mutating the tree; the
+        caller captures whatever it needs from each yielded node. Kept
+        in sync with ``_evict_local`` so rank-0's CP victim selection
+        matches the local-eviction selection followers would compute.
+
+        Parent-promotion is decided before each yield with
+        ``len(parent.children) == 1`` (pre-removal) -- equivalent to
+        ``_evict_local``'s ``len == 0`` check after ``_delete_leaf``.
+        """
+        leaves = list(self.evictable_leaves)
+        eviction_heap = [
+            (self.eviction_strategy.get_priority(node), node) for node in leaves
+        ]
+        heapq.heapify(eviction_heap)
+
+        num_evicted = 0
+        while num_evicted < num_tokens and eviction_heap:
+            _priority, x = heapq.heappop(eviction_heap)
+
+            parent = x.parent
+            promote_parent = (
+                parent is not None
+                and parent is not self.root_node
+                and parent.lock_ref == 0
+                and len(parent.children) == 1
+            )
+
+            num_evicted += len(x.value)
+            yield x
+
+            if promote_parent:
+                new_priority = self.eviction_strategy.get_priority(parent)
+                heapq.heappush(eviction_heap, (new_priority, parent))
+
+    def _evict_local(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
@@ -583,6 +702,117 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
+
+    def _evict_cp_consensus(self, params: EvictParams) -> EvictResult:
+        """Leader-driven eviction (DESIGN_kv_reshard.md §5).
+
+        Rank 0 runs the same heap-pop as ``_evict_local`` and records
+        each victim's root-to-node token path. The path list (plus the
+        total evicted token count) is broadcast over the CP group, and
+        every rank then locates the matching nodes in its own mirrored
+        tree and frees only the locally-owned (sentinel-filtered) rows.
+        One ``broadcast_object`` per call -- no allgather, no allreduce.
+        """
+        start_time = time.perf_counter()
+
+        if self.cp_rank == 0:
+            victim_paths, num_evicted = self._pick_cp_victims(params.num_tokens)
+            payload = {"paths": victim_paths, "num_evicted": num_evicted}
+        else:
+            payload = None
+
+        payload = self.cp_attn_group.broadcast_object(payload, src=0)
+        if os.environ.get("SGLANG_DEBUG_KV_RESHARD"):
+            self._assert_cp_eviction_consensus(payload["paths"])
+
+        self._apply_cp_eviction(payload["paths"])
+
+        self.update_eviction_metrics(payload["num_evicted"], start_time)
+        return EvictResult(num_tokens_evicted=payload["num_evicted"])
+
+    def _pick_cp_victims(self, num_tokens: int) -> Tuple[List[Tuple[int, ...]], int]:
+        """Rank-0-only: capture each victim's root-to-node token path
+        using the shared eviction iterator. Returns (paths, num_evicted)."""
+        paths: List[Tuple[int, ...]] = []
+        num_evicted = 0
+        for x in self._iter_eviction_victims(num_tokens):
+            paths.append(self._full_path_token_ids(x))
+            num_evicted += len(x.value)
+        return paths, num_evicted
+
+    def _apply_cp_eviction(self, paths: List[Tuple[int, ...]]) -> None:
+        """All-ranks: free and delete every node identified by ``paths``."""
+        for path in paths:
+            node = self._lookup_by_path(path)
+            if node is None or node is self.root_node:
+                # Under SPMD invariants this shouldn't happen; tolerate it
+                # so a stale path from a malformed broadcast doesn't crash
+                # the scheduler. The debug verifier above surfaces the bug.
+                continue
+            self.token_to_kv_pool_allocator.free(_filter_pool_rows(node.value))
+            self._delete_leaf(node)
+            self._record_remove_event(node)
+
+    def _assert_cp_eviction_consensus(self, paths: List[Tuple[int, ...]]) -> None:
+        """Debug verifier: allgather a CRC32 over the broadcast paths and
+        assert every rank received the same payload. Catches structural
+        divergence in the mirrored trees that the broadcast itself
+        cannot detect. Only invoked when SGLANG_DEBUG_KV_RESHARD is set."""
+        import zlib
+
+        digest = zlib.crc32(
+            b"".join(
+                len(p).to_bytes(4, "little")
+                + b"".join(int(t).to_bytes(4, "little", signed=False) for t in p)
+                for p in paths
+            )
+        )
+        check = self.cp_attn_group.broadcast_object(digest, src=0)
+        if check != digest:
+            raise AssertionError(
+                f"cp eviction divergence: rank-0 digest={check:#x} != "
+                f"rank-{self.cp_rank} digest={digest:#x}"
+            )
+
+    def _full_path_token_ids(self, node: TreeNode) -> Tuple[int, ...]:
+        """Root-to-node token sequence -- a stable across-rank identifier.
+
+        Every CP rank's mirrored tree contains a node addressable by the
+        same path (the SPMD invariant), so this tuple lets followers
+        find the same victim that rank 0 chose without any process-local
+        identifiers like ``id()``.
+        """
+        segments: List[List[int]] = []
+        n = node
+        while n is not None and n.parent is not None:
+            segments.append(list(n.key.token_ids))
+            n = n.parent
+        flat: List[int] = []
+        for segment in reversed(segments):
+            flat.extend(segment)
+        return tuple(flat)
+
+    def _lookup_by_path(self, path: Tuple[int, ...]) -> Optional[TreeNode]:
+        """Find the TreeNode whose full root-to-node token path equals
+        ``path``. Walks the children dict using the same ``child_key``
+        protocol as ``_match_prefix_helper`` so we never desync from
+        how nodes are indexed."""
+        if len(path) == 0:
+            return self.root_node
+        node = self.root_node
+        i = 0
+        while i < len(path):
+            probe = RadixKey(token_ids=list(path[i:]), extra_key=None)
+            child_id = probe.child_key(self.page_size)
+            child = node.children.get(child_id)
+            if child is None:
+                return None
+            seg_len = len(child.key.token_ids)
+            if tuple(child.key.token_ids) != path[i : i + seg_len]:
+                return None
+            node = child
+            i += seg_len
+        return node
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
@@ -686,6 +916,19 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             child.hash_value, split_len, self.page_size
         )
 
+        # CP KV-resharding (v4): cp_owner_per_page is page-granular and the
+        # split point is page-aligned because key.match() rounds to page_size.
+        # Slice the array so the parent gets the leading pages and the child
+        # keeps the trailing pages. Mirrored across CP ranks (same array on
+        # every rank, sliced identically).
+        if child.cp_owner_per_page is not None:
+            page_split = split_len // self.page_size
+            assert (
+                split_len % self.page_size == 0
+            ), f"split_len={split_len} must be page-aligned for cp_owner slicing"
+            new_node.cp_owner_per_page = child.cp_owner_per_page[:page_split].clone()
+            child.cp_owner_per_page = child.cp_owner_per_page[page_split:].clone()
+
         return new_node
 
     def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
@@ -703,6 +946,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         value,
         priority: int = 0,
         chunked: bool = False,
+        cp_owner_per_page: Optional[torch.Tensor] = None,
     ):
         # Convert None priority to 0
         if priority is None:
@@ -724,6 +968,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
+            # CP KV-resharding (v4): keep cp_owner_per_page aligned with the
+            # remaining key. prefix_len is page-aligned (match() rounds to
+            # page_size) so the slice unit is pages.
+            if cp_owner_per_page is not None:
+                cp_owner_per_page = cp_owner_per_page[prefix_len // self.page_size :]
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -738,9 +987,16 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if len(key):
             new_node = TreeNode(priority=priority)
+            new_node.last_access_time = access_time
+            new_node.creation_time = access_time
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            if cp_owner_per_page is not None:
+                # The leftover key length is page-aligned (page_aligned()
+                # was applied in insert()), so this slice covers it exactly.
+                num_new_pages = len(key) // self.page_size
+                new_node.cp_owner_per_page = cp_owner_per_page[:num_new_pages].clone()
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
