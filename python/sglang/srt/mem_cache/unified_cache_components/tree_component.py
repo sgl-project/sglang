@@ -116,11 +116,15 @@ class TreeComponent(ABC):
         return len(value) if value is not None else 0
 
     @abstractmethod
-    def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
+    def create_match_validator(
+        self, match_device_only: bool = False
+    ) -> Callable[[UnifiedTreeNode], bool]:
         """Return a per-match stateful predicate that decides whether a node
         is a valid match boundary for this component.
         Called once per match_prefix; the returned closure may carry state.
-        - Full: always True (every node is valid).
+        When match_device_only is true, host-backed nodes must not be accepted
+        as valid match boundaries.
+        - Full: returns True if the node has full component data.
         - SWA: tracks accumulated length since last gap; returns True only
           when the contiguous window reaches swa_sliding_window_size.
         - Mamba: returns True iff the node has mamba component data."""
