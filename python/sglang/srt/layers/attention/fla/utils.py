@@ -336,8 +336,4 @@ else:
         return torch.cuda.device(index)
 
 
-def _preferred_block_v() -> int:
-    return 16 if is_intel else 32  # 16 for Intel GPU to reduce register spill
-
-
 device_platform = get_available_device()
