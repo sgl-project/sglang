@@ -193,7 +193,7 @@ class TestSWA(unittest.TestCase):
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
         self.assertEqual(len(second_insert_events), 2)
-        self.assertEqual(second_insert_events[0].token_ids, [5])
+        self.assertEqual(list(second_insert_events[0].token_ids), [5])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
     def test_swa_memory_pool(self):
