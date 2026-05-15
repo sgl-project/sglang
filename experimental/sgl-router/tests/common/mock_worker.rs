@@ -11,7 +11,7 @@ use axum::routing::post;
 use axum::Json;
 use bytes::Bytes;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
@@ -19,7 +19,8 @@ use tokio::sync::oneshot;
 /// Headers captured from the most recent inbound request.
 #[derive(Default)]
 pub struct CapturedHeaders {
-    pub seen: HashSet<String>,
+    pub seen: HashSet<String>,            // names (kept for backwards compat)
+    pub headers: HashMap<String, String>, // name -> value (last write wins)
     pub last_body: Option<Bytes>,
 }
 
@@ -78,22 +79,47 @@ impl MockWorker {
     #[allow(dead_code)]
     pub async fn start_returning_error(status: StatusCode, body: Value) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
-        let body_str = body.to_string();
-        let app = axum::Router::new().route(
-            "/v1/chat/completions",
-            post(move || {
-                let body_str = body_str.clone();
-                async move {
-                    let mut r = Response::new(Body::from(body_str));
-                    *r.status_mut() = status;
-                    r.headers_mut().insert(
-                        HeaderName::from_static("content-type"),
-                        HeaderValue::from_static("application/json"),
-                    );
-                    r
+        let body_arc = Arc::new(body.to_string());
+
+        #[derive(Clone)]
+        struct ErrorState {
+            captured: Arc<Mutex<CapturedHeaders>>,
+            body_str: Arc<String>,
+            status: StatusCode,
+        }
+
+        async fn error_handler(
+            State(s): State<ErrorState>,
+            headers: HeaderMap,
+            _body: Bytes,
+        ) -> Response<Body> {
+            {
+                let mut g = s.captured.lock().unwrap();
+                for (k, v) in headers.iter() {
+                    g.seen.insert(k.as_str().to_string());
+                    if let Ok(val) = v.to_str() {
+                        g.headers.insert(k.as_str().to_string(), val.to_string());
+                    }
                 }
-            }),
-        );
+            }
+            let mut r = Response::new(Body::from(s.body_str.as_ref().clone()));
+            *r.status_mut() = s.status;
+            r.headers_mut().insert(
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/json"),
+            );
+            r
+        }
+
+        let state = ErrorState {
+            captured: captured.clone(),
+            body_str: body_arc,
+            status,
+        };
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", post(error_handler))
+            .with_state(state);
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         let url = format!("http://{addr}");
@@ -118,8 +144,11 @@ async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes)
     {
         let mut g = s.captured.lock().unwrap();
         g.last_body = Some(body.clone());
-        for (k, _v) in headers.iter() {
+        for (k, v) in headers.iter() {
             g.seen.insert(k.as_str().to_string());
+            if let Ok(val) = v.to_str() {
+                g.headers.insert(k.as_str().to_string(), val.to_string());
+            }
         }
     }
     let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);

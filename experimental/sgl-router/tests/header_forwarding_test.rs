@@ -39,6 +39,9 @@ async fn forwards_whitelisted_headers_strips_others() {
     }))
     .unwrap();
 
+    // Use a spoofed content-length that differs from the real body length so we
+    // can distinguish "inbound value forwarded" from "reqwest auto-computed it".
+    let spoofed_content_length = "99999";
     let req = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -48,17 +51,38 @@ async fn forwards_whitelisted_headers_strips_others() {
         .header("x-sgl-route-key", "k1")
         .header("cookie", "should-not-forward=true")
         .header("host", "example.com")
+        .header("content-length", spoofed_content_length)
+        .header("transfer-encoding", "chunked")
         .body(Body::from(body))
         .unwrap();
     app.oneshot(req).await.unwrap();
 
     let seen = worker.captured.lock().unwrap();
+    // Whitelisted headers are forwarded.
     assert!(seen.seen.contains("authorization"));
     assert!(seen.seen.contains("x-request-id"));
     assert!(seen.seen.contains("x-sgl-route-key"));
+    // Cookie must be stripped.
     assert!(!seen.seen.contains("cookie"));
-    // axum/reqwest reset host automatically; we just check we didn't propagate
-    // the inbound Host: example.com value (reqwest will set host to the worker's
-    // bound address, not the client-supplied "example.com")
-    assert!(!seen.seen.contains("host") || !seen.seen.contains("example.com"));
+    // transfer-encoding is hop-by-hop and must not be forwarded (reqwest does not
+    // re-add it for a regular body, so absence check is reliable here).
+    assert!(
+        !seen.seen.contains("transfer-encoding"),
+        "transfer-encoding is hop-by-hop and must be stripped"
+    );
+    // content-length: the inbound spoofed value must not reach the upstream.
+    // reqwest may auto-compute its own content-length for the outbound body,
+    // so we assert value-inequality rather than absence.
+    assert_ne!(
+        seen.headers.get("content-length").map(|s| s.as_str()),
+        Some(spoofed_content_length),
+        "router must not forward the inbound content-length value to upstream"
+    );
+    // Host: the inbound value must not reach the upstream.
+    let captured_host: Option<&String> = seen.headers.get("host");
+    assert_ne!(
+        captured_host,
+        Some(&"example.com".to_string()),
+        "router must not forward the inbound Host header to upstream"
+    );
 }
