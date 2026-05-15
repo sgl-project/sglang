@@ -6,12 +6,18 @@ import torch
 from sgl_kernel import topk_sigmoid
 
 
+_IS_HIP = torch.version.hip is not None
+
+
 @pytest.fixture(autouse=True)
 def _deterministic_seed():
-    # Pin RNG so torch.randn produces identical gating scores across runs.
-    # Without this, near-tied sigmoid scores trip atol=0 index comparisons
-    # against torch.topk's tie-break (which can differ from sgl_kernel.topk_sigmoid).
-    torch.manual_seed(0)
+    # AMD/ROCm only: pin RNG so torch.randn produces identical gating scores
+    # across runs. atol=0 indices comparison is otherwise tripped by near-tied
+    # sigmoid scores where hipCUB's tie-break inside torch.topk disagrees with
+    # sgl_kernel.topk_sigmoid. Not observed on CUDA, so leave CUDA behavior
+    # unchanged.
+    if _IS_HIP:
+        torch.manual_seed(0)
 
 
 @pytest.mark.parametrize(
