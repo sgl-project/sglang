@@ -729,6 +729,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
     num_correct_drafts: Optional[torch.Tensor] = None
     num_accept_tokens: Optional[torch.Tensor] = None
+    draft_cache_locs: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)

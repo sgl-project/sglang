@@ -417,7 +417,11 @@ class EagleDraftWorker(BaseDraftWorker):
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
-        out_cache_loc = forward_batch.out_cache_loc
+        out_cache_loc = (
+            spec_info.draft_cache_locs
+            if spec_info.draft_cache_locs is not None
+            else forward_batch.out_cache_loc
+        )
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
             spec_info.topk_index,

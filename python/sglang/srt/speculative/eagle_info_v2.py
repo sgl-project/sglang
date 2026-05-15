@@ -216,7 +216,7 @@ class EagleDraftInputV2Mixin:
             bs = len(batch.seq_lens)
 
             # Assign cache locations
-            batch.out_cache_loc = torch.empty(
+            draft_cache_locs = torch.empty(
                 (bs * topk * num_steps,),
                 dtype=torch.int64,
                 device=batch.input_ids.device,
@@ -226,11 +226,15 @@ class EagleDraftInputV2Mixin:
                 batch.req_pool_indices,
                 req_to_token_pool.req_to_token,
                 batch.seq_lens,
-                batch.out_cache_loc,
+                draft_cache_locs,
                 req_to_token_pool.req_to_token.shape[1],
                 topk,
                 num_steps,
             )
+            self.draft_cache_locs = draft_cache_locs
+            batch.out_cache_loc = draft_cache_locs.view(bs, topk, num_steps)[
+                :, :, 0
+            ].reshape(-1)
             hisparse_coordinator = getattr(
                 target_model_runner, "hisparse_coordinator", None
             )
@@ -247,9 +251,11 @@ class EagleDraftInputV2Mixin:
                     tokens_per_req_cpu,
                 )
                 target_model_runner.token_to_kv_pool_allocator.bind_device_mapping(
-                    batch.out_cache_loc,
+                    draft_cache_locs,
                     device_slots,
                 )
+        else:
+            self.draft_cache_locs = None
 
         # Get a forward batch
         self.num_tokens_per_req = topk
