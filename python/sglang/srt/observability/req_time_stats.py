@@ -557,6 +557,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # only for request tracing
     scheduler_recv_time: float = 0.0
     last_chunked_prefill_finish_time: float = 0.0
+    chunked_prefill_ct: int = 0
     last_decode_finish_time: float = 0.0
     decode_ct: int = 0
     last_decode_scheduled_time: float = 0.0
@@ -662,6 +663,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.last_forward_entry_time = 0.0
         self.last_prefill_finished_time = 0.0
         self.last_chunked_prefill_finish_time = 0.0
+        self.chunked_prefill_ct = 0
         self.last_decode_finish_time = 0.0
         self.last_decode_scheduled_time = 0.0
 
@@ -723,7 +725,21 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         elif self.last_forward_entry_time == 0.0:
             self.last_forward_entry_time = ts
 
-    def set_last_chunked_prefill_finish_time(self, ts=None):
+    def _chunked_prefill_trace_attrs(
+        self, is_final_chunk: bool, attrs: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        self.chunked_prefill_ct += 1
+        trace_attrs = {
+            "chunk_index": self.chunked_prefill_ct,
+            "is_final_chunk": is_final_chunk,
+        }
+        if attrs:
+            trace_attrs.update(attrs)
+        return trace_attrs
+
+    def set_last_chunked_prefill_finish_time(
+        self, ts=None, attrs: Optional[Dict[str, Any]] = None
+    ):
         ts = ts or time.perf_counter()
         last_time = self.last_chunked_prefill_finish_time
         self.last_chunked_prefill_finish_time = ts
@@ -733,7 +749,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
         stage = RequestStage.PREFILL_CHUNKED_FORWARD
         self.observe_per_stage_req_latency(stage, ts - last_time)
-        self.trace_slice(stage, last_time, ts)
+        self.trace_slice(
+            stage,
+            last_time,
+            ts,
+            self._chunked_prefill_trace_attrs(is_final_chunk=False, attrs=attrs),
+        )
 
     def set_prefill_finished_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -750,6 +771,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                         RequestStage.PREFILL_CHUNKED_FORWARD,
                         self.last_chunked_prefill_finish_time,
                         ts,
+                        self._chunked_prefill_trace_attrs(is_final_chunk=True),
                     )
 
                 self.trace_ctx.trace_slice_end(
@@ -772,6 +794,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     RequestStage.PREFILL_CHUNKED_FORWARD,
                     self.last_chunked_prefill_finish_time,
                     ts,
+                    self._chunked_prefill_trace_attrs(
+                        is_final_chunk=True, attrs={"is_retracted": True}
+                    ),
                 )
             else:
                 self.trace_slice(
