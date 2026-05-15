@@ -410,9 +410,7 @@ def fp8_native_paged_mean_pooling_completed_blocks(
                     # 1 = -1`` would index ReqToToken at -1, which under
                     # int32 → uint64 widening becomes a huge offset → OOB.
                     safe_upper = T.max(new_len - 1, 0)
-                    chunk_logical_start = T.min(
-                        chunk_logical_start_raw, safe_upper
-                    )
+                    chunk_logical_start = T.min(chunk_logical_start_raw, safe_upper)
                     T.fill(index_k_shared, 0.0)
 
                     buf_pos = ReqToToken[req_idx, chunk_logical_start]
