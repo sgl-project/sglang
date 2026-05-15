@@ -5,7 +5,6 @@ offloading under UnifiedRadixTree, verifying multi-turn cache correctness
 via KL divergence.
 """
 
-import os
 import unittest
 
 from test_unified_radix_cache_kl import UnifiedRadixTreeTestMixin
@@ -28,10 +27,7 @@ MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
 MAMBA_CHUNK_SIZE = 64
 MAMBA_TRACK_INTERVAL = 128
 
-DSV4_FLASH_MODEL = os.getenv(
-    "SGLANG_TEST_DSV4_FLASH_MODEL",
-    "sgl-project/DeepSeek-V4-Flash-FP8",
-)
+DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
 DSV32_MODEL = "deepseek-ai/DeepSeek-V3.2"
