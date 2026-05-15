@@ -152,7 +152,7 @@ export const GLM5Deployment = () => {
     const memFraction = hwConfig.mem;
 
     let cmd = 'sglang serve \\\n';
-    cmd += `  --model ${modelName}`;
+    cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
 
     // NVFP4 B200: trtllm NSA backends, flashinfer fusion, FP8 KV cache.

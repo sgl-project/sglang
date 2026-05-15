@@ -16,6 +16,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
@@ -187,6 +190,12 @@ class LTX2PipelineConfig(PipelineConfig):
     def vae_temporal_compression(self):
         return self.vae_config.arch_config.temporal_compression_ratio
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_disable_component_offload_min_available_memory_gb=70,
+            auto_disable_component_offload_components=("dit",),
+        )
+
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         """Return unpacked latent shape [B, C, F, H, W]."""
         height = batch.height // self.vae_scale_factor
@@ -244,6 +253,9 @@ class LTX2PipelineConfig(PipelineConfig):
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         # Adapted from diffusers_pipeline.py _get_gemma_prompt_embeds
         # But we only need tokenization here, the embedding happens in TextEncodingStage
+        # Official LTX Gemma tokenizer trims surrounding whitespace before
+        # tokenization.
+        prompt = [text.strip() for text in prompt]
 
         # Gemma expects left padding for chat-style prompts
         tokenizer.padding_side = "left"

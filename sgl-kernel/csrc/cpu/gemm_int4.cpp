@@ -740,8 +740,6 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
     const at::Tensor& weight_qzeros,
     const std::optional<at::Tensor>& bias,
     at::ScalarType output_dtype) {
-  RECORD_FUNCTION("sgl-kernel::int4_scaled_mm_cpu_with_quant", std::vector<c10::IValue>({input, weight}));
-
   int64_t M_a = input.size(0);
   int64_t K_a = input.size(1);
   int64_t lda = input.stride(0);

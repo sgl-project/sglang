@@ -287,8 +287,15 @@ jobs:
       OSL: ${{ matrix.config.osl }}
       CONFIG_FILE: ${{ matrix.config.config_file }}
       RESULT_FILENAME: gb200-${{ matrix.config.name }}
+      MATRIX_CONFIG_NAME: ${{ matrix.config.name }}
       SQUASH_FILE: ${{ needs.prepare-image.outputs.squash_file }}
       NGINX_SQUASH_FILE: ${{ needs.prepare-image.outputs.nginx_squash_file }}
+      # S3 log-upload credentials — consumed by srt-slurm's postprocess stage
+      # to upload /logs after each Slurm job; prefix derived in launch_gb200.sh.
+      AWS_ACCESS_KEY_ID: ${{ secrets.NV_S3_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.NV_S3_SECRET_ACCESS_KEY }}
+      S3_BUCKET: ${{ secrets.NV_S3_BUCKET }}
+      S3_ENDPOINT_URL: ${{ secrets.NV_S3_ENDPOINT_URL }}
 
     steps:
       - name: Checkout code
@@ -360,6 +367,26 @@ jobs:
           else
             echo "No log tarball found, skipping analysis"
           fi
+
+      - name: Upload AI analysis to S3
+        if: failure()
+        continue-on-error: true
+        env:
+          ISL: ${{ matrix.config.isl }}
+          OSL: ${{ matrix.config.osl }}
+        run: |
+          ANALYSIS="${{ github.workspace }}/ai_analysis.md"
+          [ -f "$ANALYSIS" ] || { echo "no ai_analysis.md, skipping"; exit 0; }
+          case "${{ github.event_name }}" in
+            schedule)          TRIGGER=cron ;;
+            workflow_dispatch) TRIGGER=manual ;;
+            *)                 TRIGGER="${{ github.event_name }}" ;;
+          esac
+          fmt() { if [ $(( $1 % 1024 )) -eq 0 ]; then echo "$(( $1 / 1024 ))k"; else echo "$1"; fi; }
+          SEQ_LEN="$(fmt "$ISL")$(fmt "$OSL")"
+          KEY="${TRIGGER}/${{ github.run_id }}-${{ github.run_attempt }}/${SEQ_LEN}/${{ matrix.config.name }}/ai_analysis.md"
+          aws --endpoint-url "$S3_ENDPOINT_URL" s3 cp "$ANALYSIS" "s3://${S3_BUCKET}/${KEY}"
+          echo "uploaded to s3://${S3_BUCKET}/${KEY}"
 
       - name: Clean up Slurm jobs on failure/cancel
         if: failure() || cancelled()

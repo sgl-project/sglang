@@ -291,19 +291,20 @@ class TestMambaAttention(CustomTestCase):
     def test_fused_gdn_gating(self):
         dims = [6, 32]
         for dim in dims:
-            A_log = torch.rand(dim)
-            a = torch.rand(1024, dim, dtype=torch.bfloat16)
-            b = torch.rand(1024, dim, dtype=torch.bfloat16)
-            dt_bias = torch.rand(dim, dtype=torch.bfloat16)
+            for A_log_dtype in [torch.float32, torch.bfloat16]:
+                A_log = torch.rand(dim, dtype=A_log_dtype)
+                a = torch.rand(1024, dim, dtype=torch.bfloat16)
+                b = torch.rand(1024, dim, dtype=torch.bfloat16)
+                dt_bias = torch.rand(dim, dtype=torch.bfloat16)
 
-            g, beta = torch_gdn_gating(A_log, a, b, dt_bias)
-            g_sgl, beta_sgl = torch.ops.sgl_kernel.fused_gdn_gating_cpu(
-                A_log, a, b, dt_bias
-            )
-            atol = rtol = precision[g.dtype]
-            atol2 = rtol2 = precision[beta.dtype]
-            torch.testing.assert_close(g, g_sgl, atol=atol, rtol=rtol)
-            torch.testing.assert_close(beta, beta_sgl, atol=atol2, rtol=rtol2)
+                g, beta = torch_gdn_gating(A_log, a, b, dt_bias)
+                g_sgl, beta_sgl = torch.ops.sgl_kernel.fused_gdn_gating_cpu(
+                    A_log, a, b, dt_bias
+                )
+                atol = rtol = precision[g.dtype]
+                atol2 = rtol2 = precision[beta.dtype]
+                torch.testing.assert_close(g, g_sgl, atol=atol, rtol=rtol)
+                torch.testing.assert_close(beta, beta_sgl, atol=atol2, rtol=rtol2)
 
     def test_fused_sigmoid_gating_delta_rule_update(self):
         batch_size = 1
@@ -346,41 +347,47 @@ class TestMambaAttention(CustomTestCase):
         if num_value_heads // num_heads > 1:
             query_ref = query_ref.repeat_interleave(num_value_heads // num_heads, dim=2)
             key_ref = key_ref.repeat_interleave(num_value_heads // num_heads, dim=2)
-        core_attn_out_ref, last_recurrent_state_ref = sigmoid_gating_delta_rule_update(
-            query_ref.transpose(0, 1),
-            key_ref.transpose(0, 1),
-            value.transpose(0, 1),
-            A_log,
-            a,
-            dt_bias,
-            b,
-            initial_state=ssm_states[cache_indices],
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        )
-        core_attn_out = torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
-            A_log=A_log,
-            dt_bias=dt_bias,
-            q=query,
-            k=key,
-            v=value,
-            a=a,
-            b=b,
-            initial_state_source=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-        )
-        last_recurrent_state = ssm_states[cache_indices]
-        atol = rtol = precision[core_attn_out.dtype]
-        torch.testing.assert_close(
-            core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
-        )
-        torch.testing.assert_close(
-            last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
-        )
+        for A_log_dtype in [torch.float32, torch.bfloat16]:
+            A_log = A_log.to(A_log_dtype)
+            core_attn_out_ref, last_recurrent_state_ref = (
+                sigmoid_gating_delta_rule_update(
+                    query_ref.transpose(0, 1),
+                    key_ref.transpose(0, 1),
+                    value.transpose(0, 1),
+                    A_log,
+                    a,
+                    dt_bias,
+                    b,
+                    initial_state=ssm_states[cache_indices],
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
+            )
+            core_attn_out = (
+                torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    q=query,
+                    k=key,
+                    v=value,
+                    a=a,
+                    b=b,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices,
+                    cu_seqlens=query_start_loc,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                )
+            )
+            last_recurrent_state = ssm_states[cache_indices]
+            atol = rtol = precision[core_attn_out.dtype]
+            torch.testing.assert_close(
+                core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol
+            )
+            torch.testing.assert_close(
+                last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
+            )
 
 
 if __name__ == "__main__":

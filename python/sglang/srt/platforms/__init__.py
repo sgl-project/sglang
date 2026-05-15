@@ -90,7 +90,7 @@ def _resolve_platform() -> SRTPlatform:
             logger.exception("Failed to activate platform plugin: %s", name)
 
     if len(activated) == 0:
-        logger.warning("No platform detected. Using base SRTPlatform with defaults.")
+        logger.debug("No platform detected. Using base SRTPlatform with defaults.")
         return SRTPlatform()
 
     if len(activated) == 1:
