@@ -66,12 +66,12 @@ Every CI-discovered test file must call a registration function at module level:
 ```python
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=80, stage="stage-b", runner_config="1-gpu-small")
 ```
 
-Parameters: `est_time` (seconds), `suite` (target suite), `nightly=True` (nightly-only), `disabled="reason"` (temporarily disable).
+Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and runner pool from `scripts/ci/runner_configs.yml`), `nightly=True` (nightly-only), `disabled="reason"` (temporarily disable).
 
-Keep `est_time` and `suite` as **literal values** — `run_suite.py` collects them by AST parsing.
+Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
 JIT kernel files live outside `test/registered/` but still use registration:
 - Correctness tests: `python/sglang/jit_kernel/tests/test_*.py` → `stage-b-kernel-unit-1-gpu-large`
