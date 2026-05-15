@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
-from sglang.srt.server_args import get_global_server_args
+
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.server_args import get_global_server_args
 
 try:
     from lmcache.integration.sglang.multi_process_adapter import LMCacheMPConnector
@@ -48,9 +49,10 @@ class _LMCacheLoadBackMarker:
     key: RadixKey  # page-aligned key the scheduler matched on
     value_numel: int  # number of tokens already in radix at match time
 
+
 class LMCacheMode(enum.Enum):
-    MP = enum.auto() # multi-process mode
-    IP = enum.auto() # in-process mode
+    MP = enum.auto()  # multi-process mode
+    IP = enum.auto()  # in-process mode
 
 
 class LayerTransferCounter:
