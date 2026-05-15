@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=50, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=50, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=140, suite="stage-b-test-1-gpu-small-amd")
 
 # System message to guide Llama3.2 to produce proper tool call format

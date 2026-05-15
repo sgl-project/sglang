@@ -676,6 +676,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         workspace=workspace_manager.workspace,
         pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
         launch_with_pdl=True,
+        trigger_completion_at_end=trigger_completion_at_end,
         residual_out=residual_out,
         norm_out=norm_out,
         residual_in=residual,

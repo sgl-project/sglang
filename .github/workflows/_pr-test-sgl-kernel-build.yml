@@ -1,0 +1,121 @@
+name: PR Test - Build sgl-kernel Wheels
+
+# Reusable workflow that builds the sgl-kernel CUDA wheels for one
+# architecture / runner pool. Called twice from pr-test.yml: once for the
+# x86_64 runner pool, once for arm64. All architecture-specific values
+# (runner label, display name, artifact name suffix) are passed in via
+# inputs.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'Runner label (e.g. x64-kernel-build-node, arm-kernel-build-node)'
+        type: string
+        required: true
+      job_display_name:
+        description: 'Display name shown in the Actions UI (e.g. "Build Wheel", "Build Wheel Arm")'
+        type: string
+        default: 'Build Wheel'
+      arch_suffix:
+        description: "Suffix appended to the upload-artifact name. '' for x86, '-aarch64' for arm."
+        type: string
+        default: ''
+      pr_head_sha:
+        type: string
+        default: ''
+      git_ref:
+        type: string
+        default: ''
+      skip_stage_health_check:
+        description: 'Forwarded from the caller workflow input of the same name. Not consumed inside this reusable workflow today, but mirrored so the resulting env context matches the inline-job baseline.'
+        type: boolean
+        default: false
+
+# Mirror the caller workflow's top-level env block. GitHub Actions does NOT
+# automatically inherit workflow-level env vars across the workflow_call
+# boundary, so anything pr-test.yml defines must be redeclared here for the
+# reusable jobs to see the same context. Most of these are not read by the
+# wheel-build path, but PR_TEST_BYPASS_MAINTENANCE_ON_MAIN is consumed by the
+# check-maintenance composite action and would otherwise be unset.
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check && 'true' || 'false' }}
+  FORCE_REBUILD_DEEPEP: '1'
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  USE_VENV: false
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 240
+    strategy:
+      matrix:
+        include:
+          - python-version: "3.10"
+            cuda-version: "13.0"
+    name: ${{ inputs.job_display_name }}
+    steps:
+      - name: Cleanup
+        run: |
+          if [ -d "$GITHUB_WORKSPACE" ]; then
+            sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+          else
+            echo "$GITHUB_WORKSPACE does not exist, nothing to clean"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Free Docker disk space
+        run: |
+          set -x
+          # `-f` only (no `-a`): drops dangling <none>:<none> layers from
+          # prior runs but keeps the tagged sgl-kernel-deps:* base images.
+          docker image prune -f
+          # Reap orphan buildx builders from interrupted prior runs. Must
+          # `buildx rm` (not `volume rm`) — the volume is held open by the
+          # buildkit helper container; removing the builder frees both.
+          # `sgl-kernel-builder` and `default` are skipped on purpose.
+          for b in $(docker buildx ls --format '{{.Name}}' | grep -E '^builder-' || true); do
+            echo "Removing orphan buildx builder: $b"
+            docker buildx rm "$b" || true
+          done
+          # Trim the persistent local buildx cache (--cache-to mode=max grows
+          # unbounded). Cache-hit imports rewrite the blob, so mtime tracks
+          # "last carried forward by a build" — 14d is well past the freshest
+          # CI cycle.
+          if [ -d "$HOME/.cache/sgl-kernel/buildx/blobs" ]; then
+            find "$HOME/.cache/sgl-kernel/buildx/blobs" -type f -mtime +14 -delete
+          fi
+          df -h /
+
+      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
+        run: |
+          cd sgl-kernel
+          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+        env:
+          USE_CCACHE: 1
+
+      - name: Verify wheel artifacts
+        run: |
+          ls -alh sgl-kernel/dist
+          ls -alh sgl-kernel/dist/*.whl
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}${{ inputs.arch_suffix }}
+          path: sgl-kernel/dist/*
+          if-no-files-found: error
