@@ -18,10 +18,13 @@ use sgl_router::config::{
     Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig, ServerConfig,
     StaticFileDiscoveryConfig,
 };
+use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::policies::factory::build_registry as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
+use sgl_router::workers::WorkerRegistry;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -54,9 +57,19 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
     let worker = common::mock_worker::MockWorker::start_hanging(Duration::from_secs(5)).await;
     let cfg = config(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy =
         Arc::new(Proxy::new(worker.url.parse().unwrap(), Duration::from_millis(200)).unwrap());
-    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy));
+    let ctx = Arc::new(AppContext::new(
+        cfg, tokenizers, proxy, registry, policies,
+    ));
     let app = build_router(ctx);
 
     let req = Request::builder()

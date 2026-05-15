@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
+use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::tokenizer::TokenizerRegistry;
+use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -12,15 +14,25 @@ pub struct AppContext {
     pub config: Config,
     pub tokenizers: Arc<TokenizerRegistry>,
     pub proxy: Arc<Proxy>,
+    pub registry: Arc<WorkerRegistry>,
+    pub policies: Arc<PolicyRegistry>,
     ready: AtomicBool,
 }
 
 impl AppContext {
-    pub fn new(config: Config, tokenizers: Arc<TokenizerRegistry>, proxy: Arc<Proxy>) -> Self {
+    pub fn new(
+        config: Config,
+        tokenizers: Arc<TokenizerRegistry>,
+        proxy: Arc<Proxy>,
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+    ) -> Self {
         Self {
             config,
             tokenizers,
             proxy,
+            registry,
+            policies,
             ready: AtomicBool::new(false),
         }
     }
@@ -59,6 +71,8 @@ impl AppContext {
             proxy: Arc::new(
                 Proxy::new(url, std::time::Duration::from_secs(60)).expect("stub proxy"),
             ),
+            registry: Arc::new(WorkerRegistry::default()),
+            policies: Arc::new(PolicyRegistry::default()),
             ready: AtomicBool::new(false),
         }
     }

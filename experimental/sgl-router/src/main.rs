@@ -70,7 +70,24 @@ async fn main() -> Result<()> {
             .context("load tokenizers")?,
     );
 
-    // TODO(M2 Task 11): replace with policy-driven worker selection.
+    let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
+    let policies = Arc::new(
+        sgl_router::policies::factory::build_registry(&cfg).context("build policy registry")?,
+    );
+
+    // Spawn discovery + manager tasks.
+    let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
+        .await
+        .context("spawn discovery")?;
+    let manager_handle = tokio::spawn(sgl_router::workers::manager::run(
+        event_rx,
+        registry.clone(),
+    ));
+
+    // Build proxy. The constructor still requires a worker_url + timeout
+    // (M1's typed-URL contract); the field is no longer authoritative — per
+    // request, chat.rs supplies the actual worker URL via
+    // `forward_*_to(&worker.url, ...)`. The M3 cleanup pass drops the field.
     let placeholder_worker_url = reqwest::Url::parse("http://localhost:30000")
         .context("parse placeholder worker URL")?;
     let proxy = Arc::new(
@@ -85,6 +102,8 @@ async fn main() -> Result<()> {
         cfg.clone(),
         tokenizers,
         proxy,
+        registry,
+        policies,
     ));
     ctx.mark_ready();
 
@@ -98,10 +117,14 @@ async fn main() -> Result<()> {
 
     let (sigterm, sigint) = install_signal_handlers()?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(sigterm, sigint))
-        .await
-        .context("axum serve")
+    let serve = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(sigterm, sigint));
+    let server_result = serve.await.context("axum serve");
+
+    // Best-effort: cancel discovery + manager on shutdown.
+    discovery_handle.abort();
+    manager_handle.abort();
+    server_result
 }
 
 async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
