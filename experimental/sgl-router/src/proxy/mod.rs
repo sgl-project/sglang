@@ -50,86 +50,22 @@ impl Proxy {
     /// path, so a base URL with or without a trailing `/` produces the same
     /// result. Errors only on malformed `path` inputs; we surface them as
     /// `ApiError::Internal` since callers pass static path literals.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn worker_path(&self, path: &str) -> Result<Url, ApiError> {
         self.worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })
     }
 
-    /// Forward a JSON POST to the worker and return the buffered response.
-    /// The worker's status code is preserved; content-type is set to
-    /// application/json.
-    pub async fn forward_json(
-        &self,
-        path: &str,
-        headers: &HeaderMap,
-        body: Bytes,
-    ) -> Result<Response<Body>, ApiError> {
-        let url = self.worker_path(path)?;
-        let mut req = self.client.post(url.clone()).body(body);
-        for (k, v) in headers {
-            if should_forward_request_header(k) {
-                req = req.header(k, v);
-            }
-        }
-        req = req
-            .header("content-type", "application/json")
-            .timeout(self.request_timeout);
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| self.classify_reqwest_error(e, path))?;
-        let status = resp.status();
-        // Parity with forward_streaming: log non-2xx upstream responses so a
-        // 5xx spike on non-streaming requests is visible server-side, not
-        // streaming-only.
-        if !status.is_success() {
-            tracing::warn!(
-                upstream = %url,
-                path = path,
-                status = %status,
-                "upstream returned non-2xx on non-streaming request",
-            );
-        }
-        // Headers + status were already received; a mid-body read failure
-        // here is NOT "unreachable" (the upstream demonstrably replied). We
-        // surface it as `UpstreamStatus { status }` with a server-side log
-        // so operators can see the worker started a response and dropped.
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    upstream = %url,
-                    status = %status,
-                    error = ?e,
-                    "upstream dropped connection mid-body",
-                );
-                return Err(ApiError::UpstreamStatus { status });
-            }
-        };
-        let mut out = Response::new(Body::from(bytes));
-        *out.status_mut() = status;
-        out.headers_mut().insert(
-            HeaderName::from_static("content-type"),
-            HeaderValue::from_static("application/json"),
-        );
-        Ok(out)
-    }
-
-    /// Classify a reqwest error into the right `ApiError` variant.
+    /// Classify a reqwest error into the right `ApiError` variant, given an
+    /// explicit worker URL. Called from the breaker-gated `forward_*_to`
+    /// methods, which carry per-request worker URLs (not a single proxy-level
+    /// URL).
     ///
     /// Walks the full source chain to detect timeouts, because reqwest wraps
     /// hyper which wraps `std::io::Error` — a top-level `is_timeout()` check
     /// misses both the wrapped reqwest timeout and the `io::ErrorKind::TimedOut`
     /// cases.
-    fn classify_reqwest_error(&self, e: reqwest::Error, path: &str) -> ApiError {
-        Self::classify_reqwest_error_for(self.worker_url.clone(), e, path)
-    }
-
-    /// Classify a reqwest error into the right `ApiError` variant, given an
-    /// explicit worker URL. Used by both the legacy methods (which thread
-    /// `self.worker_url`) and the M2 breaker-gated `_to` methods (which take
-    /// per-request worker URLs).
     fn classify_reqwest_error_for(worker: Url, e: reqwest::Error, path: &str) -> ApiError {
         let source = anyhow::Error::new(e).context(format!("worker {worker}: post {path}"));
         let is_timeout = source.chain().any(|c| {
@@ -145,6 +81,7 @@ impl Proxy {
             ApiError::UpstreamUnreachable { worker, source }
         }
     }
+
 
     /// One-shot health check against the configured worker. Returns `Ok(())`
     /// if the worker responded with any 2xx or 3xx within the timeout;
@@ -169,14 +106,14 @@ impl Proxy {
     /// success/failure based on response status, and returns
     /// `ApiError::ServiceUnavailable` immediately when the breaker is Open.
     ///
-    /// `worker_url` is the typed `reqwest::Url` per M1's typed-URL contract;
-    /// joining with `path` uses [`Url::join`] which handles trailing-slash
-    /// normalization cleanly. Transport failures map to the split
-    /// `UpstreamUnreachable` / `UpstreamTimeout` / `UpstreamStatus` variants
-    /// from M1, NOT a flat `UpstreamWorker(String)`.
+    /// `worker_url` is the discovery-emitted worker URL string. It's parsed
+    /// to [`reqwest::Url`] internally so we can use [`Url::join`] for clean
+    /// path concatenation (no double-slash) and pass a typed URL to the
+    /// split error variants (`UpstreamUnreachable` / `UpstreamTimeout` /
+    /// `UpstreamStatus`).
     pub async fn forward_json_to(
         &self,
-        worker_url: &Url,
+        worker_url: &str,
         breaker: &CircuitBreaker,
         path: &str,
         headers: &HeaderMap,
@@ -187,6 +124,11 @@ impl Proxy {
                 "worker circuit breaker open".into(),
             ));
         }
+        let worker_url = Url::parse(worker_url).map_err(|e| {
+            ApiError::Internal(
+                anyhow::Error::new(e).context(format!("parse worker URL {worker_url:?}")),
+            )
+        })?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
@@ -234,7 +176,7 @@ impl Proxy {
     /// success/failure, and returns `ApiError::ServiceUnavailable` when Open.
     pub async fn forward_streaming_to(
         &self,
-        worker_url: &Url,
+        worker_url: &str,
         breaker: &CircuitBreaker,
         path: &str,
         headers: &HeaderMap,
@@ -245,6 +187,11 @@ impl Proxy {
                 "worker circuit breaker open".into(),
             ));
         }
+        let worker_url = Url::parse(worker_url).map_err(|e| {
+            ApiError::Internal(
+                anyhow::Error::new(e).context(format!("parse worker URL {worker_url:?}")),
+            )
+        })?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
@@ -273,79 +220,6 @@ impl Proxy {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/json")
             .to_string();
-        let content_type = if status.is_success() {
-            "text/event-stream".to_string()
-        } else {
-            upstream_ct
-        };
-        let body = sse::bytes_stream_to_body(resp.bytes_stream());
-        let mut out = Response::new(body);
-        *out.status_mut() = status;
-        out.headers_mut().insert(
-            HeaderName::from_static("content-type"),
-            HeaderValue::from_str(&content_type)
-                .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
-        );
-        Ok(out)
-    }
-
-    /// Forward a JSON POST and stream the SSE response back unmodified.
-    /// Adds `accept: text/event-stream` to the outbound request.
-    ///
-    /// Note: streaming requests deliberately do NOT set a wall-clock
-    /// `.timeout(...)` — long generations are valid and clients drive
-    /// cancellation by dropping the response stream. The client-level
-    /// `connect_timeout` configured in [`Self::new`] still applies, so a
-    /// worker that never accepts TCP fails fast at request initiation.
-    pub async fn forward_streaming(
-        &self,
-        path: &str,
-        headers: &HeaderMap,
-        body: Bytes,
-    ) -> Result<Response<Body>, ApiError> {
-        let url = self.worker_path(path)?;
-        let mut req = self.client.post(url.clone()).body(body);
-        for (k, v) in headers {
-            if should_forward_request_header(k) {
-                req = req.header(k, v);
-            }
-        }
-        req = req
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream");
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| self.classify_reqwest_error(e, path))?;
-        let status = resp.status();
-        if !status.is_success() {
-            tracing::warn!(
-                upstream = %url,
-                path = path,
-                status = %status,
-                "upstream returned non-2xx on streaming request",
-            );
-        }
-        // Capture content-type BEFORE consuming resp via bytes_stream().
-        // If the upstream has a content-type header but its value is not
-        // ASCII-printable (non-conforming worker, mojibake, etc.), we fall
-        // back to application/json — but we log the case so this isn't a
-        // silent corruption. Conformant workers (axum, tonic, fastapi)
-        // never hit this fallback.
-        let upstream_ct = match resp.headers().get(reqwest::header::CONTENT_TYPE) {
-            Some(v) => match v.to_str() {
-                Ok(s) => s.to_string(),
-                Err(_) => {
-                    tracing::warn!(
-                        upstream = %url,
-                        "upstream content-type header is not ASCII-printable; \
-                         defaulting to application/json",
-                    );
-                    "application/json".to_string()
-                }
-            },
-            None => "application/json".to_string(),
-        };
         let content_type = if status.is_success() {
             "text/event-stream".to_string()
         } else {

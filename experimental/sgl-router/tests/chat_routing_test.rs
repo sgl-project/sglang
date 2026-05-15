@@ -7,10 +7,13 @@ use sgl_router::config::{
     Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig, ServerConfig,
     StaticFileDiscoveryConfig,
 };
+use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::policies::factory::build_registry as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
+use sgl_router::workers::WorkerRegistry;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -21,7 +24,7 @@ use tower::ServiceExt;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn config(worker_url: &str) -> Config {
+fn config_for(_worker_url: &str) -> Config {
     Config {
         server: ServerConfig {
             host: "0".into(),
@@ -36,20 +39,36 @@ fn config(worker_url: &str) -> Config {
         }],
         discovery: DiscoveryConfig {
             backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {
-                path: worker_url.into(),
+                path: "/tmp/x.toml".into(),
                 poll_interval_ms: 200,
             }),
         },
     }
 }
 
+fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
+    let cfg = config_for(url);
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: url.to_string(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    // Proxy still requires a worker_url for the legacy constructor; the
+    // breaker-gated `forward_*_to` methods supply per-request URLs from the
+    // registry, so this placeholder is never used for routing.
+    let placeholder_url = reqwest::Url::parse("http://placeholder.invalid").unwrap();
+    let proxy = Arc::new(Proxy::new(placeholder_url, TEST_TIMEOUT).unwrap());
+    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+}
+
 #[tokio::test]
 async fn non_streaming_returns_200() {
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy));
+    let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx);
 
     let req = Request::builder()
@@ -79,10 +98,7 @@ async fn non_streaming_upstream_unreachable_returns_502_unreachable() {
     let dead_url = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
 
-    let cfg = config(&dead_url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(dead_url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy));
+    let ctx = build_ctx_with_worker(&dead_url);
     let app = build_router(ctx);
     let req = Request::builder()
         .method("POST")
@@ -123,10 +139,8 @@ async fn streaming_chunks_pass_through() {
         "data: [DONE]\n\n",
     ];
     let worker = common::mock_worker::MockWorker::start(chunks.clone()).await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
 
     let req = Request::builder()
         .method("POST")
@@ -158,17 +172,13 @@ async fn streaming_chunks_pass_through() {
 
 #[tokio::test]
 async fn streaming_first_chunk_before_completion() {
-    // Mock worker with an artificially slow stream — but we shouldn't
-    // wait for all chunks before getting the first byte.
     let chunks: Vec<&'static str> = vec![
         "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
         "data: [DONE]\n\n",
     ];
     let worker = common::mock_worker::MockWorker::start(chunks).await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
 
     let req = Request::builder()
         .method("POST")
@@ -206,18 +216,8 @@ async fn concurrent_streams_are_isolated() {
     let worker_a = common::mock_worker::MockWorker::start(chunks_a).await;
     let worker_b = common::mock_worker::MockWorker::start(chunks_b).await;
 
-    let cfg_a = config(&worker_a.url);
-    let cfg_b = config(&worker_b.url);
-    let ctx_a = Arc::new(AppContext::new(
-        cfg_a.clone(),
-        Arc::new(TokenizerRegistry::load_from_config(&cfg_a).unwrap()),
-        Arc::new(Proxy::new(worker_a.url.parse().unwrap(), TEST_TIMEOUT).unwrap()),
-    ));
-    let ctx_b = Arc::new(AppContext::new(
-        cfg_b.clone(),
-        Arc::new(TokenizerRegistry::load_from_config(&cfg_b).unwrap()),
-        Arc::new(Proxy::new(worker_b.url.parse().unwrap(), TEST_TIMEOUT).unwrap()),
-    ));
+    let ctx_a = build_ctx_with_worker(&worker_a.url);
+    let ctx_b = build_ctx_with_worker(&worker_b.url);
     let app_a = build_router(ctx_a);
     let app_b = build_router(ctx_b);
 
@@ -248,19 +248,13 @@ async fn concurrent_streams_are_isolated() {
 
 #[tokio::test]
 async fn streaming_upstream_5xx_preserves_content_type() {
-    // Regression: when the worker returns a 5xx with JSON body to a
-    // streaming request, the router must preserve upstream content-type
-    // (application/json), not lie and say text/event-stream. OpenAI
-    // clients gate parsing on content-type.
     let worker = common::mock_worker::MockWorker::start_returning_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         serde_json::json!({"error": {"type": "upstream", "message": "boom"}}),
     )
     .await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
 
     let req = Request::builder()
         .method("POST")
@@ -302,10 +296,8 @@ async fn non_streaming_upstream_429_preserved() {
         upstream_body.clone(),
     )
     .await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
 
     let req = Request::builder()
         .method("POST")
@@ -352,10 +344,8 @@ async fn non_streaming_upstream_500_preserved() {
         upstream_body.clone(),
     )
     .await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
 
     let req = Request::builder()
         .method("POST")
@@ -392,10 +382,8 @@ async fn non_streaming_upstream_4xx_body_passthrough() {
         upstream_body.clone(),
     )
     .await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
 
     let req = Request::builder()
         .method("POST")
@@ -425,10 +413,8 @@ async fn oversized_request_body_returns_413() {
     // rejected at the layer BEFORE the handler reads it into memory, and
     // must NOT be forwarded to the upstream worker.
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
 
     // 2 MiB body — the configured limit is 1 MiB.
     let big = vec![b'x'; 2 * 1024 * 1024];
@@ -460,10 +446,8 @@ async fn chat_rejects_null_body_400() {
     // a chat-completions request shape. The router must reject it with 400
     // BadRequest and NOT forward it to the worker.
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
 
     let req = Request::builder()
         .method("POST")
@@ -490,10 +474,8 @@ async fn chat_rejects_array_body_400() {
     // Regression: a JSON array `[]` body is not a chat-completions request
     // shape (object expected). Router must 400 and not forward.
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
 
     let req = Request::builder()
         .method("POST")
@@ -516,10 +498,8 @@ async fn chat_rejects_string_body_400() {
     // Regression: a JSON string `"hi"` is not a chat-completions request
     // shape. Router must 400 and not forward.
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
 
     let req = Request::builder()
         .method("POST")
@@ -549,10 +529,8 @@ async fn non_streaming_mid_body_drop_classified_as_upstream_status() {
         b"{\"partial\": ",
     )
     .await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
 
     let req = Request::builder()
         .method("POST")
@@ -582,14 +560,9 @@ async fn non_streaming_mid_body_drop_classified_as_upstream_status() {
 
 #[tokio::test]
 async fn malformed_json_returns_400_bad_request() {
-    // Regression: a malformed JSON request body must return 400 with
-    // bad_request envelope from the router itself; we must NOT forward
-    // the bad payload to the worker.
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
-    let cfg = config(&worker.url);
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
     let req = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -602,12 +575,44 @@ async fn malformed_json_returns_400_bad_request() {
         res.headers().get("x-router-error-code").unwrap(),
         "bad_request"
     );
-    // Also: worker must NOT have received a body for this request
+    // Worker must NOT have received a body for this request.
     let captured = worker.captured.lock().unwrap();
     assert!(
         captured.last_body.is_none(),
         "router must not forward malformed JSON to upstream worker; got body: {:?}",
         captured.last_body
+    );
+}
+
+#[tokio::test]
+async fn no_healthy_workers_returns_503() {
+    // Build a context with an empty registry for model "tiny" — no workers.
+    let cfg = config_for("http://unused");
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default()); // empty — no workers added
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let placeholder_url = reqwest::Url::parse("http://placeholder.invalid").unwrap();
+    let proxy = Arc::new(Proxy::new(placeholder_url, TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        res.headers().get("x-router-error-code").unwrap(),
+        "service_unavailable"
     );
 }
 
@@ -624,8 +629,8 @@ async fn forward_json_to_records_failure_on_5xx() {
     )
     .await;
 
-    let worker_url: reqwest::Url = worker.url.parse().unwrap();
-    let proxy = Proxy::new(worker_url.clone(), TEST_TIMEOUT).unwrap();
+    let proxy =
+        Proxy::new(worker.url.parse().unwrap(), Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
         threshold: 1,
         cool_down: Duration::from_secs(30),
@@ -635,7 +640,7 @@ async fn forward_json_to_records_failure_on_5xx() {
     let body = bytes::Bytes::from(b"{}".to_vec());
     let _: Result<_, ApiError> = proxy
         .forward_json_to(
-            &worker_url,
+            &worker.url,
             &breaker,
             "/v1/chat/completions",
             &headers,
@@ -657,8 +662,8 @@ async fn forward_json_to_rejects_when_breaker_open() {
     use std::time::Duration;
 
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
-    let worker_url: reqwest::Url = worker.url.parse().unwrap();
-    let proxy = Proxy::new(worker_url.clone(), TEST_TIMEOUT).unwrap();
+    let proxy =
+        Proxy::new(worker.url.parse().unwrap(), Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
         threshold: 1,
         cool_down: Duration::from_secs(30),
@@ -669,7 +674,7 @@ async fn forward_json_to_rejects_when_breaker_open() {
     let body = bytes::Bytes::from(b"{}".to_vec());
     let res = proxy
         .forward_json_to(
-            &worker_url,
+            &worker.url,
             &breaker,
             "/v1/chat/completions",
             &headers,

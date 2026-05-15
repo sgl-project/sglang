@@ -9,10 +9,13 @@ use sgl_router::config::{
     Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig, ServerConfig,
     StaticFileDiscoveryConfig,
 };
+use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::policies::factory::build_registry as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
+use sgl_router::workers::WorkerRegistry;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -40,8 +43,18 @@ async fn forwards_whitelisted_headers_strips_others() {
         },
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), Duration::from_secs(5)).unwrap());
-    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+    let app = build_router(Arc::new(AppContext::new(
+        cfg, tokenizers, proxy, registry, policies,
+    )));
 
     let body = serde_json::to_vec(&serde_json::json!({
         "model":"tiny","messages":[{"role":"user","content":"hi"}]

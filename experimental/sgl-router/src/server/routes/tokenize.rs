@@ -135,7 +135,15 @@ mod tests {
             )
             .expect("stub proxy"),
         );
-        Arc::new(AppContext::new(cfg, Arc::new(registry), proxy))
+        let worker_registry = Arc::new(crate::workers::WorkerRegistry::default());
+        let policies = Arc::new(crate::policies::PolicyRegistry::default());
+        Arc::new(AppContext::new(
+            cfg,
+            Arc::new(registry),
+            proxy,
+            worker_registry,
+            policies,
+        ))
     }
 
     #[tokio::test]
