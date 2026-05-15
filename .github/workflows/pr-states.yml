@@ -50,7 +50,10 @@ jobs:
             }
 
             const ptRun = hasCI ? await findRunWithRetry('pr-test.yml') : null;
-            const peRun = hasExtra ? await findRunWithRetry('pr-test-extra.yml') : null;
+            // pr-test-extra's gate requires BOTH run-ci AND run-ci-extra
+            // (see pr-test-extra.yml check-changes if-condition), so without
+            // run-ci the extra workflow doesn't run either.
+            const peRun = (hasCI && hasExtra) ? await findRunWithRetry('pr-test-extra.yml') : null;
 
             // Treat a fully-skipped run as "no real run" — happens when the PR
             // was opened without the label and label was added later (GHA does
@@ -63,9 +66,11 @@ jobs:
             const ptText = !hasCI
               ? missingCIText
               : (isReal(ptRun) ? `[Run #${ptRun.id}](${ptRun.html_url})` : '_Not run yet_');
-            const peText = !hasExtra
-              ? notExtraEnabledText
-              : (isReal(peRun) ? `[Run #${peRun.id}](${peRun.html_url})` : stalePushText);
+            const peText = !hasCI
+              ? missingCIText
+              : !hasExtra
+                ? notExtraEnabledText
+                : (isReal(peRun) ? `[Run #${peRun.id}](${peRun.html_url})` : stalePushText);
 
             const outerStart = '<!-- pr-states:start -->';
             const outerEnd   = '<!-- pr-states:end -->';
