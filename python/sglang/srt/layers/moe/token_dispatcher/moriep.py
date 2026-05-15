@@ -1042,6 +1042,7 @@ class MoriEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
+        self._num_tokens = hidden_states.shape[0]
         inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
             topk_output=topk_output,
@@ -1059,8 +1060,8 @@ class MoriEPDispatcher(BaseDispatcher):
         combine_input: CombineInput,
     ) -> Tuple:
         self.combine_a(combine_input)
-        ret = self.combine_b()
-        return ret
+        hidden_states = self.combine_b()
+        return hidden_states[: self._num_tokens]
 
     def combine_a(
         self,

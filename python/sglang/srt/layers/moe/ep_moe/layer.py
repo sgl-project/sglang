@@ -177,19 +177,11 @@ class DeepEPMoE(FusedMoE):
                 topk_output,
             )
 
-        num_tokens = hidden_states.shape[0]
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
         combine_input = self.run_moe_core(dispatch_output)
-        hidden_states = self.dispatcher.combine(combine_input=combine_input)
-
-        if get_moe_a2a_backend().is_mori():
-            # mori combine returns a buffer-sized tensor; slice back to the
-            # caller's token count.
-            hidden_states = hidden_states[:num_tokens]
-
-        return hidden_states
+        return self.dispatcher.combine(combine_input=combine_input)
 
     def dispatch(
         self,
