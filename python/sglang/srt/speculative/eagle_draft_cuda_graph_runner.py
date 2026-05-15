@@ -109,7 +109,7 @@ class EAGLEDraftCudaGraphRunner:
             0
         ].get_cuda_graph_seq_len_fill_value()
         seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
         )
         self.extend_seq_lens_cpu = [self.seq_len_fill_value] * self.max_bs
 
@@ -127,9 +127,9 @@ class EAGLEDraftCudaGraphRunner:
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
             seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
             )
-            extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
+            extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int64)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             _hidden_size = EagleDraftInput.hidden_size_for(self.eagle_worker)
