@@ -40,6 +40,12 @@ async fn main() -> Result<()> {
             .context("load tokenizers")?,
     );
     let proxy = Arc::new(sgl_router::proxy::Proxy::new(cfg.workers[0].url.clone()));
+
+    match proxy.probe_health(std::time::Duration::from_secs(2)).await {
+        Ok(()) => tracing::info!("worker probe ok"),
+        Err(e) => tracing::warn!("startup worker probe failed: {e}; continuing anyway"),
+    }
+
     let ctx = Arc::new(sgl_router::server::app_context::AppContext::new(
         cfg.clone(),
         tokenizers,
