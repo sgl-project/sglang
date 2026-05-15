@@ -1,9 +1,4 @@
-"""Benchmark the hybrid mla_kv_pack_quantize_fp8 against an inlined naive Triton baseline.
-
-The naive baseline is a straightforward 3-phase implementation (load k_nope /
-k_pe / v, FP8 cast, store packed K and quantized V) on a 2-D ``(s, h)`` grid
-tuned with ``(BLOCK_S, num_warps, num_stages)`` bands by ``s``.
-"""
+"""Bench the hybrid ``mla_kv_pack_quantize_fp8`` against an inlined naive Triton baseline."""
 
 import itertools
 from typing import Tuple
@@ -26,9 +21,6 @@ from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, suite="stage-b-kernel-benchmark-1-gpu-large")
-
-
-# ---------- Triton baseline --------------------------------------------------
 
 
 @triton.jit
@@ -138,13 +130,9 @@ def _triton_pack(k_nope, k_pe, v, k_out, v_out):
     )
 
 
-# ---------- Benchmark scaffolding --------------------------------------------
-
-# Per-head dims (DSv3 standard).
 QK_NOPE = 128
 QK_ROPE = 64
 V_HEAD = 128
-# TP=4 of 128 heads → 32 heads per rank.
 NUM_HEADS = 32
 NUM_LAYERS = 8
 

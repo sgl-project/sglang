@@ -1,17 +1,6 @@
-"""Hybrid Triton wrapper for ``mla_kv_pack_quantize_fp8``.
+"""Fused ``cat(k_nope, broadcast(k_pe)) + FP8 quantize`` for K and ``FP8 quantize`` for V.
 
-Auto-dispatches between two Triton kernels based on the batch size
-(``s``, the token count). Both perform the same fused operation:
-
-    out_k = cat(quantize_fp8(k_nope), broadcast(quantize_fp8(k_pe)))
-    out_v = quantize_fp8(v)
-
-See ``_pick_kernel`` for the heuristic.
-
-A JIT CUDA implementation was also explored and is dominated by these two
-Triton kernels at every batch size on GB300 even after aggressive
-optimization (1-D flat grid, packed fp8x2 cvt, predicate elision), so the
-dispatch is Triton-only.
+Dispatches between two Triton kernels per batch size; see ``_pick_kernel``.
 """
 
 from __future__ import annotations
@@ -23,10 +12,6 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
-
-# ---------------------------------------------------------------------------
-# Kernels
-# ---------------------------------------------------------------------------
 
 
 @triton.jit
@@ -160,29 +145,11 @@ def _v1_flat_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-# ---------------------------------------------------------------------------
-# Dispatch
-# ---------------------------------------------------------------------------
-
-
 def _pick_kernel(s: int, num_heads: int) -> Tuple[str, dict]:
-    """Return ('v0' or 'v1_flat', kwargs).
-
-    Heuristic tuned by an isolated 10-30 trial sweep on GB300 (DSv3 dims,
-    BF16 -> FP8 e4m3). Hybrid wins over the naive 2-D Triton baseline at
-    every batch size in {1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192,
-    256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288,
-    16384} by 1.02x-7.29x.
-
-    Why both v0 and v1_flat appear: v0's 2-D ``(s, h)`` grid wins when
-    ``BLOCK_S`` can be larger than 1 and per-CTA work is bandwidth-bound
-    (bs=4-16 and bs=256-1536). v1_flat's 1-D grid wins at the transition
-    points where the 2-D grid either over- or under-provisions CTAs.
-    """
+    """Tuned on GB300, DSv3 dims, BF16 -> FP8 e4m3."""
     if s <= 2:
-        # Launch-overhead-bound: kernel runtime < 1 µs, dominated by fixed
-        # PDL + launch attribute setup. Bench-to-bench variance (±70 ns)
-        # exceeds any config win, so match the naive baseline here.
+        # Launch-overhead-bound; tighter (BLOCK_S, num_warps) just adds warp
+        # setup cost without paying back in per-CTA work.
         return "v0", {"BLOCK_S": 1, "num_warps": 1, "num_stages": 2}
     if s <= 16:
         return "v0", {"BLOCK_S": 4, "num_warps": 2, "num_stages": 3}
@@ -192,13 +159,7 @@ def _pick_kernel(s: int, num_heads: int) -> Tuple[str, dict]:
         return "v1_flat", {"BLOCK": 16, "num_warps": 8, "num_stages": 3}
     if s <= 1536:
         return "v0", {"BLOCK_S": 16, "num_warps": 4, "num_stages": 3}
-    # s >= 2048: HBM-bound regime, v1_flat with deeper pipelining.
-    block, num_warps, num_stages = 16, 8, 3
-    return "v1_flat", {
-        "BLOCK": block,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-    }
+    return "v1_flat", {"BLOCK": 16, "num_warps": 8, "num_stages": 3}
 
 
 _FP8_DTYPE_MAP = {
@@ -218,20 +179,11 @@ def mla_kv_pack_quantize_fp8(
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
     enable_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Hybrid Triton replacement for the JIT CUDA ``mla_kv_pack_quantize_fp8``.
+    """Fused ``cat(k_nope, broadcast k_pe) + FP8 quantize`` for K and ``FP8 quantize`` for V.
 
-    Args:
-        k_nope: BF16/FP16 ``[s, h, qk_nope]``. May be a strided view.
-        k_pe:   BF16/FP16 ``[s, 1, qk_rope]`` or ``[s, qk_rope]``. Shared across heads.
-        v:      BF16/FP16 ``[s, h, v_head]``. May be a strided view.
-        k_scale_inv: scalar multiplier applied before the FP8 cast on K.
-        v_scale_inv: scalar multiplier applied before the FP8 cast on V.
-        k_out, v_out: optional pre-allocated FP8 outputs.
-        fp8_dtype: ``torch.float8_e4m3fn`` (default) or ``torch.float8_e5m2``.
-        enable_pdl: opt into PDL. Auto-detected when ``None``.
-
-    Returns:
-        ``(k_fp8 [s, h, qk_nope + qk_rope], v_fp8 [s, h, v_head])``.
+    Shapes: ``k_nope [s, h, qk_nope]``, ``k_pe [s, 1, qk_rope]`` or ``[s, qk_rope]``,
+    ``v [s, h, v_head]``. Returns ``(k_fp8 [s, h, qk_nope + qk_rope], v_fp8 [s, h, v_head])``.
+    Strided views are supported as long as the inner dim is contiguous.
     """
     assert k_nope.dtype in (
         torch.bfloat16,

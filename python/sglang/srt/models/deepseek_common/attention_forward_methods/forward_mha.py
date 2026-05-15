@@ -38,8 +38,6 @@ if _use_aiter_gfx95:
 
 
 def _resolve_attn_backend(forward_batch: ForwardBatch):
-    """Unwrap TboAttnBackend so ``hasattr``-based hook dispatch works
-    regardless of whether two-batch overlap is on."""
     backend = forward_batch.attn_backend
     if isinstance(backend, TboAttnBackend):
         backend = backend.primary
@@ -379,11 +377,7 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
 
-        # Backend hook: when present, the backend owns the BF16->FP8 K/V
-        # build for the prefix chunk. kv_b_proj always needs BF16 input, so
-        # request BF16 from the cache fetch when a pack hook is supplied —
-        # the legacy ``q.dtype`` happens to be BF16 in default code but
-        # breaks once q is FP8.
+        # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
         backend = _resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
         kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype

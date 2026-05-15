@@ -11,7 +11,6 @@ register_cuda_ci(est_time=60, suite="stage-b-kernel-unit-1-gpu-large")
 
 DEVICE = "cuda"
 
-# DSv3 / DeepSeek-V4 typical per-head dims.
 SHAPES = get_ci_test_range(
     [(128, 64, 128), (64, 32, 64)],
     [(128, 64, 128)],
@@ -71,8 +70,6 @@ def test_strided_inputs(dtype):
     s, h = 16, 32
     qk_nope, qk_rope, v_head = 128, 64, 128
 
-    # Strided view: simulate an `kv = cat(kv_a, k_nope)` layout where k_nope is
-    # the second slice.
     full = torch.randn(
         (s, h, qk_nope * 2), dtype=dtype, device=DEVICE, requires_grad=False
     )
