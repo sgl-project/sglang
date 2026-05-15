@@ -22,5 +22,9 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             "/v1/detokenize",
             post(crate::server::routes::tokenize::detokenize),
         )
+        .route(
+            "/v1/chat/completions",
+            post(crate::server::routes::chat::chat_completions),
+        )
         .with_state(ctx)
 }
