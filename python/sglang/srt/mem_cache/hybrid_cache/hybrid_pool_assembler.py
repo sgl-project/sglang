@@ -3,12 +3,15 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
+    DeepSeekV4PagedHostPool,
+    DeepSeekV4StateHostPool,
     HostPoolGroup,
+    LogicalHostPool,
     MambaPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
@@ -71,7 +74,6 @@ def build_pool_entry(
     layer_mapping: dict[int, int],
     transfer_layer_num: int,
     is_anchor: bool = False,
-    share_indices_with_anchor: bool = False,
     host_evict_fn: Optional[Callable[[int], Any]] = None,
     device_evict_fn: Optional[Callable[[int], Any]] = None,
     device_alloc_fn: Optional[Callable[[int], Any]] = None,
@@ -83,7 +85,6 @@ def build_pool_entry(
         device_pool=device_pool,
         layer_mapper=_make_layer_mapper(layer_mapping, transfer_layer_num),
         is_primary_index_anchor=is_anchor,
-        share_indices_with_anchor=share_indices_with_anchor,
         host_evict_fn=host_evict_fn,
         device_evict_fn=device_evict_fn,
         device_alloc_fn=device_alloc_fn,
@@ -100,8 +101,8 @@ def build_kv_only_stack(
     page_size: int,
     tp_group,
     load_cache_event,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
@@ -110,8 +111,6 @@ def build_kv_only_stack(
     storage_backend_extra_config: Optional[dict] = None,
     pp_rank: int = 0,
     pp_size: int = 1,
-    attn_cp_rank: int = 0,
-    attn_cp_size: int = 1,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
@@ -149,8 +148,6 @@ def build_kv_only_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        attn_cp_rank=attn_cp_rank,
-        attn_cp_size=attn_cp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
@@ -168,6 +165,8 @@ def build_hybrid_swa_stack(
     page_size: int,
     tp_group,
     load_cache_event,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
@@ -177,8 +176,6 @@ def build_hybrid_swa_stack(
     storage_backend_extra_config: Optional[dict] = None,
     pp_rank: int = 0,
     pp_size: int = 1,
-    attn_cp_rank: int = 0,
-    attn_cp_size: int = 1,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
@@ -225,6 +222,8 @@ def build_hybrid_swa_stack(
         page_size,
         tp_group,
         load_cache_event=load_cache_event,
+        attn_cp_group=attn_cp_group,
+        attn_tp_group=attn_tp_group,
         write_policy=server_args.hicache_write_policy,
         io_backend=server_args.hicache_io_backend,
         storage_backend=storage_backend,
@@ -233,8 +232,249 @@ def build_hybrid_swa_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        attn_cp_rank=attn_cp_rank,
-        attn_cp_size=attn_cp_size,
+        transfer_layer_num=transfer_layer_num,
+        enable_storage_metrics=enable_storage_metrics,
+    )
+    return host_pool_group, cache_controller
+
+
+def _deepseek_v4_num_host_pages(
+    *,
+    params: CacheInitParams,
+    server_args: ServerArgs,
+    kvcache: Any,
+    page_size: int,
+    swa_page_size: int,
+) -> tuple[int, int]:
+    allocator = params.token_to_kv_pool_allocator
+    device_full_size = getattr(allocator, "size_full", kvcache.size)
+    device_full_pages = (device_full_size + page_size - 1) // page_size
+
+    device_swa_pages = (kvcache.swa_size + swa_page_size - 1) // swa_page_size
+
+    if server_args.hicache_size > 0:
+        raise ValueError(
+            "DeepSeek V4 HiCache currently does not support --hicache-size; "
+            "use --hicache-ratio instead."
+        )
+    ratio = server_args.hicache_ratio
+    full_host_pages = max(int(device_full_pages * ratio), device_full_pages + 1)
+    swa_host_pages = max(int(device_swa_pages * ratio), device_swa_pages + 1)
+    return full_host_pages, swa_host_pages
+
+
+def build_deepseek_v4_hicache_stack(
+    *,
+    params: CacheInitParams,
+    server_args: ServerArgs,
+    kvcache: Any,
+    page_size: int,
+    tp_group,
+    load_cache_event,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    storage_backend: Optional[str],
+    host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    prefetch_threshold: int = 256,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    pp_rank: int = 0,
+    pp_size: int = 1,
+    enable_storage_metrics: bool = False,
+) -> tuple[HostPoolGroup, HybridCacheController]:
+    transfer_layer_num = len(kvcache.compression_ratios)
+    full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
+    swa_layer_mapping = {
+        layer_id: layer_id for layer_id in range(len(kvcache.swa_kv_pool.kv_buffer))
+    }
+
+    c4_layer_mapping = {}
+    c128_layer_mapping = {}
+    c4_state_global_layers = []
+    c128_state_global_layers = []
+    for layer_id, layer_item in enumerate(kvcache.layer_mapping):
+        if layer_item.compress_ratio == 4:
+            c4_layer_mapping[layer_id] = layer_item.compress_layer_id
+            c4_state_global_layers.append(layer_id)
+        elif layer_item.compress_ratio == 128:
+            c128_layer_mapping[layer_id] = layer_item.compress_layer_id
+            c128_state_global_layers.append(layer_id)
+
+    c4_state_mapping = {
+        layer_id: local_id for local_id, layer_id in enumerate(c4_state_global_layers)
+    }
+    c128_state_mapping = {
+        layer_id: local_id for local_id, layer_id in enumerate(c128_state_global_layers)
+    }
+    num_host_pages, swa_num_host_pages = _deepseek_v4_num_host_pages(
+        params=params,
+        server_args=server_args,
+        kvcache=kvcache,
+        page_size=page_size,
+        swa_page_size=kvcache.swa_page_size,
+    )
+
+    logical_host_pool = LogicalHostPool(num_host_pages * page_size, page_size)
+    swa_host_pool = DeepSeekV4PagedHostPool(
+        pool_name=str(PoolName.SWA),
+        device_buffers=kvcache.swa_kv_pool.kv_buffer,
+        item_bytes=kvcache.swa_kv_pool.bytes_per_page_padded,
+        num_host_pages=swa_num_host_pages,
+        slot_page_size=kvcache.swa_page_size,
+        allocator_type=server_args.hicache_storage_backend,
+    )
+    swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
+    entries = [
+        build_pool_entry(
+            name=PoolName.KV,
+            host_pool=logical_host_pool,
+            device_pool=kvcache,
+            layer_mapping=full_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            is_anchor=True,
+        ),
+        build_pool_entry(
+            name=PoolName.SWA,
+            host_pool=swa_host_pool,
+            device_pool=kvcache.swa_kv_pool,
+            layer_mapping=swa_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            host_evict_fn=host_swa_evict_fn,
+            device_evict_fn=device_swa_evict_fn,
+            device_alloc_fn=swa_attn_allocator.alloc,
+            device_free_fn=swa_attn_allocator.free,
+        ),
+    ]
+
+    if c4_layer_mapping:
+        c4_host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.DEEPSEEK_V4_C4),
+            device_buffers=kvcache.c4_kv_pool.kv_buffer,
+            item_bytes=kvcache.c4_kv_pool.bytes_per_page_padded,
+            num_host_pages=num_host_pages,
+            slot_page_size=page_size,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        c4_indexer_host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
+            device_buffers=kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer,
+            item_bytes=(
+                kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[0].shape[1]
+                * kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[0].element_size()
+            ),
+            num_host_pages=num_host_pages,
+            slot_page_size=page_size,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        c4_state_host_pool = DeepSeekV4StateHostPool(
+            pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
+            state_pools=[
+                kvcache.compress_state_pools[layer_id]
+                for layer_id in c4_state_global_layers
+            ],
+            num_host_pages=swa_num_host_pages,
+            swa_page_size=kvcache.swa_page_size,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
+            pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
+            state_pools=[
+                kvcache.indexer_compress_state_pools[layer_id]
+                for layer_id in c4_state_global_layers
+            ],
+            num_host_pages=swa_num_host_pages,
+            swa_page_size=kvcache.swa_page_size,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        entries.extend(
+            [
+                build_pool_entry(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    host_pool=c4_host_pool,
+                    device_pool=kvcache.c4_kv_pool,
+                    layer_mapping=c4_layer_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                ),
+                build_pool_entry(
+                    name=PoolName.DEEPSEEK_V4_C4_INDEXER,
+                    host_pool=c4_indexer_host_pool,
+                    device_pool=kvcache.c4_indexer_kv_pool,
+                    layer_mapping=c4_layer_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                ),
+                build_pool_entry(
+                    name=PoolName.DEEPSEEK_V4_C4_STATE,
+                    host_pool=c4_state_host_pool,
+                    device_pool=None,
+                    layer_mapping=c4_state_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                ),
+                build_pool_entry(
+                    name=PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+                    host_pool=c4_indexer_state_host_pool,
+                    device_pool=None,
+                    layer_mapping=c4_state_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                ),
+            ]
+        )
+
+    if c128_layer_mapping:
+        c128_host_pool = DeepSeekV4PagedHostPool(
+            pool_name=str(PoolName.DEEPSEEK_V4_C128),
+            device_buffers=kvcache.c128_kv_pool.kv_buffer,
+            item_bytes=kvcache.c128_kv_pool.bytes_per_page_padded,
+            num_host_pages=num_host_pages,
+            slot_page_size=page_size,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        c128_state_host_pool = DeepSeekV4StateHostPool(
+            pool_name=str(PoolName.DEEPSEEK_V4_C128_STATE),
+            state_pools=[
+                kvcache.compress_state_pools[layer_id]
+                for layer_id in c128_state_global_layers
+            ],
+            num_host_pages=swa_num_host_pages,
+            swa_page_size=kvcache.swa_page_size,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        entries.extend(
+            [
+                build_pool_entry(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    host_pool=c128_host_pool,
+                    device_pool=kvcache.c128_kv_pool,
+                    layer_mapping=c128_layer_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                ),
+                build_pool_entry(
+                    name=PoolName.DEEPSEEK_V4_C128_STATE,
+                    host_pool=c128_state_host_pool,
+                    device_pool=None,
+                    layer_mapping=c128_state_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                ),
+            ]
+        )
+
+    host_pool_group = HostPoolGroup(entries)
+    cache_controller = HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        page_size,
+        tp_group,
+        load_cache_event=load_cache_event,
+        attn_cp_group=attn_cp_group,
+        attn_tp_group=attn_tp_group,
+        write_policy=server_args.hicache_write_policy,
+        io_backend=server_args.hicache_io_backend,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
@@ -252,8 +492,8 @@ def build_hybrid_mamba_stack(
     page_size: int,
     tp_group,
     load_cache_event,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     host_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
@@ -263,8 +503,6 @@ def build_hybrid_mamba_stack(
     storage_backend_extra_config: Optional[dict] = None,
     pp_rank: int = 0,
     pp_size: int = 1,
-    attn_cp_rank: int = 0,
-    attn_cp_size: int = 1,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
@@ -317,37 +555,33 @@ def build_hybrid_mamba_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        attn_cp_rank=attn_cp_rank,
-        attn_cp_size=attn_cp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
     return host_pool_group, cache_controller
 
 
-def build_shared_anchor_stack(
+def build_anchor_sidecar_stack(
     *,
     params: CacheInitParams,
     server_args: ServerArgs,
     kv_pool: Any,
-    shared_pool_name: PoolName,
+    sidecar_pool_name: PoolName,
     full_layer_mapping: dict[int, int],
     page_size: int,
     tp_group,
     load_cache_event,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
-    shared_host_pool_factory: Callable[[Any], Any],
+    sidecar_host_pool_factory: Callable[[Any], Any],
     prefetch_threshold: int = 256,
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     pp_rank: int = 0,
     pp_size: int = 1,
-    attn_cp_rank: int = 0,
-    attn_cp_size: int = 1,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
@@ -358,7 +592,7 @@ def build_shared_anchor_stack(
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
     )
-    shared_host_pool = shared_host_pool_factory(kv_host_pool)
+    sidecar_host_pool = sidecar_host_pool_factory(kv_host_pool)
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -369,12 +603,11 @@ def build_shared_anchor_stack(
             is_anchor=True,
         ),
         build_pool_entry(
-            name=shared_pool_name,
-            host_pool=shared_host_pool,
+            name=sidecar_pool_name,
+            host_pool=sidecar_host_pool,
             device_pool=kv_pool,
             layer_mapping=full_layer_mapping,
             transfer_layer_num=transfer_layer_num,
-            share_indices_with_anchor=True,
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
@@ -394,8 +627,6 @@ def build_shared_anchor_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         pp_rank=pp_rank,
         pp_size=pp_size,
-        attn_cp_rank=attn_cp_rank,
-        attn_cp_size=attn_cp_size,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
     )
@@ -408,11 +639,12 @@ def attach_hybrid_pool_to_unified_cache(
     server_args: ServerArgs,
     *,
     load_cache_event,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import (
         HybridLinearKVPool,
         MLATokenToKVPool,
@@ -426,8 +658,15 @@ def attach_hybrid_pool_to_unified_cache(
         swa_stack = isinstance(kvcache, SWAKVPool)
         mamba_stack = isinstance(kvcache, HybridLinearKVPool)
         nsa_stack = isinstance(kvcache, NSATokenToKVPool)
+        deepseek_v4_stack = isinstance(kvcache, DeepSeekV4TokenToKVPool)
 
-        if mamba_stack:
+        if deepseek_v4_stack:
+            use_mla = False
+            assert set(cache.components.keys()) == {
+                ComponentType.FULL,
+                ComponentType.SWA,
+            }, "DeepSeekV4TokenToKVPool requires FULL + SWA in UnifiedRadixCache."
+        elif mamba_stack:
             full_kv_pool = kvcache.full_kv_pool
             use_mla = kvcache.use_mla
             assert set(cache.components.keys()) == {
@@ -448,7 +687,51 @@ def attach_hybrid_pool_to_unified_cache(
                 ComponentType.FULL
             }, "Non-hybrid KV pool currently only supports FULL-only UnifiedRadixCache."
 
-        if mamba_stack:
+        if deepseek_v4_stack:
+            host_pool_group, cache_controller = build_deepseek_v4_hicache_stack(
+                params=params,
+                server_args=server_args,
+                kvcache=kvcache,
+                page_size=cache.page_size,
+                tp_group=params.tp_cache_group,
+                load_cache_event=load_cache_event,
+                attn_cp_group=attn_cp_group,
+                attn_tp_group=attn_tp_group,
+                storage_backend=None,
+                host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+                device_swa_evict_fn=lambda n: cache.evict(
+                    EvictParams(swa_num_tokens=n)
+                ),
+                pp_rank=params.pp_rank,
+                pp_size=params.pp_size,
+            )
+            cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
+            cache.host_pool_group = host_pool_group
+            cache.cache_controller = cache_controller
+            cache.components[ComponentType.FULL]._full_kv_pool_host = (
+                cache.full_kv_pool_host
+            )
+            cache.swa_kv_pool_host = host_pool_group.get_pool(PoolName.SWA)
+            cache.components[ComponentType.SWA]._swa_kv_pool_host = (
+                cache.swa_kv_pool_host
+            )
+            for pool_name, indices_from_pool in (
+                (PoolName.DEEPSEEK_V4_C4, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C128, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA),
+                (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, PoolName.SWA),
+                (PoolName.DEEPSEEK_V4_C128_STATE, PoolName.SWA),
+            ):
+                if pool_name in host_pool_group.entry_map:
+                    cache.register_sidecar_pool(
+                        SidecarPoolSpec(
+                            pool_name=pool_name,
+                            indices_from_pool=indices_from_pool,
+                        )
+                    )
+            transfer_layer_num = len(kvcache.compression_ratios)
+        elif mamba_stack:
             full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
             mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
             host_pool_group, cache_controller = build_hybrid_mamba_stack(
@@ -505,6 +788,8 @@ def attach_hybrid_pool_to_unified_cache(
                 page_size=cache.page_size,
                 tp_group=params.tp_cache_group,
                 load_cache_event=load_cache_event,
+                attn_cp_group=attn_cp_group,
+                attn_tp_group=attn_tp_group,
                 storage_backend=None,
                 use_mla=False,
                 host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
@@ -529,18 +814,21 @@ def attach_hybrid_pool_to_unified_cache(
             full_layer_mapping = {
                 layer_id: layer_id for layer_id in range(full_kv_pool.layer_num)
             }
-            host_pool_group, cache_controller = build_shared_anchor_stack(
+            host_pool_group, cache_controller = build_anchor_sidecar_stack(
                 params=params,
                 server_args=server_args,
                 kv_pool=full_kv_pool,
-                shared_pool_name=PoolName.INDEXER,
+                sidecar_pool_name=PoolName.INDEXER,
                 full_layer_mapping=full_layer_mapping,
                 page_size=cache.page_size,
                 tp_group=params.tp_cache_group,
                 load_cache_event=load_cache_event,
+                attn_cp_group=attn_cp_group,
+                attn_tp_group=attn_tp_group,
                 storage_backend=None,
                 use_mla=use_mla,
-                shared_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
+                override_kv_cache_dim=full_kv_pool.kv_cache_dim,
+                sidecar_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
                     full_kv_pool,
                     kv_host_pool,
                     server_args.hicache_mem_layout,
@@ -548,17 +836,15 @@ def attach_hybrid_pool_to_unified_cache(
                 ),
                 pp_rank=params.pp_rank,
                 pp_size=params.pp_size,
-                attn_cp_rank=params.attn_cp_rank,
-                attn_cp_size=params.attn_cp_size,
             )
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
             cache.cache_controller = cache_controller
-            # Register the NSA indexer pool as sharing anchor-KV indices so
-            # HiCache backup/load emits its PoolTransfer together with KV.
-            cache.register_hicache_anchor_kv_shared_indices_pool(
-                PoolName.INDEXER,
-                hit_policy=PoolHitPolicy.ALL_PAGES,
+            cache.register_sidecar_pool(
+                SidecarPoolSpec(
+                    pool_name=PoolName.INDEXER,
+                    indices_from_pool=PoolName.KV,
+                )
             )
             cache.components[ComponentType.FULL]._full_kv_pool_host = (
                 cache.full_kv_pool_host
@@ -595,7 +881,9 @@ def attach_hybrid_pool_to_unified_cache(
             cache.cache_controller.layer_done_counter
         )
 
-        if mamba_stack:
+        if deepseek_v4_stack:
+            pools_desc = "KV + SWA + DeepSeekV4 sidecars"
+        elif mamba_stack:
             pools_desc = "KV + MAMBA"
         elif swa_stack:
             pools_desc = "KV + SWA"
@@ -622,8 +910,8 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
     prefetch_threshold: int,
     enable_storage_metrics: bool,
     load_cache_event,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
 
@@ -632,11 +920,11 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
     try:
         kv = radix_cache.kv_cache
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
-        host_pool_group, cache_controller = build_shared_anchor_stack(
+        host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             server_args=server_args,
             kv_pool=kv,
-            shared_pool_name=PoolName.INDEXER,
+            sidecar_pool_name=PoolName.INDEXER,
             full_layer_mapping=layer_mapping,
             page_size=radix_cache.page_size,
             tp_group=radix_cache.tp_group,
@@ -645,8 +933,9 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
             attn_tp_group=attn_tp_group,
             storage_backend=server_args.hicache_storage_backend,
             use_mla=True,
+            override_kv_cache_dim=kv.kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
-            shared_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
+            sidecar_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
                 kv,
                 kv_host_pool,
                 server_args.hicache_mem_layout,
@@ -656,8 +945,6 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
             storage_backend_extra_config=extra_config,
             pp_rank=radix_cache.pp_rank,
             pp_size=radix_cache.pp_size,
-            attn_cp_rank=params.attn_cp_rank,
-            attn_cp_size=params.attn_cp_size,
             enable_storage_metrics=enable_storage_metrics,
         )
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
@@ -682,8 +969,8 @@ def attach_hybrid_pool_to_mamba_cache(
     prefetch_threshold: int,
     load_cache_event,
     enable_storage_metrics: bool = False,
-    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
-    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """Attach HostPoolGroup (KV + Mamba) + HybridCacheController for HiMambaRadixCache.
 
@@ -715,8 +1002,6 @@ def attach_hybrid_pool_to_mamba_cache(
             storage_backend_extra_config=extra_config,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
-            attn_cp_rank=params.attn_cp_rank,
-            attn_cp_size=params.attn_cp_size,
             enable_storage_metrics=enable_storage_metrics,
         )
         mamba_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
