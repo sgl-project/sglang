@@ -1038,8 +1038,8 @@ SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320
 SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0
 
 # Optional env vars for custom w4a4 MegaMoE kernel
-export SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1
-export SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1`
+SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1
+SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1`
         }</pre>
         <p style={{ margin: "6px 0 0 0", fontSize: "12px", opacity: 0.85, lineHeight: "1.8" }}>
           Adjust <code>SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK</code> based on your chunked prefill size (e.g. 4096 for balanced, 8320 for max-throughput).<br/>
