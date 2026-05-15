@@ -128,13 +128,18 @@ def _flush_cache(base_url, timeout_s=30):
 
 
 def _generate(
-    base_url, input_ids, max_new_tokens, return_logprob=False, logprob_start_len=-1
+    base_url,
+    input_ids,
+    max_new_tokens,
+    return_logprob=False,
+    logprob_start_len=-1,
+    temperature=1,
 ):
     """Send generate request and return results."""
     json_data = {
         "input_ids": input_ids,
         "sampling_params": {
-            "temperature": 1,
+            "temperature": temperature,
             "max_new_tokens": max_new_tokens,
             "ignore_eos": True,
         },
@@ -151,7 +156,7 @@ def _generate(
     return response.json()
 
 
-def _get_input_logprobs(base_url, new_input_ids, output_logprobs):
+def _get_input_logprobs(base_url, new_input_ids, output_logprobs, temperature=1):
     """Run prefill to get input logprobs matching output logprobs."""
     _flush_cache(base_url)
     results = _generate(
@@ -160,6 +165,7 @@ def _get_input_logprobs(base_url, new_input_ids, output_logprobs):
         max_new_tokens=0,
         return_logprob=True,
         logprob_start_len=0,
+        temperature=temperature,
     )
     assert len(results) == len(new_input_ids)
 

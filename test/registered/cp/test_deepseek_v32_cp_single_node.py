@@ -13,11 +13,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(
-    est_time=616,
-    suite="stage-c-test-deepep-8-gpu-h200",
-    disabled="Disabled due to #24268. Should be fixed soon.",
-)
+register_cuda_ci(est_time=616, stage="extra-b", runner_config="deepep-8-gpu-h200")
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
