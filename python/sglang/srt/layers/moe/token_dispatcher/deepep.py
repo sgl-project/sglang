@@ -364,6 +364,11 @@ class _DeepEPDispatcherImplBase:
     def _get_buffer(self):
         raise NotImplementedError
 
+    def _buffer_deepep_mode(self):
+        if self.deepep_mode == DeepEPMode.LOW_LATENCY:
+            return DeepEPMode.AUTO
+        return self.deepep_mode
+
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
 
@@ -536,7 +541,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.group,
             self.hidden_size,
             self.params_bytes,
-            self.deepep_mode,
+            self._buffer_deepep_mode(),
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
@@ -744,7 +749,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.group,
             self.hidden_size,
             self.params_bytes,
-            self.deepep_mode,
+            self._buffer_deepep_mode(),
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
@@ -792,7 +797,7 @@ class DeepEPDispatcher(BaseDispatcher):
                 return_recv_hook=return_recv_hook,
                 **common_kwargs,
             )
-        if self.deepep_mode.enable_normal():
+        if self.deepep_mode.enable_normal() or self.deepep_mode.enable_low_latency():
             self._normal_dispatcher = _DeepEPDispatcherImplNormal(
                 async_finish=async_finish,
                 **common_kwargs,
@@ -818,7 +823,9 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-        inner_state = self._get_impl().dispatch_a(
+        impl = self._get_dispatch_impl(hidden_states, topk_output)
+        self._active_dispatch_impl = impl
+        inner_state = impl.dispatch_a(
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
@@ -828,7 +835,9 @@ class DeepEPDispatcher(BaseDispatcher):
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
         inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_impl().dispatch_b(*inner_state)
+        impl = self._active_dispatch_impl
+        del self._active_dispatch_impl
+        return impl.dispatch_b(*inner_state)
 
     def combine(
         self,
@@ -844,7 +853,9 @@ class DeepEPDispatcher(BaseDispatcher):
     ):
         hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        inner_state = self._get_impl().combine_a(
+        impl = self._get_combine_impl(combine_input)
+        self._active_combine_impl = impl
+        inner_state = impl.combine_a(
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
@@ -855,7 +866,54 @@ class DeepEPDispatcher(BaseDispatcher):
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
         inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
-        return self._get_impl().combine_b(*inner_state)
+        impl = self._active_combine_impl
+        del self._active_combine_impl
+        return impl.combine_b(*inner_state)
+
+    def _get_dispatch_impl(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ) -> _DeepEPDispatcherImplBase:
+        impl = self._get_impl()
+        if not isinstance(impl, _DeepEPDispatcherImplLowLatency):
+            return impl
+
+        num_tokens = (
+            hidden_states[0].shape[0]
+            if isinstance(hidden_states, tuple)
+            else hidden_states.shape[0]
+        )
+        topk_rows = topk_output.topk_ids.shape[0]
+        if num_tokens != topk_rows:
+            raise RuntimeError(
+                "DeepEP low-latency dispatch shape mismatch: "
+                f"hidden_states.shape={hidden_states.shape if not isinstance(hidden_states, tuple) else hidden_states[0].shape}, "
+                f"topk_ids.shape={topk_output.topk_ids.shape}"
+            )
+        if num_tokens > impl.num_max_dispatch_tokens_per_rank:
+            if not hasattr(self, "_normal_dispatcher"):
+                raise RuntimeError(
+                    "DeepEP low-latency dispatch token count exceeds capacity: "
+                    f"num_tokens={num_tokens}, "
+                    f"num_max_dispatch_tokens_per_rank={impl.num_max_dispatch_tokens_per_rank}"
+                )
+            if not getattr(self, "_warned_low_latency_fallback", False):
+                logger.warning(
+                    "DeepEP low-latency dispatch token count exceeds capacity "
+                    "(num_tokens=%s, num_max_dispatch_tokens_per_rank=%s); "
+                    "falling back to normal dispatch.",
+                    num_tokens,
+                    impl.num_max_dispatch_tokens_per_rank,
+                )
+                self._warned_low_latency_fallback = True
+            return self._normal_dispatcher
+        return impl
+
+    def _get_combine_impl(self, combine_input: CombineInput) -> _DeepEPDispatcherImplBase:
+        if combine_input.format == CombineInputFormat.DEEPEP_NORMAL:
+            return self._normal_dispatcher
+        if combine_input.format == CombineInputFormat.DEEPEP_LL:
+            return self._low_latency_dispatcher
+        return self._get_impl()
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         is_extend_in_batch = get_is_extend_in_batch()
