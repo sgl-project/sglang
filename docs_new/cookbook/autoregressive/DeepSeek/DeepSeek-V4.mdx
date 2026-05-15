@@ -170,6 +170,16 @@ fail with `nvlink_transport.cpp:497 Requested address ... not found!`. If
 this happens, prepend `MC_FORCE_MNNVL=1 NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1`
 to both prefill and decode `sglang serve` commands.
 
+### 3.3 Playground
+
+The §3.1 generator emits only **verified** cells. Use the Playground below to layer additional toggles — parallelism overrides, parsers, speculative-decoding presets — on top of whichever cell §3.1 is currently showing. The base is read live from your §3.1 selection; only your overrides change.
+
+Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. Until a configuration is verified end-to-end, the badge stays Auto-Estimated.
+
+import { DeepSeekV4Playground } from "/src/snippets/autoregressive/deepseek-v4-playground.jsx";
+
+<DeepSeekV4Playground />
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
