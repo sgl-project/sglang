@@ -68,26 +68,21 @@ jobs:
             // For pr-test-extra: only attribute the run URL when the PR carries
             // `run-ci-extra` and the extra graph actually executed. Without the
             // label the run is label-gate-skipped and contains nothing but
-            // call-pr-awareness itself — linking to it would be misleading.
+            // call-pr-awareness itself — linking to it would be misleading, so
+            // we inline a warning notice in the slot instead.
+            const notEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt into nightly-class coverage.';
             const newPrTest = (kind === 'pr-test')
               ? `[Run #${context.runId}](${runUrl})`
               : (prevPrTest || '_Not run yet_');
             const newPrExtra = (kind === 'pr-test-extra')
               ? (hasExtra
                   ? `[Run #${context.runId}](${runUrl})`
-                  : '_Skipped (no run-ci-extra label)_')
-              : (prevPrExtra || (hasExtra ? '_Not run yet_' : '_Skipped (no run-ci-extra label)_'));
-
-            // Label-status notice
-            const labelSection = hasExtra
-              ? `:white_check_mark: **Extra CI is enabled** for this PR (\`run-ci-extra\` label present).`
-              : `:warning: **Extra CI is not enabled.** This PR did not opt into nightly-class coverage. Add the \`run-ci-extra\` label and re-trigger the PR Test Extra workflow to enable.`;
+                  : notEnabledText)
+              : (prevPrExtra || (hasExtra ? '_Not run yet_' : notEnabledText));
 
             const newBlock = [
               outerStart,
               '### CI Awareness',
-              '',
-              labelSection,
               '',
               '**Latest CI runs:**',
               `- PR Test: ${ptStart}${newPrTest}${ptEnd}`,
