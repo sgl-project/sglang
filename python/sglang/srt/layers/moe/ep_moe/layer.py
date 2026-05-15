@@ -4,7 +4,6 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
@@ -127,7 +126,7 @@ class DeepEPMoE(FusedMoE):
         self.deepep_mode = get_deepep_mode()
 
         if quant_config is None and hasattr(self.dispatcher, "set_quant_config"):
-            self.dispatcher.set_quant_config({"bf16_dispatch": True})
+            self.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
         if (
             self.deepep_mode.enable_low_latency()
