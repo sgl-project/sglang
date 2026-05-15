@@ -1,5 +1,6 @@
 name: PR States
-# Maintains a CI-states block at the bottom of the PR body.
+# Maintains a CI-states block at the bottom of the PR body, showing the
+# latest PR Test / PR Test Extra run URLs.
 
 on:
   pull_request:
