@@ -28,7 +28,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=300,
-    suite="stage-c-test-8-gpu-h200",
+    stage="stage-c",
+    runner_config="8-gpu-h200",
     disabled="Temporarily disabled",
 )
 

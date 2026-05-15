@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import requests
+import torch.distributed as dist
 import zmq
 from aiohttp import web
 
@@ -25,7 +26,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferMetric,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -141,6 +142,13 @@ class CommonKVManager(BaseKVManager):
                 not self.enable_all_cp_ranks_for_transfer
                 and self.attn_cp_size > 1
                 and self.attn_cp_rank != 0
+            )
+            # Sync the leader's bootstrap port to every rank before
+            # registering: in multi-node prefill, registration targets
+            # `dist_init_addr` (rank 0) but each rank's local port may
+            # differ when the launcher auto-reserves a free port per host.
+            self.bootstrap_port = self._sync_bootstrap_port_across_nodes(
+                self.bootstrap_port
             )
             self.register_to_bootstrap()
             self.transfer_infos = {}
@@ -335,8 +343,38 @@ class CommonKVManager(BaseKVManager):
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
 
+    def _sync_bootstrap_port_across_nodes(self, local_port: int) -> int:
+        """Broadcast world-rank-0's bootstrap port to all prefill ranks.
+
+        Required for multi-node prefill when the launcher auto-reserves a
+        free port per host (e.g. Dynamo's
+        `_reserve_disaggregation_bootstrap_port`): without sync, non-leader
+        ranks register to `<leader_ip>:<their_local_port>`, hit
+        `Connection refused`, and the leader's `prefill_port_table` ends
+        up missing rows.
+        """
+        if not self.dist_init_addr or self.server_args.nnodes == 1:
+            return local_port
+
+        if not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError(
+                "torch.distributed must be initialised before "
+                "CommonKVManager registers to the bootstrap server in "
+                "multi-node prefill mode."
+            )
+
+        world_group = get_world_group()
+        synced_port = world_group.broadcast_object(local_port, src=0)
+        if synced_port != local_port:
+            logger.info(
+                f"Synced disaggregation bootstrap port from leader: "
+                f"local={local_port} -> leader={synced_port} "
+                f"(world_rank={world_group.rank_in_group})"
+            )
+        return synced_port
+
     def register_to_bootstrap(self):
-        """Register prefill server info to bootstrap server via HTTP POST."""
+        """Register prefill server info to bootstrap server via HTTP PUT."""
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
             host = NetworkAddress.parse(self.dist_init_addr).resolved().host
@@ -364,18 +402,33 @@ class CommonKVManager(BaseKVManager):
             "load_balance_method": self.server_args.load_balance_method,
         }
 
-        try:
-            response = requests.put(url, json=payload, timeout=5)
-            if response.status_code == 200:
-                logger.debug("Prefill successfully registered to bootstrap server.")
-            else:
-                logger.error(
-                    f"Prefill instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
+        max_retries, initial_delay, max_delay = 5, 1.0, 30.0
+        for attempt in range(max_retries):
+            try:
+                response = requests.put(url, json=payload, timeout=5)
+                if response.status_code == 200:
+                    logger.debug("Prefill successfully registered to bootstrap server.")
+                    return
+                logger.warning(
+                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
                 )
-        except Exception as e:
-            logger.error(
-                f"Prefill instance failed to register to bootstrap server: {e}"
+            except Exception as e:
+                # Walk to root cause to skip misleading urllib3 wrapper messages
+                cause = e
+                while cause.__cause__ is not None:
+                    cause = cause.__cause__
+                logger.warning(
+                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: {cause}"
+                )
+            if attempt == max_retries - 1:
+                break
+            delay = min(initial_delay * (2**attempt), max_delay) * (
+                0.75 + 0.25 * (time.monotonic() % 1)
             )
+            time.sleep(delay)
+        logger.error(
+            f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
+        )
 
     @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
