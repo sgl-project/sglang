@@ -1,11 +1,5 @@
-name: PR Awareness
-# Standalone PR-event-triggered workflow that maintains an "awareness block"
-# at the bottom of the PR body, surfacing extra-CI opt-in state + latest
-# PR Test / PR Test Extra run URLs.
-#
-# Trigger-driven (not reusable) so `pulls: write` stays scoped to this file
-# only — does NOT propagate up the pr-test.yml caller chain (e.g.
-# release-branch-cut.yml does not need `pulls: write`).
+name: PR States
+# Maintains a CI-states block at the bottom of the PR body.
 
 on:
   pull_request:
@@ -16,16 +10,14 @@ permissions:
   actions: read
 
 concurrency:
-  # cancel-in-progress: false — multiple events fire in quick succession
-  # (push + label change), serialize them so each run sees the latest state.
-  group: pr-awareness-${{ github.event.pull_request.number }}
+  group: pr-states-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
   update-pr-body:
     runs-on: ubuntu-latest
     steps:
-      - name: Update awareness block in PR body
+      - name: Update CI states block in PR body
         uses: actions/github-script@v7
         with:
           script: |
@@ -33,10 +25,7 @@ jobs:
             const labels = context.payload.pull_request.labels.map(l => l.name);
             const hasExtra = labels.includes('run-ci-extra');
 
-            // pr-test / pr-test-extra fire on the same PR event, but may
-            // not yet be visible via the API by the time this workflow
-            // starts. Retry briefly so the first sync's awareness lands
-            // with real URLs instead of "Not run yet".
+            // Retry briefly: pr-test* may not be API-visible yet when we start.
             async function findRunBySha(workflowFile) {
               const { data } = await github.rest.actions.listWorkflowRuns({
                 owner: context.repo.owner,
@@ -57,15 +46,11 @@ jobs:
             }
 
             const ptRun = await findRunWithRetry('pr-test.yml');
-            // pr-test-extra only runs when the label is set; skip the
-            // retry when it would never appear.
             const peRun = hasExtra ? await findRunWithRetry('pr-test-extra.yml') : null;
 
-            // Treat a fully-skipped run as "no real run" — happens when the
-            // PR was opened without `run-ci-extra` and the label was added
-            // later. GHA does not retrigger pr-test-extra on the labeled
-            // event, so the latest API-visible run is the original
-            // label-gate-skipped one and linking it would mislead.
+            // Treat a fully-skipped run as "no real run" — happens when the PR
+            // was opened without the label and label was added later (GHA does
+            // not retrigger on `labeled`).
             const isReal = (run) => run && run.conclusion !== 'skipped';
 
             const notEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
@@ -75,8 +60,8 @@ jobs:
               ? notEnabledText
               : (isReal(peRun) ? `[Run #${peRun.id}](${peRun.html_url})` : stalePushText);
 
-            const outerStart = '<!-- pr-awareness:start -->';
-            const outerEnd   = '<!-- pr-awareness:end -->';
+            const outerStart = '<!-- pr-states:start -->';
+            const outerEnd   = '<!-- pr-states:end -->';
             const ptStart    = '<!-- slot:pr-test:start -->';
             const ptEnd      = '<!-- slot:pr-test:end -->';
             const peStart    = '<!-- slot:pr-test-extra:start -->';
@@ -85,7 +70,7 @@ jobs:
             const newBlock = [
               outerStart,
               '---',
-              '### CI Awareness',
+              '### CI States',
               '',
               `Latest PR Test: ${ptStart}${ptText}${ptEnd}`,
               `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
@@ -97,9 +82,11 @@ jobs:
               repo: context.repo.repo,
               pull_number: context.issue.number,
             });
-            const body = pr.body || '';
+            let body = pr.body || '';
 
-            // Match optional stale leading `---` separator so we strip it.
+            // One-time migration: strip the legacy `pr-awareness:` block.
+            body = body.replace(/(?:\n+---\n+)?<!-- pr-awareness:start -->[\s\S]*?<!-- pr-awareness:end -->/, '');
+
             const blockRe = new RegExp(`(?:\\n+---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
             let newBody;
             if (blockRe.test(body)) {
@@ -118,7 +105,4 @@ jobs:
                 pull_number: context.issue.number,
                 body: newBody,
               });
-              core.info('Updated PR body awareness block.');
-            } else {
-              core.info('PR body awareness block already up-to-date.');
             }
