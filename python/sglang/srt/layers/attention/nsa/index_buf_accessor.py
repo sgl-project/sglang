@@ -4,14 +4,19 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# aiter cp_gather kernel with preshuffle=True is only valid when the indexer
+# uses the page_size=64 preshuffle layout (i.e. when the matching MQA gluon path
+# is also enabled).
+_use_aiter_preshuffle = aiter_can_use_preshuffle_paged_mqa()
 
-if _use_aiter:
+if _use_aiter_preshuffle:
     from aiter.ops.cache import cp_gather_indexer_k_quant_cache
 
 if TYPE_CHECKING:
@@ -167,7 +172,11 @@ class GetS:
 class GetKAndS:
     @classmethod
     def execute(cls, *args, **kwargs):
-        if _use_aiter:
+        # The aiter path uses cp_gather_indexer_k_quant_cache(preshuffle=True),
+        # which only matches the layout produced when the rest of the indexer
+        # is on the page_size=64 preshuffle path. Otherwise fall back to the
+        # triton implementation (which works on the page_size=1 legacy layout).
+        if _use_aiter_preshuffle:
             return cls.aiter(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
@@ -419,9 +428,14 @@ def _set_k_and_s_triton(
     assert index_head_dim == 128
     assert scale_dim == 1
     if _is_hip:
-        assert (
-            page_size % 16 == 0
-        ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+        if _use_aiter_preshuffle:
+            assert (
+                page_size % 16 == 0
+            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+        else:
+            assert (
+                page_size == 1
+            ), f"HIP legacy NSA path requires page_size == 1, got {page_size}"
     else:
         assert page_size == 64
 
