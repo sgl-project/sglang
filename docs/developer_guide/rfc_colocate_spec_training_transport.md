@@ -105,11 +105,38 @@ transport class).
 - #25050 *Add `--model-config-parser` registry for pluggable config
   formats* — precedent for a small registry indirection.
 
-## Status of the implementation
+## Reference implementation (fork-side, against v0.5.8.post1)
 
-A working out-of-tree patch (against v0.5.8.post1 and v0.5.10.post1)
-exists in the TorchSpec project and exercises all three surfaces on a
-4×H100 box with 1 engine × TP=4 + 4 trainers × FSDP=4 sharing GPUs
-via MPS. Once API shape is agreed in the linked issue, the patch will
-be re-shaped against the names above and submitted as the
-implementation PR.
+The exact fork-side patch we run today is checked in alongside this
+RFC as
+[`rfc_colocate_spec_training_transport.v0.5.8.post1.patch`](rfc_colocate_spec_training_transport.v0.5.8.post1.patch)
+(836 lines, against `v0.5.8.post1`). It is provided as a *reference
+artifact* so reviewers can see the exact shape of the change without
+guessing — **it does not apply cleanly to current main** and is
+not the form intended to land upstream.
+
+What the patch touches:
+
+| File | Change |
+|---|---|
+| `python/sglang/srt/distributed/parallel_state.py` | `initialize_model_parallel` accepts an explicit `tp_world_ranks` list and skips the `world_size != tp * pp` assertion when set (engine occupies `[N, 2N)` of a `2N`-rank union default PG). |
+| `python/sglang/srt/distributed/torchspec_colocate.py` | New module: env-var-driven helper to compute the engine's union rank, build the TP rank list, and bootstrap the existing default PG. |
+| `python/sglang/srt/managers/scheduler.py` | Route the spec-training callback to the colocate hidden-states sender when the colocate env vars are set. |
+| `python/sglang/srt/managers/scheduler_output_processor_mixin.py` | Fire the callback on every TP rank for the colocate transport (default Mooncake path still TP-0-only). |
+| `python/sglang/srt/model_executor/model_runner.py` | Pass `tp_world_ranks` through to `initialize_model_parallel` when colocate is active. |
+
+Names in the patch are TorchSpec-namespaced (`torchspec_colocate.py`,
+`TORCHSPEC_COLOCATE_*` env vars) because the patch was written for the
+fork. Renaming them to a neutral shape is part of what the RFC
+discussion is meant to settle — the proposed names above
+(transport registry, framework-neutral env vars) are the upstream
+target.
+
+## Status
+
+A working end-to-end run with the above patch on a 4×H100 box
+(1 engine × TP=4 + 4 trainers × FSDP=4, GPUs shared via MPS) is
+green: 6/6 colocate tests pass, training loss decreases monotonically,
+peak-alloc flat over 200 steps. Once the API shape is agreed in the
+linked issue, the patch will be re-shaped against the names above
+and submitted as the implementation PR (against current main).
