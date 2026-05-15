@@ -354,7 +354,7 @@ class WanTransformerBlock(nn.Module):
         super().__init__()
 
         # 1. Self-attention
-        self.norm1 = LayerNormScaleShift(
+        self.norm1 = ScaleResidualLayerNormScaleShift(
             dim,
             eps=eps,
             elementwise_affine=False,
@@ -487,41 +487,62 @@ class WanTransformerBlock(nn.Module):
         self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        self.register_buffer("null_gate", None, persistent=False)
+        self.register_buffer("null_shift", None, persistent=False)
+        self.register_buffer("null_scale", None, persistent=False)
 
     def forward(
         self,
+        residual: torch.Tensor,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        c_gate_msa: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
         orig_dtype = hidden_states.dtype
         if temb.dim() == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table.unsqueeze(0) + temb.float()
-            ).chunk(6, dim=2)
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                c_shift_msa,
+                c_scale_msa,
+                next_c_gate_msa,
+            ) = (self.scale_shift_table.unsqueeze(0) + temb.float()).chunk(6, dim=2)
             # batch_size, seq_len, 1, inner_dim
             shift_msa = shift_msa.squeeze(2)
             scale_msa = scale_msa.squeeze(2)
             gate_msa = gate_msa.squeeze(2)
             c_shift_msa = c_shift_msa.squeeze(2)
             c_scale_msa = c_scale_msa.squeeze(2)
-            c_gate_msa = c_gate_msa.squeeze(2)
+            next_c_gate_msa = next_c_gate_msa.squeeze(2)
         else:
             # temb: batch_size, 6, inner_dim (wan2.1/wan2.2 14B)
             e = self.scale_shift_table + temb.float()
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                e.chunk(6, dim=1)
-            )
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                c_shift_msa,
+                c_scale_msa,
+                next_c_gate_msa,
+            ) = e.chunk(6, dim=1)
 
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        norm_hidden_states, hidden_states = self.norm1(
+            residual,
+            hidden_states,
+            c_gate_msa,
+            shift_msa,
+            scale_msa,
+        )
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
@@ -581,11 +602,17 @@ class WanTransformerBlock(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
+        if self.null_shift is None or self.null_scale is None or self.null_gate is None:
+            # Initialize null_shift, null_scale, and null_gate as attributes, so they are created only once, avoiding repeated cudaMalloc and cudaMemset operations.
+            self.null_shift = self.null_scale = torch.zeros(
+                1, dtype=torch.float32, device=hidden_states.device
+            )
+            self.null_gate = torch.ones(
+                1, dtype=torch.float32, device=hidden_states.device
+            )
+
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
+            hidden_states, attn_output, gate_msa, self.null_shift, self.null_scale
         )
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype
@@ -596,7 +623,7 @@ class WanTransformerBlock(nn.Module):
             norm_hidden_states, context=encoder_hidden_states, context_lens=None
         )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
-            hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
+            hidden_states, attn_output, self.null_gate, c_shift_msa, c_scale_msa
         )
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype
@@ -604,10 +631,7 @@ class WanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
-        hidden_states = hidden_states.to(orig_dtype)
-
-        return hidden_states
+        return hidden_states, ff_output, next_c_gate_msa
 
 
 class WanTransformerBlock_VSA(nn.Module):
@@ -628,7 +652,7 @@ class WanTransformerBlock_VSA(nn.Module):
         super().__init__()
 
         # 1. Self-attention
-        self.norm1 = LayerNormScaleShift(
+        self.norm1 = ScaleResidualLayerNormScaleShift(
             dim,
             eps=eps,
             elementwise_affine=False,
@@ -748,27 +772,34 @@ class WanTransformerBlock_VSA(nn.Module):
         self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        self.register_buffer("null_gate", None, persistent=False)
+        self.register_buffer("null_shift", None, persistent=False)
+        self.register_buffer("null_scale", None, persistent=False)
 
     def forward(
         self,
+        residual: torch.Tensor,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        c_gate_msa: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
         orig_dtype = hidden_states.dtype
         # assert orig_dtype != torch.float32
         e = self.scale_shift_table + temb.float()
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = e.chunk(
-            6, dim=1
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, next_c_gate_msa = (
+            e.chunk(6, dim=1)
         )
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        norm_hidden_states, hidden_states = self.norm1(
+            residual, hidden_states, c_gate_msa, shift_msa, scale_msa
+        )
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
@@ -828,9 +859,17 @@ class WanTransformerBlock_VSA(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = torch.zeros((1,), device=hidden_states.device)
+        if self.null_shift is None or self.null_scale is None or self.null_gate is None:
+            # Initialize null_shift, null_scale, and null_gate as attributes, so they are created only once, avoiding repeated cudaMalloc and cudaMemset operations.
+            self.null_shift = self.null_scale = torch.zeros(
+                1, dtype=torch.float32, device=hidden_states.device
+            )
+            self.null_gate = torch.ones(
+                1, dtype=torch.float32, device=hidden_states.device
+            )
+
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
+            hidden_states, attn_output, gate_msa, self.null_shift, self.null_scale
         )
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype
@@ -841,7 +880,7 @@ class WanTransformerBlock_VSA(nn.Module):
             norm_hidden_states, context=encoder_hidden_states, context_lens=None
         )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
-            hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
+            hidden_states, attn_output, self.null_gate, c_shift_msa, c_scale_msa
         )
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype
@@ -849,10 +888,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
-        hidden_states = hidden_states.to(orig_dtype)
-
-        return hidden_states
+        return hidden_states, ff_output, next_c_gate_msa
 
 
 class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
@@ -966,6 +1002,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         self.layer_names = ["blocks"]
+        self.mlp_residual = MulAdd()
 
     @lru_cache(maxsize=1)
     def _compute_rope_for_sequence_shard(
@@ -1150,11 +1187,21 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
-
+            dtype = hidden_states.dtype
+            residual = torch.zeros_like(hidden_states)
+            c_gate_msa = torch.ones(1, dtype=torch.float32, device=hidden_states.device)
             for block in self.blocks:
-                hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                residual, hidden_states, c_gate_msa = block(
+                    residual,
+                    hidden_states,
+                    encoder_hidden_states,
+                    c_gate_msa,
+                    timestep_proj,
+                    freqs_cis,
                 )
+            hidden_states = self.mlp_residual(hidden_states, c_gate_msa, residual)
+            hidden_states = hidden_states.to(dtype=dtype)
+
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
