@@ -235,7 +235,11 @@ class BaseFormatDetector(ABC):
                         # Keep current_tool_id and streamed_args_for_tool
                         # intact — already-completed slots must survive so
                         # the next valid tool advances via Case 1.
-                        self._buffer = ""
+                        self._buffer = (
+                            current_text[start_idx + end_idx :]
+                            if is_current_complete
+                            else ""
+                        )
                         return StreamingParseResult()
 
                 # Handle parameters/arguments consistency

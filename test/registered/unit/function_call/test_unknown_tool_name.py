@@ -198,6 +198,33 @@ def test_streaming_unknown_tool_between_known_preserves_state(weather_tools):
         ]
 
 
+def test_streaming_unknown_tool_same_chunk_preserves_following_known(weather_tools):
+    """Skipping a complete unknown tool must preserve later buffered calls."""
+    with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(False):
+        detector = StreamingDummyDetector()
+        chunks = [
+            "<tool>",
+            '{"name":"get_weather","arguments":{"x":1}}',
+            (
+                ', {"name":"unknown","arguments":{}}, '
+                '{"name":"get_weather","arguments":{"y":2}}'
+            ),
+            "",
+            "",
+            "",
+        ]
+        calls, _ = _run_streaming(detector, chunks, weather_tools)
+        assert [call.name for call in calls if call.name] == [
+            "get_weather",
+            "get_weather",
+        ]
+        assert detector.streamed_args_for_tool == ['{"x": 1}', '{"y": 2}']
+        assert [entry.get("arguments") for entry in detector.prev_tool_call_arr] == [
+            {"x": 1},
+            {"y": 2},
+        ]
+
+
 def test_streaming_after_unknown_tool_continues(weather_tools):
     """Dropping an unknown tool must not poison subsequent normal text."""
     with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(False):
