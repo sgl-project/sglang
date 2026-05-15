@@ -3548,7 +3548,7 @@ class ServerArgs:
                     f"--speculative-draft-window-size must be positive, got {window_size}."
                 )
             self.speculative_draft_window_size = window_size
-            if self.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
+            if self.speculative_algorithm not in ("EAGLE3", "DFLASH"):
                 logger.warning(
                     "--speculative-draft-window-size has no effect with "
                     "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
