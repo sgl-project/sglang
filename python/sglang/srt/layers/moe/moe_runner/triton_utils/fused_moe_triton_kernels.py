@@ -336,6 +336,7 @@ def fused_moe_kernel(
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
     add_mask_ptr,
+    c_map_ptr,
     # Matrix dimensions
     N,
     K,
@@ -381,6 +382,7 @@ def fused_moe_kernel(
     FUSE_ADD_TO_OUTPUT: tl.constexpr,
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
+    USE_C_MAP_OUTPUT: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -612,7 +614,13 @@ def fused_moe_kernel(
         # Accumulate into existing output with per-token mask.
         offs_token_out = offs_token // ROUTER_TOPK
         add_mask = tl.load(add_mask_ptr + offs_token_out, mask=token_mask, other=False)
-        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        if USE_C_MAP_OUTPUT:
+            c_row = tl.load(c_map_ptr + offs_token, mask=token_mask, other=0).to(
+                tl.int64
+            )
+        else:
+            c_row = offs_token
+        c_ptrs = c_ptr + stride_cm * c_row[:, None] + stride_cn * offs_cn[None, :]
         c_mask = token_mask[:, None] & add_mask[:, None] & (offs_cn[None, :] < N)
         existing = tl.load(c_ptrs, mask=c_mask, other=0.0)
         tl.store(c_ptrs, existing + accumulator, mask=c_mask)
@@ -731,6 +739,7 @@ def invoke_fused_moe_kernel(
     router_topk: int = 1,
     fuse_add_to_output: bool = False,
     add_output_mask: Optional[torch.Tensor] = None,
+    c_map: Optional[torch.Tensor] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -807,6 +816,16 @@ def invoke_fused_moe_kernel(
         assert (
             add_output_mask is not None
         ), "add_output_mask required when fuse_add_to_output=True"
+    if c_map is not None:
+        assert fuse_add_to_output, (
+            "c_map output remap is only supported with fuse_add_to_output"
+        )
+        assert not c_sorted, "c_map output remap and c_sorted are mutually exclusive"
+        assert not (use_int8_w8a16 or use_int4_w4a16), (
+            "c_map output remap is not supported for GPTQ/AWQ kernels"
+        )
+        assert c_map.dtype == torch.int32
+        assert c_map.stride(0) == 1
 
     if (
         (use_int8_w8a16 or use_int4_w4a16)
@@ -892,6 +911,7 @@ def invoke_fused_moe_kernel(
             expert_ids,
             num_tokens_post_padded,
             add_output_mask,
+            c_map,
             B.shape[1],
             B.shape[2] - padded_size,
             sorted_token_ids.shape[0],
@@ -926,6 +946,7 @@ def invoke_fused_moe_kernel(
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
+            USE_C_MAP_OUTPUT=c_map is not None,
             **config,
         )
 
