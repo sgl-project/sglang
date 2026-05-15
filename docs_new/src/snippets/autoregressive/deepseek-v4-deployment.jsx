@@ -1,119 +1,684 @@
+// DeepSeek-V4 deployment generator.
+//
+// MINTLIFY CONSTRAINT (confirmed by experiment): Mintlify's `.jsx` snippet
+// loader strips ALL module-level statements — only the exported component
+// function survives — AND it replaces every capitalized JSX tag with a
+// `_provideComponents()` context lookup, ignoring `import` statements for
+// custom components. So we can't share a `<DeploymentGenerator/>` across
+// snippets; the entire generator engine has to live inside the wrapper
+// function. This file is the proof-of-concept of "config-driven, no bespoke
+// rendering logic per cookbook" — the generator code below is identical for
+// every model and is meant to be copy-pasted (or codegen'd) into each
+// cookbook's snippet. The only model-specific section is the
+// `config = { ... cells: [ ... ] }` literal further down.
 export const DeepSeekV4Deployment = () => {
-  // DeepSeek-V4 deployment matrix (small / real checkpoint):
-  //   Hardware × Recipe → concrete launch command.
-  //
-  //   Hardware (quantization determined by GPU generation):
-  //     B200  → FP4 weights, Flash TP=4 / Pro TP=8 single-node
-  //     GB200 → FP4 weights, Flash TP=4 / Pro TP=8 2-node
-  //     GB300 → FP4 weights, Flash TP=4 / Pro TP=4 single-node
-  //     H200  → FP8 weights, Flash TP=4 / Pro TP=16 2-node
-  //     H100  → FP4 weights (Marlin), Flash TP=8 single-node / Pro TP=16 2-node
-  //   Model variant → HF slug:
-  //     Flash (285B) → deepseek-ai/DeepSeek-V4-Flash
-  //     Pro   (1.6T) → deepseek-ai/DeepSeek-V4-Pro
-  //
-  //   Recipe:
-  //     low-latency    → TP(+DP on H200 no, Blackwell no), MTP 3/4
-  //     balanced       → DP-attn + DeepEP + MTP 1/2
-  //     max-throughput → DP-attn + DeepEP, no MTP
-  //     cp             → TP + DeepEP + context-parallel flags, no MTP
-  //     pd-disagg      → 1P1D (prefill + decode + router), separate commands shown together
-  //
-  // HF slugs, parser names, and `sglang serve` flag parity are all confirmed —
-  // see cookbook_v2/DISCUSSION.md ("人类提供的事实" and 设计决定 §3).
-
-  const options = {
-    hardware: {
-      name: "hardware",
-      title: "Hardware Platform",
-      items: [
-        { id: "b200",  label: "B200 (FP4)",  default: true  },
-        { id: "b300",  label: "B300 (FP4)",  default: false  },
-        { id: "gb200", label: "GB200 (FP4)", default: false },
-        { id: "gb300", label: "GB300 (FP4)", default: false },
-        { id: "h200",  label: "H200 (FP8)",  default: false },
-        { id: "h200-fp4", label: "H200 (FP4)", default: false },
-        { id: "h100", label: "H100 (FP4)", default: false },
-      ],
-    },
-    modelSize: {
-      name: "modelSize",
-      title: "Model Variant",
-      items: [
-        { id: "small", label: "Flash", default: true,  subtitle: "285B" },
-        { id: "big",   label: "Pro",   default: false, subtitle: "1.6T" },
-      ],
-    },
-    recipe: {
-      name: "recipe",
-      title: "Recipe",
-      items: [
-        { id: "low-latency",    label: "Low-Latency",      default: true  },
-        { id: "balanced",       label: "Balanced",         default: false },
-        { id: "max-throughput", label: "Max-Throughput",   default: false },
-        { id: "cp",             label: "Context-Parallel", default: false },
-        { id: "pd-disagg",      label: "PD-Disagg",        default: false },
-      ],
-    },
-    reasoningParser: {
-      name: "reasoningParser",
-      title: "Reasoning Parser",
-      items: [
-        { id: "disabled", label: "Disabled", default: true  },
-        { id: "enabled",  label: "Enabled",  default: false, subtitle: "deepseek-v4" },
-      ],
-    },
-    toolcall: {
-      name: "toolcall",
-      title: "Tool Call Parser",
-      items: [
-        { id: "disabled", label: "Disabled", default: true  },
-        { id: "enabled",  label: "Enabled",  default: false, subtitle: "deepseekv4" },
-      ],
-    },
+  // ==========================================================================
+  // 1. Hardware catalog (shared across cookbooks — keep identical when copying)
+  // VRAM is reported as per-GPU on-chip memory (HBM3/3e/E), not per-module.
+  // ==========================================================================
+  const HARDWARE_CATALOG = {
+    nvidia: [
+      { id: "h100",  label: "H100",  vram: "80GB"  },
+      { id: "h200",  label: "H200",  vram: "141GB" },
+      { id: "b200",  label: "B200",  vram: "192GB" },
+      { id: "b300",  label: "B300",  vram: "288GB" },
+      { id: "gb200", label: "GB200", vram: "192GB" },
+      { id: "gb300", label: "GB300", vram: "288GB" },
+    ],
+    amd: [
+      { id: "mi300x", label: "MI300X", vram: "192GB" },
+      { id: "mi325x", label: "MI325X", vram: "256GB" },
+      { id: "mi350x", label: "MI350X", vram: "288GB" },
+      { id: "mi355x", label: "MI355X", vram: "288GB" },
+    ],
   };
 
-  // Recipes that are not supported on the Marlin (FP4) Hopper paths
-  // (H200 FP4, H100 FP4).
-  const MARLIN_UNSUPPORTED_RECIPES = new Set(["cp", "pd-disagg"]);
-  const MARLIN_HARDWARE = new Set(["h200-fp4", "h100"]);
-  const MARLIN_LABEL = { "h200-fp4": "H200 (FP4)", h100: "H100 (FP4)" };
+  // ==========================================================================
+  // 2. Cell catalog — the only section that differs per cookbook
+  // ==========================================================================
 
-  const resolveItems = (option, vals) => {
-    if (option.name === "recipe" && vals && MARLIN_HARDWARE.has(vals.hardware)) {
-      return option.items.map((it) =>
-        MARLIN_UNSUPPORTED_RECIPES.has(it.id)
-          ? { ...it, disabled: true, disabledReason: `Not supported on ${MARLIN_LABEL[vals.hardware]}` }
-          : it
+  // ----- 2.a Shared flag fragments -----
+  const HEAD = ["--trust-remote-code", "--model-path {{MODEL_NAME}}"];
+  const TAIL = ["--host {{HOST_IP}}", "--port {{PORT}}"];
+
+  const MTP_314 = [
+    "--speculative-algo EAGLE",
+    "--speculative-num-steps 3",
+    "--speculative-eagle-topk 1",
+    "--speculative-num-draft-tokens 4",
+  ];
+  const MTP_112 = [
+    "--speculative-algo EAGLE",
+    "--speculative-num-steps 1",
+    "--speculative-eagle-topk 1",
+    "--speculative-num-draft-tokens 2",
+  ];
+  // DeepEP large-SMS config (single-quoted JSON so users can copy-paste without escaping).
+  const DEEPEP_LARGE_SMS =
+    `--deepep-config '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'`;
+  // B200/B300 Pro accuracy-verified env block (same 5 vars across all 3 strategies for b200|big).
+  const B200_PRO_ACC_ENV = [
+    "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
+    "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
+    "SGLANG_OPT_USE_JIT_NORM=1",
+    "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
+    "SGLANG_OPT_USE_TOPK_V2=1",
+  ];
+
+  // ----- 2.b Cell factory -----
+  const cellOf = (match, { verified = true, env = [], flags = [] } = {}) => ({
+    match, verified, env, flags,
+  });
+  const cloneToHw = (cells, fromHw, toHw) =>
+    cells.filter((c) => c.match.hw === fromHw)
+         .map((c) => ({ ...c, match: { ...c.match, hw: toHw } }));
+
+  // ----- 2.c Cells -----
+  const baseCells = [
+    // ----- B200 + FP4 -----
+    cellOf({ hw: "b200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
+      env: [],
+      flags: [...HEAD, "--tp 4", "--moe-runner-backend flashinfer_mxfp4", ...MTP_314,
+              "--chunked-prefill-size 4096", "--disable-flashinfer-autotune",
+              "--swa-full-tokens-ratio 0.1", ...TAIL],
+    }),
+    cellOf({ hw: "b200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" }, {
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", ...MTP_112, DEEPEP_LARGE_SMS, ...TAIL],
+    }),
+    cellOf({ hw: "b200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", DEEPEP_LARGE_SMS, ...TAIL],
+    }),
+    cellOf({ hw: "b200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
+      env: [...B200_PRO_ACC_ENV],
+      flags: [...HEAD, "--tp 8", "--moe-runner-backend flashinfer_mxfp4", ...MTP_314,
+              "--chunked-prefill-size 8192", "--disable-flashinfer-autotune",
+              "--swa-full-tokens-ratio 0.1", "--mem-fraction-static 0.90", ...TAIL],
+    }),
+    cellOf({ hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" }, {
+      env: [...B200_PRO_ACC_ENV],
+      flags: [...HEAD, "--tp 8", "--dp 8", "--enable-dp-attention",
+              "--moe-runner-backend flashinfer_mxfp4", "--disable-flashinfer-autotune",
+              "--chunked-prefill-size 32768", "--swa-full-tokens-ratio 0.1", ...MTP_112,
+              "--mem-fraction-static 0.92", "--cuda-graph-max-bs 256",
+              DEEPEP_LARGE_SMS, ...TAIL],
+    }),
+    cellOf({ hw: "b200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
+      env: [...B200_PRO_ACC_ENV,
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
+            "NVSHMEM_DISABLE_IB=1",
+            "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1",
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
+      flags: [...HEAD, "--tp 8", "--dp 8", "--enable-dp-attention",
+              "--moe-a2a-backend megamoe", "--mem-fraction-static 0.835",
+              "--cuda-graph-max-bs 544", "--swa-full-tokens-ratio 0.075",
+              "--chunked-prefill-size 65536", "--tokenizer-worker-num 8",
+              "--enable-prefill-delayer", DEEPEP_LARGE_SMS, ...TAIL],
+    }),
+
+    // ----- GB200 + FP4 -----
+    cellOf({ hw: "gb200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
+      env: [],
+      flags: [...HEAD, "--tp 4", "--moe-runner-backend flashinfer_mxfp4", ...MTP_314,
+              "--chunked-prefill-size 4096", "--disable-flashinfer-autotune",
+              "--swa-full-tokens-ratio 0.1", ...TAIL],
+    }),
+    cellOf({ hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" }, {
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", ...MTP_112, DEEPEP_LARGE_SMS, ...TAIL],
+    }),
+    cellOf({ hw: "gb200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", DEEPEP_LARGE_SMS, ...TAIL],
+    }),
+    // GB200 Pro requires 2 nodes; multi-node wiring (--nnodes / --node-rank /
+    // --dist-init-addr) added by the renderer below.
+    cellOf({ hw: "gb200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" }, {
+      env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [...HEAD, "--tp 8", "--moe-runner-backend flashinfer_mxfp4", ...MTP_314,
+              "--chunked-prefill-size 4096", "--disable-flashinfer-autotune",
+              "--swa-full-tokens-ratio 0.1", "--mem-fraction-static 0.88", ...TAIL],
+    }),
+    cellOf({ hw: "gb200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" }, {
+      env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [...HEAD, "--tp 8", "--dp 8", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", ...MTP_112,
+              "--mem-fraction-static 0.78", "--cuda-graph-max-bs 64",
+              "--max-running-requests 128", ...TAIL],
+    }),
+    cellOf({ hw: "gb200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "multi-2" }, {
+      env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [...HEAD, "--tp 8", "--dp 8", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", "--mem-fraction-static 0.78",
+              "--cuda-graph-max-bs 64", "--max-running-requests 256", ...TAIL],
+    }),
+
+    // ----- GB300 + FP4 -----
+    cellOf({ hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
+      env: [],
+      flags: [...HEAD, "--tp 4", "--moe-runner-backend flashinfer_mxfp4", ...MTP_314,
+              "--chunked-prefill-size 4096", "--disable-flashinfer-autotune",
+              "--swa-full-tokens-ratio 0.1", ...TAIL],
+    }),
+    cellOf({ hw: "gb300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" }, {
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", ...MTP_112, DEEPEP_LARGE_SMS, ...TAIL],
+    }),
+    cellOf({ hw: "gb300", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", DEEPEP_LARGE_SMS, ...TAIL],
+    }),
+    cellOf({ hw: "gb300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
+      env: [],
+      flags: [...HEAD, "--tp 4", "--moe-runner-backend flashinfer_mxfp4", ...MTP_314,
+              "--chunked-prefill-size 4096", "--disable-flashinfer-autotune",
+              "--swa-full-tokens-ratio 0.1", "--mem-fraction-static 0.88", ...TAIL],
+    }),
+    cellOf({ hw: "gb300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" }, {
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", ...MTP_112,
+              "--mem-fraction-static 0.9", "--cuda-graph-max-bs 128",
+              "--max-running-requests 256", DEEPEP_LARGE_SMS, ...TAIL],
+    }),
+    cellOf({ hw: "gb300", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", "--mem-fraction-static 0.9",
+              "--cuda-graph-max-bs 128", "--max-running-requests 256",
+              DEEPEP_LARGE_SMS, ...TAIL],
+    }),
+
+    // ----- H200 + FP8 -----
+    cellOf({ hw: "h200", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single" }, {
+      env: ["SGLANG_DSV4_FP4_EXPERTS=0"],
+      flags: [...HEAD, "--tp 4", ...MTP_314, ...TAIL],
+    }),
+    cellOf({ hw: "h200", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single" }, {
+      env: ["SGLANG_DSV4_FP4_EXPERTS=0", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", ...MTP_112,
+              "--cuda-graph-max-bs 128", "--max-running-requests 128",
+              DEEPEP_LARGE_SMS, ...TAIL],
+    }),
+    cellOf({ hw: "h200", variant: "flash", quant: "fp8", strategy: "max-throughput", nodes: "single" }, {
+      env: ["SGLANG_DSV4_FP4_EXPERTS=0", "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", "--cuda-graph-max-bs 128",
+              "--max-running-requests 256", DEEPEP_LARGE_SMS, ...TAIL],
+    }),
+    // H200 Pro FP8: low-latency exposes BOTH single-node (TP=8 Marlin) and
+    // multi-2 (TP=16 DP-attn + DeepEP) — the old combined block, split.
+    cellOf({ hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single" }, {
+      env: ["SGLANG_DSV4_FP4_EXPERTS=0"],
+      flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin", ...MTP_314,
+              "--chunked-prefill-size 4096", "--disable-flashinfer-autotune",
+              "--mem-fraction-static 0.88", ...TAIL],
+    }),
+    cellOf({ hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "multi-2" }, {
+      env: ["SGLANG_DSV4_FP4_EXPERTS=0", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+      flags: [...HEAD, "--tp 16", "--dp 16", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", "--cuda-graph-max-bs 8",
+              "--max-running-requests 32", ...MTP_314,
+              "--mem-fraction-static 0.88", ...TAIL],
+    }),
+    cellOf({ hw: "h200", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "multi-2" }, {
+      env: ["SGLANG_DSV4_FP4_EXPERTS=0", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+      flags: [...HEAD, "--tp 16", "--dp 16", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", ...MTP_112,
+              "--mem-fraction-static 0.88", "--cuda-graph-max-bs 8",
+              "--max-running-requests 32", ...TAIL],
+    }),
+    cellOf({ hw: "h200", variant: "pro", quant: "fp8", strategy: "max-throughput", nodes: "multi-2" }, {
+      env: ["SGLANG_DSV4_FP4_EXPERTS=0", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
+      flags: [...HEAD, "--tp 16", "--dp 16", "--enable-dp-attention",
+              "--moe-a2a-backend deepep", "--mem-fraction-static 0.88",
+              "--cuda-graph-max-bs 128", "--max-running-requests 256", ...TAIL],
+    }),
+
+    // ----- H200 + FP4 (Marlin, single-node only) -----
+    cellOf({ hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
+      env: [], flags: [...HEAD, "--tp 4", "--moe-runner-backend marlin", ...MTP_314, ...TAIL],
+    }),
+    cellOf({ hw: "h200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" }, {
+      env: [], flags: [...HEAD, "--tp 4", "--moe-runner-backend marlin", ...MTP_112, ...TAIL],
+    }),
+    cellOf({ hw: "h200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
+      env: [], flags: [...HEAD, "--tp 4", "--moe-runner-backend marlin", ...TAIL],
+    }),
+    cellOf({ hw: "h200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
+      env: [], flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin", ...MTP_314,
+                       "--mem-fraction-static 0.88", ...TAIL],
+    }),
+    cellOf({ hw: "h200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" }, {
+      env: [], flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin", ...MTP_112,
+                       "--mem-fraction-static 0.88", ...TAIL],
+    }),
+    cellOf({ hw: "h200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
+      env: [], flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin",
+                       "--mem-fraction-static 0.88", ...TAIL],
+    }),
+
+    // ----- H100 + FP4 (Marlin) -----
+    cellOf({ hw: "h100", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
+      env: [], flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin", ...MTP_314, ...TAIL],
+    }),
+    cellOf({ hw: "h100", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" }, {
+      env: [], flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin", ...MTP_112, ...TAIL],
+    }),
+    cellOf({ hw: "h100", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
+      env: [], flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin", ...TAIL],
+    }),
+    cellOf({ hw: "h100", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" }, {
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
+      flags: [...HEAD, "--tp 16", "--moe-runner-backend marlin", ...MTP_314,
+              "--mem-fraction-static 0.9", "--cuda-graph-max-bs 8",
+              "--max-running-requests 32", ...TAIL],
+    }),
+    cellOf({ hw: "h100", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" }, {
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
+      flags: [...HEAD, "--tp 16", "--moe-runner-backend marlin", ...MTP_112,
+              "--mem-fraction-static 0.9", "--cuda-graph-max-bs 8",
+              "--max-running-requests 32", ...TAIL],
+    }),
+    cellOf({ hw: "h100", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "multi-2" }, {
+      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
+      flags: [...HEAD, "--tp 16", "--moe-runner-backend marlin",
+              "--mem-fraction-static 0.9", ...TAIL],
+    }),
+  ];
+
+  // B300 mirrors B200 in the original generator. Materialise the duplicates.
+  const allCells = [...baseCells, ...cloneToHw(baseCells, "b200", "b300")];
+
+  const MULTI_NODE_HINTS = {
+    gb200: [
+      "The following env vars may be needed depending on your cluster:",
+      "  GLOO_SOCKET_IFNAME=<your-nic>",
+      "  NVSHMEM_ENABLE_NIC_PE_MAPPING=1",
+      "  NVSHMEM_HCA_LIST=<your-hca-list>",
+    ],
+  };
+
+  // ==========================================================================
+  // 3. Final config object
+  // ==========================================================================
+  const config = {
+    modelName: "DeepSeek-V4",
+    // `supportedHardware` is the catalog-visibility list, NOT the
+    // has-runnable-cells list. Listing AMD ids here makes those buttons appear
+    // in the UI; since no cell references them, `isOptionAvailable` will
+    // return false for each one and they render greyed out automatically.
+    // Drop an id from this list to hide it from the UI entirely.
+    supportedHardware: [
+      "h100", "h200", "b200", "b300", "gb200", "gb300",
+      "mi300x", "mi325x", "mi350x", "mi355x",
+    ],
+    variants: [
+      { id: "flash", label: "Flash", subtitle: "285B" },
+      { id: "pro",   label: "Pro",   subtitle: "1.6T" },
+    ],
+    quantizations: [
+      { id: "fp8", label: "FP8" },
+      { id: "fp4", label: "FP4" },
+    ],
+    strategies: [
+      { id: "low-latency",    label: "Low-Latency"    },
+      { id: "balanced",       label: "Balanced"       },
+      { id: "max-throughput", label: "Max-Throughput" },
+    ],
+    // Nodes dimension. The id format `multi-N` carries the node count so the
+    // renderer can emit `--nnodes N` automatically. We expose just one
+    // multi-node option here using 2 nodes as the canonical example; cookbooks
+    // that need a different N (e.g. 4 nodes) can add `multi-4` here AND in the
+    // matching cells without any renderer change.
+    nodesOptions: [
+      { id: "single",  label: "Single Node" },
+      { id: "multi-2", label: "Multi-Nodes" },
+    ],
+    // HF slug: layered lookup. `${hw}|${variant}|${quant}` (override) → `${variant}|${quant}` (base).
+    // Both `--model-path` (via {{MODEL_NAME}} in cell.flags) and the cURL body's
+    // `"model"` field resolve from the same map.
+    modelNames: {
+      "flash|fp4": "deepseek-ai/DeepSeek-V4-Flash",
+      "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
+      "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
+      "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
+      // H200 FP8 needs the sgl-project repackaging (Hopper can't run FP4-mixed Instruct).
+      "h200|flash|fp8": "sgl-project/DeepSeek-V4-Flash-FP8",
+      "h200|pro|fp8":   "sgl-project/DeepSeek-V4-Pro-FP8",
+    },
+    placeholders: {
+      HOST_IP:   { target: "command", label: "Bind host",       default: "0.0.0.0"  },
+      PORT:      { target: "command", label: "Bind port",       default: "30000"    },
+      NODE0_IP:  { target: "command", label: "Head node IP",    default: "<node0-ip>"   },
+      NODE_RANK: { target: "command", label: "This node rank",  default: "<node-rank>"  },
+      CURL_HOST: { target: "curl",    label: "Server host",     default: "localhost" },
+      CURL_PORT: { target: "curl",    label: "Server port",     default: "30000"     },
+    },
+    curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
+  -H 'Content-Type: application/json' \\
+  -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
+    cells: allCells,
+    multiNodeHints: MULTI_NODE_HINTS,
+  };
+
+  // ==========================================================================
+  // 4. Style helper (dark-mode-aware)
+  // ==========================================================================
+  const makeStyles = (isDark) => ({
+    container: { maxWidth: "900px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "4px" },
+    card: {
+      padding: "8px 12px",
+      border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
+      borderLeft: `3px solid ${isDark ? "#E85D4D" : "#D45D44"}`,
+      borderRadius: "4px",
+      display: "flex", alignItems: "center", gap: "12px",
+      background: isDark ? "#1f2937" : "#fff",
+    },
+    cardColumn: {
+      padding: "8px 12px",
+      border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
+      borderLeft: `3px solid ${isDark ? "#E85D4D" : "#D45D44"}`,
+      borderRadius: "4px",
+      display: "flex", flexDirection: "column", gap: "6px",
+      background: isDark ? "#1f2937" : "#fff",
+    },
+    title: { fontSize: "13px", fontWeight: "600", minWidth: "140px", flexShrink: 0, color: isDark ? "#e5e7eb" : "inherit" },
+    vendorRow: { display: "flex", alignItems: "center", gap: "8px" },
+    vendorLabel: {
+      fontSize: "11px", fontWeight: "600",
+      color: isDark ? "#9ca3af" : "#6b7280",
+      minWidth: "48px", textTransform: "uppercase", letterSpacing: "0.04em",
+    },
+    itemsGrid: (cols) => ({
+      display: "grid", gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
+      gap: "6px", flex: 1,
+    }),
+    labelBase: {
+      padding: "4px 10px",
+      border: `1px solid ${isDark ? "#9ca3af" : "#d1d5db"}`,
+      borderRadius: "3px", cursor: "pointer",
+      display: "inline-flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center",
+      fontWeight: "500", fontSize: "13px",
+      transition: "all 0.2s", userSelect: "none",
+      minHeight: "32px", textAlign: "center",
+      background: isDark ? "#374151" : "#fff",
+      color: isDark ? "#e5e7eb" : "inherit",
+    },
+    checked: { background: "#D45D44", color: "white", borderColor: "#D45D44" },
+    disabled: { cursor: "not-allowed", opacity: 0.4 },
+    subtitle: { display: "block", fontSize: "9px", marginTop: "1px", lineHeight: "1.1", opacity: 0.7 },
+    commandWrap: {
+      position: "relative", flex: 1,
+      background: isDark ? "#111827" : "#f5f5f5",
+      borderRadius: "6px",
+      border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
+      overflow: "hidden",
+    },
+    commandHeader: {
+      display: "flex", justifyContent: "space-between", alignItems: "center",
+      padding: "6px 10px",
+      borderBottom: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
+      background: isDark ? "#1f2937" : "#fafafa",
+    },
+    commandPre: {
+      padding: "12px 16px",
+      fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace",
+      fontSize: "12px", lineHeight: "1.5",
+      color: isDark ? "#e5e7eb" : "#374151",
+      whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
+    },
+    badge: (verified) => ({
+      display: "inline-flex", alignItems: "center", gap: "6px",
+      padding: "2px 8px", borderRadius: "10px",
+      background: verified ? (isDark ? "#064e3b" : "#d1fae5")
+                           : (isDark ? "#78350f" : "#fef3c7"),
+      color:      verified ? (isDark ? "#a7f3d0" : "#065f46")
+                           : (isDark ? "#fde68a" : "#92400e"),
+      fontSize: "11px", fontWeight: 600,
+    }),
+    badgeDot: (verified) => ({
+      width: "8px", height: "8px", borderRadius: "50%",
+      background: verified ? "#10b981" : "#f59e0b",
+    }),
+    iconButton: {
+      padding: "4px 10px",
+      border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
+      borderRadius: "4px",
+      background: isDark ? "#1f2937" : "#fff",
+      color: isDark ? "#e5e7eb" : "#374151",
+      fontSize: "11px", fontWeight: 500, cursor: "pointer",
+      display: "inline-flex", alignItems: "center", gap: "4px",
+    },
+    iconRow: { display: "inline-flex", gap: "6px" },
+    modalBackdrop: {
+      position: "fixed", inset: 0,
+      background: "rgba(0,0,0,0.5)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      zIndex: 9999,
+    },
+    modalBox: {
+      background: isDark ? "#1f2937" : "#fff",
+      color: isDark ? "#e5e7eb" : "#111827",
+      borderRadius: "8px", padding: "20px",
+      maxWidth: "720px", width: "92%", maxHeight: "85vh", overflowY: "auto",
+      border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
+      boxShadow: "0 10px 25px rgba(0,0,0,0.25)",
+    },
+    modalHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" },
+    modalTitle: { fontSize: "15px", fontWeight: 600 },
+    modalCloseBtn: {
+      background: "transparent", border: "none", color: "inherit",
+      fontSize: "20px", cursor: "pointer", padding: "0 6px", lineHeight: 1,
+    },
+    formField: { display: "flex", flexDirection: "column", gap: "4px", marginBottom: "10px" },
+    formLabel: { fontSize: "12px", fontWeight: 500, color: isDark ? "#9ca3af" : "#4b5563" },
+    formInput: {
+      padding: "6px 10px", fontSize: "13px",
+      border: `1px solid ${isDark ? "#4b5563" : "#d1d5db"}`,
+      borderRadius: "4px",
+      background: isDark ? "#111827" : "#fff",
+      color: isDark ? "#e5e7eb" : "#111827",
+      fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace",
+    },
+    sectionHeading: {
+      fontSize: "12px", fontWeight: 600, textTransform: "uppercase",
+      letterSpacing: "0.04em",
+      color: isDark ? "#9ca3af" : "#6b7280",
+      margin: "12px 0 6px 0",
+    },
+    primaryBtn: {
+      padding: "6px 14px", background: "#D45D44", color: "white",
+      border: "none", borderRadius: "4px", cursor: "pointer",
+      fontSize: "13px", fontWeight: 500,
+    },
+  });
+
+  // ==========================================================================
+  // 5. Pure helpers (no React state)
+  // ==========================================================================
+  // DIMENSIONS is ordered by priority — higher-index dims adapt to lower-index
+  // picks, never the other way around. Order is Hardware → Variant →
+  // Quantization → Strategy → Nodes, matching the on-screen sections from top
+  // to bottom and the user's mental model ("first I pick my GPU, then the
+  // model size, then quant, then how I want to serve, then how many nodes").
+  const DIMENSIONS = ["hw", "variant", "quant", "strategy", "nodes"];
+  const findCell = (cells, sel) =>
+    cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
+
+  // Grey-out predicate: a (dim, value) button is enabled iff there exists at
+  // least one cell that matches every HIGHER-priority dimension in the current
+  // selection AND has `dim === value`. Lower-priority dims are free to differ
+  // — they'll be adapted by snapToValidCell on click.
+  //
+  // Example: with sel = { hw:b200, variant:flash, quant:fp4, strategy:low-latency, nodes:single },
+  // the "Multi-Nodes" button on the Nodes section asks: is there a cell with
+  // hw=b200 AND variant=flash AND quant=fp4 AND strategy=low-latency AND nodes=multi-2?
+  // There isn't (B200 has no multi-node cells) → button is greyed out.
+  // It will NOT silently switch hardware to find a multi-node cell.
+  const isOptionAvailable = (cells, sel, dim, value) => {
+    const idx = DIMENSIONS.indexOf(dim);
+    const higher = DIMENSIONS.slice(0, idx);
+    return cells.some(
+      (c) => c.match[dim] === value && higher.every((d) => c.match[d] === sel[d]),
+    );
+  };
+
+  // When the user clicks an ENABLED button at `dim`, snap to a real cell:
+  //   - higher-priority dims (above `dim`) stay locked to `sel[d]`
+  //   - the clicked `dim` becomes `value`
+  //   - lower-priority dims (below `dim`) adopt the best-fit cell's values,
+  //     preferring the cell that keeps the most of the user's current lower-
+  //     priority choices (minimises perceived churn).
+  // If the button was correctly greyed out by isOptionAvailable, this function
+  // is never called for a value with no matching cell.
+  const snapToValidCell = (cells, sel, dim, value) => {
+    const idx = DIMENSIONS.indexOf(dim);
+    const higher = DIMENSIONS.slice(0, idx);
+    const lower = DIMENSIONS.slice(idx + 1);
+    let best = null, bestLowerMatches = -1;
+    for (const c of cells) {
+      if (c.match[dim] !== value) continue;
+      if (!higher.every((d) => c.match[d] === sel[d])) continue;
+      let s = 0;
+      for (const d of lower) if (c.match[d] === sel[d]) s++;
+      if (s > bestLowerMatches) { bestLowerMatches = s; best = c; }
+    }
+    if (!best) return sel; // defensive — shouldn't be reachable
+    const next = { ...sel, [dim]: value };
+    for (const d of lower) next[d] = best.match[d];
+    return next;
+  };
+
+  // Validate a selection from URL hash: walk dimensions in priority order,
+  // accept each parsed value if a matching cell exists with all already-
+  // accepted dims; otherwise adopt the value from the first cell consistent
+  // with the dims accepted so far. This guarantees the result is a real cell
+  // even if the URL hash names an impossible combination (e.g. a stale link
+  // after the catalog changed).
+  const validateSelection = (cells, parsed) => {
+    const valid = {};
+    for (const dim of DIMENSIONS) {
+      const want = parsed[dim];
+      const works = cells.some(
+        (c) =>
+          c.match[dim] === want &&
+          DIMENSIONS.slice(0, DIMENSIONS.indexOf(dim)).every((d) => c.match[d] === valid[d]),
       );
+      if (works) {
+        valid[dim] = want;
+      } else {
+        const fallback = cells.find((c) =>
+          DIMENSIONS.slice(0, DIMENSIONS.indexOf(dim)).every((d) => c.match[d] === valid[d]),
+        );
+        valid[dim] = fallback ? fallback.match[dim] : want;
+      }
     }
-    return option.items;
+    return valid;
   };
 
-  const getInitialState = () => {
-    const initialState = {};
-    for (const [key, option] of Object.entries(options)) {
-      const items = resolveItems(option);
-      const def = items.find((i) => i.default && !i.disabled) || items.find((i) => !i.disabled) || items[0];
-      initialState[key] = def.id;
-    }
-    return initialState;
+  const resolveModelName = (sel) => {
+    const triple = `${sel.hw}|${sel.variant}|${sel.quant}`;
+    const pair = `${sel.variant}|${sel.quant}`;
+    return config.modelNames[triple] ?? config.modelNames[pair] ?? "";
   };
 
-  const [values, setValues] = useState(getInitialState);
-  const [isDark, setIsDark] = useState(false);
+  const interpolate = (text, env, modelName) =>
+    text.replace(/{{(\w+)}}/g, (_, key) =>
+      key === "MODEL_NAME" ? modelName : (env[key] ?? `{{${key}}}`));
 
-  useEffect(() => {
-    const checkDarkMode = () => {
-      const html = document.documentElement;
-      const isDarkMode =
-        html.classList.contains("dark") ||
-        html.getAttribute("data-theme") === "dark" ||
-        html.style.colorScheme === "dark";
-      setIsDark(isDarkMode);
+  const parseNnodes = (id) => {
+    if (id === "single") return 1;
+    const m = /^multi-(\d+)$/.exec(id);
+    return m ? parseInt(m[1], 10) : 1;
+  };
+
+  const renderCommand = (cell, sel, envValues) => {
+    if (!cell) return "# No command available for the current selection.";
+    const modelName = resolveModelName(sel);
+    const nnodes = parseNnodes(sel.nodes);
+    const multinode = nnodes > 1;
+    const flags = [...cell.flags];
+    if (multinode) {
+      const i = flags.findIndex((f) => f.startsWith("--model-path"));
+      flags.splice(i + 1, 0,
+        `--nnodes ${nnodes}`,
+        `--node-rank {{NODE_RANK}}`,
+        `--dist-init-addr {{NODE0_IP}}:20000`);
+    }
+    const flagBlock = flags.map((f) => "  " + f).join(" \\\n");
+    const envBlock = cell.env.length ? cell.env.join(" \\\n") + " \\\n" : "";
+    let cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
+    if (multinode && config.multiNodeHints && config.multiNodeHints[sel.hw]) {
+      const hint = config.multiNodeHints[sel.hw]
+        .map((line) => (line.length ? "# " + line : "#")).join("\n");
+      cmd = `${hint}\n${cmd}`;
+    }
+    cmd = interpolate(cmd, envValues, modelName);
+    if (multinode) {
+      const header =
+        `# Multi-node (${nnodes} nodes). Run the same command on every node with:\n` +
+        `#   <node-rank> = 0 on the head node, 1..${nnodes - 1} on the others\n` +
+        `#   <node0-ip>  = IP of the head node (reachable from all others)`;
+      cmd = `${header}\n${cmd}`;
+    }
+    return cmd;
+  };
+
+  const buildHardwareGroups = () => {
+    const supported = new Set(config.supportedHardware);
+    const groups = [];
+    for (const [vendor, list] of Object.entries(HARDWARE_CATALOG)) {
+      const items = list.filter((hw) => supported.has(hw.id))
+        .map((hw) => ({ id: hw.id, label: hw.label, subtitle: hw.vram }));
+      if (items.length) groups.push({ label: vendor.toUpperCase(), items });
+    }
+    return groups;
+  };
+
+  const initialSelectionFromCells = () => {
+    const first = config.cells[0];
+    if (!first) return Object.fromEntries(DIMENSIONS.map((d) => [d, ""]));
+    return {
+      hw: first.match.hw, variant: first.match.variant, quant: first.match.quant,
+      strategy: first.match.strategy, nodes: first.match.nodes,
     };
-    checkDarkMode();
-    const observer = new MutationObserver(checkDarkMode);
+  };
+
+  const placeholderDefaults = (schema) => {
+    const out = {};
+    for (const [k, v] of Object.entries(schema || {})) out[k] = v.default ?? "";
+    return out;
+  };
+
+  // ==========================================================================
+  // 6. State + effects
+  // ==========================================================================
+  const [isDark, setIsDark] = useState(false);
+  useEffect(() => {
+    const check = () => {
+      const html = document.documentElement;
+      setIsDark(
+        html.classList.contains("dark") ||
+          html.getAttribute("data-theme") === "dark" ||
+          html.style.colorScheme === "dark"
+      );
+    };
+    check();
+    const observer = new MutationObserver(check);
     observer.observe(document.documentElement, {
       attributes: true,
       attributeFilter: ["class", "data-theme", "style"],
@@ -121,879 +686,269 @@ export const DeepSeekV4Deployment = () => {
     return () => observer.disconnect();
   }, []);
 
-  const handleRadioChange = (optionName, value) => {
-    setValues((prev) => {
-      const next = { ...prev, [optionName]: value };
-      // Switching to a Marlin (FP4) Hopper path while cp / pd-disagg is
-      // selected: fall back to low-latency since those recipes are not
-      // supported on Marlin.
-      if (
-        optionName === "hardware" &&
-        MARLIN_HARDWARE.has(value) &&
-        MARLIN_UNSUPPORTED_RECIPES.has(next.recipe)
-      ) {
-        next.recipe = "low-latency";
+  const STORAGE_KEY = "sglang-deploy-env";
+  const [env, setEnv] = useState(() => placeholderDefaults(config.placeholders));
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        setEnv({ ...placeholderDefaults(config.placeholders), ...parsed });
       }
-      return next;
-    });
+    } catch {}
+  }, []);
+  const saveEnv = (next) => {
+    setEnv(next);
+    try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
   };
 
-  // ============================================================================
-  // generateCommand — strict mirror of sunrise_allinone.py LAUNCH_COMMANDS
-  // for BOTH small and big (1.6T) real-checkpoint rows.
-  //
-  // SOURCE OF TRUTH: sunrise_final/sunrise_allinone.py LAUNCH_COMMANDS dict.
-  // Allowed deviations are documented in cookbook_v2/DISCUSSION.md
-  // → "Human-approved diffs from allinone":
-  //   1. NVSHMEM env (B200) removed — personal hardware NIC mapping
-  //   2. Model path uses HF slug instead of allinone's local paths
-  //   3. `sglang serve` instead of `python3 -m sglang.launch_server`
-  //   4. (retired — big is now a real ckpt and exposed)
-  //   5. GB300 PD MNNVL topology envs (MC_FORCE_MNNVL / NCCL_*) removed;
-  //      SGLANG_MOONCAKE_CUSTOM_MEM_POOL kept.
-  //
-  // Any other diff vs allinone is a bug — fix the JSX, not the whitelist.
-  // ============================================================================
-
-  // === SHARED BEGIN ===
-  // Constants reachable by both generateCommand and buildPDDisaggCommand.
-  // verify_commands.mjs also scrapes this block between the SHARED markers and
-  // prepends it to the extracted function bodies (since `new Function(body)`
-  // loses closure scope). Don't rename the markers.
-
-  // Per (hardware, modelSize) spec derived from allinone _MODEL_SPEC.
-  // "small" (JSX id) = DeepSeek-V4-Flash (285B); "big" = DeepSeek-V4-Pro (1.6T).
-  // The internal ids match allinone's model="small" / model="big" keys so the
-  // verify_commands.py diff is mechanical. One HF repo per variant holds both
-  // FP8 and FP4 weights (quantization picked by hardware, not by repo suffix).
-  const HW_SIZE_SPEC = {
-    "b200|small":  { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4,  multinode: false },
-    "b200|big":    { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 8,  multinode: false },
-    "gb300|small": { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4,  multinode: false },
-    "gb300|big":   { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 4,  multinode: false },
-    "gb200|small": { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4,  multinode: false },
-    "gb200|big":   { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 8,  multinode: true, nnodes: 2 },
-    // H200 needs an FP8-only Instruct ckpt (deepseek-ai's Flash/Pro repos ship
-    // FP4-mixed weights that Hopper can't run). sgl-project publishes FP8
-    // repackagings for both variants.
-    "h200|small":  { slug: "sgl-project/DeepSeek-V4-Flash-FP8",        tp: 4,  multinode: false },
-    "h200|big":    { slug: "sgl-project/DeepSeek-V4-Pro-FP8",          tp: 16, multinode: true, nnodes: 2 },
-    // H200 (FP4) runs the original FP4-mixed Instruct repos through the Marlin
-    // MoE runner: experts are dequantized from FP4 to FP16 at runtime, so a
-    // single-node TP=4 / TP=8 deployment fits Flash / Pro on Hopper.
-    "h200-fp4|small": { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4, multinode: false },
-    "h200-fp4|big":   { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 8, multinode: false },
-    // H100 (FP4) also uses the Marlin runner, but Hopper memory pressure forces
-    // a higher TP: Flash fits at TP=8 single-node, Pro needs TP=16 across 2 nodes.
-    "h100|small":  { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 8,  multinode: false },
-    "h100|big":    { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 16, multinode: true, nnodes: 2 },
-  };
-  // Per (hardware, modelSize) PD role TP (from allinone _PD_SPEC).
-  const PD_TP_SPEC = {
-    "b200|small":  { tp: 2,  multinode: false },
-    "b200|big":    { tp: 8,  multinode: false },
-    "gb300|small": { tp: 4,  multinode: false },
-    "gb300|big":   { tp: 4,  multinode: false },
-    "gb200|small": { tp: 4,  multinode: false },
-    "gb200|big":   { tp: 8,  multinode: true, nnodes: 2 },
-    "h200|small":  { tp: 4,  multinode: false },
-    "h200|big":    { tp: 16, multinode: true, nnodes: 2 },
-  };
-  // Recipes that have been end-to-end verified on the latest (Flash/Pro) HF
-  // checkpoints. Every cell NOT listed here is emitted with its entire body
-  // commented out (every line prefixed with `# `) plus a "being verified"
-  // banner on top — so copy-pasting an unverified command is a no-op in shell.
-  // To mark a cell verified, add its "hardware|modelSize|recipe" string here
-  // and the cell renders as a normal, runnable command.
-  // pd-disagg is verified as a single unit (both prefill and decode together).
-  const VERIFIED_RECIPES = new Set([
-    "b200|small|low-latency",
-    "b200|small|balanced",
-    "b200|small|max-throughput",
-    "b200|small|cp",
-    "b200|small|pd-disagg",
-    "b200|big|low-latency",
-    "b200|big|balanced",
-    "b200|big|max-throughput",
-    "b200|big|cp",
-    "h200|small|low-latency",
-    "h200|small|balanced",
-    "h200|small|max-throughput",
-    "gb300|small|low-latency",
-    "gb300|big|low-latency",
-    "gb300|small|balanced",
-    "gb300|big|balanced",
-    "gb300|small|max-throughput",
-    "gb300|big|max-throughput",
-    "h200|small|cp",
-    "h200|small|pd-disagg",
-    "h200|big|low-latency",
-    "h200|big|balanced",
-    "h200|big|max-throughput",
-    "h200|big|pd-disagg",
-    "gb300|small|cp",
-    "gb300|big|cp",
-    "gb300|small|pd-disagg",
-    "gb300|big|pd-disagg",
-    "gb200|small|low-latency",
-    "gb200|small|balanced",
-    "gb200|small|max-throughput",
-    "gb200|small|cp",
-    "gb200|big|low-latency",
-    "gb200|big|balanced",
-    "gb200|big|max-throughput",
-    "h200-fp4|small|low-latency",
-    "h200-fp4|small|balanced",
-    "h200-fp4|small|max-throughput",
-    "h200-fp4|big|low-latency",
-    "h200-fp4|big|balanced",
-    "h200-fp4|big|max-throughput",
-    "h100|small|low-latency",
-    "h100|small|balanced",
-    "h100|small|max-throughput",
-    "h100|big|low-latency",
-    "h100|big|balanced",
-    "h100|big|max-throughput",
-  ]);
-  // Recipes whose command is intentionally not yet provided (e.g. blocked by an
-  // upstream limitation). Showing a minimal placeholder is friendlier to users
-  // than emitting a commented-out invalid command.
-  const TBD_RECIPES = new Set([
-    "h200|big|cp",
-    "gb200|small|pd-disagg",
-    "gb200|big|pd-disagg",
-  ]);
-  const TBD_PLACEHOLDER = "# to be provided";
-  const BEING_VERIFIED_NOTE =
-    "# NOTE: this recipe is being verified on the latest checkpoint";
-
-  // Prefix every line with "# " so the whole command becomes a shell no-op.
-  const commentOutCommand = (cmd) =>
-    cmd
-      .split("\n")
-      .map((line) => (line.length ? `# ${line}` : "#"))
-      .join("\n");
-
-  // DeepEP large SMS flag (allinone _DEEPEP_LARGE_SMS_FLAG).
-  const DEEPEP_LARGE_SMS_FLAG =
-    `  --deepep-config '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'`;
-
-  // Multi-node flags (renders with <node0-ip> / <node-rank> placeholders;
-  // allinone template uses {node0_ip} / {node_rank} that verify_commands.py formats
-  // with the same placeholder strings so dynamic-diff stays exact).
-  const multiNodeFlags = (nnodes) => [
-    `  --nnodes ${nnodes}`,
-    `  --node-rank <node-rank>`,
-    `  --dist-init-addr <node0-ip>:20000`,
-  ];
-
-  const prependMultiNodeNote = (cmd, nnodes) =>
-    `# Multi-node (${nnodes} nodes). Run the same command on every node with:\n` +
-    `#   <node-rank> = 0 on the head node, 1..${nnodes - 1} on the others\n` +
-    `#   <node0-ip>  = IP of the head node (reachable from all others)\n` +
-    `${cmd}`;
-  // === SHARED END ===
-
-  const generateCommand = () => {
-    const { hardware: rawHardware, modelSize, recipe, reasoningParser, toolcall } = values;
-    // B300 usage is identical to B200 — alias so we don't duplicate every spec entry.
-    const hardware = rawHardware === "b300" ? "b200" : rawHardware;
-    const specKey = `${hardware}|${modelSize}`;
-    const spec = HW_SIZE_SPEC[specKey];
-    const { slug, tp, multinode, nnodes } = spec;
-    const isBig = modelSize === "big";
-
-    if (recipe === "pd-disagg") {
-      return buildPDDisaggCommand(hardware, modelSize);
-    }
-
-    // H200 (FP4) Marlin path: dedicated branch — Hopper runs the FP4-mixed
-    // Instruct repos through the Marlin MoE runner, so it doesn't share envs
-    // or flags with either the FP8 H200 path or the Blackwell paths.
-    //   Flash: TP=4, single node       Pro: TP=8, single node
-    //   low-latency:    MTP 3 / 1 / 4 (steps / topk / draft-tokens)
-    //   balanced:       MTP 1 / 1 / 2
-    //   max-throughput: MTP disabled
-    if (hardware === "h200-fp4") {
-      const verifyKey = `${hardware}|${modelSize}|${recipe}`;
-      if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
-
-      const fp4Flags = [
-        "  --trust-remote-code",
-        `  --model-path ${slug}`,
-        `  --tp ${tp}`,
-        "  --moe-runner-backend marlin",
-      ];
-      if (recipe === "low-latency") {
-        fp4Flags.push("  --speculative-algo EAGLE");
-        fp4Flags.push("  --speculative-num-steps 3");
-        fp4Flags.push("  --speculative-eagle-topk 1");
-        fp4Flags.push("  --speculative-num-draft-tokens 4");
-      } else if (recipe === "balanced") {
-        fp4Flags.push("  --speculative-algo EAGLE");
-        fp4Flags.push("  --speculative-num-steps 1");
-        fp4Flags.push("  --speculative-eagle-topk 1");
-        fp4Flags.push("  --speculative-num-draft-tokens 2");
-      }
-      if (isBig) fp4Flags.push("  --mem-fraction-static 0.88");
-      if (toolcall === "enabled") fp4Flags.push("  --tool-call-parser deepseekv4");
-      if (reasoningParser === "enabled") fp4Flags.push("  --reasoning-parser deepseek-v4");
-      fp4Flags.push("  --host 0.0.0.0");
-      fp4Flags.push("  --port 30000");
-
-      const fp4Cmd = `sglang serve \\\n${fp4Flags.join(" \\\n")}`;
-      return VERIFIED_RECIPES.has(verifyKey)
-        ? fp4Cmd
-        : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(fp4Cmd)}`;
-    }
-
-    // H100 (FP4) Marlin path: also Hopper + Marlin, but unlike H200 (FP4) the
-    // memory budget forces a higher TP and (for Pro) a 2-node deployment.
-    //   Flash: TP=8, single node
-    //   Pro:   TP=16, 2 nodes, env SGLANG_SHARED_EXPERT_TP1=1
-    //          + mem-fraction-static 0.9; cg=8 / max-run=32 on low-lat/balanced
-    //   low-latency:    MTP 3 / 1 / 4 (steps / topk / draft-tokens)
-    //   balanced:       MTP 1 / 1 / 2
-    //   max-throughput: MTP disabled
-    if (hardware === "h100") {
-      const verifyKey = `${hardware}|${modelSize}|${recipe}`;
-      if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
-
-      const h100Env = isBig ? ["SGLANG_SHARED_EXPERT_TP1=1"] : [];
-      const h100EnvBlock = h100Env.length ? h100Env.join(" \\\n") + " \\\n" : "";
-
-      const h100Flags = [
-        "  --trust-remote-code",
-        `  --model-path ${slug}`,
-        `  --tp ${tp}`,
-      ];
-      if (multinode) h100Flags.push(...multiNodeFlags(nnodes));
-      h100Flags.push("  --moe-runner-backend marlin");
-      if (recipe === "low-latency") {
-        h100Flags.push("  --speculative-algo EAGLE");
-        h100Flags.push("  --speculative-num-steps 3");
-        h100Flags.push("  --speculative-eagle-topk 1");
-        h100Flags.push("  --speculative-num-draft-tokens 4");
-      } else if (recipe === "balanced") {
-        h100Flags.push("  --speculative-algo EAGLE");
-        h100Flags.push("  --speculative-num-steps 1");
-        h100Flags.push("  --speculative-eagle-topk 1");
-        h100Flags.push("  --speculative-num-draft-tokens 2");
-      }
-      if (isBig) {
-        h100Flags.push("  --mem-fraction-static 0.9");
-        // max-throughput leaves cg/max-run at engine defaults; low-lat + balanced
-        // cap them tight to keep latency predictable on Hopper.
-        if (recipe !== "max-throughput") {
-          h100Flags.push("  --cuda-graph-max-bs 8");
-          h100Flags.push("  --max-running-requests 32");
-        }
-      }
-      if (toolcall === "enabled") h100Flags.push("  --tool-call-parser deepseekv4");
-      if (reasoningParser === "enabled") h100Flags.push("  --reasoning-parser deepseek-v4");
-      h100Flags.push("  --host 0.0.0.0");
-      h100Flags.push("  --port 30000");
-
-      const h100Cmd = `${h100EnvBlock}sglang serve \\\n${h100Flags.join(" \\\n")}`;
-      const h100WithNote = multinode ? prependMultiNodeNote(h100Cmd, nnodes) : h100Cmd;
-      return VERIFIED_RECIPES.has(verifyKey)
-        ? h100WithNote
-        : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(h100WithNote)}`;
-    }
-
-    // ---- env ----
-    // _LAUNCH_HEAD always prepends these:
-    // Per-hardware env (whitelist #1: NVSHMEM removed for B200).
-    const HW_ENV = {
-      h200:  ["SGLANG_DSV4_FP4_EXPERTS=0"],   // allinone _ENV_H200
-      b200:  [],                              // _ENV_B200 minus NVSHMEM
-      gb300: [],                              // _ENV_GB300
-      // GB200 multinode needs NCCL MNNVL for cross-node NVLink communication.
-      gb200: multinode ? ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1"] : [],
-    }[hardware];
-
-    // Recipe-specific env (matches allinone exactly, taking size into account).
-    const recipeEnv = [];
-    if (recipe === "low-latency") {
-      // Big low-latency dispatch-token cap.
-      if (hardware === "h200" && isBig) {
-        recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128");
-      } else if (hardware === "gb200" && isBig) {
-        recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
-      }
-      // B200/B300 Pro accuracy-verified env vars.
-      if (isBig && hardware === "b200") {
-        recipeEnv.push(
-          "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-          "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-          "SGLANG_OPT_USE_JIT_NORM=1",
-          "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-          "SGLANG_OPT_USE_TOPK_V2=1",
-        );
-      }
-    } else if (recipe === "balanced") {
-      if (hardware === "h200") {
-        recipeEnv.push(isBig
-          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
-          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
-      } else if (isBig && hardware === "b200") {
-        // B200/B300 Pro accuracy-verified env vars.
-        recipeEnv.push(
-          "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-          "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-          "SGLANG_OPT_USE_JIT_NORM=1",
-          "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-          "SGLANG_OPT_USE_TOPK_V2=1",
-        );
-      } else {
-        recipeEnv.push(isBig
-          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
-          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
-      }
-    } else if (recipe === "max-throughput") {
-      if (hardware === "h200") {
-        if (!isBig) {
-          recipeEnv.push("SGLANG_JIT_DEEPGEMM_PRECOMPILE=0");
-        }
-        recipeEnv.push(isBig
-          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
-          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
-      } else if (isBig && hardware === "b200") {
-        // B200/B300 Pro accuracy-verified env vars.
-        recipeEnv.push(
-          "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-          "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-          "SGLANG_OPT_USE_JIT_NORM=1",
-          "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-          "SGLANG_OPT_USE_TOPK_V2=1",
-          "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
-          "NVSHMEM_DISABLE_IB=1",
-          "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1",
-          "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-        );
-      } else {
-        recipeEnv.push(isBig
-          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
-          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
-      }
-    } else if (recipe === "cp") {
-      recipeEnv.push("SGLANG_OPT_USE_JIT_INDEXER_METADATA=1");
-      if (hardware === "h200") {
-        recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
-      } else {
-        // Blackwell cp: small=1024, big=256 (allinone ternary).
-        recipeEnv.push(isBig
-          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
-          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
-      }
-    }
-    // SGLANG_ENABLE_SPEC_V2=1 was in allinone's _ENV_MTP for low-latency / balanced
-    // recipes, but V4 auto-enables spec-v2 when MTP is detected — human confirmed
-    // the env is redundant on the public cookbook path. Kept as a no-op reference
-    // in allinone for legacy runs.
-
-    // ---- flags ----
-    const flags = [];
-    flags.push("  --trust-remote-code");                              // _LAUNCH_HEAD
-    flags.push(`  --model-path ${slug}`);
-
-    if (recipe === "low-latency") {
-      // allinone:
-      //   H200 small: pure TP + MTP_314
-      //   H200 big:   DP-attn + DeepEP + MTP_314 + cg=32 max-run=64 + multi-node + mem-frac 0.82
-      //   GB200 big:  pure TP + multinode + flashinfer_mxfp4 + MTP_314 + mem-frac 0.82 (no DP-attn/DeepEP)
-      //   Blackwell:  TP + flashinfer_mxfp4 + MTP_314 + chunked-prefill-size 4096 + autotune-fix
-      //               Big Blackwell additionally: mem-frac 0.82
-      flags.push(`  --tp ${tp}`);
-      if (hardware === "h200" && isBig) {
-        flags.push(`  --dp ${tp}`);
-        flags.push("  --enable-dp-attention");
-      }
-      if (multinode) flags.push(...multiNodeFlags(nnodes));
-      if (hardware === "h200" && isBig) {
-        flags.push("  --moe-a2a-backend deepep");
-      }
-      if (hardware !== "h200") {
-        flags.push("  --moe-runner-backend flashinfer_mxfp4");
-      }
-      if (hardware === "h200" && isBig) {
-        flags.push("  --cuda-graph-max-bs 8");
-        flags.push("  --max-running-requests 32");
-      }
-      // MTP 3/4
-      flags.push("  --speculative-algo EAGLE");
-      flags.push("  --speculative-num-steps 3");
-      flags.push("  --speculative-eagle-topk 1");
-      flags.push("  --speculative-num-draft-tokens 4");
-      if (hardware !== "h200") {
-        // B200/B300 Pro accuracy-verified: chunked-prefill-size 8192
-        flags.push(isBig ? "  --chunked-prefill-size 8192" : "  --chunked-prefill-size 4096");
-        flags.push("  --disable-flashinfer-autotune");
-        flags.push("  --swa-full-tokens-ratio 0.1");
-      }
-      // B200/B300 Pro accuracy-verified: mem-fraction-static 0.90
-      if (isBig && hardware !== "h200") {
-        flags.push("  --mem-fraction-static 0.90");
-      } else if (isBig) {
-        flags.push("  --mem-fraction-static 0.88");
-      }
-    } else if (recipe === "balanced") {
-      // allinone balanced: TP + DP + DP-attn + DeepEP + MTP_112.
-      //   H200 small: cg=128 max-run=128  |  H200 big: cg=128 max-run=128 (same)
-      //   B200 small: no cg/max-run       |  B200 big: cg=64  max-run=128
-      //   GB300 small: no cg/max-run      |  GB300 big: cg=128 max-run=256
-      flags.push(`  --tp ${tp}`);
-      flags.push(`  --dp ${tp}`);
-      flags.push("  --enable-dp-attention");
-      if (multinode) flags.push(...multiNodeFlags(nnodes));
-      // B200/B300 Pro accuracy-verified: flashinfer_mxfp4 (not deepep) for balanced.
-      if (isBig && hardware === "b200") {
-        flags.push("  --moe-runner-backend flashinfer_mxfp4");
-        flags.push("  --disable-flashinfer-autotune");
-        flags.push("  --chunked-prefill-size 32768");
-        flags.push("  --swa-full-tokens-ratio 0.1");
-      } else {
-        flags.push("  --moe-a2a-backend deepep");
-      }
-      flags.push("  --speculative-algo EAGLE");
-      flags.push("  --speculative-num-steps 1");
-      flags.push("  --speculative-eagle-topk 1");
-      flags.push("  --speculative-num-draft-tokens 2");
-      if (hardware === "h200" && isBig) {
-        flags.push("  --mem-fraction-static 0.88");
-      } else if (isBig && hardware === "gb300") {
-        flags.push("  --mem-fraction-static 0.9");
-      } else if (isBig && hardware === "gb200") {
-        flags.push("  --mem-fraction-static 0.78");
-      } else if (isBig) {
-        flags.push("  --mem-fraction-static 0.92");
-      }
-      if (hardware === "h200" && isBig) {
-        flags.push("  --cuda-graph-max-bs 8");
-        flags.push("  --max-running-requests 32");
-      } else if (hardware === "h200") {
-        flags.push("  --cuda-graph-max-bs 128");
-        flags.push("  --max-running-requests 128");
-      } else if (isBig && hardware === "b200") {
-        flags.push("  --cuda-graph-max-bs 256");
-      } else if (isBig && hardware === "gb300") {
-        flags.push("  --cuda-graph-max-bs 128");
-        flags.push("  --max-running-requests 256");
-      } else if (isBig && hardware === "gb200") {
-        flags.push("  --cuda-graph-max-bs 64");
-        flags.push("  --max-running-requests 128");
-      }
-      // allinone H200 gates DEEPEP_LARGE_SMS_FLAG on !multinode — only H200 big
-      // is multi-node; all Blackwell cells get the flag unconditionally.
-      if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
-    } else if (recipe === "max-throughput") {
-      // allinone max-throughput: TP + DP + DP-attn + DeepEP (NO MTP).
-      //   H200 small: cg=128 max-run=256  |  H200 big: cg=128 max-run=256 (same)
-      //   B200 small: no cg/max-run       |  B200 big: cg=64  max-run=256
-      //   GB300 small: no cg/max-run      |  GB300 big: cg=128 max-run=256
-      flags.push(`  --tp ${tp}`);
-      flags.push(`  --dp ${tp}`);
-      flags.push("  --enable-dp-attention");
-      if (multinode) flags.push(...multiNodeFlags(nnodes));
-      if (isBig && hardware === "b200") {
-        flags.push("  --moe-a2a-backend megamoe");
-      } else {
-        flags.push("  --moe-a2a-backend deepep");
-      }
-      if (hardware === "h200" && isBig) {
-        flags.push("  --mem-fraction-static 0.88");
-      } else if (isBig && hardware === "gb300") {
-        flags.push("  --mem-fraction-static 0.9");
-      } else if (isBig && hardware === "gb200") {
-        flags.push("  --mem-fraction-static 0.78");
-      } else if (isBig) {
-        flags.push("  --mem-fraction-static 0.835");
-      }
-      if (hardware === "h200") {
-        flags.push("  --cuda-graph-max-bs 128");
-        flags.push("  --max-running-requests 256");
-      } else if (isBig && hardware === "b200") {
-        // B200/B300 Pro accuracy-verified max-throughput config.
-        flags.push("  --cuda-graph-max-bs 544");
-        flags.push("  --swa-full-tokens-ratio 0.075");
-        flags.push("  --chunked-prefill-size 65536");
-        flags.push("  --tokenizer-worker-num 8");
-        flags.push("  --enable-prefill-delayer");
-      } else if (isBig && hardware === "gb300") {
-        flags.push("  --cuda-graph-max-bs 128");
-        flags.push("  --max-running-requests 256");
-      } else if (isBig && hardware === "gb200") {
-        flags.push("  --cuda-graph-max-bs 64");
-        flags.push("  --max-running-requests 256");
-      }
-      if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
-    } else if (recipe === "cp") {
-      // allinone cp: TP (NO --dp) + DeepEP + _CP_FLAGS (mem-frac 0.78, max-run 1024).
-      //   Blackwell big additionally: mem-frac 0.70 (overrides), cg=256, max-run=256.
-      //   No flashinfer_mxfp4 even on Blackwell (allinone omits).
-      flags.push(`  --tp ${tp}`);
-      if (multinode) flags.push(...multiNodeFlags(nnodes));
-      flags.push("  --moe-a2a-backend deepep");
-      flags.push("  --enable-nsa-prefill-context-parallel");
-      flags.push("  --nsa-prefill-cp-mode round-robin-split");
-      flags.push("  --chunked-prefill-size 16384");
-      // GB300 big CP needs higher mem-fraction-static: Pro 1.6T weights at
-      // tp=4 are ~224 GB/card on a 273 GB GB300, so 0.78 leaves a negative
-      // KV pool (init_memory_pool fails: "Not enough memory ... weights
-      // 224 GB > static target 213 GB"). 0.88 gives weights 224 + KV 16 +
-      // runtime 33. Other Blackwell tp=8 paths fit fine at 0.78.
-      // Verified on 2026-04-25 (journal 2026-04-25-001 Cell B, Δ4).
-      if (hardware === "gb300" && isBig) {
-        flags.push("  --mem-fraction-static 0.88");
-      } else {
-        flags.push("  --mem-fraction-static 0.78");
-      }
-      // allinone _CP_FLAGS has --max-running-requests 1024; Blackwell big cp overrides
-      // to 256. Human directed (2026-04-24) to emit only one value — keep 256 override
-      // for big Blackwell, else the default 1024.
-      if (isBig && hardware !== "h200") {
-        flags.push("  --cuda-graph-max-bs 256");
-        flags.push("  --max-running-requests 256");
-      } else {
-        flags.push("  --max-running-requests 1024");
-      }
-      // H200 CP gates DEEPEP_LARGE_SMS_FLAG on !multinode; Blackwell always gets it.
-      if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
-    }
-
-    // Optional parsers (cookbook UI extension; not in allinone — opt-in toggles only).
-    if (toolcall === "enabled") flags.push("  --tool-call-parser deepseekv4");
-    if (reasoningParser === "enabled") flags.push("  --reasoning-parser deepseek-v4");
-
-    flags.push("  --host 0.0.0.0");
-    flags.push("  --port 30000");
-
-    // Assemble: [HW env] [recipe env] \ sglang serve \ flags...
-    const envAll = [...HW_ENV, ...recipeEnv];
-    const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
-    // B200/B300 Pro recipes carry many accuracy-verified env vars that will be
-    // consolidated; prepend a shell comment so users know these are temporary.
-    const simplifyNote = (isBig && hardware === "b200" && recipeEnv.length > 2)
-      ? "# flags will be simplified\n"
-      : "";
-    const base = `${simplifyNote}${envBlock}sglang serve \\\n${flags.join(" \\\n")}`;
-    // GB200 multinode may need machine-specific NVSHMEM / Gloo env vars;
-    // emit them as commented hints above the env block so users know to check.
-    let cmd = base;
-    if (hardware === "gb200" && multinode) {
-      cmd =
-        `# The following env vars may be needed depending on your cluster:\n` +
-        `#   GLOO_SOCKET_IFNAME=<your-nic>\n` +
-        `#   NVSHMEM_ENABLE_NIC_PE_MAPPING=1\n` +
-        `#   NVSHMEM_HCA_LIST=<your-hca-list>\n` +
-        cmd;
-    }
-    const withMultinode = multinode ? prependMultiNodeNote(cmd, nnodes) : cmd;
-
-    // H200 Pro low-latency: show BOTH a single-node (TP=8 marlin) variant
-    // and the existing multi-node (TP=16 DP-attn + DeepEP) variant.
-    if (hardware === "h200" && isBig && recipe === "low-latency") {
-      const singleFlags = [
-        "  --trust-remote-code",
-        "  --model-path deepseek-ai/DeepSeek-V4-Pro",
-        "  --tp 8",
-        "  --moe-runner-backend marlin",
-        "  --speculative-algo EAGLE",
-        "  --speculative-num-steps 3",
-        "  --speculative-eagle-topk 1",
-        "  --speculative-num-draft-tokens 4",
-        "  --chunked-prefill-size 4096",
-        "  --disable-flashinfer-autotune",
-        "  --mem-fraction-static 0.88",
-      ];
-      if (toolcall === "enabled") singleFlags.push("  --tool-call-parser deepseekv4");
-      if (reasoningParser === "enabled") singleFlags.push("  --reasoning-parser deepseek-v4");
-      singleFlags.push("  --host 0.0.0.0");
-      singleFlags.push("  --port 30000");
-      const singleNodeCmd = `sglang serve \\\n${singleFlags.join(" \\\n")}`;
-      const combined =
-        `# --- Single-Node (TP=8, Marlin) ---\n${singleNodeCmd}\n\n` +
-        `# --- Multi-Node (2 nodes, TP=16, DP-Attn + DeepEP) ---\n${withMultinode}`;
-      const verifyKey = `${hardware}|${modelSize}|${recipe}`;
-      if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
-      return VERIFIED_RECIPES.has(verifyKey)
-        ? combined
-        : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(combined)}`;
-    }
-
-    const verifyKey = `${hardware}|${modelSize}|${recipe}`;
-    if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
-    return VERIFIED_RECIPES.has(verifyKey)
-      ? withMultinode
-      : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(withMultinode)}`;
-  };
-
-  // ============================================================================
-  // buildPDDisaggCommand — mirror of allinone pd-p / pd-d for small AND big.
-  //
-  //   _PD_SPEC[(hw, size)] → tp (and whether multinode).
-  //     H200-fp8 small: tp=4  single-node,  ib=mlx5_0
-  //     H200-fp8 big:   tp=16 2-node,       ib=mlx5_0
-  //     B200 small:     tp=2  single-node,  ib=mlx5_7
-  //     B200 big:       tp=8  single-node,  ib=mlx5_7
-  //     GB300 small/big: tp=4 single-node,  ib=""    (uses MNNVL, no IB device)
-  //
-  //   deepep flag only on Blackwell PD; H200 PD does NOT use deepep.
-  //   cap_env (SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024) only on B200 decode.
-  //   SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True only on GB300.
-  //   --dist-init-addr for disagg wiring only on non-GB300.
-  //   --max-running-requests 256 only on decode (PD decode can't retract).
-  //   No flashinfer_mxfp4 / autotune-fix / MTP / mem-fraction-static on PD (allinone omits).
-  // ============================================================================
-  const buildPDDisaggCommand = (rawHardware, modelSize) => {
-    // B300 usage is identical to B200 — alias so we don't duplicate every spec entry.
-    const hardware = rawHardware === "b300" ? "b200" : rawHardware;
-    const specKey = `${hardware}|${modelSize}`;
-    const { tp: pdTp, multinode, nnodes } = PD_TP_SPEC[specKey];
-    const slug = HW_SIZE_SPEC[specKey].slug;
-    const ibDevice = { h200: "mlx5_0", b200: "mlx5_7", gb300: "", gb200: "" }[hardware];
-    const isGB300 = hardware === "gb300";
-    const isBlackwell = hardware === "b200" || hardware === "gb200" || isGB300;
-
-    const HW_ENV = {
-      h200:  ["SGLANG_DSV4_FP4_EXPERTS=0"],
-      b200:  [],
-      gb300: [],
-      gb200: [],
-    }[hardware];
-    // Whitelist #5: only SGLANG_MOONCAKE_CUSTOM_MEM_POOL kept; MC_FORCE_MNNVL /
-    // NCCL_MNNVL_ENABLE / NCCL_CUMEM_ENABLE may also be needed depending on the
-    // GB300 cluster's NVLink/IB topology — see §3.2 "Configuration Tips" note.
-    const MNNVL_ENV = isGB300 ? ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True"] : [];
-
-    const buildRole = (mode, port, distPort) => {
-      const roleEnv = [];
-      if (hardware === "b200" && mode === "decode") {
-        roleEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
-      }
-      // GB300 PD needs DeepEP dispatch buffer cap on BOTH prefill + decode;
-      // without it, the first forward fails `deep_ep.cpp:1233` assertion
-      // `x.size(0) <= num_max_dispatch_tokens_per_rank`. The cap also
-      // co-moves with --max-running-requests below: 256 for big (which
-      // uses --max-running-requests 128, per-rank=32 ≤ 256), 1024 for
-      // small (--max-running-requests 256, per-rank=64 ≤ 1024).
-      // Verified on 2026-04-25 (journal 2026-04-25-001 §C/§D).
-      if (isGB300) {
-        roleEnv.push(modelSize === "big"
-          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
-          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
-      }
-      // H200 Pro PD: tp=16 multinode + DeepEP needs the dispatch buffer cap on
-      // BOTH prefill + decode (matches production playground LWS for the same
-      // hw/model combo). Verified on 2026-04-25 (journal 2026-04-25-014).
-      if (hardware === "h200" && modelSize === "big") {
-        roleEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128");
-      }
-      const envAll = [...HW_ENV, ...roleEnv, ...MNNVL_ENV];
-      const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
-
-      const flags = [];
-      flags.push("  --trust-remote-code");
-      flags.push(`  --model-path ${slug}`);
-      flags.push(`  --tp ${pdTp}`);
-      flags.push(`  --dp ${pdTp}`);
-      flags.push("  --enable-dp-attention");
-      if (multinode) flags.push(...multiNodeFlags(nnodes));
-      // H200 Pro PD also needs deepep: at tp=16 the FP8 block_n=128 doesn't
-      // divide moe intermediate_size_per_partition (3072 / 16 = 192) so MoE
-      // experts must be kept on a single rank rather than TP-sharded. Verified
-      // on 2026-04-25 (journal 2026-04-25-014, candidate cookbook Bug L).
-      if (isBlackwell || (hardware === "h200" && modelSize === "big")) {
-        flags.push("  --moe-a2a-backend deepep");
-      }
-      flags.push(`  --disaggregation-mode ${mode}`);
-      flags.push("  --disaggregation-transfer-backend mooncake");
-      if (ibDevice) flags.push(`  --disaggregation-ib-device ${ibDevice}`);
-      // Same-host PD bootstrap addr; for multinode PD (h200 big tp=16 across 2
-      // nodes) skip this — argparse would override the multinode dist-init-addr
-      // already emitted by multiNodeFlags above. Verified 2026-04-25 (journal
-      // 2026-04-25-014). sglang falls back to its own bootstrap port (default
-      // 8998) which works for cross-node mooncake handshake.
-      if (!isGB300 && !multinode) flags.push(`  --dist-init-addr 127.0.0.1:${distPort}`);
-      // H200 Pro PD memory-budget: cookbook defaults give available_gpu_memory
-      // ~17.93 GB after weights but reserve target = (1 - mem_fraction_static)
-      // × 138 GB = 87 GB → "Not enough memory" at memory profile. mem-frac 0.90
-      // and cg-max-bs 128 verified on 2026-04-25 (journal 2026-04-25-014). 128
-      // matches gb300|big|pd decode and gives larger decode batching headroom;
-      // CG capture takes ~1 hr (one-time, vs ~5 min for cg=64) but runtime
-      // throughput is better.
-      if (hardware === "h200" && modelSize === "big") {
-        flags.push("  --cuda-graph-max-bs 128");
-        flags.push("  --mem-fraction-static 0.9");
-      }
-      if (mode === "decode") {
-        // GB300 big PD decode is the most memory-pressured PD role: Pro 1.6T
-        // weights at tp=4 take ~224 GB/card on a 273 GB GB300; runtime needs
-        // headroom for DeepEP buffer + mooncake KV recv + CG private pool.
-        // Cookbook defaults (mem-frac 0.874, cg_max_bs 512, max-running 256)
-        // OOM during CG capture. mem-frac sweep at 0.83 / 0.87 / 0.89 / 0.91
-        // all pass static validation; 0.9 picked as the default — leaves
-        // ~14 GB / GPU post-CG headroom for mooncake transfer + activation
-        // peaks while giving ~1M-token KV pool.
-        if (isGB300 && modelSize === "big") {
-          flags.push("  --max-running-requests 128");
-          flags.push("  --mem-fraction-static 0.9");
-          flags.push("  --cuda-graph-max-bs 128");
-        } else {
-          flags.push("  --max-running-requests 256");
-        }
-      }
-      flags.push("  --host 0.0.0.0");
-      flags.push(`  --port ${port}`);
-
-      return `${envBlock}sglang serve \\\n${flags.join(" \\\n")}`;
+  const [sel, setSel] = useState(() => initialSelectionFromCells());
+  useEffect(() => {
+    const hydrate = () => {
+      const raw = window.location.hash.replace(/^#/, "");
+      if (!raw) return;
+      const params = new URLSearchParams(raw);
+      const initial = initialSelectionFromCells();
+      const parsed = { ...initial };
+      let touched = false;
+      params.forEach((value, key) => {
+        if (key in parsed) { parsed[key] = value; touched = true; }
+      });
+      if (!touched) return;
+      // Snap to a real cell if the URL named an impossible combination
+      // (stale share link, manual edit, catalog changes). The hash mirror
+      // useEffect below rewrites the URL to match the validated state.
+      setSel(validateSelection(config.cells, parsed));
     };
+    hydrate();
+    window.addEventListener("hashchange", hydrate);
+    return () => window.removeEventListener("hashchange", hydrate);
+  }, []);
+  useEffect(() => {
+    const target = "#" + new URLSearchParams(sel).toString();
+    if (window.location.hash !== target) {
+      window.history.replaceState(null, "", target);
+    }
+  }, [sel]);
 
-    const prefillHeader = multinode
-      ? `# --- Prefill role (port 30000) — multi-node, run on each of ${nnodes} nodes ---`
-      : "# --- Prefill role (port 30000) ---";
-    const decodeHeader = multinode
-      ? `# --- Decode role (port 30001) — multi-node, run on each of ${nnodes} nodes ---`
-      : "# --- Decode role (port 30001) ---";
+  const [modal, setModal] = useState(null); // 'curl' | 'env' | null
+  useEffect(() => {
+    if (modal === null) return;
+    const onKey = (e) => { if (e.key === "Escape") setModal(null); };
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [modal]);
 
-    const prefill = `${prefillHeader}\n${buildRole("prefill", 30000, 30335)}`;
-    const decode  = `${decodeHeader}\n${buildRole("decode",  30001, 30435)}`;
-    // Router addresses prefill / decode by their reachable hostnames / IPs.
-    // Substitute <prefill-host> / <decode-host> with the actual hosts before
-    // running. On a same-host deployment, both can be 127.0.0.1.
-    const router  = `# --- Router (port 8000) ---
-python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:30000 \\
-  --decode http://<decode-host>:30001 \\
-  --host 0.0.0.0 --port 8000 \\
-  --disable-circuit-breaker \\
-  --health-check-interval-secs 999999`;
+  const [copied, setCopied] = useState(false);
+  const [curlCopied, setCurlCopied] = useState(false);
+  const [envDraft, setEnvDraft] = useState(env);
+  useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
 
-    const full = `${prefill}\n\n${decode}\n\n${router}`;
-    const verifyKey = `${hardware}|${modelSize}|pd-disagg`;
-    if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
-    return VERIFIED_RECIPES.has(verifyKey)
-      ? full
-      : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(full)}`;
+  // ==========================================================================
+  // 7. Derived
+  // ==========================================================================
+  const s = makeStyles(isDark);
+  const cell = findCell(config.cells, sel);
+  const command = renderCommand(cell, sel, env);
+  const modelName = resolveModelName(sel);
+  const curlText = interpolate(config.curl || "", env, modelName);
+  const hwGroups = buildHardwareGroups();
+
+  const isEnabled = (dim, value) => isOptionAvailable(config.cells, sel, dim, value);
+
+  const handleSelect = (dim, value) => {
+    setSel((prev) => snapToValidCell(config.cells, prev, dim, value));
   };
 
-  // ---- styles ----
-  const containerStyle = { maxWidth: "900px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "4px" };
-  const cardStyle = {
-    padding: "8px 12px",
-    border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
-    borderLeft: `3px solid ${isDark ? "#E85D4D" : "#D45D44"}`,
-    borderRadius: "4px",
-    display: "flex",
-    alignItems: "center",
-    gap: "12px",
-    background: isDark ? "#1f2937" : "#fff",
+  const handleCopy = () => {
+    navigator.clipboard.writeText(command);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1200);
   };
-  const titleStyle = { fontSize: "13px", fontWeight: "600", minWidth: "140px", flexShrink: 0, color: isDark ? "#e5e7eb" : "inherit" };
-  const itemsStyle = { display: "flex", rowGap: "2px", columnGap: "6px", flexWrap: "wrap", alignItems: "center", flex: 1 };
-  const labelBaseStyle = {
-    padding: "4px 10px",
-    border: `1px solid ${isDark ? "#9ca3af" : "#d1d5db"}`,
-    borderRadius: "3px",
-    cursor: "pointer",
-    display: "inline-flex",
-    flexDirection: "column",
-    alignItems: "center",
-    justifyContent: "center",
-    fontWeight: "500",
-    fontSize: "13px",
-    transition: "all 0.2s",
-    userSelect: "none",
-    minWidth: "45px",
-    textAlign: "center",
-    flex: 1,
-    background: isDark ? "#374151" : "#fff",
-    color: isDark ? "#e5e7eb" : "inherit",
+  const copyCurl = () => {
+    navigator.clipboard.writeText(curlText);
+    setCurlCopied(true);
+    setTimeout(() => setCurlCopied(false), 1200);
   };
-  const checkedStyle = { background: "#D45D44", color: "white", borderColor: "#D45D44" };
-  const disabledStyle = { cursor: "not-allowed", opacity: 0.4 };
-  const subtitleStyle = { display: "block", fontSize: "9px", marginTop: "1px", lineHeight: "1.1", opacity: 0.7 };
-  const commandDisplayStyle = {
-    flex: 1,
-    padding: "12px 16px",
-    background: isDark ? "#111827" : "#f5f5f5",
-    borderRadius: "6px",
-    fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace",
-    fontSize: "12px",
-    lineHeight: "1.5",
-    color: isDark ? "#e5e7eb" : "#374151",
-    whiteSpace: "pre-wrap",
-    overflowX: "auto",
-    margin: 0,
-    border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
+
+  // Group placeholders by `target` for the Env modal.
+  const placeholderGroups = (() => {
+    const out = { command: [], curl: [] };
+    for (const [key, meta] of Object.entries(config.placeholders || {})) {
+      (out[meta.target] || (out[meta.target] = [])).push({ key, ...meta });
+    }
+    return out;
+  })();
+
+  // ==========================================================================
+  // 8. JSX render
+  // ==========================================================================
+  const renderButton = (item, dim, selectedId) => {
+    const checked = selectedId === item.id;
+    const disabled = !isEnabled(dim, item.id);
+    return (
+      <label
+        key={item.id}
+        style={{
+          ...s.labelBase,
+          ...(checked ? s.checked : {}),
+          ...(disabled ? s.disabled : {}),
+        }}
+        title={disabled ? "Not supported for current selection" : ""}
+        onClick={(e) => {
+          if (disabled) { e.preventDefault(); return; }
+          handleSelect(dim, item.id);
+        }}
+      >
+        <input type="radio" checked={checked} disabled={disabled} readOnly style={{ display: "none" }} />
+        <span>{item.label}</span>
+        {item.subtitle && (
+          <small style={{ ...s.subtitle, color: checked ? "rgba(255,255,255,0.85)" : "inherit" }}>
+            {item.subtitle}
+          </small>
+        )}
+      </label>
+    );
   };
+
+  const renderFlatSection = (title, options, dim, selectedId) => (
+    <div style={s.card}>
+      <div style={s.title}>{title}</div>
+      <div style={s.itemsGrid(options.length)}>
+        {options.map((item) => renderButton(item, dim, selectedId))}
+      </div>
+    </div>
+  );
+
+  const maxHwCols = Math.max(...hwGroups.map((x) => x.items.length));
 
   return (
-    <div style={containerStyle} className="not-prose">
-      {Object.entries(options).map(([key, option]) => {
-        const items = resolveItems(option, values);
-        return (
-          <div key={key} style={cardStyle}>
-            <div style={titleStyle}>{option.title}</div>
-            <div style={itemsStyle}>
-              {items.map((item) => {
-                const isChecked = values[option.name] === item.id;
-                const isDisabled = !!item.disabled;
-                return (
-                  <label
-                    key={item.id}
-                    style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}
-                    title={item.disabledReason || ""}
-                  >
-                    <input
-                      type="radio"
-                      name={option.name}
-                      value={item.id}
-                      checked={isChecked}
-                      disabled={isDisabled}
-                      onChange={() => !isDisabled && handleRadioChange(option.name, item.id)}
-                      style={{ display: "none" }}
-                    />
-                    {item.label}
-                    {item.subtitle && (
-                      <small style={{ ...subtitleStyle, color: isChecked ? "rgba(255,255,255,0.85)" : "inherit" }}>
-                        {item.subtitle}
-                      </small>
-                    )}
-                  </label>
-                );
-              })}
+    <div style={s.container} className="not-prose">
+      {/* Hardware section (2 vendor rows in one card, equal-width grid) */}
+      <div style={s.cardColumn}>
+        <div style={{ ...s.title, marginBottom: "2px" }}>Hardware Platform</div>
+        {hwGroups.map((g) => (
+          <div key={g.label} style={s.vendorRow}>
+            <div style={s.vendorLabel}>{g.label}</div>
+            <div style={s.itemsGrid(maxHwCols)}>
+              {g.items.map((item) => renderButton(item, "hw", sel.hw))}
+              {Array.from({ length: maxHwCols - g.items.length }).map((_, i) => (
+                <div key={`pad-${i}`} />
+              ))}
             </div>
           </div>
-        );
-      })}
-      <div style={cardStyle}>
-        <div style={titleStyle}>Run this Command:</div>
-        <pre style={commandDisplayStyle}>{generateCommand()}</pre>
+        ))}
       </div>
-      <div style={{ padding: "12px 16px", background: isDark ? "#1a2332" : "#f0f7ff", borderRadius: "6px", border: `1px solid ${isDark ? "#2d4a6f" : "#c8ddf5"}`, fontSize: "13px", lineHeight: "1.6", color: isDark ? "#c8ddf5" : "#1e3a5f" }}>
-        <strong style={{ display: "block", marginBottom: "6px" }}>Enabling MegaMoE</strong>
-        <p style={{ margin: "0" }}>
-          MegaMoE fuses expert dispatch + GEMM into a single kernel for higher throughput on MoE layers.
-          It is currently verified on B200/B300 Pro (balanced &amp; max-throughput recipes above).
-          We have not yet tested the full hardware/recipe matrix, but it should work on other platforms (GB200, GB300, Flash).
-          To enable it, add the flag and env vars:
-        </p>
-        <pre style={{ margin: "8px 0 0 0", padding: "8px 12px", background: isDark ? "#111827" : "#f5f5f5", borderRadius: "4px", fontSize: "12px", lineHeight: "1.5", overflowX: "auto" }}>{
-`# Add this flag to the sglang serve command:
---moe-a2a-backend megamoe
 
-# And set these env vars:
-SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320
-SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0`
-        }</pre>
-        <p style={{ margin: "6px 0 0 0", fontSize: "12px", opacity: 0.85, lineHeight: "1.8" }}>
-          Adjust <code>SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK</code> based on your chunked prefill size (e.g. 4096 for balanced, 8320 for max-throughput).<br/>
-          <code>SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0</code> — if your config mentions DeepEP dispatch buffer constraints, they do not apply when this is set to 0.<br/>
-          These flags are expected to be simplified in a future release.
-        </p>
+      {renderFlatSection("Model Variant", config.variants,        "variant",  sel.variant)}
+      {renderFlatSection("Quantization",  config.quantizations,   "quant",    sel.quant)}
+      {renderFlatSection("Strategy",      config.strategies,      "strategy", sel.strategy)}
+      {renderFlatSection("Nodes",         config.nodesOptions,    "nodes",    sel.nodes)}
+
+      {/* Command box */}
+      <div style={s.card}>
+        <div style={s.title}>Run this Command:</div>
+        <div style={s.commandWrap}>
+          <div style={s.commandHeader}>
+            <div style={s.badge(Boolean(cell && cell.verified))}>
+              <span style={s.badgeDot(Boolean(cell && cell.verified))} />
+              {cell && cell.verified ? "Verified" : "Auto-Estimated"}
+            </div>
+            <div style={s.iconRow}>
+              <button style={s.iconButton} onClick={handleCopy}>
+                {copied ? "✓ Copied" : "⧉ Copy"}
+              </button>
+              <button style={s.iconButton} onClick={() => setModal("curl")}>$ cURL</button>
+              <button style={s.iconButton} onClick={() => setModal("env")}>⚙ Env</button>
+            </div>
+          </div>
+          <pre style={s.commandPre}>{command}</pre>
+        </div>
       </div>
+
+      {/* cURL modal */}
+      {modal === "curl" && (
+        <div style={s.modalBackdrop} onClick={() => setModal(null)}>
+          <div style={s.modalBox} onClick={(e) => e.stopPropagation()}>
+            <div style={s.modalHeader}>
+              <div style={s.modalTitle}>cURL example</div>
+              <button style={s.modalCloseBtn} onClick={() => setModal(null)} aria-label="Close">×</button>
+            </div>
+            <div style={s.commandWrap}>
+              <div style={s.commandHeader}>
+                <div style={{ fontSize: 11, opacity: 0.7 }}>
+                  Model: <code>{modelName || "(unresolved)"}</code>
+                </div>
+                <button style={s.iconButton} onClick={copyCurl}>
+                  {curlCopied ? "✓ Copied" : "⧉ Copy"}
+                </button>
+              </div>
+              <pre style={s.commandPre}>{curlText}</pre>
+            </div>
+            <p style={{ fontSize: 11, opacity: 0.7, marginTop: 8 }}>
+              Edit <code>CURL_HOST</code> / <code>CURL_PORT</code> in the Env panel.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Env modal */}
+      {modal === "env" && (
+        <div style={s.modalBackdrop} onClick={() => setModal(null)}>
+          <div style={s.modalBox} onClick={(e) => e.stopPropagation()}>
+            <div style={s.modalHeader}>
+              <div style={s.modalTitle}>Env / placeholder values</div>
+              <button style={s.modalCloseBtn} onClick={() => setModal(null)} aria-label="Close">×</button>
+            </div>
+            {placeholderGroups.curl.length > 0 && (
+              <div>
+                <div style={s.sectionHeading}>cURL placeholders</div>
+                {placeholderGroups.curl.map(({ key, label }) => (
+                  <div key={key} style={s.formField}>
+                    <label style={s.formLabel}>
+                      {label} <code style={{ opacity: 0.6 }}>{`{{${key}}}`}</code>
+                    </label>
+                    <input
+                      style={s.formInput}
+                      value={envDraft[key] ?? ""}
+                      onChange={(e) => setEnvDraft({ ...envDraft, [key]: e.target.value })}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+            {placeholderGroups.command.length > 0 && (
+              <div>
+                <div style={s.sectionHeading}>Command placeholders</div>
+                {placeholderGroups.command.map(({ key, label }) => (
+                  <div key={key} style={s.formField}>
+                    <label style={s.formLabel}>
+                      {label} <code style={{ opacity: 0.6 }}>{`{{${key}}}`}</code>
+                    </label>
+                    <input
+                      style={s.formInput}
+                      value={envDraft[key] ?? ""}
+                      onChange={(e) => setEnvDraft({ ...envDraft, [key]: e.target.value })}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+              <button style={{ ...s.iconButton, padding: "6px 14px" }} onClick={() => setModal(null)}>Cancel</button>
+              <button style={s.primaryBtn} onClick={() => { saveEnv(envDraft); setModal(null); }}>Save</button>
+            </div>
+            <p style={{ fontSize: 11, opacity: 0.7, marginTop: 10 }}>
+              Values persist in localStorage and are reused the next time you visit any cookbook.
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
