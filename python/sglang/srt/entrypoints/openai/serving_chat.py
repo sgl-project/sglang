@@ -681,8 +681,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         return_dict=False,
                         **extra_template_kwargs,
                     )
-                except jinja2.TemplateError as template_error:
+                except (jinja2.TemplateError, TypeError) as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
+                    # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
 
