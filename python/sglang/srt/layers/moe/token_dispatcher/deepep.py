@@ -174,10 +174,7 @@ class DeepEPBuffer:
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
-            if param_bytes == 0:
-                hidden_bytes = hidden_size // 2
-            else:
-                hidden_bytes = hidden_size * param_bytes
+            hidden_bytes = hidden_size * param_bytes
             for config in (
                 DeepEPConfig.get_instance().normal_dispatch_config
                 or Buffer.get_dispatch_config(group.size()),
@@ -333,6 +330,7 @@ class _DeepEPDispatcherImplBase:
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
 
+        self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
@@ -384,12 +382,10 @@ class _DeepEPDispatcherImplBase:
         # Configuration mapping for each dtype
         config_map = {
             DeepEPOutputDtype.BF16: {
-                "params_bytes": 2,
                 "use_fp8": False,
                 "use_nvfp4": False,
             },
             DeepEPOutputDtype.FP8: {
-                "params_bytes": 1,
                 "use_fp8": True,
                 "use_nvfp4": False,
             },
@@ -397,12 +393,10 @@ class _DeepEPDispatcherImplBase:
             # despite the use_fp8 flag,
             # quantization will be performed in int8
             DeepEPOutputDtype.INT8: {
-                "params_bytes": 1,
                 "use_fp8": True,
                 "use_nvfp4": False,
             },
             DeepEPOutputDtype.NVFP4: {
-                "params_bytes": 0,
                 "use_fp8": False,
                 "use_nvfp4": True,
             },
@@ -413,12 +407,12 @@ class _DeepEPDispatcherImplBase:
 
         # Apply configuration
         config = config_map[self.deepep_output_dtype]
-        self.params_bytes = config["params_bytes"]
         self.use_fp8 = config["use_fp8"]
         self.use_nvfp4 = config["use_nvfp4"]
 
         # Handle environment variables
-        self._update_int8_quant_env()
+        if _is_npu:
+            self._update_int8_quant_env()
 
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
