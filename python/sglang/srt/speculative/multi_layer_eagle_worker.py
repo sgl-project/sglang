@@ -272,7 +272,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 self.draft_tp_context(self.mtp_model_runner(0).tp_group),
                 speculative_moe_backend_context(),
             ):
-                self.forward_draft_extend(
+                next_draft_input = self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
             return GenerationBatchResult(
@@ -280,6 +280,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 next_token_ids=next_token_ids,
                 num_correct_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
+                next_draft_input=next_draft_input,
             )
         else:
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
@@ -314,25 +315,50 @@ class MultiLayerEagleWorker(TpModelWorker):
                 self.draft_tp_context(self.mtp_model_runner(0).tp_group),
                 speculative_moe_backend_context(),
             ):
-                # NOTE: We should use `check_forward_draft_extend_after_decode`
-                # when DP attention is enabled, but it is slow. Skip it for now.
                 draft_extend_input = verify_output.draft_extend_input
+                next_draft_input = None
                 if (
                     self.server_args.enable_dp_attention
                     or draft_extend_input.input_ids.shape[0] > 0
                 ):
-                    # decode is not finished; install draft_extend_input for
-                    # the extend forward, then install the next-iter
-                    # EagleDraftInput it returns.
-                    batch.spec_info = draft_extend_input
-                    next_draft_input = self.forward_draft_extend_after_decode(batch)
-                    batch.spec_info = next_draft_input
+                    # decode is not finished. Install draft_extend_input as
+                    # batch.spec_info for the extend forward; the assembled
+                    # next-iter EagleDraftInput is returned via batch_result
+                    # and installed by the scheduler before the next draft.
+                    extend_batch = batch
+                    if (
+                        not batch.forward_mode.is_idle()
+                        and draft_extend_input.input_ids.shape[0] == 0
+                    ):
+                        # All reqs finished this verify (only reachable when
+                        # dp_attention forces the forward). Run the extend on
+                        # an idle batch copy + idle ExtendInput so the original
+                        # batch is not mutated.
+                        extend_batch = batch.copy()
+                        extend_batch.prepare_for_idle()
+                        draft_extend_capture_mode = (
+                            CaptureHiddenMode.NULL
+                            if self.speculative_algorithm.is_standalone()
+                            else CaptureHiddenMode.LAST
+                        )
+                        draft_extend_input = EagleDraftExtendInput.create_idle_input(
+                            device=self.device,
+                            hidden_size=EagleDraftExtendInput.hidden_size_for(self),
+                            dtype=EagleDraftExtendInput.dtype_for(self),
+                            capture_hidden_mode=draft_extend_capture_mode,
+                        )
+                    extend_batch.spec_info = draft_extend_input
+                    next_draft_input = self.forward_draft_extend_after_decode(
+                        extend_batch
+                    )
                 else:
-                    # All reqs finished and dp_attention isn't forcing extend.
-                    # Install an idle EagleDraftInput so next iter's scheduler
-                    # ops (merge_batch / filter_batch) see well-typed empty
-                    # tensors instead of None.
-                    self._draft_preprocess_idle(batch)
+                    # All reqs finished and dp_attention is not forcing the
+                    # forward. Use an empty EagleDraftInput so next iter's
+                    # merge_batch short-circuits on None hidden_states
+                    # (EagleVerifyInput has no merge_batch).
+                    next_draft_input = EagleDraftInput(
+                        capture_hidden_mode=CaptureHiddenMode.LAST,
+                    )
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
@@ -344,6 +370,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
                 num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
                 can_run_cuda_graph=verify_output.can_run_cuda_graph,
+                next_draft_input=next_draft_input,
             )
 
     def check_forward_draft_extend_after_decode(self, verify_output: EagleVerifyOutput):
@@ -663,67 +690,78 @@ class MultiLayerEagleWorker(TpModelWorker):
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        """Run draft model extend. This API modifies the states of the batch.
+    ) -> EagleDraftInput:
+        """Run draft model extend. Returns next-iter `EagleDraftInput`;
+        scheduler installs it on `batch.spec_info` via `batch_result.next_draft_input`.
 
-        Args:
-            batch: The batch to run.
-            hidden_states: Hidden states from the target model forward
-            next_token_ids: Next token ids generated from the target forward.
+        We mutate `batch.spec_info` transiently so the forward kernel can read
+        the draft input via `batch.get_model_worker_batch`, then restore on
+        return.
         """
-        batch.spec_info = EagleDraftInput(
+        next_draft_input = EagleDraftInput(
             hidden_states=hidden_states,
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
+        return_hidden_states_backup = batch.return_hidden_states
+        spec_info_backup = batch.spec_info
+
+        batch.spec_info = next_draft_input
         batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
+        next_draft_input.prepare_for_extend(batch)
         capture_mode = (
             CaptureHiddenMode.NULL
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
-        batch.spec_info.capture_hidden_mode = capture_mode
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=seq_lens_cpu
-        )
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.mtp_model_runner(0)
-        )
-        forward_batch.return_logprob = False
-        forward_batch.return_hidden_states_before_norm = True
-        topk_p_list = []
-        topk_index_list = []
-        for step in range(self.speculative_num_steps):
-            logits_output = (
-                self.mtp_model_runner(step).forward(forward_batch).logits_output
+        next_draft_input.capture_hidden_mode = capture_mode
+        try:
+            model_worker_batch = batch.get_model_worker_batch(
+                seq_lens_cpu_cache=seq_lens_cpu
             )
-            maybe_detect_nan(
-                logits_output.next_token_logits,
-                f"draft_extend_for_prefill step {step}",
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.mtp_model_runner(0)
             )
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            topk_p_list.append(topk_p)
-            topk_index_list.append(topk_index)
-            pt = 0
-            if forward_batch.extend_seq_lens is not None:
-                for i, extend_len in enumerate(forward_batch.extend_seq_lens):
-                    input_ids = forward_batch.input_ids[pt : pt + extend_len]
-                    forward_batch.input_ids[pt : pt + extend_len] = torch.cat(
-                        (input_ids[1:], topk_index[i].reshape(1))
-                    )
-                    pt += extend_len
+            forward_batch.return_logprob = False
+            forward_batch.return_hidden_states_before_norm = True
+            topk_p_list = []
+            topk_index_list = []
+            for step in range(self.speculative_num_steps):
+                logits_output = (
+                    self.mtp_model_runner(step).forward(forward_batch).logits_output
+                )
+                maybe_detect_nan(
+                    logits_output.next_token_logits,
+                    f"draft_extend_for_prefill step {step}",
+                )
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                topk_p_list.append(topk_p)
+                topk_index_list.append(topk_index)
+                pt = 0
+                if forward_batch.extend_seq_lens is not None:
+                    for i, extend_len in enumerate(forward_batch.extend_seq_lens):
+                        input_ids = forward_batch.input_ids[pt : pt + extend_len]
+                        forward_batch.input_ids[pt : pt + extend_len] = torch.cat(
+                            (input_ids[1:], topk_index[i].reshape(1))
+                        )
+                        pt += extend_len
 
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        assert forward_batch.spec_info is batch.spec_info
-        forward_batch.spec_info.topk_p = torch.cat(topk_p_list, dim=1)
-        forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
+            next_draft_input.topk_p = torch.cat(topk_p_list, dim=1)
+            next_draft_input.topk_index = torch.cat(topk_index_list, dim=1)
+        finally:
+            batch.spec_info = spec_info_backup
+            batch.return_hidden_states = return_hidden_states_backup
+
+        return next_draft_input
 
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch
     ) -> EagleDraftInput:
+        # Caller installs the EagleDraftExtendInput on `batch.spec_info`
+        # (using either the verify-produced one or an idle one for the
+        # all-finished + dp_attention edge case).
         draft_extend_input: EagleDraftExtendInput = batch.spec_info
 
         # Backup fields that will be modified in-place
@@ -739,19 +777,6 @@ class MultiLayerEagleWorker(TpModelWorker):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
-        if draft_extend_input.input_ids.shape[0] == 0:
-            # Single source for hidden_size via hidden_size_for(self) (incl.
-            # EAGLE-3 aux widening). Two stub origins from verify(): fully-idle
-            # batch and active batch with all reqs finished.
-            batch = batch.copy()
-            batch.prepare_for_idle()
-            draft_extend_input = EagleDraftExtendInput.create_idle_input(
-                device=self.device,
-                hidden_size=EagleDraftExtendInput.hidden_size_for(self),
-                dtype=EagleDraftExtendInput.dtype_for(self),
-                capture_hidden_mode=draft_extend_capture_mode,
-            )
-            batch.spec_info = draft_extend_input
 
         # Phase 1: prepare extend (kernel writes draft_extend_input.{positions, bonus_tokens})
         draft_extend_input.num_tokens_per_req = self.speculative_num_steps + 1
