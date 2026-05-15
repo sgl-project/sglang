@@ -1,0 +1,225 @@
+name: PR Test Extra
+# Label-gated CI for nightly-class tests opted into a per-PR run.
+#
+# Adds runtime to a PR only when the author asks for it: pull_request
+# events bail unless the PR carries the `run-ci-extra` label. The same job
+# graph runs unconditionally on workflow_dispatch / workflow_call so it
+# can be triggered manually or chained from another workflow.
+#
+# Stages: extra-a (1-/2-gpu) and extra-b (4-/8-gpu) caller stubs reuse
+# `_pr-test-stage.yml` and `_pr-test-check-changes.yml` from pr-test.yml.
+
+run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage)) || '' }}
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target_stage:
+        description: "Specific stage to run (optional, for quick testing)"
+        required: false
+        type: string
+        default: ""
+      force_continue_on_error:
+        description: "Force continue-on-error (test scheduled CI behavior)"
+        required: false
+        type: boolean
+        default: false
+      pr_head_sha:
+        description: "PR head SHA to checkout (for /rerun-stage on fork PRs)"
+        required: false
+        type: string
+        default: ""
+      include_wheel_build:
+        description: "When set with target_stage, also run sgl-kernel-build-wheels so the target stage uses the freshly-built kernel (for /rerun-stage on PRs that modify sgl-kernel/)"
+        required: false
+        type: boolean
+        default: false
+      test_parallel_dispatch:
+        description: "Test parallel dispatch behavior (simulates scheduled run)"
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      git_ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests (for releasing or testing purpose)"
+        required: false
+        type: boolean
+        default: false
+      skip_stage_health_check:
+        description: "Skip stage health check fast-fail (e.g. for release branch cuts)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: pr-test-extra-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.git_ref || 'all' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
+  FORCE_REBUILD_DEEPEP: '1'
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  USE_VENV: false
+
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  # =============================================== check changes ====================================================
+  # Label gate: pull_request events only proceed when the PR carries BOTH
+  # `run-ci` and `run-ci-extra` labels — `run-ci` is the basic-CI prerequisite
+  # (matching pr-test.yml's pr-gate `require-run-ci`) and `run-ci-extra` is the
+  # explicit opt-in to this workflow. Other event types
+  # (workflow_dispatch / workflow_call) always run. When this job is
+  # skipped by the gate, every downstream caller stub naturally skips
+  # because its needs do not resolve.
+  check-changes:
+    if: |
+      github.event_name != 'pull_request' ||
+      (
+        contains(github.event.pull_request.labels.*.name, 'run-ci') &&
+        contains(github.event.pull_request.labels.*.name, 'run-ci-extra')
+      )
+    uses: ./.github/workflows/_pr-test-check-changes.yml
+    with:
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      target_stage: ${{ inputs.target_stage || '' }}
+      include_wheel_build: ${{ inputs.include_wheel_build == true }}
+      run_all_tests: ${{ inputs.run_all_tests == true }}
+      force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
+      pr_test_yml: '.github/workflows/pr-test-extra.yml'
+    secrets: inherit
+
+  # =============================================== sgl-kernel ====================================================
+  sgl-kernel-build-wheels:
+    needs: check-changes
+    if: |
+      always() &&
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.sgl_kernel == 'true' &&
+      (!inputs.target_stage || inputs.include_wheel_build)
+    uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
+    with:
+      runs_on: x64-kernel-build-node
+      job_display_name: Build Wheel
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
+    secrets: inherit
+
+  # =============================================== extra-a (1-/2-gpu) ===============================================
+  extra-a-test-1-gpu-small:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: extra-a-test-1-gpu-small
+      runner_config: 1-gpu-small
+      runs_on: 1-gpu-5090
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '60'
+    secrets: inherit
+
+  extra-a-test-1-gpu-large:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: extra-a-test-1-gpu-large
+      runner_config: 1-gpu-large
+      runs_on: 1-gpu-h100
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '60'
+      timeout_per_file: '1800'
+    secrets: inherit
+
+  extra-a-test-2-gpu-large:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: extra-a-test-2-gpu-large
+      runner_config: 2-gpu-large
+      runs_on: 2-gpu-h100
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '60'
+    secrets: inherit
+
+  # =============================================== extra-b (4-/8-gpu) ===============================================
+  extra-b-test-4-gpu-h100:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: extra-b-test-4-gpu-h100
+      runner_config: 4-gpu-h100
+      runs_on: 4-gpu-h100
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '60'
+    secrets: inherit
+
+  extra-b-test-4-gpu-b200:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: extra-b-test-4-gpu-b200
+      runner_config: 4-gpu-b200
+      runs_on: ${{ needs.check-changes.outputs.b200_runner }}
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '60'
+      timeout_per_file: '1800'
+    secrets: inherit
+
+  extra-b-test-8-gpu-h200:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: extra-b-test-8-gpu-h200
+      runner_config: 8-gpu-h200
+      runs_on: 8-gpu-h200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '60'
+    secrets: inherit
+
+  extra-b-test-deepep-8-gpu-h200:
+    needs: [check-changes, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: extra-b-test-deepep-8-gpu-h200
+      runner_config: deepep-8-gpu-h200
+      runs_on: 8-gpu-h200-deepep
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '60'
+    secrets: inherit
