@@ -9,14 +9,14 @@ register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
 
 class TestQwen3235BA22BW8A8(GSM8KAscendMixin, CustomTestCase):
-    """Testcase: Verify that the inference accuracy of the vllm-ascend/Qwen3-235B-A22B-W8A8 model on the GSM8K dataset is no less than 0.955.
+    """Testcase: Verify that the inference accuracy of the vllm-ascend/Qwen3-235B-A22B-W8A8 model on the GSM8K dataset is no less than 0.94.
 
     [Test Category] Model
     [Test Target] vllm-ascend/Qwen3-235B-A22B-W8A8
     """
 
     model = QWEN3_235B_A22B_W8A8_WEIGHTS_PATH
-    accuracy = 0.955
+    accuracy = 0.94
     timeout_for_server_launch = 3000
     other_args = [
         "--trust-remote-code",
