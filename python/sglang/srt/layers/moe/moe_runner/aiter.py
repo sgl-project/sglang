@@ -189,8 +189,12 @@ def pre_permute_standard_to_aiter(
 
 
 def _is_mori_dispatch_output(dispatch_output: Any) -> bool:
-    # MoriEP{Normal,LL}DispatchOutput carry the post-mori-permute origin_topk_*
-    # tensors that the standard DeepEP outputs lack.
+    # MoriEP{Normal,LL}DispatchOutput reuse DispatchOutputFormat.DEEPEP_NORMAL/LL
+    # so format-based dispatch cannot distinguish them from DeepEP outputs.
+    # The structural presence of origin_topk_ids (the post-mori-permute ids
+    # that the combine step needs) is the only available signal.
+    # If a future DeepEP output ever gains this field this check must be revised
+    # (e.g. by introducing MORI_NORMAL / MORI_LL format enum values).
     return hasattr(dispatch_output, "origin_topk_ids")
 
 
