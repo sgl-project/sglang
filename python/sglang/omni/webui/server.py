@@ -71,6 +71,8 @@ class U1OmniUIHandler(BaseHTTPRequestHandler):
             or "application/octet-stream",
         )
         self.send_header("content-length", str(len(data)))
+        if content_type and "text/html" in content_type:
+            self.send_header("cache-control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 

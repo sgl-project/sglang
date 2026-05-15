@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
 import json
 import unittest
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from sglang.omni.core.coordinator import OmniCoordinator
 from sglang.omni.core.protocol import (
@@ -43,6 +45,14 @@ class _ScriptedARBackend:
 class _ImageBackend:
     def generate_segment(self, request, context_ops):
         return GeneratedSegment(type="image", image={"b64_json": "abc"})
+
+
+class _PILImageBackend:
+    def generate_segment(self, request, context_ops):
+        return GeneratedSegment(
+            type="image",
+            image=Image.new("RGB", (4, 4), (12, 34, 56)),
+        )
 
 
 class TestOmniHttp(unittest.TestCase):
@@ -104,6 +114,39 @@ class TestOmniHttp(unittest.TestCase):
             [event["type"] for event in events],
         )
         self.assertEqual("before", events[0]["delta"])
+
+    def test_generate_endpoint_streams_serialized_png_image(self):
+        app = create_app(
+            coordinator=OmniCoordinator(
+                _ScriptedARBackend(
+                    [
+                        OmniBoundary(type="image"),
+                        OmniBoundary(type="done"),
+                    ]
+                ),
+                _PILImageBackend(),
+            )
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/omni/generate",
+            json={
+                "stream": True,
+                "messages": [{"type": "text", "text": "draw"}],
+            },
+        )
+
+        self.assertEqual(200, response.status_code)
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        image_event = next(event for event in events if event["type"] == "image")
+        raw = base64.b64decode(image_event["image"]["b64_json"], validate=True)
+        self.assertEqual("image/png", image_event["image"]["mime_type"])
+        self.assertEqual(b"\x89PNG\r\n\x1a\n", raw[:8])
 
 
 if __name__ == "__main__":

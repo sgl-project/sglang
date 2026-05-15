@@ -12,7 +12,11 @@ from dataclasses import dataclass, field
 from threading import BoundedSemaphore
 from typing import TYPE_CHECKING, Any, Callable
 
-from sglang.omni.core.interleaved import STREAMED_TEXT_METADATA_KEY
+from sglang.omni.core.interleaved import (
+    STREAMED_TEXT_METADATA_KEY,
+    TEXT_ROLE_METADATA_KEY,
+    TEXT_ROLE_THINK,
+)
 from sglang.omni.core.protocol import (
     ARBackend,
     ContextOps,
@@ -113,6 +117,18 @@ class OmniCoordinator:
                     break
 
                 if boundary.type == "text":
+                    is_think_text = (
+                        boundary.metadata.get(TEXT_ROLE_METADATA_KEY)
+                        == TEXT_ROLE_THINK
+                    )
+                    if is_think_text:
+                        # 1. think text may have already streamed; it is not user-visible answer text
+                        if (
+                            stream_sink is not None
+                            and boundary.metadata.get(STREAMED_TEXT_METADATA_KEY)
+                        ):
+                            stream_sink.finish_text()
+                        continue
                     if num_text_segments >= request.max_text_segments:
                         break
                     if stream_sink is not None:
@@ -177,6 +193,12 @@ class OmniCoordinator:
                     generated_segment,
                     request=request,
                 )
+                if (
+                    num_image_segments >= request.max_images
+                    and request.max_text_segments == 0
+                ):
+                    # 1. do not run an extra AR probe when the caller disabled post-image text
+                    break
 
         finally:
             if release_context:

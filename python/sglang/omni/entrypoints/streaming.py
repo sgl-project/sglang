@@ -20,17 +20,22 @@ class OmniStreamSink:
         self._emit = emit
         self._next_segment_index = 0
         self._active_text_segment_id: str | None = None
+        self._active_text_metadata: dict[str, Any] | None = None
 
     def text_delta(
         self,
         delta: str,
         *,
         token_id: int | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         if not delta:
             return
         if self._active_text_segment_id is None:
             self._active_text_segment_id = self._new_segment_id()
+            self._active_text_metadata = dict(metadata or {})
+        elif metadata:
+            self._active_text_metadata = dict(metadata)
         event: dict[str, Any] = {
             "type": "text_delta",
             "segment_id": self._active_text_segment_id,
@@ -38,24 +43,33 @@ class OmniStreamSink:
         }
         if token_id is not None:
             event["token_id"] = int(token_id)
+        if self._active_text_metadata:
+            event["metadata"] = dict(self._active_text_metadata)
         self._emit(event)
 
-    def text_segment(self, text: str) -> None:
+    def text_segment(
+        self,
+        text: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         if not text:
             return
-        self.text_delta(text)
+        self.text_delta(text, metadata=metadata)
         self.finish_text()
 
     def finish_text(self) -> None:
         if self._active_text_segment_id is None:
             return
-        self._emit(
-            {
-                "type": "text_end",
-                "segment_id": self._active_text_segment_id,
-            }
-        )
+        event: dict[str, Any] = {
+            "type": "text_end",
+            "segment_id": self._active_text_segment_id,
+        }
+        if self._active_text_metadata:
+            event["metadata"] = dict(self._active_text_metadata)
+        self._emit(event)
         self._active_text_segment_id = None
+        self._active_text_metadata = None
 
     def begin_image(self) -> str:
         self.finish_text()

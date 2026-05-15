@@ -5,7 +5,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from sglang.omni.core.interleaved import STREAMED_TEXT_METADATA_KEY
+from sglang.omni.core.interleaved import (
+    STREAMED_TEXT_METADATA_KEY,
+    TEXT_ROLE_METADATA_KEY,
+    TEXT_ROLE_THINK,
+)
 from sglang.omni.core.protocol import GeneratedSegment
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
@@ -77,7 +81,7 @@ class SRTBackedOmniSessionAdapter:
                 session = thinking.session
                 if thinking.text:
                     metadata: dict[str, Any] = {
-                        "role": "think",
+                        TEXT_ROLE_METADATA_KEY: TEXT_ROLE_THINK,
                         "token_ids": [
                             int(token_id) for token_id in thinking.next_token_ids
                         ],

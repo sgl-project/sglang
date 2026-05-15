@@ -658,6 +658,7 @@
     let sessionId = "";
     let turnIndex = 0;
     let lastImagePayload = null;
+    const activeImageObjectUrls = new Set();
 
     const prompts = {
       turn1: "Create one clean studio image of a matte cobalt-blue cube centered on a white tabletop, with a plain light-gray background. After the image, describe the cube color and table in one short sentence.",
@@ -710,6 +711,19 @@
       $("statusText").textContent = text;
       $("statusDot").classList.toggle("ok", ok);
     }
+
+    function releaseImageObjectUrl(objectUrl) {
+      if (!objectUrl || !activeImageObjectUrls.has(objectUrl)) return;
+      URL.revokeObjectURL(objectUrl);
+      activeImageObjectUrls.delete(objectUrl);
+    }
+
+    window.addEventListener("pagehide", () => {
+      for (const objectUrl of activeImageObjectUrls) {
+        URL.revokeObjectURL(objectUrl);
+      }
+      activeImageObjectUrls.clear();
+    });
 
     async function loadConfig() {
       try {
@@ -778,7 +792,8 @@
         nodes.push(makeEl("div", "error", error));
       } else {
         for (const segment of data.segments || []) {
-          nodes.push(renderSegment(segment));
+          const rendered = renderSegment(segment);
+          if (rendered) nodes.push(rendered);
         }
         const raw = makeEl("pre", "raw", JSON.stringify({
           session: data.session || null,
@@ -826,6 +841,9 @@
     }
 
     function renderSegment(segment) {
+      if (segment?.metadata?.role === "think") {
+        return null;
+      }
       const wrap = makeEl("div", "segment");
       wrap.appendChild(makeEl("span", "tag", segment.type || "unknown"));
       if (segment.type === "text") {
@@ -850,6 +868,42 @@
       };
     }
 
+    function imagePayloadToSource(image) {
+      if (image?.url) {
+        return {src: image.url, fallbackSrc: "", objectUrl: null};
+      }
+      let b64Json = image?.b64_json || image?.base64 || "";
+      if (!b64Json) {
+        return {src: "", fallbackSrc: "", objectUrl: null};
+      }
+      let mimeType = image.mime_type || "image/png";
+      const dataUrlMatch = /^data:([^;,]+)?;base64,/.exec(b64Json);
+      if (dataUrlMatch) {
+        mimeType = dataUrlMatch[1] || mimeType;
+        b64Json = b64Json.slice(dataUrlMatch[0].length);
+      }
+      b64Json = String(b64Json || "").replace(/\s/g, "");
+      const dataUrl = `data:${mimeType};base64,${b64Json}`;
+      const blob = base64ToBlob(b64Json, mimeType);
+      const objectUrl = URL.createObjectURL(blob);
+      activeImageObjectUrls.add(objectUrl);
+      return {src: dataUrl, fallbackSrc: objectUrl, objectUrl};
+    }
+
+    function base64ToBlob(b64Json, mimeType) {
+      const binary = atob(String(b64Json || ""));
+      const chunks = [];
+      for (let offset = 0; offset < binary.length; offset += 8192) {
+        const slice = binary.slice(offset, offset + 8192);
+        const bytes = new Uint8Array(slice.length);
+        for (let index = 0; index < slice.length; index += 1) {
+          bytes[index] = slice.charCodeAt(index);
+        }
+        chunks.push(bytes);
+      }
+      return new Blob(chunks, {type: mimeType || "image/png"});
+    }
+
     function previousImageSegment() {
       if (!lastImagePayload) return null;
       return {
@@ -862,8 +916,36 @@
       const img = document.createElement("img");
       img.className = "image";
       img.alt = "generated image";
-      img.src = image.url ||
-        `data:${image.mime_type || "image/png"};base64,${image.b64_json || ""}`;
+      try {
+        const source = imagePayloadToSource(image || {});
+        if (source.objectUrl) {
+          img.dataset.objectUrl = source.objectUrl;
+        }
+        if (source.fallbackSrc) {
+          img.dataset.fallbackSrc = source.fallbackSrc;
+        }
+        img.src = source.src;
+      } catch (error) {
+        return makeEl("div", "error", `Image render failed: ${error.message}`);
+      }
+      img.addEventListener("load", () => {
+        const objectUrl = img.dataset.objectUrl;
+        if (objectUrl && img.currentSrc !== objectUrl) {
+          releaseImageObjectUrl(objectUrl);
+          delete img.dataset.objectUrl;
+        }
+      });
+      img.addEventListener("error", () => {
+        const fallbackSrc = img.dataset.fallbackSrc;
+        if (fallbackSrc && img.src !== fallbackSrc) {
+          delete img.dataset.fallbackSrc;
+          img.src = fallbackSrc;
+          return;
+        }
+        const objectUrl = img.dataset.objectUrl;
+        releaseImageObjectUrl(objectUrl);
+        img.replaceWith(makeEl("div", "error", "Image load failed"));
+      });
       return img;
     }
 
@@ -918,7 +1000,16 @@
 
     function handleStreamEvent(pending, event) {
       if (event.type === "text_delta") {
-        const entry = getLiveSegment(pending, event.segment_id || "seg-text", "text");
+        const role = event.metadata?.role || "";
+        if (role === "think") {
+          setPendingStatus(pending, "Thinking");
+          return;
+        }
+        const entry = getLiveSegment(
+          pending,
+          event.segment_id || "seg-text",
+          "text"
+        );
         entry.content.textContent += event.delta || "";
         setPendingStatus(pending, "Writing");
       } else if (event.type === "text_end") {
@@ -1002,7 +1093,7 @@
           t_eps: 0.02
         },
         max_images: 1,
-        max_text_segments: 3
+        max_text_segments: task === "interleave" ? 3 : 0
       };
 
       if (task === "interleave" && sessionId) {

@@ -18,6 +18,7 @@ from sglang.omni.core.interleaved import (
     INTERLEAVED_BOUNDARY_MODALITY_KEY,
     INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
     STREAMED_TEXT_METADATA_KEY,
+    TEXT_ROLE_METADATA_KEY,
 )
 from sglang.omni.core.protocol import (
     ARBackend,
@@ -439,9 +440,12 @@ def _pre_image_segments_to_boundaries(
             boundaries.append(_pre_image_segment_to_boundary(segment))
             continue
         boundary = _pre_image_segment_to_boundary(segment)
-        if text_parts and text_metadata.get(
-            STREAMED_TEXT_METADATA_KEY
-        ) != boundary.metadata.get(STREAMED_TEXT_METADATA_KEY):
+        if text_parts and (
+            text_metadata.get(STREAMED_TEXT_METADATA_KEY)
+            != boundary.metadata.get(STREAMED_TEXT_METADATA_KEY)
+            or text_metadata.get(TEXT_ROLE_METADATA_KEY)
+            != boundary.metadata.get(TEXT_ROLE_METADATA_KEY)
+        ):
             flush_text()
         text_parts.append(boundary.text or "")
         text_token_ids.extend(int(token_id) for token_id in boundary.token_ids)

@@ -12,6 +12,8 @@ from sglang.omni.core.interleaved import (
     INTERLEAVED_BOUNDARY_POSITION_ID_KEY,
     INTERLEAVED_BOUNDARY_TOKEN_ID_KEY,
     INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
+    TEXT_ROLE_METADATA_KEY,
+    TEXT_ROLE_THINK,
 )
 from sglang.omni.model_adapters.sensenova_u1.context import (
     U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
@@ -265,6 +267,10 @@ class TestSenseNovaU1Context(unittest.TestCase):
 
         self.assertTrue(result.streamed_text)
         self.assertEqual(["42", "124"], stream_sink.deltas)
+        self.assertEqual(
+            [{TEXT_ROLE_METADATA_KEY: TEXT_ROLE_THINK}] * 2,
+            stream_sink.metadata,
+        )
         self.assertEqual([10, 10, 123], runtime.appended_token_ids)
 
     def test_load_native_image_accepts_data_url(self):
@@ -541,9 +547,11 @@ class _NativeThinkRuntime:
 class _TextDeltaSink:
     def __init__(self):
         self.deltas = []
+        self.metadata = []
 
-    def text_delta(self, delta, *, token_id=None):
+    def text_delta(self, delta, *, token_id=None, metadata=None):
         self.deltas.append(delta)
+        self.metadata.append(metadata)
 
 
 if __name__ == "__main__":

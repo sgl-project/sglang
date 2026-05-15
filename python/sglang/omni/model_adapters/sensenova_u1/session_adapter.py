@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any
 from sglang.omni.core.interleaved import (
     INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
     STREAMED_TEXT_METADATA_KEY,
+    TEXT_ROLE_METADATA_KEY,
+    TEXT_ROLE_THINK,
     ar_appended_token_positions,
     ar_output_position,
     build_generation_boundary_metadata,
@@ -412,6 +414,13 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                     session=session,
                 )
                 if generated_text_ids:
+                    metadata = (
+                        {STREAMED_TEXT_METADATA_KEY: True}
+                        if stream_sink is not None
+                        else {}
+                    )
+                    if self.native_interleave_think_mode:
+                        metadata[TEXT_ROLE_METADATA_KEY] = TEXT_ROLE_THINK
                     return OmniDecodeResult(
                         type="text",
                         text=_u1_decode_token_ids(
@@ -419,11 +428,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                             generated_text_ids,
                         ),
                         token_ids=tuple(generated_text_ids),
-                        metadata=(
-                            {STREAMED_TEXT_METADATA_KEY: True}
-                            if stream_sink is not None
-                            else {}
-                        ),
+                        metadata=metadata,
                     )
                 return OmniDecodeResult(
                     type="image_marker",
@@ -471,7 +476,10 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                     else current_text
                 )
                 streamed_text = current_text
-                stream_sink.text_delta(delta, token_id=token_id)
+                metadata = None
+                if self.native_interleave_think_mode:
+                    metadata = {TEXT_ROLE_METADATA_KEY: TEXT_ROLE_THINK}
+                stream_sink.text_delta(delta, token_id=token_id, metadata=metadata)
 
         self._merge_runtime_u1_state(
             runtime,
@@ -634,7 +642,11 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                 )
                 streamed_text = current_text
                 # 2. t2i/edit think text is decoded before the image boundary reaches coordinator
-                stream_sink.text_delta(delta, token_id=token_id)
+                stream_sink.text_delta(
+                    delta,
+                    token_id=token_id,
+                    metadata={TEXT_ROLE_METADATA_KEY: TEXT_ROLE_THINK},
+                )
             if token_id == think_end_token_id:
                 break
 

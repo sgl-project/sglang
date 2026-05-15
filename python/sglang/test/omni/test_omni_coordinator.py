@@ -9,6 +9,7 @@ from threading import Lock
 from typing import Any
 
 from sglang.omni.core.coordinator import OmniCoordinator
+from sglang.omni.core.interleaved import TEXT_ROLE_METADATA_KEY, TEXT_ROLE_THINK
 from sglang.omni.core.protocol import (
     GeneratedSegment,
     OmniBoundary,
@@ -234,6 +235,30 @@ class TestOmniCoordinator(unittest.TestCase):
                 future.result()
 
         self.assertEqual(1, gen_backend.max_active)
+
+    def test_think_text_does_not_count_against_user_visible_text_limit(self):
+        ar_backend = _ScriptedARBackend(
+            [
+                OmniBoundary(
+                    type="text",
+                    text="internal prompt",
+                    metadata={TEXT_ROLE_METADATA_KEY: TEXT_ROLE_THINK},
+                ),
+                OmniBoundary(type="image"),
+                OmniBoundary(type="done"),
+            ]
+        )
+        gen_backend = _ImageBackend()
+        coordinator = OmniCoordinator(ar_backend, gen_backend)
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="draw"),),
+            max_text_segments=0,
+        )
+
+        response = coordinator.generate(request)
+
+        self.assertEqual(["image"], [segment.type for segment in response.segments])
+        self.assertEqual(1, gen_backend.calls)
 
 
 if __name__ == "__main__":

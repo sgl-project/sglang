@@ -19,6 +19,8 @@ INTERLEAVED_BOUNDARY_POSITION_ID_KEY = "boundary_position_id"
 INTERLEAVED_GENERATION_TOKEN_COUNT_KEY = "generation_token_count"
 INTERLEAVED_GENERATION_TOKEN_COUNT_SOURCE_KEY = "generation_token_count_source"
 STREAMED_TEXT_METADATA_KEY = "_omni_streamed_text"
+TEXT_ROLE_METADATA_KEY = "role"
+TEXT_ROLE_THINK = "think"
 
 
 def get_ar_decode_input_position(next_output_position: int) -> int:
