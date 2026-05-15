@@ -31,6 +31,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
@@ -280,13 +282,32 @@ class MultiLayerEagleWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
+            set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
+
             with (
                 self.draft_tp_context(self.mtp_model_runner(0).tp_group),
                 speculative_moe_backend_context(),
             ):
                 verify_input = self.draft(batch)
+
+            set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
+            set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
+
             batch.spec_info = verify_input
             logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
+
+            if get_global_tracing_enabled():
+                for idx, req in enumerate(batch.reqs):
+                    num_correct_drafts = verify_output.num_correct_drafts_per_req_cpu[
+                        idx
+                    ]
+                    req.time_stats.set_spec_verify_end_time(
+                        num_correct_drafts=num_correct_drafts
+                    )
+
+            set_time_batch(
+                batch.reqs, "set_spec_draft_extend_start_time", trace_only=True
+            )
 
             with (
                 self.draft_tp_context(self.mtp_model_runner(0).tp_group),
@@ -311,10 +332,15 @@ class MultiLayerEagleWorker(TpModelWorker):
                     # tensors instead of None.
                     self._draft_preprocess_idle(batch)
 
+            set_time_batch(
+                batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
+            )
+
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=verify_output.accept_tokens,
                 num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
+                num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 

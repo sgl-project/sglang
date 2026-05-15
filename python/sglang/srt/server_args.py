@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import glob
 import importlib
 import importlib.util
 import json
@@ -158,6 +159,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flashinfer",
     "flashmla",
     "trtllm_mla",
+    "tokenspeed_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
     # AMD specific
@@ -378,6 +380,7 @@ class ServerArgs:
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
+    model_config_parser: str = "auto"
 
     # HTTP server
     host: str = "127.0.0.1"
@@ -634,6 +637,7 @@ class ServerArgs:
     elastic_ep_backend: Literal[None, "mooncake", "nixl"] = None
     enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
+    enable_deepep_waterfill: bool = False
     elastic_ep_rejoin: bool = False
 
     # Mamba cache
@@ -1841,8 +1845,25 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    self.page_size = 64
-                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                    # Deferred import to avoid a circular import at module-load
+                    # time (nsa.utils imports get_global_server_args).
+                    from sglang.srt.layers.attention.nsa.utils import (
+                        aiter_can_use_preshuffle_paged_mqa,
+                    )
+
+                    if is_hip() and not aiter_can_use_preshuffle_paged_mqa():
+                        # Legacy ROCm NSA path: aiter's gluon paged-MQA kernel is
+                        # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
+                        # not set, or SGLANG_NSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
+                        self.page_size = 1
+                        logger.warning(
+                            "Setting page size to 1 for DeepSeek DSA on ROCm "
+                            "(aiter preshuffle paged-MQA path unavailable: "
+                            "needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1)."
+                        )
+                    else:
+                        self.page_size = 64
+                        logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     import torch
 
@@ -2702,6 +2723,25 @@ class ServerArgs:
                 )
 
         if (
+            self.attention_backend == "tokenspeed_mla"
+            or self.decode_attention_backend == "tokenspeed_mla"
+        ):
+            if not is_blackwell_supported():
+                raise ValueError(
+                    "tokenspeed_mla backend is only supported on Blackwell GPUs (SM100/SM12x)."
+                )
+            if self.page_size not in [32, 64]:
+                logger.warning(
+                    f"tokenspeed_mla only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
+                )
+                self.page_size = 64
+            if self.kv_cache_dtype not in ["fp8_e4m3"]:
+                raise ValueError(
+                    "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3, "
+                    f"got {self.kv_cache_dtype}."
+                )
+
+        if (
             self.attention_backend == "trtllm_mha"
             or self.decode_attention_backend == "trtllm_mha"
             or self.prefill_attention_backend == "trtllm_mha"
@@ -3138,6 +3178,13 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
+        if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
+            logger.warning(
+                "moe_a2a_backend is overridden to 'deepep' because DeepEP "
+                "Waterfill requires the DeepEP backend."
+            )
+            self.moe_a2a_backend = "deepep"
+
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
@@ -3146,6 +3193,16 @@ class ServerArgs:
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+            if self.enable_deepep_waterfill:
+                if self.disable_shared_experts_fusion:
+                    logger.warning(
+                        "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
+                    )
+                    self.disable_shared_experts_fusion = False
+                self.enforce_shared_experts_fusion = True
+                logger.info(
+                    "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
+                )
 
         if self.moe_a2a_backend == "mooncake":
             self.ep_size = self.tp_size
@@ -3899,44 +3956,60 @@ class ServerArgs:
             )
 
     def _is_mistral_native_format(self) -> bool:
-        """Detect if the model uses Mistral native format (params.json + consolidated weights).
+        """True iff the checkpoint requires load_format=mistral.
 
-        When both params.json and config.json exist, default to HF format to
-        avoid weight-name mismatches (e.g. Mistral-7B-Instruct-v0.3).
+        Looks for ``consolidated*.safetensors`` with no competing
+        ``model-*.safetensors``; when both weight formats ship in the
+        same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
+        preferred to avoid loading Mistral-named weights into an
+        HF-named architecture.
 
-        Exception: models routed through ``_load_mistral_large_3_for_causal_LM``
-        (mistral-large-3, mistral-small-4, leanstral) build their config from
-        params.json and expect native weight names, so native format is required
-        even when config.json is also present.
+        Name override: ``mistral-large-3`` / ``mistral-small-4`` /
+        ``leanstral`` always treat as Mistral-native when ``params.json``
+        is present -- those families need Mistral weight loading
+        regardless of which weight files happen to be present.
         """
-        # Keep in sync with the name checks in
-        # hf_transformers_utils.py::get_config / get_tokenizer.
-        _MISTRAL_NATIVE_CONFIG_PATTERNS = (
+        _MISTRAL_NATIVE_PATTERNS = (
             "mistral-large-3",
             "mistral-small-4",
             "leanstral",
         )
+        name_matches = any(
+            p in str(self.model_path).lower() for p in _MISTRAL_NATIVE_PATTERNS
+        )
 
-        def _check_format(has_params: bool, has_hf_config: bool) -> bool:
-            if has_params and not has_hf_config:
+        def _check_format(has_params, has_consolidated, has_hf_weights) -> bool:
+            if has_params and name_matches:
                 return True
-            if has_params and has_hf_config:
-                model_lower = str(self.model_path).lower()
-                if any(name in model_lower for name in _MISTRAL_NATIVE_CONFIG_PATTERNS):
-                    return True
-            return False
+            return has_consolidated and not has_hf_weights
 
         if os.path.isdir(self.model_path):
-            has_params = os.path.exists(os.path.join(self.model_path, "params.json"))
-            has_hf_config = os.path.exists(os.path.join(self.model_path, "config.json"))
-            return _check_format(has_params, has_hf_config)
+            return _check_format(
+                has_params=os.path.exists(os.path.join(self.model_path, "params.json")),
+                has_consolidated=bool(
+                    glob.glob(
+                        os.path.join(self.model_path, "consolidated*.safetensors")
+                    )
+                ),
+                has_hf_weights=bool(
+                    glob.glob(os.path.join(self.model_path, "model-*.safetensors"))
+                ),
+            )
 
-        # For hub models, check remote files
         try:
             from huggingface_hub import HfApi
 
             files = {s.rfilename for s in HfApi().model_info(self.model_path).siblings}
-            return _check_format("params.json" in files, "config.json" in files)
+            return _check_format(
+                has_params="params.json" in files,
+                has_consolidated=any(
+                    f.startswith("consolidated") and f.endswith(".safetensors")
+                    for f in files
+                ),
+                has_hf_weights=any(
+                    f.startswith("model-") and f.endswith(".safetensors") for f in files
+                ),
+            )
         except Exception:
             return False
 
@@ -4166,6 +4239,15 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
+        # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
+        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
+            if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                logger.warning(
+                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm100+ (Blackwell), "
+                    "detected sm%d.",
+                    get_device_sm(),
+                )
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
@@ -4542,6 +4624,15 @@ class ServerArgs:
             '* "transformers" will use the Transformers model '
             '* "mindspore" will use the MindSpore model '
             "implementation.\n",
+        )
+        parser.add_argument(
+            "--model-config-parser",
+            type=str,
+            default=ServerArgs.model_config_parser,
+            help='Which model-config parser to use. "auto" picks "mistral" '
+            'via the is_mistral_model name heuristic, else "hf" '
+            "(AutoConfig over config.json). Plugins can register additional "
+            "parsers via @register_model_config_parser.",
         )
 
         # HTTP server
@@ -6021,6 +6112,18 @@ class ServerArgs:
             "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
         parser.add_argument(
+            "--enable-deepep-waterfill",
+            action="store_true",
+            default=ServerArgs.enable_deepep_waterfill,
+            help="Enable DeepEP Waterfill: dispatch the shared expert as the 9th "
+            "routed expert to the least-loaded EP rank. Automatically sets "
+            "--moe-a2a-backend deepep, implicitly enables shared-expert fusion, "
+            "and supports --deepep-mode auto, normal, or low_latency. Use auto "
+            "or low_latency for production decode so CUDA graph remains enabled. "
+            "Supported on DeepSeek-V3/R1 "
+            "with EP >= 2.",
+        )
+        parser.add_argument(
             "--elastic-ep-rejoin",
             action="store_true",
             default=ServerArgs.elastic_ep_rejoin,
@@ -6567,7 +6670,12 @@ class ServerArgs:
         parser.add_argument(
             "--disable-shared-experts-fusion",
             action="store_true",
-            help="Disable shared experts fusion optimization for deepseek v3/r1.",
+            help=(
+                "Disable the built-in shared experts fusion optimization for DeepSeek V3/R1. "
+                "Note: DeepEP Waterfill (--enable-deepep-waterfill) still routes shared expert "
+                "through DeepEP as an extra MoE slot, so shared expert is not separated from the "
+                "MoE path when Waterfill is enabled."
+            ),
         )
         parser.add_argument(
             "--enforce-shared-experts-fusion",
