@@ -27,15 +27,30 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.workers.is_empty() {
-            return Err(anyhow!("at least one worker required"));
-        }
-        // Per-worker URL syntax + scheme is enforced by the typed
-        // `WorkerConfig.url: reqwest::Url` deserializer; no further check
-        // needed here.
+        const VALID_POLICIES: &[&str] = &["round_robin", "random", "power_of_two"];
+
         for m in &self.models {
             if m.id.is_empty() {
                 return Err(anyhow!("model.id must be non-empty"));
+            }
+            if !VALID_POLICIES.contains(&m.policy.as_str()) {
+                return Err(anyhow!(
+                    "model.policy = {:?} not recognized; valid: {VALID_POLICIES:?}",
+                    m.policy
+                ));
+            }
+        }
+        match &self.discovery.backend {
+            DiscoveryBackend::StaticFile(s) => {
+                if s.path.is_empty() {
+                    return Err(anyhow!("discovery.static_file.path must be set"));
+                }
+            }
+            DiscoveryBackend::K8s(k) => {
+                if k.namespace.is_empty() {
+                    return Err(anyhow!("discovery.k8s.namespace must be set"));
+                }
+                // label_selector may be empty (matches everything in namespace)
             }
         }
         Ok(())
@@ -59,15 +74,20 @@ server:
 models:
   - id: "qwen3-0.6b"
     tokenizer_path: "/tmp/qwen.json"
-workers:
-  - url: "http://127.0.0.1:30000"
+discovery:
+  backend: static_file
+  static_file:
+    path: "/tmp/workers.toml"
 "#,
         )
         .unwrap();
         let c = Config::from_path(&p).unwrap();
         assert_eq!(c.server.port, 8090);
         assert_eq!(c.models[0].id, "qwen3-0.6b");
-        assert_eq!(c.workers[0].url.as_str(), "http://127.0.0.1:30000/");
+        match &c.discovery.backend {
+            DiscoveryBackend::StaticFile(s) => assert_eq!(s.path, "/tmp/workers.toml"),
+            _ => panic!("expected static_file backend"),
+        }
     }
 
     #[test]
@@ -83,52 +103,19 @@ port = 8090
 [[models]]
 id = "qwen3-0.6b"
 tokenizer_path = "/tmp/qwen.json"
-[[workers]]
-url = "http://127.0.0.1:30000"
+[discovery]
+backend = "static_file"
+[discovery.static_file]
+path = "/tmp/workers.toml"
 "#,
         )
         .unwrap();
         let c = Config::from_path(&p).unwrap();
         assert_eq!(c.server.port, 8090);
-    }
-
-    #[test]
-    fn loads_workers_array() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.toml");
-        std::fs::write(
-            &p,
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8090
-[[models]]
-id = "qwen3-0.6b"
-tokenizer_path = "/tmp/qwen.json"
-[[workers]]
-url = "http://127.0.0.1:30000"
-"#,
-        )
-        .unwrap();
-        let c = Config::from_path(&p).unwrap();
-        assert_eq!(c.workers.len(), 1);
-        assert_eq!(c.workers[0].url.as_str(), "http://127.0.0.1:30000/");
-    }
-
-    #[test]
-    fn rejects_empty_workers() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
-            "server:\n  host: \"0.0.0.0\"\n  port: 8090\nmodels: []\nworkers: []\n",
-        )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err();
-        assert!(
-            err.to_string().to_lowercase().contains("worker"),
-            "got: {err}"
-        );
+        match &c.discovery.backend {
+            DiscoveryBackend::StaticFile(s) => assert_eq!(s.path, "/tmp/workers.toml"),
+            _ => panic!("expected static_file backend"),
+        }
     }
 
     #[test]
@@ -142,7 +129,8 @@ url = "http://127.0.0.1:30000"
         .unwrap();
         let err = Config::from_path(&p).unwrap_err();
         assert!(
-            err.to_string().to_lowercase().contains("worker"),
+            err.to_string().to_lowercase().contains("discovery")
+                || err.to_string().to_lowercase().contains("missing"),
             "got: {err}"
         );
     }
@@ -156,361 +144,119 @@ url = "http://127.0.0.1:30000"
         assert!(err.to_string().contains("yaml") && err.to_string().contains("toml"));
     }
 
-    // Worker URL parsing.
-    //
-    // The field is `reqwest::Url` (re-export of `url::Url`). The `url` crate
-    // normalizes a bare authority to include a `/` path: parsing
-    // `"http://x:30000"` yields a `Url` whose `as_str()` is
-    // `"http://x:30000/"`. So both forms below converge on the same string.
-
     #[test]
-    fn loads_config_with_url_having_trailing_slash() {
+    fn loads_static_file_discovery() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
+        let p = dir.path().join("c.toml");
         std::fs::write(
             &p,
             r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models:
-  - id: "qwen3-0.6b"
-    tokenizer_path: "/tmp/qwen.json"
-workers:
-  - url: "http://127.0.0.1:30000/"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "qwen3-0.6b"
+tokenizer_path = "/tmp/qwen.json"
+policy = "round_robin"
+[discovery]
+backend = "static_file"
+[discovery.static_file]
+path = "/etc/experimental/sgl-router/workers.toml"
 "#,
         )
         .unwrap();
         let c = Config::from_path(&p).unwrap();
-        // url crate normalizes — both with and without trailing slash end up
-        // with a path of "/". We pin the normalized form here.
-        assert_eq!(c.workers[0].url.as_str(), "http://127.0.0.1:30000/");
-    }
-
-    #[test]
-    fn loads_config_without_trailing_slash_normalizes_to_trailing_slash() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
-            r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models:
-  - id: "qwen3-0.6b"
-    tokenizer_path: "/tmp/qwen.json"
-workers:
-  - url: "http://127.0.0.1:30000"
-"#,
-        )
-        .unwrap();
-        let c = Config::from_path(&p).unwrap();
-        assert_eq!(c.workers[0].url.as_str(), "http://127.0.0.1:30000/");
-    }
-
-    #[test]
-    fn loads_config_rejects_malformed_url() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
-            r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models: []
-workers:
-  - url: "not-a-url"
-"#,
-        )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("url") || msg.contains("relative") || msg.contains("scheme"),
-            "expected URL parse failure, got: {err}"
-        );
-    }
-
-    #[test]
-    fn loads_config_rejects_url_without_scheme() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
-            r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models: []
-workers:
-  - url: "127.0.0.1:30000"
-"#,
-        )
-        .unwrap();
-        // "127.0.0.1:30000" parses as scheme "127.0.0.1" — the url crate
-        // accepts this (it's a syntactically valid URI with an opaque path).
-        // Our validator rejects schemes other than http/https.
-        let err = Config::from_path(&p).unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("scheme") || msg.contains("http") || msg.contains("url"),
-            "expected scheme validation failure, got: {err}"
-        );
-    }
-
-    #[test]
-    fn loads_config_rejects_empty_url() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
-            r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models: []
-workers:
-  - url: ""
-"#,
-        )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("url") || msg.contains("empty") || msg.contains("relative"),
-            "expected empty-URL failure, got: {err}"
-        );
-    }
-
-    #[test]
-    fn loads_config_rejects_url_with_path() {
-        // A worker URL with a non-trivial path silently loses the path when
-        // we later join `/v1/tokenize` etc., so we reject up-front.
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
-            r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models: []
-workers:
-  - url: "http://x:30000/api/"
-"#,
-        )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("path"),
-            "expected path-rejection error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn loads_config_rejects_url_with_query() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
-            r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models: []
-workers:
-  - url: "http://x:30000/?key=foo"
-"#,
-        )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("query"),
-            "expected query-rejection error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn loads_config_rejects_url_with_fragment() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
-            r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models: []
-workers:
-  - url: "http://x:30000/#frag"
-"#,
-        )
-        .unwrap();
-        let err = Config::from_path(&p).unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("fragment"),
-            "expected fragment-rejection error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn loads_config_accepts_bare_authority() {
-        // Both with and without trailing slash must pass — they're the
-        // canonical forms our deserializer allows.
-        for url in &["http://x:30000", "http://x:30000/"] {
-            let dir = tempfile::tempdir().unwrap();
-            let p = dir.path().join("c.yaml");
-            std::fs::write(
-                &p,
-                format!(
-                    r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models: []
-workers:
-  - url: "{url}"
-"#
-                ),
-            )
-            .unwrap();
-            let c = Config::from_path(&p)
-                .unwrap_or_else(|e| panic!("expected {url} to pass, got: {e}"));
-            assert_eq!(c.workers[0].url.as_str(), "http://x:30000/");
+        match &c.discovery.backend {
+            DiscoveryBackend::StaticFile(s) => {
+                assert_eq!(s.path, "/etc/experimental/sgl-router/workers.toml");
+            }
+            _ => panic!("expected static_file backend"),
         }
+        assert_eq!(c.models[0].policy, "round_robin");
     }
 
-    // `request_timeout` parsing.
-    //
-    // The field is `Option<Duration>` deserialized via `humantime_serde`, so
-    // operators write human-readable strings (`"60s"`, `"500ms"`, `"2m"`)
-    // rather than raw milliseconds. Malformed input must be rejected at
-    // config-load — a silent fallback to a default hides typos in
-    // production configs.
-
     #[test]
-    fn loads_request_timeout_in_seconds() {
+    fn loads_k8s_discovery() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
+        let p = dir.path().join("c.toml");
         std::fs::write(
             &p,
             r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models: []
-workers:
-  - url: "http://127.0.0.1:30000"
-    request_timeout: "60s"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "qwen3-0.6b"
+tokenizer_path = "/tmp/qwen.json"
+policy = "round_robin"
+[discovery]
+backend = "k8s"
+[discovery.k8s]
+namespace = "default"
+label_selector = "app=sglang"
 "#,
         )
         .unwrap();
         let c = Config::from_path(&p).unwrap();
-        assert_eq!(
-            c.workers[0].request_timeout,
-            Some(std::time::Duration::from_secs(60))
-        );
-    }
-
-    #[test]
-    fn loads_request_timeout_in_ms() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
-            r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models: []
-workers:
-  - url: "http://127.0.0.1:30000"
-    request_timeout: "500ms"
-"#,
-        )
-        .unwrap();
-        let c = Config::from_path(&p).unwrap();
-        assert_eq!(
-            c.workers[0].request_timeout,
-            Some(std::time::Duration::from_millis(500))
-        );
-    }
-
-    #[test]
-    fn loads_request_timeout_default_when_absent() {
-        // Absent => None at the config layer. main.rs picks the default
-        // (currently 60 s). Keeping the default in main.rs (not here) lets
-        // tests build a `WorkerConfig` without committing to a magic number
-        // at the type-system boundary.
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("c.yaml");
-        std::fs::write(
-            &p,
-            r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models: []
-workers:
-  - url: "http://127.0.0.1:30000"
-"#,
-        )
-        .unwrap();
-        let c = Config::from_path(&p).unwrap();
-        assert_eq!(c.workers[0].request_timeout, None);
-    }
-
-    #[test]
-    fn loads_request_timeout_rejects_garbage() {
-        // Reject malformed input loudly. Cases that should never silently
-        // become the 60 s default: a non-numeric word and a negative
-        // duration (humantime rejects negatives at the lexer; humantime
-        // also rejects "infinity").
-        for bad in ["infinity", "-5s", "5 fortnights"] {
-            let dir = tempfile::tempdir().unwrap();
-            let p = dir.path().join("c.yaml");
-            std::fs::write(
-                &p,
-                format!(
-                    r#"
-server:
-  host: "0.0.0.0"
-  port: 8090
-models: []
-workers:
-  - url: "http://127.0.0.1:30000"
-    request_timeout: "{bad}"
-"#
-                ),
-            )
-            .unwrap();
-            assert!(
-                Config::from_path(&p).is_err(),
-                "expected `request_timeout: {bad:?}` to fail to parse, but it succeeded"
-            );
+        match &c.discovery.backend {
+            DiscoveryBackend::K8s(k) => {
+                assert_eq!(k.namespace, "default");
+                assert_eq!(k.label_selector, "app=sglang");
+            }
+            _ => panic!("expected k8s backend"),
         }
     }
 
     #[test]
-    fn url_join_drops_existing_path_for_absolute_input() {
-        // Pin the Url::join semantics we rely on in proxy::forward_*. An
-        // absolute path ("/v1/...") replaces the existing path, so a
-        // trailing-slash worker URL and a non-trailing one both produce the
-        // same joined URL — no double-slash bug.
-        let base_with = reqwest::Url::parse("http://x:30000/").unwrap();
-        let base_without = reqwest::Url::parse("http://x:30000").unwrap();
-        assert_eq!(
-            base_with.join("/v1/tokenize").unwrap().as_str(),
-            "http://x:30000/v1/tokenize"
+    fn rejects_unknown_policy_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            "
+server:
+  host: 0.0.0.0
+  port: 8090
+discovery:
+  backend: static_file
+  static_file:
+    path: /tmp/w.toml
+models:
+  - id: qwen
+    tokenizer_path: /tmp/qwen.json
+    policy: bogus_policy
+",
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("bogus_policy")
+                || err.to_string().to_lowercase().contains("policy"),
+            "got: {err}"
         );
-        assert_eq!(
-            base_without.join("/v1/tokenize").unwrap().as_str(),
-            "http://x:30000/v1/tokenize"
-        );
+    }
+
+    #[test]
+    fn defaults_policy_to_round_robin() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "qwen"
+tokenizer_path = "/tmp/qwen.json"
+[discovery]
+backend = "static_file"
+[discovery.static_file]
+path = "/tmp/w.toml"
+"#,
+        )
+        .unwrap();
+        let c = Config::from_path(&p).unwrap();
+        assert_eq!(c.models[0].policy, "round_robin");
     }
 }

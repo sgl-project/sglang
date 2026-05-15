@@ -115,11 +115,17 @@ mod tests {
             models: vec![crate::config::ModelConfig {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+                policy: "round_robin".into(),
+                circuit_breaker: None,
             }],
-            workers: vec![crate::config::WorkerConfig {
-                url: reqwest::Url::parse("http://x:30000").unwrap(),
-                request_timeout: None,
-            }],
+            discovery: crate::config::DiscoveryConfig {
+                backend: crate::config::DiscoveryBackend::StaticFile(
+                    crate::config::StaticFileDiscoveryConfig {
+                        path: "/tmp/test-workers.toml".into(),
+                        poll_interval_ms: 200,
+                    },
+                ),
+            },
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();
         let proxy = Arc::new(

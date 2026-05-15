@@ -4,3 +4,4 @@ target/
 # Override the repo-root Cargo.lock ignore — binary crates must track their lockfile.
 !Cargo.lock
 M1_TEST_SURVEY.md
+M2_TEST_SURVEY.md

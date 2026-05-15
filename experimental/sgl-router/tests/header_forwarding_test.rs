@@ -5,7 +5,10 @@ mod common;
 
 use axum::body::Body;
 use axum::http::Request;
-use sgl_router::config::{Config, ModelConfig, ObservabilityConfig, ServerConfig, WorkerConfig};
+use sgl_router::config::{
+    Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig, ServerConfig,
+    StaticFileDiscoveryConfig,
+};
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -26,11 +29,15 @@ async fn forwards_whitelisted_headers_strips_others() {
         models: vec![ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            policy: "round_robin".into(),
+            circuit_breaker: None,
         }],
-        workers: vec![WorkerConfig {
-            url: worker.url.parse().unwrap(),
-            request_timeout: None,
-        }],
+        discovery: DiscoveryConfig {
+            backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {
+                path: "/tmp/test-workers.toml".into(),
+                poll_interval_ms: 200,
+            }),
+        },
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), Duration::from_secs(5)).unwrap());
