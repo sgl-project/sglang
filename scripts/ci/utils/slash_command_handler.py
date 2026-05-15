@@ -9,6 +9,15 @@ from datetime import datetime, timezone
 import requests
 from github import Auth, Github
 
+# Import scripts/ci/runner_configs.py (sibling-up dir) for runner_config -> runs_on lookup.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import runner_configs as _runner_configs  # noqa: E402
+
+# rerun-test workflow doesn't build sgl-kernel, so b200 stages always use the
+# non-kernel pool. Keep this aligned with the legacy CUDA_SUITE_TO_RUNNER below.
+_B200_DEFAULT_RUNNER = "4-gpu-b200"
+_DEFAULT_INSTALL = "scripts/ci/cuda/ci_install_dependency.sh"
+
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 
@@ -598,15 +607,63 @@ def _extract_suite(content, func_name):
     return None
 
 
+def _extract_runner_config(content):
+    """Pull `runner_config` from a new-style `register_cuda_ci(...)` call."""
+    args = re.search(r"^[^#\n]*register_cuda_ci\(([^)]*)\)", content, re.MULTILINE)
+    if not args:
+        return None
+    m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
+    return m.group(1) if m else None
+
+
 def detect_suite(file_path_from_test):
     """
     Read a test file and extract the suite from register_cuda_ci or register_cpu_ci.
+
+    For new-style `register_cuda_ci(runner_config="...")`, resolves the runner
+    label from scripts/ci/runner_configs.yml — works for any stage (stage-a/b/c,
+    extra-a/b, etc.) without a hard-coded suite table.
+
+    Legacy `register_cuda_ci(suite="...")` (nightly/weekly/manual tests) still
+    uses CUDA_SUITE_TO_RUNNER.
 
     Returns (suite_name, runner_label, use_deepep, is_cpu, error_message).
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
         content = f.read()
+
+    # New style: runner_config="..." -> look up runs_on from runner_configs.yml.
+    rc = _extract_runner_config(content)
+    if rc:
+        cfg = _runner_configs.load().get(rc)
+        if cfg is None:
+            known = ", ".join(f"`{k}`" for k in sorted(_runner_configs.load()))
+            return (
+                rc,
+                None,
+                False,
+                False,
+                (
+                    f"Unknown runner_config `{rc}` in `{full_path}` "
+                    f"— not in scripts/ci/runner_configs.yml.\n\n"
+                    f"Known runner_configs: {known}"
+                ),
+            )
+        runs_on = cfg.get("runs_on")
+        # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
+        # so always pick the non-kernel b200 pool.
+        if runs_on == "$b200_runner":
+            runs_on = _B200_DEFAULT_RUNNER
+        # Stage is informational for telemetry/messages; not used for dispatch.
+        stage_m = re.search(
+            r'^[^#\n]*register_cuda_ci\([^)]*stage\s*=\s*["\']([^"\']+)["\']',
+            content,
+            re.MULTILINE,
+        )
+        suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
+        use_deepep = cfg.get("install", _DEFAULT_INSTALL) != _DEFAULT_INSTALL
+        return suite, runs_on, use_deepep, False, None
 
     suite = _extract_suite(content, "register_cuda_ci")
     if suite:
