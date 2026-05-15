@@ -661,7 +661,9 @@ def correctness_test(
     for i in range(len(reqs)):
         rank_print(f"========== Prompt {i} ==========")
         rank_print(tokenizer.decode(output_ids[i]), "\n")
-
+    
+    # Always destroy distributed environment if it was initialized
+    destroy_distributed_environment()
 
 def synchronize(device):
     torch.get_device_module(device).synchronize()
@@ -919,8 +921,7 @@ def latency_test(
             for result in result_list:
                 fout.write(json.dumps(result) + "\n")
 
-    if server_args.tp_size > 1:
-        destroy_distributed_environment()
+    destroy_distributed_environment()
 
 
 def main(server_args, bench_args):
@@ -960,10 +961,12 @@ def main(server_args, bench_args):
                 proc.start()
                 workers.append(proc)
 
-        for proc in workers:
-            proc.join()
 
-        proc.terminate()
+        for proc in workers:
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1)
 
 
 if __name__ == "__main__":
@@ -984,3 +987,4 @@ if __name__ == "__main__":
     finally:
         if server_args.tp_size != 1:
             kill_process_tree(os.getpid(), include_parent=False)
+
