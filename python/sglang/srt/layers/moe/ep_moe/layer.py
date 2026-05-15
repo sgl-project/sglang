@@ -293,7 +293,36 @@ class DeepEPMoE(FusedMoE):
             overlap_args=overlap_args,
         )
 
+    def forward_unquantized_deepep_ll(
+        self,
+        dispatch_output: DeepEPLLDispatchOutput,
+    ):
+        hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
+        assert hidden_states_scale is None
+        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.is_gated
+        assert hidden_states.dim() == 3
 
+        num_experts, max_tokens, _ = hidden_states.shape
+        token_offsets = torch.arange(max_tokens, device=hidden_states.device)
+        valid_mask = (
+            token_offsets.unsqueeze(0) < masked_m[:num_experts].unsqueeze(1)
+        ).unsqueeze(-1)
+        hidden_states = hidden_states.masked_fill(~valid_mask, 0)
+
+        gate_up = torch.bmm(hidden_states, self.w13_weight.transpose(1, 2))
+        w13_bias = getattr(self, "w13_weight_bias", None)
+        if w13_bias is not None:
+            gate_up = gate_up + w13_bias.unsqueeze(1)
+
+        gate, up = gate_up.chunk(2, dim=-1)
+        hidden_states = F.silu(gate) * up
+
+        output = torch.bmm(hidden_states, self.w2_weight.transpose(1, 2))
+        w2_bias = getattr(self, "w2_weight_bias", None)
+        if w2_bias is not None:
+            output = output + w2_bias.unsqueeze(1)
+        return output.masked_fill(~valid_mask, 0)
 
     def forward_flashinfer_cutedsl(
         self,

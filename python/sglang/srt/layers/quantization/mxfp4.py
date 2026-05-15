@@ -1018,7 +1018,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.runner = MoeRunner(
                 moe_runner_backend, replace(moe_runner_config, activation="swiglu")
             )
-        elif moe_runner_backend.is_triton_kernels() or moe_runner_backend.is_triton():
+        elif (
+            moe_runner_backend.is_triton_kernels()
+            or moe_runner_backend.is_triton()
+            or moe_runner_backend.is_marlin()
+        ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
