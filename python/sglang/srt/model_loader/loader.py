@@ -2209,7 +2209,10 @@ class PreshardedModelLoader(DefaultModelLoader):
             # SHAs are computed eagerly inside the per-file loop so we can
             # release tensor references after each file (otherwise the rank
             # would hold every loaded tensor in memory until end-of-load).
-            # Only populated when verify_on_load=True.
+            # Always populated — not gated by verify_on_load — so that both
+            # code paths traverse items identically before the copy loop,
+            # ensuring the same CPU-cache warming effect for all items.
+            # Only the final aggregate comparison is gated by verify_on_load.
             verify_hashes: List[Tuple[str, str]] = []
             for filename, items in by_file.items():
                 full_path = os.path.join(presharded_dir, filename)
@@ -2221,15 +2224,12 @@ class PreshardedModelLoader(DefaultModelLoader):
                         if r["stored_key"] not in cached:
                             cached[r["stored_key"]] = fh.get_tensor(r["stored_key"])
 
-                # Always hash each unique stored_key in parallel (multi-
-                # threaded). The actual purpose here is to parallelize the
-                # mmap page-faults that the subsequent single-threaded
-                # ``param_data.copy_(tensor)`` would otherwise pay one tensor
-                # at a time on a network FS. SHA1 cost is fully overlapped
-                # with IO wait, so unifying the code path is effectively
-                # free and ensures verify-off is no slower than verify-on.
-                # Verification (comparison against ``plan["rank_checksums"]``)
-                # is still gated by ``verify_on_load``.
+                # Hash each unique stored_key in parallel (multi-threaded).
+                # Primary purpose: parallel mmap page-faults so the
+                # subsequent ``param_data.copy_`` finds pages already in RAM
+                # rather than paying serial faults on the critical path on a
+                # network FS. Secondary purpose: populate ``key_to_hash`` for
+                # the always-run accumulation loop below.
                 keys = list(cached.keys())
                 n_workers = min(max(1, len(keys)), self._hash_num_threads)
 
@@ -2244,9 +2244,8 @@ class PreshardedModelLoader(DefaultModelLoader):
                         thread_name_prefix="presharded-readahead",
                     ) as ex:
                         key_to_hash = dict(ex.map(_hash_one, keys))
-                if self._verify_on_load:
-                    for r in items:
-                        verify_hashes.append((r["name"], key_to_hash[r["stored_key"]]))
+                for r in items:
+                    verify_hashes.append((r["name"], key_to_hash[r["stored_key"]]))
 
                 for r in items:
                     tensor = cached[r["stored_key"]]
