@@ -1599,6 +1599,10 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
+        def pop_and_process():
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
@@ -1610,6 +1614,15 @@ class SchedulerDisaggregationDecodeMixin:
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
+            # Match the normal overlap scheduler: for spec_v2 + grammar, commit
+            # accepted tokens to req.output_ids / req.grammar before launching the
+            # next decode batch. Otherwise disagg overlap can prepare the next MTP
+            # verify from advanced spec state while the grammar matcher is still
+            # one result behind.
+            if disable_overlap_for_batch and self.last_batch:
+                pop_and_process()
 
             # Launch the current batch
             if batch:
@@ -1620,8 +1633,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if not disable_overlap_for_batch:
+                    pop_and_process()
             elif batch is None:
                 self.on_idle()
 
