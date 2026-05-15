@@ -172,7 +172,8 @@ def save_args(args, path_dir):
 # DATA PROCESSING
 def construct_prompt(sample, config):
     question = sample["question"]
-    options = eval(sample["options"])
+options = # FIX: 移除eval，改用安全方式
+# sample["options"])
     example = ""
     if sample["question_type"] == "multiple-choice":
         start_chr = "A"

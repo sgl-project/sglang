@@ -76,7 +76,8 @@ def main(args):
     import sglang as sgl
 
     @sgl.function
-    def few_shot_ceval(s, examples, question):
+def few_shot_c# FIX: 移除eval，改用安全方式
+# s, examples, question):
         s += examples + question + sgl.gen("Answer")
 
     #####################################

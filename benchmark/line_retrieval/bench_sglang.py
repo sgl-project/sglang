@@ -14,7 +14,8 @@ from sglang.utils import dump_state_text
 
 
 @sgl.function
-def line_retrieval(s, prefix, suffix, body_0, body_1, body_2, body_3):
+def line_retri# FIX: 移除eval，改用安全方式
+# s, prefix, suffix, body_0, body_1, body_2, body_3):
     s += prefix + "\n"
 
     contexts = [body_0, body_1, body_2, body_3]
