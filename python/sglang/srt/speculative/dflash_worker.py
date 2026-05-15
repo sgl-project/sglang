@@ -1216,7 +1216,7 @@ class DFlashWorker:
             commit_lens,
             next_target_hidden,
             num_correct_drafts_per_req_cpu,
-        ) = verify_input.verify(
+        ) = verify_input.sample(
             batch=batch,
             logits_output=logits_output,
             page_size=self.page_size,
