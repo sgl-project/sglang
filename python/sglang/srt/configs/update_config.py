@@ -236,6 +236,10 @@ def adjust_config_with_unaligned_cpu_tp(
         ]:
             update_config(config, "num_key_value_heads", num_key_value_heads)
             update_config(config, "num_attention_heads", num_attention_heads)
+            if hasattr(config, "encoder_attention_heads"):
+                update_config(config, "encoder_attention_heads", num_attention_heads)
+            if hasattr(config, "decoder_attention_heads"):
+                update_config(config, "decoder_attention_heads", num_attention_heads)
 
     adjust_tp_num_heads_if_necessary(model_config.hf_config, tp_size, True)
     if hasattr(model_config.hf_config, "text_config"):
@@ -249,6 +253,8 @@ def adjust_config_with_unaligned_cpu_tp(
         "intermediate_size",
         "intermediate_size_mlp",
         "shared_expert_intermediate_size",
+        "encoder_ffn_dim",
+        "decoder_ffn_dim",
     ]:
         model_config = update_intermediate_size(
             model_config, moe_intermediate_attr, intermediate_padding_size
