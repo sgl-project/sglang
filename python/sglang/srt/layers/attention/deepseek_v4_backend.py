@@ -47,6 +47,12 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
+    dequantize_k_cache_paged,
+)
+from sglang.srt.layers.attention.dsv4.sparse_indices import (
+    SparsePrefillChunkCache,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -271,6 +277,11 @@ class DSV4Metadata:
     c4_compress_metadata: Optional[FusedCompressMetadata] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
 
+    # Lazily populated on the first call to ``_forward_prefill_sparse`` and
+    # reused across every layer in the chunk. Reset to ``None`` on copy_ so
+    # cuda-graph replay rebuilds it for the next forward.
+    sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
+
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
         return self.core_attn_metadata
@@ -282,6 +293,7 @@ class DSV4Metadata:
         maybe_copy_inplace(
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
+        self.sparse_prefill_cache = None
 
 
 @dataclass
@@ -1031,6 +1043,21 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
+            if (
+                forward_batch.forward_mode.is_extend()
+                and compress_ratio in (0, 4, 128)
+                and envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            ):
+                return self._forward_prefill_sparse(
+                    q=q,
+                    layer_id=layer_id,
+                    compress_ratio=compress_ratio,
+                    forward_batch=forward_batch,
+                    token_to_kv_pool=token_to_kv_pool,
+                    core_attn_metadata=core_attn_metadata,
+                    attn_sink=attn_sink,
+                )
+
             import flash_mla
 
             o = flash_mla.flash_mla_with_kvcache(
@@ -1054,6 +1081,107 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _forward_prefill_sparse(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        compress_ratio: Literal[0, 4, 128],
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        core_attn_metadata: DSV4AttnMetadata,
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """Unified prefill via flash_mla_sparse_fwd. Replaces the
+        flash_mla_with_kvcache call on the extend path. Per request,
+        positionally gathers the SWA window (always) and the compressed
+        cache (c4/c128) into a flat bf16 workspace, then lets
+        flash_mla_sparse_fwd consume the workspace via per-query rebased
+        indices. Chunk-invariant scaffolding lives in
+        ``self.forward_metadata.sparse_prefill_cache``.
+        """
+        from flash_mla import flash_mla_sparse_fwd
+
+        # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
+        q_flat = q.squeeze(1)
+
+        cache = self.forward_metadata.sparse_prefill_cache
+        if cache is None:
+            # ``swa_window_size`` on the pool is its storage page size, not
+            # the model's SWA window — pass both explicitly.
+            cache = SparsePrefillChunkCache.build(
+                seq_lens=forward_batch.seq_lens.to(torch.int32),
+                extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
+                req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+                req_to_token=self.req_to_token,
+                full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
+                swa_window_size=SWA_WINDOW,
+                swa_page_size=token_to_kv_pool.swa_window_size,
+                num_qo_tokens=q_flat.shape[0],
+            )
+            self.forward_metadata.sparse_prefill_cache = cache
+
+        # Resolve the workspace + indices for this ratio, then dequant
+        # SWA + compressed regions directly into the workspace (no torch.cat).
+        compressed_slice = None
+        extra_k_cache = None
+        extra_page_size = None
+        flat_token_ids = None
+        if compress_ratio == 0:
+            workspace = cache.c0_workspace
+            combined_indices = cache.c0_combined_indices
+            combined_lens = cache.c0_combined_lens
+            swa_slice = workspace
+        elif compress_ratio in (4, 128):
+            extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            if compress_ratio == 128:
+                assert core_attn_metadata.c128_page_indices is not None
+                cache.ensure_c128(core_attn_metadata.c128_page_indices)
+                flat_token_ids = cache.c128_flat_token_ids
+                workspace = cache.c128_workspace
+                combined_indices = cache.c128_combined_indices
+                combined_lens = cache.c128_combined_lens
+            else:
+                assert core_attn_metadata.c4_sparse_page_indices is not None
+                cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
+                flat_token_ids = cache.c4_flat_token_ids
+                workspace = cache.c4_workspace
+                combined_indices, combined_lens = cache.combine_c4_layer(
+                    c4_sparse_page_indices=core_attn_metadata.c4_sparse_page_indices,
+                    page_table=core_attn_metadata.page_table,
+                )
+            n_compressed = flat_token_ids.shape[0]
+            compressed_slice = workspace[:n_compressed]
+            swa_slice = workspace[n_compressed:]
+        else:
+            raise NotImplementedError(f"prefill {compress_ratio=} not yet wired")
+
+        if compressed_slice is not None:
+            dequantize_k_cache_paged(
+                extra_k_cache,
+                flat_token_ids,
+                page_size=extra_page_size,
+                out=compressed_slice,
+            )
+        dequantize_k_cache_paged(
+            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+            cache.swa_token_ids,
+            page_size=cache.swa_page_size,
+            out=swa_slice,
+        )
+        kv = workspace
+
+        o, _, _ = flash_mla_sparse_fwd(
+            q=q_flat,
+            kv=kv,
+            indices=combined_indices.unsqueeze(1),
+            sm_scale=self.softmax_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink,
+            topk_length=combined_lens,
+        )
+        return o
 
     def expand_prefill_casually(
         self,
