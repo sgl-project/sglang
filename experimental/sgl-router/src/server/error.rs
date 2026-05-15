@@ -59,7 +59,9 @@ impl IntoResponse for ApiError {
         // For Internal: log full chain server-side, return generic message to client.
         let message = match &self {
             ApiError::Internal(e) => {
-                tracing::error!(error = ?e, "internal error serving request");
+                // `{:#}` prints the anyhow chain (top error + sources) — `?e`
+                // would only show the outermost message.
+                tracing::error!("internal error serving request: {e:#}");
                 "internal error".to_string()
             }
             _ => self.to_string(),
