@@ -754,7 +754,7 @@ def embed_mm_inputs(
     multimodal_model: nn.Module = None,
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
-    use_deepstack: Dict[Modality, bool] = {},
+    use_deepstack: Dict[Modality, bool] = None,
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -770,6 +770,9 @@ def embed_mm_inputs(
     Returns:
         Combined embedding tensor with multimodal content integrated
     """
+    if use_deepstack is None:
+        use_deepstack = {}
+
     other_info = {}
     if mm_inputs_list is None:
         return None
@@ -893,9 +896,12 @@ def _embed_mm_inputs_with_split(
     multimodal_model: nn.Module = None,
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
-    use_deepstack: Dict[Modality, bool] = {},
+    use_deepstack: Dict[Modality, bool] = None,
 ):
     """Split batch into precomputed vs non-precomputed, embed each group, merge back."""
+    if use_deepstack is None:
+        use_deepstack = {}
+
     precomputed_req_indices = []
     non_precomputed_req_indices = []
     for idx, mm_input in enumerate(mm_inputs_list):
@@ -994,7 +1000,7 @@ def general_mm_embed_routine(
     multimodal_model: Optional[nn.Module] = None,
     data_embedding_funcs: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: Optional[dict[Modality, List[int]]] = None,
-    use_deepstack: Dict[Modality, bool] = {},
+    use_deepstack: Dict[Modality, bool] = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -1012,6 +1018,9 @@ def general_mm_embed_routine(
     Returns:
         Hidden states from language model forward pass
     """
+    if use_deepstack is None:
+        use_deepstack = {}
+
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
     if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
