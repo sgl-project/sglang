@@ -32,6 +32,7 @@ from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
+    attn_tp_all_gather_into_tensor,
     dp_gather_partial,
     dp_scatter,
     get_attention_cp_rank,
@@ -833,9 +834,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states, local_hidden_states = get_global_dp_buffer(), hidden_states
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
+        _a2a_full_token_count: int = 0
         if _use_tp_attn_a2a_scatter:
             s, r = get_attention_tp_size(), get_attention_tp_rank()
             _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
+            _a2a_full_token_count = hidden_states.shape[0]
             hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
@@ -850,9 +853,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
-            gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
-            attn_tp_all_gather(gathered, hidden_states.contiguous())
-            hidden_states = torch.cat(gathered)
+            local_contig = hidden_states.contiguous()
+            hidden_states = torch.empty(
+                (_a2a_full_token_count, *local_contig.shape[1:]),
+                dtype=local_contig.dtype,
+                device=local_contig.device,
+            )
+            attn_tp_all_gather_into_tensor(hidden_states, local_contig)
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
