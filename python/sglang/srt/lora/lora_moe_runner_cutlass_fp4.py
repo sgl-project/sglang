@@ -88,12 +88,11 @@ class CutlassFp4LoraRunnerCore:
         hooks: Optional["LoRAHooks"] = None,
         lora_info=None,
     ) -> "StandardCombineInput":
-        from sgl_kernel import prepare_moe_input
+        from sgl_kernel import apply_shuffle_mul_sum, prepare_moe_input
 
         from sglang.srt.layers.moe.cutlass_moe import (
             cutlass_fp4_group_mm,
             scaled_fp4_experts_quant,
-            shuffle_rows,
         )
         from sglang.srt.layers.moe.token_dispatcher.standard import (
             StandardCombineInput,
@@ -232,10 +231,16 @@ class CutlassFp4LoraRunnerCore:
             out_3d_sorted_view = out_flat.view(m_a, num_topk, K)
             hooks.after_down(intermediate, out_3d_sorted_view, local_weights, topk_ids)
 
-        # ---- combine: un-sort once, weight (base + delta) once, sum.
-        out_3d = shuffle_rows(out_flat, c_map, (total_tokens, K)).view(
-            m_a, num_topk, K
+        # ---- combine: un-sort once, weight (base + delta) once, sum. Keep
+        # router weights in fp32 to match FlashInfer-CUTLASS fused MoE's final
+        # accumulation; the kernel stores the final result as ``out_dtype``.
+        output = torch.empty((m_a, K), dtype=out_dtype, device=device)
+        apply_shuffle_mul_sum(
+            out_flat,
+            output,
+            c_map,
+            None
+            if runner_config.apply_router_weight_on_input
+            else local_weights.reshape(-1),
         )
-        if not runner_config.apply_router_weight_on_input:
-            out_3d = out_3d * local_weights.view(m_a, num_topk, 1).to(out_dtype)
-        return StandardCombineInput(hidden_states=out_3d.sum(dim=1))
+        return StandardCombineInput(hidden_states=output)
