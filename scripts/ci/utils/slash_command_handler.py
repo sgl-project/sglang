@@ -17,6 +17,13 @@ import runner_configs as _runner_configs  # noqa: E402
 # non-kernel pool when resolving the `$b200_runner` sentinel from runner_configs.yml.
 _B200_DEFAULT_RUNNER = "4-gpu-b200"
 
+# install_script values from runner_configs.yml are passed verbatim into a
+# `bash ${{ inputs.install_script }}` step in rerun-test.yml. GHA expression
+# substitution happens before bash parses, so shell metacharacters in the
+# string would inject. Restrict the allowed shape to `scripts/ci/cuda/*.sh`
+# (single path component under that dir, no whitespace/operators).
+_ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
+
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 
@@ -590,6 +597,15 @@ def detect_suite(file_path_from_test):
                 f"— not in scripts/ci/runner_configs.yml.\n\n"
                 f"Known runner_configs: {known}",
             )
+        install_script = cfg["install"]
+        if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
+            return _err(
+                rc,
+                f"Disallowed `install` value `{install_script}` for runner_config "
+                f"`{rc}` in scripts/ci/runner_configs.yml. The slash handler "
+                f"passes this string verbatim into a shell step, so it must "
+                f"match `scripts/ci/cuda/*.sh`.",
+            )
         runs_on = cfg.get("runs_on")
         # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
         # so always pick the non-kernel b200 pool.
@@ -600,7 +616,7 @@ def detect_suite(file_path_from_test):
         return {
             "suite": suite,
             "runner_label": runs_on,
-            "install_script": cfg["install"],
+            "install_script": install_script,
             "install_timeout": str(cfg["install_timeout"]),
             "rdma_devices": cfg.get("rdma_devices", ""),
             "is_cpu": False,
