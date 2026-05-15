@@ -184,7 +184,7 @@ class EagleDraftInputV2Mixin:
         req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
         cuda_graph_runner: EAGLEDraftCudaGraphRunner,
-        draft_model_runner: ModelRunner,
+        draft_runner: ModelRunner,
         topk: int,
         num_steps: int,
     ):
@@ -213,12 +213,12 @@ class EagleDraftInputV2Mixin:
         self.num_tokens_for_logprob_per_req = topk
         capture_mode = (
             CaptureHiddenMode.NULL
-            if draft_model_runner.spec_algorithm.is_standalone()
+            if draft_runner.spec_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
         batch.capture_hidden_mode = capture_mode
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        forward_batch = ForwardBatch.init_new(batch, draft_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
@@ -230,7 +230,7 @@ class EagleDraftExtendInputV2Mixin:
         batch: ModelWorkerBatch,
         predict: torch.Tensor,
         num_draft_tokens: int,
-        draft_model_runner: Any,
+        draft_runner: Any,
         cuda_graph_runner: Any,
     ):
         # Caller is responsible for `batch.spec_info = self` before calling.
@@ -247,7 +247,7 @@ class EagleDraftExtendInputV2Mixin:
         batch.extend_num_tokens = extend_num_tokens
         capture_mode = (
             CaptureHiddenMode.NULL
-            if draft_model_runner.spec_algorithm.is_standalone()
+            if draft_runner.spec_algorithm.is_standalone()
             else CaptureHiddenMode.FULL
         )
         batch.capture_hidden_mode = capture_mode
@@ -256,10 +256,10 @@ class EagleDraftExtendInputV2Mixin:
             if batch.forward_mode.is_idle()
             else ForwardMode.DRAFT_EXTEND_V2
         )
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        forward_batch = ForwardBatch.init_new(batch, draft_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
-            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+            draft_runner.attn_backend.init_forward_metadata(forward_batch)
         return forward_batch
 
 

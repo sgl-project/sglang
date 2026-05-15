@@ -163,16 +163,16 @@ class MultiLayerEagleWorker(TpModelWorker):
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
             if (
-                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
-                and self.draft_model_runner.model.load_lm_head_from_target
+                hasattr(self.mtp_model_runner(0).model, "load_lm_head_from_target")
+                and self.mtp_model_runner(0).model.load_lm_head_from_target
             ):
-                self.draft_model_runner.model.set_embed_and_head(embed, head)
+                self.mtp_model_runner(0).model.set_embed_and_head(embed, head)
             else:
-                self.draft_model_runner.model.set_embed(embed)
+                self.mtp_model_runner(0).model.set_embed(embed)
 
             # grab hot token ids
-            if self.draft_model_runner.model.hot_token_id is not None:
-                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
+            if self.mtp_model_runner(0).model.hot_token_id is not None:
+                self.hot_token_id = self.mtp_model_runner(0).model.hot_token_id.to(
                     embed.device
                 )
 
@@ -247,6 +247,10 @@ class MultiLayerEagleWorker(TpModelWorker):
 
     def mtp_model_runner(self, layer_id: int) -> ModelRunner:
         return self.model_runner_list[layer_id]
+
+    @property
+    def draft_runner_list(self) -> List[ModelRunner]:
+        return self.model_runner_list
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run speculative decoding forward.
