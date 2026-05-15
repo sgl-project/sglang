@@ -148,11 +148,8 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup --pipeline-class-name LTX2TwoStagePipeline --cfg-parallel-size 2 --vae-cpu-offload",
-                    "extra_env": {
-                        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                        "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true"
-                    }
+                    "serve_args": "--enable-torch-compile --pipeline-class-name LTX2TwoStagePipeline --cfg-parallel-size 2",
+                    "extra_env": {}
                 }
             }
         },
