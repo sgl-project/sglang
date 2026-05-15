@@ -331,6 +331,78 @@ class TestLoRAFormatAdapter:
             r["pass"] for r in results
         ), "At least one LoRA format adapter case failed"
 
+    def test_zimage_diffusers_peft_prefix_stripped(self):
+        """Regression: diffusers PEFT Z-Image LoRA must have `transformer.` prefix stripped.
+
+        Without stripping, every key misses `ZImageTransformer2DModel.named_modules()`
+        naming and LoRA silently becomes a no-op.
+        """
+        rank = 4
+        hidden = 2560
+        state_dict = {}
+        for layer_idx in range(2):
+            for branch in ("layers", "noise_refiner", "context_refiner"):
+                for proj in ("to_q", "to_k", "to_v"):
+                    base = f"transformer.{branch}.{layer_idx}.attention.{proj}"
+                    state_dict[f"{base}.lora_A.weight"] = torch.randn(rank, hidden)
+                    state_dict[f"{base}.lora_B.weight"] = torch.randn(hidden, rank)
+                for w in ("w1", "w2", "w3"):
+                    base = f"transformer.{branch}.{layer_idx}.feed_forward.{w}"
+                    state_dict[f"{base}.lora_A.weight"] = torch.randn(rank, hidden)
+                    state_dict[f"{base}.lora_B.weight"] = torch.randn(hidden, rank)
+
+        assert all(k.startswith("transformer.") for k in state_dict)
+
+        fmt = detect_lora_format_from_state_dict(state_dict)
+        assert fmt == LoRAFormat.STANDARD, f"unexpected detected format: {fmt}"
+
+        normalized = normalize_lora_state_dict(state_dict, logger=logger)
+
+        assert not any(
+            k.startswith("transformer.") for k in normalized
+        ), "`transformer.` prefix must be stripped; found keys: " + str(
+            [k for k in normalized if k.startswith("transformer.")][:3]
+        )
+
+        assert len(normalized) == len(state_dict)
+        for k_new, v_new in normalized.items():
+            k_old = "transformer." + k_new
+            assert k_old in state_dict
+            assert v_new.shape == state_dict[k_old].shape
+
+    def test_zimage_diffusers_ffn_only_lora_still_detected(self):
+        """Regression for gemini-code-assist review feedback.
+
+        A target_modules=['w1','w2','w3'] LoRA has no `noise_refiner` or
+        `context_refiner` keys, but still needs `transformer.` prefix stripping.
+        The Gated-MLP fingerprint in `_looks_like_zimage_diffusers` catches it.
+        """
+        state_dict = {}
+        for layer_idx in range(2):
+            for w in ("w1", "w2", "w3"):
+                base = f"transformer.layers.{layer_idx}.feed_forward.{w}"
+                state_dict[f"{base}.lora_A.weight"] = torch.randn(4, 2560)
+                state_dict[f"{base}.lora_B.weight"] = torch.randn(2560, 4)
+
+        # No refiner keys present — would have slipped past the old detector.
+        assert not any("refiner" in k for k in state_dict)
+
+        fmt = detect_lora_format_from_state_dict(state_dict)
+        assert fmt == LoRAFormat.STANDARD
+
+        normalized = normalize_lora_state_dict(state_dict, logger=logger)
+
+        assert not any(k.startswith("transformer.") for k in normalized), (
+            "`transformer.` prefix must be stripped for FFN-only Z-Image LoRA; "
+            + "found keys: "
+            + str([k for k in normalized if k.startswith("transformer.")][:3])
+        )
+        assert len(normalized) == len(state_dict)
+        for k_new, v_new in normalized.items():
+            k_old = "transformer." + k_new
+            assert k_old in state_dict
+            assert v_new.shape == state_dict[k_old].shape
+
 
 if __name__ == "__main__":
     main()
