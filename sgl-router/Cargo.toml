@@ -8,6 +8,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Slim KV-aware OpenAI-compatible router for SGLang workers"
+publish = false  # binary-only; not published to crates.io
 
 [lib]
 name = "sgl_router"

@@ -13,3 +13,29 @@ This product includes software derived from the following projects:
    Copyright (c) The SGLang Authors.
    Licensed under the Apache License, Version 2.0.
    Code is ported on a file-by-file basis with original SPDX headers preserved.
+
+## Third-Party License Notices
+
+The compiled binary contains code under the following additional licenses:
+
+### LGPL-3.0-only (transitive through `dynamo-parsers → rustpython-parser → malachite-bigint`)
+
+- `malachite` (https://crates.io/crates/malachite)
+- `malachite-base` (https://crates.io/crates/malachite-base)
+- `malachite-nz` (https://crates.io/crates/malachite-nz)
+- `malachite-q` (https://crates.io/crates/malachite-q)
+- `malachite-bigint` (https://crates.io/crates/malachite-bigint)
+
+The full Cargo manifest (`sgl-router/Cargo.toml` + `sgl-router/Cargo.lock`) and source
+repository are publicly available, satisfying the LGPL-3.0 distribution requirement that
+users be able to relink against modified versions of these libraries. To rebuild against
+a different malachite version, edit the version constraint in `Cargo.lock` and
+`cargo build`.
+
+### NCSA license
+
+- `libfuzzer-sys` (transitive via `rav1e` → `image` → `openai-harmony` → `dynamo-parsers`)
+
+### CDLA-Permissive-2.0
+
+- `webpki-roots` (transitive via `reqwest` → multiple paths)
