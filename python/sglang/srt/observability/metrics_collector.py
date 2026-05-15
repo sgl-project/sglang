@@ -937,6 +937,28 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self._initialize_kv_transfer_metric_labels()
+
+    def _initialize_kv_transfer_metric_labels(self) -> None:
+        """Pre-create KV transfer metric children for the current label set.
+
+        In non-disaggregated deployments these metrics can legitimately remain at zero
+        forever, but Prometheus multiprocess mode only exposes labeled metrics after a
+        child is created. Pre-initializing them keeps `/metrics` stable and avoids the
+        appearance that the series are missing or null.
+        """
+        self.num_decode_transfer_queue_reqs.labels(**self.labels).set(0)
+        self.num_decode_prealloc_queue_reqs.labels(**self.labels).set(0)
+        self.num_prefill_prealloc_queue_reqs.labels(**self.labels).set(0)
+        self.num_prefill_inflight_queue_reqs.labels(**self.labels).set(0)
+        self.num_bootstrap_failed_reqs.labels(**self.labels)
+        self.num_transfer_failed_reqs.labels(**self.labels)
+        self.num_prefill_retries_total.labels(**self.labels)
+        self.kv_transfer_speed_gb_s.labels(**self.labels)
+        self.kv_transfer_latency_ms.labels(**self.labels)
+        self.kv_transfer_bootstrap_ms.labels(**self.labels)
+        self.kv_transfer_alloc_ms.labels(**self.labels)
+        self.kv_transfer_total_mb.labels(**self.labels)
 
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.
