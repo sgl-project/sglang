@@ -1094,40 +1094,9 @@ def compress_fused_norm_rope_inplace(
         weight,
         plan[1],
         freq_cis,
-        mode,
+        int(plan.is_decode),
         eps,
         plan.compress_ratio,
-    )
-
-
-def fused_norm_rope_inplace(
-    kv: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    freq_cis: torch.Tensor,
-    positions: torch.Tensor,
-) -> None:
-    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    if _is_xpu:
-        _torch_fused_norm_rope(
-            kv,
-            weight,
-            positions,
-            freq_cis,
-            2,
-            eps,
-            0,
-        )
-        return
-    module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
-    module.forward(
-        kv,
-        weight,
-        positions,
-        freq_cis,
-        2,
-        eps,
-        0,
     )
 
 
