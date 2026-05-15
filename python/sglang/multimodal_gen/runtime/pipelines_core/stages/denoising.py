@@ -316,6 +316,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         module.compile(**compile_kwargs)
         self._torch_compiled_module_ids.add(module_id)
 
+    def _maybe_enable_cache_dit_and_torch_compile(
+        self, num_inference_steps: int | tuple[int, int], batch: Req
+    ) -> None:
+        """Apply request-dependent transformer acceleration in trace-safe order."""
+        self._maybe_enable_cache_dit(num_inference_steps, batch)
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            self._maybe_enable_torch_compile(transformer)
+
     @staticmethod
     def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
         for submodule in module.modules():
@@ -605,22 +613,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         else:
             cache_dit_num_inference_steps = num_inference_steps
 
-        if not server_args.model_loaded["transformer"]:
+        transformer_was_loaded = server_args.model_loaded["transformer"]
+        if not transformer_was_loaded:
             # FIXME: reuse more code
             loader = TransformerLoader()
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args, "transformer"
             )
-            # enable cache-dit before torch.compile (delayed mounting)
-            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
+
+        self._maybe_enable_cache_dit_and_torch_compile(
+            cache_dit_num_inference_steps, batch
+        )
+
+        if not transformer_was_loaded:
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
-        else:
-            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
-
-        for transformer in filter(None, [self.transformer, self.transformer_2]):
-            self._maybe_enable_torch_compile(transformer)
 
         if batch.rollout:
             self._maybe_prepare_rollout(batch)
