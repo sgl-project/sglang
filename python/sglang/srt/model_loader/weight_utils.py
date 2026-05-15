@@ -488,6 +488,33 @@ def _find_local_hf_snapshot_dir_unlocked(
     # Only perform cache validation and cleanup in CI to avoid
     # unnecessary overhead for regular users
     if is_in_ci() and local_weight_files:
+        # Detect consolidated.pt format (original Mistral/Meta release format).
+        # These files use different parameter naming (e.g. tok_embeddings.weight
+        # vs model.embed_tokens.weight) that causes load_weights() to silently
+        # drop all parameters, producing garbage output with 0% accuracy.
+        # Delete them to trigger re-download in safetensors/HF format.
+        consolidated_pt_files = [
+            f
+            for f in local_weight_files
+            if os.path.basename(f).startswith("consolidated")
+            and f.endswith((".pt", ".pth"))
+        ]
+        has_safetensors = any(f.endswith(".safetensors") for f in local_weight_files)
+        if consolidated_pt_files and not has_safetensors:
+            log_info_on_rank0(
+                logger,
+                f"[CI] Found only consolidated .pt format weights for "
+                f"{model_name_or_path} (incompatible naming convention). "
+                f"Removing {len(consolidated_pt_files)} file(s) to trigger "
+                f"re-download in safetensors format.",
+            )
+            for f in consolidated_pt_files:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            return None
+
         is_valid = ci_validate_and_cleanup_local_snapshot(
             model_name_or_path, found_local_snapshot_dir, local_weight_files
         )

@@ -127,6 +127,47 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 
+def _check_critical_weights_loaded(model: torch.nn.Module) -> None:
+    """CI-only check: verify that embedding/lm_head weights were actually loaded.
+
+    When checkpoint files use a different naming convention (e.g., original
+    Mistral consolidated.pt format vs HuggingFace format), load_weights()
+    silently drops all unrecognized parameters. This leaves the model with
+    uninitialized weights that produce garbage output and 0% accuracy.
+
+    This check looks for common embedding parameter names and verifies they
+    have non-zero values, catching the problem at load time rather than after
+    a long eval run produces 0.0 scores.
+    """
+    # Skip for speculative draft models — their embeddings are intentionally
+    # zero-initialized during load_weights and populated later via
+    # set_embed_and_head() from the target model.
+    if hasattr(model, "set_embed_and_head"):
+        return
+
+    params = dict(model.named_parameters())
+
+    # Common names for the embedding layer across model architectures
+    embed_names = [
+        "model.embed_tokens.weight",
+        "transformer.wte.weight",
+        "embeddings.word_embeddings.weight",
+    ]
+
+    for name in embed_names:
+        if name in params:
+            param = params[name]
+            if param.count_nonzero() == 0:
+                raise RuntimeError(
+                    f"[CI] Critical weight '{name}' is all zeros after loading. "
+                    f"This likely means the checkpoint format does not match the "
+                    f"model definition (e.g., original Mistral consolidated.pt "
+                    f"format with different parameter naming). The cached weights "
+                    f"may need to be re-downloaded in the correct format."
+                )
+            break
+
+
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     if target_device.type == "cpu":
@@ -731,6 +772,13 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
         model.load_weights(weights)
+
+        # CI-only: verify critical weights were actually loaded.
+        # Catches format mismatches (e.g. consolidated.pt with original Mistral
+        # naming vs HuggingFace naming) where load_weights silently drops
+        # unrecognized parameters, leaving the model with uninitialized weights.
+        if os.environ.get("SGLANG_IS_IN_CI") == "true":
+            _check_critical_weights_loaded(model)
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
