@@ -21,6 +21,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
     set_is_extend_in_batch,
+    set_dp_buffer_len,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -557,10 +558,10 @@ class SchedulerPPMixin:
             model_runner = self.tp_worker.model_runner
             model_config = model_runner.model_config
             input_ids_list = []
-            for i in range(128):
+            for i in range(160):
                 chunk_size = int(
                     self.chunked_prefill_size * 1.25
-                    - i * (self.chunked_prefill_size * 1.25 // 128)
+                    - i * (self.chunked_prefill_size * 1.25 // 160)
                 )
                 if chunk_size <= 0:
                     break
@@ -612,6 +613,17 @@ class SchedulerPPMixin:
                     global_num_tokens[dp_rank] = current_seq_len
                     batch.global_num_tokens = global_num_tokens
                     batch.global_num_tokens_for_logprob = global_num_tokens
+                else:
+                    # DP disabled: set_dp_buffer_len is never called in normal forward path,
+                    # but communicator still uses get_local_dp_buffer() for TP all_gather.
+                    # With context parallel / scatter, each rank has input (current_seq_len // attn_tp_size, H),
+                    # so all_gather output is (current_seq_len, H); use current_seq_len for buffer.
+                    set_dp_buffer_len(
+                        current_seq_len,
+                        current_seq_len,
+                        dp_max_padding=False,
+                        global_num_tokens=[current_seq_len],
+                    )
 
                 proxy_tensors = {
                     "hidden_states": torch.zeros(

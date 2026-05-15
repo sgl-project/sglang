@@ -62,6 +62,14 @@ CLIP_MAX_NEW_TOKENS = int(
     os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
 )
 
+# When using chunked prefill (including dynamic chunking), very small remaining
+# tails can result in many tiny prefill batches and extra communication.
+# This threshold controls when to merge the remaining tail into the current
+# chunk instead of starting another tiny chunk.
+DYNAMIC_CHUNK_TAIL_MERGE_TOKENS = int(
+    os.environ.get("SGLANG_DYNAMIC_CHUNK_TAIL_MERGE_TOKENS", "256")
+)
+
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (against existing cache) less than this value,
 # the scheduler runs the in-batch prefix caching check for this request.
@@ -480,6 +488,10 @@ class PrefillAdder:
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
 
+        # Small-tail merge threshold for chunked prefill.
+        # A value of 0 disables this behavior.
+        self.tail_merge_threshold = DYNAMIC_CHUNK_TAIL_MERGE_TOKENS
+
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
@@ -669,6 +681,8 @@ class PrefillAdder:
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
+            remain = req.extend_input_len
+
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
                 # alloc_extend needs extend_num_tokens + page_size per request,
@@ -682,6 +696,23 @@ class PrefillAdder:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
+
+            # Try to merge a very small remaining tail into this chunk instead of
+            # creating another tiny prefill chunk in the next round.
+            if (
+                self.tail_merge_threshold > 0
+                and self.rem_chunk_tokens is not None
+                and remain > _rem_tokens
+                and (remain - _rem_tokens) <= self.tail_merge_threshold
+                and len(self.can_run_list) == 0
+                and (
+                    self.running_batch is None or self.running_batch.is_empty()
+                )
+            ):
+                # Ensure we still respect the overall token budget.
+                paged_len = self.ceil_paged_tokens(remain)
+                if paged_len <= min(self.cur_rem_tokens, self.rem_total_tokens):
+                    _rem_tokens = remain
 
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
