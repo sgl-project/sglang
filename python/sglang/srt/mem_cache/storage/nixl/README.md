@@ -143,6 +143,69 @@ python3 -m sglang.launch_server \
 ⚠️ **Note**:
 This method is convenient for testing / experimenting. For production or multi-plugin setups, it is always recommended to use the config file based approach.
 
+### 4. Validated Hybrid-Model Example
+
+The following setup was validated against a hybrid Mamba model with HiCache enabled:
+
+- model: `Qwen/Qwen3.5-0.8B`
+- storage backend: `nixl`
+- NIXL plugin: `POSIX` with `io_uring`
+- HiCache layout: `page_first`
+- model type: hybrid attention + Mamba sidecar cache (`KV + MAMBA`)
+
+Important details from this validation:
+
+- Use a real `.toml` file path with `--hicache-storage-backend-extra-config`.
+- Do not point SGLang at `nixl.config.toml.sample` directly, because SGLang validates the file extension and `.sample` is not accepted.
+- For this validated path, the storage directory was provided through `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`.
+
+Example TOML file:
+
+```toml
+[plugin.posix]
+use_uring = "true"
+active = true
+```
+
+Example serve command for a hybrid model:
+
+```bash
+export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/tmp/sglang_nixl_e2e_storage
+
+~/ve_sgl_dev/bin/sglang serve \
+  --model-path /workspace/LLM_models/Qwen3.5-0.8B \
+  --served-model-name Qwen/Qwen3.5-0.8B \
+  --host 127.0.0.1 \
+  --port 31000 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2 \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first \
+  --hicache-storage-prefetch-policy wait_complete \
+  --page-size 256 \
+  --log-level info \
+  --disable-cuda-graph \
+  --hicache-storage-backend nixl \
+  --hicache-storage-backend-extra-config @/tmp/nixl.config.toml \
+  --mamba-scheduler-strategy extra_buffer
+```
+
+Expected behavior for this validated setup:
+
+- the server starts with `Attached hybrid Mamba pool stack to HiMambaRadixCache: pools=KV + MAMBA`
+- NIXL logs show `Backend POSIX was instantiated`
+- the storage directory contains KV files plus Mamba sidecar files such as `..._0_1.mamba`
+- after restarting the server against the same storage directory, a repeated long prompt shows large `cached_tokens` in the response metadata
+
+Minimal end-to-end validation flow:
+
+1. Start the server with the TOML file shown above.
+2. Send a long prompt once to populate storage.
+3. Restart the server against the same `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`.
+4. Send the same long prompt again and confirm that `meta_info.cached_tokens` is high.
+
+In the validated run used for this backend, the repeated 6000-token prompt returned `cached_tokens: 5888`.
+
 
 ## Running Unit Tests
 

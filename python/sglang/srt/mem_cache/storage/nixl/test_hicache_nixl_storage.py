@@ -7,12 +7,37 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
-from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageConfig,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
     NixlFileManager,
     NixlRegistration,
 )
+
+try:
+    from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
+except ImportError:
+    HiCacheNixl = None
+
+
+class FakePool:
+    def __init__(self, page_size: int = 1, page_bytes: int = 4):
+        self.page_size = page_size
+        self.page_bytes = page_bytes
+        self.data = {}
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(self.page_bytes, dtype=torch.uint8)
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        self.data[index] = data_page.clone()
+
+    def get_data_page(self, index: int, flat: bool = True) -> torch.Tensor:
+        return self.data[index].clone()
 
 
 class TestNixlUnified(unittest.TestCase):
@@ -20,6 +45,9 @@ class TestNixlUnified(unittest.TestCase):
 
     def setUp(self):
         """Set up test environment."""
+        if HiCacheNixl is None:
+            self.skipTest("NIXL not available, skipping NIXL storage tests")
+
         # Create test directories
         self.test_dir = "/tmp/test_nixl_unified"
         os.makedirs(self.test_dir, exist_ok=True)
@@ -258,6 +286,92 @@ class TestNixlUnified(unittest.TestCase):
 
         # Test buffer registration
         self.assertIsNotNone(self.hicache.register_buffers(tensor))
+
+    def test_batch_exists_v2_respects_pool_hit_policies(self):
+        keys = ["k0", "k1", "k2", "k3"]
+        self.hicache.registered_pools = {
+            PoolName.MAMBA: FakePool(),
+            PoolName.INDEXER: FakePool(),
+        }
+        self.hicache.batch_exists = MagicMock(return_value=4)
+
+        existing = {
+            self.hicache._get_component_key("k0", PoolName.INDEXER),
+            self.hicache._get_component_key("k1", PoolName.INDEXER),
+            self.hicache._get_component_key("k2", PoolName.INDEXER),
+            self.hicache._get_component_key("k0", PoolName.MAMBA),
+            self.hicache._get_component_key("k1", PoolName.MAMBA),
+            self.hicache._get_component_key("k2", PoolName.MAMBA),
+        }
+        self.hicache._query_keys_exist = MagicMock(
+            side_effect=lambda query_keys: [key in existing for key in query_keys]
+        )
+
+        result = self.hicache.batch_exists_v2(
+            keys,
+            [
+                PoolTransfer(name=PoolName.INDEXER, hit_policy=PoolHitPolicy.ALL_PAGES),
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    keys=["k2"],
+                ),
+            ],
+        )
+
+        self.assertEqual(result.kv_hit_pages, 3)
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.INDEXER], 3)
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.MAMBA], 3)
+
+    def test_batch_get_set_v2_uses_pool_component_keys(self):
+        pool = FakePool()
+        pool.data[0] = torch.tensor([1, 2, 3, 4], dtype=torch.uint8)
+        pool.data[1] = torch.tensor([5, 6, 7, 8], dtype=torch.uint8)
+        self.hicache.registered_pools = {PoolName.MAMBA: pool}
+
+        recorded = {}
+
+        def fake_transfer(buffers, keys, direction):
+            recorded[direction] = (keys, [buf.clone() for buf in buffers])
+            if direction == "READ":
+                for i, buf in enumerate(buffers):
+                    buf.copy_(torch.full_like(buf, i + 9))
+            return True
+
+        self.hicache._transfer_by_keys = MagicMock(side_effect=fake_transfer)
+
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=torch.tensor([0, 1], dtype=torch.int64),
+            keys=["p0", "p1"],
+        )
+
+        set_results = self.hicache.batch_set_v2([transfer])
+        self.assertEqual(set_results[PoolName.MAMBA], [True, True])
+        self.assertEqual(
+            recorded["WRITE"][0],
+            [
+                self.hicache._get_component_key("p0", PoolName.MAMBA),
+                self.hicache._get_component_key("p1", PoolName.MAMBA),
+            ],
+        )
+        self.assertTrue(
+            torch.equal(recorded["WRITE"][1][0], torch.tensor([1, 2, 3, 4], dtype=torch.uint8))
+        )
+
+        get_results = self.hicache.batch_get_v2([transfer])
+        self.assertEqual(get_results[PoolName.MAMBA], [True, True])
+        self.assertEqual(
+            recorded["READ"][0],
+            [
+                self.hicache._get_component_key("p0", PoolName.MAMBA),
+                self.hicache._get_component_key("p1", PoolName.MAMBA),
+            ],
+        )
+        self.assertTrue(torch.equal(pool.data[0], torch.tensor([9, 9, 9, 9], dtype=torch.uint8)))
+        self.assertTrue(
+            torch.equal(pool.data[1], torch.tensor([10, 10, 10, 10], dtype=torch.uint8))
+        )
 
         # Test batch registration
         tensors = [torch.randn(5, 5) for _ in range(3)]
