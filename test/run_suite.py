@@ -55,9 +55,17 @@ PER_COMMIT_SUITES = {
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-b200",
         "stage-c-test-deepep-4-gpu-h100",
-        "stage-c-test-deepep-8-gpu-h200",
         "stage-c-test-dsv4-4-gpu-b200",
         "stage-c-test-dsv4-8-gpu-h200",
+        # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
+        # (tests still tagged per-commit but skipped on default PR runs).
+        "extra-a-test-1-gpu-small",
+        "extra-a-test-1-gpu-large",
+        "extra-a-test-2-gpu-large",
+        "extra-b-test-4-gpu-h100",
+        "extra-b-test-4-gpu-b200",
+        "extra-b-test-8-gpu-h200",
+        "extra-b-test-deepep-8-gpu-h200",
     ],
     HWBackend.NPU: [
         "stage-a-test-1-gpu-small",
