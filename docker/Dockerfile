@@ -787,6 +787,9 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
 COPY --from=framework_final /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
 
+# Copy router CLI binary built in framework stage
+COPY --from=framework /usr/local/bin/sglang-router /usr/local/bin/sglang-router
+
 # Copy SGLang workspace
 COPY --from=framework_final /sgl-workspace /sgl-workspace
 
