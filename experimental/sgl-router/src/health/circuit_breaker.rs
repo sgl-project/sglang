@@ -108,10 +108,9 @@ impl CircuitBreaker {
                 }
             }
             State::Open { .. } => {
-                // Already open — refresh opened_at to extend the cool-down.
-                g.state = State::Open {
-                    opened_at: Instant::now(),
-                };
+                // Already open: ticking consecutive_failures or refreshing opened_at
+                // would pin us Open during a failure storm. The cool_down is
+                // measured from first-open; failures during Open are ignored.
             }
         }
     }
