@@ -107,7 +107,18 @@ pub async fn spawn(
     let (notify_tx, mut notify_rx) = mpsc::channel(64);
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(e) = res {
-            let _ = notify_tx.blocking_send(e);
+            // The notify-rs callback runs on the watcher's internal thread.
+            // blocking_send would block that thread when full, silently dropping
+            // subsequent fs events. Use try_send instead: warn on Full, no-op on Closed.
+            match notify_tx.try_send(e) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!("static_file discovery: event channel full, dropping event");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    // Consumer dropped; nothing useful to do on the notify thread.
+                }
+            }
         }
     })
     .context("create file watcher")?;
