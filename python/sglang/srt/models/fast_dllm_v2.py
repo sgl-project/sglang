@@ -21,7 +21,7 @@ Reference: https://huggingface.co/Efficient-Large-Model/Fast_dLLM_v2_7B
 """
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -43,7 +43,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention, AttentionType
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -263,6 +263,7 @@ class FastDLLMV2DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
+
 class FastDLLMV2Model(nn.Module):
     def __init__(
         self,
@@ -402,12 +403,14 @@ class FastDLLMV2Model(nn.Module):
                     "Self attention has no KV cache scaling " "factor attribute!"
                 )
 
+
 class FastDLLMV2(nn.Module):
     """
     Fast-dLLM v2 model for SGLang.
 
     This model is based on Qwen2 architecture with block diffusion capabilities.
     """
+
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -426,7 +429,6 @@ class FastDLLMV2(nn.Module):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
-
 
     def __init__(
         self,
@@ -474,7 +476,7 @@ class FastDLLMV2(nn.Module):
         # Return full logits for FastDLLMV2
         self.logits_processor = LogitsProcessor(config, return_full_logits=True)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-    
+
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embedding(input_ids)
 

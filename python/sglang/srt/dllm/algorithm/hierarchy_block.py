@@ -25,9 +25,7 @@ class HierarchyBlock(DllmAlgorithm):
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
-    ) -> Tuple[
-        Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool
-    ]:
+    ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
         # Per-request inheritance state (last_inherited_token, positions[0]==0
         # new-request detection) assumes a single in-flight request. DLLM is
         # launched with --max-running-requests=1, so enforce that here.
@@ -77,9 +75,7 @@ class HierarchyBlock(DllmAlgorithm):
 
                 # Token shift: [L0, L0, L1, ..., LN-2]
                 if self.token_shift > 0:
-                    shifted_full = torch.cat(
-                        [full_logits[:1], full_logits[:-1]], dim=0
-                    )
+                    shifted_full = torch.cat([full_logits[:1], full_logits[:-1]], dim=0)
                 else:
                     shifted_full = full_logits
 
