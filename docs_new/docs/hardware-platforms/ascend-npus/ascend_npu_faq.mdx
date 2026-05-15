@@ -1,0 +1,223 @@
+---
+title: "Ascend NPU Troubleshooting and FAQ"
+metatags:
+  description: "Troubleshooting and frequently asked questions for Ascend NPU"
+---
+
+Contributions are welcome. Feel free to add more.
+
+## 1. Context corruption with GLOO op.preamble.length &lt;= op.nbytes in PD disaggregation
+
+### Error message
+
+```text highlight=2,5-7
+[2026-04-07 13:24:13 TP0] Decode batch, #running-req: 10, #token: 485248, token usage: 0.94, pre-allocated usage: 0.51, #prealloc-req: 1, #transfer-req: 12, #retracted-req: 0, npu graph: True, gen throughput (token/s): 259.82, #queue-req: 0
+[2026-04-07 13:24:13 TP0] Context corruption detected: Request 3b5dcfe1575d4e1f9b18c953de878a93 (bootstrap_room=7451500070298748792) received metadata from bootstrap_room=4125156593077881415. Metadata buffer index: 1. This indicates metadata buffer index collision.
+[2026-04-07 13:24:13] INFO:      127.0.0.1:59272 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[2026-04-07 13:24:13] INFO:      127.0.0.1:34000 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+terminate called after throwing an instance of 'gloo::EnforceNotMet'
+ what():  [enforce fail at /pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:456] op.preamble.length <= op.nbytes. 4 vs 3
+Fatal Python error: Aborted
+
+Thread 0x0000fff873f6f120 (most recent call first):
+ File "/usr/local/python3.11.14/lib/python3.11/site-packages/sglang/srt/disaggregation/mooncake/conn.py", line 1499 in heartbeat_checker
+```
+
+### Cause
+
+(Possibly, not precisely located) High-concurrency long sequences fill up the transfer buffer, causing buffer index collision and data corruption.
+
+### Solution
+
+1. Disable overlap on the Prefill node with `--disable-overlap-schedule`. The Prefill node in PD disaggregation must not enable overlap, otherwise it causes timing issues that lead to out-of-order reception on the Decode node.
+2. Even with overlap disabled, multi-Prefill node high-concurrency long-sequence scenarios may still encounter this issue with low probability. This is a known issue pending resolution.
+
+## 2. Graph mode aclnnInplaceFillScalar error
+
+### Error message
+
+```text highlight=2
+(SGLangEngine pid=3872176) [rank0]:[E414 12:14:41.204711510 compiler_depend.ts:444] operator():build/CMakeFiles/torch_npu.dir/compiler_depend.ts:26 NPU function error:
+ call aclnnInplaceFillScalar failed, error code is 507000
+(SGLangEngine pid=3872176) [ERROR] 2026-04-14-12:14:41 (PID:3874122, Device:0, RankID:-1) ERR00100 PTA call acl api failed
+(SGLangEngine pid=3872176) [Error]: An internal error occurs in the runtime module on the host.
+(SGLangEngine pid=3872176) Rectify the fault based on the error information in the ascend log.
+(SGLangEngine pid=3872176) [PID: 3874122] 2026-04-14-12:14:41.897.548 AclNN_Runtime_Error(EZ9903): aclrtLaunchKerneWithHostArgs failed, return: 507000
+(SGLangEngine pid=3872176)	Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+(SGLangEngine pid=3872176)	TraceBack (most recent call last):
+(SGLangEngine pid=3872176)	Check kernel task failed, stream_id=2028, task_id=48, retCode=0x7080005.[FUNC:LaunchKernel][FILE:context.cc][LINE:1585]
+(SGLangEngine pid=3872176)	rtsLaunchKernelWithHostArgs execution failed, reason=kernel type error[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:61]
+(SGLangEngine pid=3872176)	rtsLaunchKernelWithHostArgs failed, runtime result = 507000.[FUNC:ReportCallError][FILE:Log_inner.cpp][LINE:148]
+(SGLangEngine pid=3872176)	aclrtLaunchKerneWWithHostArgs failed, return: 507000
+(SGLangEngine pid=3872176) 	Launch kernel failed.
+(SGLangEngine pid=3872176)	#### KernelLaunch failed: /home/850b160/cann-8.5.8/opp/built-in/op_impl/ai_core/tbe//kernel/ascend910_93/ops_legacy/fill/Fill_41dadce325bOf810d03359af2a38990b_high_performance.o
+(SGLangEngine pid=3872176)	Kernel Run failed. opType: 18, Fill
+(SGLangEngine pid=3872176)	launch failed for Fill, errno:361001.
+(SGLangEngine pid=3872176)
+(SGLangEngine pid=3872176) Exception raised from operator() at build/CMakeFiles/torch_npu.dir/compiler depend.ts:26 (most recent call first):
+(SGLangEngine pid=3872176) frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >)+ 0xb0 (0xffff806848c0 in /root/anaconda3/envs/slime_re/Lib/python3.11/site-packages/torch/lib/libc10.so)
+(SGLangEngine pid=3872176) frame #1: c10::detail::torchCheckFail(char const*, char const*, unsigned int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) + 0x68(0xffff8062c140 in /root/anaconda3/envs/slime_re/Tib/puthon3.11/site-packages/torch/lib/libc10.so)
+(SGLangEngine pid=3872176) frame #2: <unknown function> + 0x110e2b4 (0xffff6d44e2b4 in /root/anaconda3/envs/slime_re/lib/python3.11/site-packages/torch_npu/lib/libtorch_npu.so)
+(SGLangEngine pid=3872176) frame #3: <unknown function> + 0x29f0894(0xffff6ed30894 in /root/anaconda3/envs/slime_re/lib/python3.11/site-packages/torch_npu/lib/libtorch_npu.so)
+(SGLangEngine pid=3872176) frame #4: <unknown function> + 0x9cc708(0xffff6cd0c700 in /root/anaconda3/envs/slime_re/lib/python3.11/site-packages/torch_npu/lib/libtorch_npu.so)
+(SGLangEngine pid=3872176) frame #5: <unknown function> + 0x9cd2dc (0xffff6cd0d2dc in /root/anaconda3/envs/slime_re/lib/python3.11/site-packages/torch_npu/lib/libtorch_npu.so)
+```
+
+### Cause
+
+Too many captured graphs cause a conflict in the graph mode update stream. Each graph is placed on a separate stream, but the number of streams is limited. If too many graphs are captured, conflicts occur.
+
+### Solution
+
+- CANN 8.5 + PTA 2.8 should have resolved this issue.
+- If your versions do not match, reduce the number of captured graphs to 10 or fewer.
+
+## 3. alloc_extend_kernel error
+
+### Error message
+
+```
+[root@os-node-created-6z9tp pd_7p1d_tp2_20260414_030537]# grep -nR -E "aivec error|ACL" *,log
+prefill 1.log:5739:EZ9999[PID: 164243] 2026-04-14-06:40:35.033.745 (EZ9999): The error from device(chipId:0, dieId:1), serial number is 1, there is an exception of aivec error, core id is 23, error code = 0, dump info: pc start: 0x12420156a000, current: 0x12420156ad74, vec error info: 0xdb1751f50e, mte error info: 0x98f6388707, ifu error info: 0x212c93fc00000, ccu error info: 0x998e981c00000000, cube error info: 0, biu error info: 0, aic error mask: 0x6500020bd00028c, para base: 0x12c100dccc00.[FUNC:PrintCoreInfo][FILE:device error core proc.cc][LINE:347]
+prefill_1.log:5747:EZ9999[PID: 164242] 2026-04-14-06:40:35.034.456 (EZ9999):  The error from device(chipId:0, dieId:0), serial number is 1, there is an exception of aivec error, core id is 45, error code = O, dump info: pc start: 0x12400156a000, current: 0x12400156ad74, vec error info: 0x7304583407, mte error info: 0x27e2b1c765, ifu error info: 0x212c93fc00000, ccu error info: 0x6e0836f300000000, cube error info: 0, biu error info: 0O, aic error mask: 0x6500020bd00028c, para base: 0x12c100dccc0O.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:347]
+prefill_1.Log:5784:RuntimeError: ACL stream synchronize failed, error code:507035
+prefill_1.Log:5816:RuntimeError: ACL stream synchronize failed, error code:507035
+prefill 2.log:2566:EZ9999[PID: 163475] 2026-04-14-05:28:43.282.016 (EZ9999):  The error from device(chipId:1, dieId:1), serial number is 1, there is an exception of aivec error, core id is 20, error code = 0, dump info: pc start: 0x124601550000, current: 0x124601550d74, vec error info: 0x9b07e496e3, mte error info: 0xc2a6806828, ifu error info: 0x212c93f200000, ccu error info: 0xaa64401100000000, cube error info: O, biu error info: 0, aic error mask: 0x6500020bd00028c, para base: 0x12c100c72400.[FUNC:PrintCoreInfo][FILE:device_error_core proc.cc][LINE:347]
+prefill 2.log:2574:EZ9999[PID: 163474] 2026-04-14-05:28:43.282.809 (EZ9999):  The error from device(chipId:1, dieId:0), serial number is 1, there is an exception of aivec error, core id is 22, error code = 0, dump info: pc start: 0x124401550000, current: 0x124401550d74, vec error info: 0xa80496049a, mte error info: 0xa0770e2bf2, ifu error info: 0x212c93f200000, ccu error info: 0x1083000000000000, cube error info: O, biu error info: 0O, aic error mask: 0x6500020bd00028c, para base: 0x12c100c72400.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:347]
+prefill 2.log:2611:RuntimeError: ACL stream synchronize failed, error code:507035
+prefill 2.log:2644:RuntimeError: ACL stream synchronize failed, error code:507035
+prefill 4.log:1323:EZ9999[PID: 163478] 2026-04-14-05:08:15.363.509 (EZ9999):  The error from device(chipId:3, dieId:0), serial number is 1, there is an exception of aivec error, core id is 5, error code = 0, dump info: pc start: 0x124c00dff000, current: 0x124c00dff860, vec error info: 0xf311fb8727, mte error info: 0x45418486a, ifu error info: 0x212c93fa00000, ccu error info: 0x17a9996f00000000, cube error info: 0, biu error info: 0, aic error mask: 0x6500020bd00028c, para base: 0x12c100d40c00.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:347]
+prefill 4.log:1331:EZ9999[PID: 163479] 2026-04-14-05:08:15.364.016 (EZ9999):  The error from device(chipId:3, dieId:1), serial number is 1, there is an exception of aivec error, core id is 40, error code = 0, dump info: pc start: 0x124e00dff000, current: 0x124e00dff860, vec error info: 0xf11a9cf188, mte error info: 0xfb7710514a, ifu error info: 0x212c93fa00000, ccu error info: 0x1f5828a900000000, cube error info: 0, biu error info: O, aic error mask: 0x6500020bd00028c, para base: 0x12c100d40c00.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:347]
+prefill 4.Log:1368:RuntimeError: ACL stream synchronize failed, error code:507035
+prefill 4.log:1400:RuntimeError: ACL stream synchronize failed, error code:507035
+prefill 7.log:3017:EZ9999[PID: 164628] 2026-04-14-05:34:12.369.755 (EZ9999): The error from device(chipId:6, dieId:0), serial number is 1, there is an exception of aivec error, core id is 33, error code = 0, dump info: pc start: 0x1258015ae000, current: 0x1258015aed74, vec error info: 0x740053222c, mte error info: 0x97103df5a0, ifu error info: 0x212c93f400000, ccu error info: 0x391c89ab00000000, cube error info: 0, biu error info: 0O, aic error mask: 0x6500020bd00028c, para base: 0x12c10Ocd6400.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:347]
+prefill 7.log:3025:EZ9999[PID: 164629] 2026-04-14-05:34:12.369.742 (EZ9999):  The error from device(chipId:6, dieId:1), serial number is 1, there is an exception of aivec error, core id is 42, error code = 0, dump info: pc start: 0x125a015ae000, current: 0x125a015aed74, vec error info: 0xb91ae07b35, mte error info: 0xfc000670ef, ifu error info: 0x212c93f400000, ccu error info: 0x57c069b000000000, cube error info: 0, biu error info: O, aic error mask: 0x6500020bd00028c, para base: 0x12c10Ocd6400.[FUNC:PrintCoreInfo][FILE:device_error_core_proc.cc][LINE:347]
+prefill 7.log:3062:RuntimeError: ACL stream synchronize failed, error code:507035
+prefill 7.log:3094:RuntimeError: ACL stream synchronize failed, error code:507035
+```
+
+### Error plog
+
+```text highlight=21
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.353.461 [stars engine.cc:1534]170327 ProcLogicCaReport:Task run failed, device id=13, stream id=43, task id=13145, sqe type=0(ffts), errType=0x1(task exception), sqSwStatus=0
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.369.720 device error core proc.cc:3211170327 AddExceptionReqInfo:add error register: core id=42, stream id=43, task id=13145
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.369.730 device error core proc.cc:3471170327 PrintCorelnfo:The error from device(chipld:6, dield:1), serial number is 1, there is an exception of aivec error, core id is 42, error code = O, dump info: pc start: 0x125a015ae000,current: 0x125a015aed74, vec error info: 0xb91ae07b35, mte error info: 0xfc000670ef, ifu error info: 0x212c93f400000, ccu error info: 0x57c069b000000000, cube error info: 0, biu error info: 0, aic error mask: 0x6500020bd00028c, para base: 0x12c100cd6400.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.369.774 device error core proc.cc:3601170327 PrintCorelnto:The extend into: errcode:(0, 0x8000, 0) errorStr: When the D-cache reads and writes data to the UB, the response value returned bv the bus is a non-zero value. fixp_error0 info: 0x670ef, fixp error1 info: 0xfc, fsmId:0, tslot:2, thread:0, ctxid:0, blk:2, sublk:0, subErrType:4.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.369.787 device error core proc.cc:4341170327 ProcessStarsCoreErrorInfo:devId=13, streamId=43, taskId=13145, MTE errorCode=0.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.369.795 davinci task.cc:2011170327 SetStarsResultForDavinciTask:AIV Kernel happen error, retCode=0x31.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.381.644 davinci kernel task.cc:15821170327 PreCheckTaskErr:Kernel task happen error retCode=0x31, vector core exception1.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.381.705 davinci kernel task.cc:14241170327 GetArasInfo:[AIC INFO] aras(0 to 9) after execute:0x3fffffb9000, 0, 0, 0x12c9323ff600, 0x12c93231ee00, 0x12c93f1d8800,0x12c93f3ff600,0x12c958200000,0x100000003, 0xaaaa00000001.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.381.710 [davinci kernel task.cc:1427]170327 GetArgsInfo:tilingKey = 0, print 1 Times totalLen=(10*8), argsSize=80, blockDim=3
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.381.717 [davinci kernel task.cc:1468]170327 PrintErrorInfoForDavinciTask:[AIC INFO] after execute:arqs print end
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.381.751 davinci kernel task.cc:14981170327 PrintErrorInfoForDavinciTask:[DFX INFO]Aicore kernel execute failed, device id=13, stream id=43, report stream id=43, task id=13145, flip num=56, fault kernel_name=alloc_extend _kernel_18, fault kernel info ext=alloc_extend_kernel, program id=141, hash=14069671779787989248.
+[ERROR] IDEDD(164629,):2026-04-14-05:34:12.381.823 [dump manager.cpp:41][tid:170327] An exception callback message is received.
+[ERROR] IDEDD(164629,):2026-04-14-05:34:12.381.971 [kernel info collector.cpp:384][tid:170327] Get error register information. coreNum=0
+[ERROR] IDEDD(164629,):2026-04-14-05:34:12.381.981 kernel info collector.cpp:4771tid:1703271 It is Non-SuperKernel. functionCount=1, qlobalCount=1
+[ERROR] IDEDD(164629,):2026-04-14-05:34:12.381.987 [dump args.cpp:668][tid:170327] In arqAddr[0x12c100cd6400]|arqSize[80]dfxAddr[(nil)]|dfxSize[0] has invalid attribute.
+[ERROR] IDEDD(164629,):2026-04-14-05:34:12.383.894 [dump_printf.cpp:1118][tid:170327] infoAddr is null
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.908 [stream.cc:1332]170327 GetError:Stream Synchronize failed, stream id=43, retCode=0x31, [vector core exception].
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.911 [stream.cc:1335]170327 GetError:AIV Kernel happen error, retCode=0x31.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.929 [stream.cc:1335]170327 GetError:[AIC_INFO] after execute:args print end
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.936 stream.cc:13351170327 GetError: DFX INFO1Aicore kernel execute failed, device id=13, stream id=43, report stream id=43, task id=13145, tlip num=56,
+ fault kernel_name=alloc_extend_kernel_18, ault kernel info ext=alloc_extend_kernel, program id=141, hash=14069671779787989248.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.943 [stream.cc:3549]170327 EnterFailureAbort:stream id=43 enter failure abort.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.973 [stars_engine.cc:1427]170327 StarsResumeRtsa:stop scheduling in abort failure mode: stream id=43, sq id=6,sq head=801, task id=13145, taskType=66.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.972 [stream.cc:1463]164629 SynchronizeExecutedTask:context is abort, status=0x715005e.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.978 [stream.cc:1516]164629 Synchronizelmpl:failed, stream_id=43, error=0x715005e
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.982 [api error.cc:1015]164629 StreamSynchronize:Stream synchronize failed, stream_id=43, timeout=-1ms.
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.991 [apic stream.cc:154]164629 rtStreamSynchronize:ErrCode=507035, desc=[vector core exception], InnerCode=0x715005e
+[ERROR] RUNTIME(164629,):2026-04-14-05:34:12.383.997 [error_message_manage.cc:61]164629 FuncErrorReason:rtStreamSynchronize execution failed, reason=vector core exception
+[ERROR] ASCENDCL(164629,):2026-04-14-05:34:12.384.269 [stream.cpp:140]164629 acIrtSynchronizeStreamImpl:synchronize stream failed, runtime result = 507035
+```
+
+### Cause
+
+The `alloc_extend_kernel` operator appears to have a memory allocation issue. Pending resolution.
+
+### Solution
+
+Modify `sglang/srt/hardware_backend/npu/allocator_npu.py` to comment out the affected branch and use the else branch instead.
+
+```text highlight=15-36
+    def alloc_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        num_new_pages: int = None,
+    ):
+        ...
+        if num_new_pages_item > len(self.free_pages):
+            return None
+
+        # if num_new_pages_item < 200:
+        #     from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
+
+        #     out_indices = torch.empty(
+        #         (extend_num_tokens,),
+        #         dtype=torch.int64,
+        #         device=self.device,
+        #     )
+        #     max_num_extend_tokens = next_power_of_2(extend_num_tokens)
+        #     bs = prefix_lens.shape[0]
+        #     alloc_extend_kernel[(bs,)](
+        #         prefix_lens,
+        #         seq_lens,
+        #         last_loc,
+        #         self.free_pages,
+        #         out_indices,
+        #         next_power_of_2(bs),
+        #         self.page_size,
+        #         max_num_extend_tokens,
+        #     )
+
+        # else:
+            out_indices = torch.empty(
+                (extend_num_tokens,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        ...
+```
+
+## 4. Out of NPU memory
+
+```text highlight=7
+  File "/home/code/sglang/python/sglang/srt/model_executor/pool_configurator.py", line 175, in calculate_pool_sizes
+    return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 8, in __init__
+  File "/home/code/sglang/python/sglang/srt/model_executor/pool_configurator.py", line 44, in __post_init__
+    raise RuntimeError(msg)
+RuntimeError: Not enough memory. Please try to increase --mem-fraction-static.
+```
+
+### Solution
+
+First, use the `npu-smi info` command to check the NPU memory usage.
+
+If the NPUs are occupied by other processes, use `--base-gpu-id` to specify the starting device index.
+
+If the NPUs are not occupied, you can use `--tp` to deploy across multiple devices, or reduce the KV cache memory usage by decreasing the `--mem-fraction-static` value. For detailed tuning guidance, see [Hyperparameter Tuning](/docs/advanced_features/hyperparameter_tuning).
+
+## 5. How to update sgl-kernel-npu
+
+### Solution
+```
+git clone https://github.com/sgl-project/sgl-kernel-npu.git
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+cd sgl-kernel-npu
+# Building Project
+bash build.sh
+
+pip install output/sgl_kernel_npu*.whl --force-reinstall
+
+# (Optional) Confirm whether the import can be successfully
+python -c "import sgl_kernel_npu; print(sgl_kernel_npu.__path__)"
+
+rm -rf sgl-kernel-npu
+```
