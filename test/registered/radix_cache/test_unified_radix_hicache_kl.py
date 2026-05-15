@@ -99,8 +99,9 @@ def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
 class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """DeepSeek V4 Flash FP8 + HiCache + UnifiedRadixCache."""
 
-    hicache_io_backend = "kernel"
-    hicache_mem_layout = "layer_first"
+    hicache_io_backend = "direct"
+    hicache_mem_layout = "page_first_direct"
+    max_running_requests = 4
     kl_threshold = 0.0035
     sampling_temperature = 0
     decode_cache_assert = staticmethod(_assert_dsv4_decode_cached_tokens)
@@ -146,7 +147,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
                 "--max-total-tokens",
                 "20000",
                 "--max-running-requests",
-                "4",
+                str(cls.max_running_requests),
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
@@ -165,8 +166,9 @@ class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
 ):
     """DeepSeek V4 Flash HiCache layout smoke: page_first_direct + direct."""
 
-    hicache_io_backend = "direct"
-    hicache_mem_layout = "page_first_direct"
+    hicache_io_backend = "kernel"
+    hicache_mem_layout = "layer_first"
+    max_running_requests = 4
 
 
 if __name__ == "__main__":
