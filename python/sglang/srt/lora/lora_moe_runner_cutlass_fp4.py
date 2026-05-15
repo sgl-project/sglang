@@ -1,14 +1,5 @@
-"""FlashInfer-CUTLASS NVFP4 MoE runner core with LoRA support.
-
-Breaks open the upstream ``flashinfer_cutlass_fused_moe`` (a single black-box
-kernel called from ``ModelOptNvFp4FusedMoEMethod.apply``) into its FP4 group
-GEMMs so we can inject the standard ``after_gate_up`` / ``after_down`` LoRA
-hooks between w13 and w2, mirroring ``MarlinLoraRunnerCore``.
-
-Layout bridge: ``cutlass_fp4_group_mm`` writes expert-sorted ``[M*topk, *]``.
-Classic and virtual-expert LoRA hooks consume ``c_map`` directly so the hot
-path stays sorted until the final combine.
-"""
+"""NVFP4 MoE runner that exposes ``after_gate_up`` / ``after_down`` LoRA hooks
+between the W13 and W2 group GEMMs of FlashInfer-CUTLASS."""
 
 from __future__ import annotations
 
@@ -34,30 +25,24 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
+# Use the JIT silu_and_mul: it carries the ``swap_halves`` flag (the AOT
+# sgl_kernel build doesn't expose it yet) for Kimi-K2.5's ``[Up|Gate]`` W13.
 if _is_cuda:
-    # In-tree JIT variant (carries the ``swap_halves`` flag added for the
-    # ``[Up | Gate]`` Kimi-K2.5 W13 loader layout). The sgl_kernel AOT
-    # build doesn't expose ``swap_halves`` yet; the JIT path is the only
-    # caller of swap_halves and is loaded on demand on first use.
     from sglang.jit_kernel.activation import silu_and_mul
 elif _is_hip:
-    # HIP path doesn't reach the cutlass FP4 LoRA runner (SM100+ only).
-    # Keep the existing import for code-symmetry; if it's ever called with
-    # swap_halves=True it will raise.
+    # SM100+ only; this import is here for symmetry and should never run.
     from vllm._custom_ops import silu_and_mul
 
 
 @dataclass
 class CutlassFp4MoeQuantInfo(MoeQuantInfo):
-    """Quantization payload consumed by ``CutlassFp4LoraRunnerCore``."""
-
-    w13_weight: torch.Tensor  # [E, 2 * N, K // 2] uint8
-    w2_weight: torch.Tensor  # [E, K, N // 2]     uint8
+    w13_weight: torch.Tensor  # [E, 2*N, K // 2] uint8
+    w2_weight: torch.Tensor  # [E, K, N // 2]   uint8
     w13_blockscale_swizzled: torch.Tensor
     w2_blockscale_swizzled: torch.Tensor
     g1_alphas: torch.Tensor  # [E] fp32
     g2_alphas: torch.Tensor  # [E] fp32
-    # ``[E]``-expanded once at load time so the hot path never has to expand.
+    # [E]-expanded once at load time so the hot path doesn't broadcast.
     w13_input_scale_expanded: torch.Tensor  # [E] fp32
     w2_input_scale_expanded: torch.Tensor  # [E] fp32
     cutlass_moe_params: object
@@ -65,20 +50,16 @@ class CutlassFp4MoeQuantInfo(MoeQuantInfo):
     hidden_size: int
     intermediate_size_per_partition: int
     moe_ep_rank: int
-    moe_ep_size: int
-    # FlashInfer-CUTLASS loads w13 as ``[up | gate]`` (Kimi-K2.5).
+    # ``[Up|Gate]`` W13 layout (Kimi-K2.5): silu the second half, multiply the first.
     w13_swap_halves: bool
 
 
 class CutlassFp4LoraRunnerCore:
-    """LoRA-aware NVFP4 MoE forward on the FlashInfer-CUTLASS GEMM primitives.
-
-    Pipeline: EP local-id remap → FP4 GEMM 1 → ``after_gate_up`` →
-    silu_and_mul → FP4 GEMM 2 → ``after_down`` → un-sort/combine.
-    """
+    """LoRA-aware NVFP4 MoE forward on the FlashInfer-CUTLASS GEMM primitives."""
 
     def __init__(self, config: MoeRunnerConfig):
-        self.config = config
+        # config is unused today; runner_config is passed per-call.
+        pass
 
     def run_from_dispatch(
         self,
@@ -98,19 +79,12 @@ class CutlassFp4LoraRunnerCore:
             StandardCombineInput,
         )
 
-        # The FP4 all-gather dispatch path (DP-attention + EP + flashinfer_cutlass
-        # + modelopt_fp4, gated by ``should_use_flashinfer_cutlass_moe_fp4_allgather``)
-        # replaces ``dispatch_output.hidden_states`` with pre-packed FP4 uint8 and
-        # populates ``hidden_states_scale``. The base ``flashinfer_cutlass_fused_moe``
-        # call consumes that pair; our unfused runner currently re-quantizes
-        # ``hidden_states`` via ``scaled_fp4_experts_quant`` assuming it is bf16
-        # input, so the packed-input variant would silently produce garbage.
+        # FP4 all-gather dispatch (gated by should_use_flashinfer_cutlass_moe_fp4_allgather)
+        # delivers pre-packed FP4 input; this runner re-quantizes bf16 only.
         if getattr(dispatch_output, "hidden_states_scale", None) is not None:
             raise NotImplementedError(
-                "CutlassFp4LoraRunnerCore does not yet support the FP4 all-gather "
-                "dispatch path (StandardDispatcher with should_use_flashinfer_cutlass_"
-                "moe_fp4_allgather()). Disable that path for LoRA configurations, or "
-                "extend this runner to consume the pre-packed FP4 input."
+                "CutlassFp4LoraRunnerCore does not support the FP4 all-gather "
+                "dispatch path; disable it for LoRA configurations."
             )
 
         hidden_states = dispatch_output.hidden_states
@@ -124,17 +98,14 @@ class CutlassFp4LoraRunnerCore:
         device = hidden_states.device
         E = quant_info.num_local_experts
         K = quant_info.hidden_size
-        # ``prepare_moe_input`` takes the un-doubled intermediate size; ``N``
-        # below is the doubled w13 output used for silu / shuffle_rows.
         inter = quant_info.intermediate_size_per_partition
-        N = inter * 2
+        N = inter * 2  # w13 output dim (gate|up concatenated)
         params = quant_info.cutlass_moe_params
         offsets = params.expert_offsets
         total_tokens = m_a * num_topk
 
         # StandardDispatcher hands flashinfer_cutlass global topk_ids; remap
-        # to local for the per-rank GEMM. Non-local tokens go to local expert
-        # 0 with weight 0 — they pay GEMM cost but contribute nothing.
+        # to local. Non-local tokens go to local expert 0 with weight 0.
         local_offset = quant_info.moe_ep_rank * E
         local_ids = topk_ids.to(torch.int32) - local_offset
         non_local = (local_ids < 0) | (local_ids >= E)
@@ -175,29 +146,18 @@ class CutlassFp4LoraRunnerCore:
             params.to_gemm1_args(),
         )
 
-        # Hand the LoRA hook builder the c_map so its kernel calls read/write
-        # against the expert-sorted base GEMM buffers directly, skipping the
-        # 3× ``shuffle_rows`` layout bridge the token-major contract would
-        # otherwise need (un-sort gateup, re-sort gateup, un-sort intermediate).
-        # ``sorted_layout=True`` also tells ``_add_lora_down_delta`` to leave
-        # the router weighting to the runner — see the post-W2 multiply below.
-        # The hook closures captured ``lora_info`` from ``build_lora_hooks`` so
-        # these mutations are visible at hook-call time.
+        # Hand the LoRA hooks the c_map so their kernels read/write expert-sorted
+        # rows directly, skipping the token-major round-trips.
         if lora_info is not None:
             lora_info.c_map = c_map
             lora_info.sorted_layout = True
 
         # ---- LoRA w13 delta
-        # Output buffer is ``gateup_flat`` interpreted as ``[M, topk, 2N]``;
-        # the kernel uses c_map indirection to write the delta at the
-        # expert-sorted row matching the base GEMM output.
         if hooks is not None and hooks.after_gate_up is not None:
             gateup_3d = gateup_flat.view(m_a, num_topk, N)
             hooks.after_gate_up(hidden_states, gateup_3d, topk_weights, topk_ids)
 
         # ---- silu + mul
-        # ``w13_swap_halves=True`` selects the ``[up | gate]`` convention
-        # (silu(second) * first) for FlashInfer-CUTLASS NVFP4 W13 loaders.
         intermediate = torch.empty(
             total_tokens, N // 2, dtype=out_dtype, device=device
         )
@@ -221,19 +181,14 @@ class CutlassFp4LoraRunnerCore:
             params.to_gemm2_args(),
         )
 
-        # ---- LoRA w2 delta
-        # Input ``intermediate`` is already expert-sorted (W13->silu output);
-        # the down kernel uses c_map indirection on BOTH input and output, so
-        # we don't materialize a token-major copy. ``mul_routed_weight=False``
-        # is set inside ``_add_lora_down_delta`` for sorted layout — the
-        # router weighting happens once below, over ``base + unweighted_delta``.
+        # ---- LoRA w2 delta. Sorted-layout: hook writes unweighted delta into
+        # out_flat; router weighting happens once in the combine below.
         if hooks is not None and hooks.after_down is not None:
             out_3d_sorted_view = out_flat.view(m_a, num_topk, K)
             hooks.after_down(intermediate, out_3d_sorted_view, local_weights, topk_ids)
 
-        # ---- combine: un-sort once, weight (base + delta) once, sum. Keep
-        # router weights in fp32 to match FlashInfer-CUTLASS fused MoE's final
-        # accumulation; the kernel stores the final result as ``out_dtype``.
+        # ---- combine: un-sort, weight (base + delta), sum. Router weights stay
+        # fp32 to match FlashInfer-CUTLASS fused MoE's final accumulation.
         output = torch.empty((m_a, K), dtype=out_dtype, device=device)
         apply_shuffle_mul_sum(
             out_flat,

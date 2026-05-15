@@ -51,12 +51,8 @@ struct ActivationParams {
   uint32_t expert_step;
 };
 
-// kSwapHalves selects which half of the [first | second] input feeds the
-// activation. kSwapHalves=false computes act(first) * second (the stock
-// [Gate | Up] convention). kSwapHalves=true computes act(second) * first
-// (the [Up | Gate] convention used by FlashInfer-CUTLASS NVFP4 MoE, e.g.
-// Kimi-K2.5). The flag is a template constexpr, so the existing call path
-// compiles to byte-identical SASS.
+// kSwapHalves=false: act(first) * second  ([Gate | Up], default).
+// kSwapHalves=true : act(second) * first  ([Up | Gate], FlashInfer-CUTLASS NVFP4).
 template <typename T, ActivationKind kAct, bool kUsePDL, bool kFilterExpert, bool kSwapHalves>
 __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams params) {
   using namespace device;

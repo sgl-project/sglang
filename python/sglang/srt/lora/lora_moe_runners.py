@@ -188,25 +188,14 @@ class LoRAInfo:
     hidden_size: int = 0
     lora_use_virtual_experts: bool = False
 
-    # True iff at least one request in the batch maps to a slot with rank > 0.
-    # Mirrors ``LoRABatchInfo.has_active_lora`` set by ``LoRAManager``; read by
-    # ``build_lora_hooks`` to gate the eager-mode ``fused_moe_lora`` launch.
+    # True iff at least one batch request maps to a slot with rank > 0.
     has_active_lora: bool = True
 
-    # When set, the kernel reads/writes its input/output via
-    # ``c_map[pair_idx]`` instead of ``pair_idx`` — letting callers keep
-    # tensors in expert-sorted layout and skip the ``shuffle_rows`` round
-    # trips that bridge between expert-sorted GEMM output and token-major
-    # hook contract. Populated by ``CutlassFp4LoraRunnerCore`` (which has
-    # the maps from ``prepare_moe_input``); other runners leave it ``None``
-    # and get the existing token-major behavior.
+    # Set by the runner when its GEMM outputs are in expert-sorted layout.
+    # When ``sorted_layout`` is True and ``c_map`` is set, hook kernels
+    # address rows via ``c_map[pair_idx]`` and the runner applies router
+    # weights once over (base + delta) instead of the kernel doing it.
     c_map: torch.Tensor | None = None
-
-    # When ``c_map`` is set AND this flag is True, ``_add_lora_down_delta``
-    # passes ``mul_routed_weight=False`` to the kernel — the caller is
-    # responsible for applying router weights after the LoRA delta is
-    # accumulated, so the kernel doesn't pre-weight (which would double the
-    # weighting under sorted-layout reordering).
     sorted_layout: bool = False
 
 
@@ -510,10 +499,8 @@ def _add_lora_down_delta(
         )
     else:
         blk = _get_moe_lora_block_config(lora_info.max_lora_rank)
-        # Sorted-layout callers apply router weights *after* the LoRA delta is
-        # accumulated into the expert-sorted output; running mul_routed_weight
-        # inside the kernel here would double-weight (Bug 4 reborn under the
-        # new layout). Token-major callers keep the existing single-weighting.
+        # Sorted-layout callers apply router weights themselves over base+delta;
+        # don't let the kernel pre-weight or we double-weight.
         kernel_mul_routed_weight = not _sorted_layout_active(lora_info)
         fused_moe_lora(
             output=intermediate_cache,
@@ -568,10 +555,8 @@ def build_lora_hooks(
         if get_capture_lora_variant() == "nolora":
             return LoRAHooks()
     elif not lora_info.has_active_lora:
-        # Eager-mode mirror of the graph-mode "nolora" gate above. The kernel
-        # is mathematically zero on the passthrough slot (``lora_a``/``lora_b``
-        # are zero-initialised), but its bf16 round-trip accumulates across
-        # layers into visible drift on the NVFP4 path.
+        # Eager-mode mirror of the graph-mode "nolora" gate: skip kernels whose
+        # zero-LoRA passthrough still accumulates bf16 drift on the NVFP4 path.
         return LoRAHooks()
 
     # Compute alignment / mapping (once, shared by both hooks)
