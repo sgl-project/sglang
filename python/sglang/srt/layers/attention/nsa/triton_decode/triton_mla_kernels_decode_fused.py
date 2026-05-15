@@ -1158,14 +1158,13 @@ def _fused_gather_attn_dsv4_dual_scope_kernel(
     tl.store(lse_ptrs, lse, mask=mask_h)
 
 
-
 def _prune_splitk_configs(configs, named_args, **kwargs):
     """Prune BLOCK_H=16 configs for large batch sizes to avoid CU oversubscription.
-    
+
     With h_q=128 and BLOCK_H=16, the grid has cdiv(128,16)=8 H-blocks.
     At bs=32 with split_k=2, this creates 8*32*2=512 blocks (200% CU),
     causing performance regression from oversubscription.
-    
+
     For small batch sizes (bucket <= 8), BLOCK_H=16 provides better
     parallelism and is ~10% faster in CUDA graph replay.
     """
@@ -1652,9 +1651,7 @@ def fused_gather_attn_decode_dsv4_dual_scope(
     )
     # For h_q > 64 (e.g. h_q=128), the non-splitk grid has very few blocks
     # in the H dimension, leading to low GPU utilization at medium batch sizes.
-    use_splitk_for_large_hq = (
-        h_q > 64 and total_tokens > 8 and total_topk >= 256
-    )
+    use_splitk_for_large_hq = h_q > 64 and total_tokens > 8 and total_topk >= 256
     if (
         use_splitk_for_small_bs
         or use_splitk_for_h64_large_topk
@@ -2847,9 +2844,7 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
     # For h_q > 64 (e.g. h_q=128), the non-splitk grid has very few blocks
     # in the H dimension (cdiv(128,64)=2), leading to low GPU utilization
     # at medium batch sizes.  Split-K doubles the parallelism.
-    use_splitk_for_large_hq = (
-        h_q > 64 and total_tokens > 8 and total_topk >= 256
-    )
+    use_splitk_for_large_hq = h_q > 64 and total_tokens > 8 and total_topk >= 256
 
     if not (
         use_splitk_for_small_bs
