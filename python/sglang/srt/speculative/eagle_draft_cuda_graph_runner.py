@@ -342,6 +342,10 @@ class EAGLEDraftCudaGraphRunner:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
             self.positions.zero_()
+            self.topk_p.zero_()
+            self.topk_index.zero_()
+            self.hidden_states.zero_()
+            self.req_pool_indices.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 

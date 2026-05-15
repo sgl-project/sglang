@@ -1274,9 +1274,36 @@ class DeepseekV4MultiStepBackend(DeepseekV4BackendRadix):
                 )
             )
 
+    def _split_out_cache_loc_by_step(
+        self, out_cache_loc: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if out_cache_loc is None:
+            return None
+
+        slots_per_req = self.topk * self.speculative_num_steps
+        assert out_cache_loc.numel() % slots_per_req == 0, (
+            "DeepSeekV4 EAGLE draft expects out_cache_loc to be laid out as "
+            f"[bs, topk, speculative_num_steps], got {out_cache_loc.shape=} "
+            f"{self.topk=} {self.speculative_num_steps=}"
+        )
+        num_reqs = out_cache_loc.numel() // slots_per_req
+        return (
+            out_cache_loc.reshape(num_reqs, self.topk, self.speculative_num_steps)
+            .permute(2, 0, 1)
+            .reshape(self.speculative_num_steps, -1)
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+        original_out_cache_loc = forward_batch.out_cache_loc
+        step_out_cache_loc = self._split_out_cache_loc_by_step(original_out_cache_loc)
+
+        try:
+            for i in range(self.speculative_num_steps - 1):
+                if step_out_cache_loc is not None:
+                    forward_batch.out_cache_loc = step_out_cache_loc[i]
+                self.attn_backends[i].init_forward_metadata(forward_batch)
+        finally:
+            forward_batch.out_cache_loc = original_out_cache_loc
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
@@ -1304,6 +1331,9 @@ class DeepseekV4MultiStepBackend(DeepseekV4BackendRadix):
         if self.speculative_num_steps == 1:
             return
 
+        step_out_cache_loc = self._split_out_cache_loc_by_step(
+            forward_batch.out_cache_loc
+        )
         self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -1313,7 +1343,11 @@ class DeepseekV4MultiStepBackend(DeepseekV4BackendRadix):
             forward_mode=ForwardMode.DECODE,
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
-            out_cache_loc=forward_batch.out_cache_loc,
+            out_cache_loc=(
+                step_out_cache_loc[0]
+                if step_out_cache_loc is not None
+                else forward_batch.out_cache_loc
+            ),
         )
         temp_metadata = self.attn_backends[0].forward_metadata
 
