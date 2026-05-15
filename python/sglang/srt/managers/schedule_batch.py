@@ -910,6 +910,8 @@ class Req(ReqDllmMixin):
         self.return_pooled_hidden_states = return_pooled_hidden_states
         self.pooled_hidden_state = None
 
+        self.eos_token_id = None
+        self.additional_stop_token_ids = None
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
 

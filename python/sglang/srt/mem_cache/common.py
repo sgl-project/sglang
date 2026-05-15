@@ -521,6 +521,24 @@ def alloc_paged_token_slots_decode(
     return out_cache_loc
 
 
+@triton.jit
+def _write_decode_req_to_token_kernel(
+    req_to_token_ptr,  # [max_batch, max_context_len], int32
+    req_pool_indices_ptr,  # [bs], int64
+    seq_lens_ptr,  # [bs], int32/int64 (used as column index)
+    out_cache_loc_ptr,  # [bs], int64
+    stride: tl.constexpr,  # max_context_len
+):
+    pid = tl.program_id(0)
+    req_idx = tl.load(req_pool_indices_ptr + pid)
+    col_idx = tl.load(seq_lens_ptr + pid)
+    value = tl.load(out_cache_loc_ptr + pid)
+    tl.store(
+        req_to_token_ptr + req_idx * stride + col_idx,
+        value.to(tl.int32),
+    )
+
+
 def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     Allocate KV cache for decode batch and write to req_to_token_pool.
@@ -556,8 +574,12 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         locs = batch.seq_lens.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+    _write_decode_req_to_token_kernel[(bs,)](
+        batch.req_to_token_pool.req_to_token,
+        batch.req_pool_indices,
+        locs,
+        out_cache_loc,
+        batch.req_to_token_pool.req_to_token.shape[1],
     )
 
     return out_cache_loc
