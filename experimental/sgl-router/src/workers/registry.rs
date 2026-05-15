@@ -68,6 +68,10 @@ impl WorkerRegistry {
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
+
+    pub fn get(&self, id: &WorkerId) -> Option<Arc<Worker>> {
+        self.by_id.get(id).map(|w| Arc::clone(&w))
+    }
 }
 
 #[cfg(test)]
