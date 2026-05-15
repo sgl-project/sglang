@@ -5,7 +5,6 @@ import pytest
 import torch
 from sgl_kernel import topk_sigmoid
 
-
 _IS_HIP = torch.version.hip is not None
 
 
