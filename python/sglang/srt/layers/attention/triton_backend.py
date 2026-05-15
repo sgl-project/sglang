@@ -123,12 +123,11 @@ class TritonAttnBackend(AttentionBackend):
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        self.num_head = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
-        )
         self.dcp_size = model_runner.dcp_size
         self.dcp_rank = model_runner.dcp_rank
-        self.dcp_num_head = self.num_head * self.dcp_size
+        self.num_head = (
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+        ) * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
@@ -288,7 +287,7 @@ class TritonAttnBackend(AttentionBackend):
             seq_lens,
             num_seq,
             num_group,
-            self.dcp_num_head,
+            self.num_head,
             self.num_kv_head,
             self.max_kv_splits,
             self.device_core_count,
@@ -425,20 +424,20 @@ class TritonAttnBackend(AttentionBackend):
                 bs = kv_indptr.shape[0] - 1
 
             attn_logits = torch.empty(
-                (bs, self.dcp_num_head, self.max_kv_splits, self.v_head_dim),
+                (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
                 dtype=torch.float32,
                 device=self.device,
             )
             if self.swa_v_head_dim is not None:
                 swa_attn_logits = torch.empty(
-                    (bs, self.dcp_num_head, self.max_kv_splits, self.swa_v_head_dim),
+                    (bs, self.num_head, self.max_kv_splits, self.swa_v_head_dim),
                     dtype=torch.float32,
                     device=self.device,
                 )
             else:
                 swa_attn_logits = None
             attn_lse = torch.empty(
-                (bs, self.dcp_num_head, self.max_kv_splits),
+                (bs, self.num_head, self.max_kv_splits),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -609,7 +608,7 @@ class TritonAttnBackend(AttentionBackend):
         cuda_graph_num_kv_splits_buf: Optional[torch.Tensor] = None,
     ):
         self.cuda_graph_attn_logits = torch.zeros(
-            (max_num_tokens, self.dcp_num_head, self.max_kv_splits, self.v_head_dim),
+            (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
             dtype=torch.float32,
             device=self.device,
         )
@@ -617,7 +616,7 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_swa_attn_logits = torch.zeros(
                 (
                     max_num_tokens,
-                    self.dcp_num_head,
+                    self.num_head,
                     self.max_kv_splits,
                     self.swa_v_head_dim,
                 ),
@@ -627,7 +626,7 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_swa_attn_logits = None
         self.cuda_graph_attn_lse = torch.zeros(
-            (max_num_tokens, self.dcp_num_head, self.max_kv_splits),
+            (max_num_tokens, self.num_head, self.max_kv_splits),
             dtype=torch.float32,
             device=self.device,
         )
