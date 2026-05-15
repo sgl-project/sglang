@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=300, suite="stage-c-test-4-gpu-gb200")
+register_cuda_ci(est_time=300, stage="stage-c", runner_config="4-gpu-gb200")
 
 
 class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):

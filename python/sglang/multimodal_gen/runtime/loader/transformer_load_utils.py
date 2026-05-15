@@ -368,6 +368,12 @@ def resolve_transformer_quant_load_spec(
         safetensors_list=safetensors_list,
         component_model_path=component_model_path,
     )
+
+    if quant_config is not None:
+        packed = getattr(model_cls, "packed_modules_mapping", None)
+        if packed and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = packed
+
     nunchaku_config = server_args.nunchaku_config
 
     # resolve target param dtype
@@ -493,8 +499,11 @@ def _resolve_quant_config(
     reverse_param_names_mapping_dict = getattr(
         arch_config, "reverse_param_names_mapping", None
     )
-
-    quant_config = get_quant_config(hf_config, component_model_path)
+    quant_config = get_quant_config(
+        hf_config,
+        component_model_path,
+        reverse_param_names_mapping=reverse_param_names_mapping_dict,
+    )
     quant_config_name = _get_quant_config_name(quant_config)
     inferred_nvfp4_config = None
     if quant_config is None or quant_config_name == "modelopt_fp4":

@@ -6,7 +6,7 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import fused_store_cache
+from sglang.jit_kernel.deepseek_v4 import fused_k_norm_rope_flashmla, fused_store_cache
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4 import (
@@ -605,7 +605,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             else:
                 raise ValueError(f"Unsupported compression ratio: {ratio}")
 
+    def wait_layer_transfer(self, layer_id: int) -> None:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
+        self.wait_layer_transfer(layer_id)
         compress_state_pool = self.compress_state_pools[layer_id]
         assert (
             compress_state_pool is not None
@@ -613,6 +618,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return compress_state_pool
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
+        self.wait_layer_transfer(layer_id)
         indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
         assert (
             indexer_compress_state_pool is not None
@@ -620,6 +626,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return indexer_compress_state_pool
 
     def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
         return self.swa_kv_pool.get_key_buffer(layer_id)
 
     def set_swa_key_buffer(
@@ -630,7 +637,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> None:
         self.swa_kv_pool.set_key_buffer(layer_id, loc, cache_nope_fp8_rope_bf16_pack)
 
+    def get_extra_key_page_size(self, layer_id: int) -> int:
+        _, _, compress_kv_pool = self.layer_mapping[layer_id]
+        assert compress_kv_pool is not None
+        return compress_kv_pool.page_size
+
     def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor | None:
+        self.wait_layer_transfer(layer_id)
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         return compress_kv_pool.get_key_buffer(compress_layer_id)
@@ -647,7 +660,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             compress_layer_id, loc, cache_nope_fp8_rope_bf16_pack
         )
 
+    def get_index_k_page_size(self) -> int:
+        return self.c4_indexer_kv_pool.page_size
+
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.get_index_k_with_scale_buffer(compress_layer_id)
@@ -658,6 +675,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.get_index_k_scale_buffer(
@@ -701,6 +719,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
+        self.wait_layer_transfer(layer_id)
         return self.swa_kv_pool.get_key_buffer(layer_id)
 
     def set_swa_key_buffer_radix_fused(
@@ -716,6 +735,33 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         else:
             swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         return self.swa_kv_pool.set_key_buffer_fused(layer_id, swa_loc, cache_k)
+
+    def set_swa_key_buffer_radix_fused_norm_rope(
+        self,
+        layer_id: int,
+        raw_loc: torch.Tensor,
+        kv: torch.Tensor,
+        kv_weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        if self._should_cache_swa:
+            if layer_id == self.start_layer or self.cached_loc is None:
+                self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
+            swa_loc = self.cached_loc
+        else:
+            swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+        fused_k_norm_rope_flashmla(
+            kv=kv,
+            kv_weight=kv_weight,
+            eps=eps,
+            freqs_cis=freqs_cis,
+            positions=positions,
+            out_loc=swa_loc,
+            kvcache=self.swa_kv_pool.kv_buffer[layer_id],
+            page_size=self.swa_kv_pool.page_size,
+        )
 
     def set_extra_key_buffer_fused(
         self,
