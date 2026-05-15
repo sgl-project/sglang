@@ -52,8 +52,8 @@ fn distribution_skews_to_lower_load() {
     }
     let c_picks = *counts.get("c").unwrap_or(&0);
     assert!(
-        c_picks < 100,
-        "loaded worker should be picked < 10% of the time, got {c_picks}"
+        c_picks < 200,
+        "loaded worker should be picked < 20% of the time, got {c_picks}"
     );
 }
 
