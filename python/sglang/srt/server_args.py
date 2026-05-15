@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import glob
 import importlib
 import importlib.util
 import json
@@ -378,6 +379,7 @@ class ServerArgs:
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
+    model_config_parser: str = "auto"
 
     # HTTP server
     host: str = "127.0.0.1"
@@ -1842,8 +1844,25 @@ class ServerArgs:
                                 f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
                             )
 
-                    self.page_size = 64
-                    logger.warning("Setting page size to 64 for DeepSeek DSA.")
+                    # Deferred import to avoid a circular import at module-load
+                    # time (nsa.utils imports get_global_server_args).
+                    from sglang.srt.layers.attention.nsa.utils import (
+                        aiter_can_use_preshuffle_paged_mqa,
+                    )
+
+                    if is_hip() and not aiter_can_use_preshuffle_paged_mqa():
+                        # Legacy ROCm NSA path: aiter's gluon paged-MQA kernel is
+                        # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
+                        # not set, or SGLANG_NSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
+                        self.page_size = 1
+                        logger.warning(
+                            "Setting page size to 1 for DeepSeek DSA on ROCm "
+                            "(aiter preshuffle paged-MQA path unavailable: "
+                            "needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1)."
+                        )
+                    else:
+                        self.page_size = 64
+                        logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
                     import torch
 
@@ -3936,44 +3955,60 @@ class ServerArgs:
             )
 
     def _is_mistral_native_format(self) -> bool:
-        """Detect if the model uses Mistral native format (params.json + consolidated weights).
+        """True iff the checkpoint requires load_format=mistral.
 
-        When both params.json and config.json exist, default to HF format to
-        avoid weight-name mismatches (e.g. Mistral-7B-Instruct-v0.3).
+        Looks for ``consolidated*.safetensors`` with no competing
+        ``model-*.safetensors``; when both weight formats ship in the
+        same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
+        preferred to avoid loading Mistral-named weights into an
+        HF-named architecture.
 
-        Exception: models routed through ``_load_mistral_large_3_for_causal_LM``
-        (mistral-large-3, mistral-small-4, leanstral) build their config from
-        params.json and expect native weight names, so native format is required
-        even when config.json is also present.
+        Name override: ``mistral-large-3`` / ``mistral-small-4`` /
+        ``leanstral`` always treat as Mistral-native when ``params.json``
+        is present -- those families need Mistral weight loading
+        regardless of which weight files happen to be present.
         """
-        # Keep in sync with the name checks in
-        # hf_transformers_utils.py::get_config / get_tokenizer.
-        _MISTRAL_NATIVE_CONFIG_PATTERNS = (
+        _MISTRAL_NATIVE_PATTERNS = (
             "mistral-large-3",
             "mistral-small-4",
             "leanstral",
         )
+        name_matches = any(
+            p in str(self.model_path).lower() for p in _MISTRAL_NATIVE_PATTERNS
+        )
 
-        def _check_format(has_params: bool, has_hf_config: bool) -> bool:
-            if has_params and not has_hf_config:
+        def _check_format(has_params, has_consolidated, has_hf_weights) -> bool:
+            if has_params and name_matches:
                 return True
-            if has_params and has_hf_config:
-                model_lower = str(self.model_path).lower()
-                if any(name in model_lower for name in _MISTRAL_NATIVE_CONFIG_PATTERNS):
-                    return True
-            return False
+            return has_consolidated and not has_hf_weights
 
         if os.path.isdir(self.model_path):
-            has_params = os.path.exists(os.path.join(self.model_path, "params.json"))
-            has_hf_config = os.path.exists(os.path.join(self.model_path, "config.json"))
-            return _check_format(has_params, has_hf_config)
+            return _check_format(
+                has_params=os.path.exists(os.path.join(self.model_path, "params.json")),
+                has_consolidated=bool(
+                    glob.glob(
+                        os.path.join(self.model_path, "consolidated*.safetensors")
+                    )
+                ),
+                has_hf_weights=bool(
+                    glob.glob(os.path.join(self.model_path, "model-*.safetensors"))
+                ),
+            )
 
-        # For hub models, check remote files
         try:
             from huggingface_hub import HfApi
 
             files = {s.rfilename for s in HfApi().model_info(self.model_path).siblings}
-            return _check_format("params.json" in files, "config.json" in files)
+            return _check_format(
+                has_params="params.json" in files,
+                has_consolidated=any(
+                    f.startswith("consolidated") and f.endswith(".safetensors")
+                    for f in files
+                ),
+                has_hf_weights=any(
+                    f.startswith("model-") and f.endswith(".safetensors") for f in files
+                ),
+            )
         except Exception:
             return False
 
@@ -4197,6 +4232,15 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
+        # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
+        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
+            if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                logger.warning(
+                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm100+ (Blackwell), "
+                    "detected sm%d.",
+                    get_device_sm(),
+                )
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
@@ -4567,6 +4611,15 @@ class ServerArgs:
             '* "transformers" will use the Transformers model '
             '* "mindspore" will use the MindSpore model '
             "implementation.\n",
+        )
+        parser.add_argument(
+            "--model-config-parser",
+            type=str,
+            default=ServerArgs.model_config_parser,
+            help='Which model-config parser to use. "auto" picks "mistral" '
+            'via the is_mistral_model name heuristic, else "hf" '
+            "(AutoConfig over config.json). Plugins can register additional "
+            "parsers via @register_model_config_parser.",
         )
 
         # HTTP server

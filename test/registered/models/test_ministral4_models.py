@@ -6,11 +6,7 @@ from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 
-register_cuda_ci(
-    est_time=200,
-    stage="stage-b",
-    runner_config="2-gpu-large",
-)
+register_cuda_ci(est_time=200, stage="extra-a", runner_config="2-gpu-large")
 
 MODEL = "mistralai/Mistral-Small-4-119B-2603"
 
