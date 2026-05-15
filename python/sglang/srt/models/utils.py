@@ -279,6 +279,9 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
         and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+        # TODO(mattteochen): Allow SWAKVPool after the compiled/native RoPE
+        # path reports whether the fused write actually happened, so attention
+        # can set save_kv_cache from the executed write instead of this predicate.
         and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
     ) or (_is_hip and not is_prefill_context_parallel_enabled())
@@ -299,11 +302,20 @@ def create_fused_set_kv_buffer_arg(
 
     if not _is_hip:
         assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
+        cache_loc = forward_batch.out_cache_loc
+        if isinstance(token_to_kv_pool, SWAKVPool):
+            _, is_swa_layer = token_to_kv_pool.layers_mapping[layer_id]
+            if is_swa_layer:
+                cache_loc = forward_batch.out_cache_loc_swa
+
+        if cache_loc is None:
+            return None
+
         return FusedSetKVBufferArg(
             value=value,
             k_buffer=k_buffer.view(k_buffer.shape[0], -1),
             v_buffer=v_buffer.view(v_buffer.shape[0], -1),
-            cache_loc=forward_batch.out_cache_loc,
+            cache_loc=cache_loc,
         )
     else:
         page_size = token_to_kv_pool.page_size

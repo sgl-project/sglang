@@ -729,6 +729,10 @@ class ServerArgs:
     enforce_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
+    torch_compile_scope: str = "full"
+    torch_compile_override_layers: Optional[List[str]] = None
+    torch_compile_override_regions: Optional[List[str]] = None
+    torch_compile_op_config: Optional[str] = None
     piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
@@ -1302,8 +1306,11 @@ class ServerArgs:
         # 2. DP attention
         if self.enable_dp_attention:
             self.disable_piecewise_cuda_graph = True
-        # 3. Torch compile
-        if self.enable_torch_compile:
+        # 3. Torch compile (full scope wraps model.forward with torch.compile,
+        #    which conflicts with PCG's own trampoline.  Local scope only
+        #    compiles leaf ops during CG capture and restores before PCG init,
+        #    so piecewise is safe.)
+        if self.enable_torch_compile and self.torch_compile_scope != "local":
             self.disable_piecewise_cuda_graph = True
         # 4. Pipeline parallelism
         if self.pp_size > 1:
@@ -4443,6 +4450,45 @@ class ServerArgs:
             self.enable_mixed_chunk = False
 
     def _handle_other_validations(self):
+        if self.torch_compile_override_layers and not self.enable_torch_compile:
+            logger.warning(
+                "--torch-compile-override-layers has no effect without "
+                "--enable-torch-compile"
+            )
+        if self.torch_compile_override_regions and not self.enable_torch_compile:
+            logger.warning(
+                "--torch-compile-override-regions has no effect without "
+                "--enable-torch-compile"
+            )
+        if self.torch_compile_override_regions and self.torch_compile_scope != "local":
+            logger.warning(
+                "--torch-compile-override-regions has no effect unless "
+                "--torch-compile-scope local is set"
+            )
+        if (
+            self.enable_torch_compile
+            and self.torch_compile_scope == "local"
+            and not self.torch_compile_override_layers
+            and not self.torch_compile_override_regions
+        ):
+            logger.warning(
+                "--torch-compile-scope local has no effect without "
+                "--torch-compile-override-layers or --torch-compile-override-regions"
+            )
+        if self.torch_compile_op_config:
+            from sglang.srt.utils.torch_compile_utils import parse_compile_op_config
+
+            try:
+                parse_compile_op_config(self.torch_compile_op_config)
+            except ValueError as exc:
+                raise ValueError(f"Invalid --torch-compile-op-config: {exc}") from exc
+
+            if not self.enable_torch_compile:
+                logger.warning(
+                    "--torch-compile-op-config has no effect without "
+                    "--enable-torch-compile"
+                )
+
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(
@@ -6570,6 +6616,43 @@ class ServerArgs:
             type=int,
             default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
+        )
+        parser.add_argument(
+            "--torch-compile-scope",
+            type=str,
+            default=ServerArgs.torch_compile_scope,
+            choices=["full", "local"],
+            help="Set torch compile scope. `full` compiles the outer model "
+            "forward, while `local` compiles only allowlisted MultiPlatformOp "
+            "layers or named regions and keeps the outer model forward eager.",
+        )
+        parser.add_argument(
+            "--torch-compile-override-layers",
+            type=str,
+            nargs="+",
+            metavar="CLASS_NAME",
+            help="Override decode torch.compile layer switching with an exact-class-name "
+            "allowlist. Requires --enable-torch-compile. Example: "
+            "`--torch-compile-override-layers UnquantizedFusedMoEMethod RMSNorm`.",
+        )
+        parser.add_argument(
+            "--torch-compile-override-regions",
+            type=str,
+            nargs="+",
+            metavar="REGION_NAME",
+            help="Allowlist named CompilableRegionMixin regions for local torch.compile. "
+            "Requires --enable-torch-compile --torch-compile-scope local.",
+        )
+        parser.add_argument(
+            "--torch-compile-op-config",
+            type=str,
+            default=ServerArgs.torch_compile_op_config,
+            help="Per-op/region torch.compile config as a JSON string mapping "
+            'class or region names to {"mode": ..., "options": {...}, "dynamic": ...}. '
+            '"dynamic" accepts true, false, or null (let Dynamo decide). '
+            "Overrides the class-level defaults. Example: "
+            """'{"RMSNorm": {"mode": "max-autotune", "dynamic": false}, """
+            """"QKNorm": {"dynamic": null}}'.""",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-max-tokens",
