@@ -192,8 +192,18 @@ class RuntimeEndpoint(BaseBackend):
         self._assert_success(res)
 
         obj = res.json()
-        comp = obj["text"]
-        return comp, obj["meta_info"]
+
+        if isinstance(obj, list):
+            if not obj:
+                return [], []
+            comps, meta_infos = zip(
+                *((item["text"], item["meta_info"]) for item in obj)
+            )
+            return list(comps), list(meta_infos)
+        else:
+            comp = obj["text"]
+            meta_info = obj["meta_info"]
+            return comp, meta_info
 
     def generate_stream(
         self,
