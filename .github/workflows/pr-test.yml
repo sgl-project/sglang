@@ -243,7 +243,7 @@ jobs:
     uses: ./.github/workflows/pr-test-sgl-kernel.yml
     with:
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
+      b200_runner: ${{ fromJson(needs.check-changes.outputs.runner_map)['4-gpu-b200'].runs_on }}
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
       skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
@@ -264,7 +264,7 @@ jobs:
     with:
       jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
+      b200_runner: ${{ fromJson(needs.check-changes.outputs.runner_map)['4-gpu-b200'].runs_on }}
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
       target_stage: ${{ inputs.target_stage || '' }}
@@ -438,7 +438,7 @@ jobs:
     with:
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
-      b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
+      b200_runner: ${{ fromJson(needs.check-changes.outputs.runner_map)['4-gpu-b200'].runs_on }}
       continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
