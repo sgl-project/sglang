@@ -1109,64 +1109,15 @@ class MMEncoder:
                 target = (
                     self.model.thinker if hasattr(self.model, "thinker") else self.model
                 )
-                audio_feature_fn = getattr(target, "get_audio_feature", None)
-                if audio_feature_fn is not None:
-                    audio_features = mm_inputs["video_audio_features"]
-                    audio_feature_lens = mm_inputs["video_audio_feature_lens"]
-                    audio_mm_item = MultimodalDataItem.from_dict(
-                        {
-                            "modality": Modality.AUDIO,
-                            "feature": _convert(audio_features),
-                        }
-                    )
-                    audio_mm_item.set(
-                        "audio_feature_lens", _convert(audio_feature_lens)
-                    )
-                    with torch.inference_mode():
-                        audio_embedding = audio_feature_fn([audio_mm_item])
-                        audio_embedding = audio_embedding.cpu()
-                    if audio_embedding.ndim != 2:
-                        audio_embedding = audio_embedding.reshape(
-                            -1, audio_embedding.shape[-1]
-                        )
-
-                    segment_lens_flat = mm_inputs["video_audio_segment_lens_flat"]
-                    segment_starts_flat = mm_inputs["video_audio_segment_starts_flat"]
-                    per_video_num_units = mm_inputs["video_audio_per_video_num_units"]
-                    per_video_audio_token_lens = (
-                        audio_feature_lens.tolist()
-                        if hasattr(audio_feature_lens, "tolist")
-                        else list(audio_feature_lens)
-                    )
-                    trimmed_chunks = []
-                    emb_offset = 0
-                    unit_idx = 0
-                    audio_video_idx = 0
-                    for num_units in per_video_num_units:
-                        if num_units <= 0:
-                            continue
-                        vid_audio_len = per_video_audio_token_lens[audio_video_idx]
-                        for _ in range(num_units):
-                            start = segment_starts_flat[unit_idx]
-                            seg_len = segment_lens_flat[unit_idx]
-                            trimmed_chunks.append(
-                                audio_embedding[
-                                    emb_offset + start : emb_offset + start + seg_len
-                                ]
-                            )
-                            unit_idx += 1
-                        emb_offset += vid_audio_len
-                        audio_video_idx += 1
-                    audio_embedding = (
-                        torch.cat(trimmed_chunks, dim=0)
-                        if trimmed_chunks
-                        else audio_embedding[:0]
-                    )
-                    aux_data["video_audio_embedding"] = audio_embedding
+                hook = getattr(target, "encode_video_audio", None)
+                if hook is not None:
+                    audio_embedding = hook(mm_inputs)
+                    if audio_embedding is not None:
+                        aux_data["video_audio_embedding"] = audio_embedding
                 else:
                     logger.warning(
                         "Videos carry audio tracks but model has no "
-                        "get_audio_feature; dropping audio for EPD encoding."
+                        "encode_video_audio; dropping audio for EPD encoding."
                     )
 
             return (
