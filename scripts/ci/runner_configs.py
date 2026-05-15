@@ -1,19 +1,14 @@
-"""Emit runner_config setup details (install / artifact_version /
-install_timeout / runs_on / rdma_devices) for use in GitHub Actions.
+"""Emit runner_config setup for GitHub Actions $GITHUB_OUTPUT.
 
-Two modes:
+runner_configs.py <runner_config>
+    Per-field `key=value` lines (install / artifact_version /
+    install_timeout / runs_on / rdma_devices). Called per stage by
+    _pr-test-stage.yml.
 
-  runner_configs.py <runner_config>
-      Single-config mode. Prints each field as `key=value` lines (one per
-      field) suitable for `>> $GITHUB_OUTPUT`. Called once per stage by
-      .github/workflows/_pr-test-stage.yml.
-
-  runner_configs.py --map --b200-runner <label>
-      Map mode. Prints a single line `runner_map={json}` for $GITHUB_OUTPUT,
-      where {json} is a JSON object keyed by runner_config name. The literal
-      `$b200_runner` in any `runs_on` field is substituted with <label>.
-      Called once by .github/workflows/_pr-test-check-changes.yml so the
-      resolved map is fanned out to every stage via check-changes outputs.
+runner_configs.py --map --b200-runner <label>
+    `runner_map={json}` — full dict keyed by runner_config, with
+    `$b200_runner` substituted in `runs_on` fields. Called by
+    _pr-test-check-changes.yml to fan out to all stages.
 """
 
 import json

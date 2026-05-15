@@ -82,10 +82,8 @@ jobs:
           (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true')
         )
       )
-    # runs-on and rdma_devices are resolved from scripts/ci/runner_configs.yml
-    # via the runner_map JSON output of check-changes. The map already has the
-    # dynamic b200 runner tag substituted (see runner_configs.py --map), so
-    # this expression is purely a key lookup.
+    # runs-on / rdma_devices resolved from runner_map (check-changes already
+    # substituted $b200_runner; see runner_configs.py --map).
     runs-on: ${{ fromJson(fromJson(inputs.check_changes).runner_map)[inputs.runner_config].runs_on }}
     timeout-minutes: 240
     env:
