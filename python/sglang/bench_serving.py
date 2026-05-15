@@ -131,6 +131,18 @@ def get_request_headers() -> Dict[str, str]:
     return headers
 
 
+def _fetch_server_info_payload(base_url: str) -> Optional[Dict[str, Any]]:
+    url = base_url + "/server_info"
+    response = requests.get(url, headers=get_auth_headers())
+    if response.status_code != 200:
+        return None
+
+    try:
+        return response.json()
+    except requests.exceptions.JSONDecodeError:
+        return None
+
+
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
     """Wait for the server to become ready by polling the given URL."""
     print(f"Waiting up to {timeout_sec}s for {url} to become ready...")
@@ -1435,11 +1447,8 @@ async def benchmark(
         pbar.close()
 
     if "sglang" in backend:
-        server_info = requests.get(
-            base_url + "/server_info", headers=get_auth_headers()
-        )
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
+        server_info_json = _fetch_server_info_payload(base_url)
+        if server_info_json is not None:
             if "decode" in server_info_json:
                 server_info_json = server_info_json["decode"][0]
             if (
@@ -1572,8 +1581,7 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
-    server_info = resp.json() if resp.status_code == 200 else None
+    server_info = _fetch_server_info_payload(base_url)
 
     if (
         metrics.median_ttft_ms is not None
