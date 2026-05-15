@@ -66,6 +66,14 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 
 
+def _is_sm100_device(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    device_id = torch.cuda.current_device() if device.index is None else device.index
+    major, _ = get_device_capability(device_id)
+    return major == 10
+
+
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
     return (n, k) in [
         (1024, 8192),
@@ -112,7 +120,9 @@ if _is_cuda:
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
     @register_fake_if_exists("sgl_kernel::fp8_blockwise_scaled_mm")
-    def _fp8_blockwise_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype):
+    def _fp8_blockwise_scaled_mm_abstract(
+        mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None
+    ):
         # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
@@ -634,10 +644,16 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     q_input, x_scale = per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=True
     )
+    fuse_bias = bias is not None and _is_sm100_device(input_2d.device)
     output = fp8_blockwise_scaled_mm(
-        q_input, weight.T, x_scale, weight_scale.T, out_dtype=input_2d.dtype
+        q_input,
+        weight.T,
+        x_scale,
+        weight_scale.T,
+        out_dtype=input_2d.dtype,
+        bias=bias if fuse_bias else None,
     )
-    if bias is not None:
+    if bias is not None and not fuse_bias:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 

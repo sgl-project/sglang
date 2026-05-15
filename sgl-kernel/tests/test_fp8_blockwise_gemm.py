@@ -60,7 +60,14 @@ def baseline_scaled_mm(
     return output
 
 
-def _test_accuracy_once(M, N, K, out_dtype, device):
+def _is_sm100():
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return major == 10 and minor in (0, 3)
+
+
+def _test_accuracy_once(M, N, K, out_dtype, device, use_bias=False):
     fp8_info = torch.finfo(torch.float8_e4m3fn)
     fp8_max, fp8_min = fp8_info.max, fp8_info.min
     a_fp32 = (torch.rand(M, K, dtype=torch.float32, device=device) - 0.5) * 2 * fp8_max
@@ -75,19 +82,32 @@ def _test_accuracy_once(M, N, K, out_dtype, device):
     scale_b = torch.randn(scale_b_shape, device=device, dtype=torch.float32) * 0.001
     scale_a = scale_a.t().contiguous().t()
     scale_b = scale_b.t().contiguous().t()
-    o = baseline_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype)
-    o1 = fp8_blockwise_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype)
+    bias = torch.randn(N, device=device, dtype=out_dtype) * 0.01 if use_bias else None
+    o = baseline_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias=bias)
+    o1 = fp8_blockwise_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, out_dtype, bias=bias)
     rtol = 0.02
     atol = 1
     torch.testing.assert_close(o, o1, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize(
+    "use_bias",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not _is_sm100(), reason="bias only supported on sm100 GPUs"
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("M", [1, 3, 5, 127, 128, 512, 1024, 4096])
 @pytest.mark.parametrize("N", [128, 512, 1024, 4096, 8192, 14080])
 @pytest.mark.parametrize("K", [512, 1024, 4096, 8192, 14080, 16384])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
-def test_accuracy(M, N, K, out_dtype):
-    _test_accuracy_once(M, N, K, out_dtype, "cuda")
+def test_accuracy(M, N, K, out_dtype, use_bias):
+    _test_accuracy_once(M, N, K, out_dtype, "cuda", use_bias=use_bias)
 
 
 if __name__ == "__main__":
