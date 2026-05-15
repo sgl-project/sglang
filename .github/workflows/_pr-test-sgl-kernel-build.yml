@@ -21,9 +21,6 @@ on:
         description: "Suffix appended to the upload-artifact name. '' for x86, '-aarch64' for arm."
         type: string
         default: ''
-      pr_head_sha:
-        type: string
-        default: ''
       git_ref:
         type: string
         default: ''
@@ -69,7 +66,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
 
