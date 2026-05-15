@@ -4,7 +4,8 @@
   "name": "SGLang Documentation",
   "seo": {
     "metatags": {
-      "google-site-verification": "bX3ofyYQhraIpAYf4DpyZQXZO_G4xLR_RqeBAKnJA7g"
+      "google-site-verification": "bX3ofyYQhraIpAYf4DpyZQXZO_G4xLR_RqeBAKnJA7g",
+      "canonical": "https://docs.sglang.io"
     }
   },
   "redirects": [
