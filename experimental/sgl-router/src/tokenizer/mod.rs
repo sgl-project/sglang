@@ -47,13 +47,18 @@ mod tests {
 
     fn cfg() -> crate::config::Config {
         crate::config::Config {
-            server: crate::config::ServerConfig { host: "0".into(), port: 0 },
+            server: crate::config::ServerConfig {
+                host: "0".into(),
+                port: 0,
+            },
             observability: Default::default(),
             models: vec![crate::config::ModelConfig {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             }],
-            worker: crate::config::WorkerConfig { url: "http://x".into() },
+            worker: crate::config::WorkerConfig {
+                url: "http://x".into(),
+            },
         }
     }
 
@@ -69,7 +74,10 @@ mod tests {
         let r = TokenizerRegistry::load_from_config(&cfg()).unwrap();
         let a = r.get("tiny").unwrap();
         let b = r.get("tiny").unwrap();
-        assert!(Arc::ptr_eq(&a, &b), "registry should return shared Arc, not clones");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "registry should return shared Arc, not clones"
+        );
     }
 
     #[test]

@@ -53,9 +53,7 @@ impl MockWorker {
             .route("/v1/chat/completions", post(chat))
             .with_state(state);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         let url = format!("http://{addr}");
         let (tx, rx) = oneshot::channel::<()>();
@@ -75,11 +73,7 @@ impl MockWorker {
     }
 }
 
-async fn chat(
-    State(s): State<MockWorkerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response<Body> {
+async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
     {
         let mut g = s.captured.lock().unwrap();
         g.last_body = Some(body.clone());

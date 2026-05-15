@@ -47,8 +47,8 @@ impl Proxy {
             .send()
             .await
             .map_err(|e| ApiError::UpstreamWorker(format!("{e}")))?;
-        let status = StatusCode::from_u16(resp.status().as_u16())
-            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let status =
+            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let bytes = resp
             .bytes()
             .await
@@ -84,8 +84,8 @@ impl Proxy {
             .send()
             .await
             .map_err(|e| ApiError::UpstreamWorker(format!("{e}")))?;
-        let status = StatusCode::from_u16(resp.status().as_u16())
-            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let status =
+            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let body = sse::bytes_stream_to_body(resp.bytes_stream());
         let mut out = Response::new(body);
         *out.status_mut() = status;

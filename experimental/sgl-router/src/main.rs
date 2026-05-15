@@ -21,14 +21,19 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.observability.log_level))
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(&cfg.observability.log_level)
+            }),
         )
         .with_target(true)
         .init();
 
-    tracing::info!("sgl-router {} starting on {}:{}",
-        env!("CARGO_PKG_VERSION"), cfg.server.host, cfg.server.port);
+    tracing::info!(
+        "sgl-router {} starting on {}:{}",
+        env!("CARGO_PKG_VERSION"),
+        cfg.server.host,
+        cfg.server.port
+    );
 
     let tokenizers = Arc::new(
         sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
@@ -36,14 +41,17 @@ async fn main() -> Result<()> {
     );
     let proxy = Arc::new(sgl_router::proxy::Proxy::new(cfg.worker.url.clone()));
     let ctx = Arc::new(sgl_router::server::app_context::AppContext::new(
-        cfg.clone(), tokenizers, proxy,
+        cfg.clone(),
+        tokenizers,
+        proxy,
     ));
     ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());
 
     let bind = format!("{}:{}", cfg.server.host, cfg.server.port);
-    let listener = tokio::net::TcpListener::bind(&bind).await
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!("listening on {bind}");
 
@@ -56,7 +64,7 @@ async fn main() -> Result<()> {
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM");
-    let mut sigint  = signal(SignalKind::interrupt()).expect("install SIGINT");
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT");
     tokio::select! {
         _ = sigterm.recv() => tracing::info!("got SIGTERM, shutting down"),
         _ = sigint.recv()  => tracing::info!("got SIGINT, shutting down"),
