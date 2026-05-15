@@ -1675,7 +1675,7 @@ def check_chat_template(model_path):
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         return "chat_template" in tokenizer.init_kwargs
     except Exception as e:
-        print(f"Fail to load tokenizer config with error={e}")
+        print(f"Failed to load tokenizer config with error={e}")
         return False
 
 
