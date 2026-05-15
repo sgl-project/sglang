@@ -1,23 +1,17 @@
 """Hybrid Triton wrapper for ``mla_kv_pack_quantize_fp8``.
 
-Auto-dispatches between two optimized Triton kernels based on the batch size
-(``s``, the token count). Both kernels perform the same fused operation:
+Auto-dispatches between two Triton kernels based on the batch size
+(``s``, the token count). Both perform the same fused operation:
 
     out_k = cat(quantize_fp8(k_nope), broadcast(quantize_fp8(k_pe)))
     out_v = quantize_fp8(v)
 
-The dispatch heuristic is derived from three optimization spikes on GB300
-(DSv3 dims, BF16 -> FP8 E4M3, NUM_HEADS=32):
+See ``_pick_kernel`` for the heuristic.
 
-    - bs <= 8  -> optimized v0 (2-D ``(s, h)`` grid). Wins at small bs where
-                  per-program work is light and the 2-D grid keeps SMs busy.
-    - bs >  8  -> optimized v1_flat (1-D flat grid over ``s * num_heads``).
-                  Wins at larger bs by collapsing the grid and amortizing the
-                  index math across BLOCK pairs.
-
-The standalone JIT CUDA kernel is dominated by these two Triton kernels at
-every batch size on GB300 even after aggressive optimization, so it is not
-included in the dispatch.
+A JIT CUDA implementation was also explored and is dominated by these two
+Triton kernels at every batch size on GB300 even after aggressive
+optimization (1-D flat grid, packed fp8x2 cvt, predicate elision), so the
+dispatch is Triton-only.
 """
 
 from __future__ import annotations
@@ -29,7 +23,6 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
-
 
 # ---------------------------------------------------------------------------
 # Kernels
@@ -138,30 +131,28 @@ def _v1_flat_kernel(
     rope_idx = tl.arange(0, QK_ROPE)
     v_idx_ = tl.arange(0, V_HEAD)
     nope_off = (
-        t_idx[:, None] * k_nope_stride_t + h_idx[:, None] * k_nope_stride_h
+        t_idx[:, None] * k_nope_stride_t
+        + h_idx[:, None] * k_nope_stride_h
         + nope_idx[None, :]
     )
     k_nope = tl.load(k_nope_ptr + nope_off, mask=mask[:, None])
     pe_off = t_idx[:, None] * k_pe_stride_t + rope_idx[None, :]
     k_pe = tl.load(k_pe_ptr + pe_off, mask=mask[:, None])
-    v_off = (
-        t_idx[:, None] * v_stride_t + h_idx[:, None] * v_stride_h + v_idx_[None, :]
-    )
+    v_off = t_idx[:, None] * v_stride_t + h_idx[:, None] * v_stride_h + v_idx_[None, :]
     v = tl.load(v_ptr + v_off, mask=mask[:, None])
     k_nope_fp8 = (k_nope.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
     k_pe_fp8 = (k_pe.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
     v_fp8 = (v.to(tl.float32) * v_scale_inv).to(FP8_DTYPE)
     k_out_base = t_idx[:, None] * k_out_stride_t + h_idx[:, None] * k_out_stride_h
-    tl.store(
-        k_out_ptr + k_out_base + nope_idx[None, :], k_nope_fp8, mask=mask[:, None]
-    )
+    tl.store(k_out_ptr + k_out_base + nope_idx[None, :], k_nope_fp8, mask=mask[:, None])
     tl.store(
         k_out_ptr + k_out_base + QK_NOPE + rope_idx[None, :],
         k_pe_fp8,
         mask=mask[:, None],
     )
     v_out_off = (
-        t_idx[:, None] * v_out_stride_t + h_idx[:, None] * v_out_stride_h
+        t_idx[:, None] * v_out_stride_t
+        + h_idx[:, None] * v_out_stride_h
         + v_idx_[None, :]
     )
     tl.store(v_out_ptr + v_out_off, v_fp8, mask=mask[:, None])
