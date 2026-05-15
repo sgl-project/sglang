@@ -591,6 +591,9 @@ class EagleDraftWorker(BaseDraftWorker):
             - 1
         )
 
+        # Install draft_extend_input as `batch.spec_info` for the extend forward.
+        batch.spec_info = draft_extend_input
+
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
             forward_batch = draft_extend_input.prepare_for_extend_to_fill_draft_kvcache(
@@ -1072,7 +1075,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
-        verify_output = verify_input.sample(batch, logits_output, vocab_mask)
+        verify_output = verify_input.verify_v2(batch, logits_output, vocab_mask)
         accept_lens = verify_output.draft_extend_input.num_accept_tokens
         new_seq_lens = batch.seq_lens + accept_lens
 
