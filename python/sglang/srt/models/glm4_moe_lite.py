@@ -140,10 +140,14 @@ class Glm4MoeLiteMLP(nn.Module):
             return x
 
         # Some quantization wrappers store the underlying parameter as `weight_packed`.
-        if not hasattr(self.gate_up_proj, "weight"):
-            self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
-        if not hasattr(self.down_proj, "weight"):
-            self.down_proj.weight = getattr(self.down_proj, "weight_packed")
+        if not hasattr(self.gate_up_proj, "weight") and hasattr(
+            self.gate_up_proj, "weight_packed"
+        ):
+            self.gate_up_proj.weight = self.gate_up_proj.weight_packed
+        if not hasattr(self.down_proj, "weight") and hasattr(
+            self.down_proj, "weight_packed"
+        ):
+            self.down_proj.weight = self.down_proj.weight_packed
 
         if (
             gemm_output_zero_allocator is not None
