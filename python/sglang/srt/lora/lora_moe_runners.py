@@ -444,12 +444,10 @@ def _add_lora_gate_up_delta(
     )
 
     if get_is_capture_mode():
-        # During CUDA graph capture, always enter the LoRA path so that
-        # the LoRA kernels are recorded in the graph.  adapter_enabled is
-        # all-zeros during capture, so the Triton kernel early-exits per
-        # program (zero overhead).  During replay the tensor is updated
-        # in-place with the real adapter mask before graph.replay().
-        has_active_lora = True
+        from sglang.srt.model_executor.cuda_graph_runner import get_capture_lora_variant
+
+        # Record LoRA kernels for lora graph; skip for nolora graph.
+        has_active_lora = get_capture_lora_variant() != "nolora"
     else:
         num_loras = len(lora_info.lora_ranks)
         has_active_lora = (
@@ -467,18 +465,23 @@ def _add_lora_gate_up_delta(
     r = lora_info.max_lora_rank
     gate_up_a = lora_info.gate_up_lora_a_weights
     gate_up_b = lora_info.gate_up_lora_b_weights
-    inter_size = gate_up_b.shape[2] // 2
-    M, top_k, gate_up_dim = intermediate_cache.shape
-    r = lora_info.max_lora_rank
-    gate_up_a = lora_info.gate_up_lora_a_weights
-    gate_up_b = lora_info.gate_up_lora_b_weights
-    inter_size = gate_up_b.shape[2] // 2
 
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
-    inter_size = gate_up_b.shape[2] // 2
-    lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
-    lora_b_stacked = [gate_up_b[:, :, :inter_size, :], gate_up_b[:, :, inter_size:, :]]
+
+    # Detect gated vs non-gated from A buffer rank dimension.
+    # Gated: A has 2*r rows (gate + up). Non-gated: A has 1*r rows (w1 only).
+    is_gated = gate_up_a.shape[2] > r
+    if is_gated:
+        inter_size = gate_up_b.shape[2] // 2
+        lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
+        lora_b_stacked = [
+            gate_up_b[:, :, :inter_size, :],
+            gate_up_b[:, :, inter_size:, :],
+        ]
+    else:
+        lora_a_stacked = [gate_up_a]
+        lora_b_stacked = [gate_up_b]
 
     if lora_info.lora_use_virtual_experts:
         merged_experts_fused_moe_lora_add(
@@ -548,6 +551,12 @@ def _add_lora_down_delta(
 
     if lora_info.max_lora_rank == 0:
         return
+
+    if get_is_capture_mode():
+        from sglang.srt.model_executor.cuda_graph_runner import get_capture_lora_variant
+
+        if get_capture_lora_variant() == "nolora":
+            return
 
     M, top_k, hidden_dim = intermediate_cache.shape
 
@@ -628,6 +637,12 @@ def build_lora_hooks(
     """
     if lora_info is None or lora_info.max_lora_rank == 0:
         return LoRAHooks()
+
+    if get_is_capture_mode():
+        from sglang.srt.model_executor.cuda_graph_runner import get_capture_lora_variant
+
+        if get_capture_lora_variant() == "nolora":
+            return LoRAHooks()
 
     # Compute alignment / mapping (once, shared by both hooks)
     token_lora_mapping: torch.Tensor | None = None
