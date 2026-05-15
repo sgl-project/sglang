@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+from sglang.srt.models.deepseek_v2 import _is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.metadata import DeepseekV4Metadata
@@ -42,7 +43,11 @@ class CompressorBackend:
         super().__init__()
         self.forward_metadata: DeepseekV4Metadata
 
+    def _maybe_upgrade_forward_metadata(self) -> None:
+        pass
+
     def get_paged_compress_metadata(self, compress_ratio: int) -> FusedCompressMetadata:
+        self._maybe_upgrade_forward_metadata()
         attr_name = f"c{compress_ratio}_compress_metadata"
         metadata = getattr(self.forward_metadata, attr_name)
         assert isinstance(metadata, FusedCompressMetadata)
@@ -76,6 +81,37 @@ class CompressorBackend:
             metadata = (forward_batch.req_pool_indices.to(torch.int32), None, plan)
         indices, extra_data, plan = metadata
 
+        if _is_hip:
+            if not is_paged:
+                raise NotImplementedError("HIP fused compressor expects paged metadata")
+
+            from sglang.srt.layers.attention.compressed.fused_compress_triton import (
+                hip_compress_forward,
+                hip_compress_fused_norm_rope_inplace,
+            )
+
+            kv_compressed = hip_compress_forward(
+                kv_score_buffer=kv_score_buffer,
+                kv_score_input=kv_score_input,
+                ape=ape,
+                indices=indices,
+                plan=plan,
+                compress_ratio=compress_ratio,
+                head_dim=head_dim,
+                extra_data=extra_data,
+            )
+            norm_eps = (
+                norm.variance_epsilon if hasattr(norm, "variance_epsilon") else norm.eps
+            )
+            hip_compress_fused_norm_rope_inplace(
+                kv_compressed,
+                norm.weight,
+                norm_eps,
+                freqs_cis_cache,
+                plan,
+            )
+            return rotate_activation(kv_compressed) if rotate else kv_compressed
+
         # NOTE: shape [num_q_tokens, head_dim]
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
@@ -90,7 +126,7 @@ class CompressorBackend:
         compress_fused_norm_rope_inplace(
             kv_compressed,
             norm.weight,
-            norm.eps,
+            norm.variance_epsilon if hasattr(norm, "variance_epsilon") else norm.eps,
             freqs_cis_cache,
             plan,
         )
@@ -106,6 +142,9 @@ class CompressorBackend:
         # NOTE: this function will 1. compress kv 2. store to kv pool
         if forward_batch.forward_mode.is_idle():
             return
+        # CUDA graph capture may keep only lightweight metadata until the first
+        # consumer. Compressor can run before attention forward, so upgrade here.
+        self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = forward_batch.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -135,6 +174,9 @@ class CompressorBackend:
         compressor: Compressor,
     ) -> None:
         assert is_overlap_compress(compressor.ratio)
+        # See forward_core_compressor: indexer compression also reads core
+        # metadata before the backend attention forward path.
+        self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = forward_batch.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -204,7 +246,8 @@ def create_paged_compressor_data(
     # TODO(dark): remove this hardcode
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
-    assert ring_size % compress_ratio == 0
+    # Paged DSV4 compressor maps through full_to_swa_index_mapping, so ring_size
+    # does not need to be an exact multiple of the compression ratio.
 
     def clip_down(positions: torch.Tensor) -> torch.Tensor:
         return positions // compress_ratio * compress_ratio
@@ -289,6 +332,8 @@ def create_paged_compressor_data(
         if is_overlap:
             write_overlap_loc = get_raw_loc(write_positions - compress_ratio)
             extra_data = write_overlap_loc.view(-1, 1)
+        elif _is_hip:
+            extra_data = get_raw_loc(write_positions - compress_ratio)
         else:
             extra_data = None
         plan = CompressorDecodePlan(compress_ratio, seq_lens.to(torch.int32))

@@ -78,11 +78,11 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
+    is_gfx95_supported,
+    is_hip,
     log_info_on_rank0,
     make_layers,
     maybe_torch_compile,
-    is_gfx95_supported,
-    is_hip,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,6 +98,7 @@ _is_gfx95_supported = is_gfx95_supported()
 
 if _use_aiter:
     from aiter import rope_rotate_activation
+
     if is_gfx95_supported():
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
@@ -294,7 +295,7 @@ class Compressor(nn.Module):
     @cached_property
     def use_fused_compress(self) -> bool:
         if _is_hip:
-            return False
+            return envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
         if (
             envs.SGLANG_OPT_USE_FUSED_PAGED_COMPRESS.get()
             and envs.SGLANG_OPT_DPSK_V4_RADIX.get()
@@ -891,7 +892,16 @@ class Compressor(nn.Module):
         kv_score: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if self.use_fused_compress:
+        if self.use_fused_compress and (
+            not _is_hip
+            or (
+                envs.SGLANG_OPT_DPSK_V4_RADIX.get()
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_extend_without_speculative()
+                )
+            )
+        ):
             return self.compress_fused(kv_score, forward_batch)
 
         if envs.SGLANG_OPT_USE_OLD_COMPRESSOR.get():
@@ -1776,7 +1786,12 @@ class MQALayer(nn.Module):
             )
         else:
             q, kv = self._forward_prepare(
-                x, positions, forward_batch, attn_backend, freqs_cis, q_out,
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                freqs_cis,
+                q_out,
                 x_quant=x_quant,
             )
 
