@@ -63,7 +63,10 @@ permissions:
   actions: write
   contents: read
   issues: read
-  pull-requests: read
+  # write (not read) is required by call-pr-awareness — reusable workflow
+  # permissions ceiling = caller workflow-level, job-level override is NOT
+  # honored for reusable calls. So this MUST live at workflow level.
+  pull-requests: write
 
 jobs:
   # =============================================== check changes ====================================================
@@ -80,8 +83,6 @@ jobs:
   call-pr-awareness:
     needs: check-changes
     if: always() && github.event_name == 'pull_request'
-    permissions:
-      pull-requests: write
     uses: ./.github/workflows/_pr-awareness-comment.yml
     with:
       workflow_kind: pr-test
