@@ -14,7 +14,7 @@
 
 import logging
 import re
-from typing import Iterable, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -25,10 +25,12 @@ from transformers import (
 )
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.gemma4_fused_ops import (
     gemma_dual_rmsnorm_residual_scalar,
+    gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
@@ -339,22 +341,64 @@ class Gemma4Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        q = self.q_norm(q)
-        q = q.flatten(-2, -1)
-
-        # Check if we should use shared KV cache
-        if self.is_kv_shared_layer and self.kv_shared_layer_index is not None:
-            # For KV shared layers, we skip K/V computation and normalization
-            # The RadixAttention will handle retrieving shared KV from cache
-            k = None
-            v = None
+        # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
+        # Preconditions for the fused path: tensors on CUDA, q_norm/k_norm use
+        # the standard norm*weight (scale_shift==0) and v_norm has weight=ones
+        # (with_scale=False) — the canonical Gemma4 attention configuration.
+        is_kv_shared = (
+            self.is_kv_shared_layer and self.kv_shared_layer_index is not None
+        )
+        can_fuse_qkv_norm = (
+            q.is_cuda
+            and self.q_norm.scale_shift == 0.0
+            and self.k_norm.scale_shift == 0.0
+            and not self.v_norm.with_scale
+        )
+        if can_fuse_qkv_norm:
+            if is_kv_shared:
+                gemma_qkv_rmsnorm(
+                    q,
+                    None,
+                    None,
+                    self.q_norm.weight.data,
+                    None,
+                    num_q_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    eps=self.q_norm.eps,
+                )
+                k = None
+                v = None
+            else:
+                gemma_qkv_rmsnorm(
+                    q,
+                    k,
+                    v,
+                    self.q_norm.weight.data,
+                    self.k_norm.weight.data,
+                    num_q_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    eps=self.q_norm.eps,
+                )
+                # Match the original norm path's output shapes: q stays 2D,
+                # k/v become 3D so the subsequent `.flatten(-2, -1)` works.
+                # Use reshape (not view) since k/v are strided slice views of
+                # the qkv buffer and may not satisfy view's contiguity rules.
+                k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+                v = v.reshape(-1, self.num_kv_heads, self.head_dim)
         else:
-            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            k = self.k_norm(k)
-
-            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v = self.v_norm(v)
+            q = q.unflatten(-1, (self.num_heads, self.head_dim))
+            q = self.q_norm(q)
+            q = q.flatten(-2, -1)
+            if is_kv_shared:
+                k = None
+                v = None
+            else:
+                k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                k = self.k_norm(k)
+                v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                v = self.v_norm(v)
 
         # Apply rotary embedding
         if k is not None:
@@ -689,6 +733,7 @@ class Gemma4TextModel(PreTrainedModel):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture = []
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -786,7 +831,13 @@ class Gemma4TextModel(PreTrainedModel):
 
         hidden_states = input_embeds
 
+        aux_hidden_states = []
+        num_layers = len(self.layers)
+
         for layer_idx, layer in enumerate(self.layers):
+            if layer_idx in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states)
+
             if per_layer_inputs is not None:
                 per_layer_input = per_layer_inputs[:, layer_idx, :]
             else:
@@ -801,11 +852,21 @@ class Gemma4TextModel(PreTrainedModel):
             hidden_states = layer_outputs[0]
             residual = layer_outputs[1] if len(layer_outputs) > 1 else None
 
+        # Capture the output of the last layer if requested.
+        # layers_to_capture uses +1 offset, so num_layers means
+        # "output of the last layer" which is only available after the loop.
+        if num_layers in self.layers_to_capture:
+            aux_hidden_states.append(hidden_states)
+
         if residual is None:
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class Gemma4ForCausalLM(PreTrainedModel):
@@ -873,6 +934,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
+        self.capture_aux_hidden_states = False
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -905,8 +967,13 @@ class Gemma4ForCausalLM(PreTrainedModel):
             per_layer_inputs,
             **kwargs,
         )
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
     def _get_k_eq_v_layers(self) -> set:
@@ -1034,6 +1101,39 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 if names:
                     logger.log(level, "%s: %s", msg, names)
         return loaded_params
+
+    def _shard_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        """Shard a full embedding/lm_head weight along vocab dim for the current TP rank.
+
+        Gemma4 uses nn.Embedding (unsharded) but the Eagle3 draft model uses
+        VocabParallelEmbedding (sharded). This method extracts the correct
+        shard so the weights can be shared.
+        """
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size <= 1:
+            return weight
+        tp_rank = get_tensor_model_parallel_rank()
+        shard_size = (weight.shape[0] + tp_size - 1) // tp_size
+        return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
+
+    def get_embed(self):
+        return self._shard_weight(self.model.embed_tokens.weight)
+
+    def get_embed_and_head(self):
+        embed = self._shard_weight(self.model.embed_tokens.weight)
+        head = self._shard_weight(self.lm_head.weight)
+        return embed, head
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Gemma4ForCausalLM

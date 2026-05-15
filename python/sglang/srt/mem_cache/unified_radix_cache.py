@@ -22,7 +22,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
@@ -37,7 +41,6 @@ from sglang.srt.mem_cache.unified_cache_components import (
     TreeComponent,
     get_and_increase_time_counter,
 )
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
@@ -222,13 +225,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._components_tuple: tuple[TreeComponent, ...] = tuple(
             self.components.values()
         )
-        self.hicache_anchor_kv_shared_indices_pools: list[
-            tuple[PoolName, PoolHitPolicy]
-        ] = []
-        if self.is_eagle:
-            self.key_convert_fn = convert_to_bigram_key
-        else:
-            self.key_convert_fn = lambda key: key
+        self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
         # Streaming session: embedded StreamingSession with self as inner.
         # Always on -- zero overhead when no streaming session is open (the
@@ -287,6 +284,17 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
 
+        self._empty_match_result = MatchResult(
+            device_indices=torch.empty(
+                (0,),
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            last_device_node=self.root_node,
+            last_host_node=self.root_node,
+            best_match_node=self.root_node,
+        )
+
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -303,12 +311,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
 
         self.load_cache_event = threading.Event()
-        self.hicache_anchor_kv_shared_indices_pools.clear()
+        self.sidecar_pool_specs.clear()
         attach_hybrid_pool_to_unified_cache(
             self,
             params,
             server_args,
             load_cache_event=self.load_cache_event,
+            attn_cp_group=params.attn_cp_cache_group,
+            attn_tp_group=params.attn_tp_cache_group,
         )
 
         # State initialization
@@ -325,12 +335,8 @@ class UnifiedRadixCache(BasePrefixCache):
             f"transfer_layer_num={self.cache_controller.layer_num}"
         )
 
-    def register_hicache_anchor_kv_shared_indices_pool(
-        self,
-        pool_name: PoolName,
-        hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES,
-    ) -> None:
-        self.hicache_anchor_kv_shared_indices_pools.append((pool_name, hit_policy))
+    def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
+        self.sidecar_pool_specs.append(spec)
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
@@ -340,19 +346,15 @@ class UnifiedRadixCache(BasePrefixCache):
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
-            return MatchResult(
-                device_indices=torch.empty(
-                    (0,),
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                last_device_node=self.root_node,
-                last_host_node=self.root_node,
-            )
+            return self._empty_match_result
         key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return self._empty_match_result
 
-        value, last_node, best_value_len = self._match_prefix_helper(key)
-        return self._match_post_processor(params, value, last_node, best_value_len)
+        value, best_match_node, best_value_len = self._match_prefix_helper(key)
+        return self._match_post_processor(
+            params, value, best_match_node, best_value_len
+        )
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -594,16 +596,16 @@ class UnifiedRadixCache(BasePrefixCache):
         child_key = key.child_key(self.page_size)
         value: list[torch.Tensor] = []
         best_value_len = 0
-        best_node = node
+        best_match_node = node
         validators = tuple(
             comp.create_match_validator() for comp in self._components_tuple
         )
 
         def _update_best_if_valid(node):
-            nonlocal best_value_len, best_node
+            nonlocal best_value_len, best_match_node
             if all(v(node) for v in validators):
                 best_value_len = len(value)
-                best_node = node
+                best_match_node = node
 
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
@@ -624,7 +626,7 @@ class UnifiedRadixCache(BasePrefixCache):
             key = key[prefix_len:]
             if len(key):
                 child_key = key.child_key(self.page_size)
-        return value, best_node, best_value_len
+        return value, best_match_node, best_value_len
 
     def _match_prefix_helper(
         self, key: RadixKey
@@ -633,16 +635,16 @@ class UnifiedRadixCache(BasePrefixCache):
         child_key = key.child_key(self.page_size)
         value: list[torch.Tensor] = []
         best_value_len = 0
-        best_node = node
+        best_match_node = node
         validators = tuple(
             comp.create_match_validator() for comp in self._components_tuple
         )
 
         def _update_best_if_valid(node):
-            nonlocal best_value_len, best_node
+            nonlocal best_value_len, best_match_node
             if all(v(node) for v in validators):
                 best_value_len = len(value)
-                best_node = node
+                best_match_node = node
 
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
@@ -653,10 +655,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
-                if child.evicted:
-                    break
                 node = self._split_node(child.key, child, prefix_len)
-                value.append(node.component_data[BASE_COMPONENT_TYPE].value)
+                if not node.evicted:
+                    value.append(node.component_data[BASE_COMPONENT_TYPE].value)
                 _update_best_if_valid(node)
                 break
 
@@ -667,16 +668,16 @@ class UnifiedRadixCache(BasePrefixCache):
             key = key[prefix_len:]
             if len(key):
                 child_key = key.child_key(self.page_size)
-        return value, best_node, best_value_len
+        return value, best_match_node, best_value_len
 
     def _match_post_processor(
         self,
         params: MatchPrefixParams,
         value: list[torch.Tensor],
-        last_node: UnifiedTreeNode,
+        best_match_node: UnifiedTreeNode,
         best_value_len: int,
     ) -> MatchResult:
-        node_update = last_node
+        node_update = best_match_node
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue  # Full uses last_access_time, not LRU
@@ -691,23 +692,24 @@ class UnifiedRadixCache(BasePrefixCache):
             node_update = node_update.parent
 
         # Walk up to find last_device_node
-        last_device_node = last_node
+        last_device_node = best_match_node
         while last_device_node is not self.root_node and last_device_node.evicted:
             last_device_node = last_device_node.parent
 
         # Walk up to find last_host_node
-        last_host_node = last_node
+        last_host_node = best_match_node
         while last_host_node is not self.root_node and not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
         if best_value_len > 0:
             device_indices = torch.cat(value[:best_value_len])
         else:
-            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+            device_indices = self._empty_match_result.device_indices
         result = MatchResult(
             device_indices=device_indices,
             last_device_node=last_device_node,
             last_host_node=last_host_node,
+            best_match_node=best_match_node,
             host_hit_length=0,
         )
 
@@ -892,7 +894,13 @@ class UnifiedRadixCache(BasePrefixCache):
         target: EvictLayer = EvictLayer.DEVICE,
     ):
         """Cascade eviction from trigger to lower-or-equal priority components."""
-        is_leaf = len(node.children) == 0
+
+        is_leaf = False
+        if target == EvictLayer.DEVICE:
+            is_leaf = node in self.evictable_device_leaves
+        elif target == EvictLayer.HOST:
+            is_leaf = node in self.evictable_host_leaves
+
         trigger_priority = trigger.eviction_priority(is_leaf)
 
         for comp in self._components_tuple:
@@ -1154,7 +1162,10 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return 0
 
-        # Build aux transfers, keyed per component
+        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
+
+        # Build aux transfers, keyed per component.
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1162,13 +1173,11 @@ class UnifiedRadixCache(BasePrefixCache):
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
                 comp_xfers[comp.component_type] = t
-        anchor_kv_shared_indices_xfers = [
-            PoolTransfer(name=pool_name, hit_policy=hit_policy)
-            for pool_name, hit_policy in self.hicache_anchor_kv_shared_indices_pools
-        ]
+        sidecar_xfers = self._build_sidecar_transfers(
+            CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
+        )
 
         # Pre-evict host if insufficient
-        device_value = node.component_data[BASE_COMPONENT_TYPE].value
         kv_tokens = len(device_value)
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
@@ -1178,7 +1187,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 return 0
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(anchor_kv_shared_indices_xfers)
+        aux_xfers.extend(sidecar_xfers)
         host_indices = self.cache_controller.write(
             device_value, node_id=node.id, extra_pools=aux_xfers or None
         )
@@ -1207,7 +1216,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def load_back(
         self,
-        node: UnifiedTreeNode,
+        best_match_node: UnifiedTreeNode,
         mem_quota: Optional[int] = None,
         req=None,
     ) -> Optional[torch.Tensor]:
@@ -1216,15 +1225,12 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
 
         # Build KV transfer
-        last_hit_node = node
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
-            last_hit_node, CacheTransferPhase.LOAD_BACK
+            best_match_node, CacheTransferPhase.LOAD_BACK
         )[0]
 
         # Lock path & pre-evict if device pool is insufficient
-        nodes_to_load = kv_xfer.nodes_to_load
-        ancestor_node = nodes_to_load[0].parent if nodes_to_load else last_hit_node
-        result = self.inc_lock_ref(ancestor_node)
+        result = self.inc_lock_ref(best_match_node)
         ancestor_lock_params = result.to_dec_params()
         kv_tokens = len(kv_xfer.host_indices)
 
@@ -1234,14 +1240,13 @@ class UnifiedRadixCache(BasePrefixCache):
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
             t = comp.build_hicache_transfers(
-                last_hit_node, CacheTransferPhase.LOAD_BACK, req=req
+                best_match_node, CacheTransferPhase.LOAD_BACK, req=req
             )
             if t:
                 comp_xfers[comp.component_type] = t
-        anchor_kv_shared_indices_xfers = [
-            PoolTransfer(name=pool_name, hit_policy=hit_policy)
-            for pool_name, hit_policy in self.hicache_anchor_kv_shared_indices_pools
-        ]
+        sidecar_xfers = self._build_sidecar_transfers(
+            CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
+        )
 
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
@@ -1249,7 +1254,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
-            self.dec_lock_ref(ancestor_node, ancestor_lock_params)
+            self.dec_lock_ref(best_match_node, ancestor_lock_params)
             return None
 
         avail = self.token_to_kv_pool_allocator.available_size()
@@ -1257,42 +1262,88 @@ class UnifiedRadixCache(BasePrefixCache):
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
             if result.num_tokens_evicted < needed:
-                self.dec_lock_ref(ancestor_node, ancestor_lock_params)
+                self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 return None
 
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(anchor_kv_shared_indices_xfers)
+        aux_xfers.extend(sidecar_xfers)
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
-            node_id=last_hit_node.id,
+            node_id=best_match_node.id,
             extra_pools=aux_xfers or None,
         )
 
-        self.dec_lock_ref(ancestor_node, ancestor_lock_params)
+        self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
             return None
 
         # Commit: each component gets only its own transfers
         kv_xfer.device_indices = device_indices
         self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
-            last_hit_node,
+            best_match_node,
             CacheTransferPhase.LOAD_BACK,
             [kv_xfer],
         )
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
-                last_hit_node,
+                best_match_node,
                 CacheTransferPhase.LOAD_BACK,
                 xfers,
             )
 
-        self._update_evictable_leaf_sets(ancestor_node)
-        self.ongoing_load_back[last_hit_node.id] = (
-            last_hit_node,
-            self.inc_lock_ref(last_hit_node).to_dec_params(),
+        self._update_evictable_leaf_sets(best_match_node)
+        self.ongoing_load_back[best_match_node.id] = (
+            best_match_node,
+            self.inc_lock_ref(best_match_node).to_dec_params(),
         )
         return device_indices
+
+    def _build_sidecar_transfers(
+        self,
+        phase: CacheTransferPhase,
+        kv_xfer: PoolTransfer,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    ) -> list[PoolTransfer]:
+        transfers: list[PoolTransfer] = []
+        for spec in self.sidecar_pool_specs:
+            if spec.indices_from_pool == PoolName.KV:
+                indices_source = kv_xfer
+            else:
+                source_component = {
+                    PoolName.SWA: ComponentType.SWA,
+                    PoolName.MAMBA: ComponentType.MAMBA,
+                }.get(spec.indices_from_pool)
+                if source_component is None:
+                    raise AssertionError(
+                        f"Unsupported sidecar indices source pool "
+                        f"{spec.indices_from_pool}."
+                    )
+                matching_sources = comp_xfers.get(source_component, ())
+                if not matching_sources:
+                    continue
+                indices_source = matching_sources[0]
+                if indices_source.name != spec.indices_from_pool:
+                    raise AssertionError(
+                        f"Sidecar indices source pool {spec.indices_from_pool} "
+                        f"resolved to {indices_source.name} during {phase}."
+                    )
+
+            indices = (
+                indices_source.device_indices
+                if phase == CacheTransferPhase.BACKUP_HOST
+                else indices_source.host_indices
+            )
+            if indices is None or len(indices) == 0:
+                continue
+            transfers.append(
+                PoolTransfer(
+                    name=spec.pool_name,
+                    hit_policy=spec.hit_policy,
+                    indices_from_pool=spec.indices_from_pool,
+                )
+            )
+        return transfers
 
     def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
         """Increment hit count; trigger write_backup when threshold reached."""
@@ -1378,27 +1429,28 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> tuple[torch.Tensor, UnifiedTreeNode]:
         """Prepare KV cache loading from host to device.
         Returns (device_indices, last_node) tuple."""
-        last_node = params.last_host_node
+        best_match_node = params.best_match_node
         mem_quota = params.mem_quota
         req = params.req
 
-        if last_node.evicted or params.host_hit_length > 0:
-            loading_values = self.load_back(last_node, mem_quota, req=req)
+        if best_match_node.evicted or params.host_hit_length > 0:
+            loading_values = self.load_back(best_match_node, mem_quota, req=req)
             if loading_values is not None:
                 logger.debug(
                     "init_load_back success: loaded %d tokens for node %d",
                     len(loading_values),
-                    last_node.id,
+                    best_match_node.id,
                 )
-                return loading_values, last_node
+                return loading_values, best_match_node
 
             # Fallback: walk up to non-evicted ancestor
-            while last_node is not self.root_node and last_node.evicted:
-                last_node = last_node.parent
+            # TODO(ispobock): The fallback path is not correct. The last_device_node should consider all the components.
+            while best_match_node is not self.root_node and best_match_node.evicted:
+                best_match_node = best_match_node.parent
 
         return (
-            torch.empty((0,), dtype=torch.int64, device=self.device),
-            last_node,
+            self._empty_match_result.device_indices,
+            best_match_node,
         )
 
     def check_hicache_events(self) -> None:
