@@ -99,15 +99,15 @@ jobs:
             });
             const body = pr.body || '';
 
-            // Replace existing block in place, or append at body end.
-            const blockRe = new RegExp(`${outerStart}[\\s\\S]*?${outerEnd}`);
+            // Match optional stale leading `---` separator so we strip it.
+            const blockRe = new RegExp(`(?:\\n+---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
             let newBody;
             if (blockRe.test(body)) {
-              newBody = body.replace(blockRe, newBlock);
+              newBody = body.replace(blockRe, `\n\n${newBlock}`);
             } else {
               const sep = body.length === 0
                 ? ''
-                : (body.endsWith('\n') ? '\n---\n\n' : '\n\n---\n\n');
+                : (body.endsWith('\n') ? '\n' : '\n\n');
               newBody = `${body}${sep}${newBlock}`;
             }
 
