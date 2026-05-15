@@ -55,9 +55,7 @@ def _ltx2_split_rotary_kernel(
     )
 
     tl.store(out_ptr + x_base + offsets[None, :], out_first, mask=mask)
-    tl.store(
-        out_ptr + x_base + half_dim + offsets[None, :], out_second, mask=mask
-    )
+    tl.store(out_ptr + x_base + half_dim + offsets[None, :], out_second, mask=mask)
 
 
 def apply_ltx2_split_rotary_emb(
