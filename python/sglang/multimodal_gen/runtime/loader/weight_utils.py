@@ -4,6 +4,7 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/model_loader/weight_utils.py
 """Utilities for downloading, loading, initializing and verifying model weights."""
 
+import glob
 import hashlib
 import json
 import os
@@ -82,6 +83,22 @@ def filter_duplicate_safetensors_files(
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
+
+
+def get_safetensors_weight_files(hf_folder: str, index_file: str) -> list[str]:
+    """Return safetensors weight files, preferring the index when available."""
+    index_file_name = os.path.join(hf_folder, index_file)
+    if os.path.isfile(index_file_name):
+        with open(index_file_name) as f:
+            weight_map = json.load(f)["weight_map"]
+        return sorted(
+            {
+                os.path.join(hf_folder, relative_path)
+                for relative_path in weight_map.values()
+            }
+        )
+
+    return glob.glob(os.path.join(hf_folder, "*.safetensors"))
 
 
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
