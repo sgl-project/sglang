@@ -1,82 +1,229 @@
+"""Hybrid Triton wrapper for ``mla_kv_pack_quantize_fp8``.
+
+Auto-dispatches between two optimized Triton kernels based on the batch size
+(``s``, the token count). Both kernels perform the same fused operation:
+
+    out_k = cat(quantize_fp8(k_nope), broadcast(quantize_fp8(k_pe)))
+    out_v = quantize_fp8(v)
+
+The dispatch heuristic is derived from three optimization spikes on GB300
+(DSv3 dims, BF16 -> FP8 E4M3, NUM_HEADS=32):
+
+    - bs <= 8  -> optimized v0 (2-D ``(s, h)`` grid). Wins at small bs where
+                  per-program work is light and the 2-D grid keeps SMs busy.
+    - bs >  8  -> optimized v1_flat (1-D flat grid over ``s * num_heads``).
+                  Wins at larger bs by collapsing the grid and amortizing the
+                  index math across BLOCK pairs.
+
+The standalone JIT CUDA kernel is dominated by these two Triton kernels at
+every batch size on GB300 even after aggressive optimization, so it is not
+included in the dispatch.
+"""
+
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
-from sglang.jit_kernel.utils import (
-    cache_once,
-    is_arch_support_pdl,
-    load_jit,
-    make_cpp_args,
-)
-
-if TYPE_CHECKING:
-    from tvm_ffi.module import Module
+from sglang.jit_kernel.utils import is_arch_support_pdl
 
 
-@cache_once
-def _jit_mla_kv_pack_quantize_fp8_module(
-    in_dtype: torch.dtype,
-    out_dtype: torch.dtype,
-    qk_nope: int,
-    qk_rope: int,
-    v_head: int,
-    use_pdl: bool,
-) -> Module:
-    args = make_cpp_args(in_dtype, out_dtype, qk_nope, qk_rope, v_head, use_pdl)
-    tag = (
-        f"mla_kv_pack_quantize_fp8_{qk_nope}_{qk_rope}_{v_head}_"
-        f"{str(in_dtype).split('.')[-1]}_{str(out_dtype).split('.')[-1]}"
+# ---------------------------------------------------------------------------
+# Kernels
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _v0_kernel(
+    k_nope_ptr,
+    k_pe_ptr,
+    v_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    k_scale_inv,
+    v_scale_inv,
+    s_total,
+    k_nope_stride_t,
+    k_nope_stride_h,
+    k_pe_stride_t,
+    v_stride_t,
+    v_stride_h,
+    k_out_stride_t,
+    k_out_stride_h,
+    v_out_stride_t,
+    v_out_stride_h,
+    QK_NOPE: tl.constexpr,
+    QK_ROPE: tl.constexpr,
+    V_HEAD: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    pid_s = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    t_idx = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    t_mask = t_idx < s_total
+    nope_idx = tl.arange(0, QK_NOPE)
+    rope_idx = tl.arange(0, QK_ROPE)
+    v_idx = tl.arange(0, V_HEAD)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    nope_off = (
+        t_idx[:, None] * k_nope_stride_t + pid_h * k_nope_stride_h + nope_idx[None, :]
     )
-    return load_jit(
-        tag,
-        *args,
-        cuda_files=["elementwise/mla_kv_pack_quantize_fp8.cuh"],
-        cuda_wrappers=[
-            (
-                "mla_kv_pack_quantize_fp8",
-                f"MlaKVPackQuantizeFp8Kernel<{args}>::run",
-            )
-        ],
+    k_nope = tl.load(k_nope_ptr + nope_off, mask=t_mask[:, None])
+    pe_off = t_idx[:, None] * k_pe_stride_t + rope_idx[None, :]
+    k_pe = tl.load(k_pe_ptr + pe_off, mask=t_mask[:, None])
+    v_off = t_idx[:, None] * v_stride_t + pid_h * v_stride_h + v_idx[None, :]
+    v = tl.load(v_ptr + v_off, mask=t_mask[:, None])
+    k_nope_fp8 = (k_nope.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
+    k_pe_fp8 = (k_pe.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
+    v_fp8 = (v.to(tl.float32) * v_scale_inv).to(FP8_DTYPE)
+    k_out_base = t_idx[:, None] * k_out_stride_t + pid_h * k_out_stride_h
+    tl.store(
+        k_out_ptr + k_out_base + nope_idx[None, :], k_nope_fp8, mask=t_mask[:, None]
     )
+    tl.store(
+        k_out_ptr + k_out_base + QK_NOPE + rope_idx[None, :],
+        k_pe_fp8,
+        mask=t_mask[:, None],
+    )
+    v_out_off = (
+        t_idx[:, None] * v_out_stride_t + pid_h * v_out_stride_h + v_idx[None, :]
+    )
+    tl.store(v_out_ptr + v_out_off, v_fp8, mask=t_mask[:, None])
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
-def _pick_dispatch(s_total: int) -> Tuple[int, int, int]:
-    """Return (vec_n, block_s, num_warps).
+@triton.jit
+def _v1_flat_kernel(
+    k_nope_ptr,
+    k_pe_ptr,
+    v_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    k_scale_inv,
+    v_scale_inv,
+    s_total,
+    num_heads,
+    k_nope_stride_t,
+    k_nope_stride_h,
+    k_pe_stride_t,
+    v_stride_t,
+    v_stride_h,
+    k_out_stride_t,
+    k_out_stride_h,
+    v_out_stride_t,
+    v_out_stride_h,
+    QK_NOPE: tl.constexpr,
+    QK_ROPE: tl.constexpr,
+    V_HEAD: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    pid = tl.program_id(0)
+    pair_idx = pid * BLOCK + tl.arange(0, BLOCK)
+    total = s_total * num_heads
+    mask = pair_idx < total
+    t_idx = pair_idx // num_heads
+    h_idx = pair_idx % num_heads
+    nope_idx = tl.arange(0, QK_NOPE)
+    rope_idx = tl.arange(0, QK_ROPE)
+    v_idx_ = tl.arange(0, V_HEAD)
+    nope_off = (
+        t_idx[:, None] * k_nope_stride_t + h_idx[:, None] * k_nope_stride_h
+        + nope_idx[None, :]
+    )
+    k_nope = tl.load(k_nope_ptr + nope_off, mask=mask[:, None])
+    pe_off = t_idx[:, None] * k_pe_stride_t + rope_idx[None, :]
+    k_pe = tl.load(k_pe_ptr + pe_off, mask=mask[:, None])
+    v_off = (
+        t_idx[:, None] * v_stride_t + h_idx[:, None] * v_stride_h + v_idx_[None, :]
+    )
+    v = tl.load(v_ptr + v_off, mask=mask[:, None])
+    k_nope_fp8 = (k_nope.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
+    k_pe_fp8 = (k_pe.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
+    v_fp8 = (v.to(tl.float32) * v_scale_inv).to(FP8_DTYPE)
+    k_out_base = t_idx[:, None] * k_out_stride_t + h_idx[:, None] * k_out_stride_h
+    tl.store(
+        k_out_ptr + k_out_base + nope_idx[None, :], k_nope_fp8, mask=mask[:, None]
+    )
+    tl.store(
+        k_out_ptr + k_out_base + QK_NOPE + rope_idx[None, :],
+        k_pe_fp8,
+        mask=mask[:, None],
+    )
+    v_out_off = (
+        t_idx[:, None] * v_out_stride_t + h_idx[:, None] * v_out_stride_h
+        + v_idx_[None, :]
+    )
+    tl.store(v_out_ptr + v_out_off, v_fp8, mask=mask[:, None])
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
-    - block_s=0 (sentinel): "small / fat-warp" kernel. One CTA = 1 warp per
-      (token, head), straight-line code, no inner loop. Wins at bs <= 16 where
-      the loop kernel's per-CTA bookkeeping dominates.
-    - vec_n=8 (128-bit BF16/FP16 loads): wins at small s where per-CTA work
-      is light and the extra cost of 256-bit ld/st instructions isn't paid back.
-    - vec_n=16 (256-bit BF16/FP16 loads): wins at large s where the kernel is
-      memory bandwidth-bound and fewer instructions help.
 
-    Tuned by sweep on GB300 (148 SMs, BF16 → FP8 e4m3, DSv3 dims).
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+
+# v0 (2-D grid) best configs by bs. Maps s -> (BLOCK_S, num_warps, num_stages).
+_V0_CFG = {
+    1: (1, 4, 2),
+    2: (2, 4, 2),
+    4: (4, 4, 2),
+    8: (4, 4, 4),
+}
+
+
+def _pick_v1_flat_cfg(total: int) -> Tuple[int, int, int]:
+    """Pick (BLOCK, num_warps, num_stages) for v1_flat given total = s*num_heads."""
+    if total <= 64:
+        return 1, 1, 2
+    if total <= 512:
+        return 4, 4, 3
+    if total <= 2048:
+        return 8, 8, 2
+    if total <= 16384:
+        return 16, 8, 2
+    if total <= 49152:
+        return 32, 8, 3
+    return 16, 8, 3
+
+
+def _pick_kernel(s: int, num_heads: int) -> Tuple[str, dict]:
+    """Return ('v0' or 'v1_flat', kwargs).
+
+    Heuristic (GB300, DSv3, BF16 -> FP8 e4m3):
+        s <= 8   -> optimized v0 with per-bs tuned BLOCK_S/num_warps/num_stages
+        s >  8   -> optimized v1_flat with BLOCK/num_warps/num_stages by total
     """
-    if s_total <= 14:
-        # Fat-warp variant: one CTA = 1 warp per (token, head), straight-line.
-        # vec_n=4 fills the warp for the 32-vec K_nope/V phases (128/4=32 vecs)
-        # and uses 16 lanes for the 16-vec K_pe phase. Wins through bs~14 where
-        # SM occupancy from one-CTA-per-(token,head) outweighs the loop kernel's
-        # ability to keep many threads per CTA busy.
-        return 4, 0, 1
-    if s_total <= 192:
-        return 8, 8, 4
-    if s_total <= 256:
-        # Marginal win over the bs<=1536 band at exactly bs=256 in the 8-layer
-        # cudagraph bench (1.82us vs 1.86us). vec_n=8 + larger block_s keeps
-        # register pressure low and warp occupancy high.
-        return 8, 32, 8
-    if s_total <= 1536:
-        return 16, 16, 4
-    # Bandwidth-bound regime. Sweep on GB300 (148 SMs, BF16 → FP8 e4m3, DSv3
-    # dims) shows block_s=64 with the batched-load fast path keeps enough
-    # transactions in flight at bs >= 2048.
-    if s_total <= 8192:
-        return 16, 64, 8
-    return 16, 64, 16
+    if s <= 8:
+        block_s, num_warps, num_stages = _V0_CFG[s]
+        return "v0", {
+            "BLOCK_S": block_s,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+    block, num_warps, num_stages = _pick_v1_flat_cfg(s * num_heads)
+    return "v1_flat", {
+        "BLOCK": block,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
+_FP8_DTYPE_MAP = {
+    torch.float8_e4m3fn: tl.float8e4nv,
+    torch.float8_e5m2: tl.float8e5,
+}
 
 
 def mla_kv_pack_quantize_fp8(
@@ -89,14 +236,8 @@ def mla_kv_pack_quantize_fp8(
     v_out: Optional[torch.Tensor] = None,
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
     enable_pdl: Optional[bool] = None,
-    vec_n: int = 0,
-    block_s: int = 0,
-    num_warps: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fused cat(k_nope, broadcast k_pe) + per-tensor FP8 quantize for K, plus
-    per-tensor FP8 quantize for V. Single-kernel JIT path that fuses what would
-    otherwise be three Triton kernels (cat + 2 FP8 quantize) for the MLA
-    chunked-prefill K/V packing.
+    """Hybrid Triton replacement for the JIT CUDA ``mla_kv_pack_quantize_fp8``.
 
     Args:
         k_nope: BF16/FP16 ``[s, h, qk_nope]``. May be a strided view.
@@ -107,7 +248,6 @@ def mla_kv_pack_quantize_fp8(
         k_out, v_out: optional pre-allocated FP8 outputs.
         fp8_dtype: ``torch.float8_e4m3fn`` (default) or ``torch.float8_e5m2``.
         enable_pdl: opt into PDL. Auto-detected when ``None``.
-        block_s, num_warps: dispatch tuning knobs (0 = auto from ``s``).
 
     Returns:
         ``(k_fp8 [s, h, qk_nope + qk_rope], v_fp8 [s, h, v_head])``.
@@ -151,28 +291,72 @@ def mla_kv_pack_quantize_fp8(
     if enable_pdl is None:
         enable_pdl = is_arch_support_pdl()
 
-    if vec_n <= 0 or block_s <= 0 or num_warps <= 0:
-        auto_vn, auto_bs, auto_nw = _pick_dispatch(s)
-        if vec_n <= 0:
-            vec_n = auto_vn
-        if block_s <= 0:
-            block_s = auto_bs
-        if num_warps <= 0:
-            num_warps = auto_nw
+    fp8_tl_dtype = _FP8_DTYPE_MAP[fp8_dtype]
+    kernel_choice, cfg = _pick_kernel(s, num_heads)
+    extra = {"launch_pdl": True} if enable_pdl else {}
 
-    module = _jit_mla_kv_pack_quantize_fp8_module(
-        k_nope.dtype, fp8_dtype, qk_nope, qk_rope, v_head, enable_pdl
-    )
-    module.mla_kv_pack_quantize_fp8(
-        k_out,
-        v_out,
-        k_nope,
-        k_pe_2d,
-        v,
-        float(k_scale_inv),
-        float(v_scale_inv),
-        vec_n,
-        block_s,
-        num_warps,
-    )
+    if kernel_choice == "v0":
+        block_s = cfg["BLOCK_S"]
+        grid = (triton.cdiv(s, block_s), num_heads)
+        _v0_kernel[grid](
+            k_nope,
+            k_pe_2d,
+            v,
+            k_out,
+            v_out,
+            float(k_scale_inv),
+            float(v_scale_inv),
+            s,
+            k_nope.stride(0),
+            k_nope.stride(1),
+            k_pe_2d.stride(0),
+            v.stride(0),
+            v.stride(1),
+            k_out.stride(0),
+            k_out.stride(1),
+            v_out.stride(0),
+            v_out.stride(1),
+            QK_NOPE=qk_nope,
+            QK_ROPE=qk_rope,
+            V_HEAD=v_head,
+            FP8_DTYPE=fp8_tl_dtype,
+            BLOCK_S=block_s,
+            ENABLE_PDL=enable_pdl,
+            num_warps=cfg["num_warps"],
+            num_stages=cfg["num_stages"],
+            **extra,
+        )
+    else:
+        block = cfg["BLOCK"]
+        total = s * num_heads
+        grid = (triton.cdiv(total, block),)
+        _v1_flat_kernel[grid](
+            k_nope,
+            k_pe_2d,
+            v,
+            k_out,
+            v_out,
+            float(k_scale_inv),
+            float(v_scale_inv),
+            s,
+            num_heads,
+            k_nope.stride(0),
+            k_nope.stride(1),
+            k_pe_2d.stride(0),
+            v.stride(0),
+            v.stride(1),
+            k_out.stride(0),
+            k_out.stride(1),
+            v_out.stride(0),
+            v_out.stride(1),
+            QK_NOPE=qk_nope,
+            QK_ROPE=qk_rope,
+            V_HEAD=v_head,
+            FP8_DTYPE=fp8_tl_dtype,
+            BLOCK=block,
+            ENABLE_PDL=enable_pdl,
+            num_warps=cfg["num_warps"],
+            num_stages=cfg["num_stages"],
+            **extra,
+        )
     return k_out, v_out

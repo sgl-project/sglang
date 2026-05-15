@@ -62,9 +62,6 @@ def test_correctness(dtype, shape, num_heads, batch_size):
 
     k_ref, v_ref = _ref(k_nope, k_pe, v, k_scale_inv, v_scale_inv, torch.float8_e4m3fn)
 
-    # FP8 is exact-equal when both impls round identically. Allow a 1-ULP
-    # tolerance in case of subtle rounding differences between Triton-style
-    # `.to(fp8)` and CUDA's saturating `static_cast<fp8>`.
     torch.testing.assert_close(k_fp8.float(), k_ref.float(), rtol=1e-2, atol=0.5)
     torch.testing.assert_close(v_fp8.float(), v_ref.float(), rtol=1e-2, atol=0.5)
 

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -370,6 +371,11 @@ class DeepseekMHAForwardMixin:
     ) -> torch.Tensor:
 
         assert forward_batch.num_prefix_chunks is not None
+        fp8_attn = (
+            _is_cuda
+            and self.current_attention_backend == "fa3"
+            and self.kv_cache_dtype != "auto"
+        )
         for i in range(forward_batch.num_prefix_chunks):
             forward_batch.set_prefix_chunk_idx(i)
 
@@ -385,17 +391,28 @@ class DeepseekMHAForwardMixin:
             v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
 
-            k = torch.empty(
-                (
-                    k_nope.shape[0],
-                    self.num_local_heads,
-                    self.qk_nope_head_dim + self.qk_rope_head_dim,
-                ),
-                dtype=v.dtype,
-                device=v.device,
-            )
-            k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
+            if fp8_attn:
+                # Fused cat(k_nope, broadcast k_pe) + FP8 quantize for K + FP8
+                # quantize for V in a single kernel — saves two separate
+                # elementwise quantize launches and the K-cat alloc.
+                k, v = mla_kv_pack_quantize_fp8(
+                    k_nope,
+                    k_pe,
+                    v,
+                    fp8_dtype=forward_batch.token_to_kv_pool.dtype,
+                )
+            else:
+                k = torch.empty(
+                    (
+                        k_nope.shape[0],
+                        self.num_local_heads,
+                        self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    ),
+                    dtype=v.dtype,
+                    device=v.device,
+                )
+                k[..., : self.qk_nope_head_dim] = k_nope
+                k[..., self.qk_nope_head_dim :] = k_pe
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             tmp_output = torch.empty_like(accum_output)

@@ -1,8 +1,8 @@
-"""Benchmark the JIT mla_kv_pack_quantize_fp8 against an inlined Triton baseline.
+"""Benchmark the hybrid mla_kv_pack_quantize_fp8 against an inlined naive Triton baseline.
 
-The Triton baseline is a straightforward 3-phase implementation (load k_nope /
-k_pe / v, FP8 cast, store packed K and quantized V) tuned with
-``(BLOCK_S, num_warps, num_stages)`` bands by ``s``.
+The naive baseline is a straightforward 3-phase implementation (load k_nope /
+k_pe / v, FP8 cast, store packed K and quantized V) on a 2-D ``(s, h)`` grid
+tuned with ``(BLOCK_S, num_warps, num_stages)`` bands by ``s``.
 """
 
 import itertools
@@ -20,7 +20,7 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
 )
 from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import (
-    mla_kv_pack_quantize_fp8 as jit_pack,
+    mla_kv_pack_quantize_fp8 as hybrid_pack,
 )
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -153,8 +153,8 @@ BS_RANGE = get_benchmark_range(
     ci_range=[1, 64, 1024, 4096, 16384],
 )
 
-LINE_VALS = ["jit", "triton"]
-LINE_NAMES = ["JIT (auto)", "Triton baseline"]
+LINE_VALS = ["hybrid", "triton"]
+LINE_NAMES = ["hybrid (v0+v1_flat)", "naive Triton"]
 STYLES = [("green", "-"), ("red", "--")]
 CONFIGS = list(itertools.product(BS_RANGE))
 
@@ -200,11 +200,11 @@ def benchmark(batch_size: int, provider: str) -> Tuple[float, float, float]:
     )
     torch.cuda.synchronize()
 
-    if provider == "jit":
+    if provider == "hybrid":
 
         def fn():
             for i in range(NUM_LAYERS):
-                jit_pack(k_nope[i], k_pe[i], v[i], k_out=k_out[i], v_out=v_out[i])
+                hybrid_pack(k_nope[i], k_pe[i], v[i], k_out=k_out[i], v_out=v_out[i])
 
     else:
 

@@ -102,7 +102,6 @@ CPP_DTYPE_MAP = {
     torch.float: "fp32_t",
     torch.float16: "fp16_t",
     torch.float8_e4m3fn: "fp8_e4m3_t",
-    torch.float8_e5m2: "fp8_e5m2_t",
     torch.bfloat16: "bf16_t",
     torch.int8: "int8_t",
     torch.int32: "int32_t",
