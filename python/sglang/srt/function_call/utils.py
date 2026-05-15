@@ -76,26 +76,54 @@ def _get_tool_schema_defs(tools: List[Tool]) -> dict:
             continue
         defs = tool.function.parameters.get("$defs", {})
         for def_name, def_schema in defs.items():
-            if def_name in all_defs and all_defs[def_name] != def_schema:
+            sanitized_schema = _sanitize_tool_parameters_schema(def_schema)
+            if def_name in all_defs and all_defs[def_name] != sanitized_schema:
                 raise ValueError(
                     f"Tool definition '{def_name}' has "
                     "multiple schemas, which is not "
                     "supported."
                 )
             else:
-                all_defs[def_name] = def_schema
+                all_defs[def_name] = sanitized_schema
     return all_defs
 
 
+_NULLABLE_ARRAY_SCHEMA_FIELDS = frozenset(
+    {"required", "enum", "allOf", "anyOf", "oneOf"}
+)
+
+
+def _sanitize_tool_parameters_schema(schema: Any) -> Any:
+    """Normalize a user-provided JSON Schema so grammar backends can compile it.
+
+    Some clients send array-typed JSON Schema fields (e.g. ``required``) with
+    a ``null`` value to mean "no entries". JSON Schema requires these fields
+    to be arrays, so strict validators such as the one used by xgrammar reject
+    the whole tool call. Other inference engines (e.g. vLLM) silently tolerate
+    this shape; this helper brings sglang in line by dropping such
+    ``null``-valued fields so the schema's default (empty) semantics apply.
+    """
+    if isinstance(schema, dict):
+        return {
+            key: _sanitize_tool_parameters_schema(value)
+            for key, value in schema.items()
+            if not (key in _NULLABLE_ARRAY_SCHEMA_FIELDS and value is None)
+        }
+    if isinstance(schema, list):
+        return [_sanitize_tool_parameters_schema(item) for item in schema]
+    return schema
+
+
 def _get_tool_schema(tool: Tool) -> dict:
+    parameters = tool.function.parameters
+    if parameters:
+        parameters = _sanitize_tool_parameters_schema(parameters)
+    else:
+        parameters = {"type": "object", "properties": {}}
     return {
         "properties": {
             "name": {"type": "string", "enum": [tool.function.name]},
-            "parameters": (
-                tool.function.parameters
-                if tool.function.parameters
-                else {"type": "object", "properties": {}}
-            ),
+            "parameters": parameters,
         },
         "required": ["name", "parameters"],
     }

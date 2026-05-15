@@ -38,6 +38,7 @@ from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.trinity_detector import TrinityDetector
 from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
+    _sanitize_tool_parameters_schema,
     get_json_schema_constraint,
 )
 
@@ -188,7 +189,11 @@ class FunctionCallParser:
             is_strict = (
                 function.strict or self.tool_strict_level >= ToolStrictLevel.PARAMETER
             )
-            schema = function.parameters if is_strict else {}
+            schema = (
+                _sanitize_tool_parameters_schema(function.parameters)
+                if is_strict and function.parameters
+                else {}
+            )
 
             tool_structures.append(
                 StructuresResponseFormat(
