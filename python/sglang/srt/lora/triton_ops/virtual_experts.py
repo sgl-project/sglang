@@ -426,8 +426,18 @@ def _invoke_moe_lora_expand_add(
     c_map: torch.Tensor | None = None,
     output_is_sorted: bool = False,
 ) -> None:
-    """Launch LoRA B expand-add, optionally writing through c_map."""
-    output_2d = output.view(-1, output.shape[-1])
+    """Launch LoRA B expand-add, optionally writing through c_map.
+
+    ``output`` may be either a 3D ``[M, top_k, K_out]`` tensor or a 2D slice
+    of one (e.g. one half of a gated MLP's gate_up output). For 2D slices we
+    avoid ``.view()`` (which would fail for non-contiguous strides) and pass
+    the tensor through directly; strides come from ``.stride()`` and remain
+    correct.
+    """
+    if output.dim() == 2:
+        output_2d = output
+    else:
+        output_2d = output.view(-1, output.shape[-1])
     N = weight.shape[1]
     K = weight.shape[2]
     BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
@@ -871,9 +881,91 @@ def _merged_experts_fused_moe_lora_add_impl(
         b_stage_config["BLOCK_SIZE_M"],
     )
 
+    # Gated MLP detection: lora_a stacks gate+up A-weights along the rank
+    # dim (rank=2r), while lora_b keeps the original rank dim (r). The expand
+    # kernel reads K=lora_b.shape[2]=r columns of the shrink output. Without
+    # special-casing, only the first r columns (gate proj) get used and the
+    # ``up`` rank slice [r, 2r) is silently dropped — the kernel writes
+    # ``gate_proj @ B[:, n, :]`` to both the gate (n in [0, N)) and up
+    # (n in [N, 2N)) halves of the output. Match the classic-LoRA path by
+    # splitting the expand into two calls, one per slice.
+    expand_rank = lora_b_virtual.shape[-1]
+    is_gated_expand = max_lora_rank > expand_rank
+    intermediate_2d = intermediate.view(-1, max_lora_rank)
+    out_dim = lora_b_virtual.shape[1]
+
+    def _do_expand(a_slice_2d, b_slice_3d, out_slice):
+        if output_is_sorted:
+            _invoke_moe_lora_expand_add(
+                a_slice_2d,
+                b_slice_3d,
+                out_slice,
+                topk_weights,
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                token_lora_mask,
+                b_stage_config,
+                mul_routed_weight,
+                c_map=c_map,
+                output_is_sorted=True,
+            )
+        else:
+            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+                invoke_fused_moe_kernel,
+            )
+
+            invoke_fused_moe_kernel(
+                a_slice_2d,
+                b_slice_3d,
+                None,
+                out_slice,
+                None,
+                None,
+                None,
+                topk_weights,
+                topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                mul_routed_weight,
+                1,
+                b_stage_config,
+                tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
+                False,
+                False,
+                False,
+                False,
+                False,
+                None,
+                fuse_add_to_output=True,
+                add_output_mask=token_lora_mask,
+                router_topk=topk_ids.shape[1],
+            )
+
+    if is_gated_expand:
+        # Gate slice: A[:, 0:r] @ B[:, 0:N/2, :] -> output[:, 0:N/2]
+        # Up   slice: A[:, r:2r] @ B[:, N/2:N, :] -> output[:, N/2:N]
+        n_half = out_dim // 2
+        # Output is [M, top_k, 2*N/2]. Flatten to 2D once, then slice cols.
+        output_full_2d = output.view(-1, out_dim)
+        for slice_idx in range(2):
+            a_slice = intermediate_2d[
+                :, slice_idx * expand_rank : (slice_idx + 1) * expand_rank
+            ]
+            b_slice = lora_b_virtual[
+                :, slice_idx * n_half : (slice_idx + 1) * n_half, :
+            ]
+            out_slice = output_full_2d[
+                :, slice_idx * n_half : (slice_idx + 1) * n_half
+            ]
+            _do_expand(a_slice, b_slice, out_slice)
+        return
+
     if output_is_sorted:
         _invoke_moe_lora_expand_add(
-            intermediate.view(-1, max_lora_rank),
+            intermediate_2d,
             lora_b_virtual,
             output,
             topk_weights,
@@ -893,7 +985,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         )
 
         invoke_fused_moe_kernel(
-            intermediate.view(-1, max_lora_rank),
+            intermediate_2d,
             lora_b_virtual,
             None,
             output,
