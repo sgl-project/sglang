@@ -81,7 +81,7 @@ def compute_split_seq_index(
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> Optional[int]:
-    if forward_mode == ForwardMode.EXTEND:
+    if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_lens is not None
         return _split_extend_seqs(extend_lens)
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
@@ -220,24 +220,26 @@ def split_spec_info(
         positions = spec_info.positions[start_token_index:end_token_index]
     else:
         positions = None
-    if spec_info.retrive_index is not None:
-        retrive_index = spec_info.retrive_index[start_seq_index:end_seq_index]
+    if spec_info.retrieve_index is not None:
+        retrieve_index = spec_info.retrieve_index[start_seq_index:end_seq_index]
     else:
-        retrive_index = None
-    if spec_info.retrive_next_token is not None:
-        retrive_next_token = spec_info.retrive_next_token[start_seq_index:end_seq_index]
-    else:
-        retrive_next_token = None
-    if spec_info.retrive_next_sibling is not None:
-        retrive_next_sibling = spec_info.retrive_next_sibling[
+        retrieve_index = None
+    if spec_info.retrieve_next_token is not None:
+        retrieve_next_token = spec_info.retrieve_next_token[
             start_seq_index:end_seq_index
         ]
     else:
-        retrive_next_sibling = None
-    if spec_info.retrive_cum_len is not None:
-        retrive_cum_len = spec_info.retrive_cum_len[start_seq_index:end_seq_index]
+        retrieve_next_token = None
+    if spec_info.retrieve_next_sibling is not None:
+        retrieve_next_sibling = spec_info.retrieve_next_sibling[
+            start_seq_index:end_seq_index
+        ]
     else:
-        retrive_cum_len = None
+        retrieve_next_sibling = None
+    if spec_info.retrieve_cum_len is not None:
+        retrieve_cum_len = spec_info.retrieve_cum_len[start_seq_index:end_seq_index]
+    else:
+        retrieve_cum_len = None
 
     if spec_info.seq_lens_cpu is not None:
         seq_lens_cpu = spec_info.seq_lens_cpu[start_seq_index:end_seq_index]
@@ -252,10 +254,10 @@ def split_spec_info(
         custom_mask=custom_mask,
         draft_token=draft_token,
         positions=positions,
-        retrive_index=retrive_index,
-        retrive_next_token=retrive_next_token,
-        retrive_next_sibling=retrive_next_sibling,
-        retrive_cum_len=retrive_cum_len,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
+        retrieve_cum_len=retrieve_cum_len,
         seq_lens_cpu=seq_lens_cpu,
         seq_lens_sum=seq_lens_sum,
     )
@@ -268,7 +270,7 @@ def compute_split_token_index(
     extend_seq_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> int:
-    if forward_mode == ForwardMode.EXTEND:
+    if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_seq_lens is not None
         if _is_two_chunk_split_enabled(extend_seq_lens):
             return sum(extend_seq_lens) // 2
@@ -699,12 +701,20 @@ class TboForwardBatchPreparer:
             "spec_algorithm",
             "capture_hidden_mode",
             "padded_static_len",
-            "mrope_positions",  # only used by qwen2-vl, thus not care
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
         ]:
             output_dict[key] = getattr(batch, key)
+
+        mrope_positions = getattr(batch, "mrope_positions")
+        if mrope_positions is not None:
+            output_dict["mrope_positions"] = mrope_positions[
+                :, start_token_index:end_token_index
+            ]
+        else:
+            output_dict["mrope_positions"] = None
+
         if not batch.forward_mode.is_target_verify():
             assert (
                 _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)

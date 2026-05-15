@@ -51,16 +51,14 @@ def is_prefill_cp_in_seq_split():
 
 
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
-    # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
-    # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
-    # the seq data needs to be divided and recombined at twice the size of cp_size.
+    # CP metadata (zigzag split) only supports batch=1 for now.
     cur_cp_seq_len = seq_len // (cp_size * 2)
-    # print("DEBUG: can_cp_split", cur_cp_seq_len, cp_size, forward_batch.forward_mode.is_context_parallel_extend(), is_prefill_context_parallel_enabled(), flush=True)
     if (
         cur_cp_seq_len != 0
         and cp_size > 1
         and forward_batch.forward_mode.is_context_parallel_extend()
         and is_prefill_context_parallel_enabled()
+        and forward_batch.seq_lens_cpu.shape[0] == 1
     ):
         return True
     else:
@@ -181,12 +179,15 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
         input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
 
     # Create output tensor with proper shape for all dimensions
-    input_tensor_full = torch.empty(
-        max_len * cp_size,
-        *input_tensor.shape[1:],
-        device=input_tensor.device,
-        dtype=input_tensor.dtype,
-    )
+    with use_symmetric_memory(
+        get_attention_cp_group(), disabled=not is_allocation_symmetric()
+    ):
+        input_tensor_full = torch.empty(
+            max_len * cp_size,
+            *input_tensor.shape[1:],
+            device=input_tensor.device,
+            dtype=input_tensor.dtype,
+        )
 
     get_attention_cp_group().cp_all_gather_into_tensor_async(
         input_tensor_full, input_tensor, stream

@@ -437,10 +437,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     std::optional<at::Tensor> w_scale,
     bool is_vnni,
     std::optional<std::vector<int64_t>> block_size) {
-  RECORD_FUNCTION(
-      "sgl-kernel::qkv_proj_with_rope",
-      std::vector<c10::IValue>({hidden_states, q_a_proj_weight, q_b_proj_weight, kv_a_proj_weight, w_kc}));
-
   const auto st = hidden_states.scalar_type();
   CHECK_INPUT(hidden_states);
   CHECK_INPUT(positions);
@@ -649,10 +645,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
     int64_t q_lora_rank,
     int64_t kv_lora_rank,
     int64_t qk_rope_head_dim) {
-  RECORD_FUNCTION(
-      "sgl-kernel::qkv_proj_with_rope_fused_weight",
-      std::vector<c10::IValue>({hidden_states, qkv_a_proj_weight, q_b_proj_weight, w_kc}));
-
   int64_t hidden_size = hidden_states.size(1);
   CHECK_EQ(qkv_a_proj_weight.size(0), q_lora_rank + kv_lora_rank + qk_rope_head_dim);
   CHECK_EQ(qkv_a_proj_weight.size(1), get_row_size(hidden_size, use_int8_w8a8));
