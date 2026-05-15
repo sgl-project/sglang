@@ -194,6 +194,8 @@ def configure_deep_gemm_num_sms(num_sms):
     if num_sms is None or not ENABLE_JIT_DEEPGEMM:
         yield
     else:
+        import deep_gemm
+
         original_num_sms = deep_gemm.get_num_sms()
         deep_gemm.set_num_sms(num_sms)
         try:
