@@ -32,6 +32,8 @@ pub struct MockWorkerState {
 /// A running mock SGLang worker. Shuts down on Drop via the oneshot sender.
 pub struct MockWorker {
     pub url: String,
+    // Used in header_forwarding_test; not every test file reads captured headers.
+    #[allow(dead_code)]
     pub captured: Arc<Mutex<CapturedHeaders>>,
     _shutdown: oneshot::Sender<()>,
 }
