@@ -14,7 +14,10 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use sgl_router::config::{Config, ModelConfig, ObservabilityConfig, ServerConfig, WorkerConfig};
+use sgl_router::config::{
+    Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig, ServerConfig,
+    StaticFileDiscoveryConfig,
+};
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
@@ -23,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
-fn config(worker_url: &str) -> Config {
+fn config(_worker_url: &str) -> Config {
     Config {
         server: ServerConfig {
             host: "0".into(),
@@ -33,11 +36,15 @@ fn config(worker_url: &str) -> Config {
         models: vec![ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            policy: "round_robin".into(),
+            circuit_breaker: None,
         }],
-        workers: vec![WorkerConfig {
-            url: worker_url.parse().expect("worker URL must parse"),
-            request_timeout: Some(Duration::from_millis(200)),
-        }],
+        discovery: DiscoveryConfig {
+            backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {
+                path: "/tmp/test-workers.toml".into(),
+                poll_interval_ms: 200,
+            }),
+        },
     }
 }
 

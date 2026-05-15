@@ -51,10 +51,14 @@ mod tests {
             crate::config::ModelConfig {
                 id: "qwen3".into(),
                 tokenizer_path: "x".into(),
+                policy: "round_robin".into(),
+                circuit_breaker: None,
             },
             crate::config::ModelConfig {
                 id: "deepseek".into(),
                 tokenizer_path: "y".into(),
+                policy: "round_robin".into(),
+                circuit_breaker: None,
             },
         ];
         let app = crate::server::app::build_router(std::sync::Arc::new(ctx));

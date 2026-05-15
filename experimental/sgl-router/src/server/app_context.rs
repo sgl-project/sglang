@@ -46,10 +46,14 @@ impl AppContext {
                 },
                 observability: Default::default(),
                 models: vec![],
-                workers: vec![crate::config::WorkerConfig {
-                    url: url.clone(),
-                    request_timeout: None,
-                }],
+                discovery: crate::config::DiscoveryConfig {
+                    backend: crate::config::DiscoveryBackend::StaticFile(
+                        crate::config::StaticFileDiscoveryConfig {
+                            path: "/tmp/test-workers.toml".into(),
+                            poll_interval_ms: 200,
+                        },
+                    ),
+                },
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
             proxy: Arc::new(

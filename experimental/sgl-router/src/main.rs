@@ -69,24 +69,17 @@ async fn main() -> Result<()> {
         sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
             .context("load tokenizers")?,
     );
-    let primary_worker = cfg
-        .workers
-        .first()
-        .context("config has no workers (validate() should have rejected this)")?;
-    // Field is `Option<Duration>` after the humantime-serde refactor; only
-    // the default needs picking here.
-    let request_timeout = primary_worker
-        .request_timeout
-        .unwrap_or_else(|| std::time::Duration::from_secs(60));
-    let proxy = Arc::new(
-        sgl_router::proxy::Proxy::new(primary_worker.url.clone(), request_timeout)
-            .context("build proxy client")?,
-    );
 
-    match proxy.probe_health(std::time::Duration::from_secs(2)).await {
-        Ok(()) => tracing::info!("worker probe ok"),
-        Err(e) => tracing::warn!("startup worker probe failed: {e}; continuing anyway"),
-    }
+    // TODO(M2 Task 11): replace with policy-driven worker selection.
+    let placeholder_worker_url = reqwest::Url::parse("http://localhost:30000")
+        .context("parse placeholder worker URL")?;
+    let proxy = Arc::new(
+        sgl_router::proxy::Proxy::new(
+            placeholder_worker_url,
+            std::time::Duration::from_secs(60),
+        )
+        .context("build proxy client")?,
+    );
 
     let ctx = Arc::new(sgl_router::server::app_context::AppContext::new(
         cfg.clone(),
