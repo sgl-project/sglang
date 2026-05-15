@@ -5,7 +5,7 @@
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Json;
@@ -53,6 +53,47 @@ impl MockWorker {
             .route("/v1/chat/completions", post(chat))
             .with_state(state);
 
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        Self {
+            url,
+            captured,
+            _shutdown: tx,
+        }
+    }
+
+    /// Bind to a random port and start a worker that ALWAYS returns the given
+    /// HTTP status code and JSON body with `Content-Type: application/json`.
+    /// Used to test router behaviour when the upstream returns an error.
+    #[allow(dead_code)]
+    pub async fn start_returning_error(status: StatusCode, body: Value) -> Self {
+        let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
+        let body_str = body.to_string();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let body_str = body_str.clone();
+                async move {
+                    let mut r = Response::new(Body::from(body_str));
+                    *r.status_mut() = status;
+                    r.headers_mut().insert(
+                        HeaderName::from_static("content-type"),
+                        HeaderValue::from_static("application/json"),
+                    );
+                    r
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         let url = format!("http://{addr}");
