@@ -28,7 +28,8 @@ impl Worker {
     }
 
     pub fn active_load(&self) -> usize {
-        self.active_requests.load(std::sync::atomic::Ordering::Relaxed)
+        self.active_requests
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
