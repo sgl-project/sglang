@@ -38,8 +38,13 @@ def _yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
 
 
 def precompute_freqs_cis(
-    dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow,
-    mscale: float = 1.0, mscale_all_dim: float = 0.0,
+    dim,
+    seqlen,
+    original_seq_len,
+    base,
+    factor,
+    beta_fast,
+    beta_slow,
 ) -> torch.Tensor:
 
     def find_correction_dim(num_rotations, dim, base, max_seq_len):

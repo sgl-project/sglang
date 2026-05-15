@@ -55,6 +55,7 @@ except ImportError as e:
         f"Original ImportError: {e}"
     ) from e
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
@@ -276,9 +277,8 @@ class DeepseekV4AscendAttnBackend(
         # reference impl on top of pre-allocated req_to_token_c{N} tables;
         # main has no req_to_token_c{N}, so we compute equivalents on the
         # fly from req_to_token + the V4 KV pool's swa translation.
-        from sglang.srt.environ import envs as _envs
 
-        if _envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get() and self._dsv4_compress_ratios:
+        if envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get() and self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
 
     def _compute_kernel_metadata(self, forward_batch: "ForwardBatch") -> dict:
@@ -513,10 +513,9 @@ class DeepseekV4AscendAttnBackend(
         # The second gate stays OFF by default until the kernel call's
         # size / sparse-indices mismatch is resolved; with it OFF, output
         # is bit-for-bit identical to the flag-OFF baseline.
-        from sglang.srt.environ import envs as _envs
 
-        sparse_on = _envs.SGLANG_DSV4_NPU_SPARSE_ATTN.get()
-        c128_only = _envs.SGLANG_DSV4_NPU_SPARSE_ATTN_C128_ONLY.get()
+        sparse_on = envs.SGLANG_DSV4_NPU_SPARSE_ATTN.get()
+        c128_only = envs.SGLANG_DSV4_NPU_SPARSE_ATTN_C128_ONLY.get()
         # Bisect mode: only c128 layers route to _forward_compressed.
         if c128_only and compress_ratio != 128:
             return self._forward_dense(q, layer, forward_batch, attn_sink)
@@ -655,9 +654,8 @@ class DeepseekV4AscendAttnBackend(
         # indices tensor, not due to slab/cmp_kv layout. If output still
         # diverges from dense baseline, the issue is in compressor write
         # values (ape/wkv split) or in lingering pool state.
-        from sglang.srt.environ import envs as _envs
 
-        if compress_ratio == 4 and not _envs.SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK.get():
+        if compress_ratio == 4 and not envs.SGLANG_DSV4_NPU_SPARSE_C4_NO_TOPK.get():
             topk = fm.c4_topk_indices
             if topk is None:
                 topk = self._seed_c4_topk_indices(forward_batch)
@@ -720,9 +718,8 @@ class DeepseekV4AscendAttnBackend(
         """
         if forward_batch.forward_mode.is_idle():
             return
-        from sglang.srt.environ import envs as _envs
 
-        if not _envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get():
+        if not envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get():
             return
         compressor(x, forward_batch)
 

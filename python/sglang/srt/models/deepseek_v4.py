@@ -72,6 +72,13 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
+# torch.ops.custom.npu_hc_pre / npu_hc_post / inplace_partial_rotary_mul are
+# registered as a side-effect of importing the `custom_ops` wheel that ships
+# with the Ascend cann-8.5.0-a3 image. Import once at module load (NPU only)
+# so the per-callsite re-imports inside hc_pre / hc_post can drop.
+if _is_npu:
+    import custom_ops  # noqa: F401  registers torch.ops.custom.*
+
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
@@ -120,8 +127,10 @@ def _v4_rope_inplace_npu(
         cos_full = cos_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
         sin_full = sin_half.repeat_interleave(2, dim=-1).to(q_rope.dtype)
         rope_dim = cos_full.shape[-1]
-        cos4 = cos_full.view(-1, 1, 1, rope_dim).contiguous()
-        sin4 = sin_full.view(-1, 1, 1, rope_dim).contiguous()
+        # repeat_interleave produces a contiguous tensor, so the .view()
+        # below already returns a contiguous result — no .contiguous() needed.
+        cos4 = cos_full.view(-1, 1, 1, rope_dim)
+        sin4 = sin_full.view(-1, 1, 1, rope_dim)
         # q_rope: (T, n_heads, rope_dim) → (T, 1, n_heads, rope_dim) view
         # kv_rope: (T, 1, rope_dim) → (T, 1, 1, rope_dim) view
         q_view = q_rope.unsqueeze(1)
@@ -331,8 +340,6 @@ class MQALayer(nn.Module):
             # output (231 step 5+ test: tokens like `[19,16,19,16,343,...]`
             # = "1.1. (C.dir," vs the correct `[54994,1060,...]` =
             # "jumps over the lazy dog" for prompt "The quick brown fox").
-            mscale=float(rope_scaling.get("mscale", 1.0)),
-            mscale_all_dim=float(rope_scaling.get("mscale_all_dim", 0.0)),
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
@@ -856,8 +863,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         # tilelang/deep_gemm/torch. Use it instead of mhc.py on Ascend (where
         # tilelang isn't available and the torch fallback would be slow).
         if _is_npu:
-            import custom_ops  # noqa: F401  registers torch.ops.custom.*
-
             # Note the return order: (y, post, comb) — y is the (T, hidden)
             # mixed activation, post / comb are the hc_post inputs. The
             # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
@@ -947,8 +952,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         # the fused output replication + mixing kernel shipped in the
         # cann8.5.0-a3 image's custom_ops wheel.
         if _is_npu:
-            import custom_ops  # noqa: F401
-
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
@@ -1741,11 +1744,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        # Hot weight reload (RL workflows). torch.cuda.{empty_cache,synchronize}
-        # raise on NPU (no CUDA device); gate so V4 stays usable on Ascend.
-        if _is_cuda or _is_hip:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        # Hot weight reload (RL workflows). Use the device-agnostic module
+        # accessor so this works on both CUDA/HIP and NPU.
+        torch.get_device_module().empty_cache()
+        torch.get_device_module().synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

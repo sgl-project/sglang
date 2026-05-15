@@ -331,11 +331,8 @@ class DeepSeekV4IndexerPool(KVCache):
         # ONLY allocate when SGLANG_DSV4_NPU_REAL_COMPRESSOR is on — these
         # buffers add ~570 MB total which would otherwise eat into the KV
         # pool budget for Tier 1 baseline launches.
-        from sglang.srt.environ import envs as _envs
-        from sglang.srt.utils import is_npu as _is_npu_check
-
         self._npu_buffers_present = (
-            _is_npu_check() and _envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get()
+            _is_npu and envs.SGLANG_DSV4_NPU_REAL_COMPRESSOR.get()
         )
         if self._npu_buffers_present:
             # NPU buffer uses GLOBAL kernel_page_size (= 256), not the
