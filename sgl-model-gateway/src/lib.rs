@@ -3,6 +3,7 @@ pub use smg_auth as auth;
 pub mod config;
 pub mod core;
 pub mod middleware;
+pub mod net;
 pub mod observability;
 pub mod policies;
 pub use openai_protocol as protocols;

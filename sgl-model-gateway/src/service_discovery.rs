@@ -199,7 +199,7 @@ impl PodInfo {
 
     pub fn worker_url(&self, port: u16) -> String {
         // Default to http:// prefix; workflow will detect actual protocol (HTTP vs gRPC)
-        format!("http://{}:{}", self.ip, port)
+        format!("http://{}", crate::net::format_authority(&self.ip, port))
     }
 }
 
@@ -646,7 +646,8 @@ async fn start_router_discovery(
                     if let Some(pod_info) = pod_info {
                         if pod_info.is_router {
                             let mesh_port = pod_info.mesh_port.unwrap_or(default_mesh_port);
-                            let node_address = format!("{}:{}", pod_info.ip, mesh_port);
+                            let node_address =
+                                crate::net::format_authority(&pod_info.ip, mesh_port);
 
                             if pod.metadata.deletion_timestamp.is_some() {
                                 // Pod is being deleted, mark node as Down
@@ -951,6 +952,43 @@ mod tests {
         assert!(pod_info.is_ready);
         assert!(pod_info.pod_type.is_none());
         assert!(pod_info.bootstrap_port.is_none());
+    }
+
+    #[test]
+    fn test_worker_url_ipv4_unbracketed() {
+        let k8s_pod = create_k8s_pod(
+            Some("v4-pod"),
+            Some("10.0.0.1"),
+            Some("Running"),
+            Some("True"),
+            None,
+        );
+        let pod_info = PodInfo::from_pod(&k8s_pod, None).unwrap();
+        let url = pod_info.worker_url(8080);
+        assert_eq!(url, "http://10.0.0.1:8080");
+        // Must round-trip through url::Url.
+        let parsed = url::Url::parse(&url).expect("v4 url must parse");
+        assert_eq!(parsed.port(), Some(8080));
+    }
+
+    #[test]
+    fn test_worker_url_ipv6_bracketed() {
+        // Reproduces the original prod failure: K8s pod IP is an IPv6 literal.
+        // Without bracketing, http://2001:db8::1:8080 would be rejected by url::Url
+        // as an invalid authority.
+        let k8s_pod = create_k8s_pod(
+            Some("v6-pod"),
+            Some("2001:db8::1"),
+            Some("Running"),
+            Some("True"),
+            None,
+        );
+        let pod_info = PodInfo::from_pod(&k8s_pod, None).unwrap();
+        let url = pod_info.worker_url(8080);
+        assert_eq!(url, "http://[2001:db8::1]:8080");
+        let parsed = url::Url::parse(&url).expect("v6 url must parse");
+        assert_eq!(parsed.port(), Some(8080));
+        assert_eq!(parsed.host_str(), Some("[2001:db8::1]"));
     }
 
     #[test]

@@ -1142,8 +1142,8 @@ impl CliArgs {
                 .mesh_peer_urls
                 .first()
                 .and_then(|url| url.parse::<std::net::SocketAddr>().ok());
-            if let Ok(addr) =
-                format!("{}:{}", self.mesh_host, self.mesh_port).parse::<std::net::SocketAddr>()
+            if let Ok(addr) = smg::net::format_authority(&self.mesh_host, self.mesh_port)
+                .parse::<std::net::SocketAddr>()
             {
                 Some(MeshServerConfig {
                     self_name,

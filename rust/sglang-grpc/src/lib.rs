@@ -6,6 +6,18 @@ pub mod proto {
     tonic::include_proto!("sglang.runtime.v1");
 }
 
+/// Private copy of `sgl_model_gateway::net::format_authority`; this crate is a
+/// standalone pyo3 extension and doesn't depend on the gateway crate.
+fn format_authority(host: &str, port: u16) -> String {
+    if host.starts_with('[') && host.ends_with(']') {
+        return format!("{}:{}", host, port);
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => format!("[{}]:{}", host, port),
+        Ok(std::net::IpAddr::V4(_)) | Err(_) => format!("{}:{}", host, port),
+    }
+}
+
 /// Handle returned by `start_server` — used to shut down the gRPC server.
 #[pyclass]
 pub struct GrpcServerHandle {
@@ -44,7 +56,7 @@ fn start_server(host: String, port: u16, runtime_handle: PyObject) -> PyResult<G
     let shutdown = Arc::new(Notify::new());
     let shutdown_clone = shutdown.clone();
 
-    let addr_str = format!("{}:{}", host, port);
+    let addr_str = format_authority(&host, port);
     let addr: std::net::SocketAddr = addr_str
         .parse()
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Bad address: {e}")))?;

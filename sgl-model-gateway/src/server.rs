@@ -1048,7 +1048,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     );
 
     // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
-    let bind_addr = format!("{}:{}", config.host, config.port);
+    let bind_addr = crate::net::format_authority(&config.host, config.port);
     info!("Starting server on {}", bind_addr);
 
     // Parse address and set up graceful shutdown (common to both TLS and non-TLS)
