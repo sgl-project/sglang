@@ -158,5 +158,71 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
         kill_process_tree(cls.process.pid)
 
 
+class TestUnifiedDeepSeekV4FlashHiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
+    """DeepSeek V4 Flash FP8 + HiCache + CP + UnifiedRadixCache."""
+
+    kl_threshold = 0.0035
+    sampling_temperature = 0
+    decode_cache_assert = staticmethod(_assert_dsv4_decode_cached_tokens)
+    gsm8k_threshold = 0.90
+    num_gsm8k_questions = 100
+
+    @unittest.skip("not stable with CP.")
+    def test_multiturn_logprobs_match(self):
+        pass
+
+    @unittest.skip("not stable with CP.")
+    def test_multiturn_decode_cache_hit_branching(self):
+        pass
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DSV4_FLASH_MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DSV4_FLASH_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp-size",
+                "4",
+                "--moe-a2a-backend",
+                "deepep",
+                "--chunked-prefill-size",
+                "16384",
+                "--mem-fraction-static",
+                "0.78",
+                "--enable-hierarchical-cache",
+                "--hicache-ratio",
+                "4",
+                "--hicache-write-policy",
+                "write_through",
+                "--hicache-io-backend",
+                "direct",
+                "--hicache-mem-layout",
+                "page_first_direct",
+                "--swa-full-tokens-ratio",
+                "0.25",
+                "--max-total-tokens",
+                "20000",
+                "--max-running-requests",
+                "4",
+                "--enable-nsa-prefill-context-parallel",
+            ],
+            env={
+                "SGLANG_DSV4_FP4_EXPERTS": "0",
+                "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "1",
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+            },
+        )
+        cls.input_ids = get_input_ids(cls.model, num_samples=18)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+
 if __name__ == "__main__":
     unittest.main()

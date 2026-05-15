@@ -385,7 +385,7 @@ class MQALayer(nn.Module):
     ) -> torch.Tensor:
         """Bf16-kv path used by the NSA prefill-CP case (needs all-gather)."""
         if qkv_a is not None:
-            kv = qkv_a[..., self.q_lora_rank :]
+            kv = qkv_a[..., self.q_lora_rank :].contiguous()
         else:
             kv, _ = self.wkv(x)
         fused_norm_rope_inplace(
