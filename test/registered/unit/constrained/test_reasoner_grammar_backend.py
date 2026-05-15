@@ -188,9 +188,11 @@ class TestReasonerGrammarBackend(CustomTestCase):
 
         obj = reasoner.init_strict_reasoning_grammar(reasoning=True)
         mask = obj.allocate_vocab_mask(65, 1, "cpu")
+        mask = obj.move_vocab_mask(mask, "cpu")
         obj.fill_vocab_mask(mask, 0)
 
         self.assertEqual(mask.shape, (1, 3))
+        self.assertEqual(mask.device.type, "cpu")
         self.assertEqual(_allowed_token_ids(mask, [0, 1, 2, 3, 4, 7]), [2])
 
         logits = torch.zeros(1, 100, dtype=torch.float32)
@@ -220,12 +222,32 @@ class TestReasonerGrammarBackend(CustomTestCase):
 
         obj = reasoner.init_strict_reasoning_grammar(reasoning=True)
         mask = obj.allocate_vocab_mask(100, 1, "cpu")
+        mask = obj.move_vocab_mask(mask, "cpu")
         obj.fill_vocab_mask(mask, 0)
 
+        self.assertEqual(mask.device.type, "cpu")
         self.assertEqual(_allowed_dense_token_ids(mask, [0, 1, 2, 3, 4, 7]), [2])
 
         logits = torch.zeros(1, 100, dtype=torch.float32)
         obj.apply_vocab_mask(logits, mask)
+
+        self.assertEqual(logits[0, 2].item(), 0)
+        self.assertTrue(torch.all(torch.isneginf(logits[0, :2])))
+        self.assertTrue(torch.all(torch.isneginf(logits[0, 3:])))
+
+    def test_xgrammar_backend_apply_vocab_mask_supports_cpu_fallback(self):
+        try:
+            from sglang.srt.constrained import xgrammar_backend
+        except ModuleNotFoundError as e:
+            if e.name != "xgrammar":
+                raise
+            self.skipTest("xgrammar is not installed")
+
+        mask = xgrammar_backend.XGrammarGrammarBackend.allocate_vocab_mask(65, 1, "cpu")
+        xgrammar_backend.XGrammarGrammarBackend.set_token_filter(mask, [2], 0)
+        logits = torch.zeros(1, 100, dtype=torch.float32)
+
+        xgrammar_backend.XGrammarGrammarBackend.apply_vocab_mask(logits, mask)
 
         self.assertEqual(logits[0, 2].item(), 0)
         self.assertTrue(torch.all(torch.isneginf(logits[0, :2])))

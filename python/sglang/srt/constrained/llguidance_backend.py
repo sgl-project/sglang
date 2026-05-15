@@ -31,9 +31,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     InvalidGrammarObject,
 )
-from sglang.srt.constrained.torch_ops.bitmask_ops import (
-    apply_token_bitmask_inplace_torch,
-)
+from sglang.srt.constrained.bitmask_utils import apply_packed_vocab_mask
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
@@ -43,28 +41,10 @@ from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
-if _is_hip:
-    from sgl_kernel import apply_token_bitmask_inplace_cuda
-else:
-    from sglang.srt.constrained.triton_ops.bitmask_ops import (
-        apply_token_bitmask_inplace_triton,
-    )
 
 
 def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-    cutoff = vocab_mask.shape[-1] * 32
-    if logits.device.type in {"cuda", "xpu", "musa"}:
-        if _is_hip:
-            apply_token_bitmask_inplace_cuda(logits, vocab_mask)
-        else:
-            apply_token_bitmask_inplace_triton(logits, vocab_mask)
-    elif logits.device.type in {"cpu", "npu"}:
-        apply_token_bitmask_inplace_torch(logits[..., :cutoff], vocab_mask)
-    else:
-        raise RuntimeError(f"Unsupported device: {logits.device.type}")
-
-    if logits.shape[-1] > cutoff:
-        logits[..., cutoff:] = float("-inf")
+    apply_packed_vocab_mask(logits, vocab_mask)
 
 
 class GuidanceGrammar(BaseGrammarObject):
