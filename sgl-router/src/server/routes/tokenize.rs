@@ -1,0 +1,172 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::server::app_context::AppContext;
+use crate::server::error::ApiError;
+use crate::tokenizer::adapter;
+use axum::extract::State;
+use axum::Json;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+#[derive(Deserialize)]
+pub struct TokenizeRequest {
+    pub model: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub add_special_tokens: bool,
+}
+
+#[derive(Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
+pub struct TokenizeResponse {
+    pub model: String,
+    pub tokens: Vec<u32>,
+    pub count: usize,
+}
+
+#[derive(Deserialize)]
+pub struct DetokenizeRequest {
+    pub model: String,
+    pub tokens: Vec<u32>,
+    #[serde(default)]
+    pub skip_special_tokens: bool,
+}
+
+#[derive(Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
+pub struct DetokenizeResponse {
+    pub model: String,
+    pub text: String,
+}
+
+pub async fn tokenize(
+    State(ctx): State<Arc<AppContext>>,
+    Json(req): Json<TokenizeRequest>,
+) -> Result<Json<TokenizeResponse>, ApiError> {
+    let tok = ctx
+        .tokenizers
+        .get(&req.model)
+        .ok_or_else(|| ApiError::ModelNotFound(req.model.clone()))?;
+    let ids = adapter::encode(&tok, &req.prompt).map_err(ApiError::Internal)?;
+    Ok(Json(TokenizeResponse {
+        model: req.model,
+        count: ids.len(),
+        tokens: ids,
+    }))
+}
+
+pub async fn detokenize(
+    State(ctx): State<Arc<AppContext>>,
+    Json(req): Json<DetokenizeRequest>,
+) -> Result<Json<DetokenizeResponse>, ApiError> {
+    let tok = ctx
+        .tokenizers
+        .get(&req.model)
+        .ok_or_else(|| ApiError::ModelNotFound(req.model.clone()))?;
+    let text = adapter::decode(&tok, &req.tokens, req.skip_special_tokens)
+        .map_err(ApiError::Internal)?;
+    Ok(Json(DetokenizeResponse {
+        model: req.model,
+        text,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn ctx_with_tiny() -> Arc<AppContext> {
+        let cfg = crate::config::Config {
+            server: crate::config::ServerConfig {
+                host: "x".into(),
+                port: 0,
+            },
+            observability: Default::default(),
+            models: vec![crate::config::ModelConfig {
+                id: "tiny".into(),
+                tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            }],
+            worker: crate::config::WorkerConfig {
+                url: "http://x".into(),
+            },
+        };
+        let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();
+        let proxy = Arc::new(crate::proxy::Proxy::new("http://x".into()));
+        Arc::new(AppContext::new(cfg, Arc::new(registry), proxy))
+    }
+
+    #[tokio::test]
+    async fn tokenize_round_trip() {
+        let app = crate::server::app::build_router(ctx_with_tiny());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny", "prompt": "hello world"
+        }))
+        .unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokenize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let r: TokenizeResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(r.count > 0);
+
+        let body2 = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny", "tokens": r.tokens, "skip_special_tokens": true
+        }))
+        .unwrap();
+        let res2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/detokenize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body2))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+        let bytes2 = res2.into_body().collect().await.unwrap().to_bytes();
+        let r2: DetokenizeResponse = serde_json::from_slice(&bytes2).unwrap();
+        assert_eq!(r2.text, "hello world");
+    }
+
+    #[tokio::test]
+    async fn unknown_model_404() {
+        let app = crate::server::app::build_router(ctx_with_tiny());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "nope", "prompt": "x"
+        }))
+        .unwrap();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokenize")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            res.headers().get("x-router-error-code").unwrap(),
+            "model_not_found"
+        );
+    }
+}

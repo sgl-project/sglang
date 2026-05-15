@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::server::app_context::AppContext;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
 
@@ -13,6 +13,14 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/models",
             get(crate::server::routes::models::list_models),
+        )
+        .route(
+            "/v1/tokenize",
+            post(crate::server::routes::tokenize::tokenize),
+        )
+        .route(
+            "/v1/detokenize",
+            post(crate::server::routes::tokenize::detokenize),
         )
         .with_state(ctx)
 }
