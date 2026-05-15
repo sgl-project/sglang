@@ -52,6 +52,10 @@ class KVArgs:
     prefill_start_layer: int
     # for system dp
     system_dp_rank: int
+    # Only used of npu, for kv buf groups
+    kv_buf_groups: int
+    # Only used of npu, for decode total kv layers
+    total_kv_layers: int
 
 
 class KVPoll:

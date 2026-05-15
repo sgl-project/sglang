@@ -152,7 +152,6 @@ from sglang.srt.managers.mm_utils import (
     unwrap_shm_features,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -203,6 +202,7 @@ from sglang.srt.observability.scheduler_metrics_mixin import (
 )
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
@@ -214,7 +214,6 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
-    empty_device_cache,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -417,6 +416,9 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
+        # Init ZBAL, switch allocator should before any torch alloc action
+        self.init_zbal_on_npu()
+
         # Init PD-multiplexing context
         if self.enable_pdmux:
             self.init_pdmux()
@@ -495,6 +497,16 @@ class Scheduler(
         self.grammar_manager = GrammarManager(self)
 
         self.is_initializing = False
+
+    def init_zbal_on_npu(self):
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import init_zbal
+
+            if self.pp_size > 1:
+                logger.error(f"only zbal mix mode support pp_size > 1!")
+            init_zbal(
+                self.tp_size, self.gpu_id, self.tp_rank
+            )  # only switch allocator if is mix mode
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -1330,12 +1342,11 @@ class Scheduler(
             self.future_map = None
             return
 
-        self.future_map = FutureMap(
+        self.future_map = self.spec_algorithm.create_future_map(
             self.max_running_requests,
             self.chunked_prefill_size,
             self.model_config.context_len,
             self.device,
-            self.spec_algorithm,
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -1852,13 +1863,24 @@ class Scheduler(
             self.external_corpus_manager.check_pending_load()
 
     def init_req_max_new_tokens(self, req):
-        req.sampling_params.max_new_tokens = min(
-            (
-                req.sampling_params.max_new_tokens
-                if req.sampling_params.max_new_tokens is not None
-                else 1 << 30
+        input_len = len(req.origin_input_ids)
+        # Keep this bound consistent with PrefillAdder's admission budget:
+        # ceil_page(input_len) + max_new_tokens + page_size must be strictly
+        # smaller than max_total_num_tokens. Otherwise a request can be accepted
+        # into the waiting queue but can never be scheduled, blocking the queue
+        # and eventually making health checks fail.
+        paged_input_len = -(-input_len // self.page_size) * self.page_size
+        req.sampling_params.max_new_tokens = max(
+            0,
+            min(
+                (
+                    req.sampling_params.max_new_tokens
+                    if req.sampling_params.max_new_tokens is not None
+                    else 1 << 30
+                ),
+                self.max_req_len - input_len - 1,
+                self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
-            self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
     def _process_and_broadcast_mm_inputs(
@@ -2218,9 +2240,9 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        if not self._set_or_validate_priority(req):
+            return
         if self.disaggregation_mode == DisaggregationMode.NULL:
-            if not self._set_or_validate_priority(req):
-                return
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
@@ -3020,7 +3042,10 @@ class Scheduler(
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                        batch_result.copy_to_cpu(
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
+                        )
                     else:
                         batch_result.future_indices = future_indices
 
@@ -3125,7 +3150,10 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
-            batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
+            batch_result.copy_to_cpu(
+                return_logprob=self.cur_batch.return_logprob,
+                return_hidden_states=self.cur_batch.return_hidden_states,
+            )
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
@@ -3424,7 +3452,7 @@ class Scheduler(
                 self.draft_worker.clear_cache_pool()
 
             if empty_cache:
-                empty_device_cache(self.device_module)
+                current_platform.empty_cache()
             logger.info("Cache flushed successfully!")
             success = True
         else:
@@ -3822,7 +3850,7 @@ class IdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            empty_device_cache()
+            current_platform.empty_cache()
 
 
 def is_health_check_generate_req(recv_req):
