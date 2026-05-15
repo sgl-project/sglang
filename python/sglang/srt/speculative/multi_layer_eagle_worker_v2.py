@@ -720,15 +720,21 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
     ):
-        # Since batch.seq_lens is allocated in another stream, we need
-        # record_stream() to prevent pytorch gc and reuse the gpu memory
-        # while forward_stream is still running.
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
+        # Tell caching allocator that all SB GPU tensors read by the verify
+        # forward kernels are also used on forward_stream, so memory is not
+        # recycled while forward_stream's queued work is still in flight
+        # (e.g. when subsequent _draft_extend_for_decode rebinds
+        # batch.input_ids and drops the only SB ref to the old tensor).
+        # Pre-MWB-removal this protection was implicit: ModelWorkerBatch's
+        # per-field copy + Scheduler.batch_record_buf held one full iter.
+        from sglang.srt.speculative.eagle_worker_v2 import (
+            _record_sb_tensors_on_stream,
         )
 
-        # Parse args
+        fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
+        _record_sb_tensors_on_stream(batch, verify_input, fwd_stream)
+
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
@@ -745,6 +751,14 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     self.target_worker,
                 )
             )
+
+        # prepare_for_v2_verify rebinds batch.input_ids (= draft_token) and
+        # batch.out_cache_loc. Record both on forward_stream so subsequent
+        # _draft_extend_for_decode rebinds (which drop these from SB) do not
+        # release their memory before forward_stream finishes verify.
+        for t in (batch.input_ids, batch.out_cache_loc):
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                t.record_stream(fwd_stream)
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:
@@ -800,11 +814,16 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
-        # Construct the next draft input
+        # Construct the next draft input. The `_keep_alive_for_verify_forward`
+        # field anchors verify_forward_batch (and transitively the verify-time
+        # GPU tensors like draft_token / out_cache_loc) so they survive the
+        # imminent batch.input_ids rebind in prepare_for_extend_to_fill_draft_kvcache
+        # until the next iter's verify_done.synchronize() in filter_batch.
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
+            _keep_alive_for_verify_forward=verify_forward_batch,
         )
         return GenerationBatchResult(
             logits_output=logits_output,

@@ -94,6 +94,39 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
+def _record_sb_tensors_on_stream(batch, verify_input, fwd_stream):
+    """Tell the caching allocator that the listed SB / spec_info GPU tensors
+    are also used on `fwd_stream`. Without this, mid-forward Python rebinds
+    on SB attributes (or on spec_info) can drop the only ref to a tensor
+    while forward_stream's queued kernels are still reading its memory; the
+    allocator may then recycle that memory and corrupt in-flight forward
+    work, manifesting as a hang on the verify_done event.
+    """
+    candidates = [
+        batch.seq_lens,
+        batch.req_pool_indices,
+        batch.input_ids,
+        batch.out_cache_loc,
+    ]
+    if verify_input is not None:
+        candidates.extend(
+            [
+                getattr(verify_input, attr, None)
+                for attr in (
+                    "draft_token",
+                    "custom_mask",
+                    "positions",
+                    "retrieve_index",
+                    "retrieve_next_token",
+                    "retrieve_next_sibling",
+                )
+            ]
+        )
+    for t in candidates:
+        if isinstance(t, torch.Tensor) and t.is_cuda:
+            t.record_stream(fwd_stream)
+
+
 class EagleDraftWorker(BaseDraftWorker):
     def __init__(
         self,
@@ -965,15 +998,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ) = backup
 
     def verify(self, batch: ScheduleBatch):
-        # Since batch.seq_lens is allocated in another stream, we need
-        # record_stream() to prevent pytorch gc and reuse the gpu memory
-        # while forward_stream is still running.
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
-
-        # Parse args
+        # Tell caching allocator that all SB GPU tensors read by the verify
+        # forward kernels are also used on forward_stream, so memory is not
+        # recycled while forward_stream's queued work is still in flight
+        # (e.g. when subsequent _draft_extend_for_decode rebinds
+        # batch.input_ids and drops the only SB ref to the old tensor).
+        # Pre-MWB-removal this protection was implicit: ModelWorkerBatch's
+        # per-field copy + Scheduler.batch_record_buf held one full iter.
+        fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
+        _record_sb_tensors_on_stream(batch, verify_input, fwd_stream)
+
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
@@ -993,6 +1028,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.target_worker,
                 )
             )
+
+        # prepare_for_v2_verify rebinds batch.input_ids (= draft_token) and
+        # batch.out_cache_loc (= assign_extend_cache_locs output, allocated
+        # on plan_stream). Record both on forward_stream so subsequent
+        # _draft_extend_for_decode rebinds (which drop these from SB) do not
+        # release their memory before forward_stream finishes verify.
+        for t in (batch.input_ids, batch.out_cache_loc):
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                t.record_stream(fwd_stream)
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:
@@ -1099,11 +1143,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
-        # Construct the next draft input
+        # Construct the next draft input. The `_keep_alive_for_verify_forward`
+        # field anchors verify_forward_batch (and transitively the verify-time
+        # GPU tensors like draft_token / out_cache_loc) so they survive the
+        # imminent batch.input_ids rebind in prepare_for_extend_to_fill_draft_kvcache
+        # until the next iter's verify_done.synchronize() in filter_batch.
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
+            _keep_alive_for_verify_forward=verify_forward_batch,
         )
 
         return GenerationBatchResult(

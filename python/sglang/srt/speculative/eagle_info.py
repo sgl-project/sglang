@@ -1,7 +1,7 @@
 import logging
 from copy import copy
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -701,6 +701,18 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
     num_correct_drafts: Optional[torch.Tensor] = None
     num_accept_tokens: Optional[torch.Tensor] = None
+
+    # Keeps refs to GPU tensors used by the target-verify forward (input_ids,
+    # out_cache_loc, etc.) alive across the iter -> next-iter window.
+    # Without this, prepare_for_extend_to_fill_draft_kvcache rebinds
+    # batch.input_ids = predict, dropping the only Python ref to draft_token
+    # while target verify forward is still in flight on forward_stream;
+    # allocator can then recycle its memory and the kernel deadlocks/spins,
+    # so verify_done never fires and the next iter hangs in
+    # filter_batch -> maybe_wait_verify_done -> synchronize.
+    # Pre-MWB-removal this was provided by ModelWorkerBatch's per-field copy
+    # held in Scheduler.batch_record_buf for one full iter.
+    _keep_alive_for_verify_forward: Optional[Any] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
