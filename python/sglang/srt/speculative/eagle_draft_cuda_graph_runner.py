@@ -408,8 +408,13 @@ class EAGLEDraftCudaGraphRunner:
 
         # Common inputs
         buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        out_cache_loc = (
+            forward_batch.spec_info.draft_cache_locs
+            if forward_batch.spec_info.draft_cache_locs is not None
+            else forward_batch.out_cache_loc
+        )
         buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
-            forward_batch.out_cache_loc
+            out_cache_loc
         )
         buffers.positions[:raw_num_token].copy_(forward_batch.positions)
         maybe_detect_nan(
