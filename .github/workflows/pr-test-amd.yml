@@ -355,7 +355,7 @@ jobs:
       - name: Run JIT kernel unit tests
         timeout-minutes: 10
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout" python3 -m pytest -q python/sglang/jit_kernel/tests/test_store_cache.py
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== Wait Jobs for Sequential PR Execution ====================================================
   # These jobs poll GitHub API to wait for previous stages to complete.

@@ -7,7 +7,7 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import ScoreResult
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Keep consistent with other openai_server/basic unit tests.
-register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=9, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 try:
