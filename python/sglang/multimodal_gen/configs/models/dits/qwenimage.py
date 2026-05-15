@@ -8,6 +8,10 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
 
 
+def is_transformer_blocks(n: str, m) -> bool:
+    return "transformer_blocks" in n and str.isdigit(n.split(".")[-1])
+
+
 @dataclass
 class QwenImageArchConfig(DiTArchConfig):
     patch_size: int = 1
@@ -26,6 +30,9 @@ class QwenImageArchConfig(DiTArchConfig):
     _fsdp_shard_conditions: list = field(default_factory=lambda: [is_transformer_block])
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
+    _fsdp_shard_conditions: list = field(
+        default_factory=lambda: [is_transformer_blocks]
+    )
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
