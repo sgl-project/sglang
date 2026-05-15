@@ -35,7 +35,8 @@ def apply_packed_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> N
     """Apply a packed int32 vocab mask to logits in-place.
 
     The packed mask uses one bit per token, where 1 means allowed and 0 means
-    masked. Logits beyond the mask coverage are masked out.
+    masked. By constrained-decoding policy, logits beyond the packed mask's
+    token coverage are also masked out.
     """
     cutoff = vocab_mask.shape[-1] * 32
     if logits.device.type in {"cuda", "xpu", "musa"}:

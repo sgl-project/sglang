@@ -200,7 +200,8 @@ class TestReasonerGrammarBackend(CustomTestCase):
 
         self.assertEqual(logits[0, 2].item(), 0)
         self.assertTrue(torch.all(torch.isneginf(logits[0, :2])))
-        self.assertTrue(torch.all(torch.isneginf(logits[0, 3:])))
+        self.assertTrue(torch.all(torch.isneginf(logits[0, 3:96])))
+        self.assertTrue(torch.all(torch.isneginf(logits[0, 96:])))
 
     def test_init_strict_reasoning_grammar_supports_outlines_masks(self):
         from sglang.srt.constrained import outlines_backend
