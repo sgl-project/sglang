@@ -56,6 +56,15 @@ class TestTraceFunctions(unittest.TestCase):
         self.assertEqual(mod.global_trace_level, 5)
         mod.global_trace_level = orig
 
+    def test_global_trace_level_env_var(self):
+        import importlib
+
+        with patch.dict(os.environ, {"SGLANG_TRACE_LEVEL": "2"}):
+            importlib.reload(mod)
+            self.assertEqual(mod.global_trace_level, 2)
+        importlib.reload(mod)  # restore default (SGLANG_TRACE_LEVEL unset → 3)
+        self.assertEqual(mod.global_trace_level, 3)
+
     def test_get_global_tracing_enabled(self):
         self.assertEqual(get_global_tracing_enabled(), mod.opentelemetry_initialized)
 
@@ -114,32 +123,38 @@ class TestTraceCustomIdGenerator(unittest.TestCase):
 # __get_host_id
 class TestGetHostId(unittest.TestCase):
     def test_from_machine_id_file(self):
-        with patch("os.path.exists", return_value=True), patch(
-            "builtins.open",
-            unittest.mock.mock_open(read_data="abc123\n"),
+        with (
+            patch("os.path.exists", return_value=True),
+            patch(
+                "builtins.open",
+                unittest.mock.mock_open(read_data="abc123\n"),
+            ),
         ):
             self.assertEqual(_get_host_id(), "abc123")
 
     def test_from_machine_id_file_error(self):
         """Falls back to MAC address when file read fails."""
-        with patch("os.path.exists", return_value=True), patch(
-            "builtins.open", side_effect=IOError("read error")
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("builtins.open", side_effect=IOError("read error")),
         ):
             result = _get_host_id()
             self.assertIsInstance(result, str)
             self.assertGreater(len(result), 0)
 
     def test_from_mac_address(self):
-        with patch("os.path.exists", return_value=False), patch(
-            "uuid.getnode", return_value=0x112233445566
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("uuid.getnode", return_value=0x112233445566),
         ):
             result = _get_host_id()
             self.assertIsInstance(result, str)
             self.assertGreater(len(result), 0)
 
     def test_unknown_fallback(self):
-        with patch("os.path.exists", return_value=False), patch(
-            "uuid.getnode", return_value=0
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("uuid.getnode", return_value=0),
         ):
             self.assertEqual(_get_host_id(), "unknown")
 

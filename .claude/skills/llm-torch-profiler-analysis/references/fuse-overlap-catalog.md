@@ -28,21 +28,14 @@ overlap opportunity as novel.
 
 The catalog is grouped by reusable optimization family, not by one specific model.
 
-Refresh note `2026-04-22`: rescanned current `sglang`, `flashinfer`,
-`TensorRT-LLM`, and `vllm` mainline plus rechecked referenced PR state via the
-GitHub API on `2026-04-22`. Stable current-code families such as Qwen-style
-shared-expert top-k append, TensorRT-LLM Triton fused add+RMSNorm+FP8 quant,
-and vLLM `merge_attn_states` attention-output quant are folded into the
-mainline rows below. Closed-unmerged SGLang
-[#22410](https://github.com/sgl-project/sglang/pull/22410) and FlashInfer
-[#2840](https://github.com/flashinfer-ai/flashinfer/pull/2840) were removed
-from the PR-backed sections. Keep FlashInfer
-[#3058](https://github.com/flashinfer-ai/flashinfer/pull/3058) /
-[#3079](https://github.com/flashinfer-ai/flashinfer/pull/3079) in mind because
-that branch was reverted, and keep vLLM
-[#40057](https://github.com/vllm-project/vllm/pull/40057) in mind when using
-B200 FP4 MoE test coverage as a signal: it disables some B200 FP4 MoE layer
-tests rather than proving the kernel family is absent.
+Refresh note `2026-05-01`: rescanned current `sglang` and vLLM mainline, then
+rechecked recent merged and open optimization PRs through the GitHub CLI/API.
+The vLLM torch.compile pass inventory is now split out in
+[`vllm-torch-compile-fusions.md`](vllm-torch-compile-fusions.md). Stable
+current-code families remain folded into the mainline rows below. New
+status-sensitive rows were added for DeepSeek-V4, GLM5 NSA / PDL, NVFP4 MoE,
+torch.compile decode, vLLM DSV4, vLLM ROCm WMMA, and vLLM GPU/CPU sync-removal
+work. Recheck PR state before treating an in-flight row as shipped.
 
 ## 1. LLM / SRT fused-kernel families
 
@@ -147,12 +140,21 @@ Stable entries should be folded into the mainline family rows above.
 | PR `#22005` fused add + RMSNorm + per-token FP8 quant | `fused_add_rmsnorm_per_token_quant`<br>`per_token_quant_fp8` | `PR #22005`<br>`python/sglang/jit_kernel/csrc/elementwise/fused_add_rmsnorm_per_token_quant.cuh`<br>`python/sglang/jit_kernel/fused_add_rmsnorm_per_token_quant.py` | CUDA JIT kernel keeps normed values in registers and emits BF16 + FP8 outputs plus per-token scales | If FP8 online-quant traces show add+norm followed by per-token quant, treat this as an in-flight upstream CUDA fuse family. |
 | PR `#20667` Qwen3.5 fused QK norm + RoPE + KV cache write | `fused_qk_norm_rope_cache_pts_quant_shuffle`<br>`fused_qk_norm_mrope_3d_cache_pts_quant_shuffle`<br>`rotary_dim` | `PR #20667`<br>`python/sglang/srt/models/qwen3_5.py`<br>`python/sglang/srt/models/utils.py` | ROCm / AITER path fuses Q / K RMSNorm, partial or 3D RoPE, and direct KV cache write for Qwen3.5 attention | Treat split QK-norm + RoPE + cache-store on Qwen3.5 as a concrete in-flight upstream family, not a novel idea. |
 | PR `#22392` CUTLASS FP8 GEMM replacing nvjet | `cutlass_scaled_mm`<br>`fp8_scaled_mm`<br>`nvjet`<br>`cudaMemsetAsync` | `PR #22392`<br>`sgl-kernel/python/sgl_kernel/gemm.py`<br>`python/sglang/srt/layers/quantization/fp8_utils.py` | Runtime replacement swaps nvjet FP8 GEMMs for CUTLASS kernels, removing per-launch memset bubbles and extra output-copy kernels | Treat nvjet GEMM + memset bubble ladders as an in-flight SGLang linear-kernel family before calling them novel. |
+| PR `#18612` NVFP4 CUTLASS MoE fused SiLU+Mul+quant | `silu_and_mul_scaled_nvfp4`<br>`nvfp4 expert quant`<br>`cutlass moe` | `PR #18612`<br>`python/sglang/srt/layers/moe/cutlass_w4a8_moe.py`<br>`python/sglang/jit_kernel/nvfp4.py` | Fuses MoE activation epilogue and NVFP4 expert quantization before the CUTLASS MoE second GEMM | Treat split SiLU+Mul then NVFP4 expert quant in CUTLASS MoE traces as an in-flight upstream SGLang family. |
+| PR `#22918` FlashInfer per-token NVFP4 MoE | `per_token_nvfp4`<br>`trtllm_fp4_block_scale_moe`<br>`FlashInfer MoE` | `PR #22918`<br>`python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py` | Adds FlashInfer-backed per-token NVFP4 MoE execution so expert quant/dequant work can move into the fused MoE backend | Treat standalone per-token NVFP4 MoE support kernels as a candidate missing backend-selection path, not an automatically novel kernel idea. |
+| PR `#22851` NSA top-k backend and FlashInfer / PyTorch top-k split | `nsa topk`<br>`flashinfer_topk`<br>`pytorch_topk`<br>`fast_topk_transform` | `PR #22851`<br>`python/sglang/srt/layers/attention/nsa_backend.py` | Makes NSA top-k backend selection explicit and aligns fused top-k transform with FlashInfer / PyTorch fallbacks | When NSA top-k dominates decode, first classify it as backend selection or fused-transform eligibility work. |
+| PR `#24125` GLM5 NSA decode CatArrayBatchedCopy removal | `CatArrayBatchedCopy`<br>`GLM-5`<br>`NSA`<br>`TileLang decode` | `PR #24125`<br>`python/sglang/srt/layers/attention/nsa_backend.py` | Skips redundant cat/copy work in the GLM5 NSA TileLang decode path | Treat cat/copy bursts in GLM5 NSA decode as a concrete in-flight cleanup opportunity. |
+| PR `#24007` MoE LoRA virtual experts for csgmv backend | `csgmv`<br>`virtual experts`<br>`MoE LoRA`<br>`fused_moe_lora` | `PR #24007`<br>`python/sglang/srt/layers/lora_backend.py`<br>`python/sglang/srt/layers/moe` | Routes MoE LoRA adapter work through virtual experts so csgmv-style kernels can batch it instead of launching fragmented adapter work | Treat MoE-LoRA tiny-kernel ladders as an in-flight batching/fusion family. |
+| PR `#24150` torch.compile local decode support | `enable_torch_compile`<br>`local compile`<br>`decode compile`<br>`torchinductor` | `PR #24150`<br>`python/sglang/srt` | Extends SGLang torch.compile coverage to local decode regions, so Inductor-generated fusion may replace hand-authored tiny kernels | When decode traces show compiler-generated kernels or missing named fused kernels, check this in-flight compile path before calling the shape unsupported. |
 
 ## 7. PR-backed / in-flight kernel-overlap families
 
 | Pattern | Trace keywords | Primary code | Existing path | Skill should conclude |
 | --- | --- | --- | --- | --- |
 | PR `#21877` fused down-GEMM + combine superseding SBO | `enable_fused_grouped_gemm_combine`<br>`combine`<br>`down_gemm` | `PR #21877`<br>`python/sglang/srt/server_args.py`<br>`python/sglang/srt/layers/moe/token_dispatcher/deepep.py` | Fused combine eliminates the standalone combine window, so SBO is intentionally disabled when this path is on | If the trace discussion is about combine overlap, first classify it as this upstream fused-overlap family. |
+| PR `#23965` PDL for DSV32 / GLM5 kernels | `enable_pdl`<br>`TRTLLM_ENABLE_PDL`<br>`cudaGridDependencySynchronize`<br>`DSV32`<br>`GLM5` | `PR #23965`<br>`python/sglang/srt/layers`<br>`sgl-kernel` | Enables programmatic dependent launch on selected DeepSeek / GLM kernels so dependent decode kernels can overlap launch-to-start gaps | Treat tight same-stream decode windows around DSV32 / GLM5 as an in-flight PDL overlap family. |
+| PR `#21878` TTFT / TPOT torch.compile optimization | `enable_torch_compile`<br>`decode graph`<br>`piecewise cudagraph` | `PR #21878`<br>`python/sglang/srt` | Uses compiler and graph capture changes to shave TTFT / TPOT rather than adding one handwritten kernel | If the trace shows many small compiler-visible decode ops, compare against this compile-overlap / graph-capture family first. |
+| PR `#24168` batched GPU-to-CPU sync for logprobs / embeddings | `logprobs`<br>`embeddings`<br>`GPU->CPU sync`<br>`batch sync` | `PR #24168`<br>`python/sglang/srt` | Batches per-request synchronization work that can otherwise serialize decode progress around logprob or embedding outputs | Treat per-request CPU sync stalls in logprob / embedding traces as a concrete in-flight SGLang scheduler/data-movement family. |
 
 ## 8. FlashInfer mainline fused-kernel families
 
@@ -272,6 +274,15 @@ contain the same implementation.
 | PR `#37646` ROCm AITER fused allreduce + RMSNorm | `rocm_aiter_fused_allreduce_rmsnorm`<br>`custom_fused_ar_rms`<br>`RocmAiterAllReduceFusionPass` | `PR #37646`<br>`vllm/_aiter_ops.py`<br>`vllm/compilation/passes/pass_manager.py` | ROCm-specific compile-time path swaps the generic all-reduce fusion pass for an AITER fused allreduce-plus-RMSNorm kernel family | Treat ROCm TP all-reduce + RMSNorm ladders as an in-flight upstream fused-collective family first. |
 | PR `#36413` FlashInfer RMSNorm + FP4 quant fusion | `fuse_norm_quant`<br>`flashinfer`<br>`NVFP4`<br>`rmsnorm + fp4 quant` | `PR #36413`<br>`vllm/compilation/passes/fusion/rms_quant_fusion.py`<br>`vllm/docs/design/fusions.md` | FlashInfer-backed norm-plus-FP4 quant fusion extends the existing RMSNorm+quant family to NVFP4 flows | Treat split RMSNorm + FP4 quant ladders as an upstream in-flight family, not a fresh idea. |
 | PR `#39301` GLM5 router GEMM with PDL overlap | `TRTLLM_ENABLE_PDL`<br>`router_gemm`<br>`GLM5`<br>`FI AR RMS fusion` | `PR #39301`<br>`vllm/model_executor/layers/fused_moe/router/gate_linear.py`<br>`vllm/csrc/moe/dsv3_router_gemm_utils.h` | Extends the specialized router GEMM family to GLM5 hidden size and uses PDL to overlap the router launch with the preceding fused allreduce-plus-RMS block | Treat this as an in-flight upstream router-kernel plus launch-overlap family before calling it novel. |
+| PR `#41455` ROCm WMMA paged prefill and split-K decode | `wmma`<br>`paged prefill`<br>`split-K decode`<br>`ROCm attention` | `PR #41455`<br>`vllm/v1/attention`<br>`vllm/_aiter_ops.py` | Adds ROCm WMMA attention kernels for paged prefill and split-K decode shapes | Treat split attention support kernels on AMD as an in-flight vLLM attention-kernel family before calling them novel. |
+| PR `#41263` DeepSeek-V4 fused norm / router low-latency path | `DSV4`<br>`fuse norm router`<br>`low latency`<br>`router` | `PR #41263`<br>`vllm/model_executor/models/deepseek_v2.py`<br>`vllm/model_executor/layers/fused_moe/router` | Targets DeepSeek-V4 decode latency by fusing norm / router-adjacent work and low-latency model paths | Treat DSV4 norm-router ladders as a concrete in-flight upstream family. |
+| PR `#41428` DSV4 fused indexer Q quant kernel | `DSV4`<br>`fused Indexer Q quant`<br>`indexer q`<br>`fp4` | `PR #41428`<br>`vllm/model_executor/models/deepseek_v2.py`<br>`vllm/csrc` | Improves the fused DeepSeek-V4 indexer Q quant kernel instead of materializing Q then quantizing separately | Treat DSV4 indexer-Q quant ladders as an in-flight upstream fused quant family. |
+| PR `#41255` DeepSeek-V4 Tile kernels / `head_compute_mix_kernel` | `head_compute_mix_kernel`<br>`Tile kernel`<br>`DSV4`<br>`MLA` | `PR #41255`<br>`vllm/model_executor/models/deepseek_v2.py`<br>`vllm/csrc` | Adds DeepSeek-V4 Tile kernels that mix head compute work in one specialized kernel | Treat DSV4 MLA head-compute ladders as a known in-flight specialized-kernel family. |
+| PR `#41441` DSV4 all-reduce plus `mhc_post` fusion | `DSV4`<br>`AR+mhc_post`<br>`allreduce`<br>`mhc_post` | `PR #41441`<br>`vllm/model_executor/models/deepseek_v2.py`<br>`vllm/compilation/passes/fusion` | Fuses or overlaps DSV4 all-reduce with post-MLA head-compute work | Treat all-reduce followed by `mhc_post` in DSV4 traces as an in-flight vLLM overlap/fusion family. |
+| PR `#41446` AMD GatedDeltaNet FLA prefill kernels | `GatedDeltaNet`<br>`FLA prefill`<br>`AMD`<br>`Qwen3-Next` | `PR #41446`<br>`vllm/model_executor/models/qwen3_next.py`<br>`vllm/v1/attention` | Optimizes GatedDeltaNet / FLA prefill kernels on AMD linear-attention models | Treat split GDN prefill kernels on ROCm as an in-flight upstream family. |
+| PR `#39748` dual-stream GDN input projection | `dual-stream`<br>`input projection`<br>`GatedDeltaNet`<br>`Qwen3.5` | `PR #39748`<br>`vllm/model_executor/models/qwen3_next.py` | Overlaps sibling input-projection branches for Qwen3 / Qwen3.5 GDN-style blocks | Treat serial GDN input projections as a known in-flight overlap opportunity. |
+| PRs `#41433` / `#41434` / `#41429` / `#40561` GPU/CPU sync removal | `GPU->CPU sync`<br>`cpu sync`<br>`item()`<br>`non_blocking` | `PR #41433`<br>`PR #41434`<br>`PR #41429`<br>`PR #40561` | Removes or gates accidental GPU-to-CPU synchronization points and adds sync-detection coverage | Treat CPU gaps next to small GPU kernels as an upstream vLLM sync-removal family before proposing a kernel-only fix. |
+| PR `#36823` vLLM IR `fused_add_rms_norm` overload | `vllm_ir`<br>`fused_add_rms_norm`<br>`maybe_inplace` | `PR #36823`<br>`vllm/compilation/passes/ir`<br>`vllm/compilation/passes/fusion/rms_quant_fusion.py` | Extends vLLM IR lowering so fused-add-RMSNorm variants remain visible to later compile-time fusions | Treat missing norm/quant compile fusion as potentially an IR-lowering visibility issue. |
 
 ## 17. Important toggles and caveats
 
@@ -306,8 +317,11 @@ contain the same implementation.
 | `PassConfig.fuse_norm_quant` | `vllm/config/compilation.py` | Enables vLLM's RMSNorm(+residual add) -> FP8 / FP4 quant compile-time fusion family. |
 | `PassConfig.fuse_act_quant` | `vllm/config/compilation.py` | Enables vLLM's `SiLU+Mul -> quant` fusion family, plus ROCm AITER variants where applicable. |
 | `PassConfig.fuse_attn_quant` | `vllm/config/compilation.py` | Enables attention-epilogue quant fusion; requires the right backend / graph visibility, so split kernels may still be expected. |
+| `PassConfig.fuse_mla_dual_rms_norm` | `vllm/config/compilation.py` | Enables the AITER-backed MLA paired-Q/KV RMSNorm fusion family on ROCm. |
 | `PassConfig.enable_qk_norm_rope_fusion` | `vllm/config/compilation.py` | Enables the compile-time QK RMSNorm + RoPE family on CUDA-like backends. |
 | `PassConfig.fuse_rope_kvcache` | `vllm/config/compilation.py` | Enables ROCm / AITER RoPE + KV-cache update fusion and is range-limited by token count. |
+| `PassConfig.fuse_minimax_qk_norm` | `vllm/config/compilation.py` | Enables the MiniMax decode Q/K allreduce-plus-RMSNorm compile-time fusion family. |
+| `PassConfig.fuse_act_padding` | `vllm/config/compilation.py` | Enables the ROCm AITER add-RMSNorm-plus-pad fusion family when AITER is available. |
 | `PassConfig.enable_sp` | `vllm/config/compilation.py` | Rewrites all-reduce into sequence-parallel staging; this is often a prerequisite for the overlap family, not just a pure fuse toggle. |
 | `PassConfig.fuse_gemm_comms` | `vllm/config/compilation.py` | Enables AsyncTP GEMM + collective overlap and auto-enables `enable_sp` when valid. |
 | `TRTLLM_ENABLE_PDL` | `vllm/csrc/dsv3_fused_a_gemm.cu`<br>`vllm/csrc/moe/dsv3_router_gemm_utils.h` | Enables programmatic dependent launch for the DSV3 specialized CUDA kernels, which can change launch grouping and trace shape for router / QKV-A paths. |

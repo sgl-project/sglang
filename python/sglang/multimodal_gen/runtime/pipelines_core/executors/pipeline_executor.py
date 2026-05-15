@@ -45,6 +45,33 @@ class PipelineExecutor(ABC):
 
     def __init__(self, server_args):
         self.server_args = server_args
+        self.component_residency_manager = None
+
+    def begin_component_residency_request(
+        self,
+        stages: List["PipelineStage"],
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        self.component_residency_manager.begin_request(stages, batch, server_args)
+
+    def before_stage(
+        self,
+        stage: "PipelineStage",
+        stage_index: int,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        stage.set_component_residency_manager(self.component_residency_manager)
+        self.component_residency_manager.before_stage(
+            stage, stage_index, batch, server_args
+        )
+
+    def after_stage(self, stage_index: int) -> None:
+        self.component_residency_manager.after_stage(stage_index)
+
+    def finish_component_residency_request(self) -> None:
+        self.component_residency_manager.finish_request()
 
     def execute_with_profiling(
         self,

@@ -19,13 +19,32 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
     get_int_env_var,
+    is_cuda,
     next_power_of_2,
 )
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel.utils import is_arch_support_pdl
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+_MLA_DECODE_MIN_BLOCK_KV = 32
+
+
+def _mla_decode_kv_splits_cap(
+    base_max_kv_splits: int, sm_count: int, max_context_len: int
+) -> int:
+    if sm_count <= 0:
+        return base_max_kv_splits
+    sm_cap = next_power_of_2(sm_count)
+    ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _MLA_DECODE_MIN_BLOCK_KV))
+    return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -128,6 +147,16 @@ class TritonAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        if self.use_mla:
+            self.max_kv_splits = _mla_decode_kv_splits_cap(
+                self.max_kv_splits,
+                self.device_core_count,
+                self.max_context_len,
+            )
+        if _is_cuda:
+            self.use_pdl = is_arch_support_pdl()
+        else:
+            self.use_pdl = False
 
         self.allow_bidirectional_attention_in_extend = (
             model_runner.server_args.disable_cuda_graph
@@ -395,9 +424,9 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = kv_indices.to(torch.int64)
             mask_indptr = None
             # TODO(FIXME): This will trigger an invalid Eagle tree when using
-            # `max(spec_info.num_accepted_tokens_cpu)`.
+            # `max(spec_info.num_accept_tokens_cpu)`.
             # It might have been forgotten to update somewhere.
-            max_extend_len = torch.max(spec_info.num_accepted_tokens).item()
+            max_extend_len = torch.max(spec_info.num_accept_tokens).item()
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
@@ -887,13 +916,22 @@ class TritonAttnBackend(AttentionBackend):
         else:
             # Save KV cache first (must do this before unified kernel)
             if save_kv_cache:
-                if (
-                    self.use_mla or layer.k_scale is None
-                ):  # Triton MLA currently doesn't support quantized kv cache
+                if layer.k_scale is None:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer,
                         forward_batch.out_cache_loc,
                         k,
+                        v,
+                    )
+                elif self.use_mla:
+                    # For MLA, scale K manually before storing since MLATokenToKVPool
+                    # doesn't accept scale parameters. Clone to protect k from mutation
+                    # since it's used later in the attention kernel.
+                    k_scaled = k.clone().div_(layer.k_scale)
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        forward_batch.out_cache_loc,
+                        k_scaled,
                         v,
                     )
                 else:
@@ -1019,8 +1057,23 @@ class TritonAttnBackend(AttentionBackend):
             prefix_kv_indices = self.forward_metadata.kv_indices
             window_start_pos = None
 
-        # Build unified kv_indices using fused Triton kernel
+        # For SWA layers, mirror SWAKVPool.set_kv_buffer: read from the
+        # precomputed pool.swa_loc. Translate out_cache_loc to SWA-pool index space
+        # as a fallback when pool.swa_loc is not pre-populated.
         extend_kv_indices = forward_batch.out_cache_loc
+        pool = forward_batch.token_to_kv_pool
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and isinstance(pool, SWAKVPool)
+            and pool.layers_mapping[layer.layer_id][1]
+        ):
+            if pool.swa_loc is not None:
+                extend_kv_indices = pool.swa_loc
+            else:
+                extend_kv_indices = pool.translate_loc_from_full_to_swa(
+                    extend_kv_indices
+                )
 
         # Handle cases where extend_seq_lens or extend_start_loc might not be set
         # In speculative decoding, we can infer these from spec_info or compute them
@@ -1124,7 +1177,11 @@ class TritonAttnBackend(AttentionBackend):
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         if save_kv_cache:
-            if self.use_mla:  # Triton MLA currently doesn't support quantized kv cache
+            if self.use_mla:
+                if layer.k_scale is not None:
+                    # MLATokenToKVPool doesn't accept scale parameters; k is unused
+                    # after this point in decode, so scale in place.
+                    k.div_(layer.k_scale)
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer,
                     forward_batch.out_cache_loc,
@@ -1182,6 +1239,8 @@ class TritonAttnBackend(AttentionBackend):
             logit_cap=logits_soft_cap,
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
+            has_mla=self.use_mla,
+            use_pdl=self.use_pdl,
         )
         return o
 

@@ -100,6 +100,10 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA H200</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>lmsysorg/sglang:deepseek-v4-hopper</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA H100</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>lmsysorg/sglang:dev</code></td>
+    </tr>
   </tbody>
 </table>
 
@@ -158,10 +162,6 @@ PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake
 can discover the IB HCAs; without IB exposure mooncake silently falls back to
 TCP, which can lead to garbled KV transfer on large checkpoints.
-
-**Base model usage**
-
-In order to use base models, please enable `SGLANG_FIX_DSV4_BASE_MODEL_LOAD=1` and use latest code, before the next round of testing matrix is finished.
 
 **GB300 PD-Disagg cross-pod MNNVL**
 
@@ -333,6 +333,17 @@ print()
 ```text Output
 Pending update — replace with real server output after deployment.
 ```
+
+#### 4.2.3 HiCache (Hierarchical KV Caching)
+
+HiCache enables multi-tier KV cache offloading (GPU → CPU → Storage), significantly expanding effective context capacity for long-context and multi-turn scenarios. Combined with UnifiedRadixTree, it provides intelligent prefix caching across all tiers.
+
+To enable HiCache, use the **HiCache** toggle in the [command generator above](#3-model-deployment):
+
+- **L2 (GPU + CPU):** Offloads cold KV pages to CPU memory. Enables `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1` for intelligent hierarchical prefix caching.
+- **L3 (GPU + CPU + Storage):** Coming soon.
+
+For more details, see the [HiCache documentation](../../../docs/advanced_features/hicache).
 
 ## 5. Benchmark
 

@@ -81,7 +81,7 @@ def compute_split_seq_index(
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> Optional[int]:
-    if forward_mode == ForwardMode.EXTEND:
+    if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_lens is not None
         return _split_extend_seqs(extend_lens)
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
@@ -270,7 +270,7 @@ def compute_split_token_index(
     extend_seq_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> int:
-    if forward_mode == ForwardMode.EXTEND:
+    if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_seq_lens is not None
         if _is_two_chunk_split_enabled(extend_seq_lens):
             return sum(extend_seq_lens) // 2
@@ -701,12 +701,20 @@ class TboForwardBatchPreparer:
             "spec_algorithm",
             "capture_hidden_mode",
             "padded_static_len",
-            "mrope_positions",  # only used by qwen2-vl, thus not care
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
         ]:
             output_dict[key] = getattr(batch, key)
+
+        mrope_positions = getattr(batch, "mrope_positions")
+        if mrope_positions is not None:
+            output_dict["mrope_positions"] = mrope_positions[
+                :, start_token_index:end_token_index
+            ]
+        else:
+            output_dict["mrope_positions"] = None
+
         if not batch.forward_mode.is_target_verify():
             assert (
                 _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)

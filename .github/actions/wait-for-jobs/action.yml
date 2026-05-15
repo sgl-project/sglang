@@ -1,5 +1,5 @@
 name: Wait for Jobs
-description: Poll and wait for specified jobs in the current workflow run to complete
+description: Poll and wait for specified jobs in the current workflow run to complete. Returns success immediately when the PR carries the `bypass-fastfail` label, letting downstream stages dispatch in parallel (same effect as scheduled runs).
 
 inputs:
   stage-name:
@@ -49,6 +49,32 @@ runs:
           const pollIntervalSeconds = parseInt(process.env.INPUT_POLL_INTERVAL_SECONDS);
           const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
 
+          // bypass-fastfail label opts the PR out of stage-to-stage waiting,
+          // letting all stages dispatch in parallel like scheduled runs do.
+          let labels = [];
+          if (context.payload.pull_request?.labels) {
+            labels = context.payload.pull_request.labels.map(l => l.name);
+          } else {
+            const ref = context.payload.pull_request?.head?.sha || context.sha;
+            try {
+              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: ref,
+              });
+              if (prs.length > 0) {
+                labels = prs[0].labels.map(l => l.name);
+              }
+            } catch (e) {
+              console.log(`Could not fetch PR labels for ${ref}: ${e.message}`);
+            }
+          }
+          if (labels.includes('bypass-fastfail')) {
+            console.log(`Skipping ${stageName} wait (bypass-fastfail label present)`);
+            core.setOutput('result', 'success');
+            return;
+          }
+
           // Normalize job specs into a uniform format
           const normalizedSpecs = jobSpecs.map(spec => {
             if (typeof spec === 'string') {
@@ -63,7 +89,11 @@ runs:
             if (spec.exact) {
               return jobName === spec.prefix;
             }
-            return jobName === spec.prefix || jobName.startsWith(spec.prefix + ' (');
+            // Match bare prefix or any GHA-rendered shard suffix. Inline matrix
+            // produces `<prefix> (<shard>)`; reusable-workflow callers produce
+            // `<prefix> / <called-job> (<shard>)`. Both have a space after the
+            // prefix, so a single ' '-delimited check covers both.
+            return jobName === spec.prefix || jobName.startsWith(spec.prefix + ' ');
           };
 
           // Use ETag conditional requests to avoid consuming rate limit when nothing changed.
@@ -151,13 +181,16 @@ runs:
 
               if (matchingJobs.length < spec.expected_count) {
                 // Job-level `if:` is evaluated before matrix expansion. When it
-                // evaluates false, GitHub emits exactly one "skipped" entry using
-                // the un-expanded job name (bare prefix, no " (shard)" suffix)
-                // instead of N matrix entries. Detect that precise shape so we
-                // don't poll forever — and so we don't mistake a partially
+                // evaluates false, GitHub emits exactly one "skipped" entry
+                // without a "(shard)" suffix instead of N matrix entries. Two
+                // shapes are possible:
+                //   - inline matrix:     `<prefix>`
+                //   - reusable workflow: `<prefix> / <called-job>`
+                // Both lack the ` (` shard marker. Detect that precise shape so
+                // we don't poll forever — and so we don't mistake a partially
                 // materialized dynamic/reusable matrix for a skipped one.
                 const unexpandedSkip = matchingJobs.length === 1 &&
-                  matchingJobs[0].name === spec.prefix &&
+                  !matchingJobs[0].name.includes(' (') &&
                   matchingJobs[0].status === 'completed' &&
                   matchingJobs[0].conclusion === 'skipped';
                 if (unexpandedSkip) {
