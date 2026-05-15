@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=148, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=148, stage="stage-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 
 

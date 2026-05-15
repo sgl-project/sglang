@@ -38,16 +38,20 @@ SERVER_LAUNCH_TIMEOUT = 3600
 # Common DeepSeek-V4 env vars (AMD ROCm 7.2 path: tilelang + AITER + ROCm700A).
 # Source of truth: python/run_dsv4.sh.
 COMMON_ENV_VARS = {
-    "SGLANG_OPT_USE_FUSED_COMPRESS": "false",
+    "SGLANG_OPT_USE_FUSED_COMPRESS": "true",
     "SGLANG_OPT_USE_OLD_COMPRESSOR": "true",
     "SGLANG_OPT_USE_TILELANG_SWA_PREPARE": "false",
+    "SGLANG_OPT_USE_TRITON_SWA_PREPARE": "true",
     "SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK": "false",
     "SGLANG_OPT_USE_FUSED_HASH_TOPK": "false",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
+    "SGLANG_OPT_USE_AITER_MHC_PRE": "true",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
+    "SGLANG_OPT_USE_AITER_MHC_POST": "true",
     "SGLANG_ENABLE_THINKING": "1",
     "SGLANG_USE_AITER": "1",
+    "AITER_BF16_FP8_MOE_BOUND": "1",
     "SGLANG_USE_ROCM700A": "1",
     "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "1",
     "SGLANG_OPT_DPSK_V4_RADIX": "0",
@@ -55,7 +59,7 @@ COMMON_ENV_VARS = {
     "SGLANG_OPT_USE_FUSED_STORE_CACHE": "false",
     "SGLANG_TOPK_TRANSFORM_512_TORCH": "1",
     "SGLANG_OPT_USE_TILELANG_INDEXER": "true",
-    "SGLANG_HACK_FLASHMLA_BACKEND": "tilelang",
+    "SGLANG_HACK_FLASHMLA_BACKEND": "triton",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
 }
 
@@ -204,4 +208,12 @@ class TestDeepseekV4Fp8(CustomTestCase):
 
 
 if __name__ == "__main__":
+    # run_suite.py's run_one_file launches each test file with `python3 <file> -f`,
+    # which enables unittest fail-fast. For this file, `test_a_gsm8k` (accuracy)
+    # and `test_b_perf_8k_1k` (performance) are independent measurements that
+    # share a very expensive server launch in setUpClass; we want perf data even
+    # if accuracy fails. Strip `-f` locally so subsequent test methods still run.
+    import sys
+
+    sys.argv = [a for a in sys.argv if a not in ("-f", "--failfast")]
     unittest.main()

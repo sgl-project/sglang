@@ -20,7 +20,7 @@ from sglang.test.test_programs import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=79, suite="stage-a-test-1-gpu-small")
+register_cuda_ci(est_time=79, stage="stage-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
 
 
@@ -35,6 +35,7 @@ class TestSRTBackend(CustomTestCase):
             mem_fraction_static=0.7,
             incremental_streaming_output=True,
             log_level="info",
+            enable_metrics=True,
         )
         sgl.set_default_backend(cls.backend)
 
