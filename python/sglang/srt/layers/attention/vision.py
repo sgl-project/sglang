@@ -246,7 +246,7 @@ class VisionSdpaAttention(nn.Module):
     ) -> torch.Tensor:
         r"""
         Args:
-            cu_seqlens: [b]
+            cu_seqlens: [num_seqs + 1]
         Returns:
              [b * s, h, head_size]
         """
@@ -335,7 +335,7 @@ class VisionTritonAttention(nn.Module):
     ) -> torch.Tensor:
         r"""
         Args:
-            cu_seqlens: [b]
+            cu_seqlens: [num_seqs + 1]
             softmax_scale: override softmax scale (default 1/sqrt(head_dim))
         Returns:
              [b * s, h, head_size]
@@ -408,7 +408,7 @@ class VisionFlash3Attention(nn.Module):
     ) -> torch.Tensor:
         r"""
         Args:
-            cu_seqlens: [b]
+            cu_seqlens: [num_seqs + 1]
         Returns:
              [b * s, h, head_size]
         """
@@ -471,7 +471,7 @@ class VisionFlash4Attention(nn.Module):
     ) -> torch.Tensor:
         r"""
         Args:
-            cu_seqlens: [b]
+            cu_seqlens: [num_seqs + 1]
         Returns:
              [b * s, h, head_size]
         """
@@ -528,7 +528,7 @@ class VisionFlashInferAttention(nn.Module):
     ) -> torch.Tensor:
         r"""
         Args:
-            cu_seqlens: [b]
+            cu_seqlens: [num_seqs + 1]
         Returns:
              [b * s, h, head_size]
         """
@@ -695,7 +695,7 @@ class VisionAscendAttention(nn.Module):
     ) -> torch.Tensor:
         r"""
         Args:
-            cu_seqlens: [b]
+            cu_seqlens: [num_seqs + 1]
         Returns:
              [b * s, h, head_size]
         """
@@ -1036,7 +1036,7 @@ class VisionAttention(nn.Module):
         r"""
         Args:
             x: [b, s, embed_dim]
-            cu_seqlens: [b]
+            cu_seqlens: [num_seqs + 1]
         Returns:
              [s, b, head * head_size]
         """
