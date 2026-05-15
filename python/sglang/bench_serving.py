@@ -40,6 +40,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.power import get_power_recorder, print_power_summary
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -1219,6 +1220,7 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    record_power: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1344,6 +1346,11 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
+    # Start power recording (after warmup)
+    power_recorder = get_power_recorder() if record_power else None
+    if power_recorder is not None:
+        power_recorder.start()
+
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
@@ -1414,6 +1421,12 @@ async def benchmark(
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
+
+    # Stop power recording
+    power_stats = None
+    if power_recorder is not None:
+        power_recorder.stop()
+        power_stats = power_recorder.get_stats()
 
     # Stop profiler (only if profile_steps was not provided, as it auto-stops)
     if profile and not (
@@ -1570,6 +1583,24 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
         print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+
+    if power_stats is not None:
+        median_power = power_stats["median_power_w"]
+        if power_stats["cpu_median_power_w"] is not None:
+            median_power += power_stats["cpu_median_power_w"]
+
+        input_toks_per_watt = metrics.total_input / median_power
+        output_toks_per_watt = metrics.total_output / median_power
+        total_toks_per_watt = (
+            metrics.total_input + metrics.total_output
+        ) / median_power
+
+        power_stats["input_toks_per_watt"] = input_toks_per_watt
+        power_stats["output_toks_per_watt"] = output_toks_per_watt
+        power_stats["total_toks_per_watt"] = total_toks_per_watt
+
+        print_power_summary(power_stats)
+
     print("=" * 50)
 
     resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
@@ -1628,6 +1659,8 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
+        if power_stats is not None:
+            result.update(power_stats)
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
@@ -1925,6 +1958,7 @@ def run_benchmark(args_: argparse.Namespace):
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
+            record_power=args.record_power,
         )
     )
 
@@ -2285,6 +2319,12 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before the benchmark",
+    )
+    parser.add_argument(
+        "--record-power",
+        action="store_true",
+        help="Record GPU power usage during benchmark (excluding warmup). The environment variable `CUDA_VISIBLE_DEVICES` must be set to record the power from the used devices only (e.g. for TP=4 on an 8 devices node)."
+        "Samples every 5s and reports P25/mean/median/P75 stats.",
     )
     parser.add_argument(
         "--tokenize-prompt",
