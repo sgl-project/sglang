@@ -101,6 +101,21 @@ class CutlassFp4LoraRunnerCore:
             StandardCombineInput,
         )
 
+        # The FP4 all-gather dispatch path (DP-attention + EP + flashinfer_cutlass
+        # + modelopt_fp4, gated by ``should_use_flashinfer_cutlass_moe_fp4_allgather``)
+        # replaces ``dispatch_output.hidden_states`` with pre-packed FP4 uint8 and
+        # populates ``hidden_states_scale``. The base ``flashinfer_cutlass_fused_moe``
+        # call consumes that pair; our unfused runner currently re-quantizes
+        # ``hidden_states`` via ``scaled_fp4_experts_quant`` assuming it is bf16
+        # input, so the packed-input variant would silently produce garbage.
+        if getattr(dispatch_output, "hidden_states_scale", None) is not None:
+            raise NotImplementedError(
+                "CutlassFp4LoraRunnerCore does not yet support the FP4 all-gather "
+                "dispatch path (StandardDispatcher with should_use_flashinfer_cutlass_"
+                "moe_fp4_allgather()). Disable that path for LoRA configurations, or "
+                "extend this runner to consume the pre-packed FP4 input."
+            )
+
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights = topk_output.topk_weights
