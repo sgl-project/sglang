@@ -36,7 +36,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -54,6 +54,7 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
@@ -209,8 +210,14 @@ class BaseTpWorker(ABC):
         )
         return result
 
-    def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+    def forward_batch_embedding(
+        self,
+        batch: ScheduleBatch,
+        seq_lens_cpu_cache: Optional[torch.Tensor] = None,
+    ):
+        forward_batch = ForwardBatch.init_new(
+            batch, self.model_runner, seq_lens_cpu_cache=seq_lens_cpu_cache
+        )
         output = self.model_runner.forward(forward_batch).logits_output
         return output  # Returns EmbeddingPoolerOutput
 
@@ -446,21 +453,31 @@ class TpModelWorker(BaseTpWorker):
 
     def forward_batch_generation(
         self,
-        model_worker_batch: ModelWorkerBatch,
+        batch: Optional[ScheduleBatch],
         forward_batch: Optional[ForwardBatch] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
+        seq_lens_cpu_cache: Optional[torch.Tensor] = None,
+        capture_hidden_mode: Optional["CaptureHiddenMode"] = None,
+        return_hidden_states_before_norm: bool = False,
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 
-        # Get forward batch from model worker batch
-        if model_worker_batch is not None:
+        # Get forward batch from schedule batch
+        if batch is not None:
             # update the consumer index of hicache to the running batch
-            self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+            self.set_hicache_consumer(batch.hicache_consumer_index)
 
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(
+                batch,
+                self.model_runner,
+                seq_lens_cpu_cache=seq_lens_cpu_cache,
+                capture_hidden_mode=capture_hidden_mode,
+            )
+            if return_hidden_states_before_norm:
+                forward_batch.return_hidden_states_before_norm = True
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -490,7 +507,7 @@ class TpModelWorker(BaseTpWorker):
             if (
                 self.enable_overlap
                 and not self.enable_spec
-                and model_worker_batch.sampling_info.grammars is not None
+                and forward_batch.sampling_info.grammars is not None
             ):
 
                 def sample_batch_func():
@@ -502,7 +519,7 @@ class TpModelWorker(BaseTpWorker):
                 batch_result.delay_sample_func = sample_batch_func
                 return batch_result
 
-            if not model_worker_batch.is_prefill_only:
+            if not forward_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
@@ -511,17 +528,17 @@ class TpModelWorker(BaseTpWorker):
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
                 batch_result.next_token_ids = torch.zeros(
-                    len(model_worker_batch.seq_lens),
+                    len(forward_batch.seq_lens),
                     dtype=torch.long,
-                    device=model_worker_batch.input_ids.device,
+                    device=forward_batch.input_ids.device,
                 )
                 if (
-                    model_worker_batch.return_logprob
+                    forward_batch.return_logprob
                     and logits_output.next_token_logits is not None
                 ):
                     # NOTE: Compute logprobs without full sampling
                     self.model_runner.compute_logprobs_only(
-                        logits_output, model_worker_batch
+                        logits_output, forward_batch
                     )
 
             return batch_result
@@ -540,19 +557,18 @@ class TpModelWorker(BaseTpWorker):
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:
-            model_worker_batch = batch.get_model_worker_batch()
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
             batch.split_forward_batch = forward_batch
-            batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
-        else:
-            model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
+            batch.seq_lens_cpu_cache = forward_batch.seq_lens_cpu
 
         out = self.model_runner.forward(
             batch.split_forward_batch, split_forward_count=batch.split_forward_count
         )
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
         if logits_output:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+            next_token_ids = self.model_runner.sample(
+                logits_output, batch.split_forward_batch
+            )
         else:
             next_token_ids = None
         batch_result = GenerationBatchResult(

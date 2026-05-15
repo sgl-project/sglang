@@ -159,7 +159,6 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
-    ModelWorkerBatch,
     MultimodalInputs,
     Req,
     ScheduleBatch,
@@ -2992,14 +2991,14 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
-    def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
+    def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
         # NOTE: More Reliable: record all tensors into the forward stream
         # NOTE: - for all future tensors, we shall always read from future map
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
-        self.batch_record_buf[self.batch_record_ct] = model_worker_batch
+        self.batch_record_buf[self.batch_record_ct] = batch
 
     def run_batch(
         self,
@@ -3022,30 +3021,20 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap:
-                # In most cases, we use the model worker batch to run the forward.
-                worker_batch_or_batch = batch.get_model_worker_batch()
-            else:
-                # In speculative decoding v1 (non-overlap) case, we use the batch directly.
-                # TODO(lsyin): delete this branch after unifying the abstraction.
-                worker_batch_or_batch = batch
-
             if self.enable_overlap:
-                model_worker_batch = worker_batch_or_batch
-                self.record_batch_in_overlap(model_worker_batch)
+                self.record_batch_in_overlap(batch)
 
                 # Sampling info will be modified during forward, so we store a copy.
-                model_worker_batch.sampling_info = (
-                    model_worker_batch.sampling_info.copy_for_forward()
-                )
-                bs = len(model_worker_batch.seq_lens)
+                if batch.sampling_info is not None:
+                    batch.sampling_info = batch.sampling_info.copy_for_forward()
+                bs = len(batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
-                    self.future_map.resolve_future(model_worker_batch)
+                    self.future_map.resolve_future(batch)
                     batch_result = self.model_worker.forward_batch_generation(
-                        model_worker_batch
+                        batch
                         # here pp is not compatible with overlap
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
@@ -3082,7 +3071,7 @@ class Scheduler(
                     else {}
                 )
                 batch_result = self.model_worker.forward_batch_generation(
-                    worker_batch_or_batch, **kwargs
+                    batch, **kwargs
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
@@ -3109,24 +3098,18 @@ class Scheduler(
 
             ret = batch_result
         else:  # embedding or reward model
-            model_worker_batch = batch.get_model_worker_batch()
-
             if self.enable_overlap:
-                self.record_batch_in_overlap(model_worker_batch)
+                self.record_batch_in_overlap(batch)
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
-                    pooler_output = self.tp_worker.forward_batch_embedding(
-                        model_worker_batch
-                    )
+                    pooler_output = self.tp_worker.forward_batch_embedding(batch)
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
                     )
                     ret.copy_to_cpu()
             else:
-                pooler_output = self.tp_worker.forward_batch_embedding(
-                    model_worker_batch
-                )
+                pooler_output = self.tp_worker.forward_batch_embedding(batch)
                 ret = EmbeddingBatchResult(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
