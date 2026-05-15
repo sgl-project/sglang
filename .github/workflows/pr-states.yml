@@ -1,8 +1,11 @@
 name: PR States
-# Maintains a CI-states block at the bottom of the PR body.
+# Maintains a CI-states block at the bottom of the PR body. Triggered by
+# `pull_request_target` (not `pull_request`) so fork PRs get a write-enabled
+# GITHUB_TOKEN. Safe because the workflow never checks out PR head code —
+# only reads metadata via API and PATCHes the PR body.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
@@ -23,6 +26,7 @@ jobs:
           script: |
             const sha = context.payload.pull_request.head.sha;
             const labels = context.payload.pull_request.labels.map(l => l.name);
+            const hasCI = labels.includes('run-ci');
             const hasExtra = labels.includes('run-ci-extra');
 
             // Retry briefly: pr-test* may not be API-visible yet when we start.
@@ -45,20 +49,29 @@ jobs:
               return null;
             }
 
-            const ptRun = await findRunWithRetry('pr-test.yml');
-            const peRun = hasExtra ? await findRunWithRetry('pr-test-extra.yml') : null;
+            const ptRun = hasCI ? await findRunWithRetry('pr-test.yml') : null;
+            // pr-test-extra's gate requires BOTH run-ci AND run-ci-extra
+            // (see pr-test-extra.yml check-changes if-condition), so without
+            // run-ci the extra workflow doesn't run either.
+            const peRun = (hasCI && hasExtra) ? await findRunWithRetry('pr-test-extra.yml') : null;
 
             // Treat a fully-skipped run as "no real run" — happens when the PR
             // was opened without the label and label was added later (GHA does
             // not retrigger on `labeled`).
             const isReal = (run) => run && run.conclusion !== 'skipped';
 
-            const notEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
+            const missingCIText = ':x: **Missing `run-ci` label** — add it to run CI tests.';
+            const peBlockedByCIText = ':x: **Blocked** — `run-ci` is required first.';
+            const notExtraEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** — push again or use `/rerun-failed-ci` to dispatch.';
-            const ptText = isReal(ptRun) ? `[Run #${ptRun.id}](${ptRun.html_url})` : '_Not run yet_';
-            const peText = !hasExtra
-              ? notEnabledText
-              : (isReal(peRun) ? `[Run #${peRun.id}](${peRun.html_url})` : stalePushText);
+            const ptText = !hasCI
+              ? missingCIText
+              : (isReal(ptRun) ? `[Run #${ptRun.id}](${ptRun.html_url})` : '_Not run yet_');
+            const peText = !hasCI
+              ? peBlockedByCIText
+              : !hasExtra
+                ? notExtraEnabledText
+                : (isReal(peRun) ? `[Run #${peRun.id}](${peRun.html_url})` : stalePushText);
 
             const outerStart = '<!-- pr-states:start -->';
             const outerEnd   = '<!-- pr-states:end -->';
