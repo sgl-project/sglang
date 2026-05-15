@@ -61,11 +61,19 @@ jobs:
             // retry when it would never appear.
             const peRun = hasExtra ? await findRunWithRetry('pr-test-extra.yml') : null;
 
+            // Treat a fully-skipped run as "no real run" — happens when the
+            // PR was opened without `run-ci-extra` and the label was added
+            // later. GHA does not retrigger pr-test-extra on the labeled
+            // event, so the latest API-visible run is the original
+            // label-gate-skipped one and linking it would mislead.
+            const isReal = (run) => run && run.conclusion !== 'skipped';
+
             const notEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
-            const ptText = ptRun ? `[Run #${ptRun.id}](${ptRun.html_url})` : '_Not run yet_';
+            const stalePushText = ':warning: **Not run on latest push** — push again or use `/rerun-failed-ci` to dispatch.';
+            const ptText = isReal(ptRun) ? `[Run #${ptRun.id}](${ptRun.html_url})` : '_Not run yet_';
             const peText = !hasExtra
               ? notEnabledText
-              : (peRun ? `[Run #${peRun.id}](${peRun.html_url})` : '_Not run yet_');
+              : (isReal(peRun) ? `[Run #${peRun.id}](${peRun.html_url})` : stalePushText);
 
             const outerStart = '<!-- pr-awareness:start -->';
             const outerEnd   = '<!-- pr-awareness:end -->';
