@@ -36,7 +36,7 @@ _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
 # base-a is the critical-path entry gate; pin its fanout to smoke-coverage
 # defaults instead of est_time. max_parallel = size (no throttle).
-_STAGE_A_OVERRIDES = {
+_BASE_A_OVERRIDES = {
     "base-a-test-cpu": 4,
     "base-a-test-1-gpu-small": 1,
 }
@@ -47,7 +47,7 @@ _REUSABLE_STAGE_USES = "./.github/workflows/_pr-test-stage.yml"
 def load_run_timeouts(pr_test_yml_path: str) -> dict:
     """Map `self_name -> run_timeout_minutes` from one pr-test*.yml. The input
     is required in `_pr-test-stage.yml` -- KeyError surfaces missing.
-    Inline base-a-test-cpu is skipped (uses `_STAGE_A_OVERRIDES`)."""
+    Inline base-a-test-cpu is skipped (uses `_BASE_A_OVERRIDES`)."""
     with open(pr_test_yml_path) as f:
         wf = yaml.safe_load(f)
     timeouts = {}
@@ -122,7 +122,7 @@ def compute_partitions(
     """
     # Allowlist: stages pr-test.yml dispatches. Stress / weekly /
     # nightly-* live in test/registered/ but pr-test doesn't run them.
-    dispatched_suites = set(run_timeouts) | set(_STAGE_A_OVERRIDES)
+    dispatched_suites = set(run_timeouts) | set(_BASE_A_OVERRIDES)
     suite_tests = defaultdict(list)
     for t in tests:
         if t.backend not in _TARGET_BACKENDS:
@@ -149,8 +149,8 @@ def compute_partitions(
         bias = fit.get("bias", 0.0)
 
         # Each shard pays `bias` once, so size >= coeff*total / (target-bias).
-        if suite in _STAGE_A_OVERRIDES:
-            size = _STAGE_A_OVERRIDES[suite]
+        if suite in _BASE_A_OVERRIDES:
+            size = _BASE_A_OVERRIDES[suite]
             max_parallel = size
         else:
             target = per_shard_target_seconds(suite, run_timeouts)
