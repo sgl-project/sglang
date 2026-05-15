@@ -208,7 +208,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 ci = indices[i : i + chunk_size]
                 layer_chunks.append(
                     [
-                        t[ci].to("cpu", non_blocking=True) for t in tensors_per_layer if t is not None
+                        t[ci].to("cpu", non_blocking=True)
+                        for t in tensors_per_layer
+                        if t is not None
                     ]
                 )
             out.append(layer_chunks)
@@ -468,7 +470,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 ci = indices[i : i + chunk_size]
                 layer_chunks.append(
                     [
-                        t[ci].to("cpu", non_blocking=True) for t in tensors_per_layer if t is not None
+                        t[ci].to("cpu", non_blocking=True)
+                        for t in tensors_per_layer
+                        if t is not None
                     ]
                 )
             out.append(layer_chunks)
