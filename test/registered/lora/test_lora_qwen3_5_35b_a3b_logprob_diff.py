@@ -35,7 +35,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
-    est_time=160,
+    est_time=110,
     stage="stage-c",
     runner_config="4-gpu-b200",
 )
