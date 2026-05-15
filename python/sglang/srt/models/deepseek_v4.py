@@ -515,15 +515,20 @@ class MQALayer(nn.Module):
 
         if self.use_fused_qk_norm_rope:
             q, _ = self.wq_b(q_lora)
-            kv, _ = qkv_a[..., self.q_lora_rank :], (
-                None if qkv_a is not None else self.wkv(x)
+            kv = qkv_a[..., self.q_lora_rank :] if qkv_a is not None else self.wkv(x)[0]
+
+            from sglang.srt.layers.fused_qk_norm_rope_store import (
+                fused_qk_norm_rope_swa_store,
             )
 
-            from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
-                fused_reduce_qk_norm_rope_swa_write,
+            token_to_kv_pool = forward_batch.token_to_kv_pool
+            swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
             )
+            swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
+            swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
 
-            q = fused_reduce_qk_norm_rope_swa_write(
+            q = fused_qk_norm_rope_swa_store(
                 q=q,
                 kv=kv,
                 q_norm_weight=None,
@@ -534,7 +539,9 @@ class MQALayer(nn.Module):
                 cos_cache=self.cos_cache,
                 sin_cache=self.sin_cache,
                 positions=positions,
-                is_neox=False,
+                swa_cache=swa_cache,
+                swa_loc=swa_loc,
+                swa_page_size=swa_page_size,
                 dtype=x.dtype,
             )
 
@@ -545,12 +552,6 @@ class MQALayer(nn.Module):
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
-
-            attn_backend.store_cache(
-                layer_id=self.layer_id,
-                swa_k=kv,
-                forward_batch=forward_batch,
-            )
         else:
             q = self._compute_q_b(q_lora, positions, q_out)
             if use_cp:
