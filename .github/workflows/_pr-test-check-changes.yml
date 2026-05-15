@@ -299,7 +299,7 @@ jobs:
         id: runner-map
         run: |
           python3 scripts/ci/runner_configs.py --map \
-            --b200-runner '${{ steps.set-runner.outputs.b200_runner }}' \
+            '${{ steps.set-runner.outputs.b200_runner }}' \
             >> "$GITHUB_OUTPUT"
 
       - name: Enable retry for CI

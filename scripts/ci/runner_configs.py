@@ -5,10 +5,9 @@ runner_configs.py <runner_config>
     install_timeout / runs_on / rdma_devices). Called per stage by
     _pr-test-stage.yml.
 
-runner_configs.py --map --b200-runner <label>
+runner_configs.py --map <b200_runner_label>
     `runs_on_map={json}` — flat dict {runner_config: runs_on}, with
-    `$b200_runner` substituted. Called once by _pr-test-check-changes.yml;
-    used by stage / non-stage workflow `runs-on:` expressions.
+    `$b200_runner` substituted. Called once by _pr-test-check-changes.yml.
 """
 
 import json
@@ -26,49 +25,31 @@ def load() -> dict:
         return yaml.safe_load(f)["runner_configs"]
 
 
-def build_runs_on_map(b200_runner: str) -> dict:
-    """Return flat {runner_config: runs_on} with `$b200_runner` substituted."""
-    out = {}
-    for name, cfg in load().items():
-        runs_on = cfg.get("runs_on")
-        if runs_on == _B200_SENTINEL:
-            runs_on = b200_runner
-        out[name] = runs_on
-    return out
-
-
-def _print_single(rc: str) -> None:
-    config = load().get(rc)
-    if config is None:
+def _emit_single(rc: str) -> None:
+    cfg = load().get(rc)
+    if cfg is None:
         sys.exit(f"unknown runner_config: {rc!r}")
-    for key, value in config.items():
+    for key, value in cfg.items():
         print(f"{key}={value}")
 
 
-def _print_map(b200_runner: str) -> None:
-    payload = build_runs_on_map(b200_runner)
-    print(f"runs_on_map={json.dumps(payload, separators=(',', ':'))}")
+def _emit_map(b200_runner: str) -> None:
+    runs_on = {
+        name: (b200_runner if cfg.get("runs_on") == _B200_SENTINEL else cfg["runs_on"])
+        for name, cfg in load().items()
+    }
+    print(f"runs_on_map={json.dumps(runs_on, separators=(',', ':'))}")
 
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if args and args[0] == "--map":
-        b200_runner = ""
-        i = 1
-        while i < len(args):
-            if args[i] == "--b200-runner" and i + 1 < len(args):
-                b200_runner = args[i + 1]
-                i += 2
-            else:
-                sys.exit(f"unexpected arg: {args[i]!r}")
-        if not b200_runner:
-            sys.exit("usage: runner_configs.py --map --b200-runner <label>")
-        _print_map(b200_runner)
-    elif len(args) == 1:
-        _print_single(args[0])
+    if len(args) == 1:
+        _emit_single(args[0])
+    elif len(args) == 2 and args[0] == "--map":
+        _emit_map(args[1])
     else:
         sys.exit(
             "usage:\n"
             "  runner_configs.py <runner_config>\n"
-            "  runner_configs.py --map --b200-runner <label>"
+            "  runner_configs.py --map <b200_runner_label>"
         )
