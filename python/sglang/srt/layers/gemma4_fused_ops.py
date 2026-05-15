@@ -331,6 +331,120 @@ def _fused_kv_norm_kernel(
     tl.store(V_out_ptr + row * stride_v + cols, v_out.to(x.dtype), mask=mask)
 
 
+@triton.jit
+def _gemma_q_keqv_rmsnorm_kernel(
+    Q_ptr,  # in/out: per-token Q heads, shape [M, NUM_Q_HEADS * HEAD_DIM]
+    KV_ptr,  # input: per-token K=V raw projection, shape [M, NUM_KV_HEADS * HEAD_DIM]
+    K_out_ptr,  # output: per-token K, shape [M, NUM_KV_HEADS * HEAD_DIM]
+    V_out_ptr,  # output: per-token V, shape [M, NUM_KV_HEADS * HEAD_DIM]
+    Q_w_ptr,
+    K_w_ptr,
+    stride_q_m,
+    stride_kv_m,
+    stride_kout_m,
+    stride_vout_m,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    eps,
+    BLOCK: tl.constexpr,
+):
+    """Per-token fused RMSNorm of Q (in-place, with q_w) and K=V (out-of-place).
+
+    For the ``attention_k_eq_v`` path, the K and V projections share the same
+    raw input. We compute a single rrms per (token, head) over that shared
+    input and write:
+        K = x * rrms * k_weight   (standard RMSNorm with learned scale)
+        V = x * rrms              (Gemma4's V-norm has weight=ones)
+
+    Q is normalised in-place exactly as in :func:`_gemma_qkv_rmsnorm_kernel`.
+    """
+    m = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < HEAD_DIM
+
+    qw = tl.load(Q_w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+    # Q heads — in-place
+    for h in tl.static_range(NUM_Q_HEADS):
+        off = m * stride_q_m + h * HEAD_DIM + cols
+        x = tl.load(Q_ptr + off, mask=mask, other=0.0).to(tl.float32)
+        rrms = tl.rsqrt(tl.sum(x * x, axis=0) / HEAD_DIM + eps)
+        out = x * rrms * qw
+        tl.store(Q_ptr + off, out.to(Q_ptr.dtype.element_ty), mask=mask)
+
+    kw = tl.load(K_w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+    # K = norm(KV) * kw, V = norm(KV)  — shared rrms per (token, head)
+    for h in tl.static_range(NUM_KV_HEADS):
+        in_off = m * stride_kv_m + h * HEAD_DIM + cols
+        x = tl.load(KV_ptr + in_off, mask=mask, other=0.0).to(tl.float32)
+        rrms = tl.rsqrt(tl.sum(x * x, axis=0) / HEAD_DIM + eps)
+        v_out = x * rrms
+        k_out = v_out * kw
+        k_off = m * stride_kout_m + h * HEAD_DIM + cols
+        v_off = m * stride_vout_m + h * HEAD_DIM + cols
+        tl.store(K_out_ptr + k_off, k_out.to(K_out_ptr.dtype.element_ty), mask=mask)
+        tl.store(V_out_ptr + v_off, v_out.to(V_out_ptr.dtype.element_ty), mask=mask)
+
+
+def gemma_q_keqv_rmsnorm(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused per-token RMSNorm for Q + (K = V) attention layers.
+
+    Inputs:
+      q: [M, num_q_heads * head_dim] (CUDA, contiguous last dim).
+         Normalised in-place: ``q = norm(q) * q_weight``.
+      kv: [M, num_kv_heads * head_dim] (CUDA, contiguous last dim) — the
+         shared raw K/V projection output.
+      q_weight, k_weight: [head_dim] learned RMSNorm scales.
+
+    Returns:
+      (k, v) — newly-allocated tensors with the same shape and stride
+      pattern as ``kv``. ``k = norm(kv) * k_weight``, ``v = norm(kv)``.
+
+    Replaces the (q_norm + fused_kv_norm) two-launch sequence with a single
+    Triton launch.
+    """
+    assert q.is_cuda and kv.is_cuda
+    assert q.stride(-1) == 1 and kv.stride(-1) == 1
+    assert q_weight.shape[-1] == head_dim and k_weight.shape[-1] == head_dim
+    assert q.shape[0] == kv.shape[0], f"M mismatch: {q.shape[0]} vs {kv.shape[0]}"
+
+    M = q.shape[0]
+    BLOCK = triton.next_power_of_2(head_dim)
+
+    k_out = torch.empty_like(kv)
+    v_out = torch.empty_like(kv)
+
+    _gemma_q_keqv_rmsnorm_kernel[(M,)](
+        q,
+        kv,
+        k_out,
+        v_out,
+        q_weight,
+        k_weight,
+        q.stride(0),
+        kv.stride(0),
+        k_out.stride(0),
+        v_out.stride(0),
+        NUM_Q_HEADS=num_q_heads,
+        NUM_KV_HEADS=num_kv_heads,
+        HEAD_DIM=head_dim,
+        eps=eps,
+        BLOCK=BLOCK,
+    )
+    return k_out, v_out
+
+
 def fused_kv_norm(
     x: torch.Tensor,
     k_weight: torch.Tensor,
