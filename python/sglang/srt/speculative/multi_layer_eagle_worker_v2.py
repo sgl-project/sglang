@@ -477,6 +477,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         draft_extend_input.num_tokens_per_req = self.speculative_num_steps + 1
         draft_extend_input.num_tokens_for_logprob_per_req = 1
 
+        # Install draft_extend_input as `batch.spec_info` for the extend forward.
+        batch.spec_info = draft_extend_input
+
         # Prepare for draft extend in a separate stream
         # Notice that here we use batch_result.next_token_ids as the input ids
         with self.plan_stream_ctx:
@@ -786,7 +789,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
-        verify_output = verify_input.sample(batch, logits_output)
+        verify_output = verify_input.verify_v2(batch, logits_output)
         accept_lens = verify_output.draft_extend_input.num_accept_tokens
         new_seq_lens = batch.seq_lens + accept_lens
         verify_done = torch.get_device_module(self.device).Event()
