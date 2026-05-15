@@ -14,7 +14,7 @@ from auto_benchmark import AutoBenchmarkTestCase
 from sglang.auto_benchmark_lib import SearchDeadlineExceeded, run_candidate
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=6, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=6, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=6, suite="stage-b-test-1-gpu-small-amd")
 
 
