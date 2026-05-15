@@ -49,6 +49,7 @@ on:
 
 jobs:
   run:
+    name: check-changes
     runs-on: ubuntu-latest
     outputs:
       # Use API-based detection for target_stage mode (filter-api), otherwise use dorny/paths-filter (filter)

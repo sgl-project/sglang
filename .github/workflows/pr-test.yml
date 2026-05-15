@@ -35,6 +35,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_all_tests:
+        description: "Run all tests (mirrors the scheduled cron's behavior — combine with test_parallel_dispatch for full sim)"
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       git_ref:
@@ -67,7 +72,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
+  SKIP_STAGE_HEALTH_CHECK: ${{ (inputs.skip_stage_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true) && 'true' || 'false' }}
   # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
   FORCE_REBUILD_DEEPEP: '1'
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
@@ -91,6 +96,25 @@ jobs:
       include_wheel_build: ${{ inputs.include_wheel_build == true }}
       run_all_tests: ${{ inputs.run_all_tests == true }}
       force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
+    secrets: inherit
+
+  # Runs right after check-changes so the awareness block is injected ~30s in
+  # rather than waiting for downstream stages.
+  call-pr-awareness:
+    needs: check-changes
+    if: always() && github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+    uses: ./.github/workflows/_pr-awareness-comment.yml
+    with:
+      workflow_kind: pr-test
+    secrets: inherit
+
+  call-pr-test-extra:
+    if: github.event_name == 'schedule' || inputs.test_parallel_dispatch == true
+    uses: ./.github/workflows/pr-test-extra.yml
+    with:
+      run_all_tests: true
     secrets: inherit
 
   # =============================================== Wait Jobs for Sequential PR Execution ====================================================

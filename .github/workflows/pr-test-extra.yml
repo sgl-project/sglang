@@ -67,7 +67,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
+  SKIP_STAGE_HEALTH_CHECK: ${{ (inputs.skip_stage_health_check == true || inputs.run_all_tests == true) && 'true' || 'false' }}
   FORCE_REBUILD_DEEPEP: '1'
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -103,6 +103,19 @@ jobs:
       run_all_tests: ${{ inputs.run_all_tests == true }}
       force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
       pr_test_yml: '.github/workflows/pr-test-extra.yml'
+    secrets: inherit
+
+  # always(): on a PR without `run-ci-extra` the rest of this workflow's graph
+  # is skipped, but we still want the awareness block updated so the author
+  # sees this run was a no-op.
+  call-pr-awareness:
+    needs: check-changes
+    if: always() && github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+    uses: ./.github/workflows/_pr-awareness-comment.yml
+    with:
+      workflow_kind: pr-test-extra
     secrets: inherit
 
   # =============================================== sgl-kernel ====================================================

@@ -73,6 +73,7 @@ env:
 
 jobs:
   run:
+    name: ${{ inputs.self_name }} (${{ matrix.partition }})
     # target_stage takes precedence; otherwise default per-commit gating
     # runs on schedule / parallel-dispatch / non-failed PR with main_package
     # or sgl_kernel changes.

@@ -1105,7 +1105,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.8.post1")
+        min_version: Minimum version required (e.g., "0.6.11.post1")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -3661,7 +3661,15 @@ class ConcurrentCounter:
 
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
-    return importlib.util.find_spec("triton_kernels") is not None
+    if importlib.util.find_spec("triton_kernels") is None:
+        return False
+    try:
+        ragged_metadata_spec = importlib.util.find_spec(
+            "triton_kernels.tensor_details.ragged_tensor"
+        )
+    except ModuleNotFoundError:
+        return False
+    return ragged_metadata_spec is not None
 
 
 @lru_cache(maxsize=1)
