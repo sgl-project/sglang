@@ -23,12 +23,12 @@ def apply_token_bitmask_inplace_torch(
     This path is currently used as a fallback on NPU in xgrammar backend.
     """
     vocab_size = min(logits.shape[-1], bitmask.shape[-1] * 32)
-    logits = logits[..., :vocab_size]
+    logits_view = logits[..., :vocab_size]
     bitmask_cpu = bitmask.detach().cpu()
     token_ids = torch.arange(vocab_size, device="cpu", dtype=torch.int32)
     word_idx = token_ids // 32
     bit_idx = token_ids % 32
     words = bitmask_cpu[:, word_idx].to(torch.int32)
     allowed = ((words >> bit_idx) & 1).to(torch.bool)
-    allowed = allowed.to(logits.device, non_blocking=True)
-    logits.masked_fill_(~allowed, float("-inf"))
+    allowed = allowed.to(logits_view.device, non_blocking=True)
+    logits_view.masked_fill_(~allowed, float("-inf"))

@@ -40,10 +40,6 @@ from sglang.srt.constrained.utils import (
 logger = logging.getLogger(__name__)
 
 
-def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-    apply_packed_vocab_mask(logits, vocab_mask)
-
-
 class GuidanceGrammar(BaseGrammarObject):
 
     def __init__(self, llguidance_tokenizer: LLTokenizer, serialized_grammar: str):
@@ -107,7 +103,7 @@ class GuidanceGrammar(BaseGrammarObject):
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        apply_vocab_mask(logits, vocab_mask)
+        apply_packed_vocab_mask(logits, vocab_mask)
 
     def copy(self):
         return GuidanceGrammar(
@@ -166,7 +162,7 @@ class GuidanceBackend(BaseGrammarBackend):
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        apply_vocab_mask(logits, vocab_mask)
+        apply_packed_vocab_mask(logits, vocab_mask)
 
     @staticmethod
     def set_token_filter(

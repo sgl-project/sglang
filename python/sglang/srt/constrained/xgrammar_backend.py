@@ -98,8 +98,7 @@ class XGrammarGrammar(BaseGrammarObject):
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
         return vocab_mask.to(device, non_blocking=True)
 
-    @staticmethod
-    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+    def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         apply_packed_vocab_mask(logits, vocab_mask)
 
     def copy(self):
