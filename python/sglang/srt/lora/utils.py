@@ -9,6 +9,22 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 
 @dataclass
+class MoELoRABatchInfo:
+    # Per-request segment indptrs used by MoE LoRA routing, shape (bs + 1,).
+    seg_indptr: torch.Tensor
+
+    # Per-request adapter index used by MoE LoRA routing, shape (bs,).
+    req_to_lora: torch.Tensor
+
+    # A mask indicating if lora adapter is enabled. Shape (num_loras,)
+    adapter_enabled: torch.Tensor
+
+    # A mapping of which lora adapter is used for each token. Shape (num_tokens,)
+    # If a token has no lora adapter, the value is -1.
+    token_lora_mapping: torch.Tensor
+
+
+@dataclass
 class LoRABatchInfo:
     # The forward mode is using CUDA Graph.
     use_cuda_graph: bool
@@ -57,6 +73,9 @@ class LoRABatchInfo:
 
     # Per-request adapter index, shape (bs,).
     req_weight_indices: Optional[torch.Tensor] = None
+
+    # MoE LoRA batch info
+    moe_lora_info: Optional[MoELoRABatchInfo] = None
 
 
 class LoRAType(Enum):

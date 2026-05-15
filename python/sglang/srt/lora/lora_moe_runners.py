@@ -176,6 +176,7 @@ class LoRAInfo:
     # LoRA config per adapter
     lora_ranks: torch.Tensor  # [num_loras]
     adapter_enabled: torch.Tensor  # [num_loras] - which adapters are enabled
+    token_lora_mapping: torch.Tensor  # [num_tokens] - adapter used by each token
     max_lora_rank: int  # Maximum LoRA rank across all adapters
 
     num_experts: int
@@ -200,21 +201,8 @@ class LoRAHooks:
         Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None] | None
     ) = None
 
-
-def _compute_token_lora_mapping(
-    hidden_states: torch.Tensor,
-    lora_info: LoRAInfo,
-) -> torch.Tensor:
-    """Map each token to its LoRA adapter index (-1 for no LoRA)."""
-    token_positions = torch.arange(
-        hidden_states.shape[0], device=hidden_states.device, dtype=torch.int32
-    )
-    req_indices = torch.searchsorted(
-        lora_info.seg_indptr[1:].to(torch.int32),
-        token_positions,
-        right=True,
-    )
-    return lora_info.req_to_lora.to(torch.int32)[req_indices]
+    def __bool__(self) -> bool:
+        return self.after_gate_up is not None or self.after_down is not None
 
 
 def _compute_lora_alignment(
@@ -335,15 +323,15 @@ def _add_lora_gate_up_delta(
         merged_experts_fused_moe_lora_add,
     )
 
+    if lora_info.max_lora_rank == 0:
+        return
+
     if get_is_capture_mode():
         from sglang.srt.model_executor.cuda_graph_runner import get_capture_lora_variant
 
         # Record LoRA kernels for lora graph; skip for nolora graph.
         if get_capture_lora_variant() == "nolora":
             return
-
-    if lora_info is None or lora_info.max_lora_rank == 0:
-        return
 
     M, top_k, gate_up_dim = intermediate_cache.shape
     r = lora_info.max_lora_rank
@@ -506,7 +494,7 @@ def _add_lora_down_delta(
 
 def build_lora_hooks(
     hidden_states: torch.Tensor,
-    lora_info: LoRAInfo,
+    lora_info: LoRAInfo | None,
     topk_ids: torch.Tensor,
 ) -> LoRAHooks:
     """Build LoRA hook closures for injection into any MoE runner.
@@ -531,7 +519,7 @@ def build_lora_hooks(
     lora_ids: torch.Tensor | None = None
 
     if lora_info.lora_use_virtual_experts:
-        token_lora_mapping = _compute_token_lora_mapping(hidden_states, lora_info)
+        token_lora_mapping = lora_info.token_lora_mapping
     else:
         (
             sorted_token_ids_reshaped,

@@ -113,13 +113,11 @@ class MoeRunner:
             else:
                 hidden_states = _runner_input.hidden_states
                 topk_ids = getattr(_runner_input, "topk_ids", None)
-            if self.lora_enabled and lora_info is not None:
-                return build_lora_hooks(
-                    hidden_states,
-                    lora_info,
-                    topk_ids,
-                )
-            return None
+            return build_lora_hooks(
+                hidden_states,
+                lora_info if self.lora_enabled else None,
+                topk_ids,
+            )
 
         # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore)
         # bypass the pre-permute step and do their own alignment internally.
