@@ -6,7 +6,10 @@ on:
       sgl_kernel:
         required: true
         type: string
-      b200_runner:
+      runner_config:
+        required: true
+        type: string
+      runs_on_map:
         required: true
         type: string
       git_ref:
@@ -110,7 +113,7 @@ jobs:
           echo "All benchmark tests completed!"
 
   sgl-kernel-b200-test:
-    runs-on: ${{ inputs.b200_runner }}
+    runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
