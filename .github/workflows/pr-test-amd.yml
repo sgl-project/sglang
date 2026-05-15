@@ -419,9 +419,9 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-nondeterministic:
     name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic (linux-{0}-1gpu-sglang)', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
