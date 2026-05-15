@@ -19,6 +19,10 @@ H_KV = 1
 TOPK = 128
 S_KV = 256
 
+# DeepSeek NSA E2E currently does not plumb a per-head attention sink into
+# sparse MLA. No-sink cases are the E2E proxy; sink cases below exercise the
+# optional kernel full path and partial topk_length handling.
+
 
 def _sm90_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
@@ -64,6 +68,9 @@ def _make_case(
     # Vary topk_length per query row to exercise the partial-topk path.
     lengths = [topk if i % 2 == 0 else max(topk - 32, topk // 2) for i in range(s_q)]
     topk_length = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    for q_idx, valid_topk in enumerate(lengths):
+        if valid_topk < topk:
+            indices[q_idx, 0, valid_topk:] = -1
     return q, kv, indices, sm_scale, q_scale, kv_scale, attn_sink, topk_length
 
 
@@ -76,13 +83,17 @@ def _torch_sparse_attention_ref(
     kv_scale: torch.Tensor,
     attn_sink: torch.Tensor | None,
     topk_length: torch.Tensor | None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     topk = indices.shape[-1]
     q_f32 = q.float() * q_scale.item()
     kv_f32 = kv.float() * kv_scale.item()
     out = torch.empty(
         (q.shape[0], q.shape[1], D_V), dtype=torch.float32, device=q.device
     )
+    max_logits = torch.empty(
+        (q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device
+    )
+    lse = torch.empty_like(max_logits)
 
     for q_idx in range(q.shape[0]):
         valid_topk = topk if topk_length is None else int(topk_length[q_idx].item())
@@ -93,11 +104,13 @@ def _torch_sparse_attention_ref(
         score_max = scores.max(dim=-1, keepdim=True).values
         exp_scores = torch.exp(scores - score_max)
         denom = exp_scores.sum(dim=-1, keepdim=True)
+        max_logits[q_idx] = score_max.squeeze(-1)
+        lse[q_idx] = torch.log(denom.squeeze(-1)) + score_max.squeeze(-1)
         if attn_sink is not None:
             denom = denom + torch.exp(attn_sink[:, None] - score_max)
         out[q_idx] = torch.matmul(exp_scores, values) / denom
 
-    return out
+    return out, max_logits, lse
 
 
 def _run_and_check(d_qk, with_sink, s_q=2, topk=TOPK, s_kv=S_KV):
@@ -122,7 +135,7 @@ def _run_and_check(d_qk, with_sink, s_q=2, topk=TOPK, s_kv=S_KV):
     )
     torch.cuda.synchronize()
 
-    ref = _torch_sparse_attention_ref(
+    ref, ref_max_logits, ref_lse = _torch_sparse_attention_ref(
         q=q,
         kv=kv,
         indices=indices,
@@ -138,19 +151,26 @@ def _run_and_check(d_qk, with_sink, s_q=2, topk=TOPK, s_kv=S_KV):
     assert max_logits.shape == (q.shape[0], H_Q)
     assert lse.shape == (q.shape[0], H_Q)
     assert torch.isfinite(out.float()).all()
+    assert torch.isfinite(max_logits.float()).all()
+    assert torch.isfinite(lse.float()).all()
     torch.testing.assert_close(out.float(), ref, atol=8e-2, rtol=8e-2)
+    if attn_sink is None:
+        torch.testing.assert_close(
+            max_logits.float(), ref_max_logits, atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(lse.float(), ref_lse, atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.skipif(
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
 )
-@pytest.mark.parametrize("d_qk,with_sink", [(512, False), (576, True)])
+@pytest.mark.parametrize("d_qk,with_sink", [(512, False), (576, False)])
 def test_sparse_mla_q8kv8_prefill_matches_reference(d_qk: int, with_sink: bool):
     _run_and_check(d_qk, with_sink)
 
 
-# Corner cases: minimal s_q, larger s_q, larger topk/s_kv, and crossed
-# (d_qk=512 with sink, d_qk=576 without sink) configurations. The kernel
+# Corner cases: minimal s_q, larger s_q, larger topk/s_kv, crossed d_qk
+# configurations, and optional sink+topk_length feature coverage. The kernel
 # requires topk to be a multiple of 128, so 128 is the minimum supported.
 @pytest.mark.skipif(
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
@@ -161,8 +181,9 @@ def test_sparse_mla_q8kv8_prefill_matches_reference(d_qk: int, with_sink: bool):
         (576, True, 1, TOPK, S_KV),
         (576, True, 8, TOPK, S_KV),
         (576, True, 2, 256, 512),
+        (512, False, 65, 256, 592),
         (512, True, 2, TOPK, S_KV),
-        (576, False, 2, TOPK, S_KV),
+        (576, False, 65, 256, 592),
     ],
 )
 def test_sparse_mla_q8kv8_prefill_corner_cases(
@@ -171,26 +192,23 @@ def test_sparse_mla_q8kv8_prefill_corner_cases(
     _run_and_check(d_qk, with_sink, s_q=s_q, topk=topk, s_kv=s_kv)
 
 
-# Precision / accuracy: report distributional error of Q8KV8 kernel output
-# against the fp32 reference computed from dequantized inputs, following
-# the same metric-reporting style as test_cutedsl_gdn_precision. The medium
-# s_q cases follow the attention-test convention of covering more than tiny
-# query lengths, and exercise many CTAs/output stores.
+# Precision / accuracy: no-sink only because these metrics are intended to
+# approximate the current DeepSeek NSA E2E path. Sink behavior is still covered
+# above as kernel feature coverage, but sink-enabled precision numbers should
+# not be used as E2E proxy results until the E2E pipeline wires attn_sink.
 @pytest.mark.skipif(
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
 )
 @pytest.mark.parametrize(
-    "d_qk,with_sink,s_q,topk,s_kv",
+    "d_qk,s_q,topk,s_kv",
     [
-        (512, False, 4, 256, 512),
-        (576, True, 4, 256, 512),
-        (512, False, 64, 256, 1024),
-        (576, True, 64, 256, 1024),
+        (512, 4, 256, 512),
+        (576, 4, 256, 512),
+        (512, 64, 256, 1024),
+        (576, 64, 256, 1024),
     ],
 )
-def test_sparse_mla_q8kv8_prefill_precision(
-    d_qk: int, with_sink: bool, s_q: int, topk: int, s_kv: int
-):
+def test_sparse_mla_q8kv8_prefill_precision(d_qk: int, s_q: int, topk: int, s_kv: int):
     """Demonstrate that Q8KV8 kernel precision is near-lossless versus the
     fp32 reference: max/mean/p99 absolute error are small and the fraction
     of elements exceeding 0.1 absolute error is under 1%."""
@@ -198,11 +216,12 @@ def test_sparse_mla_q8kv8_prefill_precision(
         sparse_mla_q8kv8_prefill_fwd,
     )
 
+    with_sink = False
     q, kv, indices, sm_scale, q_scale, kv_scale, attn_sink, topk_length = _make_case(
         d_qk, with_sink, s_q=s_q, topk=topk, s_kv=s_kv
     )
 
-    out, _, _ = sparse_mla_q8kv8_prefill_fwd(
+    out, max_logits, lse = sparse_mla_q8kv8_prefill_fwd(
         q=q,
         kv=kv,
         indices=indices,
@@ -215,7 +234,7 @@ def test_sparse_mla_q8kv8_prefill_precision(
     )
     torch.cuda.synchronize()
 
-    ref = _torch_sparse_attention_ref(
+    ref, ref_max_logits, ref_lse = _torch_sparse_attention_ref(
         q=q,
         kv=kv,
         indices=indices,
@@ -233,11 +252,20 @@ def test_sparse_mla_q8kv8_prefill_precision(
     p99_diff = torch.quantile(abs_diff.flatten(), 0.99).item()
     fail_rate = (abs_diff > 0.1).float().mean().item() * 100
     has_bad = bool(torch.isnan(out_f32).any() or torch.isinf(out_f32).any())
+    ref_abs_mean = ref.abs().mean().clamp_min(1e-12).item()
+    rel_mean = mean_diff / ref_abs_mean
+    cos_diff = 1 - 2 * (out_f32.double() * ref.double()).sum().item() / max(
+        (out_f32.double().square() + ref.double().square()).sum().item(), 1e-12
+    )
+    max_logits_diff = (max_logits.float() - ref_max_logits).abs().max().item()
+    lse_diff = (lse.float() - ref_lse).abs().max().item()
 
     print(
         f"\n  d_qk={d_qk} with_sink={with_sink} s_q={s_q} topk={topk} s_kv={s_kv}: "
         f"max_diff={max_diff:.2e}, p99_diff={p99_diff:.2e}, "
-        f"mean_diff={mean_diff:.2e}, fail_rate(>0.1)={fail_rate:.3f}%"
+        f"mean_diff={mean_diff:.2e}, rel_mean={rel_mean:.2e}, "
+        f"cos_diff={cos_diff:.2e}, fail_rate(>0.1)={fail_rate:.3f}%, "
+        f"max_logits_diff={max_logits_diff:.2e}, lse_diff={lse_diff:.2e}"
     )
 
     assert not has_bad, "Q8KV8 output contains NaN/Inf"
@@ -246,6 +274,9 @@ def test_sparse_mla_q8kv8_prefill_precision(
     assert max_diff < 1e-3, f"max_diff {max_diff:.2e} exceeds 1e-3"
     assert mean_diff < 5e-3, f"mean_diff {mean_diff:.2e} exceeds 5e-3"
     assert p99_diff < 5e-2, f"p99_diff {p99_diff:.2e} exceeds 5e-2"
+    assert cos_diff < 1e-4, f"cos_diff {cos_diff:.2e} exceeds 1e-4"
+    assert max_logits_diff < 1e-2, f"max_logits_diff {max_logits_diff:.2e} exceeds 1e-2"
+    assert lse_diff < 2e-3, f"lse_diff {lse_diff:.2e} exceeds 2e-3"
 
 
 if __name__ == "__main__":
