@@ -73,3 +73,34 @@ async fn half_open_failure_reopens() {
     // Back to Open.
     assert!(!b.allow(), "back to open");
 }
+
+#[tokio::test(start_paused = true)]
+async fn open_breaker_recovery_is_not_delayed_by_continued_failures() {
+    // Regression: previously, record_failure on an already-Open breaker
+    // refreshed opened_at, so a failure storm pinned the breaker open
+    // forever. Now the cool_down is measured from first-open.
+    let b = CircuitBreaker::with_config(CircuitBreakerConfig {
+        threshold: 3,
+        cool_down: Duration::from_millis(100),
+    });
+    // Open it.
+    b.record_failure();
+    b.record_failure();
+    b.record_failure();
+    assert!(!b.allow(), "breaker should be open");
+
+    // Advance halfway through cool_down, then record more failures.
+    tokio::time::advance(Duration::from_millis(50)).await;
+    b.record_failure();
+    b.record_failure();
+    b.record_failure();
+
+    // Advance just past the original cool_down.
+    tokio::time::advance(Duration::from_millis(60)).await;
+
+    // We're past the original cool_down → HalfOpen.
+    assert!(
+        b.allow(),
+        "breaker should be half-open after cool_down from first-open"
+    );
+}
