@@ -27,6 +27,15 @@ jobs:
   update-pr-body:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # Serialize concurrent writers across both callers (pr-test.yml + pr-test-extra.yml)
+    # for the same PR. Without this, both instances race on get/modify/update of the
+    # PR body and the second writer's `pulls.update` clobbers the first writer's slot
+    # change. group is scoped to PR number so different PRs do not block each other.
+    # cancel-in-progress MUST be false — cancelling would lose the earlier writer's
+    # update entirely.
+    concurrency:
+      group: pr-awareness-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     steps:
       - name: Update awareness block in PR body
         uses: actions/github-script@v7
