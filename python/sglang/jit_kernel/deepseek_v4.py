@@ -440,14 +440,7 @@ class CompressorPrefillPlan(NamedTuple):
                 use_cuda_graph,
             )
         else:
-            # Pure-torch fallback (e.g. when tvm_ffi / CUDA toolchain is
-            # unavailable, such as on XPU, CPU). Mirrors plan_prefill_host in
-            # jit_kernel/csrc/deepseek_v4/common.cuh.
-            if _is_cpu:
-                fn = _plan_compress_prefill_torch
-            else:
-                fn= _torch_plan_compress_prefill
-            plan_lens = fn(
+            plan_lens = _plan_compress_prefill_torch(
                 extend_lens,
                 seq_lens,
                 plan_tensor[0],
@@ -499,83 +492,6 @@ class CompressorPrefillPlan(NamedTuple):
         return False
 
 
-def _torch_plan_compress_prefill(
-    extend_lens: torch.Tensor,
-    seq_lens: torch.Tensor,
-    compress_plan: torch.Tensor,
-    write_plan: torch.Tensor,
-    compress_ratio: int,
-    is_overlap: bool,
-    use_cuda_graph: bool,
-) -> Tuple[int, int]:
-    """Pure-torch fallback for ``plan_compress_prefill``.
-
-    Mirrors ``host::compress::plan_prefill_host`` in
-    ``jit_kernel/csrc/deepseek_v4/common.cuh``. Each plan slot is
-    ``PrefillPlan{ragged_id, batch_id, position, window_len}`` packed as
-    4 little-endian uint32 (16 bytes).
-    """
-    assert compress_plan.dtype == torch.uint8
-    assert write_plan.dtype == torch.uint8
-    num_tokens = compress_plan.shape[0]
-    assert write_plan.shape[0] == num_tokens
-    assert compress_plan.shape[1] == 16 and write_plan.shape[1] == 16
-
-    extend_lens_cpu = extend_lens.detach().to("cpu", dtype=torch.int64).tolist()
-    seq_lens_cpu = seq_lens.detach().to("cpu", dtype=torch.int64).tolist()
-    batch_size = len(extend_lens_cpu)
-    assert len(seq_lens_cpu) == batch_size
-
-    ratio = compress_ratio * (2 if is_overlap else 1)
-    counter = 0
-    compress_entries: list = []
-    write_entries: list = []
-
-    for i in range(batch_size):
-        seq_len = int(seq_lens_cpu[i])
-        extend_len = int(extend_lens_cpu[i])
-        assert 0 < extend_len <= seq_len
-        prefix_len = seq_len - extend_len
-        pos = (seq_len // compress_ratio) * compress_ratio
-        if is_overlap:
-            start_write_pos = pos - compress_ratio if pos >= compress_ratio else 0
-        else:
-            start_write_pos = pos
-        for j in range(extend_len):
-            position = prefix_len + j
-            window_len = ratio - min(j + 1, ratio)
-            plan = (counter + j, i, position, window_len)
-            if (position + 1) % compress_ratio == 0:
-                compress_entries.append(plan)
-            if position >= start_write_pos:
-                write_entries.append(plan)
-        counter += extend_len
-    assert (
-        counter == num_tokens
-    ), f"input size {counter} != num_q_tokens {num_tokens}"
-
-    def _fill(buf: torch.Tensor, entries: list) -> int:
-        n_entries = len(entries)
-        n_rows = num_tokens if use_cuda_graph else n_entries
-        if n_rows == 0:
-            return num_tokens if use_cuda_graph else 0
-        # View the uint8 buffer as int32 — zero-copy, no bytearray or struct.pack
-        buf_i32 = buf[:n_rows].view(torch.int32)  # shape: (n_rows, 4)
-        if n_entries > 0:
-            # Build a (n_entries, 4) int32 tensor directly from the list —
-            # one allocation instead of bytes -> bytearray -> frombuffer copies.
-            entries_t = torch.tensor(entries, dtype=torch.int32)
-            buf_i32[:n_entries].copy_(entries_t)
-        if use_cuda_graph and n_entries < n_rows:
-            # Fill padding slots with 0xFFFFFFFF (== -1 in two's complement int32)
-            buf_i32[n_entries:n_rows].fill_(-1)
-        return n_rows
-
-    compress_count = _fill(compress_plan, compress_entries)
-    write_count = _fill(write_plan, write_entries)
-    return compress_count, write_count
-
-
 def _decode_prefill_plan(plan_bytes: torch.Tensor) -> torch.Tensor:
     """Decode packed PrefillPlan tensor ([N, 16] uint8) into [N, 4] int64.
 
@@ -592,9 +508,6 @@ def _decode_prefill_plan(plan_bytes: torch.Tensor) -> torch.Tensor:
     t = plan_bytes.detach().contiguous()
     as_i32 = t.view(torch.int32).reshape(-1, 4)
     return as_i32.to(torch.int64) & 0xFFFFFFFF
-
-
-_INVALID_PLAN = 0xFFFFFFFF
 
 
 def _describe(x: Any) -> str:
