@@ -1939,7 +1939,14 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "mps"
         return "mps:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
+    try:
+        from sglang.srt.platforms import current_platform
+
+        return current_platform.get_device(device_id)
+    except:
+        raise RuntimeError(
+            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
+        )
 
 
 @lru_cache(maxsize=1)
