@@ -91,11 +91,6 @@ def _dsv4_use_no_prefix_bf16_sparse_prefill() -> bool:
     return envs.SGLANG_DSV4_USE_BF16_SPARSE_PREFILL.get()
 
 
-def _dsv4_shift_valid_indices(indices: torch.Tensor, offset: int) -> torch.Tensor:
-    offset_tensor = torch.tensor(offset, device=indices.device, dtype=indices.dtype)
-    return torch.where(indices >= 0, indices + offset_tensor, indices).to(indices.dtype)
-
-
 def _dsv4_pad_indices_last_dim(
     indices: torch.Tensor, multiple: int = 128
 ) -> torch.Tensor:
@@ -103,6 +98,32 @@ def _dsv4_pad_indices_last_dim(
     if pad == 0:
         return indices
     return F.pad(indices, (0, pad), value=-1)
+
+
+def _dsv4_get_workspace_tensor(
+    workspace: Optional[Dict[str, torch.Tensor]],
+    key: str,
+    shape: Tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    if workspace is None:
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    cached = workspace.get(key)
+    if (
+        cached is None
+        or cached.numel() < numel
+        or cached.dtype != dtype
+        or cached.device != device
+    ):
+        cached = torch.empty((numel,), dtype=dtype, device=device)
+        workspace[key] = cached
+    return cached[:numel].view(shape)
 
 
 def _dsv4_build_no_prefix_swa_ragged_indices(
@@ -153,46 +174,111 @@ def _dsv4_build_unified_prefill_inputs_no_prefix(
     q: torch.Tensor,
     swa_k: torch.Tensor,
     swa_ragged_indices: torch.Tensor,
+    swa_topk_lengths: torch.Tensor,
     extra_k: Optional[torch.Tensor],
     extra_indices: Optional[torch.Tensor],
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    extra_topk_lengths: Optional[torch.Tensor],
+    workspace: Optional[Dict[str, torch.Tensor]] = None,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     if q.ndim != 4 or q.shape[1] != 1:
         return None
     if swa_k.ndim != 3 or swa_k.shape[1] != 1 or swa_k.shape[-1] != q.shape[-1]:
         return None
     if swa_k.dtype != torch.bfloat16:
         return None
+    if swa_topk_lengths.ndim != 1 or swa_topk_lengths.shape[0] != q.shape[0]:
+        return None
 
     q_prefill = q.squeeze(1).contiguous()
     kv_unified = swa_k.contiguous()
-    indices_unified = swa_ragged_indices
+    topk_length = swa_topk_lengths.to(torch.int32).contiguous()
 
-    if extra_k is not None or extra_indices is not None:
-        if extra_k is None or extra_indices is None:
+    if (
+        extra_k is not None
+        or extra_indices is not None
+        or extra_topk_lengths is not None
+    ):
+        if extra_k is None or extra_indices is None or extra_topk_lengths is None:
             return None
-        if extra_k.ndim != 3 or extra_k.shape[1] != 1 or extra_k.shape[-1] != q.shape[-1]:
+        if (
+            extra_k.ndim != 3
+            or extra_k.shape[1] != 1
+            or extra_k.shape[-1] != q.shape[-1]
+        ):
             return None
         if extra_k.dtype != torch.bfloat16:
+            return None
+        if extra_topk_lengths.ndim != 1 or extra_topk_lengths.shape[0] != q.shape[0]:
             return None
         if extra_k.shape[0] == 0:
             extra_k = None
             extra_indices = None
+            extra_topk_lengths = None
 
     if extra_k is not None:
-        extra_offset = kv_unified.shape[0]
-        kv_unified = torch.cat([kv_unified, extra_k.contiguous()], dim=0).contiguous()
-        indices_unified = torch.cat(
-            [indices_unified, _dsv4_shift_valid_indices(extra_indices, extra_offset)],
-            dim=-1,
-        ).contiguous()
+        extra_offset = swa_k.shape[0]
+        kv_unified = _dsv4_get_workspace_tensor(
+            workspace,
+            "no_prefix_kv_unified",
+            (swa_k.shape[0] + extra_k.shape[0], swa_k.shape[1], swa_k.shape[2]),
+            dtype=swa_k.dtype,
+            device=swa_k.device,
+        )
+        kv_unified[: swa_k.shape[0]].copy_(swa_k)
+        kv_unified[swa_k.shape[0] :].copy_(extra_k)
 
-    if indices_unified.shape[-1] % 128 != 0:
-        indices_unified = _dsv4_pad_indices_last_dim(indices_unified)
+        swa_width = swa_ragged_indices.shape[-1]
+        extra_width = extra_indices.shape[-1]
+        padded_width = ceil_align(swa_width + extra_width, 128)
+        extra_topk_lengths = extra_topk_lengths.to(torch.int32)
+        topk_length = (topk_length + extra_topk_lengths).contiguous()
+        indices_unified = _dsv4_get_workspace_tensor(
+            workspace,
+            "no_prefix_indices_unified",
+            (swa_ragged_indices.shape[0], padded_width),
+            dtype=torch.int32,
+            device=swa_ragged_indices.device,
+        )
+        indices_unified.fill_(-1)
+        indices_unified[:, :swa_width].copy_(swa_ragged_indices)
+        extra_offsets = torch.arange(
+            extra_width, device=extra_indices.device, dtype=torch.int32
+        ).unsqueeze(0)
+        extra_valid = extra_offsets < extra_topk_lengths.unsqueeze(1)
+        extra_starts = topk_length - extra_topk_lengths
+        extra_positions = extra_starts.unsqueeze(1) + extra_offsets
+        extra_valid = extra_valid & (extra_positions < indices_unified.shape[-1])
+        row_ids = torch.arange(
+            extra_indices.shape[0], device=extra_indices.device
+        ).unsqueeze(1).expand_as(extra_indices)
+        extra_values = extra_indices.to(torch.int32) + torch.tensor(
+            extra_offset, device=extra_indices.device, dtype=torch.int32
+        )
+        indices_unified[row_ids[extra_valid], extra_positions[extra_valid].long()] = (
+            extra_values[extra_valid]
+        )
+
+    elif (
+        swa_ragged_indices.shape[-1] % 128 != 0
+        or swa_ragged_indices.dtype != torch.int32
+    ):
+        padded_width = ceil_align(swa_ragged_indices.shape[-1], 128)
+        padded_indices = _dsv4_get_workspace_tensor(
+            workspace,
+            "no_prefix_indices_unified",
+            (swa_ragged_indices.shape[0], padded_width),
+            dtype=torch.int32,
+            device=swa_ragged_indices.device,
+        )
+        padded_indices.fill_(-1)
+        padded_indices[:, : swa_ragged_indices.shape[-1]].copy_(swa_ragged_indices)
+        indices_unified = padded_indices
+    else:
+        indices_unified = swa_ragged_indices
+
     if indices_unified.ndim == 2:
         indices_unified = indices_unified.unsqueeze(1)
-    if indices_unified.dtype != torch.int32:
-        indices_unified = indices_unified.to(torch.int32)
-    return q_prefill, kv_unified, indices_unified
+    return q_prefill, kv_unified, indices_unified, topk_length
 
 
 def _dsv4_run_bf16_sparse_prefill_attention(
@@ -203,6 +289,7 @@ def _dsv4_run_bf16_sparse_prefill_attention(
     sm_scale: float,
     d_v: int,
     attn_sink: Optional[torch.Tensor],
+    topk_length: torch.Tensor,
 ) -> Optional[torch.Tensor]:
     import flash_mla
 
@@ -212,24 +299,11 @@ def _dsv4_run_bf16_sparse_prefill_attention(
         return None
     if indices_unified.ndim != 3 or indices_unified.shape[1] != 1:
         return None
-
-    indices_flat = indices_unified.squeeze(1)
-    valid_mask = indices_flat >= 0
-    topk_length = valid_mask.sum(dim=-1).to(torch.int32).contiguous()
+    if topk_length.ndim != 1 or topk_length.shape[0] != q_prefill.shape[0]:
+        return None
+    topk_length = topk_length.to(torch.int32).contiguous()
     if topk_length.numel() == 0 or int(topk_length.max().item()) == 0:
         return None
-
-    # FlashMLA accepts -1 padding, but no-prefix ragged concatenates SWA padding
-    # before compact KV indices. Pack valid indices first so topk_length is exact.
-    packed_indices = torch.full_like(indices_flat, -1)
-    ranks = valid_mask.to(torch.int32).cumsum(dim=-1) - 1
-    row_ids = torch.arange(
-        indices_flat.shape[0], device=indices_flat.device
-    ).unsqueeze(1).expand_as(indices_flat)
-    packed_indices[row_ids[valid_mask], ranks[valid_mask].long()] = indices_flat[
-        valid_mask
-    ]
-    indices_unified = packed_indices.unsqueeze(1).contiguous()
 
     return flash_mla.flash_mla_sparse_fwd(
         q_prefill,
@@ -542,6 +616,7 @@ class DeepseekV4AttnBackend(
         self._current_ragged_extra_kv: Dict[int, torch.Tensor] = {}
         self._current_ragged_indexer_kv_fp8: Optional[torch.Tensor] = None
         self._current_ragged_indexer_kv_scale: Optional[torch.Tensor] = None
+        self._no_prefix_ragged_workspace: Dict[str, torch.Tensor] = {}
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1178,9 +1253,11 @@ class DeepseekV4AttnBackend(
             ):
                 extra_k_bf16 = None
                 extra_indices_ragged = None
+                extra_topk_lengths = None
                 if compress_ratio == 4:
                     extra_k_bf16 = self._current_ragged_extra_kv.get(4)
                     extra_indices_ragged = core_attn_metadata.c4_sparse_page_indices
+                    extra_topk_lengths = core_attn_metadata.c4_sparse_topk_lengths
                     if extra_k_bf16 is None:
                         logger.warning(
                             "DSV4 ragged prefill fallback: missing compact c4 kv for layer %s",
@@ -1194,6 +1271,7 @@ class DeepseekV4AttnBackend(
                 elif compress_ratio == 128:
                     extra_k_bf16 = self._current_ragged_extra_kv.get(128)
                     extra_indices_ragged = core_attn_metadata.c128_ragged_indices
+                    extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
                     if extra_k_bf16 is None:
                         logger.warning(
                             "DSV4 ragged prefill fallback: missing compact c128 kv for layer %s",
@@ -1214,6 +1292,7 @@ class DeepseekV4AttnBackend(
                     ):
                         extra_k_bf16 = None
                         extra_indices_ragged = None
+                        extra_topk_lengths = None
                     if compress_ratio == 128 and extra_k_bf16 is None:
                         pass
                     else:
@@ -1225,11 +1304,19 @@ class DeepseekV4AttnBackend(
                                 else swa_k.view(-1, 1, swa_k.shape[-1])
                             ),
                             swa_ragged_indices=core_attn_metadata.swa_ragged_indices,
+                            swa_topk_lengths=core_attn_metadata.swa_topk_lengths,
                             extra_k=extra_k_bf16,
                             extra_indices=extra_indices_ragged,
+                            extra_topk_lengths=extra_topk_lengths,
+                            workspace=self._no_prefix_ragged_workspace,
                         )
                         if prefill_inputs is not None:
-                            q_prefill, kv_unified, indices_unified = prefill_inputs
+                            (
+                                q_prefill,
+                                kv_unified,
+                                indices_unified,
+                                topk_length,
+                            ) = prefill_inputs
                             o_sparse = _dsv4_run_bf16_sparse_prefill_attention(
                                 q_prefill=q_prefill,
                                 kv_unified=kv_unified,
@@ -1237,6 +1324,7 @@ class DeepseekV4AttnBackend(
                                 sm_scale=self.softmax_scale,
                                 d_v=self.head_dim_v,
                                 attn_sink=attn_sink,
+                                topk_length=topk_length,
                             )
                             if o_sparse is not None:
                                 if envs.SGLANG_DSV4_DEBUG_NO_PREFIX_RAGGED.get():

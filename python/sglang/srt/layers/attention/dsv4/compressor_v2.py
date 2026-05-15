@@ -182,6 +182,38 @@ class CompressorBackendMixin:
             kvcache=kv_cache,
             page_size=page_size,
         )
+
+    def _get_no_prefix_legacy_compress_metadata(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        compress_ratio: int,
+    ):
+        cache_name = f"_no_prefix_legacy_c{compress_ratio}_compress_metadata"
+        metadata = getattr(self.forward_metadata, cache_name, None)
+        if metadata is not None:
+            return metadata
+
+        metadata = create_legacy_paged_compressor_data(
+            compress_ratio=cast(Literal[4, 128], compress_ratio),
+            is_prefill=True,
+            token_to_kv_pool=token_to_kv_pool,
+            req_to_token=forward_batch.req_to_token_pool.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            extend_lens=forward_batch.extend_seq_lens,
+            seq_lens_cpu=(
+                forward_batch.seq_lens_cpu.tolist()
+                if forward_batch.seq_lens_cpu is not None
+                else None
+            ),
+            extend_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            use_prefill_cuda_graph=False,
+        )
+        setattr(self.forward_metadata, cache_name, metadata)
+        return metadata
+
     def _forward_no_prefix_legacy_compress(
         self,
         *,
@@ -201,21 +233,10 @@ class CompressorBackendMixin:
 
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", forward_batch.token_to_kv_pool)
         core_metadata = self.forward_metadata.core_metadata
-        metadata = create_legacy_paged_compressor_data(
-            compress_ratio=cast(Literal[4, 128], compress_ratio),
-            is_prefill=True,
+        metadata = self._get_no_prefix_legacy_compress_metadata(
+            forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
-            req_to_token=forward_batch.req_to_token_pool.req_to_token,
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens.to(torch.int32),
-            extend_lens=forward_batch.extend_seq_lens,
-            seq_lens_cpu=(
-                forward_batch.seq_lens_cpu.tolist()
-                if forward_batch.seq_lens_cpu is not None
-                else None
-            ),
-            extend_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            use_prefill_cuda_graph=False,
+            compress_ratio=compress_ratio,
         )
         coff = 2 if is_overlap_compress(compress_ratio) else 1
         last_dim = 2 * head_dim * coff
@@ -244,15 +265,15 @@ class CompressorBackendMixin:
         emit_mask = (core_metadata.seq_lens_casual % compress_ratio) == 0
         compact_kv = kv_compressed[emit_mask].contiguous()
         if is_indexer:
-            if compact_kv.numel() == 0:
-                self._current_ragged_indexer_kv_fp8 = compact_kv
-                self._current_ragged_indexer_kv_scale = compact_kv.new_empty((0, 1))
-            else:
-                (
-                    self._current_ragged_indexer_kv_fp8,
-                    self._current_ragged_indexer_kv_scale,
-                ) = act_quant(compact_kv)
             if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+                if compact_kv.numel() == 0:
+                    self._current_ragged_indexer_kv_fp8 = compact_kv
+                    self._current_ragged_indexer_kv_scale = compact_kv.new_empty((0, 1))
+                else:
+                    (
+                        self._current_ragged_indexer_kv_fp8,
+                        self._current_ragged_indexer_kv_scale,
+                    ) = act_quant(compact_kv)
                 token_to_kv_pool.set_index_k_fused(
                     layer_id=layer_id,
                     loc=core_metadata.c4_out_loc,
@@ -260,6 +281,10 @@ class CompressorBackendMixin:
                 )
             else:
                 index_k, index_k_scale = act_quant(kv_compressed)
+                self._current_ragged_indexer_kv_fp8 = index_k[emit_mask].contiguous()
+                self._current_ragged_indexer_kv_scale = index_k_scale[
+                    emit_mask
+                ].contiguous()
                 token_to_kv_pool.set_index_k_scale_buffer(
                     layer_id=layer_id,
                     loc=core_metadata.c4_out_loc,

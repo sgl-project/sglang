@@ -211,15 +211,20 @@ def topk_transform_ragged_pytorch_vectorized(
             sequential,
             torch.tensor(-1, device=device, dtype=torch.int32),
         )
-        out_indices[needs_sequential] = sequential[needs_sequential]
+        out_indices[needs_sequential, :topk] = sequential[needs_sequential]
 
     nonseq_mask = ~needs_sequential
     if not nonseq_mask.any():
         return
 
-    scores_nonseq = scores[nonseq_mask].clone()
-    starts_nonseq = row_starts[nonseq_mask]
-    lengths_nonseq = lengths[nonseq_mask]
+    if nonseq_mask.all():
+        scores_nonseq = scores
+        starts_nonseq = row_starts
+        lengths_nonseq = lengths
+    else:
+        scores_nonseq = scores[nonseq_mask].clone()
+        starts_nonseq = row_starts[nonseq_mask]
+        lengths_nonseq = lengths[nonseq_mask]
     ends_nonseq = starts_nonseq + lengths_nonseq
 
     actual_k = min(topk, total_k)
@@ -248,7 +253,10 @@ def topk_transform_ragged_pytorch_vectorized(
             dim=1,
         )
 
-    out_indices[nonseq_mask] = raw_indices
+    if nonseq_mask.all():
+        out_indices[:, :topk] = raw_indices
+    else:
+        out_indices[nonseq_mask, :topk] = raw_indices
 
 
 @triton.jit
@@ -450,29 +458,62 @@ class C4IndexerBackendMixin:
             if not valid_rows.any():
                 return
 
+            topk = core_metadata.c4_sparse_topk
+            sequential_rows = valid_rows & (lengths <= topk)
+            if sequential_rows.any():
+                row_starts = indexer_metadata.c4_k_start[sequential_rows]
+                row_lengths = lengths[sequential_rows]
+                sequential = row_starts.unsqueeze(1) + torch.arange(
+                    topk,
+                    device=row_starts.device,
+                    dtype=core_metadata.c4_sparse_page_indices.dtype,
+                ).unsqueeze(0)
+                ends = (row_starts + row_lengths).unsqueeze(1)
+                sequential = torch.where(
+                    sequential < ends,
+                    sequential,
+                    torch.tensor(
+                        -1,
+                        device=sequential.device,
+                        dtype=sequential.dtype,
+                    ),
+                )
+                core_metadata.c4_sparse_page_indices[sequential_rows, :topk] = (
+                    sequential
+                )
+
+            nonseq_rows = valid_rows & (lengths > topk)
+            if not nonseq_rows.any():
+                return
+
             import deep_gemm
 
             logits = deep_gemm.fp8_mqa_logits(
-                q_fp8_ragged[valid_rows],
+                q_fp8_ragged[nonseq_rows],
                 (k_fp8, k_scale),
-                weights[valid_rows],
-                indexer_metadata.c4_k_start[valid_rows],
-                indexer_metadata.c4_k_finish[valid_rows],
+                weights[nonseq_rows],
+                indexer_metadata.c4_k_start[nonseq_rows],
+                indexer_metadata.c4_k_finish[nonseq_rows],
                 clean_logits=False,
             )
+            nonseq_lengths = lengths[nonseq_rows].contiguous()
+            nonseq_starts = indexer_metadata.c4_k_start[nonseq_rows].contiguous()
             out_indices = torch.empty(
-                (int(valid_rows.sum().item()), core_metadata.c4_sparse_page_indices.shape[1]),
+                (
+                    int(nonseq_rows.sum().item()),
+                    core_metadata.c4_sparse_page_indices.shape[1],
+                ),
                 dtype=core_metadata.c4_sparse_page_indices.dtype,
                 device=core_metadata.c4_sparse_page_indices.device,
             )
             topk_transform_ragged_pytorch_vectorized(
                 logits,
-                indexer_metadata.c4_k_start[valid_rows],
-                lengths[valid_rows],
+                nonseq_starts,
+                nonseq_lengths,
                 out_indices,
-                topk=core_metadata.c4_sparse_topk,
+                topk=topk,
             )
-            core_metadata.c4_sparse_page_indices[valid_rows] = out_indices
+            core_metadata.c4_sparse_page_indices[nonseq_rows] = out_indices
             return
 
         assert len(c4_indexer_kv_cache.shape) == 2
