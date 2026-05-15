@@ -901,19 +901,19 @@ class LongcatFlashForCausalLM(nn.Module):
                 if self.use_ngram_embedding:
                     if ".embed_tokens." in name:
                         name = "model.embed_tokens.word_embeder.weight"
-                    if "oe_embed_tokens" in name or "oe_embed_proj" in name:
-                        import re
-                        m = re.match(
-                            r"model\.(oe_embed_tokens|oe_embed_proj)(\d+)\.weight",
-                            name,
-                        )
-                        if m:
-                            kind = m.group(1)
-                            idx = m.group(2)
-                            if kind == "oe_embed_tokens":
-                                name = f"model.ngram_embeddings.embedders.{idx}.weight"
-                            else:
-                                name = f"model.ngram_embeddings.post_projs.{idx}.weight"
+                    # if "oe_embed_tokens" in name or "oe_embed_proj" in name:
+                    #     import re
+                    #     m = re.match(
+                    #         r"model\.(oe_embed_tokens|oe_embed_proj)(\d+)\.weight",
+                    #         name,
+                    #     )
+                    #     if m:
+                    #         kind = m.group(1)
+                    #         idx = m.group(2)
+                    #         if kind == "oe_embed_tokens":
+                    #             name = f"model.ngram_embeddings.embedders.{idx}.weight"
+                    #         else:
+                    #             name = f"model.ngram_embeddings.post_projs.{idx}.weight"
                     if ".ngram_embeddings" in name:
                         self.model.embed_tokens.load_weight(None, name, loaded_weight)
                         continue

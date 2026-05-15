@@ -48,7 +48,7 @@ class NgramEmbedding(torch.nn.Module):
         self.oe_embeder = VocabParallelEmbedding(
             num_embeddings=self.exclusive_oe_embedder_size_sums[-1],
             embedding_dim=oe_hidden_dim,
-            enable_tp=is_dp_attention_enabled(),
+            enable_tp=True,
         )
 
         self.oe_projection = nn.Parameter(
