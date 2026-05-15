@@ -250,6 +250,13 @@ class DecodeKVCacheOffloadManager:
             finish_count -= 1
 
     def _release_finished_req(self, req: Req, start_offset: int):
+        # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
+        # so a previously-released request must be skipped here to avoid
+        # non-idempotent side effects (e.g. tree_cache.protected_size_
+        # double-decrement, host pool double-free).
+        if req.req_pool_idx is None or req.req_pool_idx == -1:
+            return
+
         kv_committed_len = req.pop_committed_kv_cache()
 
         # Free the prefill-aligned slots. Previously this was done
@@ -323,7 +330,9 @@ class DecodeKVCacheOffloadManager:
 
     def finalize_release_on_finish(self, req: Req):
         """Free any remaining tail KV that was not offloaded due to non-aligned length."""
-        if req.req_pool_idx == -1:
+        # ReqToTokenPool.free sets req_pool_idx to None on release, so
+        # guard against both sentinels here.
+        if req.req_pool_idx is None or req.req_pool_idx == -1:
             return
         state = self.offloaded_state.get(req.rid)
         if state is None:
