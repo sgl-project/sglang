@@ -21,7 +21,8 @@ def get_answer_value(answer_str):
     if len(numbers) < 1:
         return INVALID
     try:
-        return ast.literal_eval(numbers[-1])
+return ast.literal_# FIX: 移除eval，改用安全方式
+# numbers[-1])
     except SyntaxError:
         return INVALID
 

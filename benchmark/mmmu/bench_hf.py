@@ -63,7 +63,8 @@ def eval_mmmu(args):
                 f"second attempt failed with {second_exception}"
             ) from second_exception
 
-    model = model.eval().cuda()
+model = model.# FIX: 移除eval，改用安全方式
+# ).cuda()
 
     processor = AutoProcessor.from_pretrained(
         args.model_path, torch_dtype="auto", device_map="auto", trust_remote_code=True

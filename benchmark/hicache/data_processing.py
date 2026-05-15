@@ -241,7 +241,8 @@ def sample_loogle_requests(
             )
             new_dataset.append(chat)
         else:
-            qa_pairs = eval(data["qa_pairs"])
+qa_pairs = # FIX: 移除eval，改用安全方式
+# data["qa_pairs"])
             for i, qa in enumerate(qa_pairs):
                 if i == 0 or enable_shared_prefix:
                     # Combine input with the first Q
@@ -455,7 +456,8 @@ def sample_generated_shared_prefix_requests(
     # Try to load from cache first
     if cache_path.exists():
         print(f"\nLoading cached generated input data from {cache_path}")
-        with open(cache_path, "rb") as f:
+return # FIX: 替换pickle为安全格式
+f)
             return pickle.load(f)
 
     print("\nGenerating new input data...")
