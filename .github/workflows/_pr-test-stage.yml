@@ -11,7 +11,7 @@ on:
   workflow_call:
     inputs:
       self_name:
-        description: 'Caller job key; used for partitions[suite] lookup and target_stage gating.'
+        description: 'Caller job key; used for partitions[suite] lookup.'
         type: string
         required: true
       runner_config:
@@ -27,7 +27,7 @@ on:
         type: string
         required: true
       caller_inputs:
-        description: 'toJson(inputs) from pr-test.yml. Read via fromJson(...).target_stage / pr_head_sha / git_ref / skip_stage_health_check / test_parallel_dispatch.'
+        description: 'toJson(inputs) from pr-test.yml. Read via fromJson(...).git_ref / skip_stage_health_check / test_parallel_dispatch.'
         type: string
         required: true
       partitions:
@@ -74,19 +74,11 @@ env:
 jobs:
   run:
     name: ${{ inputs.self_name }} (${{ matrix.partition }})
-    # target_stage takes precedence; otherwise default per-commit gating
-    # runs on schedule / parallel-dispatch / non-failed PR with main_package
-    # or sgl_kernel changes.
+    # Runs on schedule / parallel-dispatch / non-failed PR with main_package or sgl_kernel changes.
     if: |
       always() &&
-      (
-        (fromJson(inputs.caller_inputs).target_stage == inputs.self_name) ||
-        (
-          !fromJson(inputs.caller_inputs).target_stage &&
-          ((github.event_name == 'schedule' || fromJson(inputs.caller_inputs).test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true')
-        )
-      )
+      ((github.event_name == 'schedule' || fromJson(inputs.caller_inputs).test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+      (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true')
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 240
     env:
@@ -100,7 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ fromJson(inputs.caller_inputs).pr_head_sha || fromJson(inputs.caller_inputs).git_ref || github.sha }}
+          ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
 
       - name: Resolve runner_config
         id: rc

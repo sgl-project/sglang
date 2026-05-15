@@ -9,30 +9,13 @@ name: PR Test Extra
 # Stages: extra-a (1-/2-gpu) and extra-b (4-/8-gpu) caller stubs reuse
 # `_pr-test-stage.yml` and `_pr-test-check-changes.yml` from pr-test.yml.
 
-run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage)) || '' }}
-
 on:
   pull_request:
     branches: [main]
   workflow_dispatch:
     inputs:
-      target_stage:
-        description: "Specific stage to run (optional, for quick testing)"
-        required: false
-        type: string
-        default: ""
       force_continue_on_error:
         description: "Force continue-on-error (test scheduled CI behavior)"
-        required: false
-        type: boolean
-        default: false
-      pr_head_sha:
-        description: "PR head SHA to checkout (for /rerun-stage on fork PRs)"
-        required: false
-        type: string
-        default: ""
-      include_wheel_build:
-        description: "When set with target_stage, also run sgl-kernel-build-wheels so the target stage uses the freshly-built kernel (for /rerun-stage on PRs that modify sgl-kernel/)"
         required: false
         type: boolean
         default: false
@@ -60,7 +43,7 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-extra-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.git_ref || 'all' }}
+  group: pr-test-extra-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
@@ -76,7 +59,7 @@ permissions:
   actions: write
   contents: read
   issues: read
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   # =============================================== check changes ====================================================
@@ -96,10 +79,7 @@ jobs:
       )
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
-      target_stage: ${{ inputs.target_stage || '' }}
-      include_wheel_build: ${{ inputs.include_wheel_build == true }}
       run_all_tests: ${{ inputs.run_all_tests == true }}
       force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
       pr_test_yml: '.github/workflows/pr-test-extra.yml'
@@ -111,8 +91,6 @@ jobs:
   call-pr-awareness:
     needs: check-changes
     if: always() && github.event_name == 'pull_request'
-    permissions:
-      pull-requests: write
     uses: ./.github/workflows/_pr-awareness-comment.yml
     with:
       workflow_kind: pr-test-extra
@@ -122,15 +100,12 @@ jobs:
   sgl-kernel-build-wheels:
     needs: check-changes
     if: |
-      always() &&
       needs.check-changes.result == 'success' &&
-      needs.check-changes.outputs.sgl_kernel == 'true' &&
-      (!inputs.target_stage || inputs.include_wheel_build)
+      needs.check-changes.outputs.sgl_kernel == 'true'
     uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
     with:
       runs_on: x64-kernel-build-node
       job_display_name: Build Wheel
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
       skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit

@@ -20,7 +20,7 @@ def _check_rebase_gate(gh_repo, pr, token):
     """
     Pre-dispatch gate mirroring `.github/actions/check-maintenance/action.yml`.
 
-    Without this, /rerun-stage and /rerun-test would dispatch a workflow_run
+    Without this, /rerun-test would dispatch a workflow_run
     on a PR that's behind a required base, the action would catch it, and
     every job in the run would fail at the gate — wasting runner time and
     producing N error annotations instead of one comment. Pre-checking here
@@ -385,221 +385,6 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         return True
     else:
         print("No failed or skipped workflows found to rerun.")
-        return False
-
-
-def handle_rerun_stage(
-    gh_repo, pr, comment, user_perms, stage_name, token, react_on_success=True
-):
-    """
-    Handles the /rerun-stage <stage-name> command.
-    Triggers a workflow_dispatch to run only the specified stage, skipping dependencies.
-    Returns True if action was taken, False otherwise.
-    """
-    if not user_perms.get("can_rerun_stage", False):
-        print("Permission denied: can_rerun_stage is false.")
-        return False
-
-    if not stage_name:
-        print("Error: No stage name provided")
-        comment.create_reaction("confused")
-        pr.create_issue_comment(
-            f"⛔ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
-            f"Examples: `/rerun-stage unit-test-backend-4-gpu`, `/rerun-stage accuracy-test-1-gpu`"
-        )
-        return False
-
-    print(f"Permission granted. Triggering workflow_dispatch for stage '{stage_name}'.")
-
-    # Valid NVIDIA stage names that support target_stage
-    nvidia_stages = [
-        "stage-a-test-1-gpu-small",
-        "stage-a-test-cpu",
-        "stage-b-test-1-gpu-small",
-        "stage-b-test-1-gpu-large",
-        "stage-b-test-2-gpu-large",
-        "stage-b-test-4-gpu-b200",
-        "stage-c-test-4-gpu-h100",
-        "stage-c-test-8-gpu-h200",
-        "stage-c-test-8-gpu-h20",
-        "stage-c-test-4-gpu-b200",
-        "stage-c-test-4-gpu-gb200",
-        "stage-c-test-dsv4-4-gpu-b200",
-        "stage-c-test-dsv4-8-gpu-h200",
-        "stage-c-test-deepep-4-gpu-h100",
-        "stage-c-test-deepep-8-gpu-h200",
-        "stage-c-test-dsv4-4-gpu-b200",
-        "stage-c-test-dsv4-8-gpu-h200",
-        "multimodal-gen-test-1-gpu",
-        "multimodal-gen-test-2-gpu",
-        "multimodal-gen-component-accuracy",
-        "multimodal-gen-component-accuracy-1-gpu",
-        "multimodal-gen-component-accuracy-2-gpu",
-        "multimodal-gen-test-1-b200",
-    ]
-
-    # Valid AMD stage names that support target_stage
-    amd_stages = [
-        "sgl-kernel-unit-test-amd",
-        "sgl-kernel-unit-test-2-gpu-amd",
-        "stage-a-test-1-gpu-small-amd",
-        "stage-b-test-1-gpu-small-amd",
-        "stage-b-test-1-gpu-small-amd-nondeterministic",
-        "stage-b-test-1-gpu-small-amd-mi35x",
-        "stage-b-test-1-gpu-large-amd",
-        "stage-b-test-2-gpu-large-amd",
-        "multimodal-gen-test-1-gpu-amd",
-        "multimodal-gen-test-2-gpu-amd",
-        "stage-c-test-large-8-gpu-amd",
-        "stage-c-test-large-8-gpu-amd-mi35x",
-    ]
-
-    valid_stages = nvidia_stages + amd_stages
-    is_amd_stage = stage_name in amd_stages
-
-    if stage_name not in valid_stages:
-        comment.create_reaction("confused")
-        pr.create_issue_comment(
-            f"⛔ Stage `{stage_name}` doesn't support isolated runs yet.\n\n"
-            f"**NVIDIA stages:**\n"
-            + "\n".join(f"- `{s}`" for s in nvidia_stages)
-            + "\n\n**AMD stages:**\n"
-            + "\n".join(f"- `{s}`" for s in amd_stages)
-            + "\n\nOther stages will be added soon. For now, use `/rerun-failed-ci` for those stages."
-        )
-        return False
-
-    allowed, gate_msg = _check_rebase_gate(gh_repo, pr, token)
-    if not allowed:
-        comment.create_reaction("confused")
-        pr.create_issue_comment(gate_msg)
-        return False
-
-    try:
-        # Get the appropriate workflow based on stage type
-        workflow_name = "PR Test (AMD)" if is_amd_stage else "PR Test"
-        workflows = gh_repo.get_workflows()
-        target_workflow = None
-        for wf in workflows:
-            if wf.name == workflow_name:
-                target_workflow = wf
-                break
-
-        if not target_workflow:
-            print(f"Error: {workflow_name} workflow not found")
-            return False
-
-        # Check if PR is from a fork by comparing repo owners
-        # Handle case where fork repo may have been deleted (pr.head.repo is None)
-        is_fork = (
-            pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
-        )
-        print(f"PR is from fork: {is_fork}")
-
-        # If the PR modifies sgl-kernel/, the target stage would otherwise use the
-        # PyPI sgl-kernel wheel instead of the PR's changes (sgl-kernel-build-wheels
-        # skips in target_stage mode by default). Set include_wheel_build=true so the
-        # workflow runs sgl-kernel-build-wheels alongside the target stage; the target
-        # stage waits for the build via its needs list.
-        kernel_changes = has_sgl_kernel_changes(pr)
-        if kernel_changes:
-            print(
-                "PR modifies sgl-kernel/ - setting include_wheel_build=true so the "
-                "target stage gets the freshly-built wheel instead of the PyPI one."
-            )
-
-        # pr_head_sha is used for fork PRs (passed to workflow and used for URL lookup)
-        pr_head_sha = None
-
-        if is_fork:
-            # For fork PRs: dispatch on main and pass SHA as input
-            # This is needed because fork branch names don't exist in the main repo
-            ref = "main"
-            pr_head_sha = pr.head.sha
-            print(
-                f"Triggering {workflow_name} workflow on ref: {ref}, PR head SHA: {pr_head_sha}"
-            )
-            inputs = {
-                "target_stage": stage_name,
-                "pr_head_sha": pr_head_sha,
-            }
-        else:
-            # For non-fork PRs: dispatch on the PR branch directly
-            # This allows testing workflow changes before merge
-            ref = pr.head.ref
-            print(f"Triggering {workflow_name} workflow on branch: {ref}")
-            inputs = {"target_stage": stage_name}
-
-        # For NVIDIA stages, honor the sgl-kernel / include_wheel_build flow. AMD is
-        # a separate workflow that doesn't share the same wheel-build pipeline.
-        if kernel_changes and not is_amd_stage:
-            inputs["include_wheel_build"] = "true"
-            # include_wheel_build relies on filter-api detecting kernel changes, which
-            # requires pr_head_sha. Ensure it's set even for non-fork PRs, and keep
-            # the local pr_head_sha in sync so find_workflow_run_url builds the
-            # expected display_title with the SHA suffix (the workflow's run-name
-            # includes the SHA whenever inputs.pr_head_sha is set).
-            if not is_fork:
-                inputs["pr_head_sha"] = pr.head.sha
-                pr_head_sha = pr.head.sha
-
-        # Record dispatch time before triggering
-        dispatch_time = time.time()
-
-        # Use requests directly as PyGithub's create_dispatch only accepts HTTP 204
-        dispatch_url = f"https://api.github.com/repos/{gh_repo.full_name}/actions/workflows/{target_workflow.id}/dispatches"
-        dispatch_resp = requests.post(
-            dispatch_url,
-            json={"ref": ref, "inputs": inputs},
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-            },
-        )
-        success = dispatch_resp.status_code in (200, 204)
-        if not success:
-            print(f"Dispatch failed: {dispatch_resp.status_code} {dispatch_resp.text}")
-
-        if success:
-            print(f"Successfully triggered workflow for stage '{stage_name}'")
-            if react_on_success:
-                comment.create_reaction("+1")
-
-                run_url = find_workflow_run_url(
-                    gh_repo,
-                    target_workflow.id,
-                    ref,
-                    stage_name,
-                    token,
-                    dispatch_time,
-                    pr_head_sha=pr_head_sha,
-                    max_wait=30,
-                )
-                if run_url:
-                    pr.create_issue_comment(
-                        f"🚀 Triggered `{stage_name}` to run independently"
-                        f" (skipping dependencies)."
-                        f" [View workflow run]({run_url})"
-                    )
-                else:
-                    pr.create_issue_comment(
-                        f"🚀 Triggered `{stage_name}` to run independently"
-                        f" (skipping dependencies).\n"
-                        f"⚠️ Could not retrieve workflow run URL. "
-                        f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
-                    )
-            return True
-        else:
-            print("Failed to trigger workflow_dispatch")
-            return False
-
-    except Exception as e:
-        print(f"Error triggering workflow_dispatch: {e}")
-        comment.create_reaction("confused")
-        pr.create_issue_comment(
-            f"⛔ Failed to trigger workflow: {str(e)}\n\n"
-            f"Please check the logs or contact maintainers."
-        )
         return False
 
 
@@ -1259,7 +1044,7 @@ def main():
 
     # PR authors can always rerun failed CI and rerun individual UTs on their own PRs,
     # even if they are not listed in CI_PERMISSIONS.json.
-    # Note: /tag-run-ci-label and /rerun-stage still require CI_PERMISSIONS.json.
+    # Note: /tag-run-ci-label still requires CI_PERMISSIONS.json.
     # Note: /rerun-test is blocked entirely for fork PRs in handle_rerun_test() itself.
     if pr.user.login == user_login:
         if user_perms is None:
@@ -1313,10 +1098,33 @@ def main():
             print("Combined command finished, but no actions were taken.")
 
     elif first_line.startswith("/rerun-stage"):
-        # Extract stage name from command
-        parts = first_line.split(maxsplit=1)
-        stage_name = parts[1].strip() if len(parts) > 1 else None
-        handle_rerun_stage(repo, pr, comment, user_perms, stage_name, token)
+        # /rerun-stage is deprecated. Stage-level granularity is too coarse to map to
+        # a specific feature, and a stage rerun re-pays the cost of all unrelated tests
+        # in that stage. Use /rerun-test for selective UT runs, or /rerun-failed-ci /
+        # `run-ci` / `run-ci-extra` labels for a full rerun.
+        print("/rerun-stage is deprecated; posting deprecation notice.")
+        comment.create_reaction("-1")
+        pr.create_issue_comment(
+            "⚠️ **`/rerun-stage` has been deprecated.**\n\n"
+            "Stage granularity is too coarse — a stage usually doesn't map to one "
+            "feature, so rerunning a stage re-pays the cost of unrelated tests. "
+            "If you don't know which exact test files to rerun, you shouldn't be "
+            "using `/rerun-stage` or `/rerun-test` in the first place.\n\n"
+            "**Use one of these instead:**\n"
+            "- **Selective tests** (you know exactly which files to rerun):\n"
+            "  ```\n"
+            "  /rerun-test test_foo.py test_bar.py\n"
+            "  ```\n"
+            "- **Rerun only failed jobs**:\n"
+            "  ```\n"
+            "  /rerun-failed-ci\n"
+            "  ```\n"
+            "- **Full CI rerun** (with extra coverage): add the `run-ci` or "
+            "`run-ci-extra` label and push a new commit (or use `/tag-and-rerun-ci`).\n\n"
+            "**AMD CI**: stage-level dispatch is still available via "
+            "Actions UI → *PR Test (AMD)* / *PR Test ROCm 7.2 (AMD)* → "
+            "*Run workflow* → pick a stage from the dropdown."
+        )
 
     elif first_line.startswith("/rerun-group"):
         group_names = first_line.split()[1:]

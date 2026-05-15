@@ -1,7 +1,4 @@
 name: PR Test
-# Dynamic run-name for /rerun-stage commands to enable URL lookup
-# Format: "[stage-name] sha" for fork PRs, "[stage-name]" for non-fork, default for normal runs
-run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage)) || '' }}
 
 on:
   schedule:
@@ -10,23 +7,8 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      target_stage:
-        description: "Specific stage to run (optional, for quick testing)"
-        required: false
-        type: string
-        default: ""
       force_continue_on_error:
         description: "Force continue-on-error (test scheduled CI behavior)"
-        required: false
-        type: boolean
-        default: false
-      pr_head_sha:
-        description: "PR head SHA to checkout (for /rerun-stage on fork PRs)"
-        required: false
-        type: string
-        default: ""
-      include_wheel_build:
-        description: "When set with target_stage, also run sgl-kernel-build-wheels so the target stage uses the freshly-built kernel (for /rerun-stage on PRs that modify sgl-kernel/)"
         required: false
         type: boolean
         default: false
@@ -59,13 +41,11 @@ on:
         default: false
 
 concurrency:
-  # Concurrency group structure: pr-test-{event}-{branch}-{pr_sha}-{stage}
+  # Concurrency group structure: pr-test-{event}-{branch}-{git_ref}
   # - event_name prevents scheduled runs from colliding with fork PRs whose branch is named 'main'
   #   (without it, both resolve the branch segment to 'main' and block each other)
   # - github.head_ref (pull_request) or github.ref_name (workflow_dispatch) normalizes to branch name
-  # - pr_head_sha isolates /rerun-stage from main branch runs
-  # - target_stage allows parallel stage dispatches to run independently
-  group: pr-test-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.pr_head_sha || 'current' }}-${{ inputs.target_stage || inputs.git_ref || 'all' }}
+  group: pr-test-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
@@ -83,17 +63,14 @@ permissions:
   actions: write
   contents: read
   issues: read
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   # =============================================== check changes ====================================================
   check-changes:
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
-      target_stage: ${{ inputs.target_stage || '' }}
-      include_wheel_build: ${{ inputs.include_wheel_build == true }}
       run_all_tests: ${{ inputs.run_all_tests == true }}
       force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
     secrets: inherit
@@ -103,8 +80,6 @@ jobs:
   call-pr-awareness:
     needs: check-changes
     if: always() && github.event_name == 'pull_request'
-    permissions:
-      pull-requests: write
     uses: ./.github/workflows/_pr-awareness-comment.yml
     with:
       workflow_kind: pr-test
@@ -130,7 +105,6 @@ jobs:
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
-      !inputs.target_stage &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
@@ -159,7 +133,6 @@ jobs:
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
-      !inputs.target_stage &&
       inputs.test_parallel_dispatch != true &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
@@ -188,11 +161,10 @@ jobs:
   # =============================================== PR Gate ====================================================
   call-gate:
     needs: check-changes
-    # Skip for scheduled runs (they run all tests) and when target_stage is specified
+    # Skip for scheduled runs (they run all tests)
     if: |
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
       (
         needs.check-changes.outputs.main_package == 'true' ||
         needs.check-changes.outputs.sgl_kernel == 'true' ||
@@ -206,53 +178,35 @@ jobs:
 
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
-    # Skip for scheduled runs (they run stages independently). Runs in target_stage mode only when
-    # include_wheel_build is true (i.e. /rerun-stage on a PR with sgl-kernel changes), so the
-    # target stage can download the freshly-built wheel.
-    #
-    # `always()` lets us run when call-gate is skipped (which it always is in target_stage mode by
-    # design). The explicit needs.<x>.result checks preserve old gating for the normal PR path.
+    # Skip for scheduled runs (they run stages independently).
     if: |
-      always() &&
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
       needs.check-changes.result == 'success' &&
       needs.check-changes.outputs.sgl_kernel == 'true' &&
-      (
-        (!inputs.target_stage && needs.call-gate.result == 'success') ||
-        (inputs.target_stage && inputs.include_wheel_build)
-      )
+      needs.call-gate.result == 'success'
     uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
     with:
       runs_on: x64-kernel-build-node
       job_display_name: Build Wheel
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
       skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
-    # Skip for scheduled runs (they run stages independently). Runs in target_stage mode only when
-    # include_wheel_build is true (i.e. /rerun-stage on a PR with sgl-kernel changes).
-    #
-    # See sgl-kernel-build-wheels above for the always() + result-check rationale.
+    # Skip for scheduled runs (they run stages independently).
     if: |
-      always() &&
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
       needs.check-changes.result == 'success' &&
       needs.check-changes.outputs.sgl_kernel == 'true' &&
-      (
-        (!inputs.target_stage && needs.call-gate.result == 'success') ||
-        (inputs.target_stage && inputs.include_wheel_build)
-      )
+      needs.call-gate.result == 'success'
     uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
     with:
       runs_on: arm-kernel-build-node
       job_display_name: Build Wheel Arm
       arch_suffix: '-aarch64'
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
       skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
@@ -262,13 +216,11 @@ jobs:
     if: |
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     uses: ./.github/workflows/pr-test-sgl-kernel.yml
     with:
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
       skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
@@ -282,16 +234,13 @@ jobs:
       !failure() && !cancelled() &&
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
       needs.check-changes.outputs.jit_kernel == 'true'
     uses: ./.github/workflows/pr-test-jit-kernel.yml
     with:
       jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
-      target_stage: ${{ inputs.target_stage || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
@@ -317,14 +266,8 @@ jobs:
     needs: [check-changes, call-gate]
     if: |
       always() &&
-      (
-        (inputs.target_stage == 'stage-a-test-cpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          (needs.check-changes.outputs.main_package == 'true')
-        )
-      )
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+      (needs.check-changes.outputs.main_package == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 240
     strategy:
@@ -341,7 +284,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
 
@@ -449,29 +392,15 @@ jobs:
     if: |
       always() &&
       !cancelled() &&
-      (
-        inputs.target_stage == 'multimodal-gen-test-1-gpu' ||
-        inputs.target_stage == 'multimodal-gen-test-2-gpu' ||
-        inputs.target_stage == 'multimodal-gen-component-accuracy' ||
-        inputs.target_stage == 'multimodal-gen-component-accuracy-1-gpu' ||
-        inputs.target_stage == 'multimodal-gen-component-accuracy-2-gpu' ||
-        inputs.target_stage == 'multimodal-gen-test-1-b200' ||
-        inputs.target_stage == 'multimodal-gen-unit-test' ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          needs.check-changes.outputs.multimodal_gen == 'true'
-        )
-      )
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+      needs.check-changes.outputs.multimodal_gen == 'true'
     uses: ./.github/workflows/pr-test-multimodal-gen.yml
     with:
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
       continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
-      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
-      target_stage: ${{ inputs.target_stage || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       caller_needs_failure: ${{ (needs.call-gate.result == 'failure' || needs.sgl-kernel-build-wheels.result == 'failure' || needs.check-changes.result == 'failure') && 'true' || 'false' }}
       skip_stage_health_check: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
