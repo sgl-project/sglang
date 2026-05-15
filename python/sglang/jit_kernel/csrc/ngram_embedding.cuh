@@ -319,8 +319,7 @@ struct NgramEmbeddingKernel {
     const auto stream = LaunchKernel::resolve_device(device_.unwrap());
 
     constexpr int BLOCK_THREADS = 256;
-    const int grid_size =
-        std::min(65535, static_cast<int>(div_ceil(total_outputs, BLOCK_THREADS)));
+    const int grid_size = std::min(65535, static_cast<int>(div_ceil(total_outputs, BLOCK_THREADS)));
 
     LaunchKernel(grid_size, BLOCK_THREADS, stream)(
         device::ngram_embedding::ComputeNGramIdsDecodeKernel,

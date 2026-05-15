@@ -42,9 +42,7 @@ def test_compute_n_gram_ids_decode_matches_general(batch_size: int) -> None:
     max_running_reqs = batch_size + 8
     num_configs = (ne_n - 1) * ne_k
 
-    ne_weights, ne_mods, exclusive_sums = _make_ngram_params(
-        ne_n, ne_k, vocab_size
-    )
+    ne_weights, ne_mods, exclusive_sums = _make_ngram_params(ne_n, ne_k, vocab_size)
     ne_token_table = torch.randint(
         0,
         vocab_size,
