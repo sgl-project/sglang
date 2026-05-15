@@ -39,6 +39,8 @@ from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_contex
 from sglang.srt.layers.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     fused_norm_rope_inplace_triton,
+    fused_softmax_pool_split_triton,
+    fused_softmax_pool_triton,
 )
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
@@ -78,11 +80,11 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
+    is_gfx95_supported,
+    is_hip,
     log_info_on_rank0,
     make_layers,
     maybe_torch_compile,
-    is_gfx95_supported,
-    is_hip,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,6 +100,7 @@ _is_gfx95_supported = is_gfx95_supported()
 
 if _use_aiter:
     from aiter import rope_rotate_activation
+
     if is_gfx95_supported():
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
@@ -492,10 +495,16 @@ class Compressor(nn.Module):
                     pt += extend_lens[i]
                     continue
 
-            kv_compressed = (
-                kv_and_score_to_compress.kv
-                * kv_and_score_to_compress.score.softmax(dim=1)
-            ).sum(dim=1)
+            if self.use_hip_fused_compress:
+                kv_compressed = fused_softmax_pool_triton(
+                    kv_and_score_to_compress.kv_score,
+                    kv_and_score_to_compress._item_size,
+                )
+            else:
+                kv_compressed = (
+                    kv_and_score_to_compress.kv
+                    * kv_and_score_to_compress.score.softmax(dim=1)
+                ).sum(dim=1)
 
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
@@ -605,9 +614,16 @@ class Compressor(nn.Module):
             bs, self.ratio * self.coff, self.head_dim
         )
 
-        kv_compressed = (
-            kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
-        ).sum(dim=1)
+        if self.use_hip_fused_compress:
+            kv_compressed = fused_softmax_pool_triton(
+                kv_and_score_to_compress.kv_score,
+                kv_and_score_to_compress._item_size,
+            )
+        else:
+            kv_compressed = (
+                kv_and_score_to_compress.kv
+                * kv_and_score_to_compress.score.softmax(dim=1)
+            ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
             # HIP-only: share the per-step freqs_cis gather across layers.
@@ -731,10 +747,16 @@ class Compressor(nn.Module):
                     pt += extend_lens[i]
                     continue
 
-            kv_compressed = (
-                kv_and_score_to_compress.kv
-                * kv_and_score_to_compress.score.softmax(dim=1)
-            ).sum(dim=1)
+            if self.use_hip_fused_compress:
+                kv_compressed = fused_softmax_pool_triton(
+                    kv_and_score_to_compress.kv_score,
+                    kv_and_score_to_compress._item_size,
+                )
+            else:
+                kv_compressed = (
+                    kv_and_score_to_compress.kv
+                    * kv_and_score_to_compress.score.softmax(dim=1)
+                ).sum(dim=1)
 
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
@@ -832,9 +854,16 @@ class Compressor(nn.Module):
             bs, self.ratio * self.coff, self.head_dim
         )
 
-        kv_compressed = (
-            kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
-        ).sum(dim=1)
+        if self.use_hip_fused_compress:
+            kv_compressed = fused_softmax_pool_triton(
+                kv_and_score_to_compress.kv_score,
+                kv_and_score_to_compress._item_size,
+            )
+        else:
+            kv_compressed = (
+                kv_and_score_to_compress.kv
+                * kv_and_score_to_compress.score.softmax(dim=1)
+            ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
             # HIP-only: share the per-step freqs_cis gather across layers.
@@ -1034,10 +1063,17 @@ class Compressor(nn.Module):
                     pt += extend_lens[i]
                     continue
 
-            kv_compressed = (
-                kv_and_score_to_compress.kv
-                * kv_and_score_to_compress.score.softmax(dim=1)
-            ).sum(dim=1)
+            if self.use_hip_fused_compress:
+                kv_compressed = fused_softmax_pool_split_triton(
+                    kv_and_score_to_compress.kv,
+                    kv_and_score_to_compress.score,
+                    kv_and_score_to_compress.kv.shape[-1],
+                )
+            else:
+                kv_compressed = (
+                    kv_and_score_to_compress.kv
+                    * kv_and_score_to_compress.score.softmax(dim=1)
+                ).sum(dim=1)
 
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
@@ -1183,10 +1219,17 @@ class Compressor(nn.Module):
                 bs, self.ratio * self.coff, self.head_dim
             )
 
-            kv_compressed = (
-                kv_and_score_to_compress.kv
-                * kv_and_score_to_compress.score.softmax(dim=1)
-            ).sum(dim=1)
+            if self.use_hip_fused_compress:
+                kv_compressed = fused_softmax_pool_split_triton(
+                    kv_and_score_to_compress.kv,
+                    kv_and_score_to_compress.score,
+                    self.head_dim,
+                )
+            else:
+                kv_compressed = (
+                    kv_and_score_to_compress.kv
+                    * kv_and_score_to_compress.score.softmax(dim=1)
+                ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
             # HIP-only: share the per-step freqs_cis gather across layers.
@@ -1776,7 +1819,12 @@ class MQALayer(nn.Module):
             )
         else:
             q, kv = self._forward_prepare(
-                x, positions, forward_batch, attn_backend, freqs_cis, q_out,
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                freqs_cis,
+                q_out,
                 x_quant=x_quant,
             )
 
