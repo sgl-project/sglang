@@ -126,8 +126,8 @@ class ServerArgsAutoTuner:
             args.use_fsdp_inference = True
             if args.dit_cpu_offload:
                 args.dit_cpu_offload = False
-            if args.layerwise_offload:
-                args.layerwise_offload = False
+            if args.dit_layerwise_offload:
+                args.dit_layerwise_offload = False
             self._enable_cfg_parallel_if_supported()
 
     def maybe_adjust_auto_default_layerwise_offload(self) -> None:
@@ -142,12 +142,12 @@ class ServerArgsAutoTuner:
             return
         if (
             not deployment_config.auto_dit_layerwise_offload
-            or args.layerwise_offload is not None
+            or args.dit_layerwise_offload is not None
         ):
             return
         if args.use_fsdp_inference:
             # if fsdp is enabled, layerwise-offload is weakened since the parameter has already been sharded
-            args.layerwise_offload = False
+            args.dit_layerwise_offload = False
             return
 
         auto_enable_layerwise_offload = (
@@ -167,36 +167,36 @@ class ServerArgsAutoTuner:
             )
             if device_total_memory_gb >= disable_threshold_gb:
                 logger.info(
-                    "Skipping automatic layerwise_offload for %s on a high-memory CUDA GPU (e.g. H200/B200/B300-class, %.2f GiB total)",
+                    "Skipping automatic dit_layerwise_offload for %s on a high-memory CUDA GPU (e.g. H200/B200/B300-class, %.2f GiB total)",
                     args.pipeline_config.__class__.__name__,
                     device_total_memory_gb,
                 )
                 auto_enable_layerwise_offload = False
-                args.layerwise_offload = False
+                args.dit_layerwise_offload = False
 
         if auto_enable_layerwise_offload:
             logger.info(
-                "Automatically enable layerwise_offload for %s for low memory and performance balance",
+                "Automatically enable dit_layerwise_offload for %s for low memory and performance balance",
                 args.pipeline_config.__class__.__name__,
             )
-            args.layerwise_offload = True
+            args.dit_layerwise_offload = True
             args.dit_cpu_offload = False
 
     def maybe_replace_cpu_offloaded_components_with_layerwise(self) -> None:
         args = self.server_args
         if (
             not self.could_override_server_args()
+            or self._explicit_memory_policy
             or current_platform.is_cpu()
             or not current_platform.is_cuda()
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
-            or args.layerwise_offload is False
             or args.layerwise_offload_components is not None
         ):
             return
 
         layerwise_components: list[str] = []
-        if args.layerwise_offload:
+        if args.dit_layerwise_offload:
             layerwise_components.append(LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS)
 
         changed: list[str] = []
@@ -213,7 +213,6 @@ class ServerArgsAutoTuner:
         if not changed:
             return
 
-        args.layerwise_offload = True
         args.layerwise_offload_components = layerwise_components
         logger.info(
             "Automatically replacing CPU offload with layerwise offload for components: %s",
@@ -229,8 +228,8 @@ class ServerArgsAutoTuner:
             args.use_fsdp_inference = False
         if args.dit_cpu_offload is None:
             args.dit_cpu_offload = False
-        if args.layerwise_offload is None:
-            args.layerwise_offload = False
+        if args.dit_layerwise_offload is None:
+            args.dit_layerwise_offload = False
         if args.text_encoder_cpu_offload is None:
             args.text_encoder_cpu_offload = False
         if args.image_encoder_cpu_offload is None:
@@ -260,9 +259,9 @@ class ServerArgsAutoTuner:
         if args.dit_cpu_offload is None:
             args.dit_cpu_offload = False
             changed.append("dit_cpu_offload=False")
-        if args.layerwise_offload is None:
-            args.layerwise_offload = False
-            changed.append("layerwise_offload=False")
+        if args.dit_layerwise_offload is None:
+            args.dit_layerwise_offload = False
+            changed.append("dit_layerwise_offload=False")
         if args.text_encoder_cpu_offload is None:
             args.text_encoder_cpu_offload = False
             changed.append("text_encoder_cpu_offload=False")
@@ -299,8 +298,8 @@ class ServerArgsAutoTuner:
 
     def _set_layerwise_offload_defaults(self) -> None:
         args = self.server_args
-        if args.layerwise_offload is None:
-            args.layerwise_offload = True
+        if args.dit_layerwise_offload is None:
+            args.dit_layerwise_offload = True
         if args.dit_cpu_offload is None:
             args.dit_cpu_offload = False
         if args.text_encoder_cpu_offload is None:
@@ -317,7 +316,7 @@ class ServerArgsAutoTuner:
 
     def _auto_uses_dit_offload(self) -> bool:
         args = self.server_args
-        return bool(args.dit_cpu_offload or args.layerwise_offload)
+        return bool(args.dit_cpu_offload or args.dit_layerwise_offload)
 
     def _get_min_available_device_memory_gb(self) -> float | None:
         args = self.server_args
@@ -340,7 +339,7 @@ class ServerArgsAutoTuner:
         return (
             args.use_fsdp_inference is not None
             or args.dit_cpu_offload is not None
-            or args.layerwise_offload is not None
+            or args.dit_layerwise_offload is not None
             or args.layerwise_offload_components is not None
             or args.text_encoder_cpu_offload is not None
             or args.image_encoder_cpu_offload is not None

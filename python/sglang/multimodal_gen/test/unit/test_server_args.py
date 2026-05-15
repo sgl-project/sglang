@@ -157,7 +157,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         args.layerwise_offload_components = ["text_encoder", "transformer"]
         args._adjust_layerwise_offload_components()
 
-        self.assertTrue(args.layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertEqual(
             args.layerwise_offload_components, ["text_encoder", "transformer"]
         )
@@ -166,12 +166,13 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "/data/my-model",
+                "performance_mode": "manual",
                 "dit_layerwise_offload": True,
             }
         )
 
-        self.assertTrue(args.layerwise_offload)
-        self.assertEqual(args.layerwise_offload_components, ["default", "text_encoder"])
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertEqual(args.layerwise_offload_components, ["default"])
 
     def test_dit_layerwise_offload_from_kwargs(self):
         with patch.object(
@@ -179,11 +180,12 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         ):
             args = ServerArgs.from_kwargs(
                 model_path="/data/my-model",
+                performance_mode="manual",
                 dit_layerwise_offload=True,
             )
 
-        self.assertTrue(args.layerwise_offload)
-        self.assertEqual(args.layerwise_offload_components, ["default", "text_encoder"])
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertEqual(args.layerwise_offload_components, ["default"])
 
     def test_layerwise_offload_components_normalize_commas(self):
         args = self._from_dict_without_model_resolution(
@@ -205,6 +207,8 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         argv = [
             "--model-path",
             "/fake",
+            "--performance-mode",
+            "manual",
             "--dit-layerwise-offload",
             "true",
         ]
@@ -216,7 +220,32 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             ):
                 server_args = ServerArgs.from_cli_args(args, unknown_args)
 
-        self.assertTrue(server_args.layerwise_offload)
+        self.assertTrue(server_args.layerwise_offload_components)
+        self.assertEqual(server_args.layerwise_offload_components, ["default"])
+
+    def test_layerwise_offload_components_cli_args(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--performance-mode",
+            "manual",
+            "--layerwise-offload-components",
+            "transformer",
+            "text_encoder",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            with patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ):
+                server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(
+            server_args.layerwise_offload_components, ["transformer", "text_encoder"]
+        )
 
 
 class TestOffloadDefaults(unittest.TestCase):
@@ -314,18 +343,16 @@ class TestOffloadDefaults(unittest.TestCase):
             args.layerwise_offload_components, ["text_encoder", "image_encoder"]
         )
 
-    def test_explicit_vae_cpu_offload_true_uses_layerwise_replacement(self):
+    def test_explicit_vae_cpu_offload_true_is_preserved_without_component_selection(
+        self,
+    ):
         args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
             kwargs={"vae_cpu_offload": True},
         )
 
-        self.assertFalse(args.vae_cpu_offload)
-        self.assertTrue(args.layerwise_offload)
-        self.assertEqual(
-            args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
-        )
+        self.assertTrue(args.vae_cpu_offload)
+        self.assertFalse(args.layerwise_offload_components)
 
     def test_layerwise_components_disable_matching_cpu_offloads(self):
         args = self._from_dict_with_task_type(
@@ -347,7 +374,7 @@ class TestOffloadDefaults(unittest.TestCase):
         ]
         args._adjust_layerwise_offload_components()
 
-        self.assertTrue(args.layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
@@ -393,7 +420,8 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.performance_mode, "manual")
         self.assertIsNone(args.use_fsdp_inference)
         self.assertIsNone(args.dit_cpu_offload)
-        self.assertIsNone(args.layerwise_offload)
+        self.assertIsNone(args.dit_layerwise_offload)
+        self.assertIsNone(args.layerwise_offload_components)
         self.assertIsNone(args.text_encoder_cpu_offload)
         self.assertIsNone(args.image_encoder_cpu_offload)
         self.assertFalse(args.enable_cfg_parallel)
@@ -407,7 +435,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.performance_mode, "auto")
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.dit_cpu_offload)
-        self.assertTrue(args.layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
@@ -428,7 +456,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(args.ltx2_two_stage_device_mode, "snapshot")
         self.assertTrue(args.dit_cpu_offload)
-        self.assertTrue(args.layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
@@ -441,7 +469,7 @@ class TestOffloadDefaults(unittest.TestCase):
             kwargs={"performance_mode": "auto"},
         )
 
-        self.assertTrue(args.layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
@@ -456,7 +484,7 @@ class TestOffloadDefaults(unittest.TestCase):
             kwargs={"performance_mode": "memory"},
         )
 
-        self.assertTrue(args.layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
@@ -476,7 +504,7 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.layerwise_offload)
+        self.assertFalse(args.layerwise_offload_components)
         self.assertTrue(args.use_fsdp_inference)
 
     def test_auto_multi_gpu_wan_uses_layerwise_offload_without_cfg(self):
@@ -493,7 +521,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.enable_cfg_parallel)
         self.assertFalse(args.dit_cpu_offload)
-        self.assertTrue(args.layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
@@ -501,7 +529,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ["default", "text_encoder", "image_encoder"],
         )
 
-    def test_explicit_multi_gpu_dit_layerwise_replaces_component_cpu_offload(self):
+    def test_explicit_multi_gpu_dit_layerwise_only_selects_default_component(self):
         args = self._from_dict_with_pipeline_config(
             MOVAPipelineConfig(),
             kwargs={
@@ -513,13 +541,10 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.dit_cpu_offload)
-        self.assertTrue(args.layerwise_offload)
-        self.assertFalse(args.text_encoder_cpu_offload)
-        self.assertFalse(args.image_encoder_cpu_offload)
-        self.assertEqual(
-            args.layerwise_offload_components,
-            ["default", "text_encoder", "image_encoder"],
-        )
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.image_encoder_cpu_offload)
+        self.assertEqual(args.layerwise_offload_components, ["default"])
 
     def test_auto_multi_gpu_ltx_replaces_component_cpu_offload_with_resident_dit(self):
         args = self._from_dict_with_pipeline_config(
@@ -534,7 +559,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.dit_cpu_offload)
-        self.assertTrue(args.layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
@@ -554,7 +579,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
         self.assertTrue(args.dit_cpu_offload)
-        self.assertTrue(args.layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
@@ -667,7 +692,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.performance_mode, "speed")
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.dit_cpu_offload)
-        self.assertFalse(args.layerwise_offload)
+        self.assertFalse(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
 
@@ -696,7 +721,7 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertFalse(args.use_fsdp_inference)
-        self.assertTrue(args.layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
@@ -717,7 +742,7 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertTrue(args.use_fsdp_inference)
-        self.assertFalse(args.layerwise_offload)
+        self.assertFalse(args.layerwise_offload_components)
         self.assertFalse(args.dit_cpu_offload)
 
     def test_invalid_performance_mode_raises(self):
