@@ -91,9 +91,9 @@ mod tests {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             }],
-            worker: crate::config::WorkerConfig {
+            workers: vec![crate::config::WorkerConfig {
                 url: "http://x".into(),
-            },
+            }],
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();
         let proxy = Arc::new(crate::proxy::Proxy::new("http://x".into()));

@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
         sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
             .context("load tokenizers")?,
     );
-    let proxy = Arc::new(sgl_router::proxy::Proxy::new(cfg.worker.url.clone()));
+    let proxy = Arc::new(sgl_router::proxy::Proxy::new(cfg.workers[0].url.clone()));
     let ctx = Arc::new(sgl_router::server::app_context::AppContext::new(
         cfg.clone(),
         tokenizers,

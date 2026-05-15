@@ -26,9 +26,9 @@ async fn forwards_whitelisted_headers_strips_others() {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
         }],
-        worker: WorkerConfig {
+        workers: vec![WorkerConfig {
             url: worker.url.clone(),
-        },
+        }],
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(worker.url.clone()));

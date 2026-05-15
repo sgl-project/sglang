@@ -56,9 +56,9 @@ mod tests {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             }],
-            worker: crate::config::WorkerConfig {
+            workers: vec![crate::config::WorkerConfig {
                 url: "http://x".into(),
-            },
+            }],
         }
     }
 

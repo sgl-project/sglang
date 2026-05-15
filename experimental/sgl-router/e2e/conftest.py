@@ -83,13 +83,36 @@ def sglang_server():
         proc.wait()
 
 
+def _find_tokenizer_path(model: str) -> str:
+    """Locate the tokenizer.json for *model* from the local HF Hub cache.
+
+    Falls back to the model string itself (a valid HF Hub repo identifier
+    that dynamo-tokenizers can resolve at runtime) when the cache is absent.
+    """
+    try:
+        from huggingface_hub import try_to_load_from_cache  # type: ignore[import]
+
+        path = try_to_load_from_cache(model, "tokenizer.json")
+        if path and Path(path).is_file():
+            return str(path)
+    except Exception:  # noqa: BLE001
+        pass
+    # Let dynamo-tokenizers resolve the repo identifier directly.
+    return model
+
+
 @pytest.fixture(scope="session")
 def router(sglang_server):  # noqa: ARG001  (sglang_server must start first)
     """Launch sgl-router on port 8090 pointed at the SGLang worker."""
+    tok_path = _find_tokenizer_path(MODEL)
     config_content = f"""\
 [server]
 host = "0.0.0.0"
 port = {ROUTER_PORT}
+
+[[models]]
+id = "{MODEL}"
+tokenizer_path = "{tok_path}"
 
 [[workers]]
 url = "http://localhost:{SGLANG_PORT}"

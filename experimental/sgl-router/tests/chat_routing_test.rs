@@ -26,9 +26,9 @@ fn config(worker_url: &str) -> Config {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
         }],
-        worker: WorkerConfig {
+        workers: vec![WorkerConfig {
             url: worker_url.into(),
-        },
+        }],
     }
 }
 
@@ -65,7 +65,7 @@ async fn non_streaming_returns_200() {
 async fn upstream_unreachable_502() {
     let cfg = config("http://127.0.0.1:1"); // no listener
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(cfg.worker.url.clone()));
+    let proxy = Arc::new(Proxy::new(cfg.workers[0].url.clone()));
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy));
     let app = build_router(ctx);
     let req = Request::builder()
