@@ -408,12 +408,22 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         **kwargs: object,
     ) -> LogitsProcessor:
         """Forward pass for multimodal Gemma3n."""
-        if (input_ids is None) ^ (input_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds"
+        positions += 1
+
+        if input_embeds is not None:
+            hidden_states = self.language_model(
+                None, positions, forward_batch, input_embeds, **kwargs
+            )
+            return self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.language_model.embed_tokens,
+                forward_batch,
             )
 
-        positions += 1
+        if input_ids is None:
+            raise ValueError("input_ids must be provided when input_embeds is not.")
+
         if input_ids is not None:
             # Prepare per-layer inputs from inputs_ids
             per_layer_inputs_mask = torch.logical_and(

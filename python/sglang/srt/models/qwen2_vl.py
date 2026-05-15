@@ -555,13 +555,18 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
-            positions=positions,
-        )
+        if input_embeds is not None:
+            hidden_states = self.model(
+                input_ids, positions, forward_batch, input_embeds
+            )
+        else:
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model,
+                multimodal_model=self,
+                positions=positions,
+            )
 
         if get_embedding:
             return self.pooler(hidden_states, forward_batch)
