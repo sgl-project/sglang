@@ -194,19 +194,34 @@ jobs:
           exit 0
 
   sgl-router-e2e:
-    name: tier-3 — e2e (placeholder)
+    name: tier-3 — e2e
     needs: sgl-router-build-and-test
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    runs-on: 2-gpu-h100
+    timeout-minutes: 45
     steps:
-      - name: Placeholder — populated in M1
+      - uses: actions/checkout@v4
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-router
+          shared-key: "sgl-router-cache"
+      - name: cargo build (release)
+        working-directory: sgl-router
+        run: cargo build --release
+      - name: Set up Python
         run: |
-          echo "e2e placeholder. To be populated in M1 (HTTP skeleton + tokenizer)."
-          exit 0
+          python3 -m venv /tmp/sgl-router-e2e-venv
+          /tmp/sgl-router-e2e-venv/bin/pip install -r sgl-router/e2e/requirements.txt
+          /tmp/sgl-router-e2e-venv/bin/pip install "sglang[srt]==0.4.5"
+      - name: Run e2e
+        working-directory: sgl-router
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: /tmp/sgl-router-e2e-venv/bin/pytest e2e/ -v -s --tb=short
 
   sgl-router-finish:
     name: finish
