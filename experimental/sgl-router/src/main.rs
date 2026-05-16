@@ -89,14 +89,11 @@ async fn main() -> Result<()> {
     // (M1's typed-URL contract); the field is no longer authoritative — per
     // request, chat.rs supplies the actual worker URL via
     // `forward_*_to(&worker.url, ...)`. The M3 cleanup pass drops the field.
-    let placeholder_worker_url = reqwest::Url::parse("http://localhost:30000")
-        .context("parse placeholder worker URL")?;
+    let placeholder_worker_url =
+        reqwest::Url::parse("http://localhost:30000").context("parse placeholder worker URL")?;
     let proxy = Arc::new(
-        sgl_router::proxy::Proxy::new(
-            placeholder_worker_url,
-            std::time::Duration::from_secs(60),
-        )
-        .context("build proxy client")?,
+        sgl_router::proxy::Proxy::new(placeholder_worker_url, std::time::Duration::from_secs(60))
+            .context("build proxy client")?,
     );
 
     let ctx = Arc::new(sgl_router::server::app_context::AppContext::new(
@@ -118,8 +115,7 @@ async fn main() -> Result<()> {
 
     let (sigterm, sigint) = install_signal_handlers()?;
 
-    let serve = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(sigterm, sigint));
+    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(sigterm, sigint));
     let server_result = serve.await.context("axum serve");
 
     // Best-effort: cancel discovery + manager on shutdown.
