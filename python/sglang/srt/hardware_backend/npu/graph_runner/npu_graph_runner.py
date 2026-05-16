@@ -82,6 +82,7 @@ class NPUGraphRunner(CudaGraphRunner):
         self.model_runner = model_runner
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.forward_mode = None
 
     def _init_arch_map(self):
         if self.is_dllm:
@@ -121,9 +122,13 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _get_update_attr_name(self):
+        if self.forward_mode is not None and self.forward_mode.is_target_verify():
+            return "actual_seq_kvlen"
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
+        if self.forward_mode is not None and self.forward_mode.is_target_verify():
+            return []
         return self.attr_type[AttentionArch.MLA]
 
     def _update_inputs(self, seq_lens):
@@ -185,6 +190,7 @@ class NPUGraphRunner(CudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
+        self.forward_mode = forward_batch.forward_mode
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
         # Replay
