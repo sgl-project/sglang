@@ -132,3 +132,4 @@ class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+# test B200 CI
