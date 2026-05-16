@@ -66,7 +66,7 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy =
-        Arc::new(Proxy::new(worker.url.parse().unwrap(), Duration::from_millis(200)).unwrap());
+        Arc::new(Proxy::new(Duration::from_millis(200)).unwrap());
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
     let app = build_router(ctx);
 

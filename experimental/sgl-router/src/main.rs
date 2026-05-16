@@ -85,14 +85,8 @@ async fn main() -> Result<()> {
         Some(Arc::new(cfg.clone())),
     ));
 
-    // The proxy's `worker_url` field is a placeholder — per-request URLs are
-    // supplied by the chat handler via `forward_*_to(&worker.url, ...)`. The
-    // field (and its only live reader, `Proxy::probe_health`) will be dropped
-    // when the proxy constructor is collapsed to take only the timeout.
-    let placeholder_worker_url =
-        reqwest::Url::parse("http://localhost:30000").context("parse placeholder worker URL")?;
     let proxy = Arc::new(
-        sgl_router::proxy::Proxy::new(placeholder_worker_url, std::time::Duration::from_secs(60))
+        sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(60))
             .context("build proxy client")?,
     );
 

@@ -49,7 +49,6 @@ impl AppContext {
 
     #[cfg(test)]
     pub fn stub() -> Self {
-        let url = reqwest::Url::parse("http://x:30000").expect("stub url parses");
         Self {
             config: Config {
                 server: crate::config::ServerConfig {
@@ -69,7 +68,7 @@ impl AppContext {
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
             proxy: Arc::new(
-                Proxy::new(url, std::time::Duration::from_secs(60)).expect("stub proxy"),
+                Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy"),
             ),
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),

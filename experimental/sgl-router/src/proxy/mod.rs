@@ -31,11 +31,6 @@ fn parse_worker_url(worker_url: &str, breaker: &CircuitBreaker) -> Result<Url, A
 
 #[derive(Debug)]
 pub struct Proxy {
-    /// Pre-parsed worker URL. Downstream paths are built via [`Url::join`]
-    /// (see [`Self::worker_path`]), which handles trailing slashes per the
-    /// URL spec — `http://x:30000/` joined with `/v1/tokenize` yields
-    /// `http://x:30000/v1/tokenize`, no double slash.
-    pub worker_url: Url,
     pub client: Client,
     /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
     /// requests deliberately do not use this (long generations are valid).
@@ -46,28 +41,15 @@ impl Proxy {
     /// Build a proxy. `request_timeout` is the per-request wall-clock budget for
     /// non-streaming forwards. Connect timeout is hard-coded to 5 s — even a
     /// streaming request fails fast at TCP setup if the worker is unreachable.
-    pub fn new(worker_url: Url, request_timeout: Duration) -> Result<Self, anyhow::Error> {
+    pub fn new(request_timeout: Duration) -> Result<Self, anyhow::Error> {
         let client = Client::builder()
             .pool_max_idle_per_host(64)
             .connect_timeout(Duration::from_secs(5))
             .build()
             .context("build reqwest client")?;
         Ok(Self {
-            worker_url,
             client,
             request_timeout,
-        })
-    }
-
-    /// Build a full upstream URL for an absolute path (e.g. `/v1/tokenize`).
-    /// Uses [`Url::join`] semantics: an absolute path replaces the base
-    /// path, so a base URL with or without a trailing `/` produces the same
-    /// result. Errors only on malformed `path` inputs; we surface them as
-    /// `ApiError::Internal` since callers pass static path literals.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn worker_path(&self, path: &str) -> Result<Url, ApiError> {
-        self.worker_url.join(path).map_err(|e| {
-            ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })
     }
 
@@ -96,28 +78,9 @@ impl Proxy {
         }
     }
 
-    /// One-shot health check against the configured worker. Returns `Ok(())`
-    /// if the worker responded with any 2xx or 3xx within the timeout;
-    /// `Err` otherwise. Result is informational — callers log and continue.
-    pub async fn probe_health(&self, timeout: Duration) -> Result<(), String> {
-        let url = self
-            .worker_url
-            .join("/health")
-            .map_err(|e| format!("worker {}: join /health failed: {e}", self.worker_url))?;
-        match tokio::time::timeout(timeout, self.client.get(url.clone()).send()).await {
-            Ok(Ok(resp)) if resp.status().is_success() || resp.status().is_redirection() => Ok(()),
-            Ok(Ok(resp)) => Err(format!("worker {} returned status {}", url, resp.status())),
-            Ok(Err(e)) => Err(format!("worker {} unreachable: {e}", url)),
-            Err(_) => Err(format!(
-                "worker {} probe timed out after {:?}",
-                url, timeout
-            )),
-        }
-    }
-
     /// Breaker-gated JSON POST: checks `breaker.allow()` first, records
     /// success/failure based on response status, and returns
-    /// `ApiError::ServiceUnavailable` immediately when the breaker is Open.
+    /// `ApiError::BreakerOpen` immediately when the breaker is Open.
     ///
     /// `worker_url` is the discovery-emitted worker URL string. It's parsed
     /// to [`reqwest::Url`] internally so we can use [`Url::join`] for clean
@@ -182,7 +145,7 @@ impl Proxy {
     }
 
     /// Breaker-gated streaming POST: checks `breaker.allow()` first, records
-    /// success/failure, and returns `ApiError::ServiceUnavailable` when Open.
+    /// success/failure, and returns `ApiError::BreakerOpen` when Open.
     ///
     /// `load_guard` — when `Some`, the guard is threaded into the SSE pump
     /// task and held for the entire body lifetime (headers → last byte /
@@ -255,83 +218,8 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
-    async fn probe_health_succeeds_against_a_listening_server() {
-        use axum::routing::get;
-        use axum::Router;
-        let app = Router::new().route("/health", get(|| async { "ok" }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = rx.await;
-                })
-                .await;
-        });
-
-        let p = Proxy::new(
-            Url::parse(&format!("http://{addr}")).unwrap(),
-            Duration::from_secs(5),
-        )
-        .unwrap();
-        let res = p.probe_health(Duration::from_secs(2)).await;
-        assert!(res.is_ok(), "expected probe to succeed, got: {res:?}");
-        let _ = tx.send(());
-    }
-
-    #[tokio::test]
     async fn new_returns_result_not_panic() {
-        // Smoke: Proxy::new returns Result<Self>; the happy path works.
-        let p = Proxy::new(
-            Url::parse("http://127.0.0.1:1").unwrap(),
-            Duration::from_secs(5),
-        )
-        .unwrap();
-        assert_eq!(p.worker_url.as_str(), "http://127.0.0.1:1/");
-    }
-
-    #[tokio::test]
-    async fn probe_health_fails_against_dead_server() {
-        // Bind a port to get a free one, then drop it so connections are refused.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-
-        let p = Proxy::new(
-            Url::parse(&format!("http://{addr}")).unwrap(),
-            Duration::from_secs(5),
-        )
-        .unwrap();
-        let res = p.probe_health(Duration::from_millis(500)).await;
-        let err = res.expect_err("expected probe to fail against a closed port");
-        assert!(
-            err.contains("unreachable") || err.contains("timed out") || err.contains("returned"),
-            "unexpected error: {err}",
-        );
-    }
-
-    #[test]
-    fn worker_path_handles_trailing_slash_and_absolute_path() {
-        // Same base, two forms (trailing or not), absolute path: same result.
-        // This pins the "no double-slash" property end-to-end.
-        let p_with = Proxy::new(
-            Url::parse("http://x:30000/").unwrap(),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        let p_without = Proxy::new(
-            Url::parse("http://x:30000").unwrap(),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        assert_eq!(
-            p_with.worker_path("/v1/tokenize").unwrap().as_str(),
-            "http://x:30000/v1/tokenize"
-        );
-        assert_eq!(
-            p_without.worker_path("/v1/tokenize").unwrap().as_str(),
-            "http://x:30000/v1/tokenize"
-        );
+        let p = Proxy::new(Duration::from_secs(5)).unwrap();
+        assert_eq!(p.request_timeout, Duration::from_secs(5));
     }
 }
