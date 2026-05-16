@@ -927,7 +927,9 @@ class ServerArgs:
         self._handle_pipeline_parallelism()
 
         # Handle speculative decoding logic.
-        self._handle_speculative_decoding()
+        from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+
+        handle_speculative_decoding(self)
 
         # Handle model loading format.
         self._handle_load_format()
@@ -3482,13 +3484,6 @@ class ServerArgs:
                 "flashinfer" if is_sm100_supported() else "triton"
             )
         return False
-
-    def _handle_speculative_decoding(self):
-        from sglang.srt.arg_groups.speculative_hook import (
-            handle_speculative_decoding,
-        )
-
-        handle_speculative_decoding(self)
 
     def _handle_load_format(self):
         if (
