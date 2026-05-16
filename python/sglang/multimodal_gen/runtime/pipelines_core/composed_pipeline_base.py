@@ -418,10 +418,14 @@ class ComposedPipelineBase(ABC):
                 load_module_name = self._extra_config_module_map[module_name]
             else:
                 load_module_name = module_name
+            component_model_path = self._resolve_component_path(
+                server_args, module_name, load_module_name
+            )
             component_load_specs.append(
                 ComponentLoadSpec(
                     module_name=module_name,
                     load_module_name=load_module_name,
+                    component_model_path=component_model_path,
                     transformers_or_diffusers=transformers_or_diffusers,
                     architecture=architecture,
                     index=index,
@@ -442,9 +446,7 @@ class ComposedPipelineBase(ABC):
             transformers_or_diffusers = spec.transformers_or_diffusers
             architecture = spec.architecture
 
-            component_model_path = self._resolve_component_path(
-                server_args, module_name, load_module_name
-            )
+            component_model_path = spec.component_model_path
             attn_backend, matched_backend_key = (
                 server_args.resolve_component_attention_backend(
                     module_name, load_module_name
