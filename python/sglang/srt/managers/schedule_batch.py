@@ -2443,8 +2443,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
-            # Filter out all requests
+            # Filter out all requests. Also shrink the per-req lockstep
+            # tensors to keep `len(self.reqs) == seq_lens.size(0) == ...`
+            # invariant — leaving them at the pre-filter size leaks stale
+            # refs into the next filter_batch entry.
             self.reqs = []
+            if self.seq_lens is not None:
+                self.seq_lens = self.seq_lens[:0]
+            if self.req_pool_indices is not None:
+                self.req_pool_indices = self.req_pool_indices[:0]
+            if self.orig_seq_lens is not None:
+                self.orig_seq_lens = self.orig_seq_lens[:0]
+            if self.seq_lens_cpu is not None:
+                self.seq_lens_cpu = self.seq_lens_cpu[:0]
+            if self.output_ids is not None:
+                self.output_ids = self.output_ids[:0]
+            self.seq_lens_sum = 0
             return
 
         if len(keep_indices) == len(self.reqs):
