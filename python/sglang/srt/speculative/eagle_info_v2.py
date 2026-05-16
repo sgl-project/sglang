@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -227,6 +228,21 @@ class EagleDraftInputV2(EagleDraftInput):
         return forward_batch, can_cuda_graph
 
 
+@dataclass(kw_only=True)
+class EagleVerifyOutputV2(EagleVerifyOutput):
+    """V2 sister of `EagleVerifyOutput`. Adds `predict` (the full per-position
+    sampled token tensor, shape `[bs * draft_token_num]`) which V2's overlap
+    pipeline uses as `GenerationBatchResult.next_token_ids` to slice without
+    a GPU->CPU sync. V1 paths produce the base `EagleVerifyOutput` and have
+    no `predict` field — they read tokens from `accept_tokens` instead.
+
+    `kw_only=True` because parent has defaulted `can_run_cuda_graph` and
+    Python dataclass forbids non-defaulted subclass fields after defaulted
+    parent fields; kw-only side-steps this so V2 can require `predict`."""
+
+    predict: torch.Tensor
+
+
 class EagleDraftExtendInputV2(EagleDraftExtendInput):
     """V2 sister of `EagleDraftExtendInput`. Adds the V2-only extend-to-fill
     prepare path used by the second forward (`_draft_extend_for_decode`)."""
@@ -358,9 +374,9 @@ class EagleVerifyInputV2(EagleVerifyInput):
         batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
         vocab_mask: torch.Tensor = None,
-    ) -> EagleVerifyOutput:
+    ) -> EagleVerifyOutputV2:
         """V2 override of `EagleVerifyInput.sample`. Samples target tokens,
-        verifies against drafts, and produces an `EagleVerifyOutput`.
+        verifies against drafts, and produces an `EagleVerifyOutputV2`.
 
         `verify_output.accept_tokens` is the V1-style flat accepted slice;
         `verify_output.predict` is the V2-only full padded per-position sample.
@@ -370,7 +386,7 @@ class EagleVerifyInputV2(EagleVerifyInput):
             predict = torch.empty(0, dtype=torch.int32, device=device)
             num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
             accept_index = torch.empty(0, dtype=torch.int32, device=device)
-            return EagleVerifyOutput(
+            return EagleVerifyOutputV2(
                 draft_extend_input=EagleDraftExtendInputV2(
                     hidden_states=logits_output.hidden_states,
                     num_correct_drafts=num_correct_drafts,
@@ -517,7 +533,7 @@ class EagleVerifyInputV2(EagleVerifyInput):
         # `num_correct_drafts` is drafts-only here; bonus is added via out-of-place
         # +1 when packaged into `EagleDraftExtendInput.num_accept_tokens`, so the
         # local name does not flip semantics mid-function (naming doc C2).
-        return EagleVerifyOutput(
+        return EagleVerifyOutputV2(
             draft_extend_input=EagleDraftExtendInputV2(
                 # V2 keeps `hidden_states` as the full target output (shape
                 # `[bs * draft_token_num, hidden]`); V1 instead stores the

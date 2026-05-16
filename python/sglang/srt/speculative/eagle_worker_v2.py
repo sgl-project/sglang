@@ -45,11 +45,11 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.eagle_info import EagleVerifyOutput
 from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftExtendInputV2,
     EagleDraftInputV2,
     EagleVerifyInputV2,
+    EagleVerifyOutputV2,
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
     fill_bonus_tokens,
@@ -573,7 +573,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self,
         batch: ModelWorkerBatch,
         batch_result: GenerationBatchResult,
-        verify_output: EagleVerifyOutput,
+        verify_output: EagleVerifyOutputV2,
     ):
         # Batch 2: Draft extend. verify already built draft_extend_input with
         # hidden_states / num_correct_drafts / num_accept_tokens; we only need
@@ -977,7 +977,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def verify(
         self, batch: ModelWorkerBatch
-    ) -> tuple[GenerationBatchResult, EagleVerifyOutput]:
+    ) -> tuple[GenerationBatchResult, EagleVerifyOutputV2]:
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
