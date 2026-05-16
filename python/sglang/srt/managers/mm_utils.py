@@ -819,11 +819,13 @@ def embed_mm_inputs(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
             items_size = torch.cumsum(items_size, dim=0).tolist()
-
-            trace_ctx = getattr(forward_batch, "trace_ctx", None)
-
-            if modality == Modality.IMAGE and trace_ctx is not None:
-                trace_ctx.trace_slice_start("vit_encode", 1)
+            
+            time_stats_list = getattr(forward_batch, "time_stats", None)
+            
+            if modality == Modality.IMAGE and time_stats_list is not None:
+                for time_stats in time_stats_list:
+                    time_stats.set_vit_encode_start_time()
+                    
             try:
                 embedding, mask, input_ids = get_embedding_and_mask(
                     data_embedding_func=embedder,
@@ -836,8 +838,9 @@ def embed_mm_inputs(
                     items_offset_list=items_offsets,
                 )
             finally:
-                if modality == Modality.IMAGE and trace_ctx is not None:
-                    trace_ctx.trace_slice_end("vit_encode", 1)
+                if modality == Modality.IMAGE and time_stats_list is not None:
+                    for time_stats in time_stats_list:
+                        time_stats.set_vit_encode_end_time()
 
             if use_deepstack.get(modality, None) and embedding is not None:
                 embedding, deepstack_embedding = (

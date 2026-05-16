@@ -568,6 +568,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     spec_draft_start_time: float = 0.0
     spec_verify_start_time: float = 0.0
     spec_draft_extend_start_time: float = 0.0
+    
+    # ViT_encode, get time by time.perf_counter()
+    vit_encode_start_time: float = 0.0
+    vit_encode_end_time: float = 0.0
 
     # other
     transfer_speed_gb_s: float = 0.0
@@ -961,6 +965,20 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
+    
+    def set_vit_encode_start_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.vit_encode_start_time = ts
+        self.trace_ctx.trace_slice_start(
+            "vit_encode", 1, convert_time_to_realtime_ns(ts)
+        )
+        
+    def set_vit_encode_end_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.vit_encode_end_time = ts
+        self.trace_ctx.trace_slice_end(
+            "vit_encode", 1, convert_time_to_realtime_ns(ts)
+        )
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
