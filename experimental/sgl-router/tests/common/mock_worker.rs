@@ -164,7 +164,7 @@ impl MockWorker {
         tokio::spawn(async move {
             // Accept one connection (or exit on shutdown).
             tokio::select! {
-                _ = &mut rx => return,
+                _ = &mut rx => (),
                 accept = listener.accept() => {
                     let (mut sock, _) = match accept {
                         Ok(v) => v,
