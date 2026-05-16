@@ -1004,7 +1004,10 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             return None, None
 
-        if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
+        if self.spec_algorithm.supports_spec_v2():
+            # V2 algorithms (EAGLE/EAGLE3/STANDALONE/MULTI_LAYER) always nest
+            # coordinator -> draft executor -> draft_runner, regardless of
+            # `enable_overlap`.
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
@@ -3022,12 +3025,20 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none() or self.enable_overlap:
-                # In most cases, we use the model worker batch to run the forward.
+            if (
+                self.spec_algorithm.is_none()
+                or self.spec_algorithm.supports_spec_v2()
+                or self.enable_overlap
+            ):
+                # ModelWorkerBatch covers: no-spec, V2 algorithms (EAGLE /
+                # STANDALONE / MULTI_LAYER, regardless of overlap), and any
+                # overlap-scheduled path. V2 worker `forward_batch_generation`
+                # requires ModelWorkerBatch.
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:
-                # In speculative decoding v1 (non-overlap) case, we use the batch directly.
-                # TODO(lsyin): delete this branch after unifying the abstraction.
+                # V1-only algorithms (NGRAM / FROZEN_KV_MTP / DFLASH) consume
+                # ScheduleBatch directly. TODO(lsyin): delete this branch after
+                # unifying the abstraction.
                 worker_batch_or_batch = batch
 
             future_indices = None
