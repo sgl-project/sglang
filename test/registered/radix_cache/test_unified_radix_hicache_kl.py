@@ -115,6 +115,8 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
     max_running_requests = 4
     kl_threshold = 0.005
     sampling_temperature = 0
+    decode_hit_request_batch_size = 4
+    decode_hit_inter_batch_delay_s = 0.5
     decode_cache_assert = staticmethod(_assert_dsv4_decode_cached_tokens)
     gsm8k_threshold = 0.90
     num_gsm8k_questions = 100
@@ -179,8 +181,6 @@ class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
 
     hicache_io_backend = "kernel"
     hicache_mem_layout = "layer_first"
-    decode_hit_request_batch_size = 4
-    decode_hit_inter_batch_delay_s = 2
 
 
 class GSM8KTwoPassMixin:
