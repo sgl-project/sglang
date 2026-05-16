@@ -7,7 +7,7 @@ from sglang.srt.managers.schedule_batch import _flatten_parts_to_int64_tensor
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
