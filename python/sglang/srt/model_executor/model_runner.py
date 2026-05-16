@@ -901,9 +901,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         include aux hidden state output paths.
         """
         if self.eagle_use_aux_hidden_state:
-            self.model.set_eagle3_layers_to_capture(
-                self.eagle_aux_hidden_state_layer_ids
+            from sglang.srt.speculative.draft_utils import (
+                adjust_eagle3_aux_hidden_state_layer_ids,
             )
+
+            layer_ids = adjust_eagle3_aux_hidden_state_layer_ids(
+                self.server_args.speculative_draft_model_path,
+                self.eagle_aux_hidden_state_layer_ids,
+            )
+            self.model.set_eagle3_layers_to_capture(layer_ids)
         if self.dflash_use_aux_hidden_state:
             if not hasattr(self.model, "set_dflash_layers_to_capture"):
                 raise ValueError(
