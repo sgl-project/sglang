@@ -144,6 +144,14 @@ impl Proxy {
             .await
             .map_err(|e| self.classify_reqwest_error(e, path))?;
         let status = resp.status();
+        if !status.is_success() {
+            tracing::warn!(
+                upstream = %url,
+                path = path,
+                status = %status,
+                "upstream returned non-2xx on streaming request",
+            );
+        }
         // Capture content-type BEFORE consuming resp via bytes_stream().
         let upstream_ct = resp
             .headers()
