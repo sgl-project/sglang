@@ -13,6 +13,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.base_spec_worker import (
+    DraftExecutor,
+    NullDraftExecutor,
+    SpecCoordinator,
+)
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -24,7 +29,15 @@ logger = logging.getLogger(__name__)
 USE_FULL_MASK = True
 
 
-class NGRAMWorker:
+class NgramSpecCoordinator(SpecCoordinator):
+    """Spec coordinator for the N-gram algorithm.
+
+    NGRAM derives draft tokens from a CPU-side n-gram corpus lookup rather than
+    a draft model. The draft side is exposed as a `NullDraftExecutor` so the
+    `SpecCoordinator + DraftExecutor` type contract holds uniformly across all
+    spec algorithms.
+    """
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -37,6 +50,7 @@ class NGRAMWorker:
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        self.server_args = server_args
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
@@ -46,6 +60,15 @@ class NGRAMWorker:
 
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+
+        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+        # NGRAM has no draft model — drafts come from `ngram_corpus.batch_get`.
+        # `NullDraftExecutor` makes the absence type-explicit.
+        self._draft_worker: DraftExecutor = NullDraftExecutor(
+            target_worker, self.speculative_algorithm
+        )
 
         self._init_preallocated_tensors()
 
@@ -79,6 +102,10 @@ class NGRAMWorker:
                 corpus_path,
                 loaded,
             )
+
+    @property
+    def draft_worker(self) -> DraftExecutor:
+        return self._draft_worker
 
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
@@ -372,3 +399,7 @@ class NGRAMWorker:
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
         )
+
+
+# Pre-rename alias; existing call sites keep importing `NGRAMWorker`.
+NGRAMWorker = NgramSpecCoordinator
