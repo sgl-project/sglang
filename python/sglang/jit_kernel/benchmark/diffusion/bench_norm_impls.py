@@ -24,7 +24,7 @@ from sglang.utils import is_in_ci
 
 register_cuda_ci(
     est_time=120,
-    suite="stage-b-kernel-benchmark-1-gpu-large",
+    suite="base-b-kernel-benchmark-1-gpu-large",
     disabled="self-skips in CI, standalone tool",
 )
 

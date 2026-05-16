@@ -209,6 +209,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "mori",
     "ascend_fuseep",
     "flashinfer",
+    "megamoe",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -332,6 +333,7 @@ class ServerArgs:
     tokenizer_mode: str = "auto"
     tokenizer_backend: str = "huggingface"
     tokenizer_worker_num: int = 1
+    detokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -572,10 +574,16 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
-        "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
+        "none",
+        "deepep",
+        "mooncake",
+        "nixl",
+        "mori",
+        "ascend_fuseep",
+        "flashinfer",
+        "megamoe",
     ] = "none"
     moe_runner_backend: str = "auto"
-    record_nolora_graph: bool = True
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
@@ -3149,6 +3157,25 @@ class ServerArgs:
             )
             self.moe_a2a_backend = "deepep"
 
+        if (
+            envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
+            and self.moe_a2a_backend != "megamoe"
+        ):
+            self.moe_a2a_backend = "megamoe"
+            logger.info(
+                "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
+                "auto-configuring --moe-a2a-backend megamoe."
+            )
+
+        if self.moe_a2a_backend == "megamoe":
+            self.ep_size = self.tp_size
+            if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
+                envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
+            logger.info(
+                f"Mega MoE is enabled. The expert parallel size is adjusted "
+                f"to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
@@ -3781,6 +3808,12 @@ class ServerArgs:
                     f"(requested {self.tokenizer_worker_num})."
                 )
                 self.tokenizer_worker_num = 1
+            if self.detokenizer_worker_num != 1:
+                logger.warning(
+                    "skip_tokenizer_init=True disables detokenizer workers; forcing detokenizer_worker_num=1 "
+                    f"(requested {self.detokenizer_worker_num})."
+                )
+                self.detokenizer_worker_num = 1
 
             if self.enable_tokenizer_batch_encode:
                 logger.warning(
@@ -4123,6 +4156,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tokenizer_worker_num,
             help="The worker num of the tokenizer manager.",
+        )
+        parser.add_argument(
+            "--detokenizer-worker-num",
+            type=int,
+            default=ServerArgs.detokenizer_worker_num,
+            help="The worker num of the detokenizer manager.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -5569,14 +5608,6 @@ class ServerArgs:
             help="Choose the runner backend for MoE.",
         )
         parser.add_argument(
-            "--record-nolora-graph",
-            action=argparse.BooleanOptionalAction,
-            default=ServerArgs.record_nolora_graph,
-            help="Capture a second set of CUDA graphs without LoRA hooks. "
-            "Batches without active adapters replay the faster nolora graph. "
-            "Enabled by default.",
-        )
-        parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
             type=str,
             choices=["default", "bf16"],
@@ -6879,6 +6910,7 @@ class ServerArgs:
                 )
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+        assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
         )

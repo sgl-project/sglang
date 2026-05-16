@@ -18,9 +18,19 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 
 
-class ParallelTiledVAE(ABC, nn.Module):
+class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_default_enabled = False
+    layer_names = [
+        "encoder.down_blocks",
+        "decoder.up_blocks",
+        "encoder.down",
+        "decoder.up",
+    ]
     tile_sample_min_height: int
     tile_sample_min_width: int
     tile_sample_min_num_frames: int
