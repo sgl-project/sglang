@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from sglang.multimodal_gen.runtime.loader import fsdp_load
+from sglang.multimodal_gen.runtime.loader import fsdp_load, weight_utils
 from sglang.multimodal_gen.runtime.loader.component_loaders import transformer_loader
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 
@@ -125,3 +125,27 @@ def test_runai_distributed_streaming_fast_path_gating(monkeypatch):
     )
     assert not enabled
     assert reason == "quantized transformer load is enabled"
+
+
+def test_runai_distributed_streamer_env_fallback(monkeypatch):
+    monkeypatch.setattr(weight_utils, "HAS_RUNAI_MODEL_STREAMER", True)
+    monkeypatch.setattr(
+        weight_utils.envs, "SGLANG_USE_RUNAI_MODEL_STREAMER", True
+    )
+    monkeypatch.setattr(
+        weight_utils.envs,
+        "SGLANG_USE_RUNAI_DISTRIBUTED_MODEL_STREAMER",
+        True,
+    )
+    monkeypatch.setattr(weight_utils.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(weight_utils.torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(weight_utils.current_platform, "is_cuda_alike", lambda: True)
+
+    assert weight_utils.can_use_runai_distributed_streamer()
+
+    monkeypatch.setattr(
+        weight_utils.envs,
+        "SGLANG_USE_RUNAI_DISTRIBUTED_MODEL_STREAMER",
+        False,
+    )
+    assert not weight_utils.can_use_runai_distributed_streamer()

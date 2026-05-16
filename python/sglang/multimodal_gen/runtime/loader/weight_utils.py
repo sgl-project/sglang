@@ -184,6 +184,7 @@ def can_use_runai_distributed_streamer() -> bool:
     return (
         HAS_RUNAI_MODEL_STREAMER
         and envs.SGLANG_USE_RUNAI_MODEL_STREAMER
+        and envs.SGLANG_USE_RUNAI_DISTRIBUTED_MODEL_STREAMER
         and torch.distributed.is_initialized()
         and torch.distributed.get_world_size() > 1
         and current_platform.is_cuda_alike()
