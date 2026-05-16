@@ -51,7 +51,13 @@ struct ActivationParams {
   uint32_t expert_step;
 };
 
-template <typename T, ActivationKind kAct, bool kUsePDL, bool kFilterExpert>
+// kSwapHalves selects which half of the [first | second] input feeds the
+// activation. kSwapHalves=false computes act(first) * second (the stock
+// [Gate | Up] convention). kSwapHalves=true computes act(second) * first
+// (the [Up | Gate] convention used by FlashInfer-CUTLASS NVFP4 MoE, e.g.
+// Kimi-K2.5). The flag is a template constexpr, so the existing call path
+// compiles to byte-identical SASS.
+template <typename T, ActivationKind kAct, bool kUsePDL, bool kFilterExpert, bool kSwapHalves>
 __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams params) {
   using namespace device;
   constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
@@ -68,13 +74,15 @@ __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams para
   const auto input_offset = token_id * (num_vecs * 2) + offset;
   const auto output_offset = tid;
   PDLWaitPrimary<kUsePDL>();
-  const auto gate = device::load_as<vec_t>(params.input, input_offset);
-  const auto up = device::load_as<vec_t>(params.input, input_offset + num_vecs);
+  const auto first = device::load_as<vec_t>(params.input, input_offset);
+  const auto second = device::load_as<vec_t>(params.input, input_offset + num_vecs);
   vec_t out;
 #pragma unroll
   for (int i = 0; i < kVecSize; ++i) {
-    const float gate_f32 = device::cast<fp32_t>(gate[i]);
-    const float up_f32 = device::cast<fp32_t>(up[i]);
+    const float first_f32 = device::cast<fp32_t>(first[i]);
+    const float second_f32 = device::cast<fp32_t>(second[i]);
+    const float gate_f32 = kSwapHalves ? second_f32 : first_f32;
+    const float up_f32 = kSwapHalves ? first_f32 : second_f32;
     out[i] = device::cast<T>(apply_activation_f32<kAct>(gate_f32) * up_f32);
   }
   device::store_as<vec_t>(params.out, out, output_offset);
@@ -86,21 +94,21 @@ struct ActivationKernel {
   static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
   static constexpr auto kBlockSize = 256u;
 
-  template <ActivationKind kAct, bool kFilterExpert>
-  static constexpr auto activation_kernel = act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert>;
+  template <ActivationKind kAct, bool kFilterExpert, bool kSwapHalves>
+  static constexpr auto activation_kernel = act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kSwapHalves>;
 
   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
 
-  template <bool kFilterExpert>
+  template <bool kFilterExpert, bool kSwapHalves>
   static auto select_kernel(const std::string& type)
-      -> decltype(activation_kernel<ActivationKind::kSiLU, kFilterExpert>) {
+      -> decltype(activation_kernel<ActivationKind::kSiLU, kFilterExpert, kSwapHalves>) {
     using namespace host;
     if (type == "silu") {
-      return activation_kernel<ActivationKind::kSiLU, kFilterExpert>;
+      return activation_kernel<ActivationKind::kSiLU, kFilterExpert, kSwapHalves>;
     } else if (type == "gelu") {
-      return activation_kernel<ActivationKind::kGELU, kFilterExpert>;
+      return activation_kernel<ActivationKind::kGELU, kFilterExpert, kSwapHalves>;
     } else if (type == "gelu_tanh") {
-      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert>;
+      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert, kSwapHalves>;
     } else {
       Panic("unsupported activation type: ", type);
     }
@@ -112,7 +120,8 @@ struct ActivationKernel {
       const tvm::ffi::TensorView& out,
       const std::string& type,
       const int32_t* expert_ids,
-      uint32_t expert_step) {
+      uint32_t expert_step,
+      bool swap_halves) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
@@ -150,16 +159,27 @@ struct ActivationKernel {
     };
     if (expert_ids != nullptr) {
       RuntimeCheck(expert_step > 0, "expert_step must be positive");
-      const auto kernel = select_kernel<true>(type);
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+      if (swap_halves) {
+        const auto kernel = select_kernel<true, true>(type);
+        LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+      } else {
+        const auto kernel = select_kernel<true, false>(type);
+        LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+      }
     } else {
-      const auto kernel = select_kernel<false>(type);
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+      if (swap_halves) {
+        const auto kernel = select_kernel<false, true>(type);
+        LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+      } else {
+        const auto kernel = select_kernel<false, false>(type);
+        LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+      }
     }
   }
 
-  static void run_activation(const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type) {
-    launch(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1);
+  static void
+  run_activation(const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type, bool swap_halves) {
+    launch(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1, swap_halves);
   }
 
   static void run_activation_filtered(
@@ -167,11 +187,18 @@ struct ActivationKernel {
       const tvm::ffi::TensorView out,
       const tvm::ffi::TensorView expert_ids,
       int64_t expert_step,
-      std::string type) {
+      std::string type,
+      bool swap_halves) {
     using namespace host;
     RuntimeCheck(is_type<int32_t>(expert_ids.dtype()), "expert_ids must have dtype int32");
     RuntimeCheck(expert_step >= 1, "expert_step must be positive");
-    launch(input, out, type, static_cast<const int32_t*>(expert_ids.data_ptr()), static_cast<uint32_t>(expert_step));
+    launch(
+        input,
+        out,
+        type,
+        static_cast<const int32_t*>(expert_ids.data_ptr()),
+        static_cast<uint32_t>(expert_step),
+        swap_halves);
   }
 };
 
