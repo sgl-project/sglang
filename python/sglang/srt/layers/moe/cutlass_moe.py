@@ -396,8 +396,8 @@ def cutlass_moe_fp4(
     c_strides_13: [e] dtype: int64 [Gemm 1: Output Strides]
     c_strides_2: [e] dtype: int64 [Gemm 1: Output Strides]
 
-    topk_weights: [m, topk] dtype: float8
-    topk_ids: [m, topk] dtype: float8
+    topk_weights: [m, topk] dtype: float32
+    topk_ids: [m, topk] dtype: int32
 
     m, n, k: Unquantized weight shapes, dtype: int
     e: number of experts for the current rank, dtype: int
@@ -431,6 +431,8 @@ def cutlass_moe_fp4(
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid input dtype"
 
     out_dtype = a.dtype
+    topk_ids = topk_ids.to(torch.int32)
+    topk_weights = topk_weights.to(torch.float32)
     num_topk = topk_ids.shape[1]
     device = a.device
     a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
@@ -490,8 +492,11 @@ def cutlass_moe_fp4(
         params.to_gemm2_args(),
     )
     del int_fp4, int_blockscale
-    c2 = shuffle_rows(c2, c_map, (m_a * num_topk, params.hidden_size))
-    c2 = c2.view(m_a, num_topk, params.hidden_size)
-    if not apply_router_weight_on_input:
-        c2 = c2 * topk_weights.view(m_a, num_topk, 1).to(out_dtype)
-    return c2.sum(dim=1).to(out_dtype)
+    output = torch.empty((m_a, params.hidden_size), device=device, dtype=out_dtype)
+    apply_shuffle_mul_sum(
+        c2,
+        output,
+        c_map,
+        None if apply_router_weight_on_input else topk_weights.reshape(-1),
+    )
+    return output
