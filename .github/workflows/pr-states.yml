@@ -7,13 +7,22 @@ name: PR States
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_run:
+    # Listen to pr-test* lifecycle so reruns initiated by slash commands
+    # (run.rerun / run.rerun_failed_jobs via GITHUB_TOKEN) — which don't
+    # refire pull_request_target — still refresh the CI-states block.
+    workflows: ["PR Test", "PR Test Extra"]
+    types: [requested, completed]
 
 permissions:
   pull-requests: write
   actions: read
 
 concurrency:
-  group: pr-states-${{ github.event.pull_request.number }}
+  # Dedupe per commit SHA across both event sources so simultaneous
+  # synchronize + workflow_run firings on the same push queue instead
+  # of racing on the body PATCH.
+  group: pr-states-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
@@ -24,8 +33,49 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const sha = context.payload.pull_request.head.sha;
-            const labels = context.payload.pull_request.labels.map(l => l.name);
+            // Event-agnostic PR lookup.
+            // - pull_request_target: PR is in the payload.
+            // - workflow_run: pull_requests[] is populated for same-repo PRs;
+            //   for fork PRs it's empty and we reverse-lookup by head ref
+            //   ("forkOwner:branch"), which is the GH-documented fork-PR query
+            //   pattern and avoids the "commit must be in default branch" caveat
+            //   of listPullRequestsAssociatedWithCommit. Bail cleanly when no
+            //   open PR matches (e.g. workflow run from a push to main).
+            let prNumber;
+            if (context.payload.pull_request) {
+              prNumber = context.payload.pull_request.number;
+            } else {
+              const wr = context.payload.workflow_run;
+              if (wr.pull_requests && wr.pull_requests.length > 0) {
+                prNumber = wr.pull_requests[0].number;
+              } else if (wr.head_repository && wr.head_branch) {
+                const headSpec = `${wr.head_repository.owner.login}:${wr.head_branch}`;
+                const { data: prs } = await github.rest.pulls.list({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                  head: headSpec,
+                });
+                // Multiple PRs could share a head ref if a branch was reused;
+                // match by head_sha to pick the right one.
+                const match = prs.find(p => p.head.sha === wr.head_sha) || prs[0];
+                if (!match) {
+                  core.info(`No open PR for head=${headSpec}; skipping.`);
+                  return;
+                }
+                prNumber = match.number;
+              } else {
+                core.info(`workflow_run has no PR linkage; skipping.`);
+                return;
+              }
+            }
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            const sha = pr.head.sha;
+            const labels = pr.labels.map(l => l.name);
             const hasCI = labels.includes('run-ci');
             const hasExtra = labels.includes('run-ci-extra');
 
@@ -90,11 +140,6 @@ jobs:
               outerEnd,
             ].join('\n');
 
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-            });
             const body = pr.body || '';
 
             const blockRe = new RegExp(`(?:\\n+---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
@@ -112,7 +157,7 @@ jobs:
               await github.rest.pulls.update({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                pull_number: context.issue.number,
+                pull_number: prNumber,
                 body: newBody,
               });
             }

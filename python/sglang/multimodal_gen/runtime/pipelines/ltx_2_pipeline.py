@@ -553,6 +553,8 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
             if self._module_is_on_gpu(target_module):
                 self._record_component_ready("transformer")
             elif not self._snapshot_strategy.is_ready("transformer"):
+                if self._snapshot_low_vram_mode:
+                    self._release_stage2_for_low_vram()
                 self._snapshot_strategy.prefetch_component("transformer", target_module)
         else:
             self._record_component_ready("transformer")
@@ -622,6 +624,16 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
         )
         if stage1_param is not None and stage1_param.device.type == "cuda":
             self._release_module_to_cpu_snapshot("transformer")
+
+    def _release_stage2_for_low_vram(self) -> None:
+        stage2_module = self.pipeline.get_module("transformer_2")
+        stage2_param = (
+            next(stage2_module.parameters(), None)
+            if stage2_module is not None
+            else None
+        )
+        if stage2_param is not None and stage2_param.device.type == "cuda":
+            self._release_module_to_cpu_snapshot("transformer_2")
 
     def _record_component_ready(self, module_name: str) -> None:
         self._snapshot_strategy.record_ready(
