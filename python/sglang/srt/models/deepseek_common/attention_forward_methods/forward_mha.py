@@ -36,6 +36,16 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
+
+def _resolve_attn_backend(forward_batch: ForwardBatch):
+    """Unwrap TboAttnBackend so ``hasattr``-based hook dispatch works
+    regardless of whether two-batch overlap is on."""
+    backend = forward_batch.attn_backend
+    if isinstance(backend, TboAttnBackend):
+        backend = backend.primary
+    return backend
+
+
 # Configs for DeepSeek-V3:
 # num_local_heads = 128
 # qk_nope_head_dim = 128
@@ -212,6 +222,24 @@ class DeepseekMHAForwardMixin:
             kv_a = self.kv_a_layernorm(kv_a)
 
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
+
+        # Backend prefill hook: the backend owns the BF16->FP8 transition
+        # (fused RoPE + quantize for Q/K, direct FP8 KV-cache write) and
+        # returns FP8 tensors ready for its kernel. Backends without the
+        # hook fall through to the BF16 path below.
+        backend = _resolve_attn_backend(forward_batch)
+        if hasattr(backend, "prepare_prefill_qkv"):
+            q_out, k_out, v_out = backend.prepare_prefill_qkv(
+                q=q,
+                q_pe=q_pe,
+                kv_a=kv_a,
+                k_pe=k_pe,
+                positions=positions,
+                layer=self,
+                forward_batch=forward_batch,
+            )
+            return q_out, k_out, v_out, forward_batch
+
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
@@ -369,6 +397,14 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
 
+        # Backend hook: when present, the backend owns the BF16->FP8 K/V
+        # build for the prefix chunk. kv_b_proj always needs BF16 input, so
+        # request BF16 from the cache fetch — the legacy ``q.dtype`` happened
+        # to be BF16 in pre-hook code and breaks once q is FP8.
+        backend = _resolve_attn_backend(forward_batch)
+        pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
+        kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
+
         assert forward_batch.num_prefix_chunks is not None
         for i in range(forward_batch.num_prefix_chunks):
             forward_batch.set_prefix_chunk_idx(i)
@@ -376,7 +412,7 @@ class DeepseekMHAForwardMixin:
             kv_indices = forward_batch.prefix_chunk_kv_indices[i]
             # Fetch latent cache from memory pool with precomputed chunked kv indices
             kv_a_normed, k_pe = self._get_mla_kv_buffer(
-                kv_indices, q.dtype, forward_batch
+                kv_indices, kv_a_dtype, forward_batch
             )
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
@@ -385,17 +421,20 @@ class DeepseekMHAForwardMixin:
             v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
 
-            k = torch.empty(
-                (
-                    k_nope.shape[0],
-                    self.num_local_heads,
-                    self.qk_nope_head_dim + self.qk_rope_head_dim,
-                ),
-                dtype=v.dtype,
-                device=v.device,
-            )
-            k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_pe
+            if pack_fn is not None:
+                k, v = pack_fn(k_nope, k_pe, v)
+            else:
+                k = torch.empty(
+                    (
+                        k_nope.shape[0],
+                        self.num_local_heads,
+                        self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    ),
+                    dtype=v.dtype,
+                    device=v.device,
+                )
+                k[..., : self.qk_nope_head_dim] = k_nope
+                k[..., self.qk_nope_head_dim :] = k_pe
 
             output, lse = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
             tmp_output = torch.empty_like(accum_output)
