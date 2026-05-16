@@ -149,7 +149,6 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
         if _is_npu:
             self.self_attn.use_explicit_npu_interleaved_rope = True
             self.self_attn.rotary_emb.use_explicit_npu_interleaved_rope = True
-            self.self_attn.rotary_emb.sync_explicit_npu_interleaved_cache()
 
         self.mlp = LongcatFlashMLP(
             hidden_size=config.hidden_size,
