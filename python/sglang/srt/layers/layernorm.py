@@ -447,12 +447,19 @@ class RMSNorm(MultiPlatformOp):
                 self.weight.data,
                 self.variance_epsilon,
             )
+        # sgl_kernel rmsnorm requires 2D input; reshape higher-rank tensors
+        needs_reshape = x.dim() != 2 and residual is None
+        if needs_reshape:
+            original_shape = x.shape
+            x = x.contiguous().reshape(-1, x.shape[-1])
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+        if needs_reshape:
+            out = out.reshape(original_shape)
         return out
 
     def forward_with_allreduce_fusion(
