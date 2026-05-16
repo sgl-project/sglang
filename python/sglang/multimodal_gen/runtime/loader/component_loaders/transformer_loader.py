@@ -1,10 +1,12 @@
 import copy
 import logging
+import os
 import time
 from typing import Any
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -63,11 +65,25 @@ def _has_merged_param_mapping(model_cls: type[torch.nn.Module]) -> bool:
     )
 
 
+def _checkpoint_size_gib(safetensors_list: list[str]) -> float | None:
+    if not safetensors_list:
+        return None
+
+    total_bytes = 0
+    for path in safetensors_list:
+        try:
+            total_bytes += os.path.getsize(path)
+        except OSError:
+            return None
+    return total_bytes / (1024**3)
+
+
 def _should_use_runai_distributed_streaming(
     server_args: ServerArgs,
     component_server_args: ServerArgs,
     model_cls: type[torch.nn.Module],
     quant_spec,
+    safetensors_list: list[str],
 ) -> tuple[bool, str]:
     if not can_use_runai_distributed_streamer():
         return False, "runai distributed streamer is not available"
@@ -81,6 +97,15 @@ def _should_use_runai_distributed_streaming(
         return False, "post-load hooks are required"
     if _has_merged_param_mapping(model_cls):
         return False, "merged parameter mapping is required"
+
+    min_weight_gib = envs.SGLANG_RUNAI_DISTRIBUTED_MODEL_STREAMER_MIN_WEIGHT_GB
+    checkpoint_size_gib = _checkpoint_size_gib(safetensors_list)
+    if checkpoint_size_gib is not None and checkpoint_size_gib < min_weight_gib:
+        return (
+            False,
+            "checkpoint is too small for distributed streaming "
+            f"({checkpoint_size_gib:.2f} GiB < {min_weight_gib:.2f} GiB)",
+        )
     return True, ""
 
 
@@ -157,7 +182,11 @@ class TransformerLoader(ComponentLoader):
         # Load the model using FSDP loader
         use_runai_distributed_streaming, disabled_reason = (
             _should_use_runai_distributed_streaming(
-                server_args, component_server_args, model_cls, quant_spec
+                server_args,
+                component_server_args,
+                model_cls,
+                quant_spec,
+                safetensors_list,
             )
         )
         if use_runai_distributed_streaming:

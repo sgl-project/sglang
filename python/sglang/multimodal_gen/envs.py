@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_USE_RUNAI_DISTRIBUTED_MODEL_STREAMER: bool = True
+    SGLANG_RUNAI_DISTRIBUTED_MODEL_STREAMER_MIN_WEIGHT_GB: float = 8.0
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = True
     SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
@@ -287,6 +288,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the distributed GPU streaming fast path used by diffusion transformer load.
     "SGLANG_USE_RUNAI_DISTRIBUTED_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_DISTRIBUTED_MODEL_STREAMER", "true"
+    ),
+    # Minimum checkpoint size for enabling RunAI distributed GPU streaming by
+    # default. Small transformers do not reliably improve whole startup time.
+    "SGLANG_RUNAI_DISTRIBUTED_MODEL_STREAMER_MIN_WEIGHT_GB": _lazy_float(
+        "SGLANG_RUNAI_DISTRIBUTED_MODEL_STREAMER_MIN_WEIGHT_GB", 8.0
     ),
     # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
     # Supported values:

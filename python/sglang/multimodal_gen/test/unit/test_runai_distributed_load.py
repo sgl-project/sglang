@@ -91,6 +91,11 @@ def test_runai_distributed_streaming_fast_path_gating(monkeypatch):
     monkeypatch.setattr(
         transformer_loader, "can_use_runai_distributed_streamer", lambda: True
     )
+    monkeypatch.setattr(
+        transformer_loader.envs,
+        "SGLANG_RUNAI_DISTRIBUTED_MODEL_STREAMER_MIN_WEIGHT_GB",
+        8.0,
+    )
     server_args = SimpleNamespace(use_fsdp_inference=False)
     component_server_args = SimpleNamespace(dit_cpu_offload=False)
     quant_spec = SimpleNamespace(runtime_quant_config=None, post_load_hooks=[])
@@ -100,6 +105,7 @@ def test_runai_distributed_streaming_fast_path_gating(monkeypatch):
         component_server_args,
         TinyModel,
         quant_spec,
+        [],
     )
     assert enabled
     assert reason == ""
@@ -112,6 +118,7 @@ def test_runai_distributed_streaming_fast_path_gating(monkeypatch):
         component_server_args,
         MergedMappingModel,
         quant_spec,
+        [],
     )
     assert not enabled
     assert reason == "merged parameter mapping is required"
@@ -122,9 +129,34 @@ def test_runai_distributed_streaming_fast_path_gating(monkeypatch):
         component_server_args,
         TinyModel,
         quant_spec,
+        [],
     )
     assert not enabled
     assert reason == "quantized transformer load is enabled"
+
+
+def test_runai_distributed_streaming_skips_small_checkpoints(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        transformer_loader, "can_use_runai_distributed_streamer", lambda: True
+    )
+    monkeypatch.setattr(
+        transformer_loader.envs,
+        "SGLANG_RUNAI_DISTRIBUTED_MODEL_STREAMER_MIN_WEIGHT_GB",
+        1.0,
+    )
+    checkpoint = tmp_path / "small.safetensors"
+    checkpoint.write_bytes(b"0")
+
+    enabled, reason = transformer_loader._should_use_runai_distributed_streaming(
+        SimpleNamespace(use_fsdp_inference=False),
+        SimpleNamespace(dit_cpu_offload=False),
+        TinyModel,
+        SimpleNamespace(runtime_quant_config=None, post_load_hooks=[]),
+        [str(checkpoint)],
+    )
+
+    assert not enabled
+    assert "checkpoint is too small" in reason
 
 
 def test_runai_distributed_streamer_env_fallback(monkeypatch):
