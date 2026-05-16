@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import glob
 import importlib
 import importlib.util
 import json
@@ -368,6 +369,7 @@ class ServerArgs:
     tokenizer_mode: str = "auto"
     tokenizer_backend: str = "huggingface"
     tokenizer_worker_num: int = 1
+    detokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -378,6 +380,7 @@ class ServerArgs:
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
+    model_config_parser: str = "auto"
 
     # HTTP server
     host: str = "127.0.0.1"
@@ -610,7 +613,6 @@ class ServerArgs:
         "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
     moe_runner_backend: str = "auto"
-    record_nolora_graph: bool = True
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
@@ -3953,44 +3955,60 @@ class ServerArgs:
             )
 
     def _is_mistral_native_format(self) -> bool:
-        """Detect if the model uses Mistral native format (params.json + consolidated weights).
+        """True iff the checkpoint requires load_format=mistral.
 
-        When both params.json and config.json exist, default to HF format to
-        avoid weight-name mismatches (e.g. Mistral-7B-Instruct-v0.3).
+        Looks for ``consolidated*.safetensors`` with no competing
+        ``model-*.safetensors``; when both weight formats ship in the
+        same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
+        preferred to avoid loading Mistral-named weights into an
+        HF-named architecture.
 
-        Exception: models routed through ``_load_mistral_large_3_for_causal_LM``
-        (mistral-large-3, mistral-small-4, leanstral) build their config from
-        params.json and expect native weight names, so native format is required
-        even when config.json is also present.
+        Name override: ``mistral-large-3`` / ``mistral-small-4`` /
+        ``leanstral`` always treat as Mistral-native when ``params.json``
+        is present -- those families need Mistral weight loading
+        regardless of which weight files happen to be present.
         """
-        # Keep in sync with the name checks in
-        # hf_transformers_utils.py::get_config / get_tokenizer.
-        _MISTRAL_NATIVE_CONFIG_PATTERNS = (
+        _MISTRAL_NATIVE_PATTERNS = (
             "mistral-large-3",
             "mistral-small-4",
             "leanstral",
         )
+        name_matches = any(
+            p in str(self.model_path).lower() for p in _MISTRAL_NATIVE_PATTERNS
+        )
 
-        def _check_format(has_params: bool, has_hf_config: bool) -> bool:
-            if has_params and not has_hf_config:
+        def _check_format(has_params, has_consolidated, has_hf_weights) -> bool:
+            if has_params and name_matches:
                 return True
-            if has_params and has_hf_config:
-                model_lower = str(self.model_path).lower()
-                if any(name in model_lower for name in _MISTRAL_NATIVE_CONFIG_PATTERNS):
-                    return True
-            return False
+            return has_consolidated and not has_hf_weights
 
         if os.path.isdir(self.model_path):
-            has_params = os.path.exists(os.path.join(self.model_path, "params.json"))
-            has_hf_config = os.path.exists(os.path.join(self.model_path, "config.json"))
-            return _check_format(has_params, has_hf_config)
+            return _check_format(
+                has_params=os.path.exists(os.path.join(self.model_path, "params.json")),
+                has_consolidated=bool(
+                    glob.glob(
+                        os.path.join(self.model_path, "consolidated*.safetensors")
+                    )
+                ),
+                has_hf_weights=bool(
+                    glob.glob(os.path.join(self.model_path, "model-*.safetensors"))
+                ),
+            )
 
-        # For hub models, check remote files
         try:
             from huggingface_hub import HfApi
 
             files = {s.rfilename for s in HfApi().model_info(self.model_path).siblings}
-            return _check_format("params.json" in files, "config.json" in files)
+            return _check_format(
+                has_params="params.json" in files,
+                has_consolidated=any(
+                    f.startswith("consolidated") and f.endswith(".safetensors")
+                    for f in files
+                ),
+                has_hf_weights=any(
+                    f.startswith("model-") and f.endswith(".safetensors") for f in files
+                ),
+            )
         except Exception:
             return False
 
@@ -4168,6 +4186,12 @@ class ServerArgs:
                     f"(requested {self.tokenizer_worker_num})."
                 )
                 self.tokenizer_worker_num = 1
+            if self.detokenizer_worker_num != 1:
+                logger.warning(
+                    "skip_tokenizer_init=True disables detokenizer workers; forcing detokenizer_worker_num=1 "
+                    f"(requested {self.detokenizer_worker_num})."
+                )
+                self.detokenizer_worker_num = 1
 
             if self.enable_tokenizer_batch_encode:
                 logger.warning(
@@ -4214,6 +4238,15 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
+        # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
+        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
+            if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                logger.warning(
+                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm100+ (Blackwell), "
+                    "detected sm%d.",
+                    get_device_sm(),
+                )
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
@@ -4503,6 +4536,12 @@ class ServerArgs:
             help="The worker num of the tokenizer manager.",
         )
         parser.add_argument(
+            "--detokenizer-worker-num",
+            type=int,
+            default=ServerArgs.detokenizer_worker_num,
+            help="The worker num of the detokenizer manager.",
+        )
+        parser.add_argument(
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request.",
@@ -4584,6 +4623,15 @@ class ServerArgs:
             '* "transformers" will use the Transformers model '
             '* "mindspore" will use the MindSpore model '
             "implementation.\n",
+        )
+        parser.add_argument(
+            "--model-config-parser",
+            type=str,
+            default=ServerArgs.model_config_parser,
+            help='Which model-config parser to use. "auto" picks "mistral" '
+            'via the is_mistral_model name heuristic, else "hf" '
+            "(AutoConfig over config.json). Plugins can register additional "
+            "parsers via @register_model_config_parser.",
         )
 
         # HTTP server
@@ -5929,14 +5977,6 @@ class ServerArgs:
             help="Choose the runner backend for MoE.",
         )
         parser.add_argument(
-            "--record-nolora-graph",
-            action=argparse.BooleanOptionalAction,
-            default=ServerArgs.record_nolora_graph,
-            help="Capture a second set of CUDA graphs without LoRA hooks. "
-            "Batches without active adapters replay the faster nolora graph. "
-            "Enabled by default.",
-        )
-        parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
             type=str,
             choices=["default", "bf16"],
@@ -7239,6 +7279,7 @@ class ServerArgs:
                 )
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+        assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
         )
