@@ -27,6 +27,12 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.srt.arg_groups.argparse_actions import (
+    DeprecatedAction,
+    DeprecatedAliasStoreAction,
+    DeprecatedStoreTrueAction,
+    LoRAPathAction,
+)
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -316,43 +322,6 @@ def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
 
 
-def _resolve_speculative_algorithm_alias(
-    speculative_algorithm: Optional[str],
-    speculative_draft_model_path: Optional[str],
-    trust_remote_code: bool = False,
-) -> Optional[str]:
-    """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
-
-    is_gemma4_draft = False
-    if speculative_draft_model_path:
-        from transformers import AutoConfig
-
-        cfg = AutoConfig.from_pretrained(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code
-        )
-        is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
-            getattr(cfg, "architectures", None) or []
-        )
-
-    if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
-        raise ValueError(
-            "Gemma4AssistantForCausalLM draft requires "
-            "--speculative-algorithm NEXTN or EAGLE; EAGLE3 is "
-            "not supported for this draft architecture."
-        )
-
-    if speculative_algorithm == "NEXTN" or speculative_algorithm == "EAGLE":
-        if is_gemma4_draft:
-            logger.info(
-                "Detected Gemma4AssistantForCausalLM draft; "
-                f"promoting --speculative-algorithm {speculative_algorithm} to FROZEN_KV_MTP."
-            )
-            return "FROZEN_KV_MTP"
-        return "EAGLE"
-
-    return speculative_algorithm
-
-
 @dataclasses.dataclass
 class ServerArgs:
     """
@@ -370,6 +339,7 @@ class ServerArgs:
     tokenizer_mode: str = "auto"
     tokenizer_backend: str = "huggingface"
     tokenizer_worker_num: int = 1
+    detokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -620,7 +590,6 @@ class ServerArgs:
         "megamoe",
     ] = "none"
     moe_runner_backend: str = "auto"
-    record_nolora_graph: bool = True
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
@@ -972,7 +941,9 @@ class ServerArgs:
         self._handle_pipeline_parallelism()
 
         # Handle speculative decoding logic.
-        self._handle_speculative_decoding()
+        from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+
+        handle_speculative_decoding(self)
 
         # Handle model loading format.
         self._handle_load_format()
@@ -3547,376 +3518,6 @@ class ServerArgs:
             )
         return False
 
-    def _handle_speculative_decoding(self):
-        if (
-            self.speculative_draft_model_path is not None
-            and self.speculative_draft_model_revision is None
-        ):
-            self.speculative_draft_model_revision = "main"
-
-        if self.speculative_moe_runner_backend is None:
-            self.speculative_moe_runner_backend = self.moe_runner_backend
-
-        if self.speculative_algorithm is not None:
-            self.speculative_algorithm = self.speculative_algorithm.upper()
-
-        self.speculative_algorithm = _resolve_speculative_algorithm_alias(
-            self.speculative_algorithm,
-            self.speculative_draft_model_path,
-            trust_remote_code=self.trust_remote_code,
-        )
-
-        if self.speculative_algorithm is not None:
-            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-            from sglang.srt.speculative.spec_registry import CustomSpecAlgo
-
-            algo = SpeculativeAlgorithm.from_string(self.speculative_algorithm)
-
-            # TODO: move the per-algorithm validation below into spec module hooks.
-            if (
-                isinstance(algo, CustomSpecAlgo)
-                and algo.validate_server_args is not None
-            ):
-                algo.validate_server_args(self)
-
-        if self.speculative_skip_dp_mlp_sync:
-            assert self.speculative_algorithm == "EAGLE", (
-                "--speculative-skip-dp-mlp-sync is only supported with "
-                f"speculative_algorithm == EAGLE, got {self.speculative_algorithm}."
-            )
-
-        if self.speculative_algorithm == "DFLASH":
-            if self.enable_dp_attention:
-                raise ValueError(
-                    "Currently DFLASH speculative decoding does not support dp attention."
-                )
-
-            if self.pp_size != 1:
-                raise ValueError(
-                    "Currently DFLASH speculative decoding only supports pp_size == 1."
-                )
-
-            if self.speculative_draft_model_path is None:
-                raise ValueError(
-                    "DFLASH speculative decoding requires setting --speculative-draft-model-path."
-                )
-
-            # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
-            # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
-            # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
-            #
-            # For DFlash, the natural unit is `block_size` (verify window length).
-            if self.speculative_num_steps is None:
-                self.speculative_num_steps = 1
-            elif int(self.speculative_num_steps) != 1:
-                logger.warning(
-                    "DFLASH only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
-                    self.speculative_num_steps,
-                )
-                self.speculative_num_steps = 1
-
-            if self.speculative_eagle_topk is None:
-                self.speculative_eagle_topk = 1
-            elif int(self.speculative_eagle_topk) != 1:
-                logger.warning(
-                    "DFLASH only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
-                    self.speculative_eagle_topk,
-                )
-                self.speculative_eagle_topk = 1
-
-            if self.speculative_dflash_block_size is not None:
-                if int(self.speculative_dflash_block_size) <= 0:
-                    raise ValueError(
-                        "DFLASH requires --speculative-dflash-block-size to be positive, "
-                        f"got {self.speculative_dflash_block_size}."
-                    )
-                if self.speculative_num_draft_tokens is not None and int(
-                    self.speculative_num_draft_tokens
-                ) != int(self.speculative_dflash_block_size):
-                    raise ValueError(
-                        "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
-                        "but they differ. For DFLASH they must match. "
-                        f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
-                        f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
-                    )
-                self.speculative_num_draft_tokens = int(
-                    self.speculative_dflash_block_size
-                )
-
-            window_size = None
-            if self.speculative_draft_window_size is not None:
-                window_size = int(self.speculative_draft_window_size)
-                if window_size <= 0:
-                    raise ValueError(
-                        f"--speculative-draft-window-size must be positive, got {window_size}."
-                    )
-                self.speculative_draft_window_size = window_size
-
-            if self.speculative_num_draft_tokens is None:
-                from sglang.srt.speculative.dflash_utils import (
-                    parse_dflash_draft_config,
-                )
-
-                model_override_args = json.loads(self.json_model_override_args)
-                inferred_block_size = None
-                try:
-                    from sglang.srt.utils.hf_transformers_utils import get_config
-
-                    draft_hf_config = get_config(
-                        self.speculative_draft_model_path,
-                        trust_remote_code=self.trust_remote_code,
-                        revision=self.speculative_draft_model_revision,
-                        model_override_args=model_override_args,
-                    )
-                    inferred_block_size = parse_dflash_draft_config(
-                        draft_hf_config=draft_hf_config
-                    ).resolve_block_size(default=None)
-                except Exception as e:
-                    logger.warning(
-                        "Failed to infer DFLASH block_size from draft model config; "
-                        "defaulting speculative_num_draft_tokens to 16. Error: %s",
-                        e,
-                    )
-
-                if inferred_block_size is None:
-                    inferred_block_size = 16
-                    logger.warning(
-                        "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
-                        inferred_block_size,
-                    )
-                self.speculative_num_draft_tokens = inferred_block_size
-
-            if window_size is not None:
-                draft_tokens = int(self.speculative_num_draft_tokens)
-                if window_size < draft_tokens:
-                    raise ValueError(
-                        "--speculative-draft-window-size must be >= "
-                        "--speculative-num-draft-tokens (block_size). "
-                        f"window_size={window_size}, block_size={draft_tokens}."
-                    )
-
-            if self.max_running_requests is None:
-                self.max_running_requests = 48
-                logger.warning(
-                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-                )
-
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
-            )
-
-            if self.enable_mixed_chunk:
-                self.enable_mixed_chunk = False
-                logger.warning(
-                    "Mixed chunked prefill is disabled because of using dflash speculative decoding."
-                )
-
-        if self.speculative_algorithm == "FROZEN_KV_MTP":
-            if self.max_running_requests is None:
-                self.max_running_requests = 48
-                logger.warning(
-                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-                )
-
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled when using Frozen-KV MTP speculative decoding (spec v2 is not supported yet)."
-            )
-
-            if self.enable_mixed_chunk:
-                self.enable_mixed_chunk = False
-                logger.warning(
-                    "Mixed chunked prefill is disabled because of using "
-                    "Frozen-KV MTP speculative decoding."
-                )
-
-        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
-            if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
-                # TODO: support dp attention for standalone speculative decoding
-                raise ValueError(
-                    "Currently standalone speculative decoding does not support dp attention."
-                )
-
-            if self.max_running_requests is None:
-                self.max_running_requests = 48
-                logger.warning(
-                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-                )
-
-            spec_v1_reason = None
-            if (
-                self.speculative_eagle_topk is not None
-                and self.speculative_eagle_topk > 1
-                and not self.disable_overlap_schedule
-            ):
-                self.disable_overlap_schedule = True
-                spec_v1_reason = "spec v2 currently only supports topk = 1"
-            elif (
-                not envs.SGLANG_ENABLE_SPEC_V2.get()
-                and not self.disable_overlap_schedule
-            ):
-                self.disable_overlap_schedule = True
-                spec_v1_reason = "SGLANG_ENABLE_SPEC_V2=False"
-
-            if self.disable_overlap_schedule:
-                logger.warning(
-                    "Spec v1 is used for eagle/eagle3/standalone speculative decoding because %s.",
-                    spec_v1_reason or "overlap schedule is disabled",
-                )
-            else:
-                logger.warning(
-                    "Spec v2 is enabled by default for eagle/eagle3/standalone speculative decoding."
-                )
-
-            if self.enable_mixed_chunk:
-                self.enable_mixed_chunk = False
-                logger.warning(
-                    "Mixed chunked prefill is disabled because of using "
-                    "eagle speculative decoding."
-                )
-
-            model_arch = self.get_model_config().hf_config.architectures[0]
-            if model_arch in [
-                "DeepseekV32ForCausalLM",
-                "DeepseekV3ForCausalLM",
-                "DeepseekV4ForCausalLM",
-                "Glm4MoeForCausalLM",
-                "Glm4MoeLiteForCausalLM",
-                "GlmMoeDsaForCausalLM",
-                "BailingMoeForCausalLM",
-                "BailingMoeV2ForCausalLM",
-                "BailingMoeV2_5ForCausalLM",
-                "MistralLarge3ForCausalLM",
-                "PixtralForConditionalGeneration",
-                "HYV3ForCausalLM",
-            ]:
-                if self.speculative_draft_model_path is None:
-                    self.speculative_draft_model_path = self.model_path
-                    self.speculative_draft_model_revision = self.revision
-                else:
-                    if model_arch not in [
-                        "MistralLarge3ForCausalLM",
-                        "PixtralForConditionalGeneration",
-                    ]:
-                        logger.warning(
-                            "DeepSeek MTP does not require setting speculative_draft_model_path."
-                        )
-
-            if self.speculative_num_steps is None:
-                assert (
-                    self.speculative_eagle_topk is None
-                    and self.speculative_num_draft_tokens is None
-                )
-                (
-                    self.speculative_num_steps,
-                    self.speculative_eagle_topk,
-                    self.speculative_num_draft_tokens,
-                ) = auto_choose_speculative_params(self)
-
-            if (
-                self.attention_backend == "trtllm_mha"
-                or self.decode_attention_backend == "trtllm_mha"
-                or self.prefill_attention_backend == "trtllm_mha"
-            ):
-                if self.speculative_eagle_topk > 1:
-                    raise ValueError(
-                        "trtllm_mha backend only supports topk = 1 for speculative decoding."
-                    )
-
-            if (
-                self.speculative_eagle_topk == 1
-                and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
-            ):
-                logger.warning(
-                    "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 when speculative_eagle_topk == 1"
-                )
-                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
-
-            if (
-                self.speculative_eagle_topk > 1
-                and self.page_size > 1
-                and self.attention_backend not in ["flashinfer", "fa3"]
-            ):
-                raise ValueError(
-                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
-                )
-
-        if self.speculative_algorithm == "NGRAM":
-            if not self.device.startswith("cuda"):
-                raise ValueError(
-                    "Ngram speculative decoding only supports CUDA device."
-                )
-
-            if self.max_running_requests is None:
-                self.max_running_requests = 48
-                logger.warning(
-                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-                )
-
-            self.disable_overlap_schedule = True
-            self.enable_mixed_chunk = False
-            self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
-            if self.speculative_num_draft_tokens is None:
-                self.speculative_num_draft_tokens = 12
-                logger.warning(
-                    "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
-                    "You can override this by explicitly setting --speculative-num-draft-tokens."
-                )
-            if self.speculative_ngram_external_corpus_path is not None:
-                if self.speculative_ngram_external_sam_budget <= 0:
-                    raise ValueError(
-                        "--speculative-ngram-external-sam-budget must be positive when "
-                        "--speculative-ngram-external-corpus-path is set."
-                    )
-                if self.speculative_ngram_external_corpus_max_tokens <= 0:
-                    raise ValueError(
-                        "--speculative-ngram-external-corpus-max-tokens must be positive when "
-                        "--speculative-ngram-external-corpus-path is set."
-                    )
-                if (
-                    self.speculative_ngram_external_sam_budget
-                    > self.speculative_num_draft_tokens - 1
-                ):
-                    raise ValueError(
-                        "speculative_ngram_external_sam_budget must be less than or equal to "
-                        f"speculative_num_draft_tokens - 1 ({self.speculative_num_draft_tokens - 1})."
-                    )
-            logger.warning(
-                "The overlap scheduler and mixed chunked prefill are disabled because of "
-                "using ngram speculative decoding."
-            )
-
-            if (
-                self.speculative_eagle_topk > 1
-                and self.page_size > 1
-                and self.attention_backend != "flashinfer"
-            ):
-                raise ValueError(
-                    f"speculative_eagle_topk({self.speculative_eagle_topk}) > 1 "
-                    f"with page_size({self.page_size}) > 1 is unstable "
-                    "and produces incorrect results for paged attention backends. "
-                    "This combination is only supported for the 'flashinfer' backend."
-                )
-            if self.enable_dp_attention:
-                # TODO: support dp attention for ngram speculative decoding
-                raise ValueError(
-                    "Currently ngram speculative decoding does not support dp attention."
-                )
-
-        if self.speculative_adaptive:
-            from sglang.srt.speculative.adaptive_spec_params import (
-                adaptive_unsupported_reason,
-            )
-
-            reason = adaptive_unsupported_reason(self)
-            if reason is not None:
-                logger.warning(
-                    f"speculative_adaptive disabled: {reason}. "
-                    "Falling back to static speculative params."
-                )
-                self.speculative_adaptive = False
-
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -4213,6 +3814,12 @@ class ServerArgs:
                     f"(requested {self.tokenizer_worker_num})."
                 )
                 self.tokenizer_worker_num = 1
+            if self.detokenizer_worker_num != 1:
+                logger.warning(
+                    "skip_tokenizer_init=True disables detokenizer workers; forcing detokenizer_worker_num=1 "
+                    f"(requested {self.detokenizer_worker_num})."
+                )
+                self.detokenizer_worker_num = 1
 
             if self.enable_tokenizer_batch_encode:
                 logger.warning(
@@ -4555,6 +4162,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tokenizer_worker_num,
             help="The worker num of the tokenizer manager.",
+        )
+        parser.add_argument(
+            "--detokenizer-worker-num",
+            type=int,
+            default=ServerArgs.detokenizer_worker_num,
+            help="The worker num of the detokenizer manager.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -5858,16 +5471,25 @@ class ServerArgs:
         )
         parser.add_argument(
             "--speculative-draft-window-size",
-            "--speculative-dflash-draft-window-size",
             type=int,
             dest="speculative_draft_window_size",
-            help="Sliding window size for the draft model (honored by EAGLE-3 and DFLASH). "
-            "For EAGLE-3, the drafter only attends to the most recent N keys "
+            help="Sliding window size for the draft model. Honored by Llama EAGLE-3 "
+            "(`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. "
+            "MLA-based drafters) silently ignore it. "
+            "For Llama EAGLE-3, the drafter only attends to the most recent N keys "
             "(verifier hidden states + its own outputs); the verifier is unaffected. "
             "For DFLASH, the draft worker keeps a recent target-token window in its "
             "local KV cache (paged backends may retain up to one extra page on the "
             "left for alignment). Default is full attention/context.",
             default=ServerArgs.speculative_draft_window_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-draft-window-size",
+            type=int,
+            dest="speculative_draft_window_size",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--speculative-draft-window-size",
+            help=argparse.SUPPRESS,
         )
         parser.add_argument(
             "--speculative-moe-runner-backend",
@@ -5990,14 +5612,6 @@ class ServerArgs:
             choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
-        )
-        parser.add_argument(
-            "--record-nolora-graph",
-            action=argparse.BooleanOptionalAction,
-            default=ServerArgs.record_nolora_graph,
-            help="Capture a second set of CUDA graphs without LoRA hooks. "
-            "Batches without active adapters replay the faster nolora graph. "
-            "Enabled by default.",
         )
         parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
@@ -7302,6 +6916,7 @@ class ServerArgs:
                 )
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+        assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
         )
@@ -7848,68 +7463,6 @@ class PortArgs:
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )
-
-
-class LoRAPathAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        lora_paths = []
-        if values:
-            assert isinstance(values, list), "Expected a list of LoRA paths."
-            for lora_path in values:
-                lora_path = lora_path.strip()
-                if lora_path.startswith("{") and lora_path.endswith("}"):
-                    obj = json.loads(lora_path)
-                    assert "lora_path" in obj and "lora_name" in obj, (
-                        f"{repr(lora_path)} looks like a JSON str, "
-                        "but it does not contain 'lora_name' and 'lora_path' keys."
-                    )
-                    lora_paths.append(obj)
-                else:
-                    lora_paths.append(lora_path)
-
-        setattr(namespace, self.dest, lora_paths)
-
-
-def print_deprecated_warning(message: str):
-    logger.warning(f"\033[1;33m{message}\033[0m")
-
-
-class DeprecatedAction(argparse.Action):
-    def __init__(self, option_strings, dest, nargs=0, **kwargs):
-        super(DeprecatedAction, self).__init__(
-            option_strings, dest, nargs=nargs, **kwargs
-        )
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        print_deprecated_warning(
-            f"The command line argument '{option_string}' is deprecated and will be removed in future versions."
-        )
-
-
-class DeprecatedStoreTrueAction(argparse.Action):
-    """Deprecated flag that still stores True and prints a warning."""
-
-    def __init__(
-        self,
-        option_strings,
-        dest,
-        new_flag=None,
-        nargs=0,
-        const=True,
-        default=False,
-        **kwargs,
-    ):
-        self.new_flag = new_flag
-        super().__init__(
-            option_strings, dest, nargs=nargs, const=const, default=default, **kwargs
-        )
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        replacement = f" Use '{self.new_flag}' instead." if self.new_flag else ""
-        print_deprecated_warning(
-            f"'{option_string}' is deprecated and will be removed in a future release.{replacement}"
-        )
-        setattr(namespace, self.dest, True)
 
 
 def auto_choose_speculative_params(self: ServerArgs):

@@ -334,6 +334,17 @@ print()
 Pending update — replace with real server output after deployment.
 ```
 
+#### 4.2.3 HiCache (Hierarchical KV Caching)
+
+HiCache enables multi-tier KV cache offloading (GPU → CPU → Storage), significantly expanding effective context capacity for long-context and multi-turn scenarios. Combined with UnifiedRadixTree, it provides intelligent prefix caching across all tiers.
+
+To enable HiCache, use the **HiCache** toggle in the [command generator above](#3-model-deployment):
+
+- **L2 (GPU + CPU):** Offloads cold KV pages to CPU memory. Enables `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1` for intelligent hierarchical prefix caching.
+- **L3 (GPU + CPU + Storage):** Coming soon.
+
+For more details, see the [HiCache documentation](../../../docs/advanced_features/hicache).
+
 ## 5. Benchmark
 
 ### 5.1 Speed Benchmark on Blackwell
