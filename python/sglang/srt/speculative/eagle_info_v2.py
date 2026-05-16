@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -42,16 +41,17 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleDraftInput,
+    EagleVerifyInput,
+    EagleVerifyOutput,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
-    )
-    from sglang.srt.speculative.eagle_info import (
-        EagleDraftExtendInput,
-        EagleDraftInput,
-        EagleVerifyInput,
-        EagleVerifyOutput,
     )
 
 if is_cuda() or is_musa():
@@ -89,9 +89,13 @@ def assign_draft_cache_locs_page_size_1(
         tl.store(out_cache_ptr + copy_offset, data, mask=mask)
 
 
-@dataclass
-class EagleDraftInputV2Mixin:
-    def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+class EagleDraftInputV2(EagleDraftInput):
+    """V2 (overlap) sister of `EagleDraftInput`. Adds V2-only prepare methods.
+    V1 path constructs `EagleDraftInput`; V2 path constructs this subclass so
+    `prepare_for_decode` / `prepare_for_v2_draft` are dispatched correctly.
+    """
+
+    def prepare_for_decode(self, batch: ScheduleBatch):
         batch.maybe_evict_swa()
 
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -180,7 +184,7 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
     def prepare_for_v2_draft(
-        self: EagleDraftInput,
+        self,
         req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
         cuda_graph_runner: EAGLEDraftCudaGraphRunner,
@@ -223,10 +227,12 @@ class EagleDraftInputV2Mixin:
         return forward_batch, can_cuda_graph
 
 
-@dataclass
-class EagleDraftExtendInputV2Mixin:
+class EagleDraftExtendInputV2(EagleDraftExtendInput):
+    """V2 sister of `EagleDraftExtendInput`. Adds the V2-only extend-to-fill
+    prepare path used by the second forward (`_draft_extend_for_decode`)."""
+
     def prepare_for_extend_to_fill_draft_kvcache(
-        self: EagleDraftExtendInput,
+        self,
         batch: ModelWorkerBatch,
         predict: torch.Tensor,
         num_draft_tokens: int,
@@ -263,10 +269,18 @@ class EagleDraftExtendInputV2Mixin:
         return forward_batch
 
 
-@dataclass
-class EagleVerifyInputV2Mixin:
+class EagleVerifyInputV2(EagleVerifyInput):
+    """V2 sister of `EagleVerifyInput`. Overrides `sample` (the V1 dataclass-
+    level method) with the V2 logic that builds an `EagleDraftExtendInputV2`
+    and a `predict` tensor for the V2 overlap pipeline.
+
+    Lives as a separate class (rather than mixin on V1) so V2's `sample` does
+    not get shadowed by V1's `sample` via MRO. V2 worker construction sites
+    instantiate this subclass directly.
+    """
+
     def prepare_for_v2_verify(
-        self: EagleVerifyInput,
+        self,
         req_to_token_pool: ReqToTokenPool,
         batch: ModelWorkerBatch,
         target_worker: TpModelWorker,
@@ -339,35 +353,25 @@ class EagleVerifyInputV2Mixin:
 
         return verify_forward_batch, can_run_cuda_graph
 
-    def verify_v2(
-        self: EagleVerifyInput,
+    def sample(
+        self,
         batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
         vocab_mask: torch.Tensor = None,
-    ) -> "EagleVerifyOutput":
-        """
-        V2 counterpart to `EagleVerifyInput.sample` (the V1 dataclass-level
-        method). Sample target tokens, verify against drafts, and produce an
-        `EagleVerifyOutput`.
-
-        Cannot be named `sample` because the V1 method is defined directly on
-        `EagleVerifyInput` and would shadow this mixin method via MRO.
+    ) -> EagleVerifyOutput:
+        """V2 override of `EagleVerifyInput.sample`. Samples target tokens,
+        verifies against drafts, and produces an `EagleVerifyOutput`.
 
         `verify_output.accept_tokens` is the V1-style flat accepted slice;
         `verify_output.predict` is the V2-only full padded per-position sample.
         """
-        from sglang.srt.speculative.eagle_info import (
-            EagleDraftExtendInput,
-            EagleVerifyOutput,
-        )
-
         device = batch.input_ids.device
         if batch.forward_mode.is_idle():
             predict = torch.empty(0, dtype=torch.int32, device=device)
             num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
             accept_index = torch.empty(0, dtype=torch.int32, device=device)
             return EagleVerifyOutput(
-                draft_extend_input=EagleDraftExtendInput(
+                draft_extend_input=EagleDraftExtendInputV2(
                     hidden_states=logits_output.hidden_states,
                     num_correct_drafts=num_correct_drafts,
                     num_accept_tokens=num_correct_drafts + 1,
@@ -514,7 +518,7 @@ class EagleVerifyInputV2Mixin:
         # +1 when packaged into `EagleDraftExtendInput.num_accept_tokens`, so the
         # local name does not flip semantics mid-function (naming doc C2).
         return EagleVerifyOutput(
-            draft_extend_input=EagleDraftExtendInput(
+            draft_extend_input=EagleDraftExtendInputV2(
                 # V2 keeps `hidden_states` as the full target output (shape
                 # `[bs * draft_token_num, hidden]`); V1 instead stores the
                 # accept-sliced view. The downstream V2 cuda-graph runner

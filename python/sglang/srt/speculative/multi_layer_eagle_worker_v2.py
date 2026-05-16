@@ -35,13 +35,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
-from sglang.srt.speculative.eagle_info import (
-    EagleDraftExtendInput,
-    EagleDraftInput,
-    EagleVerifyInput,
-    EagleVerifyOutput,
+from sglang.srt.speculative.eagle_info import EagleVerifyOutput
+from sglang.srt.speculative.eagle_info_v2 import (
+    EagleDraftExtendInputV2,
+    EagleDraftInputV2,
+    EagleVerifyInputV2,
+    fill_bonus_tokens,
 )
-from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
@@ -111,7 +111,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         )
 
         # Set constant
-        EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
+        EagleDraftInputV2.ALLOC_LEN_PER_DECODE = max(
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
@@ -233,7 +233,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
-        draft_input: EagleDraftInput = model_worker_batch.spec_info
+        draft_input: EagleDraftInputV2 = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
             model_worker_batch,
@@ -247,7 +247,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
 
         if model_worker_batch.forward_mode.is_idle():
-            return EagleVerifyInput.create_idle_input(
+            return EagleVerifyInputV2.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
@@ -280,7 +280,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             position_buf,
         )
 
-        return EagleVerifyInput(
+        return EagleVerifyInputV2(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
@@ -298,7 +298,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
-        spec_info: EagleDraftInput = forward_batch.spec_info
+        spec_info: EagleDraftInputV2 = forward_batch.spec_info
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
             spec_info.topk_index,
@@ -384,7 +384,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             next_token_ids: Next token ids generated from the target forward.
         """
         # Install draft-extend spec_info for the extend forward.
-        extend_input = EagleDraftExtendInput(
+        extend_input = EagleDraftExtendInputV2(
             hidden_states=target_hidden_states,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
@@ -441,7 +441,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Assemble fresh next-iter draft spec_info from the extend output.
         # `extend_input.hidden_states` is the chain-MTP-propagated value from
         # the loop, or `target_hidden_states` if chain-MTP is disabled.
-        next_draft_input = EagleDraftInput(
+        next_draft_input = EagleDraftInputV2(
             topk_p=torch.cat(topk_p_list, dim=1),
             topk_index=torch.cat(topk_index_list, dim=1),
             hidden_states=extend_input.hidden_states,
@@ -710,15 +710,17 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     if self.speculative_algorithm.is_standalone()
                     else CaptureHiddenMode.LAST
                 )
-                model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
+                model_worker_batch.spec_info = EagleDraftInputV2.create_idle_input(
                     device=self.device,
-                    hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
-                    dtype=EagleDraftInput.dtype_for(self.draft_worker),
+                    hidden_size=EagleDraftInputV2.hidden_size_for(self.draft_worker),
+                    dtype=EagleDraftInputV2.dtype_for(self.draft_worker),
                     topk=self.topk * self.speculative_num_steps,
                     capture_hidden_mode=capture_mode,
                 )
-            draft_input: EagleDraftInput = model_worker_batch.spec_info
-            verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
+            draft_input: EagleDraftInputV2 = model_worker_batch.spec_info
+            verify_input: EagleVerifyInputV2 = self.draft_worker.draft(
+                model_worker_batch
+            )
             assert verify_input.is_verify_input()
             # Record a CUDA event after draft() GPU work is dispatched.
             if self.plan_stream:
@@ -743,7 +745,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
 
         # Parse args
-        verify_input: EagleVerifyInput = batch.spec_info
+        verify_input: EagleVerifyInputV2 = batch.spec_info
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
@@ -789,7 +791,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
-        verify_output = verify_input.verify_v2(batch, logits_output)
+        verify_output = verify_input.sample(batch, logits_output)
         accept_lens = verify_output.draft_extend_input.num_accept_tokens
         new_seq_lens = batch.seq_lens + accept_lens
         verify_done = torch.get_device_module(self.device).Event()
@@ -816,7 +818,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             )
 
         # Construct the next draft input
-        next_draft_input = EagleDraftInput(
+        next_draft_input = EagleDraftInputV2(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
