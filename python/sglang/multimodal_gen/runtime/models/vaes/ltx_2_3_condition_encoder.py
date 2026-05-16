@@ -3,6 +3,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
     LTX2VideoCausalConv3d,
     LTX2VideoResnetBlock3d,
@@ -110,7 +113,10 @@ def _make_ltx23_encoder_block(
     )
 
 
-class LTX23VideoConditionEncoder(nn.Module):
+class LTX23VideoConditionEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_default_enabled = False
+    layer_names = ["down_blocks"]
+
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__()
 
