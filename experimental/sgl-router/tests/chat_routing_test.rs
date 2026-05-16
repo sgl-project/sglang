@@ -617,7 +617,51 @@ async fn no_healthy_workers_returns_503() {
     assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         res.headers().get("x-router-error-code").unwrap(),
-        "service_unavailable"
+        "no_healthy_workers"
+    );
+}
+
+/// A worker is registered for a model that is NOT in `cfg.models` (so the
+/// policy registry has no entry for it).  The handler returns 404
+/// `model_not_found` rather than 500 — clients can recover by sending a
+/// different model name; an internal_error would mask the misconfiguration.
+#[tokio::test]
+async fn unknown_model_with_no_policy_returns_404_model_not_found() {
+    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config_for(&worker.url);
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    // Register a worker that claims to serve "ghost-7b" — a model the
+    // policy registry knows nothing about.
+    registry.add(WorkerSpec {
+        id: WorkerId("w-ghost".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("ghost-7b".into())],
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let placeholder_url = reqwest::Url::parse("http://placeholder.invalid").unwrap();
+    let proxy = Arc::new(Proxy::new(placeholder_url, TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "ghost-7b",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        res.headers().get("x-router-error-code").unwrap(),
+        "model_not_found",
     );
 }
 
@@ -687,9 +731,56 @@ async fn forward_json_to_rejects_when_breaker_open() {
 
     let err = res.expect_err("breaker open → ApiError");
     match err {
-        ApiError::ServiceUnavailable(_) => {}
-        other => panic!("expected ServiceUnavailable, got {other:?}"),
+        ApiError::BreakerOpen { .. } => {}
+        other => panic!("expected BreakerOpen, got {other:?}"),
     }
+}
+
+/// A malformed worker URL (operator typo in `workers.toml`, broken k8s
+/// annotation) must surface as 503 `worker_misconfigured` (not 500
+/// `internal_error`) AND trip the worker's circuit breaker so the malformed
+/// worker drops out of `healthy_workers_for` and subsequent requests skip
+/// it.
+#[tokio::test]
+async fn forward_json_to_malformed_url_returns_worker_misconfigured_and_trips_breaker() {
+    use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use sgl_router::server::error::ApiError;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let proxy = Proxy::new(
+        reqwest::Url::parse("http://placeholder.invalid").unwrap(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+        threshold: 1,
+        cool_down: Duration::from_secs(30),
+    }));
+
+    let headers = axum::http::HeaderMap::new();
+    let body = bytes::Bytes::from(b"{}".to_vec());
+    let res = proxy
+        .forward_json_to(
+            "not-a-url",
+            &breaker,
+            "/v1/chat/completions",
+            &headers,
+            body,
+        )
+        .await;
+
+    let err = res.expect_err("malformed URL → ApiError");
+    match &err {
+        ApiError::WorkerMisconfigured { worker, .. } => {
+            assert_eq!(worker, "not-a-url", "{err:?}");
+        }
+        other => panic!("expected WorkerMisconfigured, got {other:?}"),
+    }
+    assert!(
+        !breaker.allow(),
+        "WorkerMisconfigured must trip the breaker so the worker drops out of selection",
+    );
 }
 
 /// Regression test: LoadGuard must be held for the *body* lifetime of a

@@ -48,8 +48,36 @@ pub enum ApiError {
     #[error("upstream timed out: worker {worker}")]
     UpstreamTimeout { worker: reqwest::Url },
 
-    #[error("service unavailable: {0}")]
-    ServiceUnavailable(String),
+    /// No healthy worker is available for `model`: either none were ever
+    /// registered, or every candidate's circuit breaker is open.  Clients
+    /// should retry; operators should check discovery + worker health.
+    #[error("no healthy workers for model {model}")]
+    NoHealthyWorkers { model: String },
+
+    /// The per-model policy returned `None` despite the candidate set
+    /// being non-empty.  Almost always a router bug or an unsupported
+    /// policy state; surfaced as 503 (not 500) so retry-on-failure clients
+    /// can drain through a rotation rather than fail-fast on internal_error.
+    #[error("policy selected no worker for model {model}")]
+    PolicySelectionFailed { model: String },
+
+    /// The worker's circuit breaker was open at the moment of dispatch.
+    /// Surfaced post-policy-selection (race with `healthy_workers_for`);
+    /// the next selection will skip this worker.
+    #[error("worker circuit breaker open: {worker}")]
+    BreakerOpen { worker: String },
+
+    /// The worker URL emitted by discovery failed to parse.  Always a
+    /// config / discovery-backend bug, not a transient infra issue — but
+    /// from the client's perspective the worker is unreachable, so 503.
+    /// The forwarder trips the circuit breaker before returning so the
+    /// malformed worker drops out of subsequent selection.
+    #[error("worker misconfigured: {worker}")]
+    WorkerMisconfigured {
+        worker: String,
+        #[source]
+        source: anyhow::Error,
+    },
 
     #[error("internal: {0}")]
     Internal(#[from] anyhow::Error),
@@ -65,8 +93,15 @@ impl ApiError {
             }
             ApiError::UpstreamStatus { .. } => (StatusCode::BAD_GATEWAY, "upstream_status"),
             ApiError::UpstreamTimeout { .. } => (StatusCode::BAD_GATEWAY, "upstream_timeout"),
-            ApiError::ServiceUnavailable(_) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
+            ApiError::NoHealthyWorkers { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, "no_healthy_workers")
+            }
+            ApiError::PolicySelectionFailed { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, "policy_selection_failed")
+            }
+            ApiError::BreakerOpen { .. } => (StatusCode::SERVICE_UNAVAILABLE, "breaker_open"),
+            ApiError::WorkerMisconfigured { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, "worker_misconfigured")
             }
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         }
@@ -121,8 +156,24 @@ impl IntoResponse for ApiError {
                 tracing::warn!(upstream = %worker, "upstream request timed out");
                 "upstream request timed out".to_string()
             }
-            ApiError::ServiceUnavailable(reason) => {
-                tracing::warn!(reason = %reason, "service unavailable");
+            ApiError::NoHealthyWorkers { model } => {
+                tracing::warn!(model = %model, reason = "no_healthy_workers", "service unavailable");
+                "no healthy workers for the requested model".to_string()
+            }
+            ApiError::PolicySelectionFailed { model } => {
+                tracing::warn!(model = %model, reason = "policy_selection_failed", "service unavailable");
+                "service unavailable".to_string()
+            }
+            ApiError::BreakerOpen { worker } => {
+                tracing::warn!(upstream = %worker, reason = "breaker_open", "service unavailable");
+                "service unavailable".to_string()
+            }
+            ApiError::WorkerMisconfigured { worker, source } => {
+                tracing::error!(
+                    upstream = %worker,
+                    error = %format_args!("{source:#}"),
+                    "worker URL emitted by discovery is malformed",
+                );
                 "service unavailable".to_string()
             }
             ApiError::BadRequest(_) | ApiError::ModelNotFound(_) => self.to_string(),

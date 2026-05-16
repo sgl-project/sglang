@@ -61,22 +61,24 @@ pub async fn chat_completions(
 
     let workers = ctx.registry.healthy_workers_for(&model_id);
     if workers.is_empty() {
-        return Err(ApiError::ServiceUnavailable(format!(
-            "no healthy workers for model {model_str}"
-        )));
+        return Err(ApiError::NoHealthyWorkers {
+            model: model_str.clone(),
+        });
     }
 
     let policy = ctx
         .policies
         .get(&model_id)
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("no policy for model {model_str}")))?;
+        .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
     let selection_ctx = SelectionContext {
         model: &model_id,
         request_body: Some(&body),
     };
     let worker = policy
         .select(&workers, &selection_ctx)
-        .ok_or_else(|| ApiError::ServiceUnavailable("policy returned no worker".into()))?;
+        .ok_or_else(|| ApiError::PolicySelectionFailed {
+            model: model_str.clone(),
+        })?;
 
     let guard = worker.load_guard();
 

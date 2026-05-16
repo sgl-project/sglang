@@ -15,6 +15,20 @@ use bytes::Bytes;
 use reqwest::{Client, Url};
 use std::time::Duration;
 
+/// Parse a worker URL emitted by discovery.  On failure, trip the worker's
+/// circuit breaker so the malformed worker drops out of subsequent
+/// `healthy_workers_for(...)` selection, then surface the error as
+/// `ApiError::WorkerMisconfigured`.
+fn parse_worker_url(worker_url: &str, breaker: &CircuitBreaker) -> Result<Url, ApiError> {
+    Url::parse(worker_url).map_err(|e| {
+        breaker.record_failure();
+        ApiError::WorkerMisconfigured {
+            worker: worker_url.to_string(),
+            source: anyhow::Error::new(e).context("parse worker URL"),
+        }
+    })
+}
+
 #[derive(Debug)]
 pub struct Proxy {
     /// Pre-parsed worker URL. Downstream paths are built via [`Url::join`]
@@ -119,15 +133,11 @@ impl Proxy {
         body: Bytes,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
-            return Err(ApiError::ServiceUnavailable(
-                "worker circuit breaker open".into(),
-            ));
+            return Err(ApiError::BreakerOpen {
+                worker: worker_url.to_string(),
+            });
         }
-        let worker_url = Url::parse(worker_url).map_err(|e| {
-            ApiError::Internal(
-                anyhow::Error::new(e).context(format!("parse worker URL {worker_url:?}")),
-            )
-        })?;
+        let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
@@ -189,15 +199,11 @@ impl Proxy {
         load_guard: Option<crate::workers::LoadGuard>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
-            return Err(ApiError::ServiceUnavailable(
-                "worker circuit breaker open".into(),
-            ));
+            return Err(ApiError::BreakerOpen {
+                worker: worker_url.to_string(),
+            });
         }
-        let worker_url = Url::parse(worker_url).map_err(|e| {
-            ApiError::Internal(
-                anyhow::Error::new(e).context(format!("parse worker URL {worker_url:?}")),
-            )
-        })?;
+        let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
