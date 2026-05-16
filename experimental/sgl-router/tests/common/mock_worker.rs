@@ -14,6 +14,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::oneshot;
 
 /// Headers captured from the most recent inbound request.
@@ -25,6 +26,7 @@ pub struct CapturedHeaders {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)] // Only used by some test files; mock_worker is shared.
 pub struct MockWorkerState {
     pub captured: Arc<Mutex<CapturedHeaders>>,
     pub stream_chunks: Arc<Vec<&'static str>>,
@@ -44,6 +46,7 @@ impl MockWorker {
     ///
     /// `stream_chunks` are the raw SSE bytes returned when a streaming
     /// chat-completion request arrives.
+    #[allow(dead_code)] // Only used by some test files.
     pub async fn start(stream_chunks: Vec<&'static str>) -> Self {
         let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
         let state = MockWorkerState {
@@ -52,6 +55,72 @@ impl MockWorker {
         };
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        Self {
+            url,
+            captured,
+            _shutdown: tx,
+        }
+    }
+
+    /// Bind to a random port and start a worker that accepts the request,
+    /// sleeps for `delay`, then returns `200 OK` with an empty JSON object.
+    /// Used to test router behaviour when the upstream wedges after accepting
+    /// the TCP connection but before sending response headers.
+    #[allow(dead_code)]
+    pub async fn start_hanging(delay: Duration) -> Self {
+        let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
+
+        #[derive(Clone)]
+        struct HangState {
+            captured: Arc<Mutex<CapturedHeaders>>,
+            delay: Duration,
+        }
+
+        async fn hang_handler(
+            State(s): State<HangState>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> Response<Body> {
+            {
+                let mut g = s.captured.lock().unwrap();
+                g.last_body = Some(body.clone());
+                for (k, v) in headers.iter() {
+                    g.seen.insert(k.as_str().to_string());
+                    if let Ok(val) = v.to_str() {
+                        g.headers.insert(k.as_str().to_string(), val.to_string());
+                    }
+                }
+            }
+            tokio::time::sleep(s.delay).await;
+            let mut r = Response::new(Body::from("{}"));
+            *r.status_mut() = StatusCode::OK;
+            r.headers_mut().insert(
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/json"),
+            );
+            r
+        }
+
+        let state = HangState {
+            captured: captured.clone(),
+            delay,
+        };
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", post(hang_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -140,6 +209,7 @@ impl MockWorker {
     }
 }
 
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
 async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
     {
         let mut g = s.captured.lock().unwrap();

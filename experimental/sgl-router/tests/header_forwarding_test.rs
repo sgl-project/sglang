@@ -11,6 +11,7 @@ use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
 use std::sync::Arc;
+use std::time::Duration;
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -28,10 +29,11 @@ async fn forwards_whitelisted_headers_strips_others() {
         }],
         workers: vec![WorkerConfig {
             url: worker.url.clone(),
+            request_timeout_ms: None,
         }],
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.clone()).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), Duration::from_secs(5)).unwrap());
     let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
 
     let body = serde_json::to_vec(&serde_json::json!({

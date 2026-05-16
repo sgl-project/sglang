@@ -13,7 +13,10 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use std::sync::Arc;
+use std::time::Duration;
 use tower::ServiceExt;
+
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn config(worker_url: &str) -> Config {
     Config {
@@ -28,6 +31,7 @@ fn config(worker_url: &str) -> Config {
         }],
         workers: vec![WorkerConfig {
             url: worker_url.into(),
+            request_timeout_ms: None,
         }],
     }
 }
@@ -37,7 +41,7 @@ async fn non_streaming_returns_200() {
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.clone()).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), TEST_TIMEOUT).unwrap());
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy));
     let app = build_router(ctx);
 
@@ -62,10 +66,15 @@ async fn non_streaming_returns_200() {
 }
 
 #[tokio::test]
-async fn upstream_unreachable_502() {
-    let cfg = config("http://127.0.0.1:1"); // no listener
+async fn non_streaming_upstream_unreachable_returns_502_unreachable() {
+    // Bind a port, drop it — guarantees a closed/refused TCP destination.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    let cfg = config(&dead_url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(cfg.workers[0].url.clone()).unwrap());
+    let proxy = Arc::new(Proxy::new(dead_url.clone(), TEST_TIMEOUT).unwrap());
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy));
     let app = build_router(ctx);
     let req = Request::builder()
@@ -84,7 +93,18 @@ async fn upstream_unreachable_502() {
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         res.headers().get("x-router-error-code").unwrap(),
-        "upstream_error"
+        "upstream_unreachable"
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body_str = String::from_utf8_lossy(&bytes);
+    assert!(
+        body_str.contains("\"code\":\"upstream_unreachable\""),
+        "body: {body_str}"
+    );
+    // Generic message — must not leak reqwest source or worker URL.
+    assert!(
+        !body_str.contains(&dead_url),
+        "worker URL must not leak in client-visible body: {body_str}"
     );
 }
 
@@ -98,7 +118,7 @@ async fn streaming_chunks_pass_through() {
     let worker = common::mock_worker::MockWorker::start(chunks.clone()).await;
     let cfg = config(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.clone()).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), TEST_TIMEOUT).unwrap());
     let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
 
     let req = Request::builder()
@@ -140,7 +160,7 @@ async fn streaming_first_chunk_before_completion() {
     let worker = common::mock_worker::MockWorker::start(chunks).await;
     let cfg = config(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.clone()).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), TEST_TIMEOUT).unwrap());
     let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
 
     let req = Request::builder()
@@ -185,12 +205,12 @@ async fn concurrent_streams_are_isolated() {
     let ctx_a = Arc::new(AppContext::new(
         cfg_a.clone(),
         Arc::new(TokenizerRegistry::load_from_config(&cfg_a).unwrap()),
-        Arc::new(Proxy::new(worker_a.url.clone()).unwrap()),
+        Arc::new(Proxy::new(worker_a.url.clone(), TEST_TIMEOUT).unwrap()),
     ));
     let ctx_b = Arc::new(AppContext::new(
         cfg_b.clone(),
         Arc::new(TokenizerRegistry::load_from_config(&cfg_b).unwrap()),
-        Arc::new(Proxy::new(worker_b.url.clone()).unwrap()),
+        Arc::new(Proxy::new(worker_b.url.clone(), TEST_TIMEOUT).unwrap()),
     ));
     let app_a = build_router(ctx_a);
     let app_b = build_router(ctx_b);
@@ -233,7 +253,7 @@ async fn streaming_upstream_5xx_preserves_content_type() {
     .await;
     let cfg = config(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.clone()).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), TEST_TIMEOUT).unwrap());
     let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
 
     let req = Request::builder()
@@ -266,7 +286,7 @@ async fn malformed_json_returns_400_bad_request() {
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.clone()).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), TEST_TIMEOUT).unwrap());
     let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
     let req = Request::builder()
         .method("POST")

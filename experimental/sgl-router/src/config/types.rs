@@ -34,4 +34,10 @@ pub struct ModelConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerConfig {
     pub url: String,
+    /// Total wall-clock timeout per non-streaming upstream request. Streaming
+    /// endpoints do NOT honour this (long generations are valid). Connect
+    /// timeout is a separate, hard-coded 5 s.
+    /// Defaults to 60 s when missing.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
 }
