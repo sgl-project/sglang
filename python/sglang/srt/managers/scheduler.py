@@ -152,7 +152,6 @@ from sglang.srt.managers.mm_utils import (
     unwrap_shm_features,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -203,6 +202,7 @@ from sglang.srt.observability.scheduler_metrics_mixin import (
 )
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
@@ -214,7 +214,6 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
-    empty_device_cache,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -1343,12 +1342,11 @@ class Scheduler(
             self.future_map = None
             return
 
-        self.future_map = FutureMap(
+        self.future_map = self.spec_algorithm.create_future_map(
             self.max_running_requests,
             self.chunked_prefill_size,
             self.model_config.context_len,
             self.device,
-            self.spec_algorithm,
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -3454,7 +3452,7 @@ class Scheduler(
                 self.draft_worker.clear_cache_pool()
 
             if empty_cache:
-                empty_device_cache(self.device_module)
+                current_platform.empty_cache()
             logger.info("Cache flushed successfully!")
             success = True
         else:
@@ -3852,7 +3850,7 @@ class IdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            empty_device_cache()
+            current_platform.empty_cache()
 
 
 def is_health_check_generate_req(recv_req):
