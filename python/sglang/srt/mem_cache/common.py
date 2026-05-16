@@ -58,7 +58,9 @@ def _safe_call(obj, method_name: str):
 
 
 def _safe_sub(*values):
-    if all(isinstance(v, (int, float, np.integer, np.floating)) for v in values):
+    if values and all(
+        isinstance(v, (int, float, np.integer, np.floating)) for v in values
+    ):
         return int(values[0] - sum(values[1:]))
     return None
 
