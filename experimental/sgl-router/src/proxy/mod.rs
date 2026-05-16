@@ -195,12 +195,25 @@ impl Proxy {
             );
         }
         // Capture content-type BEFORE consuming resp via bytes_stream().
-        let upstream_ct = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/json")
-            .to_string();
+        // If the upstream has a content-type header but its value is not
+        // ASCII-printable (non-conforming worker, mojibake, etc.), we fall
+        // back to application/json — but we log the case so this isn't a
+        // silent corruption. Conformant workers (axum, tonic, fastapi)
+        // never hit this fallback.
+        let upstream_ct = match resp.headers().get(reqwest::header::CONTENT_TYPE) {
+            Some(v) => match v.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    tracing::warn!(
+                        upstream = %url,
+                        "upstream content-type header is not ASCII-printable; \
+                         defaulting to application/json",
+                    );
+                    "application/json".to_string()
+                }
+            },
+            None => "application/json".to_string(),
+        };
         let content_type = if status.is_success() {
             "text/event-stream".to_string()
         } else {
