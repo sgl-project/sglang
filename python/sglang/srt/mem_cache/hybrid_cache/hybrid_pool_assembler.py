@@ -294,8 +294,6 @@ def build_deepseek_v4_hicache_stack(
     c4_state_global_layers = []
     c128_state_global_layers = []
     for layer_id, layer_item in enumerate(kvcache.layer_mapping):
-        if layer_item is None:
-            continue
         if layer_item.compress_ratio == 4:
             c4_layer_mapping[layer_id] = layer_item.compress_layer_id
             c4_state_global_layers.append(layer_id)
