@@ -89,15 +89,18 @@ class NPUGraphRunner(CudaGraphRunner):
             self.attr_name: Dict[str, str] = {
                 AttentionArch.MLA: "actual_seq_lengths_kv",
                 AttentionArch.MHA: "actual_seq_lengths_kv",
+                "TARGET_VERIFY": "actual_seq_kvlen",
             }
         else:
             self.attr_name: Dict[str, str] = {
                 AttentionArch.MLA: "actual_seq_lengths_kv",
                 AttentionArch.MHA: "context_lens",
+                "TARGET_VERIFY": "actual_seq_kvlen",
             }
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
+            "TARGET_VERIFY": [],
         }
 
     def _create_device_graph(self):
@@ -123,12 +126,12 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def _get_update_attr_name(self):
         if self.forward_mode is not None and self.forward_mode.is_target_verify():
-            return "actual_seq_kvlen"
+            return self.attr_name["TARGET_VERIFY"]
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
         if self.forward_mode is not None and self.forward_mode.is_target_verify():
-            return []
+            return self.attr_type["TARGET_VERIFY"]
         return self.attr_type[AttentionArch.MLA]
 
     def _update_inputs(self, seq_lens):
