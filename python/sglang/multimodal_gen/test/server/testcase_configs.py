@@ -441,7 +441,7 @@ HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
 
 MODELOPT_FLUX1_FP8_TRANSFORMER = "lmsys/flux1-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX2_FP8_TRANSFORMER = "lmsys/flux2-dev-modelopt-fp8-sglang-transformer"
-MODELOPT_WAN22_FP8_TRANSFORMER = "lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
+MODELOPT_WAN22_FP8_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8"
 MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER = (
     "lmsys/hunyuanvideo-modelopt-fp8-sglang-transformer"
 )
@@ -451,9 +451,7 @@ MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER = (
 )
 MODELOPT_FLUX1_NVFP4_TRANSFORMER = "lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer"
 MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
-MODELOPT_WAN22_NVFP4_TRANSFORMER = (
-    "lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
-)
+MODELOPT_WAN22_NVFP4_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4"
 MODELOPT_NVFP4_B200_ENV_VARS = {"SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"}
 
 

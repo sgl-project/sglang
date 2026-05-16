@@ -11,8 +11,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_NVFP4_B200_ENV_VARS,
     MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER,
     MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
-    MODELOPT_WAN22_FP8_TRANSFORMER,
-    MODELOPT_WAN22_NVFP4_TRANSFORMER,
+    MODELOPT_WAN22_FP8_MODEL,
+    MODELOPT_WAN22_NVFP4_MODEL,
     T2V_PROMPT,
     DiffusionSamplingParams,
     DiffusionServerArgs,
@@ -429,10 +429,10 @@ else:
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_fp8_t2v",
-            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            model_path=MODELOPT_WAN22_FP8_MODEL,
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
+            extras=[],
         ),
         _make_modelopt_ci_case(
             "hunyuanvideo_modelopt_fp8_t2v",
@@ -480,10 +480,10 @@ else:
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_nvfp4_t2v",
-            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            model_path=MODELOPT_WAN22_NVFP4_MODEL,
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
+            extras=[],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
         ),
     ]
