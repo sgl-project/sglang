@@ -206,8 +206,8 @@ def _run_mega_routed(
     )
 
     if num_tokens > 0:
-        topk_ids_in = topk_ids
-        topk_weights_in = topk_weights
+        topk_ids_in = topk_ids.to(torch.int32)
+        topk_weights_in = topk_weights.to(torch.float32)
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
