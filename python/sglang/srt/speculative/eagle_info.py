@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.base_spec_worker import DraftExecutor
 from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftExtendInputV2Mixin,
     EagleDraftInputV2Mixin,
@@ -715,7 +716,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             pt += extend_len
 
     @classmethod
-    def hidden_size_for(cls, worker) -> Optional[int]:
+    def hidden_size_for(cls, worker: DraftExecutor) -> Optional[int]:
         """Decode-phase `hidden_states` width: draft self-chain output
         (draft model writes its own last hidden back via `capture_for_decode`
         and the draft loop). Returns None when the draft architecture doesn't
@@ -725,7 +726,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         return worker.draft_runner.model_config.spec_hidden_size
 
     @classmethod
-    def dtype_for(cls, worker) -> Optional[torch.dtype]:
+    def dtype_for(cls, worker: DraftExecutor) -> Optional[torch.dtype]:
         if worker.speculative_algorithm.is_standalone():
             return None
         return worker.draft_runner.model_config.dtype
@@ -864,7 +865,7 @@ class EagleDraftExtendInput(SpecInput, EagleDraftExtendInputV2Mixin):
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     @classmethod
-    def hidden_size_for(cls, worker) -> Optional[int]:
+    def hidden_size_for(cls, worker: DraftExecutor) -> Optional[int]:
         """Extend-phase `hidden_states` width: target's `spec_hidden_size`,
         widened to `num_aux * target_hidden` for EAGLE-3 aux mode. Returns
         None when the draft architecture doesn't consume the field
@@ -891,7 +892,7 @@ class EagleDraftExtendInput(SpecInput, EagleDraftExtendInputV2Mixin):
         return target_hidden * num_aux
 
     @classmethod
-    def dtype_for(cls, worker) -> Optional[torch.dtype]:
+    def dtype_for(cls, worker: DraftExecutor) -> Optional[torch.dtype]:
         if worker.speculative_algorithm.is_standalone():
             return None
         return worker.target_worker.model_runner.model_config.dtype

@@ -150,6 +150,15 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # `EagleDraftInput` shape classmethods in eagle_info.py.
         self.draft_runner: ModelRunner = self.draft_runner_list[0]
 
+        self.eagle_use_aux_hidden_state = False
+        if self.speculative_algorithm.is_eagle3():
+            eagle_config = getattr(
+                self.draft_runner.model_config.hf_config, "eagle_config", {}
+            )
+            self.eagle_use_aux_hidden_state = eagle_config.get(
+                "use_aux_hidden_state", True
+            )
+
         # Chain-style MTP: each step propagates its own output hidden states to the
         # next step.  Non-chain: each step uses the target model's hidden states.
         draft_arch = self.draft_worker.model_config.hf_config.architectures[0]

@@ -37,6 +37,7 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
+from sglang.srt.speculative.base_spec_worker import DraftExecutor
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -87,7 +88,7 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
-class EAGLEWorker(TpModelWorker):
+class EAGLEWorker(TpModelWorker, DraftExecutor):
 
     def __init__(
         self,
