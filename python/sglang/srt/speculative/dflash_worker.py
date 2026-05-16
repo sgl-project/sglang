@@ -120,10 +120,9 @@ class DFlashSpecCoordinator(SpecCoordinator):
             server_args.speculative_algorithm
         )
         self.page_size = server_args.page_size
+        # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
-            int(server_args.speculative_draft_window_size)
-            if server_args.speculative_draft_window_size is not None
-            else None
+            server_args.speculative_draft_window_size
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device

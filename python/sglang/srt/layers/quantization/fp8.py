@@ -1193,7 +1193,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                 layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
 
-                if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
+                if get_moe_a2a_backend().is_megamoe():
                     from sglang.srt.layers.moe.mega_moe import (
                         build_mega_moe_experts_weights,
                     )

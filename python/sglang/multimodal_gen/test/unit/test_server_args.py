@@ -147,6 +147,106 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             server_args.component_attention_backends, {"text_encoder": "torch_sdpa"}
         )
 
+    def test_layerwise_offload_components_imply_layerwise(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "performance_mode": "manual",
+            }
+        )
+        args.layerwise_offload_components = ["text_encoder", "transformer"]
+        args._adjust_layerwise_offload_components()
+
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertEqual(
+            args.layerwise_offload_components, ["text_encoder", "transformer"]
+        )
+
+    def test_dit_layerwise_offload_extends_default_components(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "performance_mode": "manual",
+                "dit_layerwise_offload": True,
+            }
+        )
+
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertEqual(args.layerwise_offload_components, ["default"])
+
+    def test_dit_layerwise_offload_from_kwargs(self):
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+        ):
+            args = ServerArgs.from_kwargs(
+                model_path="/data/my-model",
+                performance_mode="manual",
+                dit_layerwise_offload=True,
+            )
+
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertEqual(args.layerwise_offload_components, ["default"])
+
+    def test_layerwise_offload_components_normalize_commas(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "performance_mode": "manual",
+            }
+        )
+        args.layerwise_offload_components = ["text-encoder,transformer"]
+        args._adjust_layerwise_offload_components()
+
+        self.assertEqual(
+            args.layerwise_offload_components, ["text_encoder", "transformer"]
+        )
+
+    def test_dit_layerwise_offload_cli_arg(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--performance-mode",
+            "manual",
+            "--dit-layerwise-offload",
+            "true",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            with patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ):
+                server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertTrue(server_args.layerwise_offload_components)
+        self.assertEqual(server_args.layerwise_offload_components, ["default"])
+
+    def test_layerwise_offload_components_cli_args(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--performance-mode",
+            "manual",
+            "--layerwise-offload-components",
+            "transformer",
+            "text_encoder",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            with patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ):
+                server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(
+            server_args.layerwise_offload_components, ["transformer", "text_encoder"]
+        )
+
 
 class TestOffloadDefaults(unittest.TestCase):
     def _from_dict_with_pipeline_config(
@@ -209,6 +309,10 @@ class TestOffloadDefaults(unittest.TestCase):
                 return_value=False,
             ),
             patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                return_value=True,
+            ),
+            patch(
                 "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
                 return_value=memory_gb * 1024**3,
             ),
@@ -233,16 +337,48 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.vae_cpu_offload)
         self.assertTrue(args.dit_cpu_offload)
-        self.assertTrue(args.text_encoder_cpu_offload)
-        self.assertTrue(args.image_encoder_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components, ["text_encoder", "image_encoder"]
+        )
 
-    def test_explicit_vae_cpu_offload_true_is_preserved(self):
+    def test_explicit_vae_cpu_offload_true_is_preserved_without_component_selection(
+        self,
+    ):
         args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
             kwargs={"vae_cpu_offload": True},
         )
 
         self.assertTrue(args.vae_cpu_offload)
+        self.assertFalse(args.layerwise_offload_components)
+
+    def test_layerwise_components_disable_matching_cpu_offloads(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            memory_gb=16,
+            kwargs={
+                "performance_mode": "manual",
+                "dit_cpu_offload": True,
+                "text_encoder_cpu_offload": True,
+                "image_encoder_cpu_offload": True,
+                "vae_cpu_offload": True,
+            },
+        )
+        args.layerwise_offload_components = [
+            "text_encoder",
+            "image_encoder",
+            "video_dit",
+            "vae",
+        ]
+        args._adjust_layerwise_offload_components()
+
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
 
     def test_pipeline_configs_declare_auto_tune_hints(self):
         qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
@@ -285,11 +421,12 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertIsNone(args.use_fsdp_inference)
         self.assertIsNone(args.dit_cpu_offload)
         self.assertIsNone(args.dit_layerwise_offload)
+        self.assertIsNone(args.layerwise_offload_components)
         self.assertIsNone(args.text_encoder_cpu_offload)
         self.assertIsNone(args.image_encoder_cpu_offload)
         self.assertFalse(args.enable_cfg_parallel)
 
-    def test_default_auto_keeps_legacy_single_gpu_offload_defaults(self):
+    def test_default_auto_replaces_text_encoder_cpu_offload_with_layerwise(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={"model_path": "Qwen/Qwen-Image"},
@@ -298,11 +435,14 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.performance_mode, "auto")
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.dit_cpu_offload)
-        self.assertFalse(args.dit_layerwise_offload)
-        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
 
-    def test_auto_ltx_snapshot_keeps_dit_offload_with_headroom(self):
+    def test_auto_ltx_snapshot_keeps_dit_offload_and_replaces_encoder_cpu_offload(
+        self,
+    ):
         args = self._from_dict_with_pipeline_config(
             LTX2PipelineConfig(),
             available_memory_gb=76,
@@ -316,8 +456,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(args.ltx2_two_stage_device_mode, "snapshot")
         self.assertTrue(args.dit_cpu_offload)
-        self.assertTrue(args.text_encoder_cpu_offload)
-        self.assertTrue(args.image_encoder_cpu_offload)
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components, ["text_encoder", "image_encoder"]
+        )
 
     def test_auto_wan_layerwise_offload_is_enabled_without_fsdp(self):
         args = self._from_dict_with_pipeline_config(
@@ -325,8 +469,14 @@ class TestOffloadDefaults(unittest.TestCase):
             kwargs={"performance_mode": "auto"},
         )
 
-        self.assertTrue(args.dit_layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["default", "text_encoder", "image_encoder"],
+        )
 
     def test_memory_wan_layerwise_offload_is_enabled_without_fsdp(self):
         args = self._from_dict_with_pipeline_config(
@@ -334,8 +484,14 @@ class TestOffloadDefaults(unittest.TestCase):
             kwargs={"performance_mode": "memory"},
         )
 
-        self.assertTrue(args.dit_layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["default", "text_encoder", "image_encoder"],
+        )
 
     def test_auto_wan_layerwise_offload_does_not_disable_explicit_fsdp(self):
         args = self._from_dict_with_pipeline_config(
@@ -348,7 +504,7 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.dit_layerwise_offload)
+        self.assertFalse(args.layerwise_offload_components)
         self.assertTrue(args.use_fsdp_inference)
 
     def test_auto_multi_gpu_wan_uses_layerwise_offload_without_cfg(self):
@@ -365,9 +521,52 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.enable_cfg_parallel)
         self.assertFalse(args.dit_cpu_offload)
-        self.assertTrue(args.dit_layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["default", "text_encoder", "image_encoder"],
+        )
 
-    def test_auto_multi_gpu_qwen_keeps_legacy_offload_with_cfg(self):
+    def test_explicit_multi_gpu_dit_layerwise_only_selects_default_component(self):
+        args = self._from_dict_with_pipeline_config(
+            MOVAPipelineConfig(),
+            kwargs={
+                "model_path": "OpenMOSS-Team/MOVA-360p",
+                "num_gpus": 2,
+                "dit_layerwise_offload": True,
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.image_encoder_cpu_offload)
+        self.assertEqual(args.layerwise_offload_components, ["default"])
+
+    def test_auto_multi_gpu_ltx_replaces_component_cpu_offload_with_resident_dit(self):
+        args = self._from_dict_with_pipeline_config(
+            LTX2PipelineConfig(),
+            available_memory_gb=76,
+            kwargs={
+                "model_path": "Lightricks/LTX-2",
+                "num_gpus": 2,
+                "pipeline_class_name": "LTX2TwoStagePipeline",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components, ["text_encoder", "image_encoder"]
+        )
+
+    def test_auto_multi_gpu_qwen_replaces_text_encoder_offload_with_cfg(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={
@@ -380,9 +579,10 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
         self.assertTrue(args.dit_cpu_offload)
-        self.assertFalse(args.dit_layerwise_offload)
-        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
 
     def test_auto_multi_gpu_zimage_base_prefers_fsdp(self):
         args = self._from_dict_with_pipeline_config(
@@ -424,8 +624,9 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
         self.assertTrue(args.dit_cpu_offload)
-        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
 
     def test_auto_multi_gpu_qwen_skips_fsdp_when_available_memory_is_low(self):
         args = self._from_dict_with_pipeline_config(
@@ -441,8 +642,9 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
         self.assertTrue(args.dit_cpu_offload)
-        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
 
     def test_auto_multi_gpu_qwen_uses_selected_gpu_min_available_memory(self):
         args = self._from_dict_with_pipeline_config(
@@ -459,7 +661,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
-    def test_auto_multi_gpu_qwen_keeps_legacy_offload_with_headroom(self):
+    def test_auto_multi_gpu_qwen_replaces_text_encoder_offload_with_headroom(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             available_memory_gb={1: 72, 2: 80},
@@ -474,8 +676,9 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
         self.assertTrue(args.dit_cpu_offload)
-        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
 
     def test_speed_mode_single_gpu_disables_offload(self):
         args = self._from_dict_with_pipeline_config(
@@ -489,7 +692,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.performance_mode, "speed")
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.dit_cpu_offload)
-        self.assertFalse(args.dit_layerwise_offload)
+        self.assertFalse(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
 
@@ -518,10 +721,14 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertFalse(args.use_fsdp_inference)
-        self.assertTrue(args.dit_layerwise_offload)
+        self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.dit_cpu_offload)
-        self.assertTrue(args.text_encoder_cpu_offload)
-        self.assertTrue(args.image_encoder_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["default", "text_encoder", "image_encoder"],
+        )
 
     def test_memory_mode_preserves_explicit_fsdp(self):
         args = self._from_dict_with_pipeline_config(
@@ -535,7 +742,7 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertTrue(args.use_fsdp_inference)
-        self.assertFalse(args.dit_layerwise_offload)
+        self.assertFalse(args.layerwise_offload_components)
         self.assertFalse(args.dit_cpu_offload)
 
     def test_invalid_performance_mode_raises(self):

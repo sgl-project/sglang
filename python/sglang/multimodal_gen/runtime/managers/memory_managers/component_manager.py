@@ -7,13 +7,21 @@ from typing import Mapping, MutableMapping, Protocol, Sequence, TypeVar
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.runtime.managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
     ComponentResidencyStrategy,
     LayerwiseOffloadStrategy,
     ResidentStrategy,
     VanillaD2HStrategy,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    is_layerwise_offloaded_module,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    is_dit_component_name,
+    is_image_encoder_component_name,
+    is_text_encoder_component_name,
+    is_vae_component_name,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -85,25 +93,24 @@ class ComponentResidencyPipeline(Protocol):
     component_residency_strategies: MutableMapping[str, "ComponentResidencyStrategy"]
 
 
-def build_dit_residency_strategy(
-    module: nn.Module,
-    server_args: ServerArgs,
-) -> ComponentResidencyStrategy:
-    if (
-        isinstance(module, OffloadableDiTMixin)
-        and module.layerwise_offload_managers
-        and any(manager.enabled for manager in module.layerwise_offload_managers)
-    ):
-        # only if dit_layerwise_offload is enabled
-        return LayerwiseOffloadStrategy()
-    if server_args.dit_cpu_offload and not server_args.use_fsdp_inference:
-        # handles offload by vanalla D2H
-        return VanillaD2HStrategy()
-    return ResidentStrategy()
-
-
 def is_fsdp_managed_module(module: nn.Module) -> bool:
     return module.__class__.__name__.startswith("FSDP")
+
+
+def should_cpu_offload_component(
+    component_name: str, module: nn.Module, server_args: ServerArgs
+) -> bool:
+    if server_args.use_fsdp_inference or is_fsdp_managed_module(module):
+        return False
+    if is_dit_component_name(component_name):
+        return bool(server_args.dit_cpu_offload)
+    if is_text_encoder_component_name(component_name):
+        return bool(server_args.text_encoder_cpu_offload)
+    if is_image_encoder_component_name(component_name):
+        return bool(server_args.image_encoder_cpu_offload)
+    if is_vae_component_name(component_name):
+        return bool(server_args.vae_cpu_offload)
+    return False
 
 
 def build_component_residency_strategy(
@@ -111,44 +118,10 @@ def build_component_residency_strategy(
     module: nn.Module,
     server_args: ServerArgs,
 ) -> ComponentResidencyStrategy:
-    if component_name in {
-        "transformer",
-        "transformer_2",
-        "video_dit",
-        "video_dit_2",
-        "audio_dit",
-        "dual_tower_bridge",
-    }:
-        return build_dit_residency_strategy(module, server_args)
-
-    if component_name.startswith("text_encoder") or component_name.endswith(
-        "text_encoder"
-    ):
-        if (
-            server_args.text_encoder_cpu_offload
-            and not server_args.use_fsdp_inference
-            and not is_fsdp_managed_module(module)
-        ):
-            return VanillaD2HStrategy()
-        return ResidentStrategy()
-
-    if component_name == "image_encoder":
-        if server_args.image_encoder_cpu_offload and not server_args.use_fsdp_inference:
-            return VanillaD2HStrategy()
-        return ResidentStrategy()
-
-    if component_name in {
-        "vae",
-        "video_vae",
-        "audio_vae",
-        "vocoder",
-        "spatial_upsampler",
-        "condition_image_encoder",
-    }:
-        if server_args.vae_cpu_offload and not server_args.use_fsdp_inference:
-            return VanillaD2HStrategy()
-        return ResidentStrategy()
-
+    if is_layerwise_offloaded_module(module):
+        return LayerwiseOffloadStrategy()
+    if should_cpu_offload_component(component_name, module, server_args):
+        return VanillaD2HStrategy()
     return ResidentStrategy()
 
 

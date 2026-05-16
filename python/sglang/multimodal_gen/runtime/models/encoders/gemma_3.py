@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -934,10 +937,13 @@ class Gemma3TextModel(nn.Module):
         return loaded_params
 
 
-class Gemma3ForConditionalGeneration(nn.Module):
+class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin):
     # transformers 5.6.0 flattened SiglipVisionModel, dropping the
     # `vision_model` intermediate wrapper. Our reimpl keeps it, so remap
     # HF source keys back into our nested namespace when transferring weights.
+    layerwise_offload_default_enabled = False
+    layer_names = ["language_model.layers"]
+
     param_names_mapping = {
         r"^(vision_tower\.)(embeddings|encoder|post_layernorm|head)\.": r"\1vision_model.\2.",
     }
