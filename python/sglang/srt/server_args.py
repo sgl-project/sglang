@@ -3539,19 +3539,7 @@ class ServerArgs:
             self.custom_weight_loader = []
 
         if self.load_format == "remote_instance":
-            if self.remote_instance_weight_loader_backend == "modelexpress":
-                # ModelExpress backend: requires url in --modelexpress-config
-                if self.modelexpress_url is None:
-                    logger.warning(
-                        "Fallback load_format to 'auto' due to missing 'url' in --modelexpress-config."
-                    )
-                    self.load_format = "auto"
-                elif not self.validate_transfer_engine():
-                    logger.warning(
-                        "Fallback load_format to 'auto' due to 'transfer_engine' (required by modelexpress) not being supported."
-                    )
-                    self.load_format = "auto"
-            elif (
+            if self.remote_instance_weight_loader_backend != "modelexpress" and (
                 self.remote_instance_weight_loader_seed_instance_ip is None
                 or self.remote_instance_weight_loader_seed_instance_service_port is None
             ):
@@ -6623,7 +6611,7 @@ class ServerArgs:
             "--modelexpress-config",
             type=str,
             default=ServerArgs.modelexpress_config,
-            help='JSON config for ModelExpress P2P weight loading. Keys: "url" (required, gRPC host:port), "model_name" (optional, defaults to --model-path), "source" (optional bool, true for seed mode). Example: \'{"url": "localhost:8001", "model_name": "my-model", "source": true}\'',
+            help='JSON config for ModelExpress P2P weight loading. Keys: "url" (optional gRPC host:port override), "transport" ("nixl" or "transfer_engine"). Example: \'{"url": "localhost:8001", "transport": "nixl"}\'',
         )
 
         # For PD-Multiplexing
@@ -7268,34 +7256,21 @@ class ServerArgs:
         return self._parsed_modelexpress_config.get("url")
 
     @property
-    def modelexpress_model_name(self) -> Optional[str]:
-        return self._parsed_modelexpress_config.get("model_name")
-
-    @property
-    def modelexpress_source(self) -> bool:
-        return self._parsed_modelexpress_config.get("source", False)
-
-    @property
     def modelexpress_transport(self) -> str:
-        """Transport backend for modelexpress: 'transfer_engine' (default) or 'nixl'."""
-        return self._parsed_modelexpress_config.get("transport", "transfer_engine")
+        """Transport backend for modelexpress."""
+        return self._parsed_modelexpress_config.get("transport", "nixl")
 
     def remote_instance_weight_loader_use_transfer_engine(self):
         # Use TransferEngine as seed backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
-        # ModelExpress source mode needs TransferEngine init only if transport is transfer_engine.
-        if (
-            self.modelexpress_source
-            and self.modelexpress_transport == "transfer_engine"
-        ):
-            return True
         # Use TransferEngine as client backend.
-        elif (
-            self.load_format == "remote_instance"
-            and self.remote_instance_weight_loader_backend
-            in ("transfer_engine", "modelexpress")
-            and self.modelexpress_transport == "transfer_engine"
+        if self.load_format == "remote_instance" and (
+            self.remote_instance_weight_loader_backend == "transfer_engine"
+            or (
+                self.remote_instance_weight_loader_backend == "modelexpress"
+                and self.modelexpress_transport == "transfer_engine"
+            )
         ):
             return True
         else:

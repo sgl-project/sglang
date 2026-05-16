@@ -197,7 +197,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
-        skip_init_workspace_buffer: bool = False,
     ):
         super().__init__()
 
@@ -205,7 +204,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
-        self.skip_init_workspace_buffer = skip_init_workspace_buffer
         self.enable_chunk_kv = (
             not skip_prefill
             and get_global_server_args().disaggregation_mode != "decode"
@@ -215,18 +213,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
 
         # Allocate buffers
-        if skip_init_workspace_buffer:
-            self.workspace_buffer = None
-        else:
-            global global_workspace_buffer
-            if global_workspace_buffer is None:
-                # different from flashinfer zero_init_global_workspace_buffer
-                global_workspace_buffer = torch.empty(
-                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                    dtype=torch.uint8,
-                    device=model_runner.device,
-                )
-            self.workspace_buffer = global_workspace_buffer
+        global global_workspace_buffer
+        if global_workspace_buffer is None:
+            # different from flashinfer zero_init_global_workspace_buffer
+            global_workspace_buffer = torch.empty(
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                dtype=torch.uint8,
+                device=model_runner.device,
+            )
+        self.workspace_buffer = global_workspace_buffer
 
         max_bs = model_runner.req_to_token_pool.size
         if kv_indptr_buf is None:
@@ -248,53 +243,42 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        if skip_init_workspace_buffer:
-            self.fmha_backend = None
-            self.prefill_wrapper_ragged = None
-            self.prefill_wrapper_paged = None
-            self.prefill_wrapper_verify = None
-            self.decode_wrapper = None
-            self.indices_updater_prefill = None
-            self.indices_updater_decode = None
+        if is_sm100_supported():
+            self.fmha_backend = "cutlass"
         else:
-            if is_sm100_supported():
-                self.fmha_backend = "cutlass"
-            else:
-                self.fmha_backend = "auto"
+            self.fmha_backend = "auto"
 
-            self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-                self.workspace_buffer, "NHD", backend=self.fmha_backend
+        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+            self.workspace_buffer, "NHD", backend=self.fmha_backend
+        )
+
+        if not self.skip_prefill:
+            self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                backend="auto",
             )
 
-            if not self.skip_prefill:
-                self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
-                    self.workspace_buffer,
-                    backend="auto",
-                )
-
-                # FlashinferMLA backend uses mla wrapper for target verify
-                self.prefill_wrapper_verify = BatchMLAPagedAttentionWrapper(
-                    self.workspace_buffer,
-                    backend="auto",
-                )
-
-            self.decode_wrapper = BatchMLAPagedAttentionWrapper(
-                self.workspace_buffer, backend="auto"
+            # FlashinferMLA backend uses mla wrapper for target verify
+            self.prefill_wrapper_verify = BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                backend="auto",
             )
 
-            # Create indices updater
-            if not skip_prefill:
-                self.indices_updater_prefill = FlashInferMLAIndicesUpdaterPrefill(
-                    model_runner, self
-                )
-                if self.enable_chunk_kv:
-                    self.mha_chunk_kv_cache = FlashInferMhaChunkKVRunner(
-                        model_runner, self
-                    )
+        self.decode_wrapper = BatchMLAPagedAttentionWrapper(
+            self.workspace_buffer, backend="auto"
+        )
 
-            self.indices_updater_decode = FlashInferMLAIndicesUpdaterDecode(
+        # Create indices updater
+        if not skip_prefill:
+            self.indices_updater_prefill = FlashInferMLAIndicesUpdaterPrefill(
                 model_runner, self
             )
+            if self.enable_chunk_kv:
+                self.mha_chunk_kv_cache = FlashInferMhaChunkKVRunner(model_runner, self)
+
+        self.indices_updater_decode = FlashInferMLAIndicesUpdaterDecode(
+            model_runner, self
+        )
 
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None

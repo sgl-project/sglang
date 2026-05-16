@@ -92,7 +92,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             skip_prefill,
             kv_indptr_buf,
             q_indptr_decode_buf,
-            skip_init_workspace_buffer=True,
         )
 
         if self.data_type != torch.float8_e4m3fn:
