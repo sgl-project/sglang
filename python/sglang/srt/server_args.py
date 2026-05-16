@@ -778,6 +778,7 @@ class ServerArgs:
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
     enable_adaptive_dispatch_to_encoder: bool = False
+    async_encode_recv: bool = False
 
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
@@ -3717,6 +3718,11 @@ class ServerArgs:
                 "requires at least one encoder urls to be set via --encoder-urls"
             )
 
+        if not self.language_only and self.async_encode_recv:
+            raise ValueError(
+                "async_encode_recv requires language only set via --language-only"
+            )
+
         # Validate IB devices when mooncake backend is used
         if (
             self.disaggregation_transfer_backend == "mooncake"
@@ -6548,6 +6554,11 @@ class ServerArgs:
             default=ServerArgs.enable_adaptive_dispatch_to_encoder,
             action="store_true",
             help="When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
+        )
+        parser.add_argument(
+            "--async-encode-recv",
+            action="store_true",
+            help="For VLM, receive results of encode request asynchronously.",
         )
 
         # Custom weight loader

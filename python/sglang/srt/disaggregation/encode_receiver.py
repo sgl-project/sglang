@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import logging
 import pickle
+import queue
 import random
 import threading
 import time
@@ -708,8 +709,23 @@ class MMReceiverBase(ABC):
                     skip_mm_pool=not enable_adaptive_dispatch_to_encoder,
                 )
 
+        if server_args.async_encode_recv:
+            self.pending_req_queue = queue.Queue()
+            self.poller = zmq.Poller()
+            self.socket_to_req = {}
+            self.local_waiting_dict = {}
+            # Background thread for receiving data from encode server
+            self.worker_thread = threading.Thread(
+                target=self._encode_request_thread_worker, daemon=True
+            )
+            self.worker_thread.start()
+
     @abstractmethod
     def process_waiting_requests(self, recv_reqs):
+        pass
+
+    @abstractmethod
+    def process_waiting_requests_async(self, recv_reqs):
         pass
 
     async def recv_mm_data(
@@ -940,6 +956,114 @@ class MMReceiverBase(ABC):
         self.waiting_list = new_waiting
         return new_recv_reqs, abort_reqs
 
+    def _encode_request_thread_worker(self):
+        while True:
+            try:
+                while True:
+                    new_req = self.pending_req_queue.get_nowait()
+                    self.poller.register(new_req.recv_socket, zmq.POLLIN)
+                    self.socket_to_req[new_req.recv_socket] = new_req
+            except queue.Empty:
+                pass
+
+            if not self.socket_to_req:
+                # Sleep a short time to avoid busy loop when there are no pending requests
+                time.sleep(0.005)
+                continue
+
+            events = dict(self.poller.poll(timeout=1))
+            # Retrieve the data from the socket by calling _try_recv_mm_data
+            for sock in events:
+                waiting_req = self.socket_to_req.get(sock)
+                waiting_req._try_recv_mm_data()
+
+            # Check timeouts for ALL pending requests, not just those with events.
+            # If we only checked inside the above events loop, a hung encode server would
+            # cause requests to wait forever since events would always be empty.
+            current_time = time.time()
+            for sock, waiting_req in list(self.socket_to_req.items()):
+                if current_time - waiting_req.start_time > self.wait_timeout:
+                    logger.info(f"encode recv thread: timeout.....")
+                    waiting_req.status = WaitingImageRequestStatus.TIMEOUT
+
+                # Cleanup for the request
+                if waiting_req.status != WaitingImageRequestStatus.PENDING:
+                    self.poller.unregister(sock)
+                    self.socket_to_req.pop(sock)
+
+    def _process_waiting_requests_async(self, recv_reqs, waiting_cls):
+        new_recv_reqs = []
+        for recv_req in recv_reqs:
+            if (
+                isinstance(recv_req, TokenizedGenerateReqInput)
+                and recv_req.need_wait_for_mm_inputs is True
+            ):
+                waiting_req = waiting_cls(
+                    rid=recv_req.rid,
+                    recv_req=recv_req,
+                    mm_processor=self.mm_processor,
+                    encoder_urls=self.encode_urls,
+                    host_name=self.hostname,
+                    receive_count=self.tp_size,
+                )
+                waiting_req.send_encode_request()
+
+                self.pending_req_queue.put(waiting_req)
+                self.local_waiting_dict[waiting_req.rid] = waiting_req
+            else:
+                new_recv_reqs.append(recv_req)
+
+        if not self.local_waiting_dict:
+            return new_recv_reqs, []
+
+        # IMPORTANT: Sort by RID to ensure every TP rank has the same list order
+        local_status = []
+        sorted_rids = sorted(self.local_waiting_dict.keys())
+        for rid in sorted_rids:
+            waiting_req = self.local_waiting_dict[rid]
+            local_status.append(waiting_req.status)
+        local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
+        torch.distributed.all_reduce(
+            local_status,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.tp_group.cpu_group,
+        )
+
+        new_waiting_dict = {}
+        abort_reqs = []
+        for i, rid in enumerate(sorted_rids):
+            status_value = local_status[i].item()
+            waiting_req = self.local_waiting_dict[rid]
+            if status_value == WaitingImageRequestStatus.SUCCESS:
+                new_recv_reqs.append(waiting_req.recv_req)
+            elif status_value == WaitingImageRequestStatus.FAIL:
+                logger.error(
+                    f"Waiting request {waiting_req.rid} failed: {waiting_req.error_msg} {waiting_req.error_code = }"
+                )
+                abort_reqs.append(
+                    (
+                        self.create_req(waiting_req.recv_req),
+                        waiting_req.error_msg,
+                        waiting_req.error_code,
+                    )
+                )
+            elif status_value == WaitingImageRequestStatus.TIMEOUT:
+                logger.error(
+                    f"_process_waiting_requests_async: timed out waiting for image embeddings for request {waiting_req.rid}"
+                )
+                abort_reqs.append(
+                    (
+                        self.create_req(waiting_req.recv_req),
+                        f"_process_waiting_requests_async: timed out waiting for image embedding after {self.wait_timeout}s",
+                        HTTPStatus.REQUEST_TIMEOUT,
+                    )
+                )
+            else:  # status_value == WaitingImageRequestStatus.PENDING
+                new_waiting_dict[rid] = waiting_req
+
+        self.local_waiting_dict = new_waiting_dict
+        return new_recv_reqs, abort_reqs
+
     def _run_encode_in_thread(
         self, req_id, mm_data, endpoint_encode, num_items_assigned, embedding_port
     ):
@@ -1114,6 +1238,9 @@ class MMReceiverHTTP(MMReceiverBase):
     def process_waiting_requests(self, recv_reqs):
         return self._process_waiting_requests(recv_reqs, WaitingImageRequest)
 
+    def process_waiting_requests_async(self, recv_reqs):
+        return self._process_waiting_requests_async(recv_reqs, WaitingImageRequest)
+
     async def encode(
         self,
         req_id,
@@ -1280,6 +1407,9 @@ class MMReceiverGrpc(MMReceiverBase):
     # For zmq_to_scheduler
     def process_waiting_requests(self, recv_reqs):
         return self._process_waiting_requests(recv_reqs, WaitingImageRequestGrpc)
+
+    def process_waiting_requests_async(self, recv_reqs):
+        return self._process_waiting_requests_async(recv_reqs, WaitingImageRequestGrpc)
 
     async def encode(
         self,

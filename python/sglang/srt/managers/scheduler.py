@@ -1783,7 +1783,15 @@ class Scheduler(
             and self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
-            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            if self.server_args.async_encode_recv:
+                recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests_async(
+                    recv_reqs
+                )
+            else:
+                recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(
+                    recv_reqs
+                )
+
             for req, error_msg, error_code in abort_reqs:
                 status_code = (
                     HTTPStatus.BAD_REQUEST
