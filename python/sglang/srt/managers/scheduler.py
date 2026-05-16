@@ -3090,8 +3090,22 @@ class Scheduler(
                 # `new_seq_lens` is declared on `SpecInput` base (default None),
                 # so this generalizes across algos (DFLASH / non-overlap algos
                 # leave it None).
-                if batch_result.next_draft_input.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                #
+                # Producer contract: `new_seq_lens.size(0)` MUST match the
+                # current `batch.reqs` length (pre-filter). Violating it (e.g.
+                # publishing an idle 0-length stub while reqs still hold the
+                # finished-but-not-yet-filtered req) leaves `batch.seq_lens`
+                # and `batch.reqs` out of lockstep, which crashes next iter's
+                # `filter_batch` as a CUDA index OOB. Assert here so the
+                # offending worker is named in the stack instead.
+                new_seq_lens = batch_result.next_draft_input.new_seq_lens
+                if new_seq_lens is not None:
+                    assert new_seq_lens.size(0) == len(batch.reqs), (
+                        f"new_seq_lens.size(0)={new_seq_lens.size(0)} != "
+                        f"len(batch.reqs)={len(batch.reqs)}; "
+                        f"worker violated next_draft_input.new_seq_lens contract"
+                    )
+                    batch.seq_lens = new_seq_lens
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
