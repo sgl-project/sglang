@@ -105,8 +105,9 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
-        # Alias for better readability
-        self.draft_runner = self.draft_worker.model_runner
+        # Alias for better readability. Backed by `_draft_runner` because
+        # `DraftExecutor` declares `draft_runner` as an abstract @property.
+        self._draft_runner = self.draft_worker.model_runner
 
         self.init_token_map()
         self.init_lm_head()
@@ -125,6 +126,10 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    @property
+    def draft_runner(self):
+        return self._draft_runner
 
     def init_lm_head(self):
         """Override to prevent sharing embeddings and lm_head with target model."""
