@@ -163,10 +163,19 @@ class ScheduleBatchDisaggregationDecodeMixin:
             hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
 
-            # local import to avoid circular import
-            from sglang.srt.speculative.eagle_info import EagleDraftInput
+            # local import to avoid circular import. V2 overlap path needs the
+            # V2 sister class (EagleDraftInputV2) so `prepare_for_decode` etc.
+            # dispatch correctly when this spec_info enters the V2 decode loop.
+            if self.enable_overlap:
+                from sglang.srt.speculative.eagle_info_v2 import (
+                    EagleDraftInputV2 as _DraftInputCls,
+                )
+            else:
+                from sglang.srt.speculative.eagle_info import (
+                    EagleDraftInput as _DraftInputCls,
+                )
 
-            spec_info = EagleDraftInput(
+            spec_info = _DraftInputCls(
                 topk_p=topk_p,
                 topk_index=topk_index,
                 hidden_states=hidden_states,
