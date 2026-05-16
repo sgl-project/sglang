@@ -449,6 +449,89 @@ async fn oversized_request_body_returns_413() {
 }
 
 #[tokio::test]
+async fn chat_rejects_null_body_400() {
+    // Regression (I5): a JSON `null` body is syntactically valid JSON but
+    // is NOT a chat-completions request shape. The router must reject it
+    // with 400 BadRequest and NOT forward it to the worker.
+    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&worker.url);
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), TEST_TIMEOUT).unwrap());
+    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from("null"))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        res.headers().get("x-router-error-code").unwrap(),
+        "bad_request"
+    );
+    let captured = worker.captured.lock().unwrap();
+    assert!(
+        captured.last_body.is_none(),
+        "router must NOT forward `null` body to worker; got: {:?}",
+        captured.last_body,
+    );
+}
+
+#[tokio::test]
+async fn chat_rejects_array_body_400() {
+    // Regression (I5): a JSON array `[]` body is not a chat-completions
+    // request shape (object expected). Router must 400 and not forward.
+    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&worker.url);
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), TEST_TIMEOUT).unwrap());
+    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from("[]"))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        res.headers().get("x-router-error-code").unwrap(),
+        "bad_request"
+    );
+    let captured = worker.captured.lock().unwrap();
+    assert!(captured.last_body.is_none());
+}
+
+#[tokio::test]
+async fn chat_rejects_string_body_400() {
+    // Regression (I5): a JSON string `"hi"` is not a chat-completions
+    // request shape. Router must 400 and not forward.
+    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&worker.url);
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), TEST_TIMEOUT).unwrap());
+    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from("\"hi\""))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        res.headers().get("x-router-error-code").unwrap(),
+        "bad_request"
+    );
+    let captured = worker.captured.lock().unwrap();
+    assert!(captured.last_body.is_none());
+}
+
+#[tokio::test]
 async fn malformed_json_returns_400_bad_request() {
     // Regression: a malformed JSON request body must return 400 with
     // bad_request envelope from the router itself; we must NOT forward
