@@ -27,9 +27,11 @@ pub enum ApiError {
         source: anyhow::Error,
     },
 
-    /// The worker replied with a non-2xx status. Currently not constructed
-    /// by `Proxy` (which forwards 4xx/5xx bodies verbatim); reserved for paths
-    /// that need to distinguish "worker said no" from "worker unreachable".
+    /// The worker started a response (status + headers received) but failed
+    /// to deliver the full body — mid-body socket drop, framing error, etc.
+    /// Distinct from `UpstreamUnreachable` (no reply at all) and from a
+    /// well-formed non-2xx (which `Proxy` forwards verbatim with the worker's
+    /// own body).
     #[error("upstream returned status {status}")]
     UpstreamStatus { status: StatusCode },
 

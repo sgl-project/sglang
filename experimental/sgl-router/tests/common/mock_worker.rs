@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 
 /// Headers captured from the most recent inbound request.
@@ -134,6 +135,85 @@ impl MockWorker {
                 })
                 .await
                 .unwrap();
+        });
+        Self {
+            url,
+            captured,
+            _shutdown: tx,
+        }
+    }
+
+    /// Bind to a raw TCP listener and start a worker that writes a status
+    /// line + headers with a large declared `Content-Length`, then writes
+    /// only `partial_body_bytes` of body before closing the connection.
+    ///
+    /// Used to test router behaviour when the upstream replies with a status
+    /// but drops the connection mid-body. We can't build this with axum
+    /// directly (it owns the response lifecycle); raw TCP gives us frame-level
+    /// control to short-write the body and close.
+    #[allow(dead_code)]
+    pub async fn start_returning_partial_body(
+        status: StatusCode,
+        partial_body_bytes: &'static [u8],
+    ) -> Self {
+        let captured = Arc::new(Mutex::new(CapturedHeaders::default()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let (tx, mut rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            // Accept one connection (or exit on shutdown).
+            tokio::select! {
+                _ = &mut rx => return,
+                accept = listener.accept() => {
+                    let (mut sock, _) = match accept {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    // Drain the request bytes until we see end-of-headers
+                    // (`\r\n\r\n`). We deliberately do NOT fully consume the
+                    // request body — the router has already sent it before
+                    // awaiting our response, and we want to write the
+                    // truncated response promptly.
+                    let mut buf = [0u8; 4096];
+                    let mut acc: Vec<u8> = Vec::new();
+                    while !acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        acc.extend_from_slice(&buf[..n]);
+                        if acc.len() > 64 * 1024 {
+                            // Defensive: don't loop forever if the request
+                            // never produces a header terminator.
+                            break;
+                        }
+                    }
+                    // Write a response with a Content-Length larger than the
+                    // bytes we will actually write, then drop the socket
+                    // before the body completes.
+                    let declared_len = partial_body_bytes.len() + 1024;
+                    let head = format!(
+                        "HTTP/1.1 {status_u16} {phrase}\r\n\
+                         content-type: application/json\r\n\
+                         content-length: {declared_len}\r\n\
+                         connection: close\r\n\
+                         \r\n",
+                        status_u16 = status.as_u16(),
+                        phrase = status.canonical_reason().unwrap_or("OK"),
+                    );
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if sock.write_all(partial_body_bytes).await.is_err() {
+                        return;
+                    }
+                    // Flush, then drop — the client should see content-length
+                    // mismatch as a transport-level body read failure.
+                    let _ = sock.flush().await;
+                    drop(sock);
+                }
+            }
         });
         Self {
             url,
