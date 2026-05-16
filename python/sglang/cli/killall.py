@@ -1,22 +1,38 @@
 #!/usr/bin/env python3
-"""Kill SGLang processes on CUDA_VISIBLE_DEVICES GPUs (CI mode only).
+"""Kill SGLang processes — CI strict mode and local cleanup utility.
 
-Called at the start of every CI job to clean up orphaned processes from
-previous (possibly cancelled) runs. Requires SGLANG_IS_IN_CI=true.
-
-For local/non-CI usage, use scripts/killall_sglang.sh instead.
+Modes (subcommand):
+    (no arg) / ci       Strict GPU-scoped cleanup on CUDA_VISIBLE_DEVICES.
+                        Verifies GPU memory < 10%, exit 1 on failure.
+                        Used at the start of every CI job.
+    local               NVIDIA local cleanup: kill sglang processes by name,
+                        show nvidia-smi before/after.
+    rocm                ROCm cleanup: kill sglang processes by name only.
+    all                 NVIDIA: kill sglang processes + ALL GPU users
+                        (via lsof on /dev/nvidia*).
+    gpus 0,1,2,3        Kill ALL processes on the listed GPU device files.
 
 Usage:
-    python killall.py
+    killall_sglang                  # CI strict mode (default)
+    killall_sglang local
+    killall_sglang rocm
+    killall_sglang all
+    killall_sglang gpus 0,1,2,3
 
-Exit codes:
+Exit codes (ci mode):
     0 - Clean: all target GPUs have <10% memory usage after cleanup
     1 - Dirty: GPU memory still >10% after cleanup, indicating stuck processes
         or orphaned CUDA contexts that need a container restart
+
+Other modes always exit 0 unless a hard prerequisite is missing (e.g.
+`gpus` mode without lsof).
 """
 
+import argparse
+import glob
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -26,7 +42,7 @@ from pathlib import Path
 # Constants
 MEMORY_THRESHOLD_PCT = 10
 
-# Patterns matching SGLang process command lines (equivalent to pgrep -f in killall_sglang.sh)
+# Patterns matching SGLang process command lines (equivalent to `pgrep -f`).
 _SGLANG_PROCESS_PATTERNS = re.compile(
     r"sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::|sglang serve"
 )
@@ -448,9 +464,203 @@ def _ci_mode():
     return 0
 
 
+# Local cleanup modes
+def _show_nvidia_smi_table():
+    """Print full nvidia-smi output directly to stdout (outside any box)."""
+    try:
+        subprocess.run(["nvidia-smi"], timeout=10)
+    except (subprocess.SubprocessError, FileNotFoundError):
+        print("[killall] nvidia-smi unavailable")
+
+
+def _ensure_lsof():
+    """Make sure `lsof` is available; try apt-get install if missing.
+
+    Returns True if lsof can be used after this call, False otherwise.
+    """
+    if shutil.which("lsof"):
+        return True
+    print("[killall] lsof not found, attempting apt-get install...")
+    cmd_prefix = ["sudo"] if shutil.which("sudo") else []
+    try:
+        subprocess.run(
+            cmd_prefix + ["apt-get", "update"],
+            capture_output=True,
+            timeout=120,
+        )
+        subprocess.run(
+            cmd_prefix + ["apt-get", "install", "-y", "lsof"],
+            capture_output=True,
+            timeout=180,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        print(f"[killall] apt-get install failed: {type(e).__name__}")
+        return False
+    return shutil.which("lsof") is not None
+
+
+def _find_pids_via_lsof_devices(device_paths):
+    """Run `lsof <device_paths>` and return PIDs holding these device files.
+
+    Glob patterns (e.g. `/dev/nvidia*`) are expanded locally; missing devices
+    are silently skipped.
+    """
+    expanded = []
+    for p in device_paths:
+        if any(c in p for c in "*?["):
+            expanded.extend(glob.glob(p))
+        elif Path(p).exists():
+            expanded.append(p)
+    if not expanded:
+        return set()
+    try:
+        out = subprocess.run(
+            ["lsof", *expanded],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return set()
+    pids = set()
+    # Skip header; field 2 is PID.
+    for line in out.stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            pids.add(int(parts[1]))
+    return pids
+
+
+def _local_mode():
+    """NVIDIA local cleanup: kill sglang processes by name, show nvidia-smi."""
+    print("[killall] Before cleanup:")
+    _show_nvidia_smi_table()
+    print()
+
+    pids = _find_sglang_pids_by_name()
+    if pids:
+        _kill_pids(pids, "sglang processes")
+    else:
+        _log("No sglang processes found")
+    _flush_box("killall_sglang: local")
+
+    print("\n[killall] After cleanup:")
+    _show_nvidia_smi_table()
+    return 0
+
+
+def _rocm_mode():
+    """ROCm cleanup: kill sglang processes by name (no nvidia-smi)."""
+    _log("Running in ROCm mode")
+    pids = _find_sglang_pids_by_name()
+    if pids:
+        _kill_pids(pids, "sglang processes")
+    else:
+        _log("No sglang processes found")
+    _flush_box("killall_sglang: rocm")
+    return 0
+
+
+def _all_mode():
+    """NVIDIA: kill sglang processes + ALL GPU users via lsof on /dev/nvidia*."""
+    print("[killall] Before cleanup:")
+    _show_nvidia_smi_table()
+    print()
+
+    sglang_pids = _find_sglang_pids_by_name()
+    if sglang_pids:
+        _kill_pids(sglang_pids, "sglang processes")
+
+    if _ensure_lsof():
+        other_pids = _find_pids_via_lsof_devices(["/dev/nvidia*"]) - sglang_pids
+        if other_pids:
+            _kill_pids(other_pids, "all GPU users")
+    else:
+        _log("WARNING: lsof unavailable, only sglang processes were killed")
+
+    _flush_box("killall_sglang: all")
+
+    print("\n[killall] After cleanup:")
+    _show_nvidia_smi_table()
+    return 0
+
+
+def _gpus_mode(devices_str):
+    """Kill all processes on the listed GPU device files (e.g. '0,1,2,3')."""
+    indices = [d.strip() for d in devices_str.split(",") if d.strip()]
+    if not indices:
+        print(f"[killall] ERROR: invalid devices spec '{devices_str}'")
+        return 1
+    device_paths = [f"/dev/nvidia{d}" for d in indices]
+
+    print(f"[killall] Killing all processes on GPUs: {','.join(indices)}")
+    print(f"[killall] Targeting devices: {' '.join(device_paths)}")
+    print()
+    _show_nvidia_smi_table()
+    print()
+
+    if not _ensure_lsof():
+        print("[killall] ERROR: lsof unavailable, cannot continue")
+        return 1
+
+    pids = _find_pids_via_lsof_devices(device_paths)
+    if pids:
+        _kill_pids(pids, f"processes on devices {','.join(indices)}")
+    else:
+        _log("No processes on target devices")
+    _flush_box(f"killall_sglang: gpus [{','.join(indices)}]")
+
+    print("\n[killall] After cleanup:")
+    _show_nvidia_smi_table()
+    return 0
+
+
 # Entry point
 def main():
-    return _ci_mode()
+    parser = argparse.ArgumentParser(
+        prog="killall_sglang",
+        description="Kill SGLang processes (CI strict mode + local cleanup utility).",
+    )
+    subparsers = parser.add_subparsers(dest="mode")
+    subparsers.add_parser(
+        "ci",
+        help="(default) CI strict mode: GPU-scoped kill, verify, exit 1 on dirty.",
+    )
+    subparsers.add_parser(
+        "local",
+        help="NVIDIA local cleanup: kill sglang processes by name.",
+    )
+    subparsers.add_parser(
+        "rocm",
+        help="ROCm cleanup: kill sglang processes by name only.",
+    )
+    subparsers.add_parser(
+        "all",
+        help="NVIDIA: kill sglang processes + ALL GPU users via lsof on /dev/nvidia*.",
+    )
+    sub_gpus = subparsers.add_parser(
+        "gpus",
+        help="Kill all processes on specific GPU devices.",
+    )
+    sub_gpus.add_argument(
+        "devices",
+        help="comma-separated GPU indices, e.g. 0,1,2,3",
+    )
+
+    args = parser.parse_args()
+    mode = args.mode or "ci"
+
+    if mode == "ci":
+        return _ci_mode()
+    if mode == "local":
+        return _local_mode()
+    if mode == "rocm":
+        return _rocm_mode()
+    if mode == "all":
+        return _all_mode()
+    if mode == "gpus":
+        return _gpus_mode(args.devices)
+    return 1
 
 
 if __name__ == "__main__":
