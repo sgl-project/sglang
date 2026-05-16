@@ -9,7 +9,6 @@ use thiserror::Error;
 
 pub const X_ROUTER_ERROR_CODE: HeaderName = HeaderName::from_static("x-router-error-code");
 
-// Body-size limits land in M6 with the tower_http::limit layer.
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("bad request: {0}")]
@@ -28,10 +27,9 @@ pub enum ApiError {
         source: anyhow::Error,
     },
 
-    /// Upstream worker replied with a non-2xx status code that the router
-    /// itself surfaced (vs. forwarding the worker's body). Currently unused in
-    /// the proxy path (we forward the worker's body verbatim), reserved for
-    /// future use by structured retries / circuit-breakers.
+    /// The worker replied with a non-2xx status. Currently not constructed
+    /// by `Proxy` (which forwards 4xx/5xx bodies verbatim); reserved for paths
+    /// that need to distinguish "worker said no" from "worker unreachable".
     #[error("upstream returned status {status}")]
     UpstreamStatus { status: StatusCode },
 
@@ -246,7 +244,6 @@ mod tests {
             "message must not be empty: {:?}",
             env.error.message,
         );
-        // Sanity: variants must not collide on the canonical code.
         assert_ne!(env.error.code, "internal_error");
         assert_ne!(env.error.code, "model_not_found");
     }
@@ -266,7 +263,6 @@ mod tests {
             "message must not be empty: {:?}",
             env.error.message,
         );
-        // Sanity: variants must not collide on the canonical code.
         assert_ne!(env.error.code, "internal_error");
         assert_ne!(env.error.code, "bad_request");
     }

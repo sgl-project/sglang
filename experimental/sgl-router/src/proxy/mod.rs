@@ -92,16 +92,15 @@ impl Proxy {
         Ok(out)
     }
 
-    /// Classify a reqwest error into the right `ApiError` variant. The
-    /// classification feeds the structured `code` clients see and the
-    /// structured fields tracing logs; the human source chain is preserved
-    /// via `anyhow::Error::context` for the server-side log.
+    /// Classify a reqwest error into the right `ApiError` variant.
+    ///
+    /// Walks the full source chain to detect timeouts, because reqwest wraps
+    /// hyper which wraps `std::io::Error` — a top-level `is_timeout()` check
+    /// misses both the wrapped reqwest timeout and the `io::ErrorKind::TimedOut`
+    /// cases.
     fn classify_reqwest_error(&self, e: reqwest::Error, path: &str) -> ApiError {
-        // ApiError carries `worker` as a String for logging/JSON envelope —
-        // render the parsed Url at error-construction time.
         let worker = self.worker_url.as_str().to_string();
         let source = anyhow::Error::new(e).context(format!("worker {worker}: post {path}"));
-        // Walk the source chain to detect timeouts even when wrapped.
         let is_timeout = source.chain().any(|c| {
             c.downcast_ref::<reqwest::Error>()
                 .is_some_and(|r| r.is_timeout())
@@ -235,7 +234,6 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap();
-        // url crate normalizes "http://127.0.0.1:1" → "http://127.0.0.1:1/".
         assert_eq!(p.worker_url.as_str(), "http://127.0.0.1:1/");
     }
 

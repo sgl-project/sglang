@@ -16,21 +16,16 @@ struct Cli {
 
 /// Install the global tracing subscriber.
 ///
-/// Uses `try_init` so a second call (e.g. from a test harness that already
-/// installed a subscriber, or from `main` being pulled in twice) is a no-op
-/// rather than a panic. Returns `Ok(())` on first successful install AND on
-/// the "already installed" case — both mean tracing works going forward.
+/// Idempotent: a second call returns `Ok` without panicking.
 fn init_tracing(default_level: &str) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
-    // `try_init` returns Err if a global subscriber is already set. Treat
-    // that as success: tracing already works, no panic, no double-install.
     if let Err(e) = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
         .try_init()
     {
-        // Can't use `tracing` here — install failed. Use stderr.
+        // A second install attempt; the existing subscriber is fine.
         eprintln!("tracing subscriber already initialized: {e}");
     }
     Ok(())
@@ -65,15 +60,6 @@ async fn main() -> Result<()> {
         sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
             .context("load tokenizers")?,
     );
-    // Default 60s request timeout; per-worker override via `request_timeout_ms`
-    // in config. Streaming endpoints do NOT apply this timeout (long
-    // generations are valid).
-    //
-    // `Config::validate()` rejects an empty workers list, so `.first()` is
-    // safe today — but using the typed `Option` here keeps the static-config
-    // invariant explicit at the callsite. When M2 introduces dynamic worker
-    // discovery the invariant goes away and this becomes a real error path
-    // instead of a latent panic on `workers[0]`.
     let primary_worker = cfg
         .workers
         .first()
@@ -105,9 +91,6 @@ async fn main() -> Result<()> {
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!("listening on {bind}");
 
-    // Install signal handlers BEFORE serve starts. If this fails we exit
-    // cleanly rather than starting an HTTP server that ignores SIGTERM and
-    // sits unresponsive for the k8s grace period.
     let (sigterm, sigint) = install_signal_handlers()?;
 
     axum::serve(listener, app)
@@ -137,8 +120,6 @@ mod tests {
 
     #[test]
     fn init_tracing_is_idempotent() {
-        // Double-init must not panic. `try_init` returns Err on the second
-        // call, but `init_tracing` swallows it after logging to stderr.
         let _ = init_tracing("info");
         let _ = init_tracing("info");
     }

@@ -178,11 +178,10 @@ async fn streaming_first_chunk_before_completion() {
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
 
-    // We want to receive the first chunk in well under any plausible
-    // backend latency. We'll just assert the body collects at all
-    // (sanity); first-byte timing under axum::Body::from_stream is
-    // hard to assert without poll-by-poll, but the design is
-    // streaming-first per Task 7.
+    // Asserting first-byte timing under axum::Body::from_stream requires
+    // poll-by-poll instrumentation; here we only sanity-check that the body
+    // collects at all so that a regression that buffers the entire stream
+    // before yielding will at minimum still pass through bytes.
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     assert!(bytes.windows(5).any(|w| w == b"first"));
 }
@@ -280,10 +279,10 @@ async fn streaming_upstream_5xx_preserves_content_type() {
 
 #[tokio::test]
 async fn non_streaming_upstream_429_preserved() {
-    // Regression (I3): a legitimate worker 4xx (rate limit, invalid model,
-    // etc.) must be proxied verbatim. The router is only a 502-wrapper for
-    // transport failures (connect/dns/timeout); upstream-application
-    // errors are OpenAI-compatible passthrough.
+    // Regression: a legitimate worker 4xx (rate limit, invalid model, etc.)
+    // must be proxied verbatim. The router is only a 502-wrapper for
+    // transport failures (connect/dns/timeout); upstream-application errors
+    // are OpenAI-compatible passthrough.
     let upstream_body = serde_json::json!({
         "error": {
             "type": "rate_limit_error",
@@ -335,9 +334,9 @@ async fn non_streaming_upstream_429_preserved() {
 
 #[tokio::test]
 async fn non_streaming_upstream_500_preserved() {
-    // Regression (I3): worker-side 5xx (model crashed, OOM, etc.) is
-    // proxied verbatim on non-streaming requests. Mirrors streaming
-    // behaviour. Only transport failures get 502-wrapped.
+    // Regression: worker-side 5xx (model crashed, OOM, etc.) is proxied
+    // verbatim on non-streaming requests. Mirrors streaming behaviour. Only
+    // transport failures get 502-wrapped.
     let upstream_body = serde_json::json!({
         "error": {"type": "server_error", "message": "internal worker failure"}
     });
@@ -376,7 +375,7 @@ async fn non_streaming_upstream_500_preserved() {
 
 #[tokio::test]
 async fn non_streaming_upstream_4xx_body_passthrough() {
-    // Regression (I3): the worker's response bytes must reach the client
+    // Regression: the worker's response bytes must reach the client
     // unmodified — no router envelope wrap, no field rewriting.
     let upstream_body = serde_json::json!({
         "error": {"type": "invalid_request_error", "message": "bad model"}
@@ -414,9 +413,9 @@ async fn non_streaming_upstream_4xx_body_passthrough() {
 
 #[tokio::test]
 async fn oversized_request_body_returns_413() {
-    // Regression (B4): the router must enforce a body-size cap on
-    // `/v1/chat/completions`. A multi-MiB body from a hostile client must
-    // be rejected at the layer BEFORE the handler reads it into memory, and
+    // Regression: the router must enforce a body-size cap on
+    // `/v1/chat/completions`. A multi-MiB body from a hostile client must be
+    // rejected at the layer BEFORE the handler reads it into memory, and
     // must NOT be forwarded to the upstream worker.
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config(&worker.url);
@@ -450,9 +449,9 @@ async fn oversized_request_body_returns_413() {
 
 #[tokio::test]
 async fn chat_rejects_null_body_400() {
-    // Regression (I5): a JSON `null` body is syntactically valid JSON but
-    // is NOT a chat-completions request shape. The router must reject it
-    // with 400 BadRequest and NOT forward it to the worker.
+    // Regression: a JSON `null` body is syntactically valid JSON but is NOT
+    // a chat-completions request shape. The router must reject it with 400
+    // BadRequest and NOT forward it to the worker.
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -481,8 +480,8 @@ async fn chat_rejects_null_body_400() {
 
 #[tokio::test]
 async fn chat_rejects_array_body_400() {
-    // Regression (I5): a JSON array `[]` body is not a chat-completions
-    // request shape (object expected). Router must 400 and not forward.
+    // Regression: a JSON array `[]` body is not a chat-completions request
+    // shape (object expected). Router must 400 and not forward.
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -507,8 +506,8 @@ async fn chat_rejects_array_body_400() {
 
 #[tokio::test]
 async fn chat_rejects_string_body_400() {
-    // Regression (I5): a JSON string `"hi"` is not a chat-completions
-    // request shape. Router must 400 and not forward.
+    // Regression: a JSON string `"hi"` is not a chat-completions request
+    // shape. Router must 400 and not forward.
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());

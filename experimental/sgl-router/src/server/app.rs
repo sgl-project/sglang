@@ -9,11 +9,6 @@ use axum::Router;
 use std::sync::Arc;
 
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
-    // Per-route body-size cap on /v1/chat/completions. Wired at the route
-    // level (not the app level) so /v1/tokenize and /v1/detokenize can pick
-    // their own limits later without coupling. axum's `Bytes` extractor
-    // enforces the limit and returns 413 PAYLOAD_TOO_LARGE before the
-    // handler runs.
     Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))

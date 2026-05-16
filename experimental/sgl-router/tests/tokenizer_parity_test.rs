@@ -18,9 +18,9 @@
 //! warning and passes — useful for contributors without the model snapshots.
 //! In CI (`SGLANG_IS_IN_CI=true`) the same condition is a hard failure: a
 //! parity matrix that validates nothing is worse than no test at all, since
-//! it gives a false sense of coverage. The e2e HTTP tokenize test (Task 11)
-//! remains the authoritative live-model parity gate, but this matrix must
-//! actually run against cached snapshots when present in CI.
+//! it gives a false sense of coverage. The e2e HTTP tokenize test remains
+//! the authoritative live-model parity gate, but this matrix must actually
+//! run against cached snapshots when present in CI.
 //!
 //! ## Regenerating fixtures
 //!
@@ -128,8 +128,8 @@ fn parity_matrix() {
             .collect();
         let msg = format!(
             "parity_matrix: no fixtures could be checked — HF cache empty? skipped {} cells \
-             across model families: [{}]. E2E tokenize test (Task 11) is the authoritative \
-             CI parity gate.",
+             across model families: [{}]. The e2e HTTP tokenize test remains the \
+             authoritative live-model parity gate.",
             skipped.len(),
             families.join(", "),
         );
