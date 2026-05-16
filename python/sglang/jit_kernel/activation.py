@@ -32,7 +32,7 @@ def _fast_math_flags() -> list[str]:
 def _jit_activation_module(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
-        "activation",
+        "activation_swap_halves",
         *args,
         cuda_files=["elementwise/activation.cuh"],
         extra_cuda_cflags=_fast_math_flags(),
