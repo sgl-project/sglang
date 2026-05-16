@@ -158,9 +158,7 @@ class CutlassFp4LoraRunnerCore:
             hooks.after_gate_up(hidden_states, gateup_3d, topk_weights, topk_ids)
 
         # ---- silu + mul
-        intermediate = torch.empty(
-            total_tokens, N // 2, dtype=out_dtype, device=device
-        )
+        intermediate = torch.empty(total_tokens, N // 2, dtype=out_dtype, device=device)
         silu_and_mul(gateup_flat, intermediate, swap_halves=quant_info.w13_swap_halves)
 
         # ---- GEMM 2 (w2)
@@ -194,8 +192,10 @@ class CutlassFp4LoraRunnerCore:
             out_flat,
             output,
             c_map,
-            None
-            if runner_config.apply_router_weight_on_input
-            else local_weights.reshape(-1),
+            (
+                None
+                if runner_config.apply_router_weight_on_input
+                else local_weights.reshape(-1)
+            ),
         )
         return StandardCombineInput(hidden_states=output)

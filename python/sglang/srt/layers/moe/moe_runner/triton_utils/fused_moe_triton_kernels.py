@@ -817,13 +817,13 @@ def invoke_fused_moe_kernel(
             add_output_mask is not None
         ), "add_output_mask required when fuse_add_to_output=True"
     if c_map is not None:
-        assert fuse_add_to_output, (
-            "c_map output remap is only supported with fuse_add_to_output"
-        )
+        assert (
+            fuse_add_to_output
+        ), "c_map output remap is only supported with fuse_add_to_output"
         assert not c_sorted, "c_map output remap and c_sorted are mutually exclusive"
-        assert not (use_int8_w8a16 or use_int4_w4a16), (
-            "c_map output remap is not supported for GPTQ/AWQ kernels"
-        )
+        assert not (
+            use_int8_w8a16 or use_int4_w4a16
+        ), "c_map output remap is not supported for GPTQ/AWQ kernels"
         assert c_map.dtype == torch.int32
         assert c_map.stride(0) == 1
 

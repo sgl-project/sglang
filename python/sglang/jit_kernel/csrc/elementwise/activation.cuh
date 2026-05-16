@@ -91,8 +91,7 @@ struct ActivationKernel {
   static constexpr auto kBlockSize = 256u;
 
   template <ActivationKind kAct, bool kFilterExpert, bool kSwapHalves>
-  static constexpr auto activation_kernel =
-      act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kSwapHalves>;
+  static constexpr auto activation_kernel = act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kSwapHalves>;
 
   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
 
@@ -174,11 +173,8 @@ struct ActivationKernel {
     }
   }
 
-  static void run_activation(
-      const tvm::ffi::TensorView input,
-      const tvm::ffi::TensorView out,
-      std::string type,
-      bool swap_halves) {
+  static void
+  run_activation(const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type, bool swap_halves) {
     launch(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1, swap_halves);
   }
 

@@ -135,6 +135,4 @@ def gelu_tanh_and_mul(
     expert_step: int = 1,
     swap_halves: bool = False,
 ) -> torch.Tensor:
-    return run_activation(
-        "gelu_tanh", input, out, expert_ids, expert_step, swap_halves
-    )
+    return run_activation("gelu_tanh", input, out, expert_ids, expert_step, swap_halves)
