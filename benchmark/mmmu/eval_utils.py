@@ -29,7 +29,7 @@ class EvalArgs:
     seed: int = 42
     split: str = "validation"
     image_pixels_limit: int = -1
-    result_filename: str = f"./val_sglang.json"
+    result_filename: str = "./val_sglang.json"
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
     extra_request_body: Optional[str] = None
@@ -38,9 +38,16 @@ class EvalArgs:
     concurrency: int = 1
     max_new_tokens: Optional[int] = None
     temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    presence_penalty: Optional[float] = None
+    repetition_penalty: Optional[float] = None
     response_answer_regex: str = "(?s)(.*)"
     lora_path: Optional[str] = None
     reasoning_effort: Optional[str] = None
+    min_pixels: Optional[int] = None
+    max_pixels: Optional[int] = None
+    multi_images: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -110,6 +117,30 @@ class EvalArgs:
             help="Sampling temperature for generation.",
         )
         parser.add_argument(
+            "--top-p",
+            type=float,
+            default=EvalArgs.top_p,
+            help="Top-p (nucleus) sampling parameter.",
+        )
+        parser.add_argument(
+            "--top-k",
+            type=int,
+            default=EvalArgs.top_k,
+            help="Top-k sampling parameter.",
+        )
+        parser.add_argument(
+            "--presence-penalty",
+            type=float,
+            default=EvalArgs.presence_penalty,
+            help="Presence penalty for generation (penalizes tokens that have appeared).",
+        )
+        parser.add_argument(
+            "--repetition-penalty",
+            type=float,
+            default=EvalArgs.repetition_penalty,
+            help="Repetition penalty for generation.",
+        )
+        parser.add_argument(
             "--response-answer-regex",
             type=str,
             default=EvalArgs.response_answer_regex,
@@ -127,6 +158,24 @@ class EvalArgs:
             default=EvalArgs.reasoning_effort,
             choices=["none", "high"],
             help="Reasoning effort for the model (none or high).",
+        )
+        parser.add_argument(
+            "--min-pixels",
+            type=int,
+            default=EvalArgs.min_pixels,
+            help="Minimum pixel count for image resizing (e.g., 1003520 for Qwen3-VL).",
+        )
+        parser.add_argument(
+            "--max-pixels",
+            type=int,
+            default=EvalArgs.max_pixels,
+            help="Maximum pixel count for image resizing (e.g., 4014080 for Qwen3-VL).",
+        )
+        parser.add_argument(
+            "--multi-images",
+            action="store_true",
+            default=EvalArgs.multi_images,
+            help="Use all images per sample instead of only the first.",
         )
 
     @classmethod
@@ -215,17 +264,23 @@ def prepare_samples(eval_args: EvalArgs):
     skip_count = 0
 
     def process_sample(i, sample):
-        sample = process_single_sample(sample)
+        sample = process_single_sample(sample, multi_images=eval_args.multi_images)
         sample = construct_prompt(sample, eval_args.config)
-        image = sample["image"]
-        width, height = image.size
+        images = sample.get("images", [])
+        if not images:
+            return None, True
+        first_image = images[0]
+        width, height = first_image.size
         if 0 < eval_args.image_pixels_limit <= width * height:
             return None, True
-        # Use a unique identifier for the image path to avoid potential collisions if indices reset
-        image_path = f"{images_path}/image_{sample['id']}.png"
-        if not os.path.exists(image_path):
-            image.save(image_path)
-        sample["image_path"] = image_path
+        image_paths = []
+        for idx, img in enumerate(images):
+            suffix = f"_{idx}" if len(images) > 1 else ""
+            image_path = f"{images_path}/image_{sample['id']}{suffix}.png"
+            if not os.path.exists(image_path):
+                img.save(image_path)
+            image_paths.append(image_path)
+        sample["image_paths"] = image_paths
         return sample, False
 
     print("Processing samples...")
@@ -264,10 +319,25 @@ def get_sampling_params(eval_args):
     }
 
     if eval_args.max_new_tokens is not None and eval_args.max_new_tokens > 0:
-        sampling_params.update({"max_completion_tokens": eval_args.max_new_tokens})
+        sampling_params["max_completion_tokens"] = eval_args.max_new_tokens
 
     if eval_args.temperature is not None:
-        sampling_params.update({"temperature": eval_args.temperature})
+        sampling_params["temperature"] = eval_args.temperature
+
+    if eval_args.top_p is not None:
+        sampling_params["top_p"] = eval_args.top_p
+
+    if eval_args.presence_penalty is not None:
+        sampling_params["presence_penalty"] = eval_args.presence_penalty
+
+    # top_k and repetition_penalty are SGLang extensions, not standard OpenAI fields
+    extra_body = sampling_params.pop("extra_body", {})
+    if eval_args.top_k is not None:
+        extra_body["top_k"] = eval_args.top_k
+    if eval_args.repetition_penalty is not None:
+        extra_body["repetition_penalty"] = eval_args.repetition_penalty
+    if extra_body:
+        sampling_params["extra_body"] = extra_body
 
     return sampling_params
 
@@ -286,6 +356,8 @@ _EXPLICIT_ANSWER_PATTERNS = (
     r"\\boxed\{\s*\*{0,2}\s*\(?([A-Z])\)?\s*\*{0,2}\s*\}",
     # "(the) answer is X" / "(the) correct answer is X"
     r"\b(?:the\s+)?answer\s+is\s*\*{0,2}\s*\(?([A-Z])\)?\s*\*{0,2}(?![A-Za-z])",
+    # "X." at the very start (model echoes the option letter)
+    r"^\s*\(?([A-Z])\)?\s*\.",
 )
 
 
@@ -333,8 +405,19 @@ def parse_multi_choice_response(response, all_choices, index2ans):
                 candidates.append(index)
                 index_ans = False  # it's content ans.
 
-    if len(candidates) == 0:  # still not get answer, randomly choose one.
-        pred_index = random.choice(all_choices)
+    if len(candidates) == 0:
+        stripped = response
+        for ch in ".()[],:;!*#{}\"'":
+            stripped = stripped.replace(ch, " ")
+        tokens = [t.strip() for t in stripped.split() if t.strip()]
+        found = [c for c in all_choices if c in tokens]
+        if len(found) == 1:
+            pred_index = found[0]
+        elif len(found) > 1:
+            first_pos = {c: tokens.index(c) for c in found}
+            pred_index = min(first_pos, key=first_pos.get)
+        else:
+            pred_index = random.choice(all_choices)
     elif len(candidates) > 1:
         start_indexes = []
         if index_ans:
@@ -531,20 +614,25 @@ def eval_open(gold_i, pred_i):
     """
     correct = False
     if isinstance(gold_i, list):
-        # use float to avoid trivial matches
         norm_answers = []
+        raw_answers = [str(a).strip().lower() for a in gold_i]
         for answer in gold_i:
             norm_answers.extend(normalize_str(answer))
     else:
         norm_answers = normalize_str(gold_i)
-    for pred in pred_i:  # pred is already normalized in parse response phase
-        if isinstance(pred, str):  # if it's a string, then find if ans in the pred_i
+        raw_answers = [str(gold_i).strip().lower()]
+    for pred in pred_i:
+        if isinstance(pred, str):
             for norm_ans in norm_answers:
-                # only see if the string answer in the string pred
                 if isinstance(norm_ans, str) and norm_ans in pred:
                     if not correct:
                         correct = True
                     break
+            if not correct:
+                for raw_ans in raw_answers:
+                    if raw_ans in pred:
+                        correct = True
+                        break
         else:  # it's a float number
             if pred in norm_answers:
                 if not correct:
@@ -622,7 +710,6 @@ def eval_result(model_answer_path, answer_dict, eval_output_path=None):
         eval_output_path = model_answer_path
     print("Evaluating...")
     output_dict = json.load(open(model_answer_path))
-    # answer_dict = json.load(open(answer_path))
 
     # group by category
     output_dict_w_cat = {}
@@ -662,12 +749,9 @@ def eval_result(model_answer_path, answer_dict, eval_output_path=None):
         for data_id, parsed_pred in cat_outputs.items():
             question_type = cat_answers[data_id]["question_type"]
             if question_type != "multiple-choice":
-                parsed_pred = parse_open_response(
-                    parsed_pred
-                )  # mainly for type consistency (make it number, etc.)
-            else:
-                parsed_pred = parsed_pred
-
+                raw_response = parsed_pred
+                parsed_pred = parse_open_response(raw_response)
+                parsed_pred.append(raw_response.lower())
             exampels_to_eval.append(
                 {
                     "id": data_id,

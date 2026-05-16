@@ -36,6 +36,7 @@ from tqdm import tqdm
 from sglang.test.test_utils import add_common_sglang_args_and_parse
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
+IMAGE_TAG_RE = re.compile(r"<image\s*\d*>")
 
 
 @dataclass
@@ -69,11 +70,32 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     return output
 
 
-def _get_prefix_suffix(prompt: str) -> Tuple[str, str]:
-    """Split the prompt into prefix and suffix."""
-    prefix = prompt.split("<")[0]
-    suffix = prompt.split(">", 1)[1]
-    return prefix, suffix
+def _strip_think_tags(response: Optional[str]) -> Optional[str]:
+    """Strip <think>...</think> tags from model response."""
+    if response and "</think>" in response:
+        return response.split("</think>")[-1].strip()
+    return response
+
+
+def _split_prompt_on_images(prompt: str) -> List[str]:
+    """Split prompt on <image>, <image 1>, <image 2>, etc. tags.
+
+    Returns a list of text segments (one more than the number of image tags).
+    For a prompt with no image tags, returns [prompt].
+    """
+    parts = IMAGE_TAG_RE.split(prompt)
+    return parts
+
+
+def _encode_image_path(image_path: str) -> str:
+    """Convert a local image path to a base64 data URL, or pass through remote URLs."""
+    if image_path and not image_path.startswith(("http://", "https://", "data:")):
+        p = Path(image_path)
+        mime = mimetypes.guess_type(str(p))[0] or "image/png"
+        with open(p, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        return f"data:{mime};base64,{b64}"
+    return image_path
 
 
 async def process_sample(
@@ -83,45 +105,46 @@ async def process_sample(
     model: str,
     reasoning_effort: Optional[str] = None,
     lora_path: Optional[str] = None,
+    min_pixels: Optional[int] = None,
+    max_pixels: Optional[int] = None,
 ) -> Tuple[dict, str]:
     """Send a single sample to the LLM and return (sample, response)."""
     prompt = sample["final_input_prompt"]
-    prefix, suffix = _get_prefix_suffix(prompt)
-    image = sample["image"]
-    assert image is not None
-    image_path = sample["image_path"]
-    if image_path and not image_path.startswith(("http://", "https://", "data:")):
-        p = Path(image_path)
-        mime = mimetypes.guess_type(str(p))[0] or "image/png"
-        with open(p, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        image_url = f"data:{mime};base64,{b64}"
-    else:
-        image_url = image_path
-    extra_body = {"lora_path": lora_path} if lora_path else None
+    text_parts = _split_prompt_on_images(prompt)
+    image_paths = sample["image_paths"]
+
+    content = []
+    for i, text in enumerate(text_parts):
+        if text:
+            content.append({"type": "text", "text": text})
+        if i < len(image_paths):
+            image_url = _encode_image_path(image_paths[i])
+            image_part = {"url": image_url}
+            if min_pixels is not None:
+                image_part["min_pixels"] = min_pixels
+            if max_pixels is not None:
+                image_part["max_pixels"] = max_pixels
+            content.append({"type": "image_url", "image_url": image_part})
+
+    params = {k: v for k, v in sampling_params.items() if k != "extra_body"}
+    extra_body = dict(sampling_params.get("extra_body") or {})
+    if lora_path:
+        extra_body["lora_path"] = lora_path
     payload = {
         "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prefix},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                    {"type": "text", "text": suffix},
-                ],
-            }
-        ],
-        "extra_body": extra_body,
-        **sampling_params,
+        "messages": [{"role": "user", "content": content}],
+        **params,
     }
+    if extra_body:
+        payload["extra_body"] = extra_body
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
     response = await client.chat.completions.create(**payload)
     msg = response.choices[0].message
-    content = msg.content
-    if content is None:
-        content = getattr(msg, "reasoning_content", None)
-    return sample, content
+    result = msg.content
+    if result is None:
+        result = getattr(msg, "reasoning_content", None)
+    return sample, result
 
 
 async def process_sample_with_semaphore(
@@ -132,11 +155,20 @@ async def process_sample_with_semaphore(
     model: str,
     reasoning_effort: Optional[str] = None,
     lora_path: Optional[str] = None,
+    min_pixels: Optional[int] = None,
+    max_pixels: Optional[int] = None,
 ) -> Tuple[dict, str]:
     """Wrap process_sample with a semaphore for concurrency control."""
     async with semaphore:
         return await process_sample(
-            client, sample, sampling_params, model, reasoning_effort, lora_path
+            client,
+            sample,
+            sampling_params,
+            model,
+            reasoning_effort,
+            lora_path,
+            min_pixels,
+            max_pixels,
         )
 
 
@@ -148,6 +180,8 @@ async def eval_mmmu(args) -> None:
     model = args.model
     reasoning_effort = eval_args.reasoning_effort
     lora_path = eval_args.lora_path
+    min_pixels = eval_args.min_pixels
+    max_pixels = eval_args.max_pixels
     answer_dict = {}
     out_samples = {}
     client = openai.AsyncOpenAI(
@@ -168,25 +202,34 @@ async def eval_mmmu(args) -> None:
 
         samples = samples[: args.profile_number]
 
+    def _handle_response(sample, response):
+        sample["original_response"] = response
+        response = _strip_think_tags(response)
+        answer = (
+            re.search(args.response_answer_regex, response)
+            if response is not None
+            else None
+        )
+        process_result(
+            answer.group(1).strip() if answer else response,
+            sample,
+            answer_dict,
+            out_samples,
+        )
+
     if args.concurrency == 1:
-        # For concurrency == 1, run in sequential mode to ensure consistent order
-        # this is mainly for profiling
         for sample in tqdm(samples):
             _, response = await process_sample(
-                client, sample, sampling_params, model, reasoning_effort, lora_path
-            )
-            sample["original_response"] = response
-            answer = (
-                re.search(args.response_answer_regex, response)
-                if response is not None
-                else None
-            )
-            process_result(
-                answer.group(1).strip() if answer else response,
+                client,
                 sample,
-                answer_dict,
-                out_samples,
+                sampling_params,
+                model,
+                reasoning_effort,
+                lora_path,
+                min_pixels,
+                max_pixels,
             )
+            _handle_response(sample, response)
     else:
         semaphore = asyncio.Semaphore(args.concurrency)
         tasks = [
@@ -198,24 +241,15 @@ async def eval_mmmu(args) -> None:
                 model,
                 reasoning_effort,
                 lora_path,
+                min_pixels,
+                max_pixels,
             )
             for sample in samples
         ]
 
         for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
             sample, response = await coro
-            sample["original_response"] = response
-            answer = (
-                re.search(args.response_answer_regex, response)
-                if response is not None
-                else None
-            )
-            process_result(
-                answer.group(1).strip() if answer else response,
-                sample,
-                answer_dict,
-                out_samples,
-            )
+            _handle_response(sample, response)
 
     if args.profile:
         print("Stopping profiler...")

@@ -6,6 +6,9 @@ import re
 
 import yaml
 
+# MMMU dataset has image_1 through image_7 columns
+MAX_IMAGES_PER_SAMPLE = 7
+
 DOMAIN_CAT2SUB_CAT = {
     "Art and Design": ["Art", "Art_Theory", "Design", "Music"],
     "Business": ["Accounting", "Economics", "Finance", "Manage", "Marketing"],
@@ -106,7 +109,7 @@ def parse_img_path(text):
     return matches
 
 
-def process_single_sample(data):
+def process_single_sample(data, multi_images=False):
     question = data["question"]
     o_imgs_paths = []
     for option in data["options"]:
@@ -114,30 +117,41 @@ def process_single_sample(data):
         for img_path in current_o_imgs_paths:
             o_imgs_paths.append(img_path)
 
-    if len(o_imgs_paths) > 1:  # multiple images in options, used for random selection
+    if len(o_imgs_paths) > 1:  # multiple images in options, not supported
         return {
             "id": data["id"],
             "question": question,
             "options": data["options"],
             "answer": data["answer"],
-            "image": None,
+            "images": [],
             "question_type": data["question_type"],
         }
+
+    images = []
+    if multi_images:
+        for i in range(1, MAX_IMAGES_PER_SAMPLE + 1):
+            key = f"image_{i}"
+            if key in data and data[key] is not None:
+                images.append(data[key])
     else:
-        return {
-            "id": data["id"],
-            "question": question,
-            "options": data["options"],
-            "answer": data["answer"],
-            "image": data["image_1"],
-            "question_type": data["question_type"],
-        }
+        if data.get("image_1") is not None:
+            images.append(data["image_1"])
+    return {
+        "id": data["id"],
+        "question": question,
+        "options": data["options"],
+        "answer": data["answer"],
+        "images": images,
+        "question_type": data["question_type"],
+    }
 
 
 # DATA SAVING
 def save_json(filename, ds):
     print(f"answers saved to: {filename}")
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    dirname = os.path.dirname(filename)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
     with open(filename, "w") as f:
         json.dump(ds, f, indent=4)
 
@@ -174,13 +188,17 @@ def construct_prompt(sample, config):
     question = sample["question"]
     options = eval(sample["options"])
     example = ""
+    option_fmt = config["option_format"]
     if sample["question_type"] == "multiple-choice":
         start_chr = "A"
         prediction_range = []
         index2ans = {}
         for option in options:
             prediction_range.append(start_chr)
-            example += f"({start_chr}) {option}\n"
+            if option_fmt == "dot":
+                example += f"{start_chr}. {option}\n"
+            else:
+                example += f"({start_chr}) {option}\n"
             index2ans[start_chr] = option
             start_chr = chr(ord(start_chr) + 1)
         empty_prompt_sample_structure = config["multi_choice_example_format"]

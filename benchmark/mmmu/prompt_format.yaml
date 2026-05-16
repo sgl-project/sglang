@@ -11,5 +11,7 @@ short_ans_example_format:
 - "{}
 
 Answer the question using a single word or phrase."
+option_format:
+- "paren"
 temperature:
 - 0

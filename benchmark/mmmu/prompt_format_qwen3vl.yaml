@@ -1,0 +1,12 @@
+task_instructions:
+- ""
+multi_choice_example_format:
+- "Question: {}
+Options:
+{}Please select the correct answer from the options above."
+short_ans_example_format:
+- "Question: {}"
+option_format:
+- "dot"
+temperature:
+- 0

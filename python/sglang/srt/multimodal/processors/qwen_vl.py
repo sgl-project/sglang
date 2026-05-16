@@ -33,6 +33,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils.common import ImageData
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
 
@@ -515,6 +516,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
 
+        per_request_images_kwargs = {}
+        if image_data:
+            for img_item in image_data:
+                if isinstance(img_item, ImageData) and img_item.preprocess_kwargs:
+                    per_request_images_kwargs.update(img_item.preprocess_kwargs)
+                    break
+
         video_metadata = None
         if base_output.videos:
             videos_processed = [
@@ -524,6 +532,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
         preprocess_time = time.perf_counter()
+
+        extra_kwargs = {}
+        if per_request_images_kwargs:
+            extra_kwargs["images_kwargs"] = per_request_images_kwargs
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
         if self.hf_config.model_type in (
@@ -538,10 +550,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 self.mm_tokens,
                 video_metadata=video_metadata,
                 do_sample_frames=False,
+                **extra_kwargs,
             )
         else:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
+                base_output, self.mm_tokens, **extra_kwargs
             )
 
         audio_feature_lengths = None

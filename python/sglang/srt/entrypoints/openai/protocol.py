@@ -438,6 +438,8 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    min_pixels: Optional[int] = None
+    max_pixels: Optional[int] = None
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):

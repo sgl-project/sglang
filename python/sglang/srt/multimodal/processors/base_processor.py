@@ -401,8 +401,13 @@ class BaseMultimodalProcessor(ABC):
         """
         if images:
             kwargs["images"] = images
+            per_request_images_kwargs = kwargs.pop("images_kwargs", {})
+            merged_images_kwargs = {}
             if self.image_config:
-                kwargs.setdefault("images_kwargs", {}).update(self.image_config)
+                merged_images_kwargs.update(self.image_config)
+            merged_images_kwargs.update(per_request_images_kwargs)
+            if merged_images_kwargs:
+                kwargs["images_kwargs"] = merged_images_kwargs
         if videos:
             kwargs["videos"] = videos
             if self.video_config:
@@ -1214,7 +1219,6 @@ class BaseMultimodalProcessor(ABC):
                     isinstance(item.precomputed_embeddings, torch.Tensor)
                     and item.precomputed_embeddings.is_cuda
                 ):
-
                     sync_flag, available_slice, byte_offset = (
                         self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
                             item.precomputed_embeddings

@@ -160,12 +160,17 @@ def process_content_for_template_format(
                 if chunk_type == "image_url":
                     image_obj = chunk.get("image_url") or {}
                     mdp = image_obj.get("max_dynamic_patch", None)
-                    # Also allow flat style: chunk["max_dynamic_patch"]
+                    preprocess_kwargs = {}
+                    if image_obj.get("min_pixels") is not None:
+                        preprocess_kwargs["min_pixels"] = image_obj["min_pixels"]
+                    if image_obj.get("max_pixels") is not None:
+                        preprocess_kwargs["max_pixels"] = image_obj["max_pixels"]
                     image_data.append(
                         ImageData(
                             url=image_obj["url"],
                             detail=image_obj.get("detail", "auto"),
                             max_dynamic_patch=mdp,
+                            preprocess_kwargs=preprocess_kwargs or None,
                         )
                     )
 
