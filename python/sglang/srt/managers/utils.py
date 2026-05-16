@@ -16,7 +16,8 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyOutput
+    from sglang.srt.speculative.eagle_info import EagleVerifyOutput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,11 @@ class GenerationBatchResult:
     accept_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
-    next_draft_input: Optional[EagleDraftInput] = None
+    # Worker produces a fresh draft state at end of this iter; scheduler
+    # installs it on batch.spec_info before the next iter. Covers all spec
+    # algos that need cross-iter draft state (EAGLE V1/V2, MultiLayer V1/V2,
+    # FrozenKV MTP, DFLASH). Ngram is excluded — see ngram_worker for why.
+    next_draft_input: Optional[SpecInput] = None
     # V2 only: passed from worker.verify to worker._draft_extend_for_decode in
     # the same forward_batch_generation call. Carries `draft_extend_input` +
     # `predict` (the V2 raw target output). Not consumed by scheduler.

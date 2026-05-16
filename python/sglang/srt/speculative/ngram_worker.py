@@ -235,6 +235,12 @@ class NGRAMWorker:
 
         batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
         batch.forward_mode = ForwardMode.TARGET_VERIFY
+        # Direct mutate (not GenerationBatchResult.next_draft_input relay):
+        # Ngram has no draft model and no cross-iter draft state. NgramVerifyInput
+        # is built fresh each iter from CPU corpus lookup, and must be installed
+        # *before* the target forward (target_worker reads spec_info from the
+        # captured ModelWorkerBatch). The relay model produces draft_input as
+        # forward output for the next iter — that semantic does not apply here.
         batch.spec_info = NgramVerifyInput(
             draft_tokens,
             tree_mask,

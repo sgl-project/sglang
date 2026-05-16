@@ -1173,13 +1173,15 @@ class DFlashWorker:
                 ),
             )
             self._append_target_hidden_to_draft_kv(batch, draft_input)
-            batch.spec_info = draft_input
 
+            # Scheduler installs draft_input on batch.spec_info via
+            # batch_result.next_draft_input — see scheduler.py unified install.
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
                 num_correct_drafts=0,
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                next_draft_input=draft_input,
             )
 
         # Decode / target-verify stage.
@@ -1236,7 +1238,6 @@ class DFlashWorker:
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
         self._append_target_hidden_to_draft_kv(batch, draft_input)
-        batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
         num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
@@ -1253,4 +1254,5 @@ class DFlashWorker:
             num_correct_drafts=num_correct_drafts,
             num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
+            next_draft_input=draft_input,
         )
