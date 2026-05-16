@@ -8,12 +8,8 @@ This module defines the base class for pipelines that are composed of multiple s
 """
 
 import os
-from abc import ABC, abstractmethod
-from typing import Any, Callable, Literal, cast
-
 import torch
-from tqdm import tqdm
-
+from abc import ABC, abstractmethod
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
@@ -55,6 +51,8 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from tqdm import tqdm
+from typing import Any, Callable, Literal, cast
 
 logger = init_logger(__name__)
 
@@ -390,13 +388,14 @@ class ComposedPipelineBase(ABC):
 
         loaded_components = {}
         component_load_specs: list[ComponentLoadSpec] = []
-        # enqueue only real weight loads; skipped/provided modules keep old handling
+
+        # enqueue only real weight loads (e.g., scheduler, tokenizer is excluded); skipped/provided modules keep old handling
         for index, (
-            module_name,
-            (
-                transformers_or_diffusers,
-                architecture,
-            ),
+                module_name,
+                (
+                        transformers_or_diffusers,
+                        architecture,
+                ),
         ) in enumerate(model_index.items()):
             if transformers_or_diffusers is None:
                 logger.warning(
@@ -421,6 +420,7 @@ class ComposedPipelineBase(ABC):
             component_model_path = self._resolve_component_path(
                 server_args, module_name, load_module_name
             )
+            # collect loading specs
             component_load_specs.append(
                 ComponentLoadSpec(
                     module_name=module_name,
@@ -433,7 +433,7 @@ class ComposedPipelineBase(ABC):
             )
 
         # reorder loading order to avoid OOM
-        component_load_specs = order_component_load_specs(component_load_specs)
+        component_load_specs: ComponentLoadSpec = order_component_load_specs(component_load_specs)
         logger.info(
             "Memory-aware component load order: %s",
             [spec.module_name for spec in component_load_specs],
@@ -442,12 +442,12 @@ class ComposedPipelineBase(ABC):
         for spec in tqdm(
             iterable=component_load_specs, desc="Loading required modules"
         ):
-            module_name = spec.module_name
-            load_module_name = spec.load_module_name
-            transformers_or_diffusers = spec.transformers_or_diffusers
-            architecture = spec.architecture
+            module_name: str = spec.module_name
+            load_module_name: str = spec.load_module_name
+            transformers_or_diffusers: str = spec.transformers_or_diffusers
+            architecture: str = spec.architecture
+            component_model_path: str = spec.component_model_path
 
-            component_model_path = spec.component_model_path
             attn_backend, matched_backend_key = (
                 server_args.resolve_component_attention_backend(
                     module_name, load_module_name
