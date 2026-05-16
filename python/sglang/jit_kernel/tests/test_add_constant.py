@@ -24,5 +24,18 @@ def test_add_constant_unaligned_input() -> None:
     assert torch.all(dst == src + 7)
 
 
+@pytest.mark.parametrize("size", [2**20, 2**20 + 3])
+def test_add_constant_large_aligned_input(size: int) -> None:
+    src = torch.arange(0, size, dtype=torch.int32, device="cuda")
+    dst = add_constant(src, -3)
+    assert torch.all(dst == src - 3)
+
+
+def test_add_constant_large_unaligned_input() -> None:
+    src = torch.arange(0, 2**20 + 4, dtype=torch.int32, device="cuda")[1:]
+    dst = add_constant(src, 7)
+    assert torch.all(dst == src + 7)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

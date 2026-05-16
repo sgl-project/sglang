@@ -2,11 +2,11 @@
 #include <sgl_kernel/utils.h>   // For div_ceil, RuntimeCheck
 
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
+#include <sgl_kernel/vec.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -20,28 +20,39 @@ __global__ void add_constant_kernel(int32_t* dst, const int32_t* src, size_t len
   }
 }
 
-template <int32_t kConstant>
-__global__ void add_constant_vec4_kernel(int32_t* dst, const int32_t* src, size_t length) {
-  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t length_vec4 = length / 4;
+template <int32_t kConstant, size_t kElementsPerVector>
+__global__ void add_constant_vectorized_kernel(int32_t* dst, const int32_t* src, size_t length) {
+  using Vector = device::AlignedVector<int32_t, kElementsPerVector>;
 
-  if (idx < length_vec4) {
-    int4 values = reinterpret_cast<const int4*>(src)[idx];
-    values.x += kConstant;
-    values.y += kConstant;
-    values.z += kConstant;
-    values.w += kConstant;
-    reinterpret_cast<int4*>(dst)[idx] = values;
-  }
+  const size_t work_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t vector_count = length / kElementsPerVector;
+  const size_t tail_start = vector_count * kElementsPerVector;
 
-  const size_t tail_idx = length_vec4 * 4 + idx;
-  if (tail_idx < length) {
-    dst[tail_idx] = src[tail_idx] + kConstant;
+  if (work_idx < vector_count) {
+    auto values = device::load_as<Vector>(src, work_idx);
+#pragma unroll
+    for (size_t i = 0; i < kElementsPerVector; ++i) {
+      values[i] += kConstant;
+    }
+    device::store_as<Vector>(dst, values, work_idx);
+  } else {
+    const size_t tail_idx = tail_start + work_idx - vector_count;
+    if (tail_idx < length) {
+      dst[tail_idx] = src[tail_idx] + kConstant;
+    }
   }
 }
 
 constexpr size_t kBlockSize = 256;
-constexpr size_t kVec4MinElements = 1 << 20;
+constexpr size_t kVectorizedMinElements = 1 << 20;
+constexpr size_t kVectorBytes = device::kMaxVecBytes;
+constexpr size_t kElementsPerVector = kVectorBytes / sizeof(int32_t);
+static_assert(kVectorBytes % sizeof(int32_t) == 0);
+
+template <typename Vector>
+bool is_aligned_for_vector(const int32_t* ptr) {
+  return reinterpret_cast<uintptr_t>(ptr) % alignof(Vector) == 0;
+}
 
 // You can also use struct with static method as an alternative
 template <int32_t kConstant>
@@ -69,15 +80,17 @@ void add_constant(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
 
   const auto* src_ptr = static_cast<const int32_t*>(src.data_ptr());
   auto* dst_ptr = static_cast<int32_t*>(dst.data_ptr());
-  const bool is_vec4_aligned = (reinterpret_cast<uintptr_t>(src_ptr) % alignof(int4) == 0) &&
-                               (reinterpret_cast<uintptr_t>(dst_ptr) % alignof(int4) == 0);
+  using Vector = device::AlignedVector<int32_t, kElementsPerVector>;
+  const bool is_vector_aligned = is_aligned_for_vector<Vector>(src_ptr) && is_aligned_for_vector<Vector>(dst_ptr);
 
   // 3. Launch the kernel. Error code will be automatically checked.
-  if (num_elements >= kVec4MinElements && is_vec4_aligned) {
-    const size_t vec4_work_items = std::max(num_elements / 4, num_elements % 4);
-    const size_t grid_size = div_ceil(vec4_work_items, kBlockSize);
+  if (num_elements >= kVectorizedMinElements && is_vector_aligned) {
+    const size_t vector_count = num_elements / kElementsPerVector;
+    const size_t tail_count = num_elements - vector_count * kElementsPerVector;
+    const size_t work_items = vector_count + tail_count;
+    const size_t grid_size = div_ceil(work_items, kBlockSize);
     LaunchKernel(grid_size, kBlockSize, device /*, dynamic_smem*/)(
-        add_constant_vec4_kernel<kConstant>, dst_ptr, src_ptr, num_elements);
+        add_constant_vectorized_kernel<kConstant, kElementsPerVector>, dst_ptr, src_ptr, num_elements);
   } else {
     const size_t grid_size = div_ceil(num_elements, kBlockSize);
     LaunchKernel(grid_size, kBlockSize, device /*, dynamic_smem*/)(
