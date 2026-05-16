@@ -375,11 +375,10 @@ async fn non_streaming_upstream_4xx_body_passthrough() {
     // Regression: the worker's response bytes must reach the client
     // unmodified — no router envelope wrap, no field rewriting.
     //
-    // After the M2 wiring, the model is resolved against the registry
-    // before forwarding. We register `tiny` as the model and have the
-    // worker simulate the upstream 4xx — the test is about *upstream-
-    // returned* errors passing through, not about a router-side
-    // model-not-found error.
+    // We register `tiny` as the model so the handler resolves it against
+    // the registry, then have the worker simulate a 4xx — this test is
+    // about *upstream-returned* errors passing through, not about a
+    // router-side model-not-found error.
     let upstream_body = serde_json::json!({
         "error": {"type": "invalid_request_error", "message": "bad input"}
     });

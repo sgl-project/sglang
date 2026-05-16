@@ -85,10 +85,10 @@ async fn main() -> Result<()> {
         Some(Arc::new(cfg.clone())),
     ));
 
-    // Build proxy. The constructor still requires a worker_url + timeout
-    // (M1's typed-URL contract); the field is no longer authoritative — per
-    // request, chat.rs supplies the actual worker URL via
-    // `forward_*_to(&worker.url, ...)`. The M3 cleanup pass drops the field.
+    // The proxy's `worker_url` field is a placeholder — per-request URLs are
+    // supplied by the chat handler via `forward_*_to(&worker.url, ...)`. The
+    // field (and its only live reader, `Proxy::probe_health`) will be dropped
+    // when the proxy constructor is collapsed to take only the timeout.
     let placeholder_worker_url =
         reqwest::Url::parse("http://localhost:30000").context("parse placeholder worker URL")?;
     let proxy = Arc::new(
