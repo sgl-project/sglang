@@ -2322,7 +2322,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         # Update fields
-        self.input_ids = self.output_ids
+        # Coerce to int64: torch sampling helpers (sampling_from_probs_torch /
+        # top_k_top_p_min_p_sampling_from_probs_torch) return int32 token ids,
+        # but downstream kernels enforce int64 (e.g. DeepSeek-V4 hash_topk).
+        self.input_ids = self.output_ids.to(torch.int64)
         self.output_ids = None
 
         if self.model_config.is_encoder_decoder:
