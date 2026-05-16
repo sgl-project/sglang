@@ -196,23 +196,45 @@ class SchedulerUpdateWeightsMixin:
             traceback.print_exc()
             return CheckWeightsReqOutput(success=False, message=f"{e}")
 
-    def save_remote_model(self: Scheduler, params):
-        url = params["url"]
+    def save_remote_model(
+        self: Scheduler, params=None, *, url=None, draft_url=None
+    ):
+        """Save model weights through the scheduler RPC path.
 
+        Accept both legacy ``params`` dict calls and the newer ``**kwargs`` RPC
+        dispatch used by ``Scheduler.handle_rpc_request``.
+        """
+        if params is not None:
+            url = params["url"] if url is None else url
+            draft_url = params.get("draft_url", draft_url)
+
+        assert url is not None, "url must be provided"
         self.tp_worker.model_runner.save_remote_model(url)
 
         if self.draft_worker is not None:
-            draft_url = params.get("draft_url", None)
             assert (
                 draft_url is not None
             ), "draft_url must be provided when draft model is enabled"
             self.draft_worker.model_runner.save_remote_model(draft_url)
 
-    def save_sharded_model(self: Scheduler, params):
+    def save_sharded_model(
+        self: Scheduler, params=None, *, path=None, pattern=None, max_size=None
+    ):
+        """Save sharded model weights through the scheduler RPC path.
+
+        Accept both legacy ``params`` dict calls and the newer ``**kwargs`` RPC
+        dispatch used by ``Scheduler.handle_rpc_request``.
+        """
+        if params is not None:
+            path = params["path"] if path is None else path
+            pattern = params.get("pattern", pattern)
+            max_size = params.get("max_size", max_size)
+
+        assert path is not None, "path must be provided"
         self.tp_worker.model_runner.save_sharded_model(
-            path=params["path"],
-            pattern=params["pattern"],
-            max_size=params["max_size"],
+            path=path,
+            pattern=pattern,
+            max_size=max_size,
         )
 
 
