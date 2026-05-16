@@ -38,7 +38,7 @@ FULL_MODEL = "Qwen/Qwen3-32B"
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=1200, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=1200, stage="base-c", runner_config="8-gpu-h200")
 
 
 class UnifiedRadixTreeTestMixin:
