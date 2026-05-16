@@ -8,8 +8,12 @@ This module defines the base class for pipelines that are composed of multiple s
 """
 
 import os
-import torch
 from abc import ABC, abstractmethod
+from typing import Any, Callable, Literal, cast
+
+import torch
+from tqdm import tqdm
+
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
@@ -51,8 +55,6 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from tqdm import tqdm
-from typing import Any, Callable, Literal, cast
 
 logger = init_logger(__name__)
 
@@ -391,11 +393,11 @@ class ComposedPipelineBase(ABC):
 
         # enqueue only real weight loads (e.g., scheduler, tokenizer is excluded); skipped/provided modules keep old handling
         for index, (
-                module_name,
-                (
-                        transformers_or_diffusers,
-                        architecture,
-                ),
+            module_name,
+            (
+                transformers_or_diffusers,
+                architecture,
+            ),
         ) in enumerate(model_index.items()):
             if transformers_or_diffusers is None:
                 logger.warning(
@@ -433,7 +435,9 @@ class ComposedPipelineBase(ABC):
             )
 
         # reorder loading order to avoid OOM
-        component_load_specs: ComponentLoadSpec = order_component_load_specs(component_load_specs)
+        component_load_specs: ComponentLoadSpec = order_component_load_specs(
+            component_load_specs
+        )
         logger.info(
             "Memory-aware component load order: %s",
             [spec.module_name for spec in component_load_specs],
