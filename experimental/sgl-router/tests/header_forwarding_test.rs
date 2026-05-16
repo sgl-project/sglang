@@ -51,7 +51,7 @@ async fn forwards_whitelisted_headers_strips_others() {
         model_ids: vec![ModelId("tiny".into())],
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), Duration::from_secs(5)).unwrap());
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     let app = build_router(Arc::new(AppContext::new(
         cfg, tokenizers, proxy, registry, policies,
     )));

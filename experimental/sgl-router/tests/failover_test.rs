@@ -98,8 +98,7 @@ model_ids = ["tiny"]
         "registry should contain all 3 workers after discovery"
     );
 
-    let placeholder_url = reqwest::Url::parse("http://placeholder.invalid").unwrap();
-    let proxy = Arc::new(Proxy::new(placeholder_url, Duration::from_secs(5)).unwrap());
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     let ctx = Arc::new(AppContext::new(
         cfg,
         tokenizers,

@@ -129,11 +129,7 @@ mod tests {
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();
         let proxy = Arc::new(
-            crate::proxy::Proxy::new(
-                reqwest::Url::parse("http://x:30000").unwrap(),
-                std::time::Duration::from_secs(60),
-            )
-            .expect("stub proxy"),
+            crate::proxy::Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy"),
         );
         let worker_registry = Arc::new(crate::workers::WorkerRegistry::default());
         let policies = Arc::new(crate::policies::PolicyRegistry::default());

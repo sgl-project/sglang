@@ -57,11 +57,9 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
         model_ids: vec![ModelId("tiny".into())],
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
-    // Proxy still requires a worker_url for the legacy constructor; the
-    // breaker-gated `forward_*_to` methods supply per-request URLs from the
-    // registry, so this placeholder is never used for routing.
-    let placeholder_url = reqwest::Url::parse("http://placeholder.invalid").unwrap();
-    let proxy = Arc::new(Proxy::new(placeholder_url, TEST_TIMEOUT).unwrap());
+    // Per-request worker URLs flow from the registry through
+    // `forward_*_to(&worker.url, ...)`; the proxy itself is URL-less.
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
 }
 
@@ -596,8 +594,7 @@ async fn no_healthy_workers_returns_503() {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default()); // empty — no workers added
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
-    let placeholder_url = reqwest::Url::parse("http://placeholder.invalid").unwrap();
-    let proxy = Arc::new(Proxy::new(placeholder_url, TEST_TIMEOUT).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
     let app = build_router(ctx);
 
@@ -640,8 +637,7 @@ async fn unknown_model_with_no_policy_returns_404_model_not_found() {
         model_ids: vec![ModelId("ghost-7b".into())],
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
-    let placeholder_url = reqwest::Url::parse("http://placeholder.invalid").unwrap();
-    let proxy = Arc::new(Proxy::new(placeholder_url, TEST_TIMEOUT).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
     let app = build_router(ctx);
 
@@ -678,7 +674,7 @@ async fn forward_json_to_records_failure_on_5xx() {
     )
     .await;
 
-    let proxy = Proxy::new(worker.url.parse().unwrap(), Duration::from_secs(5)).unwrap();
+    let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
         threshold: 1,
         cool_down: Duration::from_secs(30),
@@ -710,7 +706,7 @@ async fn forward_json_to_rejects_when_breaker_open() {
     use std::time::Duration;
 
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
-    let proxy = Proxy::new(worker.url.parse().unwrap(), Duration::from_secs(5)).unwrap();
+    let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
         threshold: 1,
         cool_down: Duration::from_secs(30),
@@ -748,11 +744,7 @@ async fn forward_json_to_malformed_url_returns_worker_misconfigured_and_trips_br
     use std::sync::Arc;
     use std::time::Duration;
 
-    let proxy = Proxy::new(
-        reqwest::Url::parse("http://placeholder.invalid").unwrap(),
-        Duration::from_secs(5),
-    )
-    .unwrap();
+    let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
         threshold: 1,
         cool_down: Duration::from_secs(30),
@@ -811,8 +803,7 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let placeholder_url = reqwest::Url::parse("http://placeholder.invalid").unwrap();
-    let proxy = Arc::new(Proxy::new(placeholder_url, TEST_TIMEOUT).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
     let ctx = Arc::new(AppContext::new(
         cfg,
         tokenizers,
