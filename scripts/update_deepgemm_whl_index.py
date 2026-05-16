@@ -1,14 +1,14 @@
 # Generates a PEP 503 simple index for sgl-deep-gemm wheels under
 # sgl-whl/cu<version>/sgl-deep-gemm/index.html. Mirrors the layout used by
 # update_kernel_whl_index.py so consumers can `pip install
-# sgl-deep-gemm --extra-index-url https://...whl/cu129`.
+# sgl-deep-gemm --extra-index-url https://...whl/cu126`.
 
 import argparse
 import hashlib
 import pathlib
 import re
 
-SUPPORTED_CUDA_VERSIONS = ["129", "130"]
+SUPPORTED_CUDA_VERSIONS = ["126", "130"]
 
 
 def update_wheel_index(cuda_version, wheel_dir):

@@ -15,6 +15,11 @@ set -euxo pipefail
 : "${CU_VERSION:?must be set}"
 : "${PIP_CMD:?must be set}"
 
+if [ "$CU_VERSION" = "cu126" ]; then
+    echo "flashinfer-jit-cache is not published for cu126; skipping cache install"
+    exit 0
+fi
+
 FLASHINFER_JIT_CACHE_INSTALLED=false
 if [ "$UNINSTALL_JIT_CACHE" = false ]; then
     FLASHINFER_JIT_CACHE_INSTALLED=true

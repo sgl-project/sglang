@@ -11,9 +11,9 @@ metatags:
 The command below uses `/tmp/huggingface` as an example.
 
 ```
-docker pull nvidia/cuda:12.9.1-devel-ubuntu22.04
+docker pull nvidia/cuda:12.6.3-devel-ubuntu22.04
 # Nvidia
-docker run --shm-size 128g -it -v /tmp/huggingface:/hf_home --gpus all nvidia/cuda:12.9.1-devel-ubuntu22.04 /bin/bash
+docker run --shm-size 128g -it -v /tmp/huggingface:/hf_home --gpus all nvidia/cuda:12.6.3-devel-ubuntu22.04 /bin/bash
 # AMD
 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video --shm-size 128g -it -v /tmp/huggingface:/hf_home lmsysorg/sglang:v0.5.8-rocm700-mi30x /bin/bash
 # AMD just the last 2 GPUs

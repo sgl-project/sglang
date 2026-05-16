@@ -61,9 +61,9 @@ jobs:
           # consumers pinned to the pre-flip names.
           if [ -z "${SUFFIX}" ]; then
             # Nightly: include dated tags
-            TAG_CONFIG='[{"cuda":"cu129","tags":["dev-cu12","nightly-dev-cu12-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
+            TAG_CONFIG='[{"cuda":"cu126","tags":["dev-cu12","nightly-dev-cu12-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
           else
-            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev-cu12${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
+            TAG_CONFIG="[{\"cuda\":\"cu126\",\"tags\":[\"dev-cu12${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
           fi
           echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
 

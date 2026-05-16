@@ -3,12 +3,12 @@
 #
 # Usage: build_sgl_deep_gemm.sh <PYTHON_VERSION> <CUDA_VERSION> <DEEPGEMM_SRC> [ARCH]
 #   PYTHON_VERSION: e.g. 3.10
-#   CUDA_VERSION:   e.g. 12.9 or 13.0
+#   CUDA_VERSION:   e.g. 12.6 or 13.0
 #   DEEPGEMM_SRC:   path to a checkout of sgl-project/DeepGEMM
 #   ARCH:           x86_64 (default) or aarch64
 #
 # Writes:
-#   <DEEPGEMM_SRC>/dist/      — wheel(s) tagged +cu129 / +cu130 and manylinux
+#   <DEEPGEMM_SRC>/dist/      — wheel(s) tagged +cu126 / +cu130 and manylinux
 #   <DEEPGEMM_SRC>/dist-pypi/ — cu130 only: same wheel(s) with +cu130 stripped
 #                              (PyPI rejects local-version segments)
 set -ex
@@ -25,7 +25,7 @@ ARCH="${4:-$(uname -i)}"
 
 case "${CUDA_VERSION}" in
   13.0) CU_TAG=cu130 ;;
-  12.9) CU_TAG=cu129 ;;
+  12.6) CU_TAG=cu126 ;;
   *)
     echo "Unsupported CUDA_VERSION: ${CUDA_VERSION}" >&2
     exit 1

@@ -7,7 +7,7 @@ if [ $# -lt 2 ]; then
 fi
 
 PYTHON_VERSION="$1"          # e.g. 3.10
-CUDA_VERSION="$2"            # e.g. 12.9
+CUDA_VERSION="$2"            # e.g. 12.6
 ARCH="${3:-$(uname -i)}"     # optional override
 
 if [ "${ARCH}" = "aarch64" ]; then

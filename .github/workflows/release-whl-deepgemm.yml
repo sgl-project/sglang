@@ -14,7 +14,7 @@ on:
         default: 'all'
         options:
           - 'all'
-          - 'cu129'
+          - 'cu126'
           - 'cu130'
       branch:
         description: "DeepGEMM branch to build from (default: release-0426)"
@@ -27,14 +27,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-cu129-matrix:
+  build-cu126-matrix:
     if: |
       github.repository == 'sgl-project/sglang' &&
-      (github.event.inputs.target == 'all' || github.event.inputs.target == 'cu129')
+      (github.event.inputs.target == 'all' || github.event.inputs.target == 'cu126')
     strategy:
       matrix:
         python-version: ["3.12"]
-        cuda-version: ["12.9"]
+        cuda-version: ["12.6"]
         arch: [x86_64, aarch64]
         include:
           - arch: x86_64
@@ -74,8 +74,8 @@ jobs:
           name: deepgemm-wheel-cuda${{ matrix.cuda-version }}-${{ matrix.arch }}
           path: DeepGEMM/dist/*.whl
 
-  release-cu129:
-    needs: build-cu129-matrix
+  release-cu126:
+    needs: build-cu126-matrix
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,7 +85,7 @@ jobs:
         with:
           path: dist/
           merge-multiple: true
-          pattern: deepgemm-wheel-cuda12.9-*
+          pattern: deepgemm-wheel-cuda12.6-*
 
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -102,7 +102,7 @@ jobs:
           WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
 
       - name: Update wheel index
-        run: python3 scripts/update_deepgemm_whl_index.py --cuda 129
+        run: python3 scripts/update_deepgemm_whl_index.py --cuda 126
 
       - name: Push wheel index
         run: |

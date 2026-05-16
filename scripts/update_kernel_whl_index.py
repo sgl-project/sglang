@@ -6,7 +6,7 @@ import pathlib
 import re
 
 # All the CUDA versions that the wheels will cover
-SUPPORTED_CUDA_VERSIONS = ["129", "130"]
+SUPPORTED_CUDA_VERSIONS = ["126", "130"]
 DEFAULT_CUDA_VERSION = "130"
 
 

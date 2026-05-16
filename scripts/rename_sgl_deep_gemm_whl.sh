@@ -8,7 +8,7 @@
 #
 # Usage: rename_wheels.sh <WHEEL_DIR> <CU_TAG> <ARCH>
 #   WHEEL_DIR: directory containing the *.whl file (e.g. DeepGEMM/dist)
-#   CU_TAG:    cu129 | cu130
+#   CU_TAG:    cu126 | cu130
 #   ARCH:      x86_64 | aarch64
 set -ex
 

@@ -7,7 +7,7 @@ ARG ARCH=x86_64
 ARG CUDA_VERSION=13.0
 ARG PYTHON_VERSION=3.12
 ARG PYTHON_TAG=cp312-cp312
-ARG TORCH_VER=2.11.0
+ARG TORCH_VER=2.12.0
 ARG TVM_FFI_VER=0.1.9
 ARG PIP_DEFAULT_INDEX=https://pypi.python.org/simple
 ARG PYTORCH_MIRROR=download.pytorch.org
@@ -27,8 +27,8 @@ RUN --mount=type=cache,id=sgl-deep-gemm-pip,target=/root/.cache/pip \
     set -eux; \
     case "${CUDA_VERSION}" in \
       13.0) CU_TAG=cu130 ;; \
-      12.9) CU_TAG=cu129 ;; \
-      *)    CU_TAG=cu130 ;; \
+      12.6) CU_TAG=cu126 ;; \
+      *)    echo "Unsupported CUDA_VERSION for torch ${TORCH_VER}: ${CUDA_VERSION}" >&2; exit 1 ;; \
     esac; \
     ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${CU_TAG}; \
     ${PYTHON_ROOT_PATH}/bin/pip install --index-url ${PIP_DEFAULT_INDEX} \

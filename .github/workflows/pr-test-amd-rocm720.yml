@@ -556,7 +556,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda12.6
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
@@ -697,7 +697,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda12.6
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
