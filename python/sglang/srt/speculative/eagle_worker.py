@@ -552,11 +552,22 @@ class EAGLEWorker(TpModelWorker):
                     )
                 else:
                     # All reqs finished and dp_attention is not forcing the
-                    # forward. Use an empty EagleDraftInput so next iter's
-                    # merge_batch short-circuits on None hidden_states
-                    # (EagleVerifyInput has no merge_batch).
-                    next_draft_input = EagleDraftInput(
-                        capture_hidden_mode=CaptureHiddenMode.LAST,
+                    # forward. Return a proper idle EagleDraftInput (0-length
+                    # tensors across all fields) so next iter's merge_batch /
+                    # filter_batch see well-typed empty tensors. Bare ctor
+                    # leaves topk_index=None which crashes `len(topk_index)`
+                    # check in merge_batch.
+                    capture_mode = (
+                        CaptureHiddenMode.NULL
+                        if self.speculative_algorithm.is_standalone()
+                        else CaptureHiddenMode.LAST
+                    )
+                    next_draft_input = EagleDraftInput.create_idle_input(
+                        device=self.device,
+                        hidden_size=EagleDraftInput.hidden_size_for(self),
+                        dtype=EagleDraftInput.dtype_for(self),
+                        topk=self.topk,
+                        capture_hidden_mode=capture_mode,
                     )
 
             set_time_batch(
