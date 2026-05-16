@@ -1,4 +1,11 @@
 name: PR Test Base
+run-name: >-
+  ${{
+    github.event_name == 'schedule' && 'Scheduled Full Run'
+    || github.event_name == 'workflow_dispatch' && format('Manual run by {0}', github.actor)
+    || github.event_name == 'pull_request' && format('PR #{0} - {1}', github.event.pull_request.number, github.event.pull_request.title)
+    || 'PR Test Base'
+  }}
 
 on:
   schedule:
