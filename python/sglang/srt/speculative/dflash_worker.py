@@ -20,6 +20,7 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.speculative.base_spec_worker import DraftExecutor, SpecCoordinator
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
@@ -47,7 +48,50 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
-class DFlashWorker:
+class DFlashDraftExecutor(DraftExecutor):
+    """DraftExecutor wrapping the inner draft `TpModelWorker` used by DFlash.
+
+    Holds a reference to the inner draft TpModelWorker; exposes the canonical
+    `draft_runner` accessor expected by spec-info shape classmethods. DFlash's
+    attention-backend / cuda-graph setup remains driven by the coordinator (it
+    is intertwined with the verify pipeline), so this executor's
+    `init_*` methods are no-ops.
+    """
+
+    def __init__(
+        self,
+        inner_tp: TpModelWorker,
+        target_worker: TpModelWorker,
+        speculative_algorithm: SpeculativeAlgorithm,
+    ):
+        self._inner_tp = inner_tp
+        self._target_worker = target_worker
+        self._speculative_algorithm = speculative_algorithm
+
+    @property
+    def draft_runner(self):
+        return self._inner_tp.model_runner
+
+    @property
+    def target_worker(self) -> TpModelWorker:
+        return self._target_worker
+
+    @property
+    def speculative_algorithm(self) -> SpeculativeAlgorithm:
+        return self._speculative_algorithm
+
+    @property
+    def eagle_use_aux_hidden_state(self) -> bool:
+        return False
+
+    def init_attention_backend(self) -> None:
+        pass
+
+    def init_cuda_graphs(self) -> None:
+        pass
+
+
+class DFlashSpecCoordinator(SpecCoordinator):
     """DFlash speculative decoding worker (spec-v1, tp>=1/pp=1)."""
 
     def __init__(
@@ -72,6 +116,9 @@ class DFlashWorker:
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
+        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
         self.page_size = server_args.page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
@@ -139,7 +186,7 @@ class DFlashWorker:
             target_worker.model_runner.model_config.context_len
         )
         saved_server_args = get_global_server_args()
-        self.draft_worker = TpModelWorker(
+        self._inner_tp = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
@@ -155,7 +202,10 @@ class DFlashWorker:
             memory_pool_config=target_worker.model_runner.memory_pool_config,
         )
         set_global_server_args_for_scheduler(saved_server_args)
-        self.draft_runner = self.draft_worker.model_runner
+        self.draft_runner = self._inner_tp.model_runner
+        self._draft_executor: DraftExecutor = DFlashDraftExecutor(
+            self._inner_tp, target_worker, self.speculative_algorithm
+        )
         self.draft_model = self.draft_runner.model
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_runner.model_config.hf_config
@@ -341,6 +391,10 @@ class DFlashWorker:
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker.
         return getattr(self.target_worker, name)
+
+    @property
+    def draft_worker(self) -> DraftExecutor:
+        return self._draft_executor
 
     def clear_cache_pool(self):
         # The target worker owns the shared KV allocator/cache. For the compact
@@ -1255,3 +1309,7 @@ class DFlashWorker:
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=draft_input,
         )
+
+
+# Pre-rename alias; existing call sites keep importing `DFlashWorker`.
+DFlashWorker = DFlashSpecCoordinator
