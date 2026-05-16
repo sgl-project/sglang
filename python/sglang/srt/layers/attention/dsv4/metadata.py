@@ -108,7 +108,18 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
+            # deep_gemm.get_paged_mqa_logits_metadata crashes with
+            # CUDA_ERROR_INVALID_VALUE on SM90 when the per-query batch
+            # exceeds the FlashMLA decode SMEM cap (observed at
+            # chunked_prefill_size >= 16384). The vendored JIT kernel does
+            # not have this limit. Auto-route to JIT for those shapes; an
+            # explicit env opt-in still forces JIT for all shapes.
+            _LARGE_INDEXER_QUERY_THRESHOLD = 11673
+            use_jit_indexer = (
+                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+            )
+            if use_jit_indexer:
                 from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
