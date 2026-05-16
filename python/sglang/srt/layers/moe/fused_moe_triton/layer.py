@@ -1046,6 +1046,9 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if is_in_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
+                server_args = get_global_server_args()
+                if server_args.piecewise_cuda_graph_compiler == "inductor":
+                    return self.forward_impl(hidden_states, topk_output)
                 return moe_forward_piecewise_cuda_graph_impl(
                     hidden_states,
                     topk_output.topk_weights,
