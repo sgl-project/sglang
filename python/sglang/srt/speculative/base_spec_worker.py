@@ -17,27 +17,25 @@ class DraftExecutor(ABC):
     `TpModelWorker` (V2 `EagleDraftWorker`). `draft_runner` is the canonical
     accessor; shape classmethods on `EagleDraftInput` / `EagleDraftExtendInput`
     read it directly.
+
+    The fields below (`target_worker`, `speculative_algorithm`,
+    `eagle_use_aux_hidden_state`) are declared as type annotations rather than
+    `@abstractmethod` properties because subclasses set them as instance attrs
+    in `__init__`; Python ABC would reject instance attrs as a valid override
+    of a strict abstract property.
     """
+
+    target_worker: "TpModelWorker"
+    speculative_algorithm: "SpeculativeAlgorithm"
+    # Whether the draft model consumes EAGLE3 auxiliary hidden states. Always
+    # False outside EAGLE3 (e.g. Frozen-KV MTP, standalone).
+    eagle_use_aux_hidden_state: bool
 
     @property
     @abstractmethod
     def draft_runner(self) -> Optional["ModelRunner"]:
         """Primary draft `ModelRunner`. `None` for algorithms with no draft model
         (e.g. NGRAM); for multi-layer algorithms, points to layer 0."""
-
-    @property
-    @abstractmethod
-    def target_worker(self) -> "TpModelWorker": ...
-
-    @property
-    @abstractmethod
-    def speculative_algorithm(self) -> "SpeculativeAlgorithm": ...
-
-    @property
-    @abstractmethod
-    def eagle_use_aux_hidden_state(self) -> bool:
-        """Whether the draft model consumes EAGLE3 auxiliary hidden states.
-        Always False outside EAGLE3 (e.g. Frozen-KV MTP, standalone)."""
 
     @abstractmethod
     def init_attention_backend(self) -> None: ...
@@ -104,19 +102,17 @@ class SpecCoordinator(ABC):
     `target_worker` (target model) and a `draft_worker` (a `DraftExecutor`,
     possibly `self` for V1 monolithic workers, or `NullDraftExecutor` for
     no-draft-model algorithms).
+
+    `target_worker` and `speculative_algorithm` are declared as type annotations
+    rather than abstract properties — see `DraftExecutor` for the same rationale.
     """
 
-    @property
-    @abstractmethod
-    def target_worker(self) -> "TpModelWorker": ...
+    target_worker: "TpModelWorker"
+    speculative_algorithm: "SpeculativeAlgorithm"
 
     @property
     @abstractmethod
     def draft_worker(self) -> DraftExecutor: ...
-
-    @property
-    @abstractmethod
-    def speculative_algorithm(self) -> "SpeculativeAlgorithm": ...
 
     @abstractmethod
     def clear_cache_pool(self) -> None:
