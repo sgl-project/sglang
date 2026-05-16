@@ -1,0 +1,38 @@
+name: Notify RL360 of prod update
+
+# When prod moves on this fork, fire a repository_dispatch into LLM360/RL360
+# so the auto-bump workflow there can open a PR bumping the corresponding
+# submodules/<this-repo>/ gitlink to the new prod HEAD.
+#
+# Auth: GitHub App llm360-deploy-bot (App ID in vars.DEPLOY_BOT_APP_ID,
+# private key in secrets.DEPLOY_BOT_PRIVATE_KEY). App must be installed on
+# both this repo and LLM360/RL360.
+
+on:
+  push:
+    branches: [prod]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint App token for RL360
+        id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.DEPLOY_BOT_APP_ID }}
+          private-key: ${{ secrets.DEPLOY_BOT_PRIVATE_KEY }}
+          owner: LLM360
+          repositories: RL360
+
+      - name: Fire submodule-prod-updated dispatch
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.token.outputs.token }}
+          repository: LLM360/RL360
+          event-type: submodule-prod-updated
+          client-payload: |
+            {
+              "submodule": "${{ github.event.repository.name }}",
+              "sha": "${{ github.sha }}"
+            }
