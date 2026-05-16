@@ -25,6 +25,7 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -185,6 +186,8 @@ class RMSNorm(MultiPlatformOp):
         override_orig_dtype: Optional = None,
     ) -> None:
         super().__init__()
+        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_attention_tp_rank()
         self.has_weight = has_weight
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
@@ -271,6 +274,8 @@ class RMSNorm(MultiPlatformOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
             if post_residual_addition is not None:
+                if post_residual_addition.shape[0] != residual.shape[0]:
+                    post_residual_addition = post_residual_addition.chunk(self.attn_tp_size)[self.attn_tp_ranks]
                 residual = residual + post_residual_addition
             out, _, residual_out = torch_npu.npu_add_rms_norm(
                 residual, x, self.weight.data, self.variance_epsilon
