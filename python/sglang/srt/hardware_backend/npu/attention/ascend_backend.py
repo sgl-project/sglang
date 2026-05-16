@@ -434,6 +434,17 @@ class AscendAttnBackend(AttentionBackend):
                         torch.flatten(req_prefix_block_tables),
                     )
                 )
+        bs = forward_batch.req_pool_indices.shape[0]
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
+            self.forward_metadata.actual_seq_qlen_list = [
+                self.speculative_num_draft_tokens * (i + 1) for i in range(bs)
+            ]
+        else:
+            self.forward_metadata.actual_seq_qlen_list = []
 
         self.graph_mode = False
 
