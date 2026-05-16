@@ -1,33 +1,9 @@
 import logging
-from typing import List, Optional
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils.common import is_blackwell, is_musa
 
 logger = logging.getLogger(__name__)
-
-
-def adjust_eagle3_aux_hidden_state_layer_ids(
-    draft_model_path: Optional[str],
-    layer_ids: Optional[List[int]],
-) -> Optional[List[int]]:
-    """Per-checkpoint correction to ``eagle_aux_hidden_state_layer_ids``.
-
-    Some draft model checkpoints uses "input-to-layer-X" convention for the listed
-    ids (capture happens *before* layer X). sglang's ``set_eagle3_layers_to_capture``
-    instead applies a +1 offset assuming "output-of-layer-X". Decrement here so the +1 cancels and the actual
-    capture lands on the trained-against layer.
-
-    Extend the substring table below as new EAGLE3 drafts ship with the
-    same convention.
-    """
-    if layer_ids is None:
-        return layer_ids
-    draft_path = draft_model_path or ""
-    _INPUT_CONVENTION_DRAFTS = ("kimi-k2.5-eagle3-mla",)
-    if any(s in draft_path for s in _INPUT_CONVENTION_DRAFTS):
-        return [val - 1 for val in layer_ids]
-    return layer_ids
 
 
 class DraftBackendFactory:
