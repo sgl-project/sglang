@@ -206,7 +206,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ; \
     elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
         # --no-deps prevents pip from pulling torch from default PyPI
-        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
+        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --index-url https://docs.sglang.ai/whl/cu${CUINDEX}/ --force-reinstall --no-deps \
     ; \
     else \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
