@@ -1930,6 +1930,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        hidden_states_orig = hidden_states
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
@@ -1950,6 +1951,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
+        get_attn_tp_context().clear_attn_inputs()
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -1969,13 +1971,24 @@ class DeepseekV2DecoderLayer(nn.Module):
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
-        hidden_states = self.mlp(
-            hidden_states,
-            forward_batch,
-            should_allreduce_fusion,
-            use_reduce_scatter,
-            gemm_output_zero_allocator,
-        )
+        if (
+            isinstance(self.mlp, DeepseekV2MoE)
+            and not self.mlp.experts.moe_runner_config.inplace
+        ):
+            from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
+
+            _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
+        else:
+            _mlp_ctx = nullcontext()
+
+        with _mlp_ctx:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+            )
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True

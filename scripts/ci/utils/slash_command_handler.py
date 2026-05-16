@@ -9,6 +9,21 @@ from datetime import datetime, timezone
 import requests
 from github import Auth, Github
 
+# Import scripts/ci/runner_configs.py (sibling-up dir) for runner_config -> runs_on lookup.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import runner_configs as _runner_configs  # noqa: E402
+
+# rerun-test workflow doesn't build sgl-kernel, so b200 stages always use the
+# non-kernel pool when resolving the `$b200_runner` sentinel from runner_configs.yml.
+_B200_DEFAULT_RUNNER = "4-gpu-b200"
+
+# install_script values from runner_configs.yml are passed verbatim into a
+# `bash ${{ inputs.install_script }}` step in rerun-test.yml. GHA expression
+# substitution happens before bash parses, so shell metacharacters in the
+# string would inject. Restrict the allowed shape to `scripts/ci/cuda/*.sh`
+# (single path component under that dir, no whitespace/operators).
+_ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
+
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 
@@ -388,49 +403,6 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         return False
 
 
-CUDA_SUITE_TO_RUNNER = {
-    # PR test suites
-    "stage-a-test-1-gpu-small": "1-gpu-5090",
-    "stage-a-test-cpu": "ubuntu-latest",
-    "stage-b-test-1-gpu-small": "1-gpu-5090",
-    "stage-b-test-1-gpu-large": "1-gpu-h100",
-    "stage-b-test-2-gpu-large": "2-gpu-h100",
-    "stage-b-test-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-4-gpu-h100": "4-gpu-h100",
-    "stage-c-test-8-gpu-h200": "8-gpu-h200",
-    "stage-c-test-8-gpu-h20": "8-gpu-h20",
-    "stage-c-test-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
-    "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200-deepep",
-    "stage-c-test-dsv4-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-dsv4-8-gpu-h200": "8-gpu-h200",
-    # Nightly test suites (NVIDIA)
-    "nightly-1-gpu": "1-gpu-h100",
-    "nightly-4-gpu": "4-gpu-h100",
-    "nightly-4-gpu-b200": "4-gpu-b200",
-    "nightly-8-gpu-common": "8-gpu-h200",
-    "nightly-8-gpu-h200": "8-gpu-h200",
-    "nightly-8-gpu-h20": "8-gpu-h20",
-    "nightly-8-gpu-b200": "8-gpu-b200",
-    "nightly-eval-text-2-gpu": "2-gpu-h100",
-    "nightly-eval-vlm-2-gpu": "2-gpu-h100",
-    "nightly-perf-text-2-gpu": "2-gpu-h100",
-    "nightly-perf-vlm-2-gpu": "2-gpu-h100",
-    "nightly-kernel-1-gpu": "1-gpu-h100",
-    "nightly-kernel-8-gpu-h200": "8-gpu-h200",
-    # Weekly test suites
-    "weekly-8-gpu-h200": "8-gpu-h200",
-}
-
-DEEPEP_SUITES = {
-    "stage-c-test-8-gpu-h20",
-    "stage-c-test-deepep-4-gpu-h100",
-    "stage-c-test-deepep-8-gpu-h200",
-    "stage-c-test-dsv4-4-gpu-b200",
-    "stage-c-test-dsv4-8-gpu-h200",
-}
-
-
 MULTIMODAL_TEST_DIR = "python/sglang/multimodal_gen/test"
 
 MULTIMODAL_PATH_TO_RUNNER = {
@@ -574,71 +546,100 @@ def detect_multimodal_suite(file_path):
     return MULTIMODAL_DEFAULT_RUNNER, None
 
 
-def _extract_suite(content, func_name):
-    """Pull a suite name out of a `register_{cuda,cpu}_ci(...)` call.
-
-    Two styles are supported:
-      1. legacy: register_cuda_ci(..., suite="stage-X-test-Y")
-      2. new:    register_cuda_ci(..., stage="stage-X", runner_config="Y")
-                 -> suite = f"{stage}-test-{runner_config}"
-    """
-    legacy = re.search(
-        rf'^[^#\n]*{func_name}\([^)]*suite\s*=\s*["\']([^"\']+)["\']',
-        content,
-        re.MULTILINE,
-    )
-    if legacy:
-        return legacy.group(1)
-    args = re.search(rf"^[^#\n]*{func_name}\(([^)]*)\)", content, re.MULTILINE)
-    if args:
-        stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args.group(1))
-        rc_m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
-        if stage_m and rc_m:
-            return f"{stage_m.group(1)}-test-{rc_m.group(1)}"
-    return None
+def _extract_runner_config(content):
+    """Pull `runner_config` and the args string from a `register_cuda_ci(...)` call."""
+    args = re.search(r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE)
+    if not args:
+        return None, None
+    m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
+    return (m.group(1), args.group(1)) if m else (None, None)
 
 
 def detect_suite(file_path_from_test):
     """
-    Read a test file and extract the suite from register_cuda_ci or register_cpu_ci.
+    Read a test file and extract dispatch info from register_cuda_ci or
+    register_cpu_ci.
 
-    Returns (suite_name, runner_label, use_deepep, is_cpu, error_message).
+    CUDA tests must use `register_cuda_ci(stage=..., runner_config=...)`;
+    runner label, install script, timeout, and rdma_devices are all resolved
+    from scripts/ci/runner_configs.yml — the same single source of truth that
+    drives the main PR test pipeline.
+
+    CPU tests (`register_cpu_ci(...)`) dispatch to the CPU job (ubuntu-latest).
+
+    Returns dict with keys: suite, runner_label, install_script,
+    install_timeout, rdma_devices, is_cpu, error.
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
         content = f.read()
 
-    suite = _extract_suite(content, "register_cuda_ci")
-    if suite:
-        runner = CUDA_SUITE_TO_RUNNER.get(suite)
-        if not runner:
-            known = ", ".join(f"`{s}`" for s in sorted(CUDA_SUITE_TO_RUNNER))
-            return (
-                suite,
-                None,
-                False,
-                False,
-                (
-                    f"Unknown CUDA suite `{suite}` in `{full_path}`.\n\n"
-                    f"Known suites: {known}"
-                ),
+    def _err(suite, msg):
+        return {
+            "suite": suite,
+            "runner_label": None,
+            "install_script": "",
+            "install_timeout": "",
+            "rdma_devices": "",
+            "is_cpu": False,
+            "error": msg,
+        }
+
+    rc, args_str = _extract_runner_config(content)
+    if rc:
+        configs = _runner_configs.load()
+        cfg = configs.get(rc)
+        if cfg is None:
+            known = ", ".join(f"`{k}`" for k in sorted(configs))
+            return _err(
+                rc,
+                f"Unknown runner_config `{rc}` in `{full_path}` "
+                f"— not in scripts/ci/runner_configs.yml.\n\n"
+                f"Known runner_configs: {known}",
             )
-        use_deepep = suite in DEEPEP_SUITES
-        return suite, runner, use_deepep, False, None
+        install_script = cfg["install"]
+        if not _ALLOWED_INSTALL_SCRIPT.match(install_script):
+            return _err(
+                rc,
+                f"Disallowed `install` value `{install_script}` for runner_config "
+                f"`{rc}` in scripts/ci/runner_configs.yml. The slash handler "
+                f"passes this string verbatim into a shell step, so it must "
+                f"match `scripts/ci/cuda/*.sh`.",
+            )
+        runs_on = cfg.get("runs_on")
+        # Resolve $b200_runner sentinel: rerun-test never builds sgl-kernel,
+        # so always pick the non-kernel b200 pool.
+        if runs_on == "$b200_runner":
+            runs_on = _B200_DEFAULT_RUNNER
+        stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
+        suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
+        return {
+            "suite": suite,
+            "runner_label": runs_on,
+            "install_script": install_script,
+            "install_timeout": str(cfg["install_timeout"]),
+            "rdma_devices": cfg.get("rdma_devices", ""),
+            "is_cpu": False,
+            "error": None,
+        }
 
-    suite = _extract_suite(content, "register_cpu_ci")
-    if suite:
-        return suite, "ubuntu-latest", False, True, None
+    if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
+        return {
+            "suite": "cpu",
+            "runner_label": "ubuntu-latest",
+            "install_script": "",
+            "install_timeout": "",
+            "rdma_devices": "",
+            "is_cpu": True,
+            "error": None,
+        }
 
-    return (
+    return _err(
         None,
-        None,
-        False,
-        False,
-        (
-            f"No `register_cuda_ci()` or `register_cpu_ci()` found in `{full_path}`.\n\n"
-            f"This file may not be a registered CI test."
-        ),
+        f"No `register_cuda_ci(runner_config=...)` or `register_cpu_ci()` "
+        f"found in `{full_path}`. /rerun-test only supports tests registered "
+        f"via the new-style yml-driven API; nightly/weekly tests aren't "
+        f"dispatchable through this command.",
     )
 
 
@@ -646,8 +647,8 @@ def _resolve_test_spec(test_spec):
     """
     Resolve a single test spec into its components without dispatching.
 
-    Returns a dict with keys: spec, resolved_path, test_command, suite,
-    runner_label, use_deepep, is_cpu, error.
+    Returns a dict with keys: spec, test_command, mode, runs_on,
+    install_script, install_timeout, rdma_devices, error.
     """
     if "::" in test_spec:
         file_part, test_selector = test_spec.split("::", 1)
@@ -674,57 +675,61 @@ def _resolve_test_spec(test_spec):
             test_command = f"{resolved_path}::{test_selector}"
 
         print(
-            f"Resolved (multimodal): file={resolved_path}, selector={test_selector}, "
+            f"Resolved (multimodal_gen): file={resolved_path}, selector={test_selector}, "
             f"runner={runner_label}, command='{test_command}'"
         )
         return {
             "spec": test_spec,
             "test_command": test_command,
-            "suite": "multimodal",
-            "runner_label": runner_label,
-            "use_deepep": False,
-            "is_cpu": False,
-            "install_diffusion": True,
+            "mode": "multimodal_gen",
+            "runs_on": runner_label,
+            "install_script": "",
+            "install_timeout": "",
+            "rdma_devices": "",
             "error": None,
         }
 
-    suite, runner_label, use_deepep, is_cpu, err = detect_suite(resolved_path)
-    if err:
-        return {"spec": test_spec, "error": err}
+    info = detect_suite(resolved_path)
+    if info["error"]:
+        return {"spec": test_spec, "error": info["error"]}
 
     test_command = resolved_path
     if test_selector:
         test_command = f"{resolved_path} {test_selector}"
 
+    mode = "cpu" if info["is_cpu"] else "cuda"
     print(
         f"Resolved: file={resolved_path}, selector={test_selector}, "
-        f"suite={suite}, runner={runner_label}, deepep={use_deepep}, "
-        f"cpu={is_cpu}, command='{test_command}'"
+        f"suite={info['suite']}, mode={mode}, runs_on={info['runner_label']}, "
+        f"install={info['install_script']}, rdma={info['rdma_devices']}, "
+        f"command='{test_command}'"
     )
     return {
         "spec": test_spec,
         "test_command": test_command,
-        "suite": suite,
-        "runner_label": runner_label,
-        "use_deepep": use_deepep,
-        "is_cpu": is_cpu,
-        "install_diffusion": False,
+        "mode": mode,
+        "runs_on": info["runner_label"],
+        "install_script": info["install_script"],
+        "install_timeout": info["install_timeout"],
+        "rdma_devices": info["rdma_devices"],
         "error": None,
     }
 
 
 def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker=""):
     """
-    Dispatch a single workflow run for a batch of resolved test specs
-    that share the same (runner_label, use_deepep, is_cpu).
+    Dispatch a single workflow run for a batch of resolved test specs that
+    share the same dispatch shape (mode + runs_on + install_script +
+    install_timeout + rdma_devices).
 
     Returns a dict with keys: specs, success, test_commands, runner_label, run_url, error.
     """
     test_commands = [r["test_command"] for r in batch]
-    runner_label = batch[0]["runner_label"]
-    use_deepep = batch[0]["use_deepep"]
-    is_cpu = batch[0]["is_cpu"]
-    install_diffusion = batch[0].get("install_diffusion", False)
+    mode = batch[0]["mode"]
+    runs_on = batch[0]["runs_on"]
+    install_script = batch[0]["install_script"]
+    install_timeout = batch[0]["install_timeout"]
+    rdma_devices = batch[0]["rdma_devices"]
 
     # Join multiple commands with newlines for the workflow to iterate over
     combined_command = "\n".join(test_commands)
@@ -751,11 +756,12 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
 
         pr_head_sha = None
         inputs = {
+            "mode": mode,
             "test_command": combined_command,
-            "runner_label": runner_label,
-            "use_deepep": str(use_deepep).lower(),
-            "is_cpu": str(is_cpu).lower(),
-            "install_diffusion": str(install_diffusion).lower(),
+            "runs_on": runs_on or "",
+            "install_script": install_script,
+            "install_timeout": install_timeout or "20",
+            "rdma_devices": rdma_devices,
             "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
             "reply_marker": reply_marker,
         }
@@ -803,7 +809,8 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
             "specs": [r["spec"] for r in batch],
             "success": True,
             "test_commands": test_commands,
-            "runner_label": runner_label,
+            "mode": mode,
+            "runs_on": runs_on,
             "run_url": run_url,
             "reply_marker": reply_marker,
         }
@@ -853,7 +860,8 @@ def handle_rerun_test(
 ):
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
-    (runner_label, use_deepep, is_cpu), and dispatches one workflow per group.
+    dispatch shape (mode + runs_on + install_script + install_timeout +
+    rdma_devices), and dispatches one workflow per group.
     """
     if not skip_permission_check and not _check_rerun_test_permissions(
         gh_repo, pr, comment, user_perms, "rerun-test"
@@ -888,14 +896,15 @@ def handle_rerun_test(
         else:
             resolved.append(r)
 
-    # Phase 2: Group by (runner_label, use_deepep, is_cpu, install_diffusion)
+    # Phase 2: Group by dispatch shape.
     groups = {}
     for r in resolved:
         key = (
-            r["runner_label"],
-            r["use_deepep"],
-            r["is_cpu"],
-            r.get("install_diffusion", False),
+            r["mode"],
+            r["runs_on"],
+            r["install_script"],
+            r["install_timeout"],
+            r["rdma_devices"],
         )
         groups.setdefault(key, []).append(r)
 
@@ -926,12 +935,7 @@ def handle_rerun_test(
     lines = []
     for dr in dispatch_results:
         if dr["success"]:
-            install_diff = any(
-                r.get("install_diffusion", False)
-                for r in resolved
-                if r["spec"] in dr["specs"]
-            )
-            if install_diff:
+            if dr["mode"] == "multimodal_gen":
                 cmds = "\n".join(
                     f"python3 -m pytest {cmd} -x" for cmd in dr["test_commands"]
                 )
@@ -940,15 +944,16 @@ def handle_rerun_test(
                     f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
                 )
             marker = dr.get("reply_marker", "")
+            label = dr["runs_on"] or dr["mode"]
             if dr.get("run_url"):
                 lines.append(
-                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
+                    f"🚀 `{label}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
                     f"⏳ [View workflow run]({dr['run_url']}) {marker}\n"
                     f"```\n{cmds}\n```"
                 )
             else:
                 lines.append(
-                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): ⏳ {marker}\n"
+                    f"🚀 `{label}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): ⏳ {marker}\n"
                     f"```\n{cmds}\n```\n"
                     f"⚠️ Could not retrieve workflow run URL. "
                     f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."

@@ -801,7 +801,10 @@ def get_clip_model() -> tuple[Any, Any]:
             )
         model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # ci server tests keep the generation server alive while consistency runs
+        device = (
+            "cpu" if is_in_ci() else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
         model = model.to(device)
         model.eval()
 

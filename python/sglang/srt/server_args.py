@@ -324,9 +324,9 @@ def _resolve_speculative_algorithm_alias(
 
     is_gemma4_draft = False
     if speculative_draft_model_path:
-        from transformers import AutoConfig
+        from sglang.srt.utils.hf_transformers_utils import get_config
 
-        cfg = AutoConfig.from_pretrained(
+        cfg = get_config(
             speculative_draft_model_path, trust_remote_code=trust_remote_code
         )
         is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
@@ -369,6 +369,7 @@ class ServerArgs:
     tokenizer_mode: str = "auto"
     tokenizer_backend: str = "huggingface"
     tokenizer_worker_num: int = 1
+    detokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -612,7 +613,6 @@ class ServerArgs:
         "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
     moe_runner_backend: str = "auto"
-    record_nolora_graph: bool = True
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
@@ -4189,6 +4189,12 @@ class ServerArgs:
                     f"(requested {self.tokenizer_worker_num})."
                 )
                 self.tokenizer_worker_num = 1
+            if self.detokenizer_worker_num != 1:
+                logger.warning(
+                    "skip_tokenizer_init=True disables detokenizer workers; forcing detokenizer_worker_num=1 "
+                    f"(requested {self.detokenizer_worker_num})."
+                )
+                self.detokenizer_worker_num = 1
 
             if self.enable_tokenizer_batch_encode:
                 logger.warning(
@@ -4531,6 +4537,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tokenizer_worker_num,
             help="The worker num of the tokenizer manager.",
+        )
+        parser.add_argument(
+            "--detokenizer-worker-num",
+            type=int,
+            default=ServerArgs.detokenizer_worker_num,
+            help="The worker num of the detokenizer manager.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -5968,14 +5980,6 @@ class ServerArgs:
             help="Choose the runner backend for MoE.",
         )
         parser.add_argument(
-            "--record-nolora-graph",
-            action=argparse.BooleanOptionalAction,
-            default=ServerArgs.record_nolora_graph,
-            help="Capture a second set of CUDA graphs without LoRA hooks. "
-            "Batches without active adapters replay the faster nolora graph. "
-            "Enabled by default.",
-        )
-        parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
             type=str,
             choices=["default", "bf16"],
@@ -7285,6 +7289,7 @@ class ServerArgs:
                 )
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+        assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
         )

@@ -17,7 +17,9 @@ from enum import Enum, auto
 import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dedup import StageDedupMixin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
