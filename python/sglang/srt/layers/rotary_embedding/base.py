@@ -68,9 +68,6 @@ class RotaryEmbedding(MultiPlatformOp):
         self.dtype = dtype
         self.use_explicit_npu_interleaved_rope = False
 
-        self.register_buffer("cos_cached_total", None, persistent=False)
-        self.register_buffer("sin_cached_total", None, persistent=False)
-
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
         if not _is_cuda:
@@ -218,12 +215,37 @@ class RotaryEmbedding(MultiPlatformOp):
         if not getattr(self, "use_explicit_npu_interleaved_rope", False):
             return
         cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
-        self.cos_cached_total = cos.repeat(1, 2).contiguous()
-        self.sin_cached_total = sin.repeat(1, 2).contiguous()
+        cos_cached_total = cos.repeat(1, 2).contiguous()
+        sin_cached_total = sin.repeat(1, 2).contiguous()
+
+        # Lazily create these buffers only for models that actually use
+        # explicit NPU interleaved RoPE.
+        for name, value in (
+            ("cos_cached_total", cos_cached_total),
+            ("sin_cached_total", sin_cached_total),
+        ):
+            if name not in self._buffers:
+                # Some subclasses define plain attributes with the same names
+                # before RotaryEmbedding initialization. Remove them before
+                # turning them into buffers.
+                if hasattr(self, name):
+                    delattr(self, name)
+                self.register_buffer(name, value, persistent=False)
+            else:
+                setattr(self, name, value)
 
     def update_and_get_cos_sin_cache(
         self, positions, layer_id, dtype, offsets: Optional[torch.Tensor] = None
     ):
+        if (
+            getattr(self, "cos_cached_total", None) is None
+            or getattr(self, "sin_cached_total", None) is None
+        ):
+            raise RuntimeError(
+                "Explicit NPU interleaved RoPE cache is not initialized. "
+                "Call sync_explicit_npu_interleaved_cache() before "
+                "update_and_get_cos_sin_cache()."
+            )
         if layer_id == 0:
             self.cos_cached = (
                 self.cos_cached_total[
