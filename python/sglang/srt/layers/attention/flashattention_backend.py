@@ -204,14 +204,24 @@ class FlashAttentionBackend(AttentionBackend):
         # We set nums splits to 1 if deterministic inference is enabled.
         # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
         # Furthermore, FA4 does not support num_splits=0 with CUDA Graph, so we set num_splits to 1 if CUDA Graph is enabled.
+        self.enable_deterministic = (
+            model_runner.server_args.enable_deterministic_inference
+        )
         self.num_splits = (
             1
-            if model_runner.server_args.enable_deterministic_inference
+            if self.enable_deterministic
             or (
                 self.fa_impl_ver == 4
                 and not model_runner.server_args.disable_cuda_graph
             )
             else 0
+        )
+
+        server_args = model_runner.server_args
+        self.use_deterministic_radix_varlen_kvcache = (
+            self.enable_deterministic
+            and self.fa_impl_ver == 3
+            and not server_args.disable_radix_cache
         )
 
         # In embedding mode with no chunked prefill and radix cache disabled,
@@ -222,7 +232,6 @@ class FlashAttentionBackend(AttentionBackend):
         # guard wraps both set_kv_buffer and set_mla_kv_buffer. Without this
         # gate, MLA + is_embedding would skip the write but still read stale
         # cache via get_key_buffer in the absorbed-MLA path.
-        server_args = model_runner.server_args
         self.fa_skip_kv_cache = (
             server_args.is_embedding
             and server_args.chunked_prefill_size == -1
@@ -612,6 +621,77 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
+    def _gather_kv_from_page_table(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seq_len_k: int,
+    ):
+        offsets = torch.arange(max_seq_len_k, device=self.device)
+        if self.page_size == 1:
+            kv_indices = page_table[:, :max_seq_len_k]
+        else:
+            page_offsets = offsets // self.page_size
+            kv_indices = (
+                page_table[:, page_offsets] * self.page_size
+                + offsets.remainder(self.page_size)
+            )
+
+        mask = offsets.unsqueeze(0) < cache_seqlens.unsqueeze(1)
+        kv_indices = kv_indices[mask].to(torch.long)
+        return key_cache[kv_indices], value_cache[kv_indices]
+
+    def _should_use_deterministic_radix_varlen_kvcache(
+        self,
+        *,
+        use_local_attn: bool,
+        use_cascade_attn: bool,
+        is_swa_layer: bool,
+        is_cross_attention: bool,
+        k_descale: Optional[torch.Tensor],
+        v_descale: Optional[torch.Tensor],
+    ) -> bool:
+        return (
+            self.use_deterministic_radix_varlen_kvcache
+            and not use_local_attn
+            and not use_cascade_attn
+            and not is_swa_layer
+            and not is_cross_attention
+            and k_descale is None
+            and v_descale is None
+        )
+
+    def _pad_extend_query_to_full_length(
+        self,
+        q: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        max_seqlen_q: int,
+        total_seq_len_k: int,
+    ):
+        offsets = torch.arange(max_seqlen_q, device=q.device)
+        mask = offsets.unsqueeze(0) < extend_seq_lens.unsqueeze(1)
+        dst = (
+            cu_seqlens_k[:-1].unsqueeze(1)
+            + extend_prefix_lens.unsqueeze(1)
+            + offsets.unsqueeze(0)
+        )[mask].to(torch.long)
+        src = (cu_seqlens_q[:-1].unsqueeze(1) + offsets.unsqueeze(0))[mask].to(
+            torch.long
+        )
+
+        full_q = torch.zeros(
+            (total_seq_len_k, q.shape[1], q.shape[2]),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        full_q[dst] = q[src]
+        return full_q, dst
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -749,6 +829,8 @@ class FlashAttentionBackend(AttentionBackend):
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
+            key_cache_flat = key_cache
+            value_cache_flat = value_cache
 
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
@@ -824,6 +906,56 @@ class FlashAttentionBackend(AttentionBackend):
                     out=_fa_out,
                     **kwargs,
                 )
+            elif (
+                self._should_use_deterministic_radix_varlen_kvcache(
+                    use_local_attn=use_local_attn,
+                    use_cascade_attn=use_cascade_attn,
+                    is_swa_layer=is_swa_layer,
+                    is_cross_attention=layer.is_cross_attention,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                and any(forward_batch.extend_prefix_lens_cpu)
+            ):
+                # Match full-prefill causal alignment after radix prefix hits:
+                # pad q back to the full sequence length, run varlen attention,
+                # then keep only the suffix positions requested by this extend.
+                q_reshaped = q.contiguous().view(
+                    -1, layer.tp_q_head_num, layer.head_dim
+                )
+                full_q, suffix_indices = self._pad_extend_query_to_full_length(
+                    q_reshaped,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    forward_batch.extend_prefix_lens,
+                    forward_batch.extend_seq_lens,
+                    max_seqlen_q,
+                    int(forward_batch.seq_lens_cpu.sum().item()),
+                )
+                gathered_k, gathered_v = self._gather_kv_from_page_table(
+                    key_cache_flat,
+                    value_cache_flat,
+                    page_table,
+                    cache_seqlens,
+                    metadata.max_seq_len_k,
+                )
+                full_result = flash_attn_varlen_func(
+                    q=full_q,
+                    k=gathered_k,
+                    v=gathered_v,
+                    cu_seqlens_q=cu_seqlens_k,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=metadata.max_seq_len_k,
+                    max_seqlen_k=metadata.max_seq_len_k,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
+                    **kwargs,
+                )
+                result = full_result[suffix_indices]
             else:
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
