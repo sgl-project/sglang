@@ -5,6 +5,9 @@ import torch
 from sglang.srt.layers.attention.dsv4.indexer import (
     topk_transform_512_pytorch_vectorized,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _run_topk_transform(
