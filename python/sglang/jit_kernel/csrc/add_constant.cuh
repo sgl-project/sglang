@@ -12,6 +12,18 @@
 
 namespace {
 
+constexpr size_t kBlockSize = 256;
+constexpr size_t kVectorizedMinElements = 1 << 20;
+constexpr size_t kVectorBytes = device::kMaxVecBytes;
+static_assert(
+    kVectorBytes % sizeof(int32_t) == 0, "Vector byte width must contain whole int32_t elements");
+constexpr size_t kElementsPerVector = kVectorBytes / sizeof(int32_t);
+
+template <typename Vector>
+bool is_aligned_for_vector(const int32_t* ptr) {
+  return reinterpret_cast<uintptr_t>(ptr) % alignof(Vector) == 0;
+}
+
 template <int32_t kConstant>
 __global__ void add_constant_kernel(int32_t* dst, const int32_t* src, size_t length) {
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -41,17 +53,6 @@ __global__ void add_constant_vectorized_kernel(int32_t* dst, const int32_t* src,
       dst[tail_idx] = src[tail_idx] + kConstant;
     }
   }
-}
-
-constexpr size_t kBlockSize = 256;
-constexpr size_t kVectorizedMinElements = 1 << 20;
-constexpr size_t kVectorBytes = device::kMaxVecBytes;
-constexpr size_t kElementsPerVector = kVectorBytes / sizeof(int32_t);
-static_assert(kVectorBytes % sizeof(int32_t) == 0);
-
-template <typename Vector>
-bool is_aligned_for_vector(const int32_t* ptr) {
-  return reinterpret_cast<uintptr_t>(ptr) % alignof(Vector) == 0;
 }
 
 // You can also use struct with static method as an alternative
