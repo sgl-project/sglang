@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=690,
-    stage="stage-c",
+    stage="base-c",
     runner_config="4-gpu-b200",
 )
 
