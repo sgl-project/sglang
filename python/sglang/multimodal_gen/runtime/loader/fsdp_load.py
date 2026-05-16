@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    can_use_runai_distributed_streamer,
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -166,6 +167,134 @@ def _maybe_dequantize_fp8(
     return full_tensor
 
 
+def _is_fsdp_state_dict(
+    model: FSDPModule | torch.nn.Module, meta_sd: dict[str, torch.Tensor]
+) -> bool:
+    return isinstance(model, FSDPModule) or any(
+        hasattr(p, "device_mesh") for p in meta_sd.values()
+    )
+
+
+def _record_dtype_mismatch(
+    full_tensor: torch.Tensor,
+    target_dtype: torch.dtype,
+    target_param_name: str,
+    non_quantized_dtype_mismatch_counts: Counter[tuple[torch.dtype, torch.dtype]],
+    non_quantized_dtype_mismatch_examples: dict[
+        tuple[torch.dtype, torch.dtype], list[str]
+    ],
+    quantized_dtype_mismatch_counts: Counter[tuple[torch.dtype, torch.dtype]],
+    quantized_dtype_mismatch_examples: dict[tuple[torch.dtype, torch.dtype], list[str]],
+) -> None:
+    if full_tensor.dtype == target_dtype:
+        return
+
+    mismatch_key = (full_tensor.dtype, target_dtype)
+    if full_tensor.dtype in _QUANTIZED_DTYPES or target_dtype in _QUANTIZED_DTYPES:
+        quantized_dtype_mismatch_counts[mismatch_key] += 1
+        examples = quantized_dtype_mismatch_examples[mismatch_key]
+    else:
+        non_quantized_dtype_mismatch_counts[mismatch_key] += 1
+        examples = non_quantized_dtype_mismatch_examples[mismatch_key]
+    if len(examples) < _DTYPE_MISMATCH_EXAMPLE_LIMIT:
+        examples.append(target_param_name)
+
+
+def _log_load_state_dict_stats(
+    non_quantized_dtype_mismatch_counts: Counter[tuple[torch.dtype, torch.dtype]],
+    non_quantized_dtype_mismatch_examples: dict[
+        tuple[torch.dtype, torch.dtype], list[str]
+    ],
+    quantized_dtype_mismatch_counts: Counter[tuple[torch.dtype, torch.dtype]],
+    quantized_dtype_mismatch_examples: dict[tuple[torch.dtype, torch.dtype], list[str]],
+    skipped_checkpoint_keys: list[str],
+) -> None:
+    if non_quantized_dtype_mismatch_counts:
+        logger.debug(
+            "Casting checkpoint tensors to target dtype during load: %s",
+            _format_dtype_mismatch_summary(
+                non_quantized_dtype_mismatch_counts,
+                non_quantized_dtype_mismatch_examples,
+            ),
+            main_process_only=True,
+            local_main_process_only=True,
+        )
+
+    if quantized_dtype_mismatch_counts:
+        logger.warning(
+            "Dtype mismatches detected for quantized parameters during load: %s",
+            _format_dtype_mismatch_summary(
+                quantized_dtype_mismatch_counts,
+                quantized_dtype_mismatch_examples,
+            ),
+            main_process_only=True,
+            local_main_process_only=True,
+        )
+
+    if skipped_checkpoint_keys:
+        logger.warning(
+            "Checkpoint keys not loaded (no matching model parameter) %s",
+            (
+                skipped_checkpoint_keys[:20]
+                if len(skipped_checkpoint_keys) > 20
+                else skipped_checkpoint_keys
+            ),
+        )
+        if len(skipped_checkpoint_keys) > 20:
+            logger.warning(
+                "... and %d more skipped keys.",
+                len(skipped_checkpoint_keys) - 20,
+            )
+
+
+def _load_non_fsdp_tensor(
+    model: torch.nn.Module,
+    param_dict: dict[str, torch.nn.Parameter],
+    target_param_name: str,
+    full_tensor: torch.Tensor,
+    meta_sharded_param: torch.Tensor,
+    device: torch.device,
+    target_dtype: torch.dtype,
+    cpu_offload: bool,
+) -> torch.Tensor:
+    full_tensor = full_tensor.to(device=device, dtype=target_dtype)
+    actual_param = _get_param_for_weight_loading(model, param_dict, target_param_name)
+    weight_loader = (
+        getattr(actual_param, "weight_loader", None)
+        if actual_param is not None
+        else None
+    )
+    if weight_loader is not None:
+        assert actual_param is not None
+        sharded_tensor = torch.empty_like(
+            meta_sharded_param, device=device, dtype=target_dtype
+        )
+        requires_grad = getattr(meta_sharded_param, "requires_grad", False)
+        temp_param = _make_param_like(actual_param, sharded_tensor)
+        if not (sharded_tensor.is_floating_point() or sharded_tensor.is_complex()):
+            requires_grad = False
+        temp_param.requires_grad = requires_grad
+        try:
+            weight_loader(temp_param, full_tensor)
+        except AssertionError as exc:
+            raise AssertionError(
+                "Failed to shard/load parameter "
+                f"{target_param_name}: full_tensor.shape={tuple(full_tensor.shape)}, "
+                f"meta_sharded_param.shape={tuple(meta_sharded_param.shape)}, "
+                f"temp_param.shape={tuple(temp_param.shape)}, "
+                f"param_cls={type(actual_param).__name__}"
+            ) from exc
+        sharded_tensor = temp_param.data
+    else:
+        # RunAI distributed streamer reuses its staging buffers. Keep a real
+        # parameter copy before the next tensor is yielded.
+        sharded_tensor = full_tensor.clone().detach()
+
+    if cpu_offload:
+        sharded_tensor = sharded_tensor.cpu()
+    return sharded_tensor
+
+
 # TODO(PY): add compile option
 def maybe_load_fsdp_model(
     model_cls: type[nn.Module],
@@ -181,6 +310,7 @@ def maybe_load_fsdp_model(
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
     strict: bool = True,
+    use_runai_distributed_streaming: bool = False,
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
 
@@ -244,17 +374,52 @@ def maybe_load_fsdp_model(
             pin_cpu_memory=pin_cpu_memory,
         )
 
-    weight_iterator = safetensors_weights_iterator(weight_dir_list)
-    param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
-    load_model_from_full_model_state_dict(
-        model,
-        weight_iterator,
-        device,
-        param_dtype,
-        strict=strict,
-        cpu_offload=cpu_offload,
-        param_names_mapping=param_names_mapping_fn,
+    if use_runai_distributed_streaming:
+        if not can_use_runai_distributed_streamer():
+            logger.info(
+                "RunAI distributed streaming disabled: streamer is not available"
+            )
+            use_runai_distributed_streaming = False
+        elif _is_fsdp_state_dict(model, model.state_dict()):
+            logger.info("RunAI distributed streaming disabled: FSDP is enabled")
+            use_runai_distributed_streaming = False
+        elif any(
+            isinstance(replacement, tuple)
+            for replacement in model.param_names_mapping.values()
+        ):
+            logger.info(
+                "RunAI distributed streaming disabled: "
+                "merged parameter mapping is required"
+            )
+            use_runai_distributed_streaming = False
+
+    weight_iterator = safetensors_weights_iterator(
+        weight_dir_list,
+        to_cpu=not use_runai_distributed_streaming,
+        use_runai_distributed_streamer=use_runai_distributed_streaming,
     )
+    param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+    if use_runai_distributed_streaming:
+        logger.info("Using streaming state-dict load for RunAI distributed streamer")
+        load_model_from_streamed_state_dict(
+            model,
+            weight_iterator,
+            device,
+            param_dtype,
+            strict=strict,
+            cpu_offload=cpu_offload,
+            param_names_mapping=param_names_mapping_fn,
+        )
+    else:
+        load_model_from_full_model_state_dict(
+            model,
+            weight_iterator,
+            device,
+            param_dtype,
+            strict=strict,
+            cpu_offload=cpu_offload,
+            param_names_mapping=param_names_mapping_fn,
+        )
 
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
@@ -351,6 +516,172 @@ def shard_model(
         type(model).__name__,
         condition_source,
     )
+
+
+def load_model_from_streamed_state_dict(
+    model: torch.nn.Module,
+    full_sd_iterator: Generator[tuple[str, torch.Tensor], None, None],
+    device: torch.device,
+    param_dtype: torch.dtype | None,
+    strict: bool = False,
+    cpu_offload: bool = False,
+    param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
+) -> _IncompatibleKeys:
+    """Load non-FSDP models while consuming checkpoint tensors one by one."""
+    meta_sd = model.state_dict()
+    if _is_fsdp_state_dict(model, meta_sd):
+        raise ValueError("streamed state-dict load does not support FSDP parameters")
+
+    param_dict = dict(model.named_parameters())
+    valid_target_names = set(meta_sd.keys())
+    reverse_param_names_mapping = {}
+    sharded_sd = {}
+    if param_names_mapping is None:
+        param_names_mapping = lambda name: (name, None, None)
+    skipped_checkpoint_keys: list[str] = []
+    non_quantized_dtype_mismatch_counts: Counter[tuple[torch.dtype, torch.dtype]] = (
+        Counter()
+    )
+    non_quantized_dtype_mismatch_examples: dict[
+        tuple[torch.dtype, torch.dtype], list[str]
+    ] = defaultdict(list)
+    quantized_dtype_mismatch_counts: Counter[tuple[torch.dtype, torch.dtype]] = (
+        Counter()
+    )
+    quantized_dtype_mismatch_examples: dict[
+        tuple[torch.dtype, torch.dtype], list[str]
+    ] = defaultdict(list)
+
+    for source_param_name, full_tensor in full_sd_iterator:
+        target_param_name, merge_index, num_params_to_merge = param_names_mapping(
+            source_param_name
+        )
+        if merge_index is not None:
+            raise ValueError(
+                "streamed state-dict load does not support merged checkpoint "
+                f"parameters: {source_param_name} -> {target_param_name} "
+                f"({merge_index}/{num_params_to_merge})"
+            )
+        if (
+            target_param_name != source_param_name
+            and source_param_name in valid_target_names
+            and target_param_name not in valid_target_names
+        ):
+            target_param_name = source_param_name
+            merge_index = None
+            num_params_to_merge = None
+        if (
+            target_param_name == "" or target_param_name is None
+        ):  # type: ignore[comparison-overlap]
+            continue
+
+        reverse_param_names_mapping[target_param_name] = (
+            source_param_name,
+            merge_index,
+            num_params_to_merge,
+        )
+        meta_sharded_param = meta_sd.get(target_param_name)
+        if meta_sharded_param is None:
+            if strict:
+                raise ValueError(
+                    f"Parameter {target_param_name} not found in custom model "
+                    "state dict. The hf to custom mapping may be incorrect."
+                )
+            skipped_checkpoint_keys.append(target_param_name)
+            continue
+
+        target_dtype = meta_sharded_param.dtype
+        _record_dtype_mismatch(
+            full_tensor,
+            target_dtype,
+            target_param_name,
+            non_quantized_dtype_mismatch_counts,
+            non_quantized_dtype_mismatch_examples,
+            quantized_dtype_mismatch_counts,
+            quantized_dtype_mismatch_examples,
+        )
+        sharded_tensor = _load_non_fsdp_tensor(
+            model,
+            param_dict,
+            target_param_name,
+            full_tensor,
+            meta_sharded_param,
+            device,
+            target_dtype,
+            cpu_offload,
+        )
+        sharded_sd[target_param_name] = nn.Parameter(
+            sharded_tensor, requires_grad=False
+        )
+
+    model.reverse_param_names_mapping = reverse_param_names_mapping
+    _log_load_state_dict_stats(
+        non_quantized_dtype_mismatch_counts,
+        non_quantized_dtype_mismatch_examples,
+        quantized_dtype_mismatch_counts,
+        quantized_dtype_mismatch_examples,
+        skipped_checkpoint_keys,
+    )
+
+    unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
+    if unused_keys:
+        logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
+
+    LEGACY_ALLOWED_NEW_PARAM_PATTERNS = [
+        "gate_compress",
+        "wcscales",
+        "wtscale",
+        "input_scale",
+        "weight_scale",
+        "bias",
+        "norm_q",
+        "norm_k",
+    ]
+    for new_param_name in unused_keys:
+        meta_sharded_param = meta_sd.get(new_param_name)
+        meta_sharded_param_dtype = meta_sharded_param.dtype
+        actual_param = param_dict.get(new_param_name)
+        missing_param_init = (
+            getattr(actual_param, "missing_param_init", None)
+            if actual_param is not None
+            else None
+        )
+
+        if missing_param_init is None and not any(
+            pattern in new_param_name for pattern in LEGACY_ALLOWED_NEW_PARAM_PATTERNS
+        ):
+            logger.error(
+                "Unsupported new parameter: %s. Allowed legacy patterns: %s",
+                new_param_name,
+                LEGACY_ALLOWED_NEW_PARAM_PATTERNS,
+            )
+            raise ValueError(
+                f"New parameter '{new_param_name}' is not supported. "
+                "Checkpoint-specific synthesized parameters should either match "
+                f"{LEGACY_ALLOWED_NEW_PARAM_PATTERNS} or declare missing_param_init."
+            )
+
+        if missing_param_init == "ones" or any(
+            p in new_param_name
+            for p in ("wcscales", "wtscale", "input_scale", "norm_q", "norm_k")
+        ):
+            init_like = torch.ones_like
+        elif missing_param_init == "zeros" or missing_param_init is None:
+            init_like = torch.zeros_like
+        else:
+            raise ValueError(
+                f"Unsupported missing_param_init={missing_param_init!r} "
+                f"for {new_param_name}"
+            )
+
+        sharded_tensor = init_like(
+            meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
+        )
+        if cpu_offload:
+            sharded_tensor = sharded_tensor.cpu()
+        sharded_sd[new_param_name] = nn.Parameter(sharded_tensor)
+
+    return model.load_state_dict(sharded_sd, strict=strict, assign=True)
 
 
 # TODO(mick): need refactor, to move out checkpoint-specific adjustments

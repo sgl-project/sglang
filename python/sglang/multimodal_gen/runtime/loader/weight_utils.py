@@ -27,6 +27,7 @@ except ImportError:
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -179,10 +180,21 @@ def _raise_if_duplicate_safetensors_keys(hf_weights_files: list[str]) -> None:
     )
 
 
+def can_use_runai_distributed_streamer() -> bool:
+    return (
+        HAS_RUNAI_MODEL_STREAMER
+        and envs.SGLANG_USE_RUNAI_MODEL_STREAMER
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() > 1
+        and current_platform.is_cuda_alike()
+    )
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
     use_runai_model_streamer: bool | None = None,
+    use_runai_distributed_streamer: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -193,6 +205,12 @@ def safetensors_weights_iterator(
         use_runai_model_streamer = (
             HAS_RUNAI_MODEL_STREAMER and envs.SGLANG_USE_RUNAI_MODEL_STREAMER
         )
+    use_runai_distributed_streamer = (
+        use_runai_distributed_streamer
+        and use_runai_model_streamer
+        and not to_cpu
+        and can_use_runai_distributed_streamer()
+    )
 
     # Validate files before loading
     corrupted_files = [
@@ -234,9 +252,20 @@ def safetensors_weights_iterator(
 
     if use_runai_model_streamer:
         with SafetensorsStreamer() as streamer:
-            streamer.stream_files(hf_weights_files)
+            if use_runai_distributed_streamer:
+                logger.info(
+                    "Loading safetensors with RunAI distributed streamer on %s",
+                    device,
+                )
+            streamer.stream_files(
+                hf_weights_files,
+                device=device if use_runai_distributed_streamer else "cpu",
+                is_distributed=use_runai_distributed_streamer,
+            )
             for name, tensor in streamer.get_tensors():
-                if to_cpu:
+                if use_runai_distributed_streamer:
+                    yield name, tensor
+                elif to_cpu:
                     yield name, tensor.clone().detach()
                 else:
                     yield name, tensor.to(device)
