@@ -49,7 +49,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
         │                                                     │
         ▼                                                     │
  ┌─────────────────────────────────────┐                      │
- │          Stage A (~3 min)           │                      │
+ │          Base A (~3 min)            │                      │
  │         pre-flight check            │                      │
  │                                     │                      │
  │  ┌─────────────────────────────┐    │                      │
@@ -64,8 +64,8 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
         │                                                     │
         ▼                                                     ▼
  ┌─────────────────────────────────────┐          ┌──────────────────────────┐
- │          Stage B (~30 min)          │          │      kernel test         │
- │           basic tests               │          └──────────────────────────┘
+ │          Base B (~30 min)           │          │      kernel test         │
+ │            base tests               │          └──────────────────────────┘
  │                                     │          ┌──────────────────────────┐
  │  ┌─────────────────────────────┐    │          │   multimodal gen test    │
  │  │ base-b-test-1-gpu-small    │    │          └──────────────────────────┘
@@ -83,7 +83,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
         │
         ▼
  ┌─────────────────────────────────────┐
- │          Stage C (~30 min)          │
+ │          Base C (~30 min)           │
  │          advanced tests             │
  │                                     │
  │  ┌─────────────────────────────┐    │
@@ -198,7 +198,7 @@ steps:
     ...
 
   - uses: ./.github/actions/check-pr-test-health
-    id: stage-health
+    id: pr-test-health
 
   - name: Install dependencies        # skipped automatically if health check failed
     ...                                # (default if: success() is false)
@@ -319,7 +319,7 @@ Determines which test suites to run based on file changes.
 
 | Output | Triggers |
 |--------|----------|
-| `main_package` | Stage A/B/C test suites |
+| `main_package` | Base A/B/C test suites |
 | `sgl_kernel` | Kernel wheel builds + kernel test suites; also switches B200 jobs to kernel-build runner labels outside `target_stage` mode |
 | `jit_kernel` | JIT kernel test workflow |
 | `multimodal_gen` | Multimodal-gen test workflow |
