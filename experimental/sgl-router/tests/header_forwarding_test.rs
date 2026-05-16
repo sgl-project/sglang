@@ -28,12 +28,12 @@ async fn forwards_whitelisted_headers_strips_others() {
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
         }],
         workers: vec![WorkerConfig {
-            url: worker.url.clone(),
+            url: worker.url.parse().unwrap(),
             request_timeout_ms: None,
         }],
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.clone(), Duration::from_secs(5)).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), Duration::from_secs(5)).unwrap());
     let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
 
     let body = serde_json::to_vec(&serde_json::json!({

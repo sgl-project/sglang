@@ -35,7 +35,7 @@ fn config(worker_url: &str) -> Config {
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
         }],
         workers: vec![WorkerConfig {
-            url: worker_url.into(),
+            url: worker_url.parse().expect("worker URL must parse"),
             request_timeout_ms: Some(200),
         }],
     }
@@ -47,7 +47,8 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
     let worker = common::mock_worker::MockWorker::start_hanging(Duration::from_secs(5)).await;
     let cfg = config(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(worker.url.clone(), Duration::from_millis(200)).unwrap());
+    let proxy =
+        Arc::new(Proxy::new(worker.url.parse().unwrap(), Duration::from_millis(200)).unwrap());
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy));
     let app = build_router(ctx);
 

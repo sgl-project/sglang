@@ -92,14 +92,17 @@ mod tests {
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             }],
             workers: vec![crate::config::WorkerConfig {
-                url: "http://x".into(),
+                url: reqwest::Url::parse("http://x:30000").unwrap(),
                 request_timeout_ms: None,
             }],
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();
         let proxy = Arc::new(
-            crate::proxy::Proxy::new("http://x".into(), std::time::Duration::from_secs(60))
-                .expect("stub proxy"),
+            crate::proxy::Proxy::new(
+                reqwest::Url::parse("http://x:30000").unwrap(),
+                std::time::Duration::from_secs(60),
+            )
+            .expect("stub proxy"),
         );
         Arc::new(AppContext::new(cfg, Arc::new(registry), proxy))
     }

@@ -30,11 +30,9 @@ impl Config {
         if self.workers.is_empty() {
             return Err(anyhow!("at least one worker required"));
         }
-        for w in &self.workers {
-            if w.url.is_empty() {
-                return Err(anyhow!("worker.url must be set"));
-            }
-        }
+        // Per-worker URL syntax + scheme is enforced by the typed
+        // `WorkerConfig.url: reqwest::Url` deserializer; no further check
+        // needed here.
         for m in &self.models {
             if m.id.is_empty() {
                 return Err(anyhow!("model.id must be non-empty"));
@@ -69,7 +67,7 @@ workers:
         let c = Config::from_path(&p).unwrap();
         assert_eq!(c.server.port, 8090);
         assert_eq!(c.models[0].id, "qwen3-0.6b");
-        assert_eq!(c.workers[0].url, "http://127.0.0.1:30000");
+        assert_eq!(c.workers[0].url.as_str(), "http://127.0.0.1:30000/");
     }
 
     #[test]
@@ -114,7 +112,7 @@ url = "http://127.0.0.1:30000"
         .unwrap();
         let c = Config::from_path(&p).unwrap();
         assert_eq!(c.workers.len(), 1);
-        assert_eq!(c.workers[0].url, "http://127.0.0.1:30000");
+        assert_eq!(c.workers[0].url.as_str(), "http://127.0.0.1:30000/");
     }
 
     #[test]
@@ -156,5 +154,151 @@ url = "http://127.0.0.1:30000"
         std::fs::write(&p, "").unwrap();
         let err = Config::from_path(&p).unwrap_err();
         assert!(err.to_string().contains("yaml") && err.to_string().contains("toml"));
+    }
+
+    // -- I11: worker URL is typed at config-load time -----------------------
+    //
+    // The field is `reqwest::Url` (re-export of `url::Url`). The `url` crate
+    // normalizes a bare authority to include a `/` path: parsing
+    // `"http://x:30000"` yields a `Url` whose `as_str()` is
+    // `"http://x:30000/"`. So both forms below converge on the same string.
+
+    #[test]
+    fn loads_config_with_url_having_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models:
+  - id: "qwen3-0.6b"
+    tokenizer_path: "/tmp/qwen.json"
+workers:
+  - url: "http://127.0.0.1:30000/"
+"#,
+        )
+        .unwrap();
+        let c = Config::from_path(&p).unwrap();
+        // url crate normalizes — both with and without trailing slash end up
+        // with a path of "/". We pin the normalized form here.
+        assert_eq!(c.workers[0].url.as_str(), "http://127.0.0.1:30000/");
+    }
+
+    #[test]
+    fn loads_config_without_trailing_slash_normalizes_to_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models:
+  - id: "qwen3-0.6b"
+    tokenizer_path: "/tmp/qwen.json"
+workers:
+  - url: "http://127.0.0.1:30000"
+"#,
+        )
+        .unwrap();
+        let c = Config::from_path(&p).unwrap();
+        assert_eq!(c.workers[0].url.as_str(), "http://127.0.0.1:30000/");
+    }
+
+    #[test]
+    fn loads_config_rejects_malformed_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models: []
+workers:
+  - url: "not-a-url"
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("url") || msg.contains("relative") || msg.contains("scheme"),
+            "expected URL parse failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn loads_config_rejects_url_without_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models: []
+workers:
+  - url: "127.0.0.1:30000"
+"#,
+        )
+        .unwrap();
+        // "127.0.0.1:30000" parses as scheme "127.0.0.1" — the url crate
+        // accepts this (it's a syntactically valid URI with an opaque path).
+        // Our validator rejects schemes other than http/https.
+        let err = Config::from_path(&p).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("scheme") || msg.contains("http") || msg.contains("url"),
+            "expected scheme validation failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn loads_config_rejects_empty_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models: []
+workers:
+  - url: ""
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("url") || msg.contains("empty") || msg.contains("relative"),
+            "expected empty-URL failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn url_join_drops_existing_path_for_absolute_input() {
+        // Pin the Url::join semantics we rely on in proxy::forward_*. An
+        // absolute path ("/v1/...") replaces the existing path, so a
+        // trailing-slash worker URL and a non-trailing one both produce the
+        // same joined URL — no double-slash bug.
+        let base_with = reqwest::Url::parse("http://x:30000/").unwrap();
+        let base_without = reqwest::Url::parse("http://x:30000").unwrap();
+        assert_eq!(
+            base_with.join("/v1/tokenize").unwrap().as_str(),
+            "http://x:30000/v1/tokenize"
+        );
+        assert_eq!(
+            base_without.join("/v1/tokenize").unwrap().as_str(),
+            "http://x:30000/v1/tokenize"
+        );
     }
 }
