@@ -927,6 +927,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         elif runner_backend.is_triton():
             assert base_layer.quant_method is not None, "Quant method must be set"
             self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
+        elif runner_backend.is_flashinfer_cutlass():
+            assert base_layer.quant_method is not None, "Quant method must be set"
+            self._quant_info = base_layer.quant_method.get_cutlass_fp4_quant_info(
+                base_layer
+            )
         else:
             raise NotImplementedError(
                 f"LoRA MoE not supported for backend {runner_backend}"
@@ -997,6 +1002,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
             lora_use_virtual_experts=self.lora_use_virtual_experts,
+            has_active_lora=bool(getattr(batch_info, "has_active_lora", True)),
         )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):

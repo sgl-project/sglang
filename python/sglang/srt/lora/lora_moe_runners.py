@@ -188,6 +188,11 @@ class LoRAInfo:
     hidden_size: int = 0
     lora_use_virtual_experts: bool = False
 
+    # True iff at least one request in the batch maps to a slot with rank > 0.
+    # Mirrors ``LoRABatchInfo.has_active_lora`` set by ``LoRAManager``; read by
+    # ``build_lora_hooks`` to gate the eager-mode ``fused_moe_lora`` launch.
+    has_active_lora: bool = True
+
 
 @dataclass
 class LoRAHooks:
@@ -519,6 +524,18 @@ def build_lora_hooks(
     closures that capture them for the two injection points.
     """
     if lora_info is None or lora_info.max_lora_rank == 0:
+        return LoRAHooks()
+
+    if get_is_capture_mode():
+        from sglang.srt.model_executor.cuda_graph_runner import get_capture_lora_variant
+
+        if get_capture_lora_variant() == "nolora":
+            return LoRAHooks()
+    elif not lora_info.has_active_lora:
+        # Eager-mode mirror of the graph-mode "nolora" gate above. The kernel
+        # is mathematically zero on the passthrough slot (``lora_a``/``lora_b``
+        # are zero-initialised), but its bf16 round-trip accumulates across
+        # layers into visible drift on the NVFP4 path.
         return LoRAHooks()
 
     # Compute alignment / mapping (once, shared by both hooks)
