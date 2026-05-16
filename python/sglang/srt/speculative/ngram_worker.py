@@ -17,6 +17,7 @@ from sglang.srt.speculative.base_spec_worker import (
     DraftExecutor,
     NullDraftExecutor,
     SpecCoordinator,
+    SpecResourceContext,
 )
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -50,25 +51,23 @@ class NgramSpecCoordinator(SpecCoordinator):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        # Shared spec config + memory-pool refs; properties on `SpecCoordinator`
+        # forward `self.target_worker` / `self.speculative_algorithm` / ... here.
+        self._ctx = SpecResourceContext.from_server_args(server_args, target_worker)
+
         self.server_args = server_args
-        self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
-        self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
 
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
 
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
         # NGRAM has no draft model — drafts come from `ngram_corpus.batch_get`.
-        # `NullDraftExecutor` makes the absence type-explicit.
-        self._draft_worker: DraftExecutor = NullDraftExecutor(
-            target_worker, self.speculative_algorithm
-        )
+        # `NullDraftExecutor` makes the absence type-explicit; it shares the
+        # same `_ctx` so `target_worker`, `speculative_algorithm`, ... agree.
+        self._draft_worker: DraftExecutor = NullDraftExecutor(self._ctx)
 
         self._init_preallocated_tensors()
 

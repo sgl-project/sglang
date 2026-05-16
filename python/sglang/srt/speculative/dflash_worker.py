@@ -20,7 +20,11 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.speculative.base_spec_worker import DraftExecutor, SpecCoordinator
+from sglang.srt.speculative.base_spec_worker import (
+    DraftExecutor,
+    SpecCoordinator,
+    SpecResourceContext,
+)
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
@@ -58,27 +62,13 @@ class DFlashDraftExecutor(DraftExecutor):
     `init_*` methods are no-ops.
     """
 
-    def __init__(
-        self,
-        inner_tp: TpModelWorker,
-        target_worker: TpModelWorker,
-        speculative_algorithm: SpeculativeAlgorithm,
-    ):
+    def __init__(self, inner_tp: TpModelWorker, ctx: SpecResourceContext):
         self._inner_tp = inner_tp
-        self._target_worker = target_worker
-        self._speculative_algorithm = speculative_algorithm
+        self._ctx = ctx
 
     @property
     def draft_runner(self):
         return self._inner_tp.model_runner
-
-    @property
-    def target_worker(self) -> TpModelWorker:
-        return self._target_worker
-
-    @property
-    def speculative_algorithm(self) -> SpeculativeAlgorithm:
-        return self._speculative_algorithm
 
     @property
     def eagle_use_aux_hidden_state(self) -> bool:
@@ -106,6 +96,10 @@ class DFlashSpecCoordinator(SpecCoordinator):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        # Shared spec config + memory-pool refs; properties on `SpecCoordinator`
+        # forward `self.target_worker` / `self.speculative_algorithm` / ... here.
+        self._ctx = SpecResourceContext.from_server_args(server_args, target_worker)
+
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
@@ -114,12 +108,7 @@ class DFlashSpecCoordinator(SpecCoordinator):
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
         self.nccl_port = nccl_port
-        self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
-        self.page_size = server_args.page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
             server_args.speculative_draft_window_size
@@ -204,7 +193,7 @@ class DFlashSpecCoordinator(SpecCoordinator):
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_runner = self._inner_tp.model_runner
         self._draft_executor: DraftExecutor = DFlashDraftExecutor(
-            self._inner_tp, target_worker, self.speculative_algorithm
+            self._inner_tp, self._ctx
         )
         self.draft_model = self.draft_runner.model
         draft_config = parse_dflash_draft_config(

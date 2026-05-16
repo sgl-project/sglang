@@ -37,7 +37,11 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
-from sglang.srt.speculative.base_spec_worker import DraftExecutor, SpecCoordinator
+from sglang.srt.speculative.base_spec_worker import (
+    DraftExecutor,
+    SpecCoordinator,
+    SpecResourceContext,
+)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -55,7 +59,6 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
     draft_tp_context,
@@ -102,18 +105,10 @@ class EAGLEWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # Parse arguments
-        self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.gpu_id = gpu_id
-        self.device = server_args.device
-        self.target_worker = target_worker
-        self.page_size = server_args.page_size
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
+        # Shared config + memory-pool refs in one place; properties on
+        # `DraftExecutor` / `SpecCoordinator` forward `self.topk` /
+        # `self.target_worker` / ... to this context.
+        self._ctx = SpecResourceContext.from_server_args(server_args, target_worker)
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -129,11 +124,6 @@ class EAGLEWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
         # It will be captured later.
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
-        # Share the allocator with a target worker.
-        # Draft and target worker own their own KV cache pools.
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
 
         # Load hot token ids
         if self.speculative_algorithm.is_eagle3():
@@ -169,8 +159,8 @@ class EAGLEWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                req_to_token_pool=self._ctx.req_to_token_pool,
+                token_to_kv_pool_allocator=self._ctx.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 

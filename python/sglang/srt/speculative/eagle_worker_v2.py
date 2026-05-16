@@ -37,7 +37,11 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
-from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import (
+    BaseDraftWorker,
+    BaseSpecWorker,
+    SpecResourceContext,
+)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -55,7 +59,6 @@ from sglang.srt.speculative.eagle_info_v2 import (
     fill_bonus_tokens,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     generate_token_bitmask,
@@ -110,36 +113,29 @@ class EagleDraftWorker(BaseDraftWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # copy args
+        # Shared spec config + memory-pool refs; properties on `DraftExecutor`
+        # forward `self.topk` / `self.target_worker` / ... to this context.
+        self._ctx = SpecResourceContext.from_server_args(server_args, target_worker)
+
+        # Rank coordinates + memory-pool aliases (this class doesn't inherit
+        # `TpModelWorker`; both are forwarded into the inner draft TpModelWorker
+        # below, and read on the hot path).
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.dp_rank = dp_rank
         self.moe_ep_rank = moe_ep_rank
         self.nccl_port = nccl_port
-        self.target_worker = target_worker
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
-
-        # Args for easy access
         self.device = server_args.device
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
+        self.req_to_token_pool = self._ctx.req_to_token_pool
+        self.token_to_kv_pool_allocator = self._ctx.token_to_kv_pool_allocator
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
-
-        # Share the allocator with a target worker.
-        # Draft and target worker own their own KV cache pools.
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
 
         # Init draft worker
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
@@ -161,8 +157,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                req_to_token_pool=self._ctx.req_to_token_pool,
+                token_to_kv_pool_allocator=self._ctx.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
@@ -669,23 +665,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # Parse arguments
+        # Shared spec config + memory-pool refs; properties on `SpecCoordinator`
+        # forward `self.topk` / `self.target_worker` / ... to this context.
+        self._ctx = SpecResourceContext.from_server_args(server_args, target_worker)
+
+        # Rank coordinates + memory-pool aliases.
         self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.tp_rank = tp_rank
         self.gpu_id = gpu_id
         self.device = server_args.device
-        self._target_worker = target_worker
-        self.page_size = server_args.page_size
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
-
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
+        self.req_to_token_pool = self._ctx.req_to_token_pool
+        self.token_to_kv_pool_allocator = self._ctx.token_to_kv_pool_allocator
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -732,17 +722,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                         draft_attn_backend=self._draft_worker.draft_attn_backend,
                         cuda_graph_runner=self._draft_worker.cuda_graph_runner,
-                        target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.graph_runner,
+                        target_attn_backend=target_worker.model_runner.attn_backend,
+                        target_graph_runner=target_worker.model_runner.graph_runner,
                         draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
                 )
                 self.adaptive_controller.init_states()
-
-    @property
-    def target_worker(self):
-        return self._target_worker
 
     @property
     def draft_worker(self):
@@ -858,7 +844,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs()
 
             # Build target attention backend and CUDA graph runner
-            target_model_runner = self._target_worker.model_runner
+            target_model_runner = self.target_worker.model_runner
             backup_init = target_model_runner.init_new_workspace
             try:
                 target_attn_backend = target_model_runner._get_attention_backend(
@@ -925,8 +911,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         dw.cuda_graph_runner_for_draft_extend = state.cuda_graph_runner_for_draft_extend
 
         # Target side
-        self._target_worker.model_runner.attn_backend = state.target_attn_backend
-        self._target_worker.model_runner.graph_runner = state.target_graph_runner
+        self.target_worker.model_runner.attn_backend = state.target_attn_backend
+        self.target_worker.model_runner.graph_runner = state.target_graph_runner
 
         # Sync server_args
         self.server_args.speculative_num_steps = state.speculative_num_steps
@@ -1018,7 +1004,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             if (
                 _is_npu
-                and self._target_worker.model_runner.model_is_mrope
+                and self.target_worker.model_runner.model_is_mrope
                 and batch.spec_info is not None
                 and getattr(batch.spec_info, "positions", None) is not None
                 and not batch.forward_mode.is_idle()
@@ -1026,7 +1012,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # mrope_position depends on draft output in default stream and is computed in plan stream,
                 # causing errors. Compute it here for correct values.
                 verify_forward_batch.compute_spec_mrope_positions(
-                    self._target_worker.model_runner, batch
+                    self.target_worker.model_runner, batch
                 )
 
             # Some values such as custom_mask and position depend on the output of draft,

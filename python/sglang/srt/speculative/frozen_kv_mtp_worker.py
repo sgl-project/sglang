@@ -43,7 +43,11 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import DraftExecutor, SpecCoordinator
+from sglang.srt.speculative.base_spec_worker import (
+    DraftExecutor,
+    SpecCoordinator,
+    SpecResourceContext,
+)
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
@@ -65,7 +69,6 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import (
     set_frozen_kv_positions,
     target_kv_pool_view,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
@@ -96,17 +99,10 @@ class FrozenKVMTPWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.gpu_id = gpu_id
-        self.device = server_args.device
-        self.target_worker = target_worker
-        self.page_size = server_args.page_size
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
+        # Shared spec config + memory-pool refs; properties on `DraftExecutor` /
+        # `SpecCoordinator` forward `self.topk` / `self.target_worker` / ... here.
+        self._ctx = SpecResourceContext.from_server_args(server_args, target_worker)
+
         # Frozen-KV MTP runs DSv4-style MTP, not EAGLE3; no aux hidden states.
         self.eagle_use_aux_hidden_state = False
         assert self.speculative_algorithm.is_frozen_kv_mtp(), (
@@ -123,11 +119,6 @@ class FrozenKVMTPWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
         # Defer cuda graph capture; we do it ourselves below.
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
-
-        # Draft attention uses target req_to_token + KV allocator (read-only).
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
 
         target_cfg = target_worker.model_runner.memory_pool_config
         draft_pool_config = MemoryPoolConfig(
@@ -151,8 +142,8 @@ class FrozenKVMTPWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                req_to_token_pool=self._ctx.req_to_token_pool,
+                token_to_kv_pool_allocator=self._ctx.token_to_kv_pool_allocator,
                 memory_pool_config=draft_pool_config,
             )
 

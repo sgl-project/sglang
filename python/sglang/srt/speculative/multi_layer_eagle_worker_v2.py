@@ -33,7 +33,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import (
+    BaseDraftWorker,
+    BaseSpecWorker,
+    SpecResourceContext,
+)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftExtendInputV2,
@@ -50,7 +54,6 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
     assign_hidden_states_pool_triton,
     rotate_input_ids_triton,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     maybe_detect_nan,
@@ -90,25 +93,22 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # copy args
+        # Shared spec config + memory-pool refs.
+        self._ctx = SpecResourceContext.from_server_args(server_args, target_worker)
+
+        # Rank coordinates + memory-pool aliases.
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.dp_rank = dp_rank
         self.moe_ep_rank = moe_ep_rank
         self.nccl_port = nccl_port
-        self.target_worker = target_worker
+        self.device = server_args.device
+        self.req_to_token_pool = self._ctx.req_to_token_pool
+        self.token_to_kv_pool_allocator = self._ctx.token_to_kv_pool_allocator
+
         self.draft_extend_attn_backend_list = []
         self.model_config = target_worker.model_config
-
-        # Args for easy access
-        self.device = server_args.device
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
 
         # Set constant
         EagleDraftInputV2.ALLOC_LEN_PER_DECODE = max(
@@ -119,12 +119,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # will capture later with init_cuda_graphs()
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
-
-        # Share the allocator with a target worker.
-        # Draft and target worker own their own KV cache pools.
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
         with empty_context(), speculative_moe_backend_context():
             # Init draft worker
             self.draft_worker = TpModelWorker(
@@ -138,8 +132,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                req_to_token_pool=self._ctx.req_to_token_pool,
+                token_to_kv_pool_allocator=self._ctx.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
                 is_multi_layer_eagle=True,
             )
@@ -636,22 +630,15 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # Parse arguments
+        # Shared spec config + memory-pool refs.
+        self._ctx = SpecResourceContext.from_server_args(server_args, target_worker)
+
+        # Rank coordinates + memory-pool aliases.
         self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.gpu_id = gpu_id
         self.device = server_args.device
-        self._target_worker = target_worker
-        self.page_size = server_args.page_size
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
-
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
+        self.req_to_token_pool = self._ctx.req_to_token_pool
+        self.token_to_kv_pool_allocator = self._ctx.token_to_kv_pool_allocator
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -675,10 +662,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
-
-    @property
-    def target_worker(self):
-        return self._target_worker
 
     @property
     def draft_worker(self):
