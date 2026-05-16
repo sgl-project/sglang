@@ -43,7 +43,7 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import DraftExecutor
+from sglang.srt.speculative.base_spec_worker import DraftExecutor, SpecCoordinator
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
@@ -79,7 +79,7 @@ from sglang.srt.utils import empty_context
 logger = logging.getLogger(__name__)
 
 
-class FrozenKVMTPWorker(TpModelWorker, DraftExecutor):
+class FrozenKVMTPWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
     """Frozen-KV MTP worker; same constructor shape as EAGLEWorker. Entry:
     :meth:`forward_batch_generation` (stubs for now).
     """
@@ -189,6 +189,11 @@ class FrozenKVMTPWorker(TpModelWorker, DraftExecutor):
     @property
     def draft_runner(self):
         return self.model_runner
+
+    @property
+    def draft_worker(self) -> DraftExecutor:
+        # V1 monolithic: this worker is both coordinator and draft executor.
+        return self
 
     def get_attn_backend(self):  # pragma: no cover - exposed for adaptive
         return self.draft_attn_backend
