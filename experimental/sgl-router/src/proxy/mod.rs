@@ -122,7 +122,10 @@ impl Proxy {
     /// misses both the wrapped reqwest timeout and the `io::ErrorKind::TimedOut`
     /// cases.
     fn classify_reqwest_error(&self, e: reqwest::Error, path: &str) -> ApiError {
-        let worker = self.worker_url.as_str().to_string();
+        // Carry the typed `Url` end-to-end — `Display` on `Url` is the same
+        // canonical form as `as_str()`, so logs render identically and we
+        // avoid an unnecessary re-stringify.
+        let worker = self.worker_url.clone();
         let source = anyhow::Error::new(e).context(format!("worker {worker}: post {path}"));
         let is_timeout = source.chain().any(|c| {
             c.downcast_ref::<reqwest::Error>()
