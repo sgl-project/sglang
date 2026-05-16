@@ -16,21 +16,27 @@ pub fn encode(t: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     Ok(enc.token_ids().to_vec())
 }
 
-/// Decode a complete sequence of token IDs to text. The dynamo-tokenizers
-/// `DecodeResult::Partial` variant — used to signal "this ends mid-UTF8
-/// codepoint, you may need more bytes" — is intentionally collapsed into
-/// the same String here.
+/// Decode token ids to a complete UTF-8 string.
 ///
-/// **Do NOT use this for incremental streaming detokenization.** A token
-/// boundary that splits a multi-byte UTF-8 codepoint (CJK, emoji,
-/// byte-fallback BPE) will appear here as a Partial string, and the
-/// caller will lose the signal that the next token's prefix must be
-/// concatenated before display. Streaming detokenization will get its
-/// own API in M2 (likely returning `DecodeResult` directly).
+/// Non-streaming callers (e.g. `/v1/detokenize`) get the full result either way:
+/// - `DecodeResult::Complete(s)` — the token sequence ends on a codepoint boundary.
+/// - `DecodeResult::Partial(s)` — the token sequence ends mid-codepoint; `s` ends
+///   in U+FFFD. We return `s` as-is so the client sees the closest-possible string.
+///
+/// Streaming callers should NOT use this; they should consume `DecodeResult`
+/// directly and withhold the trailing U+FFFD until the next decode produces a
+/// `Complete` result.
 pub fn decode_complete(t: &Tokenizer, ids: &[u32], skip_special: bool) -> Result<String> {
     let res = t.decode(ids, skip_special).context("decode")?;
     Ok(match res {
         DecodeResult::Complete(s) => s,
-        DecodeResult::Partial(s) => s,
+        DecodeResult::Partial(s) => {
+            tracing::debug!(
+                n_tokens = ids.len(),
+                trailing_bytes = s.len(),
+                "decode_complete: tokenizer returned Partial for non-streaming call"
+            );
+            s
+        }
     })
 }
