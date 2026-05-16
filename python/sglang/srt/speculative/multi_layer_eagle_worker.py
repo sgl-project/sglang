@@ -33,6 +33,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.base_spec_worker import DraftExecutor, SpecCoordinator
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
@@ -69,7 +70,7 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
-class MultiLayerEagleWorker(TpModelWorker):
+class MultiLayerEagleWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
 
     def __init__(
         self,
@@ -251,6 +252,16 @@ class MultiLayerEagleWorker(TpModelWorker):
     @property
     def draft_runner_list(self) -> List[ModelRunner]:
         return self.model_runner_list
+
+    @property
+    def draft_runner(self) -> ModelRunner:
+        # Canonical "primary" runner expected by `EagleDraftInput` shape classmethods.
+        return self.model_runner_list[0]
+
+    @property
+    def draft_worker(self) -> DraftExecutor:
+        # V1 monolithic: this worker is both coordinator and draft executor.
+        return self
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run speculative decoding forward.

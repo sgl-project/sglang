@@ -37,6 +37,7 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
+from sglang.srt.speculative.base_spec_worker import DraftExecutor, SpecCoordinator
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -87,7 +88,7 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
-class EAGLEWorker(TpModelWorker):
+class EAGLEWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
 
     def __init__(
         self,
@@ -438,6 +439,11 @@ class EAGLEWorker(TpModelWorker):
     @property
     def draft_runner(self):
         return self.model_runner
+
+    @property
+    def draft_worker(self) -> DraftExecutor:
+        # V1 monolithic: this worker is both coordinator and draft executor.
+        return self
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run speculative decoding forward.

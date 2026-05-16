@@ -147,8 +147,18 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Alias for better readability
         self.draft_runner_list: List[ModelRunner] = self.draft_worker.model_runner_list
         # `draft_runner` (single) is the canonical shape entry expected by the
-        # `EagleDraftInput` shape classmethods in eagle_info.py.
-        self.draft_runner: ModelRunner = self.draft_runner_list[0]
+        # `EagleDraftInput` shape classmethods in eagle_info.py. Backed by
+        # `_draft_runner` because `DraftExecutor` declares it as abstract @property.
+        self._draft_runner: ModelRunner = self.draft_runner_list[0]
+
+        self.eagle_use_aux_hidden_state = False
+        if self.speculative_algorithm.is_eagle3():
+            eagle_config = getattr(
+                self.draft_runner.model_config.hf_config, "eagle_config", {}
+            )
+            self.eagle_use_aux_hidden_state = eagle_config.get(
+                "use_aux_hidden_state", True
+            )
 
         # Chain-style MTP: each step propagates its own output hidden states to the
         # next step.  Non-chain: each step uses the target model's hidden states.
@@ -187,6 +197,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    @property
+    def draft_runner(self) -> ModelRunner:
+        return self._draft_runner
 
     def mtp_model_runner(self, step: int):
         return self.draft_runner_list[step]

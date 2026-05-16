@@ -43,6 +43,7 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.base_spec_worker import DraftExecutor, SpecCoordinator
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
@@ -78,7 +79,7 @@ from sglang.srt.utils import empty_context
 logger = logging.getLogger(__name__)
 
 
-class FrozenKVMTPWorker(TpModelWorker):
+class FrozenKVMTPWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
     """Frozen-KV MTP worker; same constructor shape as EAGLEWorker. Entry:
     :meth:`forward_batch_generation` (stubs for now).
     """
@@ -106,6 +107,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # Frozen-KV MTP runs DSv4-style MTP, not EAGLE3; no aux hidden states.
+        self.eagle_use_aux_hidden_state = False
         assert self.speculative_algorithm.is_frozen_kv_mtp(), (
             "FrozenKVMTPWorker should only be instantiated for "
             "SpeculativeAlgorithm.FROZEN_KV_MTP, got "
@@ -173,8 +176,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
 
-        self.draft_attn_backend = self._init_draft_attn_backend()
-        self.draft_runner.draft_attn_backend = self.draft_attn_backend
+        self.init_attention_backend()
         self.cuda_graph_runner = None
 
         with (
@@ -187,6 +189,11 @@ class FrozenKVMTPWorker(TpModelWorker):
     @property
     def draft_runner(self):
         return self.model_runner
+
+    @property
+    def draft_worker(self) -> DraftExecutor:
+        # V1 monolithic: this worker is both coordinator and draft executor.
+        return self
 
     def get_attn_backend(self):  # pragma: no cover - exposed for adaptive
         return self.draft_attn_backend
@@ -201,17 +208,18 @@ class FrozenKVMTPWorker(TpModelWorker):
             or self.server_args.attention_backend
         )
 
-    def _init_draft_attn_backend(self):
+    def init_attention_backend(self):
         if self.topk == 1:
-            return self.draft_runner.attn_backend
-
-        backend_type = self._resolve_draft_backend_type()
-        if backend_type != "triton":
-            raise ValueError(
-                "Frozen-KV MTP topk > 1 currently supports only the triton "
-                f"attention backend, got {backend_type}."
-            )
-        return self._init_triton_draft_attn_backend()
+            self.draft_attn_backend = self.draft_runner.attn_backend
+        else:
+            backend_type = self._resolve_draft_backend_type()
+            if backend_type != "triton":
+                raise ValueError(
+                    "Frozen-KV MTP topk > 1 currently supports only the triton "
+                    f"attention backend, got {backend_type}."
+                )
+            self.draft_attn_backend = self._init_triton_draft_attn_backend()
+        self.draft_runner.draft_attn_backend = self.draft_attn_backend
 
     def _init_triton_draft_attn_backend(self):
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
