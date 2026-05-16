@@ -65,10 +65,6 @@ class MoeA2ABackend(Enum):
         return self == MoeA2ABackend.CUSTOMIZED
 
     def supports_aiter(self) -> bool:
-        # a2a backends for which register_pre_permute("<dispatch_format>", "aiter")
-        # and register_post_permute("aiter", "<dispatch_format>") are registered in
-        # sglang.srt.layers.moe.moe_runner.aiter. "none" maps to "standard" format;
-        # deepep/mooncake/nixl/mori map to the "deepep_normal"/"deepep_ll" formats.
         return self in (
             MoeA2ABackend.NONE,
             MoeA2ABackend.DEEPEP,
