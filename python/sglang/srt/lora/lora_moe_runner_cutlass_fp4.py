@@ -99,7 +99,14 @@ class CutlassFp4LoraRunnerCore:
         E = quant_info.num_local_experts
         K = quant_info.hidden_size
         inter = quant_info.intermediate_size_per_partition
-        N = inter * 2  # w13 output dim (gate|up concatenated)
+        # This LoRA runner injects between the gate/up projection and the
+        # SwiGLU activation, so it only supports gated MoE weights.
+        N = quant_info.w13_weight.shape[1]
+        if N != inter * 2:
+            raise NotImplementedError(
+                "CutlassFp4LoraRunnerCore expects gated NVFP4 MoE weights with "
+                f"w13 output dim {inter * 2}, but got {N}."
+            )
         params = quant_info.cutlass_moe_params
         offsets = params.expert_offsets
         total_tokens = m_a * num_topk
@@ -110,7 +117,7 @@ class CutlassFp4LoraRunnerCore:
         local_ids = topk_ids.to(torch.int32) - local_offset
         non_local = (local_ids < 0) | (local_ids >= E)
         local_ids = local_ids.masked_fill(non_local, 0)
-        local_weights = topk_weights.masked_fill(non_local, 0.0)
+        local_weights = topk_weights.to(torch.float32).masked_fill(non_local, 0.0)
 
         a_map = torch.empty(total_tokens, dtype=torch.int32, device=device)
         c_map = torch.empty(total_tokens, dtype=torch.int32, device=device)
@@ -158,6 +165,8 @@ class CutlassFp4LoraRunnerCore:
             hooks.after_gate_up(hidden_states, gateup_3d, topk_weights, topk_ids)
 
         # ---- silu + mul
+        # ``w13_swap_halves=True`` selects the ``[up | gate]`` convention
+        # (silu(second) * first) for FlashInfer-CUTLASS NVFP4 W13 loaders.
         intermediate = torch.empty(total_tokens, N // 2, dtype=out_dtype, device=device)
         silu_and_mul(gateup_flat, intermediate, swap_halves=quant_info.w13_swap_halves)
 

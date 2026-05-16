@@ -658,6 +658,7 @@ def _fused_moe_lora_shrink_fake(
     num_warps: int,
     num_stages: int,
     split_k: int,
+    top_k_divisor: int = None,
     mul_routed_weight: bool = False,
     c_map: torch.Tensor | None = None,
     input_is_sorted: bool = False,

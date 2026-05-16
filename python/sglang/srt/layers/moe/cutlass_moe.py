@@ -432,6 +432,8 @@ def cutlass_moe_fp4(
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid input dtype"
 
     out_dtype = a.dtype
+    topk_ids = topk_ids.to(torch.int32)
+    topk_weights = topk_weights.to(torch.float32)
     num_topk = topk_ids.shape[1]
     device = a.device
     a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
