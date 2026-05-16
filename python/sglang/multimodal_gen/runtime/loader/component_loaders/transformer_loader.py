@@ -60,8 +60,7 @@ def _server_args_for_transformer_component(
 def _has_merged_param_mapping(model_cls: type[torch.nn.Module]) -> bool:
     param_names_mapping = getattr(model_cls, "param_names_mapping", {})
     return any(
-        isinstance(replacement, tuple)
-        for replacement in param_names_mapping.values()
+        isinstance(replacement, tuple) for replacement in param_names_mapping.values()
     )
 
 
