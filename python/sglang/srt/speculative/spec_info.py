@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+    from sglang.srt.speculative.base_spec_worker import SpecCoordinator
 
 
 class SpeculativeAlgorithm(Enum):
@@ -136,7 +136,7 @@ class SpeculativeAlgorithm(Enum):
 
     def create_worker(
         self, server_args: ServerArgs
-    ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker]]]:
+    ) -> Optional[Union[Type[SpecCoordinator], Type[TpModelWorker]]]:
         """Dispatch the spec-decoding worker class for this algorithm.
 
         EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER_EAGLE use the unified V2

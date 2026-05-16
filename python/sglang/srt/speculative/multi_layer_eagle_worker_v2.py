@@ -34,8 +34,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import (
-    BaseDraftWorker,
-    BaseSpecWorker,
+    DraftExecutor,
+    SpecCoordinator,
     SpecResourceContext,
 )
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -80,7 +80,7 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
-class MultiLayerEagleDraftWorker(BaseDraftWorker):
+class MultiLayerEagleDraftWorker(DraftExecutor):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -617,7 +617,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         )
 
 
-class MultiLayerEagleWorkerV2(BaseSpecWorker):
+class MultiLayerEagleWorkerV2(SpecCoordinator):
     def __init__(
         self,
         server_args: ServerArgs,

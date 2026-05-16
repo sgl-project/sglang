@@ -38,8 +38,8 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     SpecRuntimeState,
 )
 from sglang.srt.speculative.base_spec_worker import (
-    BaseDraftWorker,
-    BaseSpecWorker,
+    DraftExecutor,
+    SpecCoordinator,
     SpecResourceContext,
 )
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -100,7 +100,7 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
-class EagleDraftWorker(BaseDraftWorker):
+class EagleDraftWorker(DraftExecutor):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -652,7 +652,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
 
-class EAGLEWorkerV2(BaseSpecWorker):
+class EAGLEWorkerV2(SpecCoordinator):
     def __init__(
         self,
         server_args: ServerArgs,

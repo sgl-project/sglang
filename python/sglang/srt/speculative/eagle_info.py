@@ -228,7 +228,7 @@ class EagleVerifyInput(SpecInput):
     ) -> torch.Tensor:
         """
         Sample tokens, run tree acceptance, and allocate cache slots for the
-        accepted slice. dataclass-level counterpart of `EAGLEWorker.verify`
+        accepted slice. dataclass-level counterpart of `EAGLEWorkerV2.verify`
         (which is the worker-level end-to-end entry, including target forward).
 
         WARNING: This API in-place modifies the states of logits_output

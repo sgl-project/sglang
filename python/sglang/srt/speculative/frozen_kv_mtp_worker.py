@@ -83,8 +83,8 @@ logger = logging.getLogger(__name__)
 
 
 class FrozenKVMTPWorker(TpModelWorker, DraftExecutor, SpecCoordinator):
-    """Frozen-KV MTP worker; same constructor shape as EAGLEWorker. Entry:
-    :meth:`forward_batch_generation` (stubs for now).
+    """Frozen-KV MTP worker; monolithic (coordinator + draft executor) since
+    no V2 form exists yet. Entry: :meth:`forward_batch_generation`.
     """
 
     def __init__(

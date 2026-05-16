@@ -74,16 +74,17 @@ class SpecResourceContext:
 class DraftExecutor(ABC):
     """Contract for the draft-execution layer of speculative decoding.
 
-    Implementations either run the draft model on `self` (V1 monolithic
-    `EAGLEWorker(TpModelWorker, DraftExecutor)`) or wrap an inner draft
-    `TpModelWorker` (V2 `EagleDraftWorker`). `draft_runner` is the canonical
-    accessor; shape classmethods on `EagleDraftInput` / `EagleDraftExtendInput`
-    read it directly.
+    Implementations wrap an inner draft `TpModelWorker` and expose its
+    `ModelRunner` via the canonical `draft_runner` accessor; shape classmethods
+    on `EagleDraftInput` / `EagleDraftExtendInput` read it directly.
+    Algorithms with no draft model (e.g. NGRAM) use `NullDraftExecutor`,
+    whose `draft_runner` is `None`.
 
     The `_ctx` field is the single source of truth for shared config; the
     properties below forward to it. Properties cover only attributes that
-    `TpModelWorker.__init__` does *not* itself set (otherwise V1 workers
-    would fail at `super().__init__()` because the property has no setter).
+    `TpModelWorker.__init__` does *not* itself set (otherwise workers that
+    delegate to an inner `TpModelWorker` could see instance-level writes
+    rejected by the property if it has no setter).
     `eagle_use_aux_hidden_state` stays an instance attribute because it is
     derived later, after the draft model is loaded.
     """
@@ -112,7 +113,7 @@ class DraftExecutor(ABC):
     @speculative_num_steps.setter
     def speculative_num_steps(self, value: int) -> None:
         # Adaptive controller temporarily overrides this during cuda graph
-        # capture (see `_override_worker_state` in V1 / `_AdaptiveSnapshot` in V2).
+        # capture (see `apply_runtime_state` in V2 workers).
         self._ctx.speculative_num_steps = value
 
     @property
@@ -142,10 +143,8 @@ class DraftExecutor(ABC):
 
     # NOTE: V2 draft executors (`EagleDraftWorker`, `MultiLayerEagleDraftWorker`)
     # additionally expose `draft(...)` and `draft_extend(...)` as their per-phase
-    # entry points. V1 monolithic workers (`EAGLEWorker` & subclasses) drive both
-    # phases internally from `forward_batch_generation`; they do not expose those
-    # methods. Formalizing the per-phase signature is left to a later step where
-    # V1 is split into coordinator + executor.
+    # entry points. Formalizing those signatures on the ABC is left to a later
+    # step once the input type is unified.
 
 
 class NullDraftExecutor(DraftExecutor):
@@ -173,10 +172,6 @@ class NullDraftExecutor(DraftExecutor):
 
     def init_cuda_graphs(self) -> None:
         pass
-
-
-# Backward-compat alias; existing V2 subclasses continue to inherit through this name.
-BaseDraftWorker = DraftExecutor
 
 
 class SpecCoordinator(ABC):
@@ -244,10 +239,7 @@ class SpecCoordinator(ABC):
         pass
 
     # NOTE: `forward_batch_generation(...)` is the pipeline entry point but its
-    # signature is split (`ScheduleBatch` on V1 / `NGRAM`, `ModelWorkerBatch` on
-    # V2 / DFlash). Formalizing it as abstract is left to a later step that
-    # unifies the input type.
-
-
-# Backward-compat alias; pre-existing call sites keep working.
-BaseSpecWorker = SpecCoordinator
+    # signature is split (`ScheduleBatch` on V1 NGRAM / FROZEN_KV_MTP /
+    # DFLASH, `ModelWorkerBatch` on V2 EAGLE / STANDALONE / MULTI_LAYER).
+    # Formalizing it as abstract is left to a later step that unifies the input
+    # type.
