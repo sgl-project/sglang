@@ -1,4 +1,6 @@
-"""Memory-aware ordering for pipeline component weight loads.
+"""Memory-aware ordering for pipeline component weight loads to avoid OOM while loading.
+
+Load the VRAM-intensive components earlier than others
 
 The pipeline owns component selection, path resolution, and actual loading; this
 module only ranks already-selected load specs.
@@ -122,7 +124,7 @@ def _list_component_safetensors_files(component_model_path: str) -> list[str]:
 
 
 def infer_component_weight_size_bytes(component_model_path: str) -> int | None:
-    """Infer checkpoint payload size without materializing tensors."""
+    """Infer checkpoint payload size from safetensors without materializing tensors."""
     safetensors_files = _list_component_safetensors_files(component_model_path)
     if safetensors_files:
         sizes = [
@@ -162,7 +164,9 @@ def order_component_load_specs(
     return sorted(
         component_specs,
         key=lambda spec: (
+            # 1. model size inferred from checkpoints
             -(infer_component_weight_size_bytes(spec.component_model_path) or 0),
+            # 2. infer from component name
             component_load_risk_rank(spec.load_module_name),
             _component_variant_priority(spec.load_module_name),
             spec.index,

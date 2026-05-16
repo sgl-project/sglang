@@ -75,7 +75,6 @@ class ComponentResidencyStrategy:
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        """hook called"""
         self.enter(module)
 
     def wait_for_use(

@@ -432,6 +432,7 @@ class ComposedPipelineBase(ABC):
                 )
             )
 
+        # reorder loading order to avoid OOM
         component_load_specs = order_component_load_specs(component_load_specs)
         logger.info(
             "Memory-aware component load order: %s",
