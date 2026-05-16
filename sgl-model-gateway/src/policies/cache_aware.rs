@@ -464,104 +464,73 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
-    #[tokio::test]
-    async fn test_cache_aware_with_balanced_load() {
-        // Create policy without eviction thread for testing
-        let config = CacheAwareConfig {
-            eviction_interval_secs: 0, // Disable eviction thread
+    /// Build a CacheAwarePolicy with the eviction thread disabled — the
+    /// standard setup for in-process tests.
+    fn test_policy() -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
             ..Default::default()
-        };
-        let policy = CacheAwarePolicy::with_config(config);
-        let workers: Vec<Arc<dyn Worker>> = vec![
+        })
+    }
+
+    /// Build two regular HTTP workers at the canonical `http://w{1,2}:8000`
+    /// URLs. Used by every cache_aware test that needs the simplest topology.
+    fn two_workers() -> Vec<Arc<dyn Worker>> {
+        vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
                     .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
                     .build(),
             ),
             Arc::new(
                 BasicWorkerBuilder::new("http://w2:8000")
                     .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
                     .build(),
             ),
-        ];
+        ]
+    }
 
-        // Initialize the policy with workers
+    /// Convenience: produce a request info carrying just the prompt text.
+    fn req(text: &str) -> SelectWorkerInfo<'_> {
+        SelectWorkerInfo {
+            request_text: Some(text),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_aware_with_balanced_load() {
+        let policy = test_policy();
+        let workers = two_workers();
         policy.init_workers(&workers);
 
-        // First request should be distributed
         let idx1 = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("hello world"),
-                    ..Default::default()
-                },
-            )
+            .select_worker(&workers, &req("hello world"))
             .await
             .unwrap();
-
-        // Same request should go to same worker (cache hit)
+        // Same request → same worker (cache hit).
         let idx2 = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("hello world"),
-                    ..Default::default()
-                },
-            )
+            .select_worker(&workers, &req("hello world"))
             .await
             .unwrap();
         assert_eq!(idx1, idx2);
-
-        // Similar request should also go to same worker
-        let idx3 = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("hello"),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        // Shorter prefix of the same string → same worker.
+        let idx3 = policy.select_worker(&workers, &req("hello")).await.unwrap();
         assert_eq!(idx1, idx3);
     }
 
     #[tokio::test]
     async fn test_newcomer_wins_when_cache_holder_saturated() {
-        // Cache holder w1 has the prefix but is buried under pending tokens;
+        // Cache holder w1 owns the prefix but is buried under pending tokens;
         // newcomer w2 has no overlap but pending=0. For short input, w2 wins.
-        let config = CacheAwareConfig {
-            eviction_interval_secs: 0,
-            ..Default::default()
-        };
-        let policy = CacheAwarePolicy::with_config(config);
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let policy = test_policy();
+        let workers = two_workers();
         policy.init_workers(&workers);
 
         // Seed the tree so w1 owns "hello world" entirely.
         for _ in 0..3 {
             let idx = policy
-                .select_worker(
-                    &workers,
-                    &SelectWorkerInfo {
-                        request_text: Some("hello world"),
-                        ..Default::default()
-                    },
-                )
+                .select_worker(&workers, &req("hello world"))
                 .await
                 .unwrap();
             assert_eq!(idx, 0);
@@ -575,13 +544,7 @@ mod tests {
 
         // A short prompt: w1's pending dwarfs any cache savings → w2.
         let idx = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("hello world"),
-                    ..Default::default()
-                },
-            )
+            .select_worker(&workers, &req("hello world"))
             .await
             .unwrap();
         assert_eq!(
@@ -592,39 +555,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_holder_wins_when_balanced() {
-        let config = CacheAwareConfig {
-            eviction_interval_secs: 0,
-            ..Default::default()
-        };
-        let policy = CacheAwarePolicy::with_config(config);
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let policy = test_policy();
+        let workers = two_workers();
         policy.init_workers(&workers);
 
-        // First request lands somewhere (deterministic: index 0 ties broken first).
+        // First request lands somewhere; we then pin pending tokens equal
+        // and require subsequent identical-prefix requests to stick.
         let first = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("the quick brown fox"),
-                    ..Default::default()
-                },
-            )
+            .select_worker(&workers, &req("the quick brown fox"))
             .await
             .unwrap();
 
-        // Both workers report identical pending. The cache holder should win
-        // any subsequent identical-prefix request.
         let mut loads = std::collections::HashMap::new();
         loads.insert("http://w1:8000".to_string(), 10);
         loads.insert("http://w2:8000".to_string(), 10);
@@ -632,13 +573,7 @@ mod tests {
 
         for _ in 0..3 {
             let idx = policy
-                .select_worker(
-                    &workers,
-                    &SelectWorkerInfo {
-                        request_text: Some("the quick brown fox"),
-                        ..Default::default()
-                    },
-                )
+                .select_worker(&workers, &req("the quick brown fox"))
                 .await
                 .unwrap();
             assert_eq!(
@@ -650,46 +585,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_pending_tokens_default_zero_for_unknown_worker() {
-        // No update_loads call has happened yet; both workers should be
-        // treated as pending=0 and the tie should break the same way every
-        // call (longest-prefix tenant wins).
-        let config = CacheAwareConfig {
-            eviction_interval_secs: 0,
-            ..Default::default()
-        };
-        let policy = CacheAwarePolicy::with_config(config);
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        // No update_loads call has happened yet; both workers are pending=0
+        // and the tie must break the same way every call (longest-prefix wins).
+        let policy = test_policy();
+        let workers = two_workers();
         policy.init_workers(&workers);
 
         let first = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("alpha beta"),
-                    ..Default::default()
-                },
-            )
+            .select_worker(&workers, &req("alpha beta"))
             .await
             .unwrap();
         let second = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("alpha beta"),
-                    ..Default::default()
-                },
-            )
+            .select_worker(&workers, &req("alpha beta"))
             .await
             .unwrap();
         assert_eq!(first, second);
@@ -699,23 +606,8 @@ mod tests {
     async fn test_failed_load_probe_treated_as_zero() {
         // LoadMonitor reports w1 with -1 (probe failed) — must not cause w1
         // to be permanently preferred-or-excluded; we treat -1 as 0.
-        let config = CacheAwareConfig {
-            eviction_interval_secs: 0,
-            ..Default::default()
-        };
-        let policy = CacheAwarePolicy::with_config(config);
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
+        let policy = test_policy();
+        let workers = two_workers();
         policy.init_workers(&workers);
 
         let mut loads = std::collections::HashMap::new();
@@ -725,13 +617,7 @@ mod tests {
 
         // w1 (treated as 0) should beat w2 (500) for a fresh prompt.
         let idx = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("never seen before"),
-                    ..Default::default()
-                },
-            )
+            .select_worker(&workers, &req("never seen before"))
             .await
             .unwrap();
         assert_eq!(idx, 0);
@@ -739,61 +625,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_aware_worker_removal() {
-        let config = CacheAwareConfig {
-            eviction_interval_secs: 0, // Disable eviction thread
-            ..Default::default()
-        };
-        let policy = CacheAwarePolicy::with_config(config);
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .build(),
-            ),
-        ];
-
+        let policy = test_policy();
+        let workers = two_workers();
         policy.init_workers(&workers);
 
-        // Route some requests
-        policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("test1"),
-                    ..Default::default()
-                },
-            )
-            .await;
-        policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("test2"),
-                    ..Default::default()
-                },
-            )
-            .await;
+        policy.select_worker(&workers, &req("test1")).await;
+        policy.select_worker(&workers, &req("test2")).await;
 
-        // Remove a worker
         policy.remove_worker_by_url("http://w1:8000");
         workers[0].set_healthy(false);
 
-        // All requests should now go to worker2
-        let idx = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some("test1"),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        // w1 is gone + unhealthy; all traffic must land on w2.
+        let idx = policy.select_worker(&workers, &req("test1")).await.unwrap();
         assert_eq!(idx, 1);
     }
 
