@@ -14,13 +14,25 @@ import logging
 import pkgutil
 from importlib.metadata import entry_points
 
+import torch
+
 from sglang.srt.environ import envs
+from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 
 logger = logging.getLogger(__name__)
 
 _current_platform: SRTPlatform | None = None
+
+
+def _is_cuda_available() -> bool:
+    return bool(torch.cuda.is_available() and torch.version.hip is None)
+
+
+def _is_rocm_available() -> bool:
+    return bool(torch.cuda.is_available() and torch.version.hip is not None)
 
 
 def _resolve_platform() -> SRTPlatform:
@@ -39,7 +51,9 @@ def _resolve_platform() -> SRTPlatform:
 
        SGLANG_PLATFORM unset (auto-discover):
          - Import and activate all discovered plugins
-         - 0 activated → fallback base SRTPlatform
+         - 0 activated + CUDA available → fallback CudaSRTPlatform
+         - 0 activated + ROCm available → fallback RocmSRTPlatform
+         - 0 activated + neither → fallback base SRTPlatform
          - 1 activated → use it
          - N activated → RuntimeError (must set SGLANG_PLATFORM)
 
@@ -90,7 +104,17 @@ def _resolve_platform() -> SRTPlatform:
             logger.exception("Failed to activate platform plugin: %s", name)
 
     if len(activated) == 0:
-        logger.debug("No platform detected. Using base SRTPlatform with defaults.")
+        if _is_cuda_available():
+            logger.debug(
+                "No platform plugin detected. Using CUDA SRTPlatform defaults."
+            )
+            return CudaSRTPlatform()
+        if _is_rocm_available():
+            logger.debug(
+                "No platform plugin detected. Using ROCm SRTPlatform defaults."
+            )
+            return RocmSRTPlatform()
+        logger.debug("No platform detected. Using base SRTPlatform.")
         return SRTPlatform()
 
     if len(activated) == 1:

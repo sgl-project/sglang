@@ -83,7 +83,7 @@ impl MockWorker {
             .route("/health", get(health_handler))
             .route("/health_generate", get(health_generate_handler))
             .route("/server_info", get(server_info_handler))
-            .route("/get_model_info", get(model_info_handler))
+            .route("/model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))

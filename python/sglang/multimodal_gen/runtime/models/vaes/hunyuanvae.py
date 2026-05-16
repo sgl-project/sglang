@@ -22,8 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.triton.group_norm_silu import triton_group_norm_silu
-from sglang.multimodal_gen import envs
+from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
 from sglang.multimodal_gen.configs.models.vaes import HunyuanVAEConfig
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
@@ -44,26 +43,6 @@ def prepare_causal_attention_mask(
     if batch_size is not None:
         mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
     return mask
-
-
-def _apply_hunyuan_group_norm_silu(
-    hidden_states: torch.Tensor,
-    norm: nn.GroupNorm,
-    activation: nn.Module,
-) -> torch.Tensor:
-    if (
-        envs.SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU
-        and isinstance(activation, nn.SiLU)
-        and norm.affine
-    ):
-        return triton_group_norm_silu(
-            hidden_states,
-            norm.weight,
-            norm.bias,
-            num_groups=norm.num_groups,
-            eps=norm.eps,
-        )
-    return activation(norm(hidden_states))
 
 
 class HunyuanVAEAttention(nn.Module):
@@ -280,12 +259,12 @@ class HunyuanVideoResnetBlockCausal3D(nn.Module):
         hidden_states = hidden_states.contiguous()
         residual = hidden_states
 
-        hidden_states = _apply_hunyuan_group_norm_silu(
+        hidden_states = apply_group_norm_silu(
             hidden_states, self.norm1, self.nonlinearity
         )
         hidden_states = self.conv1(hidden_states)
 
-        hidden_states = _apply_hunyuan_group_norm_silu(
+        hidden_states = apply_group_norm_silu(
             hidden_states, self.norm2, self.nonlinearity
         )
         hidden_states = self.dropout(hidden_states)
@@ -655,8 +634,9 @@ class HunyuanVideoEncoder3D(nn.Module):
             assert self.mid_block is not None
             hidden_states = self.mid_block(hidden_states)
 
-        hidden_states = self.conv_norm_out(hidden_states)
-        hidden_states = self.conv_act(hidden_states)
+        hidden_states = apply_group_norm_silu(
+            hidden_states, self.conv_norm_out, self.conv_act
+        )
         hidden_states = self.conv_out(hidden_states)
 
         return hidden_states
@@ -777,8 +757,9 @@ class HunyuanVideoDecoder3D(nn.Module):
                 hidden_states = up_block(hidden_states)
 
         # post-process
-        hidden_states = self.conv_norm_out(hidden_states)
-        hidden_states = self.conv_act(hidden_states)
+        hidden_states = apply_group_norm_silu(
+            hidden_states, self.conv_norm_out, self.conv_act
+        )
         hidden_states = self.conv_out(hidden_states)
 
         return hidden_states

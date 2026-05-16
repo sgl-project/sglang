@@ -26,10 +26,13 @@ Method status annotations:
 """
 
 import enum
-from typing import TYPE_CHECKING, NamedTuple, Optional
+import random
+from typing import NamedTuple, Optional
 
-if TYPE_CHECKING:
-    import torch
+import numpy as np
+import torch
+
+from sglang.srt.environ import envs
 
 
 class PlatformEnum(enum.Enum):
@@ -83,7 +86,7 @@ _DEVICE_TO_DISTRIBUTED_BACKEND: dict[str, str] = {
     "xpu": "xccl",
     "hpu": "hccl",
     "cpu": "gloo",
-    "npu": "hccl",
+    "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
     "musa": "mccl",
 }
 
@@ -218,19 +221,12 @@ class DeviceMixin:
     @classmethod
     def inference_mode(cls):
         """[Planned] Return inference mode context manager."""
-        import torch
-
         return torch.inference_mode(mode=True)
 
     @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:
         """[Planned] Set random seeds for reproducibility across all libraries."""
         if seed is not None:
-            import random
-
-            import numpy as np
-            import torch
-
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)

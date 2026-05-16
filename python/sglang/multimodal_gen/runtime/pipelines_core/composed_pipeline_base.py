@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
 )
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    component_attn_backend_context_manager,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
@@ -411,13 +414,27 @@ class ComposedPipelineBase(ABC):
             component_model_path = self._resolve_component_path(
                 server_args, module_name, load_module_name
             )
-            module, memory_usage = PipelineComponentLoader.load_component(
-                component_name=load_module_name,
-                component_model_path=component_model_path,
-                transformers_or_diffusers=transformers_or_diffusers,
-                server_args=server_args,
-                component_architecture=architecture,
+            attn_backend, matched_backend_key = (
+                server_args.resolve_component_attention_backend(
+                    module_name, load_module_name
+                )
             )
+            if attn_backend is not None:
+                logger.info(
+                    "Using %s backend for component: %s",
+                    attn_backend.name.lower(),
+                    matched_backend_key,
+                )
+            with component_attn_backend_context_manager(
+                attn_backend, component_name=matched_backend_key or module_name
+            ):
+                module, memory_usage = PipelineComponentLoader.load_component(
+                    component_name=load_module_name,
+                    component_model_path=component_model_path,
+                    transformers_or_diffusers=transformers_or_diffusers,
+                    server_args=server_args,
+                    component_architecture=architecture,
+                )
 
             self.memory_usages[load_module_name] = memory_usage
 

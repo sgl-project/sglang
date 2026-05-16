@@ -191,7 +191,12 @@ class LoRAManager:
         """
         if lora_config.lora_added_tokens_size > 0:
             raise ValueError(
-                f"LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
+                f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support adapters that add tokens to the vocabulary"
+            )
+
+        if lora_config.use_dora:
+            raise ValueError(
+                f"Failed to load {lora_ref.lora_name} because LoRA serving currently doesn't support DoRA adapters"
             )
 
         # Check if this LoRA adapter is already loaded
