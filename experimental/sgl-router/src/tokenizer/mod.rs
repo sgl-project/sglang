@@ -92,6 +92,41 @@ mod tests {
         assert_eq!(text, "hello world");
     }
 
+    /// Forces `decode_complete` through its `DecodeResult::Partial` branch.
+    ///
+    /// Strategy A: the fixture is a GPT-2 byte-level BPE. The 4-byte UTF-8
+    /// emoji `😀` (`\xF0\x9F\x98\x80`) encodes into 2 byte-level BPE tokens
+    /// with this fixture: `[47249, 222]`. Decoding just the first token
+    /// yields a leading-bytes-only prefix that the HF adapter passes through
+    /// `String::from_utf8_lossy`, producing a trailing U+FFFD. dynamo's
+    /// `DecodeResult::from_decoded` then classifies that as `Partial`.
+    /// Pinning the literal token id keeps the test deterministic — if the
+    /// fixture or upstream BPE merges ever shift, this fails loudly rather
+    /// than silently dropping back into `Complete` and losing coverage.
+    #[test]
+    fn decode_complete_returns_string_on_partial_utf8() {
+        let r = TokenizerRegistry::load_from_config(&cfg()).unwrap();
+        let t = r.get("tiny").unwrap();
+
+        // Sanity-check that the fixture still tokenises `😀` the way we
+        // expect; if upstream changes this we want a loud failure here.
+        let full = adapter::encode(&t, "😀").unwrap();
+        assert_eq!(
+            full,
+            vec![47249, 222],
+            "fixture tokenisation drift: '😀' no longer encodes to [47249, 222]"
+        );
+
+        // Feed only the first token — its bytes are the leading 3 of a
+        // 4-byte UTF-8 codepoint, which is incomplete.
+        let s = adapter::decode_complete(&t, &full[..1], false).unwrap();
+
+        // We pin the exact output: the lossy decoder folds the 3 leading
+        // bytes into a single U+FFFD. Anything else (empty string, Err, or
+        // the original bytes) would be a regression.
+        assert_eq!(s, "\u{FFFD}");
+    }
+
     #[test]
     fn missing_file_errors() {
         let mut c = cfg();
