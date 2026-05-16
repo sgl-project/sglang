@@ -12,10 +12,20 @@ from sglang.multimodal_gen.configs.models.encoders import (
     ImageEncoderConfig,
     TextEncoderConfig,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
-class TextEncoder(nn.Module, ABC):
+class TextEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_default_enabled = False
+    layer_names = [
+        "layers",
+        "encoder.block",
+        "text_model.encoder.layers",
+        "model.language_model.layers",
+    ]
     _fsdp_shard_conditions: list = field(default_factory=lambda: [])
     _stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
     _supported_attention_backends: set[AttentionBackendEnum] = (
@@ -49,7 +59,13 @@ class TextEncoder(nn.Module, ABC):
         return self._supported_attention_backends
 
 
-class ImageEncoder(nn.Module, ABC):
+class ImageEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_default_enabled = False
+    layer_names = [
+        "layers",
+        "vision_model.encoder.layers",
+        "model.visual.blocks",
+    ]
     _supported_attention_backends: set[AttentionBackendEnum] = (
         ImageEncoderConfig()._supported_attention_backends
     )

@@ -49,7 +49,7 @@ class FutureMap:
         chunked_prefill_size: int,
         context_len: int,
         device: torch.device,
-        spec_algo: Optional[SpeculativeAlgorithm] = None,
+        spec_algo: SpeculativeAlgorithm,
     ):
         # FIXME: the calculation of future_limit and future_buffer_len maybe too conservative
         self.future_ct = 0
