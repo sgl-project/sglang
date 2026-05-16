@@ -1700,7 +1700,13 @@ Increase `--worker-startup-timeout-secs` or ensure health probes respond before 
 
 ### Load Imbalance / Hot Workers
 
-Inspect `smg_router_requests_total` by worker and tune cache-aware thresholds (`--balance-*`, `--cache-threshold`).
+Inspect `smg_router_requests_total` by worker. The `cache_aware` policy now scores
+each worker by `pending_tokens + miss_chars` (pending tokens come from `/v1/loads`,
+miss chars from the gateway's approximate prefix tree). To shift traffic off a hot
+cache holder more aggressively, increase `LoadMonitor`'s polling cadence so pending
+tokens are refreshed faster, or scale out replicas. The legacy threshold knobs
+(`--balance-*`, `--cache-threshold`) remain accepted for backward compatibility
+but no longer affect routing decisions.
 
 ### Circuit Breaker Flapping
 

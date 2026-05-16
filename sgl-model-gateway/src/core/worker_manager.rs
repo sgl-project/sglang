@@ -192,7 +192,8 @@ impl WorkerManager {
 
         // Group workers by base URL so we issue at most one /v1/loads request per
         // engine process even when N DPAwareWorker entries share the same backend.
-        let mut groups: HashMap<String, (Option<String>, Vec<Arc<dyn Worker>>)> = HashMap::new();
+        type WorkerGroup = (Option<String>, Vec<Arc<dyn Worker>>);
+        let mut groups: HashMap<String, WorkerGroup> = HashMap::new();
         for worker in &workers {
             if !matches!(worker.connection_mode(), ConnectionMode::Http) {
                 continue;

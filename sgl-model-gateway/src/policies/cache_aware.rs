@@ -412,9 +412,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             })
             .copied();
 
-        let Some(idx) = scored_idx else {
-            return None;
-        };
+        let idx = scored_idx?;
 
         // Update gateway-side tree + mesh with this request (skip if model
         // had no tree yet — caller may not have init'd one for this model).
@@ -586,7 +584,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(idx, 1, "saturated cache holder should lose to idle newcomer");
+        assert_eq!(
+            idx, 1,
+            "saturated cache holder should lose to idle newcomer"
+        );
     }
 
     #[tokio::test]
@@ -640,7 +641,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(idx, first, "cache affinity should win when pending is equal");
+            assert_eq!(
+                idx, first,
+                "cache affinity should win when pending is equal"
+            );
         }
     }
 
