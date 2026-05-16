@@ -4,15 +4,11 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 # Cross encoder model tests
 
-
-register_cuda_ci(est_time=125, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd")
 
 MODELS = [
     ("cross-encoder/ms-marco-MiniLM-L6-v2", 1, 1e-2),

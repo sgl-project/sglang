@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=300, stage="stage-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=300, stage="base-c", runner_config="8-gpu-h20")
 
 
 def _has_nixl():
