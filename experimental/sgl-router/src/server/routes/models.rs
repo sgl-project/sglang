@@ -79,5 +79,11 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["qwen3", "deepseek"]);
         assert_eq!(v["data"][0]["object"], "model");
+        // Pin `owned_by` so a refactor that flips the hardcoded value to
+        // "openai" / "" / a typo would fail loudly here. OpenAI clients
+        // expect this field and some (e.g. langchain-openai) treat
+        // `owned_by != "system"` as a meaningful signal.
+        assert_eq!(v["data"][0]["owned_by"], "sglang");
+        assert_eq!(v["data"][1]["owned_by"], "sglang");
     }
 }

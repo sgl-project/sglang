@@ -127,6 +127,59 @@ mod tests {
         assert_eq!(s, "\u{FFFD}");
     }
 
+    /// Concurrent encode against one shared `Arc<Tokenizer>`. Pins that the
+    /// registry's `Arc<Tokenizer>` is `Send + Sync` and that
+    /// `dynamo_tokenizers::Tokenizer::encode` can be called concurrently
+    /// without interior mutability hazards. A regression that wraps
+    /// `Tokenizer` in `RefCell` / `!Sync` data would fail to compile;
+    /// a regression that introduces non-thread-safe internal caches
+    /// would surface as one of the tasks returning wrong ids (caught by
+    /// the per-task assertion against the sequentially-computed
+    /// reference).
+    ///
+    /// Uses a multi-thread runtime + `JoinSet` so the 10 tasks really do
+    /// run in parallel on distinct worker threads — a single-thread
+    /// runtime wouldn't exercise the `Sync` contract.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tokenizer_supports_concurrent_encode() {
+        use tokio::task::JoinSet;
+
+        let r = TokenizerRegistry::load_from_config(&cfg()).unwrap();
+        let t = r.get("tiny").unwrap();
+
+        // Build the reference sequentially — what each task should return.
+        let inputs: Vec<String> = (0..10).map(|i| format!("hello {i}")).collect();
+        let expected: Vec<Vec<u32>> = inputs
+            .iter()
+            .map(|s| adapter::encode(&t, s).unwrap())
+            .collect();
+
+        let mut set = JoinSet::new();
+        for (i, text) in inputs.into_iter().enumerate() {
+            let shared = Arc::clone(&t);
+            set.spawn(async move {
+                let ids = adapter::encode(&shared, &text)
+                    .expect("concurrent encode must not fail");
+                (i, ids)
+            });
+        }
+
+        let mut got: Vec<Option<Vec<u32>>> = vec![None; expected.len()];
+        while let Some(joined) = set.join_next().await {
+            let (i, ids) = joined.expect("task panicked");
+            got[i] = Some(ids);
+        }
+
+        for (i, ids) in got.into_iter().enumerate() {
+            let ids = ids.unwrap_or_else(|| panic!("task {i} did not record a result"));
+            assert_eq!(
+                ids, expected[i],
+                "concurrent encode produced wrong tokens for task {i}; \
+                 sign of a non-thread-safe internal cache regression"
+            );
+        }
+    }
+
     #[test]
     fn missing_file_errors() {
         let mut c = cfg();
