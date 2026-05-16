@@ -29,6 +29,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Regex for non-streaming fallback
         self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+        self.tool_call_unit_regex = re.compile(
+            r"<tool_call>(?P<wrapped>.*?)</tool_call>"
+            r"|(?P<bare><function=.*?</function>|<function=.*$)",
+            re.DOTALL,
+        )
         self.tool_call_function_regex = re.compile(
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
         )
@@ -55,7 +60,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self.current_func_name: Optional[str] = None
 
     def has_tool_call(self, text: str) -> bool:
-        return self.tool_call_start_token in text
+        return self.tool_call_start_token in text or self.tool_call_prefix in text
 
     def _get_arguments_config(
         self, func_name: str, tools: Optional[list[Tool]]
@@ -169,69 +174,78 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
 
+    def _parse_function_blocks(
+        self, tool_content: str, tools: List[Tool], start_tool_idx: int
+    ) -> List[ToolCallItem]:
+        calls = []
+        tool_idx = start_tool_idx
+
+        for func_match in self.tool_call_function_regex.findall(tool_content):
+            func_body = func_match[0] or func_match[1]
+            if ">" not in func_body:
+                continue
+
+            name_end = func_body.index(">")
+            func_name = func_body[:name_end]
+            params_str = func_body[name_end + 1 :]
+
+            param_config = self._get_arguments_config(func_name, tools)
+            parsed_params = {}
+
+            for p_match in self.tool_call_parameter_regex.findall(params_str):
+                if ">" not in p_match:
+                    continue
+                p_idx = p_match.index(">")
+                p_name = p_match[:p_idx]
+                p_val = p_match[p_idx + 1 :]
+                # Remove prefixing and trailing \n
+                if p_val.startswith("\n"):
+                    p_val = p_val[1:]
+                if p_val.endswith("\n"):
+                    p_val = p_val[:-1]
+
+                parsed_params[p_name] = self._convert_param_value(
+                    p_val, p_name, param_config, func_name
+                )
+
+            calls.append(
+                ToolCallItem(
+                    tool_index=tool_idx,
+                    name=func_name,
+                    parameters=json.dumps(parsed_params, ensure_ascii=False),
+                )
+            )
+            tool_idx += 1
+
+        return calls
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-shot parsing for non-streaming scenarios."""
-        if self.tool_call_start_token not in text:
+        if not self.has_tool_call(text):
             return StreamingParseResult(normal_text=text)
 
         calls = []
+        normal_text_chunks = []
+        last_end = 0
         try:
-            # Simple cleanup of the text to find tool calls
-            # Note: This is a simplified regex approach consistent with vLLM
-            raw_tool_calls = self.tool_call_regex.findall(text)
-            if not raw_tool_calls:
-                # Fallback: maybe the whole text is inside the tag or tags are stripped
-                if self.tool_call_prefix in text:
-                    raw_tool_calls = [text]
+            for match in self.tool_call_unit_regex.finditer(text):
+                tool_content = match.group("wrapped") or match.group("bare")
+                parsed_calls = self._parse_function_blocks(
+                    tool_content, tools, len(calls)
+                )
+                if not parsed_calls:
+                    continue
 
-            tool_idx = 0
-            for tool_content in raw_tool_calls:
-                # Find function calls
-                funcs = self.tool_call_function_regex.findall(tool_content)
-                for func_match in funcs:
-                    func_body = func_match[0] or func_match[1]
-                    if ">" not in func_body:
-                        continue
+                normal_text_chunks.append(text[last_end : match.start()])
+                calls.extend(parsed_calls)
+                last_end = match.end()
 
-                    name_end = func_body.index(">")
-                    func_name = func_body[:name_end]
-                    params_str = func_body[name_end + 1 :]
+            if not calls:
+                return StreamingParseResult(normal_text=text)
 
-                    param_config = self._get_arguments_config(func_name, tools)
-                    parsed_params = {}
-
-                    for p_match in self.tool_call_parameter_regex.findall(params_str):
-                        if ">" not in p_match:
-                            continue
-                        p_idx = p_match.index(">")
-                        p_name = p_match[:p_idx]
-                        p_val = p_match[p_idx + 1 :]
-                        # Remove prefixing and trailing \n
-                        if p_val.startswith("\n"):
-                            p_val = p_val[1:]
-                        if p_val.endswith("\n"):
-                            p_val = p_val[:-1]
-
-                        parsed_params[p_name] = self._convert_param_value(
-                            p_val, p_name, param_config, func_name
-                        )
-
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=tool_idx,
-                            name=func_name,
-                            parameters=json.dumps(parsed_params, ensure_ascii=False),
-                        )
-                    )
-                    tool_idx += 1
-
-            # Determine normal text (text before the first tool call)
-            start_idx = text.find(self.tool_call_start_token)
-            if start_idx == -1:
-                start_idx = text.find(self.tool_call_prefix)
-            normal_text = text[:start_idx] if start_idx > 0 else ""
-
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
+            return StreamingParseResult(
+                normal_text="".join(normal_text_chunks), calls=calls
+            )
 
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")

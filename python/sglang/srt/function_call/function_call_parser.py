@@ -26,6 +26,7 @@ from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.multi_format_detector import MultiFormatDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
@@ -58,6 +59,7 @@ class FunctionCallParser:
         "llama3": Llama32Detector,
         "mimo": MiMoDetector,
         "mistral": MistralDetector,
+        "multi_format": MultiFormatDetector,
         "pythonic": PythonicDetector,
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
@@ -71,12 +73,25 @@ class FunctionCallParser:
         "gigachat3": GigaChat3Detector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
+    def __init__(
+        self,
+        tools: List[Tool],
+        tool_call_parser: str,
+        chat_template_kwargs: Optional[Dict] = None,
+    ):
+        import inspect
+
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
-        if detector_class:
-            detector = detector_class()
-        else:
+        if not detector_class:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+
+        # Pass chat_template_kwargs only to detectors whose __init__ accepts it.
+        # All existing detectors take no arguments; only MultiFormatDetector accepts it.
+        params = inspect.signature(detector_class.__init__).parameters
+        if "chat_template_kwargs" in params:
+            detector = detector_class(chat_template_kwargs=chat_template_kwargs)
+        else:
+            detector = detector_class()
 
         self.detector = detector
         self.tools = tools

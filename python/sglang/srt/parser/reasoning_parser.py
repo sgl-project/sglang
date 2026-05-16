@@ -62,7 +62,7 @@ class BaseReasoningFormatDetector:
             return StreamingParseResult(normal_text=text)
 
         # The text is considered to be in a reasoning block.
-        processed_text = text.replace(self.think_start_token, "").strip()
+        processed_text = text.replace(self.think_start_token, "")
 
         if (
             self.think_end_token not in processed_text
@@ -76,7 +76,7 @@ class BaseReasoningFormatDetector:
             ):
                 # Find the first occurrence of tool_start_token and split there
                 tool_idx = processed_text.find(self.tool_start_token)
-                reasoning_text = processed_text[:tool_idx].strip()
+                reasoning_text = processed_text[:tool_idx]
                 # Preserve tool_start_token in normal text
                 normal_text = processed_text[tool_idx:]
                 return StreamingParseResult(
@@ -89,7 +89,7 @@ class BaseReasoningFormatDetector:
         if self.think_end_token in processed_text:
             splits = processed_text.split(self.think_end_token, maxsplit=1)
             reasoning_text = splits[0]
-            normal_text = splits[1].strip()
+            normal_text = splits[1]
 
             return StreamingParseResult(
                 normal_text=normal_text, reasoning_text=reasoning_text
@@ -138,7 +138,7 @@ class BaseReasoningFormatDetector:
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
             return StreamingParseResult(
-                normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
+                normal_text=normal_text, reasoning_text=reasoning_text
             )
 
         # Continue with reasoning content
@@ -477,6 +477,55 @@ class MistralDetector(BaseReasoningFormatDetector):
         )
 
 
+class K2V3Detector(BaseReasoningFormatDetector):
+    """
+    Detector for the K2-v3 model family.
+
+    K2-v3 supports three reasoning effort levels, each using a different
+    think token pair selected via ``reasoning_effort`` in
+    ``chat_template_kwargs``:
+      - high (default): <think> / </think>
+      - medium:         <think_fast> / </think_fast>
+      - low:            <think_faster> / </think_faster>
+
+    The chat template inserts the start token into the prompt, so the
+    generated output typically contains only the end token. Parsing therefore
+    requires forced reasoning mode.
+    """
+
+    _EFFORT_TOKENS: dict = {
+        "high": ("<think>", "</think>"),
+        "medium": ("<think_fast>", "</think_fast>"),
+        "low": ("<think_faster>", "</think_faster>"),
+    }
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        reasoning_effort: str = "high",
+    ):
+        if not force_reasoning:
+            raise ValueError("K2-v3 reasoning parser requires force_reasoning=True")
+
+        effort = reasoning_effort or "high"
+        if effort == "none":
+            effort = "high"
+        start_token, end_token = self._EFFORT_TOKENS.get(
+            effort, self._EFFORT_TOKENS["high"]
+        )
+        super().__init__(
+            start_token,
+            end_token,
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -505,6 +554,7 @@ class ReasoningParser:
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
+        "k2_v3": K2V3Detector,
     }
 
     def __init__(
@@ -542,6 +592,18 @@ class ReasoningParser:
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
+
+        # K2-v3 selects its token pair via reasoning_effort. The OpenAI server
+        # pops reasoning_effort out of chat_template_kwargs and promotes it to
+        # request.reasoning_effort (see serving_chat.py); fall back to the
+        # kwargs dict for callers that bypass that normalization.
+        if model_type.lower() == "k2_v3":
+            effort = (
+                getattr(request, "reasoning_effort", None)
+                or chat_template_kwargs.get("reasoning_effort")
+            )
+            if effort:
+                kwargs["reasoning_effort"] = effort
 
         self.detector = detector_class(**kwargs)
 

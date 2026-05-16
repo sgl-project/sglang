@@ -196,6 +196,25 @@ class TestDeepSeekR1Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "I need to think about this.")
         self.assertEqual(result.normal_text, "The answer is 42.")
 
+    def test_detect_and_parse_preserves_newlines_in_normal_text(self):
+        """Whitespace surrounding normal_text must be preserved (vLLM parity).
+
+        The model commonly emits a newline immediately after </think> and one
+        at the very end of the response.  SGLang previously stripped these,
+        producing "Four" instead of "\nFour\n".
+        """
+        text = "reasoning content\n</think>\nFour\n"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning content\n")
+        self.assertEqual(result.normal_text, "\nFour\n")
+
+    def test_detect_and_parse_preserves_newlines_with_start_token(self):
+        """Same whitespace preservation check when <think> start token is present."""
+        text = "<think>reasoning content\n</think>\nFour\n"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning content\n")
+        self.assertEqual(result.normal_text, "\nFour\n")
+
 
 class TestQwen3Detector(CustomTestCase):
     def setUp(self):
@@ -718,6 +737,43 @@ class TestReasoningParser(CustomTestCase):
 
         self.assertEqual(all_reasoning, "reasoning")
         self.assertEqual(all_normal, "<|tool_calls_section_begin|><|tool_call_begin|>")
+
+
+class TestWhitespaceParityStreamingVsNonStreaming(CustomTestCase):
+    """Streaming and non-streaming paths must produce identical whitespace."""
+
+    def test_normal_text_whitespace_matches_across_paths(self):
+        """Non-streaming and streaming must agree on normal_text when newlines present."""
+        text_with_newlines = "<think>thinking\n</think>\nAnswer\n"
+
+        # Non-streaming
+        parser_ns = ReasoningParser("qwen3", force_reasoning=False)
+        reasoning_ns, normal_ns = parser_ns.parse_non_stream(text_with_newlines)
+
+        # Streaming: feed the same text as a single chunk after the think token
+        parser_s = ReasoningParser("qwen3", force_reasoning=False)
+        r1, _ = parser_s.parse_stream_chunk("<think>")
+        r2, _ = parser_s.parse_stream_chunk("thinking\n")
+        _, normal_s = parser_s.parse_stream_chunk("</think>\nAnswer\n")
+
+        self.assertEqual(normal_ns, "\nAnswer\n")
+        self.assertEqual(normal_ns, normal_s)
+
+    def test_reasoning_text_whitespace_matches_across_paths(self):
+        """Non-streaming and streaming must agree on reasoning_text trailing content."""
+        detector_ns = BaseReasoningFormatDetector(
+            "<think>", "</think>", force_reasoning=True
+        )
+        result_ns = detector_ns.detect_and_parse("thinking\n</think>answer")
+        self.assertEqual(result_ns.reasoning_text, "thinking\n")
+
+        detector_s = BaseReasoningFormatDetector(
+            "<think>", "</think>", force_reasoning=True
+        )
+        detector_s.parse_streaming_increment("thinking\n")
+        result_s = detector_s.parse_streaming_increment("</think>answer")
+        self.assertEqual(result_s.reasoning_text, "")  # flushed on end token
+        self.assertEqual(result_s.normal_text, "answer")
 
 
 class TestIntegrationScenarios(CustomTestCase):

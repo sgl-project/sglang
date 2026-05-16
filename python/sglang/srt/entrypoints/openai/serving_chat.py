@@ -363,7 +363,11 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
-                parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                parser = FunctionCallParser(
+                    request.tools,
+                    self.tool_call_parser,
+                    chat_template_kwargs=getattr(request, "chat_template_kwargs", None),
+                )
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
@@ -1034,6 +1038,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
+                    chat_template_kwargs=getattr(request, "chat_template_kwargs", None),
                 )
 
             # Extract prompt_token_ids if requested
@@ -1172,6 +1177,7 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reason: Dict[str, Any],
         tool_choice: Optional[Union[str, ToolChoice]] = None,
         history_tool_calls_cnt: int = 0,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -1215,7 +1221,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 return ToolCallProcessingResult(None, text, finish_reason)
 
         # Use parser since output is not constrained by JSON schema
-        parser = FunctionCallParser(tools, self.tool_call_parser)
+        parser = FunctionCallParser(
+            tools,
+            self.tool_call_parser,
+            chat_template_kwargs=chat_template_kwargs,
+        )
         if parser.has_tool_call(text):
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
@@ -1378,6 +1388,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 parser_dict[index] = FunctionCallParser(
                     tools=request.tools,
                     tool_call_parser=self.tool_call_parser,
+                    chat_template_kwargs=getattr(request, "chat_template_kwargs", None),
                 )
 
         parser = parser_dict[index]
