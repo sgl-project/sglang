@@ -324,9 +324,9 @@ def _resolve_speculative_algorithm_alias(
 
     is_gemma4_draft = False
     if speculative_draft_model_path:
-        from transformers import AutoConfig
+        from sglang.srt.utils.hf_transformers_utils import get_config
 
-        cfg = AutoConfig.from_pretrained(
+        cfg = get_config(
             speculative_draft_model_path, trust_remote_code=trust_remote_code
         )
         is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
