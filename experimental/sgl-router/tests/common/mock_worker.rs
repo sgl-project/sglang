@@ -160,10 +160,11 @@ impl MockWorker {
         async fn error_handler(
             State(s): State<ErrorState>,
             headers: HeaderMap,
-            _body: Bytes,
+            body: Bytes,
         ) -> Response<Body> {
             {
                 let mut g = s.captured.lock().unwrap();
+                g.last_body = Some(body);
                 for (k, v) in headers.iter() {
                     g.seen.insert(k.as_str().to_string());
                     if let Ok(val) = v.to_str() {

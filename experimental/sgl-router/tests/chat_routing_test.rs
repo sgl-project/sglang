@@ -279,6 +279,140 @@ async fn streaming_upstream_5xx_preserves_content_type() {
 }
 
 #[tokio::test]
+async fn non_streaming_upstream_429_preserved() {
+    // Regression (I3): a legitimate worker 4xx (rate limit, invalid model,
+    // etc.) must be proxied verbatim. The router is only a 502-wrapper for
+    // transport failures (connect/dns/timeout); upstream-application
+    // errors are OpenAI-compatible passthrough.
+    let upstream_body = serde_json::json!({
+        "error": {
+            "type": "rate_limit_error",
+            "message": "Too many requests",
+            "code": "rate_limit_exceeded"
+        }
+    });
+    let worker = common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        upstream_body.clone(),
+    )
+    .await;
+    let cfg = config(&worker.url);
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), TEST_TIMEOUT).unwrap());
+    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "non-streaming upstream 4xx must be proxied verbatim",
+    );
+    assert_eq!(
+        res.headers().get("content-type").unwrap().to_str().unwrap(),
+        "application/json",
+    );
+    // Router envelope code header must NOT be set — this is upstream's response.
+    assert!(
+        res.headers().get("x-router-error-code").is_none(),
+        "router envelope header must NOT be set on upstream-passthrough responses",
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(got, upstream_body, "body bytes must round-trip unchanged");
+}
+
+#[tokio::test]
+async fn non_streaming_upstream_500_preserved() {
+    // Regression (I3): worker-side 5xx (model crashed, OOM, etc.) is
+    // proxied verbatim on non-streaming requests. Mirrors streaming
+    // behaviour. Only transport failures get 502-wrapped.
+    let upstream_body = serde_json::json!({
+        "error": {"type": "server_error", "message": "internal worker failure"}
+    });
+    let worker = common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        upstream_body.clone(),
+    )
+    .await;
+    let cfg = config(&worker.url);
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), TEST_TIMEOUT).unwrap());
+    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        res.headers().get("x-router-error-code").is_none(),
+        "router envelope must NOT wrap upstream 5xx — passthrough",
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(got, upstream_body);
+}
+
+#[tokio::test]
+async fn non_streaming_upstream_4xx_body_passthrough() {
+    // Regression (I3): the worker's response bytes must reach the client
+    // unmodified — no router envelope wrap, no field rewriting.
+    let upstream_body = serde_json::json!({
+        "error": {"type": "invalid_request_error", "message": "bad model"}
+    });
+    let worker = common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::BAD_REQUEST,
+        upstream_body.clone(),
+    )
+    .await;
+    let cfg = config(&worker.url);
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), TEST_TIMEOUT).unwrap());
+    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "missing-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    // Byte-exact passthrough — compare via Value to be insensitive to
+    // whitespace, which is the only legal axis of variation for JSON.
+    let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(got, upstream_body);
+}
+
+#[tokio::test]
 async fn oversized_request_body_returns_413() {
     // Regression (B4): the router must enforce a body-size cap on
     // `/v1/chat/completions`. A multi-MiB body from a hostile client must
