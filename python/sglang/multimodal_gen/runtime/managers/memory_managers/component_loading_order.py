@@ -144,9 +144,7 @@ def infer_component_weight_size_bytes(component_model_path: str) -> int | None:
 
     weight_files = []
     for suffix in _WEIGHT_FILE_SUFFIXES:
-        weight_files.extend(
-            glob.glob(os.path.join(component_model_path, f"*{suffix}"))
-        )
+        weight_files.extend(glob.glob(os.path.join(component_model_path, f"*{suffix}")))
     if not weight_files:
         return None
     sizes = [

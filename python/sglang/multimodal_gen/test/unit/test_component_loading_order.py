@@ -31,9 +31,7 @@ def _write_safetensors(path, payload_size: int) -> None:
     }
     header_bytes = json.dumps(header).encode("utf-8")
     path.write_bytes(
-        len(header_bytes).to_bytes(8, "little")
-        + header_bytes
-        + b"\0" * payload_size
+        len(header_bytes).to_bytes(8, "little") + header_bytes + b"\0" * payload_size
     )
 
 
