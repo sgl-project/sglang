@@ -1,9 +1,14 @@
 import re
-from itertools import chain
+from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Set, Tuple
 
 import torch
+from torch.distributed.tensor import DTensor
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+    layerwise_component_matches_selection,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -70,6 +75,7 @@ class LayerwiseOffloadManager:
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
         self._offload_placeholders: Dict[torch.dtype, torch.Tensor] = {}
+        self._has_dtensor_weights = False
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
 
@@ -90,6 +96,26 @@ class LayerwiseOffloadManager:
             placeholder = torch.empty((1,), device=self.device, dtype=dtype)
             self._offload_placeholders[dtype] = placeholder
         return placeholder
+
+    @staticmethod
+    def _to_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if isinstance(tensor, DTensor):
+            return tensor.to_local()
+        return tensor
+
+    def _wrap_for_target(
+        self, target: torch.Tensor, local_tensor: torch.Tensor
+    ) -> torch.Tensor:
+        if isinstance(target, DTensor):
+            return DTensor.from_local(
+                local_tensor, target.device_mesh, target.placements
+            )
+        return local_tensor
+
+    def _get_shared_empty_tensor_for_target(
+        self, target: torch.Tensor, dtype: torch.dtype
+    ) -> torch.Tensor:
+        return self._wrap_for_target(target, self._get_shared_empty_tensor(dtype))
 
     @staticmethod
     def _get_alignment_numel(dtype: torch.dtype, alignment_bytes: int = 32) -> int:
@@ -114,16 +140,20 @@ class LayerwiseOffloadManager:
         self._named_parameters = dict(self.model.named_parameters())
         self._named_buffers = dict(self.model.named_buffers())
 
-        # 1. collect and group tensors by layer and dtype
+        # 1. collect and group layer parameters by dtype. Keep buffers resident:
+        # shared buffers such as RoPE caches may be referenced by many layers.
         layer_groups: Dict[int, Dict[torch.dtype, List[Tuple[str, torch.Tensor]]]] = {}
-        all_tensors = chain(self._named_parameters.items(), self._named_buffers.items())
-        for name, tensor in all_tensors:
+        for name, tensor in self._named_parameters.items():
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None or layer_idx >= self.num_layers:
                 continue
-            layer_groups.setdefault(layer_idx, {}).setdefault(tensor.dtype, []).append(
-                (name, tensor)
+            self._has_dtensor_weights = self._has_dtensor_weights or isinstance(
+                tensor, DTensor
             )
+            local_tensor = self._to_local_tensor(tensor)
+            layer_groups.setdefault(layer_idx, {}).setdefault(
+                local_tensor.dtype, []
+            ).append((name, tensor))
 
         # 2. concat and offload (in pinned memory)
         for layer_idx, dtype_to_params in layer_groups.items():
@@ -132,43 +162,46 @@ class LayerwiseOffloadManager:
             self._weight_metadata[layer_idx] = {}
 
             for dtype, weights in dtype_to_params.items():
-                contiguous_weights: List[Tuple[str, torch.Tensor]] = []
+                contiguous_weights: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
                 for name, weight in weights:
-                    if weight.is_contiguous():
-                        contiguous_weights.append((name, weight))
+                    local_weight = self._to_local_tensor(weight)
+                    if local_weight.is_contiguous():
+                        contiguous_weights.append((name, weight, local_weight))
                         continue
 
                     # Preserve non-contiguous layouts such as the transposed FP8
                     # weight views expected by CUTLASS kernels.
                     cpu_tensor = torch.empty_strided(
-                        size=weight.shape,
-                        stride=weight.stride(),
+                        size=local_weight.shape,
+                        stride=local_weight.stride(),
                         dtype=dtype,
                         pin_memory=self.pin_cpu_memory,
                     )
-                    cpu_tensor.copy_(weight)
+                    cpu_tensor.copy_(local_weight)
                     self._strided_cpu_weights[layer_idx][name] = cpu_tensor
                     self._weight_metadata[layer_idx][name] = {
                         "dtype": dtype,
-                        "shape": weight.shape,
-                        "stride": weight.stride(),
+                        "shape": local_weight.shape,
+                        "stride": local_weight.stride(),
                         "preserve_strides": True,
                     }
-                    weight.data = self._get_shared_empty_tensor(dtype)
+                    weight.data = self._get_shared_empty_tensor_for_target(
+                        weight, dtype
+                    )
 
                 if not contiguous_weights:
                     continue
 
                 current_offset = 0
                 aligned_offsets: Dict[str, int] = {}
-                for name, weight in contiguous_weights:
+                for name, weight, local_weight in contiguous_weights:
                     # Some fused diffusion kernels require tensor base pointers to
                     # satisfy a 32-byte alignment contract. Reusing one flat buffer
                     # is still fine, but each logical tensor slice must start on an
                     # aligned offset inside that buffer.
                     current_offset = self._align_numel_offset(current_offset, dtype)
                     aligned_offsets[name] = current_offset
-                    current_offset += weight.numel()
+                    current_offset += local_weight.numel()
 
                 total_numel = current_offset
 
@@ -178,22 +211,24 @@ class LayerwiseOffloadManager:
                 )
 
                 # offload weights to the buffer
-                for name, weight in contiguous_weights:
+                for name, weight, local_weight in contiguous_weights:
                     current_offset = aligned_offsets[name]
-                    numel = weight.numel()
+                    numel = local_weight.numel()
                     cpu_buffer[current_offset : current_offset + numel].copy_(
-                        weight.flatten()
+                        local_weight.flatten()
                     )
                     self._weight_metadata[layer_idx][name] = {
                         "dtype": dtype,
                         "offset": current_offset,
                         "numel": numel,
-                        "shape": weight.shape,
-                        "stride": weight.stride(),
+                        "shape": local_weight.shape,
+                        "stride": local_weight.stride(),
                         "preserve_strides": False,
                     }
 
-                    weight.data = self._get_shared_empty_tensor(dtype)
+                    weight.data = self._get_shared_empty_tensor_for_target(
+                        weight, dtype
+                    )
 
                     current_offset += numel
 
@@ -202,7 +237,8 @@ class LayerwiseOffloadManager:
         # Keep non-layer parameters resident on GPU. Layer tensors have already
         # been replaced by tiny device placeholders, so this does not reload the
         # offloaded layer weights.
-        self.model.to(self.device)
+        if not self._has_dtensor_weights:
+            self.model.to(self.device)
 
         # prefetch the first layer for warm-up
         self.prepare_for_next_req(non_blocking=False)
@@ -271,16 +307,17 @@ class LayerwiseOffloadManager:
                         device=self.device,
                     )
                     gpu_tensor.copy_(cpu_tensor, non_blocking=non_blocking)
-                    target.data = gpu_tensor
+                    target.data = self._wrap_for_target(target, gpu_tensor)
                     continue
 
                 dtype = meta["dtype"]
                 gpu_buffer = gpu_buffers[dtype]
 
                 # map the parameter's data to the correct slice of the GPU buffer
-                target.data = gpu_buffer[
+                local_tensor = gpu_buffer[
                     meta["offset"] : meta["offset"] + meta["numel"]
                 ].view(meta["shape"])
+                target.data = self._wrap_for_target(target, local_tensor)
 
         # record the prefetch event of this layer after all copies are enqueued
         event = torch.get_device_module().Event()
@@ -307,7 +344,9 @@ class LayerwiseOffloadManager:
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
             target = self.get_target_with_name(name)
             # Wraparound prefetch will reload the layer when it is needed again
-            target.data = self._get_shared_empty_tensor(meta["dtype"])
+            target.data = self._get_shared_empty_tensor_for_target(
+                target, meta["dtype"]
+            )
 
         self._gpu_layers.discard(layer_idx)
 
@@ -347,11 +386,12 @@ class LayerwiseOffloadManager:
         # Collect current GPU weights and write back to CPU buffer
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
             target = self.get_target_with_name(name)
+            target_local = self._to_local_tensor(target)
             if meta.get("preserve_strides", False):
-                self._strided_cpu_weights[layer_idx][name].copy_(target.data.cpu())
+                self._strided_cpu_weights[layer_idx][name].copy_(target_local.cpu())
                 continue
 
-            gpu_weight = target.data.flatten().cpu()
+            gpu_weight = target_local.flatten().cpu()
 
             dtype = meta["dtype"]
             cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
@@ -408,30 +448,32 @@ class LayerwiseOffloadManager:
                 continue
 
             meta = meta_layer[name]
-            if tuple(meta["shape"]) != tuple(loaded_weight.shape):
+            local_loaded_weight = self._to_local_tensor(loaded_weight)
+            if tuple(meta["shape"]) != tuple(local_loaded_weight.shape):
                 raise ValueError(
                     f"Shape mismatch for {name}: "
                     f"expected={tuple(meta['shape'])}, "
-                    f"loaded={tuple(loaded_weight.shape)}"
+                    f"loaded={tuple(local_loaded_weight.shape)}"
                 )
 
             dtype = meta["dtype"]
             if meta.get("preserve_strides", False):
                 self._strided_cpu_weights[layer_idx][name].copy_(
-                    loaded_weight.to(dtype=dtype)
+                    local_loaded_weight.to(dtype=dtype)
                 )
             else:
                 offset = meta["offset"]
                 numel = meta["numel"]
                 cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
                 cpu_buffer[offset : offset + numel].copy_(
-                    loaded_weight.to(dtype=dtype).flatten()
+                    local_loaded_weight.to(dtype=dtype).flatten()
                 )
 
             # If this layer is currently on GPU, update the live parameter.
             if layer_idx in self._gpu_layers:
                 target = self.get_target_with_name(name)
-                target.data.copy_(loaded_weight.to(dtype=target.dtype))
+                target_local = self._to_local_tensor(target)
+                target_local.copy_(local_loaded_weight.to(dtype=target_local.dtype))
 
             updated_names.add(name)
 
@@ -467,7 +509,7 @@ class LayerwiseOffloadManager:
         if not self.enabled:
             return
 
-        layers = getattr(self.model, self.layers_attr_str)
+        layers = dict(self.model.named_modules())[self.layers_attr_str]
 
         def make_pre_hook(i):
             def hook(module, input):
@@ -509,21 +551,24 @@ class LayerwiseOffloadManager:
         self._forward_hooks.clear()
 
 
-class OffloadableDiTMixin:
-    """
-    A mixin that registers forward hooks for a DiT to enable layerwise offload
-    """
+class LayerwiseOffloadableModuleMixin:
+    """A mixin that registers forward hooks to enable layerwise offload."""
 
-    # the list of names of a DiT's layers/blocks
-    layer_names: List[str]
+    # Legacy --dit-layerwise-offload configures these modules when no component is named.
+    layerwise_offload_default_enabled: bool = True
+    # The list of names of this module's layer/block ModuleList or Sequential attributes.
+    layer_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
 
     def configure_layerwise_offload(self, server_args: ServerArgs):
         self.layerwise_offload_managers = []
+        named_modules = dict(self.named_modules())
+        configured_layer_names = []
         for layer_name in self.layer_names:
-            # a manager per layer-list
-            module_list = getattr(self, layer_name, None)
-            if module_list is None or not isinstance(module_list, torch.nn.ModuleList):
+            module_list = named_modules.get(layer_name)
+            if not isinstance(module_list, (torch.nn.ModuleList, torch.nn.Sequential)):
+                continue
+            if len(module_list) == 0:
                 continue
 
             num_layers = len(module_list)
@@ -543,10 +588,20 @@ class OffloadableDiTMixin:
                 prefetch_size=prefetch_size,
             )
             self.layerwise_offload_managers.append(manager)
+            configured_layer_names.append(layer_name)
 
-        logger.info(
-            f"Enabled layerwise offload for {self.__class__.__name__} on modules: {self.layer_names}"
-        )
+        if configured_layer_names:
+            logger.info(
+                "Enabled layerwise offload for %s on modules: %s",
+                self.__class__.__name__,
+                configured_layer_names,
+            )
+        else:
+            logger.info(
+                "No layerwise-offloadable ModuleList found for %s. Candidates: %s",
+                self.__class__.__name__,
+                self.layer_names,
+            )
 
     def prepare_for_next_req(self):
         if self.layerwise_offload_managers is None:
@@ -583,7 +638,7 @@ def iter_materialized_weights(module: torch.nn.Module):
     the non-offloaded parameters.
     """
     offload_managers: list = []
-    if isinstance(module, OffloadableDiTMixin) and module.layerwise_offload_managers:
+    if is_layerwise_offloaded_module(module):
         offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
 
     if not offload_managers:
@@ -601,3 +656,117 @@ def iter_materialized_weights(module: torch.nn.Module):
     for name, param in module.named_parameters():
         if name not in offloaded_names:
             yield name, param
+
+
+def is_layerwise_offloaded_module(module: torch.nn.Module) -> bool:
+    return isinstance(module, LayerwiseOffloadableModuleMixin) and any(
+        manager.enabled for manager in module.layerwise_offload_managers
+    )
+
+
+def configure_layerwise_offload_modules(
+    modules: Mapping[str, object],
+    server_args: ServerArgs,
+    component_names: Sequence[str] | None = None,
+    warn_missing: bool = True,
+) -> list[str]:
+    """Configure layerwise offload for the given modules, from the given component_names
+
+    Args:
+        modules: the dict of {component_name: component}, containing the components to be chosen from
+        component_names: list of component names. component with names not in this list shouldn't be configured
+
+    Returns a list of component names of modules configured to be layerwise-offload
+    """
+
+    # components which has already been configured to be layerwise-offload
+    configured_component_names: list[str] = []
+    configured_module_ids: set[int] = set()
+    selected_component_names = (
+        set(component_names) if component_names is not None else None
+    )
+    select_all = (
+        selected_component_names is not None and "all" in selected_component_names
+    )
+    select_default = (
+        selected_component_names is not None
+        and LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS in selected_component_names
+    )
+
+    if warn_missing and selected_component_names is not None and not select_all:
+        explicit_component_names = selected_component_names - {
+            LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS
+        }
+        missing_component_names = [
+            selected_component_name
+            for selected_component_name in explicit_component_names
+            if not any(
+                layerwise_component_matches_selection(
+                    component_name, selected_component_name
+                )
+                for component_name in modules
+            )
+        ]
+        if missing_component_names:
+            logger.warning(
+                "Layerwise offload components are not currently loaded: %s. "
+                "Available pipeline components: %s",
+                sorted(missing_component_names),
+                sorted(modules),
+            )
+
+        unsupported_component_names = [
+            component_name
+            for component_name in modules
+            if any(
+                layerwise_component_matches_selection(
+                    component_name, selected_component_name
+                )
+                for selected_component_name in explicit_component_names
+            )
+            if not isinstance(modules[component_name], LayerwiseOffloadableModuleMixin)
+        ]
+        if unsupported_component_names:
+            logger.warning(
+                "Layerwise offload components do not support layerwise offload: %s",
+                sorted(unsupported_component_names),
+            )
+
+    for component_name, module in modules.items():
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            continue
+        if selected_component_names is None:
+            if not module.layerwise_offload_default_enabled:
+                continue
+        elif (
+            not select_all
+            and not any(
+                layerwise_component_matches_selection(
+                    component_name, selected_component_name
+                )
+                for selected_component_name in selected_component_names
+            )
+            and not (select_default and module.layerwise_offload_default_enabled)
+        ):
+            # if the current component is not selected to be layerwise-offload, skip
+            continue
+        module_id = id(module)
+        if module_id in configured_module_ids:
+            # avoid multiple configures on a same module
+            continue
+
+        configured_module_ids.add(module_id)
+
+        if not is_layerwise_offloaded_module(module):
+            module.configure_layerwise_offload(server_args)
+        if is_layerwise_offloaded_module(module):
+            configured_component_names.append(component_name)
+
+    if configured_component_names:
+        logger.info(
+            "Enabled layerwise offload for pipeline components: %s",
+            configured_component_names,
+        )
+    else:
+        logger.info("No pipeline component supports layerwise offload.")
+    return configured_component_names
