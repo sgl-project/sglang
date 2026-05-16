@@ -265,10 +265,20 @@ class MlxModelRunner:
         layer_list, attn_attr = find_attention_layers(self.model)
         if not layer_list:
             raise RuntimeError("Cannot determine attention config: no layers found")
-        sample_attn = getattr(layer_list[0], attn_attr)
+        sample_attn = None
+        for layer in layer_list:
+            sample_attn = getattr(layer, attn_attr, None)
+            if sample_attn is not None:
+                break
+        if sample_attn is None:
+            raise RuntimeError("Cannot determine attention config: no attention module found")
         if isinstance(sample_attn, MLXAttentionWrapper):
             sample_attn = sample_attn._inner
-        n_kv_heads = getattr(sample_attn, "n_kv_heads", None) or getattr(sample_attn, "num_k_heads", None)
+        n_kv_heads = (
+            getattr(sample_attn, "n_kv_heads", None)
+            or getattr(sample_attn, "num_k_heads", None)
+            or getattr(sample_attn, "num_key_value_heads", None)
+        )
         if n_kv_heads is None:
             raise RuntimeError("Cannot determine n_kv_heads from attention module")
         if hasattr(sample_attn, "head_dim"):

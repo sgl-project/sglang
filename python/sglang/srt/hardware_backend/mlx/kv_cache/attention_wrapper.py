@@ -77,15 +77,25 @@ class MLXAttentionWrapper(nn.Module):
         inner = self._inner
         layer_idx = self._layer_idx
         B = ctx.batch_size
+        n_heads = (
+            getattr(inner, "n_heads", None)
+            or getattr(inner, "num_heads", None)
+            or getattr(inner, "num_attention_heads")
+        )
+        n_kv_heads = (
+            getattr(inner, "n_kv_heads", None)
+            or getattr(inner, "num_k_heads", None)
+            or getattr(inner, "num_key_value_heads")
+        )
 
         queries = inner.q_proj(x)
         keys = inner.k_proj(x)
         values = inner.v_proj(x)
 
-        head_dim = queries.shape[-1] // inner.n_heads
-        queries = queries.reshape(B, 1, inner.n_heads, head_dim)
-        keys = keys.reshape(B, 1, inner.n_kv_heads, head_dim)
-        values = values.reshape(B, 1, inner.n_kv_heads, head_dim)
+        head_dim = queries.shape[-1] // n_heads
+        queries = queries.reshape(B, 1, n_heads, head_dim)
+        keys = keys.reshape(B, 1, n_kv_heads, head_dim)
+        values = values.reshape(B, 1, n_kv_heads, head_dim)
 
         if hasattr(inner, "q_norm"):
             queries = inner.q_norm(queries)
@@ -119,10 +129,10 @@ class MLXAttentionWrapper(nn.Module):
             pad = pad_sizes[i]
             if pad > 0:
                 k_pad = mx.zeros(
-                    (1, inner.n_kv_heads, pad, head_dim), dtype=k_all.dtype
+                    (1, n_kv_heads, pad, head_dim), dtype=k_all.dtype
                 )
                 v_pad = mx.zeros(
-                    (1, inner.n_kv_heads, pad, head_dim), dtype=v_all.dtype
+                    (1, n_kv_heads, pad, head_dim), dtype=v_all.dtype
                 )
                 k_all = mx.concatenate([k_all, k_pad], axis=2)
                 v_all = mx.concatenate([v_all, v_pad], axis=2)
