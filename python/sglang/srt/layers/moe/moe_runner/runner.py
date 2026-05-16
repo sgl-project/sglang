@@ -62,6 +62,17 @@ class MoeRunner:
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
         elif runner_backend.is_flashinfer_cutedsl():
             self.runner_core = None  # FlashInfer CuteDSL only supports fused path
+        elif runner_backend.is_flashinfer_cutlass():
+            if lora_enabled:
+                from sglang.srt.lora.lora_moe_runner_cutlass_fp4 import (
+                    CutlassFp4LoraRunnerCore,
+                )
+
+                self.runner_core = CutlassFp4LoraRunnerCore(config)
+            else:
+                # Non-LoRA flashinfer_cutlass bypasses MoeRunner: calls
+                # ``flashinfer_cutlass_fused_moe`` directly from quant ``apply``.
+                self.runner_core = None
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
@@ -121,8 +132,9 @@ class MoeRunner:
                 )
             return None
 
-        # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore)
-        # bypass the pre-permute step and do their own alignment internally.
+        # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore,
+        # CutlassFp4LoraRunnerCore) bypass the pre-permute step and do their
+        # own alignment internally.
         if hasattr(self.runner_core, "run_from_dispatch"):
             hooks = _maybe_build_lora_hooks(dispatch_output)
             return self.runner_core.run_from_dispatch(
