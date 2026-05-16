@@ -18,8 +18,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import get_int_env_var
 
-_MORI_MOE_MAX_INPUT_TOKENS = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -191,12 +189,8 @@ def pre_permute_standard_to_aiter(
 
 
 def _is_mori_dispatch_output(dispatch_output: Any) -> bool:
-    # MoriEP{Normal,LL}DispatchOutput reuse DispatchOutputFormat.DEEPEP_NORMAL/LL
-    # so format-based dispatch cannot distinguish them from DeepEP outputs.
-    # The structural presence of origin_topk_ids (the post-mori-permute ids
-    # that the combine step needs) is the only available signal.
-    # If a future DeepEP output ever gains this field this check must be revised
-    # (e.g. by introducing MORI_NORMAL / MORI_LL format enum values).
+    # MoriEP{Normal,LL}DispatchOutput carry the post-mori-permute origin_topk_*
+    # tensors that the standard DeepEP outputs lack.
     return hasattr(dispatch_output, "origin_topk_ids")
 
 
@@ -261,12 +255,13 @@ def _pre_permute_deepep_to_aiter(
         # Truncate dispatch tensors to the configured cap; mori combine only
         # reads [0, totalRecvTokenNum), so the truncated result needs no
         # padding back.
-        if _MORI_MOE_MAX_INPUT_TOKENS > 0:
-            hidden_states = hidden_states[:_MORI_MOE_MAX_INPUT_TOKENS]
+        mori_max = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
+        if mori_max > 0:
+            hidden_states = hidden_states[:mori_max]
             if a1_scale is not None:
-                a1_scale = a1_scale[:_MORI_MOE_MAX_INPUT_TOKENS]
-            topk_ids = topk_ids[:_MORI_MOE_MAX_INPUT_TOKENS]
-            topk_weights = topk_weights[:_MORI_MOE_MAX_INPUT_TOKENS]
+                a1_scale = a1_scale[:mori_max]
+            topk_ids = topk_ids[:mori_max]
+            topk_weights = topk_weights[:mori_max]
 
         # Upscale dispatched activations when there is no AITER kernel for the
         # weight/activation dtype pair.
@@ -306,10 +301,6 @@ def _pre_permute_deepep_to_aiter(
         # negative ids, so reroute them to the sink slot at index
         # num_local_experts (masked off by quant_info.expert_mask which has
         # shape (num_local_experts + 1,)).
-        assert quant_info.expert_mask is not None, (
-            "expert_mask must be set for DeepEP/Mooncake/Nixl AITER dispatch; "
-            "DeepEPDispatcher.__init__ sets it when _use_aiter is True"
-        )
         topk_ids = torch.where(
             topk_ids == -1,
             torch.full_like(topk_ids, runner_config.num_local_experts),
@@ -374,10 +365,6 @@ def _post_permute_aiter_to_deepep(
 
         cls = DeepEPNormalCombineInput if is_normal else DeepEPLLCombineInput
 
-    assert (
-        "aiter_combine_topk_ids" in running_state
-        and "aiter_combine_topk_weights" in running_state
-    ), "post_permute called without a prior pre_permute; running_state keys missing"
     return cls(
         hidden_states=runner_output.hidden_states,
         topk_ids=running_state["aiter_combine_topk_ids"],
