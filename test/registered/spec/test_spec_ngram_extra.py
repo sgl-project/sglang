@@ -2,83 +2,22 @@ import unittest
 
 import requests
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.test_utils import (
-    DEFAULT_TARGET_MODEL_NGRAM,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
+from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
 
-register_cuda_ci(est_time=254, stage="stage-b", runner_config="1-gpu-large")
-
-GSM_DATASET_PATH = None
+# Extra: Triton + Flashinfer NGRAM backends. Sibling per-commit file
+# (test_spec_ngram.py) keeps the Paged variant.
+register_cuda_ci(est_time=254, stage="extra-a", runner_config="1-gpu-large")
 
 
-# Default server arguments shared across all tests
-DEFAULT_SERVER_ARGS = [
-    "--trust-remote-code",
-    "--cuda-graph-max-bs",
-    "8",
-    "--speculative-algorithm",
-    "NGRAM",
-    "--speculative-num-draft-tokens",
-    "16",
-    "--mem-fraction-static",
-    0.8,
-]
+class TestNgramSpeculativeDecodingTriton(NgramServerBase, GSM8KMixin):
+    attention_backend = "triton"
 
 
-class TestNgramSpeculativeDecodingBase(GSM8KMixin, CustomTestCase):
-    model = DEFAULT_TARGET_MODEL_NGRAM
-    base_url = DEFAULT_URL_FOR_TEST
-    gsm8k_accuracy_thres = 0.79  # derived tests need to override this
-    gsm8k_accept_length_thres = 1.8  # derived spec decoding tests need to override this
-
-    @classmethod
-    def get_server_args(cls):
-        """Return the arguments for the server launch. Override in subclasses."""
-        return DEFAULT_SERVER_ARGS + ["--attention-backend", "fa3"]
-
-    @classmethod
-    def setUpClass(cls):
-        # disable deep gemm precompile to make launch server faster
-        # please don't do this if you want to make your inference workload faster
-        envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
-        model = cls.model
-        cls.process = popen_launch_server(
-            model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=cls.get_server_args(),
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
-class TestNgramSpeculativeDecodingTriton(TestNgramSpeculativeDecodingBase):
-
-    @classmethod
-    def get_server_args(cls):
-        return DEFAULT_SERVER_ARGS + ["--attention-backend", "triton"]
-
-
-class TestNgramSpeculativeDecodingFlashinfer(TestNgramSpeculativeDecodingBase):
-    @classmethod
-    def get_server_args(cls):
-        return DEFAULT_SERVER_ARGS + [
-            "--attention-backend",
-            "flashinfer",
-            "--speculative-ngram-external-sam-budget",
-            "8",
-        ]
+class TestNgramSpeculativeDecodingFlashinfer(NgramServerBase, GSM8KMixin):
+    attention_backend = "flashinfer"
+    extra_args = ["--speculative-ngram-external-sam-budget", "8"]
 
     def test_output_as_corpus_boosts_accept_length(self):
         """Baseline → HTTP add corpus → verify accept length boost."""
@@ -145,18 +84,6 @@ class TestNgramSpeculativeDecodingFlashinfer(TestNgramSpeculativeDecodingBase):
             f"SAM accept length ({sam_accept_len:.2f}) should be at least 2x "
             f"baseline ({baseline_accept_len:.2f}) when corpus matches output",
         )
-
-
-class TestNgramSpeculativeDecodingPaged(TestNgramSpeculativeDecodingBase):
-
-    @classmethod
-    def get_server_args(cls):
-        return DEFAULT_SERVER_ARGS + [
-            "--attention-backend",
-            "flashinfer",
-            "--page-size",
-            "64",
-        ]
 
 
 if __name__ == "__main__":
