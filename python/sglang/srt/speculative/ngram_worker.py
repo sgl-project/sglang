@@ -262,6 +262,12 @@ class NgramSpecCoordinator(SpecCoordinator):
 
         batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
         batch.forward_mode = ForwardMode.TARGET_VERIFY
+        # Direct mutate (not GenerationBatchResult.next_draft_input relay):
+        # Ngram has no draft model and no cross-iter draft state. NgramVerifyInput
+        # is built fresh each iter from CPU corpus lookup, and must be installed
+        # *before* the target forward (target_worker reads spec_info from the
+        # captured ModelWorkerBatch). The relay model produces draft_input as
+        # forward output for the next iter — that semantic does not apply here.
         batch.spec_info = NgramVerifyInput(
             draft_tokens,
             tree_mask,
@@ -339,7 +345,7 @@ class NgramSpecCoordinator(SpecCoordinator):
                     # and will be applied to produce wrong results
                     batch.sampling_info.vocab_mask = None
 
-            logits_output, next_token_ids, num_correct_drafts = verify_input.verify(
+            logits_output, next_token_ids, num_correct_drafts = verify_input.sample(
                 batch, logits_output, self.page_size, vocab_mask
             )
             num_correct_drafts_per_req_cpu = (

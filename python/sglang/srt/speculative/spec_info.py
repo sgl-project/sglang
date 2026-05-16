@@ -228,6 +228,13 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
+    # V2 overlap-only: forward stream computes next iter's seq_lens before
+    # scheduler dispatches the next batch. Scheduler reads this on the
+    # next_draft_input relay to sync schedule-side seq_lens. None on V1 and
+    # non-overlap algos. Declared on base so scheduler's unified install path
+    # can read it generically across all spec algos without isinstance/getattr.
+    new_seq_lens: Optional[torch.Tensor] = None
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 

@@ -27,11 +27,6 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.base_spec_worker import DraftExecutor
-from sglang.srt.speculative.eagle_info_v2 import (
-    EagleDraftExtendInputV2Mixin,
-    EagleDraftInputV2Mixin,
-    EagleVerifyInputV2Mixin,
-)
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
@@ -59,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
+class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
     custom_mask: torch.Tensor
     positions: torch.Tensor
@@ -658,7 +653,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
 
 @dataclass
-class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+class EagleDraftInput(SpecInput):
     # For idle stubs use `create_idle_input`, not the bare ctor: `filter_batch`
     # / `merge_batch` slice / cat `topk_p` / `topk_index` / `hidden_states` /
     # `bonus_tokens` unconditionally.
@@ -815,7 +810,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
 
 @dataclass
-class EagleDraftExtendInput(SpecInput, EagleDraftExtendInputV2Mixin):
+class EagleDraftExtendInput(SpecInput):
     """Inputs to the draft-extend forward (the per-accepted-token pass after verify).
 
     Produced by `EagleVerifyInput.sample`, installed on `batch.spec_info` for
@@ -1007,11 +1002,6 @@ class EagleVerifyOutput:
     # the worker after `EagleVerifyInput.sample` returns; default kept so
     # idle / direct constructions don't have to pass it.
     can_run_cuda_graph: bool = False
-    # V2-only: full per-position sampled tokens, shape `[bs * draft_token_num]`
-    # (padded layout). V2 caller uses it as `GenerationBatchResult.next_token_ids`
-    # so overlap scheduler can slice with `accept_lens` without GPU->CPU sync.
-    # V1 paths leave None.
-    predict: Optional[torch.Tensor] = None
 
     @classmethod
     def create_idle(

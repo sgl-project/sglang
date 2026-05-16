@@ -3050,6 +3050,11 @@ class Scheduler(
                     else:
                         batch_result.future_indices = future_indices
 
+                # Bind future_indices to next_draft_input so scheduler's unified
+                # install propagates them into next iter's spec_info.
+                if batch_result.next_draft_input is not None:
+                    batch_result.next_draft_input.future_indices = future_indices
+
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
@@ -3069,13 +3074,13 @@ class Scheduler(
 
             if batch_result.next_draft_input is not None:
                 batch.spec_info = batch_result.next_draft_input
-                if batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
-                    batch.spec_info.future_indices = future_indices
-
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
+                # Overlap path (V2): worker computed next iter's seq_lens
+                # under the forward stream. Sync the schedule-side seq_lens so
+                # subsequent batch preparation sees the up-to-date value.
+                # `new_seq_lens` is declared on `SpecInput` base (default None),
+                # so this generalizes across algos (DFLASH / non-overlap algos
+                # leave it None).
+                if batch_result.next_draft_input.new_seq_lens is not None:
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
