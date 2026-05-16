@@ -51,6 +51,7 @@ from sglang.srt.configs import (
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
     Step3p5Config,
+    Step3p6Config,
     Step3VLConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
@@ -104,6 +105,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         JetVLMConfig,
         KimiK25Config,
         Step3p5Config,
+        Step3p6Config,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
     ]
