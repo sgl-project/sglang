@@ -48,7 +48,22 @@ pub async fn tokenize(
         .tokenizers
         .get(&req.model)
         .ok_or_else(|| ApiError::ModelNotFound(req.model.clone()))?;
-    let ids = adapter::encode(&tok, &req.prompt).map_err(ApiError::Internal)?;
+    // Structured log on failure so an operator can correlate
+    // "every encode for model X errors" against the route, model id, and
+    // prompt size. The generic anyhow-chain log in ApiError::Internal still
+    // fires from IntoResponse — duplication is intentional: the route-level
+    // line carries `model` / `prompt_len`, the IntoResponse line carries
+    // the full anyhow chain.
+    let ids = adapter::encode(&tok, &req.prompt).map_err(|e| {
+        tracing::error!(
+            route = "/v1/tokenize",
+            model = %req.model,
+            prompt_len = req.prompt.len(),
+            error = ?e,
+            "tokenize.encode failed",
+        );
+        ApiError::Internal(e)
+    })?;
     Ok(Json(TokenizeResponse {
         model: req.model,
         count: ids.len(),
@@ -64,8 +79,18 @@ pub async fn detokenize(
         .tokenizers
         .get(&req.model)
         .ok_or_else(|| ApiError::ModelNotFound(req.model.clone()))?;
-    let text = adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens)
-        .map_err(ApiError::Internal)?;
+    let text =
+        adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens).map_err(|e| {
+            tracing::error!(
+                route = "/v1/detokenize",
+                model = %req.model,
+                n_tokens = req.tokens.len(),
+                skip_special = req.skip_special_tokens,
+                error = ?e,
+                "detokenize.decode_complete failed",
+            );
+            ApiError::Internal(e)
+        })?;
     Ok(Json(DetokenizeResponse {
         model: req.model,
         text,
