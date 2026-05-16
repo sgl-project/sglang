@@ -199,7 +199,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
     @property
-    def draft_runner(self) -> ModelRunner:
+    def draft_runner(self) -> "ModelRunner":
         return self._draft_runner
 
     def mtp_model_runner(self, step: int):
