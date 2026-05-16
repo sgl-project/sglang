@@ -3,9 +3,11 @@
 
 //! SSE passthrough — bridges a reqwest `bytes_stream()` into an axum Body.
 
+use std::panic::AssertUnwindSafe;
+
 use axum::body::Body;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Bridge a byte stream into an axum Body that streams chunks unchanged.
@@ -24,6 +26,12 @@ use tokio_stream::wrappers::ReceiverStream;
 /// When the axum Body is dropped the receiver is closed; `tx.send()` then
 /// returns `Err`, which breaks the loop — no upstream bytes are read after the
 /// client disconnects.
+///
+/// # Panic safety
+/// The pump future is wrapped in `AssertUnwindSafe(..).catch_unwind()`. If the
+/// upstream stream panics, we surface a loud `io::Error` to the client instead
+/// of letting tokio silently swallow the panic and EOF the body — the worst
+/// failure class (truncated output that looks like success).
 pub fn bytes_stream_to_body<S, E>(stream: S) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
@@ -31,14 +39,30 @@ where
 {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
-        let mut s = stream;
-        while let Some(chunk) = s.next().await {
-            let item: Result<Bytes, std::io::Error> =
-                chunk.map_err(|e| std::io::Error::other(e.to_string()));
-            // tx.send err means the receiver was dropped (client disconnect); stop reading.
-            if tx.send(item).await.is_err() {
-                break;
+        let tx_for_panic = tx.clone();
+        let pump = AssertUnwindSafe(async move {
+            let mut s = stream;
+            while let Some(chunk) = s.next().await {
+                let item: Result<Bytes, std::io::Error> =
+                    chunk.map_err(|e| std::io::Error::other(e.to_string()));
+                // tx.send err means the receiver was dropped (client disconnect); stop reading.
+                if tx.send(item).await.is_err() {
+                    break;
+                }
             }
+        });
+        if let Err(panic_payload) = pump.catch_unwind().await {
+            let msg = panic_payload
+                .downcast_ref::<&'static str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            tracing::error!(error = %msg, "SSE pump task panicked");
+            let _ = tx_for_panic
+                .send(Err(std::io::Error::other(format!(
+                    "SSE pump panicked: {msg}"
+                ))))
+                .await;
         }
     });
     Body::from_stream(ReceiverStream::new(rx))
@@ -76,6 +100,46 @@ mod tests {
         assert!(
             result.is_err(),
             "expected body collect to surface upstream error, got Ok"
+        );
+    }
+
+    /// A stream that yields one Ok chunk on the first poll, then panics on the
+    /// second poll. Used to exercise the pump's panic-catch path.
+    struct PanicOnSecondPoll {
+        polls: usize,
+    }
+
+    impl futures::Stream for PanicOnSecondPoll {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.polls += 1;
+            match self.polls {
+                1 => std::task::Poll::Ready(Some(Ok(Bytes::from_static(b"first-chunk")))),
+                _ => panic!("synthetic pump panic from stream poll"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bytes_stream_to_body_propagates_pump_panic() {
+        // The pump task panics mid-stream. The client must see a loud Err,
+        // NOT a silently-truncated success.
+        let s = PanicOnSecondPoll { polls: 0 };
+        let body = bytes_stream_to_body(s);
+        let result = body.collect().await;
+        assert!(
+            result.is_err(),
+            "expected body collect to surface pump panic as Err, got Ok (silent truncation)"
+        );
+        let err = result.err().unwrap();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("pump panicked") || msg.contains("SSE pump panicked"),
+            "expected error message to mention pump panic, got: {msg}"
         );
     }
 }
