@@ -11,6 +11,8 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     component_resident_strategies as component_resident_strategies_mod,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
     layerwise_offload as layerwise_offload_mod,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
