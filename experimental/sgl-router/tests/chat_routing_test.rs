@@ -279,6 +279,42 @@ async fn streaming_upstream_5xx_preserves_content_type() {
 }
 
 #[tokio::test]
+async fn oversized_request_body_returns_413() {
+    // Regression (B4): the router must enforce a body-size cap on
+    // `/v1/chat/completions`. A multi-MiB body from a hostile client must
+    // be rejected at the layer BEFORE the handler reads it into memory, and
+    // must NOT be forwarded to the upstream worker.
+    let worker = common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&worker.url);
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.clone(), TEST_TIMEOUT).unwrap());
+    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+
+    // 2 MiB body — the configured limit is 1 MiB.
+    let big = vec![b'x'; 2 * 1024 * 1024];
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(big))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "oversized body must be rejected with 413; got: {}",
+        res.status(),
+    );
+    // The worker must NOT have received the oversized payload.
+    let captured = worker.captured.lock().unwrap();
+    assert!(
+        captured.last_body.is_none(),
+        "router must not forward oversized body to upstream; got body of {} bytes",
+        captured.last_body.as_ref().map(|b| b.len()).unwrap_or(0),
+    );
+}
+
+#[tokio::test]
 async fn malformed_json_returns_400_bad_request() {
     // Regression: a malformed JSON request body must return 400 with
     // bad_request envelope from the router itself; we must NOT forward

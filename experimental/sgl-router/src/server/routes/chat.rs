@@ -7,8 +7,36 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Response};
 use bytes::Bytes;
-use serde_json::Value;
+use serde::de::IgnoredAny;
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Per-route body-size cap on `/v1/chat/completions`. 1 MiB is comfortable
+/// for normal chat traffic (a 200 k-token context tokenized as JSON is well
+/// under this) while preventing a hostile client from forcing the router to
+/// heap-allocate hundreds of MiB before forwarding. The cap is wired in
+/// `crate::server::app::build_router` as a route-level `DefaultBodyLimit`
+/// layer; axum's `Bytes` extractor enforces it and returns 413
+/// PAYLOAD_TOO_LARGE before this handler runs.
+pub const MAX_CHAT_BODY_BYTES: usize = 1 << 20;
+
+/// Minimal probe over the request body — we only need the `stream` field
+/// to decide between buffered vs SSE forwarding. Deserializing into this
+/// struct (vs `serde_json::Value`) does two things:
+///
+/// 1. Avoids the per-field heap allocation of `Value` for a 1 MiB body.
+/// 2. Pins the contract: the body MUST be a JSON object. Degenerate
+///    shapes (`null`, `[]`, `"hi"`) fail at this step rather than being
+///    silently forwarded with `stream=false`.
+///
+/// All other fields are ignored — the worker is authoritative for the
+/// full request schema.
+#[derive(Deserialize)]
+struct StreamProbe {
+    #[serde(default)]
+    stream: Option<bool>,
+}
 
 /// POST /v1/chat/completions — forward to the worker. M1 routes to a
 /// single hardcoded worker (no policy). If the request opts into
@@ -32,7 +60,86 @@ pub async fn chat_completions(
 }
 
 fn parse_streaming(body: &Bytes) -> Result<bool, ApiError> {
-    let v: Value = serde_json::from_slice(body)
-        .map_err(|e| ApiError::BadRequest(format!("invalid JSON body: {e}")))?;
-    Ok(v.get("stream").and_then(|x| x.as_bool()).unwrap_or(false))
+    // We deliberately do NOT echo the serde error into the client-visible
+    // message — that risks leaking field-level detail and is also of little
+    // help to a real client (which already has its own JSON validator).
+    // Server-side, the full error is logged with `tracing::debug!` for
+    // operator triage.
+    //
+    // Two-step deserialize:
+    //   1. `Map<String, IgnoredAny>` *anchors* the shape to a JSON object.
+    //      This rejects `null` / `[]` / `"hi"` (all valid JSON but not
+    //      request shape) without walking the full value into a
+    //      `serde_json::Value` per field.
+    //   2. `StreamProbe` (struct of `Option<bool>`) lifts out the only
+    //      field we care about — `stream`. Other fields are ignored; the
+    //      worker is authoritative for the rest of the schema.
+    let _: HashMap<String, IgnoredAny> = serde_json::from_slice(body).map_err(|e| {
+        tracing::debug!(error = %e, "chat-completions body rejected as non-object JSON");
+        ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
+    })?;
+    let probe: StreamProbe = serde_json::from_slice(body).map_err(|e| {
+        tracing::debug!(error = %e, "chat-completions stream-probe deserialize failed");
+        ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
+    })?;
+    Ok(probe.stream.unwrap_or(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_streaming_reads_bool_from_object() {
+        let b = Bytes::from_static(br#"{"stream": true, "model": "tiny"}"#);
+        assert!(parse_streaming(&b).unwrap());
+        let b = Bytes::from_static(br#"{"stream": false, "model": "tiny"}"#);
+        assert!(!parse_streaming(&b).unwrap());
+    }
+
+    #[test]
+    fn parse_streaming_defaults_to_false_when_field_absent() {
+        // Existing happy-path contract: well-formed object missing `stream`
+        // must default to false (non-streaming). The minimal `StreamProbe`
+        // (Option<bool> + #[serde(default)]) must NOT break this.
+        let b = Bytes::from_static(br#"{"model": "tiny", "messages": []}"#);
+        assert!(!parse_streaming(&b).unwrap());
+    }
+
+    #[test]
+    fn parse_streaming_rejects_non_object_shapes() {
+        // Pin the contract: degenerate JSON (valid JSON but wrong shape)
+        // must be rejected, not silently forwarded with `stream=false`.
+        for bad in [&b"null"[..], &b"[]"[..], &b"\"hi\""[..], &b"42"[..]] {
+            let b = Bytes::copy_from_slice(bad);
+            let err = parse_streaming(&b).unwrap_err();
+            match err {
+                ApiError::BadRequest(_) => {}
+                other => panic!("expected BadRequest for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_streaming_rejects_malformed_json() {
+        let b = Bytes::from_static(b"{not json}");
+        let err = parse_streaming(&b).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn parse_streaming_bad_request_message_does_not_leak_serde_detail() {
+        // Info-leak guard: the client-visible message must be a fixed
+        // string, not the serde error (which can contain line/column
+        // detail or hint at field shape).
+        let b = Bytes::from_static(br#"{"stream": "not-a-bool"}"#);
+        let err = parse_streaming(&b).unwrap_err();
+        match err {
+            ApiError::BadRequest(msg) => assert_eq!(
+                msg, "invalid request: body must be a JSON object",
+                "client-visible message must be fixed; got: {msg}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
 }
