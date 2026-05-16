@@ -227,33 +227,17 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             )
         else:
             loc = loc.to(torch.int32)
-            if self.head_dim != self.v_head_dim:
-                page_indices = loc // self.page_size
-                offsets_in_page = loc % self.page_size
-                k_buffer_viewed = self.k_buffer[layer_id - self.start_layer].view(
+            torch_npu._npu_reshape_and_cache(
+                key=cache_k,
+                value=cache_v,
+                key_cache=self.k_buffer[layer_id - self.start_layer].view(
                     -1, self.page_size, self.head_num, self.head_dim
-                )
-                v_buffer_viewed = self.v_buffer[layer_id - self.start_layer].view(
+                ),
+                value_cache=self.v_buffer[layer_id - self.start_layer].view(
                     -1, self.page_size, self.head_num, self.v_head_dim
-                )
-                k_buffer_viewed[page_indices, offsets_in_page] = cache_k.view(
-                    -1, self.head_num, self.head_dim
-                )
-                v_buffer_viewed[page_indices, offsets_in_page] = cache_v.view(
-                    -1, self.head_num, self.v_head_dim
-                )
-            else:
-                torch_npu._npu_reshape_and_cache(
-                    key=cache_k,
-                    value=cache_v,
-                    key_cache=self.k_buffer[layer_id - self.start_layer].view(
-                        -1, self.page_size, self.head_num, self.head_dim
-                    ),
-                    value_cache=self.v_buffer[layer_id - self.start_layer].view(
-                        -1, self.page_size, self.head_num, self.v_head_dim
-                    ),
-                    slot_indices=loc,
-                )
+                ),
+                slot_indices=loc,
+            )
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
