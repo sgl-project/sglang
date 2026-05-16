@@ -204,14 +204,11 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
 
     def _init_draft_attn_backend(self):
-        if self.topk == 1:
-            return self.draft_model_runner.attn_backend
-
         backend_type = self._resolve_draft_backend_type()
         if backend_type != "triton":
             raise ValueError(
-                "Frozen-KV MTP topk > 1 currently supports only the triton "
-                f"attention backend, got {backend_type}."
+                "Frozen-KV MTP currently supports only the triton attention "
+                f"backend, got {backend_type}."
             )
         return self._init_triton_draft_attn_backend()
 
