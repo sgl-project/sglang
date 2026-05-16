@@ -1013,11 +1013,6 @@ class EagleVerifyOutput:
     # the worker after `EagleVerifyInput.sample` returns; default kept so
     # idle / direct constructions don't have to pass it.
     can_run_cuda_graph: bool = False
-    # V2-only: full per-position sampled tokens, shape `[bs * draft_token_num]`
-    # (padded layout). V2 caller uses it as `GenerationBatchResult.next_token_ids`
-    # so overlap scheduler can slice with `accept_lens` without GPU->CPU sync.
-    # V1 paths leave None.
-    predict: Optional[torch.Tensor] = None
 
     @classmethod
     def create_idle(

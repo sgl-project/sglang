@@ -35,11 +35,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
-from sglang.srt.speculative.eagle_info import EagleVerifyOutput
 from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftExtendInputV2,
     EagleDraftInputV2,
     EagleVerifyInputV2,
+    EagleVerifyOutputV2,
     fill_bonus_tokens,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
@@ -468,7 +468,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self,
         batch: ModelWorkerBatch,
         batch_result: GenerationBatchResult,
-        verify_output: EagleVerifyOutput,
+        verify_output: EagleVerifyOutputV2,
     ):
         # Batch 2: Draft extend. verify already built draft_extend_input with
         # hidden_states / num_correct_drafts / num_accept_tokens; we only need
@@ -736,7 +736,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def verify(
         self,
         batch: ModelWorkerBatch,
-    ):
+    ) -> tuple[GenerationBatchResult, EagleVerifyOutputV2]:
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
