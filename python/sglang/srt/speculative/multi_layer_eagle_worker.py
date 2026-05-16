@@ -57,7 +57,15 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_nan,
     select_top_k_tokens,
 )
-from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda, is_npu
+from sglang.srt.utils import (
+    empty_context,
+    get_available_gpu_memory,
+    is_cuda,
+    is_hip,
+    is_npu,
+)
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -587,7 +595,10 @@ class MultiLayerEagleWorker(TpModelWorker):
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
 
-        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        if not _is_hip or logits_output.next_token_logits is not None:
+            maybe_detect_nan(
+                logits_output.next_token_logits, "verify: target model logits"
+            )
 
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
@@ -600,9 +611,10 @@ class MultiLayerEagleWorker(TpModelWorker):
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accept_indices
-        ]
+        if not _is_hip or logits_output.next_token_logits is not None:
+            logits_output.next_token_logits = logits_output.next_token_logits[
+                res.accept_indices
+            ]
         logits_output.hidden_states = logits_output.hidden_states[res.accept_indices]
 
         if self.target_worker.model_runner.hybrid_gdn_config is not None:

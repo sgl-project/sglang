@@ -248,6 +248,7 @@ class LogitsMetadata:
     # import on SamplingBatchInfo here; only attribute accesses are used.
     sampling_info: Optional[Any] = None
     sampler_return_logprob: bool = False
+    spec_info: Optional[Any] = None
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -302,6 +303,7 @@ class LogitsMetadata:
             mm_input_embeds=forward_batch.mm_input_embeds,
             sampling_info=forward_batch.sampling_info,
             sampler_return_logprob=forward_batch.return_logprob,
+            spec_info=forward_batch.spec_info,
         )
 
     def compute_dp_attention_metadata(self):
@@ -1043,7 +1045,16 @@ class LogitsProcessor(nn.Module):
             return None
         if sample_indices is not None:
             return None
-        if not logits_metadata.forward_mode.is_decode_or_idle():
+        if not (
+            logits_metadata.forward_mode.is_decode_or_idle()
+            or logits_metadata.forward_mode.is_target_verify()
+        ):
+            return None
+        spec_info = logits_metadata.spec_info
+        if (
+            spec_info is not None
+            and getattr(spec_info, "is_draft_input", lambda: False)()
+        ):
             return None
         if logits_metadata.mm_input_embeds is not None:
             return None

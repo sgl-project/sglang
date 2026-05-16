@@ -204,7 +204,9 @@ def bench_nccl(
         dist.all_gather(gather_list, avg_tensor, group=pg)
         if rank == 0:
             avg_ms = float(torch.stack(gather_list).mean().item())
-            print(f"[NCCL] {human_size(size_bytes)}: {avg_ms:.3f} ms (avg across ranks)")
+            print(
+                f"[NCCL] {human_size(size_bytes)}: {avg_ms:.3f} ms (avg across ranks)"
+            )
             results.append((size_bytes, avg_ms))
         else:
             results.append((size_bytes, None))
@@ -237,7 +239,9 @@ def bench_aiter(
         # byte size AND the per-rank input to fit in max_size / (world_size*2).
         if not _should_custom_ag(comm, inp):
             if rank == 0:
-                print(f"[Aiter] {human_size(size_bytes)}: skipped (should_custom_ag=False)")
+                print(
+                    f"[Aiter] {human_size(size_bytes)}: skipped (should_custom_ag=False)"
+                )
             results.append((size_bytes, None))
             continue
 
@@ -298,7 +302,9 @@ def bench_aiter(
 
         if disabled or not times_ms:
             if rank == 0:
-                print(f"[Aiter] {human_size(size_bytes)}: custom AG disabled (no timings)")
+                print(
+                    f"[Aiter] {human_size(size_bytes)}: custom AG disabled (no timings)"
+                )
             results.append((size_bytes, None))
             continue
 
@@ -308,7 +314,9 @@ def bench_aiter(
         dist.all_gather(gather_list, avg_tensor, group=pg)
         if rank == 0:
             avg_ms = float(torch.stack(gather_list).mean().item())
-            print(f"[Aiter] {human_size(size_bytes)}: {avg_ms:.3f} ms (avg across ranks)")
+            print(
+                f"[Aiter] {human_size(size_bytes)}: {avg_ms:.3f} ms (avg across ranks)"
+            )
             results.append((size_bytes, avg_ms))
         else:
             results.append((size_bytes, None))
@@ -365,7 +373,9 @@ def main():
             )
         except Exception as e:
             if rank == 0:
-                print(f"Failed to construct Aiter CustomAllreduce: {e}", file=sys.stderr)
+                print(
+                    f"Failed to construct Aiter CustomAllreduce: {e}", file=sys.stderr
+                )
             aiter_comm = None
 
     nccl_results = bench_nccl(

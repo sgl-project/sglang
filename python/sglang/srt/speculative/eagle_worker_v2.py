@@ -1066,7 +1066,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.sampling_info.vocab_mask = None
 
         # Sample
-        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        if not _is_hip or logits_output.next_token_logits is not None:
+            maybe_detect_nan(
+                logits_output.next_token_logits, "verify: target model logits"
+            )
         (
             predict,
             accept_lens,

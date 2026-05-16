@@ -352,40 +352,49 @@ class EagleVerifyInputV2Mixin:
 
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
-        next_token_logits = logits_output.next_token_logits
         device = batch.input_ids.device
+        shortcut_ids = logits_output.next_token_ids_shortcut if _is_hip else None
 
-        # Apply penalty
-        # This is a relaxed version of penalties for speculative decoding.
-        if sampling_info.acc_additive_penalties is not None:
-            next_token_logits.add_(
-                torch.repeat_interleave(
-                    sampling_info.acc_additive_penalties, self.draft_token_num, dim=0
-                )
-            )
-        if sampling_info.acc_scaling_penalties is not None:
-            apply_scaling_penalties(
-                next_token_logits,
-                torch.repeat_interleave(
-                    sampling_info.acc_scaling_penalties, self.draft_token_num, dim=0
-                ),
-            )
-        if sampling_info.logit_bias is not None:
-            next_token_logits.add_(
-                torch.repeat_interleave(
-                    sampling_info.logit_bias, self.draft_token_num, dim=0
-                )
-            )
+        if shortcut_ids is None:
+            next_token_logits = logits_output.next_token_logits
 
-        # Apply grammar mask if provided
-        if vocab_mask is not None:
-            assert self.grammar is not None
-            self.grammar.apply_vocab_mask(
-                logits=next_token_logits, vocab_mask=vocab_mask
-            )
+            # Apply penalty
+            # This is a relaxed version of penalties for speculative decoding.
+            if sampling_info.acc_additive_penalties is not None:
+                next_token_logits.add_(
+                    torch.repeat_interleave(
+                        sampling_info.acc_additive_penalties,
+                        self.draft_token_num,
+                        dim=0,
+                    )
+                )
+            if sampling_info.acc_scaling_penalties is not None:
+                apply_scaling_penalties(
+                    next_token_logits,
+                    torch.repeat_interleave(
+                        sampling_info.acc_scaling_penalties, self.draft_token_num, dim=0
+                    ),
+                )
+            if sampling_info.logit_bias is not None:
+                next_token_logits.add_(
+                    torch.repeat_interleave(
+                        sampling_info.logit_bias, self.draft_token_num, dim=0
+                    )
+                )
+
+            # Apply grammar mask if provided
+            if vocab_mask is not None:
+                assert self.grammar is not None
+                self.grammar.apply_vocab_mask(
+                    logits=next_token_logits, vocab_mask=vocab_mask
+                )
 
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
-        predict_shape = list(next_token_logits.shape)[:-1]
+        if shortcut_ids is not None:
+            target_predict = shortcut_ids.reshape(bs, self.draft_token_num)
+            predict_shape = list(target_predict.shape)
+        else:
+            predict_shape = list(next_token_logits.shape)[:-1]
         predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
         accept_index = torch.full(
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
@@ -393,9 +402,15 @@ class EagleVerifyInputV2Mixin:
         num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Sample tokens
-        if sampling_info.is_all_greedy or _is_npu or _is_hip:
-            target_predict = torch.argmax(next_token_logits, dim=-1)
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
+        if (
+            shortcut_ids is not None
+            or sampling_info.is_all_greedy
+            or _is_npu
+            or _is_hip
+        ):
+            if shortcut_ids is None:
+                target_predict = torch.argmax(next_token_logits, dim=-1)
+                target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable

@@ -33,7 +33,6 @@ import sys
 import torch
 import torch.distributed as dist
 
-
 # Dense M sweep to locate the eager→graph crossover precisely.
 M_SWEEP = [1, 2, 4, 6, 8, 10, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
 # V_local for Qwen3.5 FP8 LM-head on TP=8 (vocab 248320 / 8).
@@ -175,8 +174,10 @@ def main():
             f"{'base_eager (ms)':>16}  {'short_eager (ms)':>17}  {'spdup_eager':>11}  "
             f"{'base_graph (ms)':>16}  {'short_graph (ms)':>17}  {'spdup_graph':>11}"
         )
-        print(f"\nShape: V_local={V_LOCAL}  V_total={V_LOCAL * world_size}  "
-              f"dtype={DTYPE}  TP={world_size}\n")
+        print(
+            f"\nShape: V_local={V_LOCAL}  V_total={V_LOCAL * world_size}  "
+            f"dtype={DTYPE}  TP={world_size}\n"
+        )
         print(hdr)
         print("-" * len(hdr))
         cutoff_eager = None
