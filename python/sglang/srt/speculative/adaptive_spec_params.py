@@ -8,6 +8,7 @@ from __future__ import annotations
 import bisect
 import json
 import logging
+import math
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.utils import log_info_on_rank0
@@ -160,6 +161,7 @@ class AdaptiveSpeculativeParams:
         self.warmup_batches = cfg.get("warmup_batches", 10)
         self.down_hysteresis = cfg.get("down_hysteresis", -0.25)
         self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
+        self.ceiling_coeff = cfg.get("ceiling_coeff", 1.67)
 
         if initial_steps in self.candidate_steps:
             self.current_steps = initial_steps
@@ -210,7 +212,6 @@ class AdaptiveSpeculativeParams:
         old_steps = self.current_steps
         current_idx = self.candidate_steps.index(old_steps)
 
-        # TODO: Consider limiting step changes to avoid overshooting.
         while current_idx > 0:
             prev_step = self.candidate_steps[current_idx - 1]
             drop_threshold = prev_step - 0.5 + self.down_hysteresis
@@ -227,7 +228,17 @@ class AdaptiveSpeculativeParams:
             else:
                 break
 
+        # EMA ceiling: prevent over-speculation when draft quality is low.
+        # ceiling_coeff controls aggressiveness (default 1.67 = 60% accept_rate breakeven).
+        # Only applied as a downward cap — never blocks step-ups that hysteresis allows,
+        # so the system can explore higher steps and let the EMA catch up.
         target = self.candidate_steps[current_idx]
+        if self.ceiling_coeff > 0:
+            ceiling = max(1, math.ceil(self.ema_accept_len * self.ceiling_coeff))
+            if target > ceiling and target <= old_steps:
+                while current_idx > 0 and self.candidate_steps[current_idx] > ceiling:
+                    current_idx -= 1
+                target = self.candidate_steps[current_idx]
 
         if target != old_steps:
             self.current_steps = target
