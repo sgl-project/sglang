@@ -55,6 +55,7 @@ def _fused_moe_lora_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    c_map_ptr,  # NULL unless USE_C_MAP_INPUT or USE_C_MAP_OUTPUT
     # Matrix dimensions
     N,
     K,
@@ -92,6 +93,15 @@ def _fused_moe_lora_kernel(
     USE_GDC: tl.constexpr,
     launch_pdl: tl.constexpr,
     IS_PRIMARY: tl.constexpr,
+    # c_map indirection — when set, the kernel reads/writes via
+    # ``c_map[offs_token]`` instead of ``offs_token``. Lets the caller keep
+    # tensors in expert-sorted layout and skip explicit ``shuffle_rows`` round
+    # trips. ``USE_C_MAP_INPUT`` applies when the input row is per-pair
+    # (down path: input is already expert-sorted intermediate);
+    # ``USE_C_MAP_OUTPUT`` applies when the output accumulator buffer is
+    # expert-sorted. Both default off so existing callers compile identically.
+    USE_C_MAP_INPUT: tl.constexpr,
+    USE_C_MAP_OUTPUT: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     slice_id = tl.program_id(axis=1)
@@ -146,12 +156,29 @@ def _fused_moe_lora_kernel(
     )
     token_mask = offs_token < num_valid_tokens
 
+    # c_map[offs_token] maps a token-major pair index back to the expert-sorted
+    # position used by ``cutlass_fp4_group_mm`` outputs. Only read if at least
+    # one side asks for the remap; constexpr-False keeps the load out of the
+    # SASS for existing callers.
+    if USE_C_MAP_INPUT or USE_C_MAP_OUTPUT:
+        offs_token_sorted = tl.load(
+            c_map_ptr + offs_token, mask=token_mask, other=0
+        ).to(tl.int64)
+
     # ================================================================= secure
 
     # get a_ptrs,b_ptrs
-    a_ptrs = cur_a_ptr + (
-        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-    )
+    if USE_C_MAP_INPUT:
+        # Input is already expert-sorted (down path with sorted intermediate):
+        # read row at sorted_pos = c_map[pair_idx].
+        a_row = offs_token_sorted
+    else:
+        # Existing behavior: ``offs_token // top_k`` gives the M-index for
+        # the gate_up path (where ``a`` is token-major hidden_states), or
+        # ``offs_token`` itself when ``top_k == 1`` (down path with
+        # token-major intermediate, the existing default).
+        a_row = offs_token // top_k
+    a_ptrs = cur_a_ptr + (a_row[:, None] * stride_am + offs_k[None, :] * stride_ak)
 
     b_ptrs = (
         cur_b_ptr
@@ -195,9 +222,15 @@ def _fused_moe_lora_kernel(
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
     accumulator = accumulator.to(c_ptr.dtype.element_ty)
-    # Write back the block of the output
+    # Write back the block of the output. For the sorted-layout path we land
+    # the delta at the expert-sorted row (sorted_pos), matching where the
+    # base GEMM output lives in the caller's buffer.
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = cur_c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    if USE_C_MAP_OUTPUT:
+        c_row = offs_token_sorted
+    else:
+        c_row = offs_token
+    c_ptrs = cur_c_ptr + stride_cm * c_row[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
 
     if SPLIT_K == 1:
@@ -239,6 +272,8 @@ def _fused_moe_lora_shrink(
     split_k: int,
     top_k_divisor: int = None,
     mul_routed_weight: bool = False,
+    c_map: torch.Tensor | None = None,
+    input_is_sorted: bool = False,
 ) -> None:
     w1_lora_a_stacked = lora_a_stacked[0]
 
@@ -272,6 +307,7 @@ def _fused_moe_lora_shrink(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
+        c_map,
         N,
         K,
         EM,
@@ -300,6 +336,11 @@ def _fused_moe_lora_shrink(
         ),
         MUL_ROUTED_WEIGHT=False,
         IS_PRIMARY=True,
+        # Shrink reads input via c_map only when caller marks the input as
+        # already expert-sorted (down path); the scratch ``a_intermediate``
+        # stays token-major regardless.
+        USE_C_MAP_INPUT=bool(input_is_sorted),
+        USE_C_MAP_OUTPUT=False,
         **shrink_config,
     )
 
@@ -339,6 +380,7 @@ def _fused_moe_lora_expand(
     split_k: int,
     mul_routed_weight: bool = False,
     offset: int = 0,
+    c_map: torch.Tensor | None = None,
 ) -> None:
 
     b_ptr = _get_ptr(lora_b_stacked, device)
@@ -377,6 +419,7 @@ def _fused_moe_lora_expand(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
+        c_map,
         N,
         K,
         EM,
@@ -401,6 +444,13 @@ def _fused_moe_lora_expand(
         top_k=1,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         IS_PRIMARY=False,
+        # Expand writes ``b_intermediate_cache1`` at expert-sorted positions
+        # via c_map iff the caller hands a c_map. The downstream Python
+        # accumulate (``output += b_intermediate_cache1``) then lands the
+        # delta on the matching expert-sorted row of ``output``. Caller is
+        # responsible for interpreting ``output`` in the expected layout.
+        USE_C_MAP_INPUT=False,
+        USE_C_MAP_OUTPUT=c_map is not None,
         **expand_config,
     )
     for i in range(num_slices):
@@ -442,6 +492,7 @@ def _fused_moe_lora(
     mul_routed_weight: bool = False,
     fully_sharded: bool = False,
     offset: int = 0,
+    c_map: torch.Tensor | None = None,
 ) -> None:
     assert len(lora_a_stacked) == len(lora_b_stacked) > 0
     assert (
@@ -486,6 +537,11 @@ def _fused_moe_lora(
         device=device,
     )
 
+    # When the caller marks the layout sorted (``c_map is not None``) AND the
+    # input row is per-pair (``input_is_expanded``), the shrink reads its
+    # input via c_map. Gate-up path keeps M-index addressing regardless,
+    # because hidden_states is always token-major.
+    shrink_input_is_sorted = c_map is not None and input_is_expanded
     _fused_moe_lora_shrink(
         a_intermediate_cache1,
         qcurr_hidden_states,
@@ -515,6 +571,8 @@ def _fused_moe_lora(
         shrink_split_k,
         top_k_divisor=shrink_top_k_divisor,
         mul_routed_weight=False,
+        c_map=c_map,
+        input_is_sorted=shrink_input_is_sorted,
     )
 
     if fully_sharded:
@@ -562,6 +620,7 @@ def _fused_moe_lora(
         expand_split_k,
         mul_routed_weight,
         offset,
+        c_map=c_map,
     )
 
 
@@ -595,6 +654,7 @@ def _fused_moe_lora_fake(
     mul_routed_weight: bool = False,
     fully_sharded: bool = False,
     offset: int = 0,
+    c_map: torch.Tensor | None = None,
 ) -> None:
     return
 
@@ -625,7 +685,10 @@ def _fused_moe_lora_shrink_fake(
     num_warps: int,
     num_stages: int,
     split_k: int,
+    top_k_divisor: int = None,
     mul_routed_weight: bool = False,
+    c_map: torch.Tensor | None = None,
+    input_is_sorted: bool = False,
 ) -> None:
     return
 
@@ -661,6 +724,7 @@ def _fused_moe_lora_expand_fake(
     split_k: int,
     mul_routed_weight: bool = False,
     offset: int = 0,
+    c_map: torch.Tensor | None = None,
 ) -> None:
     return
 

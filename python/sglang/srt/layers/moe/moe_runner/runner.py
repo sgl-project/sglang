@@ -134,11 +134,17 @@ class MoeRunner:
 
         # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore,
         # CutlassFp4LoraRunnerCore) bypass the pre-permute step and do their
-        # own alignment internally.
+        # own alignment internally. ``lora_info`` is also passed so the runner
+        # can opt into sorted-layout LoRA hooks by mutating fields like
+        # ``c_map`` / ``sorted_layout`` before the hook closures fire.
         if hasattr(self.runner_core, "run_from_dispatch"):
             hooks = _maybe_build_lora_hooks(dispatch_output)
             return self.runner_core.run_from_dispatch(
-                dispatch_output, quant_info, self.config, hooks=hooks
+                dispatch_output,
+                quant_info,
+                self.config,
+                hooks=hooks,
+                lora_info=lora_info,
             )
 
         dispatch_format = dispatch_output.format.value

@@ -37,8 +37,15 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 
 if _is_cuda:
-    from sgl_kernel import silu_and_mul
+    # In-tree JIT variant (carries the ``swap_halves`` flag added for the
+    # ``[Up | Gate]`` Kimi-K2.5 W13 loader layout). The sgl_kernel AOT
+    # build doesn't expose ``swap_halves`` yet; the JIT path is the only
+    # caller of swap_halves and is loaded on demand on first use.
+    from sglang.jit_kernel.activation import silu_and_mul
 elif _is_hip:
+    # HIP path doesn't reach the cutlass FP4 LoRA runner (SM100+ only).
+    # Keep the existing import for code-symmetry; if it's ever called with
+    # swap_halves=True it will raise.
     from vllm._custom_ops import silu_and_mul
 
 
@@ -81,6 +88,7 @@ class CutlassFp4LoraRunnerCore:
         quant_info: CutlassFp4MoeQuantInfo,
         runner_config: MoeRunnerConfig,
         hooks: Optional["LoRAHooks"] = None,
+        lora_info=None,
     ) -> "StandardCombineInput":
         from sgl_kernel import prepare_moe_input
 
@@ -97,6 +105,15 @@ class CutlassFp4LoraRunnerCore:
         topk_output = dispatch_output.topk_output
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids
+
+        if (
+            lora_info is not None
+            and lora_info.lora_use_virtual_experts
+            and lora_info.has_active_lora
+        ):
+            raise NotImplementedError(
+                "Cutlass FP4 LoRA virtual experts are added in the virtual-experts PR."
+            )
 
         m_a = hidden_states.shape[0]
         num_topk = topk_ids.shape[1]
@@ -160,37 +177,31 @@ class CutlassFp4LoraRunnerCore:
             params.to_gemm1_args(),
         )
 
+        # Hand the LoRA hook builder the c_map so its kernel calls read/write
+        # against the expert-sorted base GEMM buffers directly, skipping the
+        # 3× ``shuffle_rows`` layout bridge the token-major contract would
+        # otherwise need (un-sort gateup, re-sort gateup, un-sort intermediate).
+        # ``sorted_layout=True`` also tells ``_add_lora_down_delta`` to leave
+        # the router weighting to the runner — see the post-W2 multiply below.
+        # The hook closures captured ``lora_info`` from ``build_lora_hooks`` so
+        # these mutations are visible at hook-call time.
+        if lora_info is not None:
+            lora_info.c_map = c_map
+            lora_info.sorted_layout = True
+
         # ---- LoRA w13 delta
-        # Un-sort to token-major with ``c_map`` (pair-index permutation), run
-        # the hook, then re-sort with ``inv_c_map``. ``a_map`` is an M-index
-        # and is NOT a valid inverse for the pair-index ``[M*topk, *]`` tensor
-        # — using it silently corrupts every (token, k>0) row.
+        # Output buffer is ``gateup_flat`` interpreted as ``[M, topk, 2N]``;
+        # the kernel uses c_map indirection to write the delta at the
+        # expert-sorted row matching the base GEMM output.
         if hooks is not None and hooks.after_gate_up is not None:
-            inv_c_map = torch.empty_like(c_map)
-            inv_c_map[c_map.long()] = torch.arange(
-                total_tokens, device=c_map.device, dtype=c_map.dtype
-            )
-            gateup_token_major = shuffle_rows(gateup_flat, c_map, (total_tokens, N))
-            gateup_3d = gateup_token_major.view(m_a, num_topk, N)
+            gateup_3d = gateup_flat.view(m_a, num_topk, N)
             hooks.after_gate_up(hidden_states, gateup_3d, topk_weights, topk_ids)
-            gateup_flat = shuffle_rows(
-                gateup_token_major.view(total_tokens, N),
-                inv_c_map,
-                (total_tokens, N),
-            )
 
         # ---- silu + mul
-        if quant_info.w13_swap_halves:
-            # ``[up | gate]`` layout: silu(gate) * up = silu(second) * first.
-            intermediate = (
-                torch.nn.functional.silu(gateup_flat[:, N // 2 :].float())
-                * gateup_flat[:, : N // 2].float()
-            ).to(out_dtype)
-        else:
-            intermediate = torch.empty(
-                total_tokens, N // 2, dtype=out_dtype, device=device
-            )
-            silu_and_mul(gateup_flat, intermediate)
+        # ``w13_swap_halves=True`` selects the ``[up | gate]`` convention
+        # (silu(second) * first) for FlashInfer-CUTLASS NVFP4 W13 loaders.
+        intermediate = torch.empty(total_tokens, N // 2, dtype=out_dtype, device=device)
+        silu_and_mul(gateup_flat, intermediate, swap_halves=quant_info.w13_swap_halves)
 
         # ---- GEMM 2 (w2)
         int_fp4, int_blockscale = scaled_fp4_experts_quant(
@@ -210,19 +221,18 @@ class CutlassFp4LoraRunnerCore:
             params.to_gemm2_args(),
         )
 
-        # Un-sort to token-major; needed by ``after_down`` and by the combine.
-        out_3d = shuffle_rows(out_flat, c_map, (total_tokens, K)).view(m_a, num_topk, K)
+        # ---- LoRA w2 delta
+        # Input ``intermediate`` is already expert-sorted (W13->silu output);
+        # the down kernel uses c_map indirection on BOTH input and output, so
+        # we don't materialize a token-major copy. ``mul_routed_weight=False``
+        # is set inside ``_add_lora_down_delta`` for sorted layout — the
+        # router weighting happens once below, over ``base + unweighted_delta``.
+        if hooks is not None and hooks.after_down is not None:
+            out_3d_sorted_view = out_flat.view(m_a, num_topk, K)
+            hooks.after_down(intermediate, out_3d_sorted_view, local_weights, topk_ids)
 
-        # Standard hook contract: the down hook adds a router-weighted delta
-        # into an already-router-weighted per-expert output.
+        # ---- combine: un-sort once, weight (base + delta) once, sum.
+        out_3d = shuffle_rows(out_flat, c_map, (total_tokens, K)).view(m_a, num_topk, K)
         if not runner_config.apply_router_weight_on_input:
             out_3d = out_3d * local_weights.view(m_a, num_topk, 1).to(out_dtype)
-
-        # ---- LoRA w2 delta
-        if hooks is not None and hooks.after_down is not None:
-            intermediate_token_major = shuffle_rows(
-                intermediate, c_map, (total_tokens, N // 2)
-            )
-            hooks.after_down(intermediate_token_major, out_3d, local_weights, topk_ids)
-
         return StandardCombineInput(hidden_states=out_3d.sum(dim=1))
