@@ -52,7 +52,7 @@ export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.9 https://github.com/sgl-project/sglang.git
+git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
