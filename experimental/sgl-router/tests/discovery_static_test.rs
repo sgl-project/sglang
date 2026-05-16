@@ -270,3 +270,73 @@ model_ids = ["m1"]
     .unwrap();
     assert!(matches!(event, DiscoveryEvent::Added(_)));
 }
+
+/// Editors and config-management tooling (vim, k8s ConfigMap mounts,
+/// `mv`-based deploys) often replace a file via `rename(tmp, target)`
+/// rather than overwriting in place.  The watcher must pick up the new
+/// content from a rename, otherwise rolling a worker pool via atomic
+/// swap would silently leave the router on the old topology.
+#[tokio::test]
+async fn atomic_rename_replacement_is_picked_up_by_watcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workers.toml");
+    tokio::fs::write(
+        &path,
+        r#"
+[[workers]]
+id = "w1"
+url = "http://x:30000"
+mode = "plain"
+model_ids = ["m1"]
+"#,
+    )
+    .await
+    .unwrap();
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let cfg = StaticFileDiscoveryConfig {
+        path: path.to_string_lossy().into_owned(),
+        poll_interval_ms: 50,
+    };
+    let _h = sgl_router::discovery::static_file::spawn(cfg, tx)
+        .await
+        .unwrap();
+    // Drain the initial Added for w1.
+    let _ = rx.recv().await.unwrap();
+
+    // Atomically swap in a new file containing w1+w2 via rename.
+    let tmp = dir.path().join("workers.toml.new");
+    tokio::fs::write(
+        &tmp,
+        r#"
+[[workers]]
+id = "w1"
+url = "http://x:30000"
+mode = "plain"
+model_ids = ["m1"]
+
+[[workers]]
+id = "w2"
+url = "http://y:30000"
+mode = "plain"
+model_ids = ["m1"]
+"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::rename(&tmp, &path).await.unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let e = rx.recv().await.unwrap();
+            if let DiscoveryEvent::Added(s) = &e {
+                if s.id.0 == "w2" {
+                    return e;
+                }
+            }
+        }
+    })
+    .await
+    .expect("watcher must observe the renamed file's new content");
+    assert!(matches!(event, DiscoveryEvent::Added(_)));
+}

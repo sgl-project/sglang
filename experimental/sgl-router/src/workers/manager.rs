@@ -153,14 +153,24 @@ pub async fn run_with_http(
                 registry.remove(&id);
             }
             DiscoveryEvent::ModeChanged { id, mode } => {
-                tracing::info!("discovery: ~worker {id} mode→{mode:?}");
                 // Mutate mode in place — preserves active_requests counter
                 // (in-flight LoadGuards stay valid) and CircuitBreaker state
                 // (open/half-open survives PD role flips).
-                if let Some(w) = registry.get(&id) {
-                    w.set_mode(mode);
-                    // workers_for_mode filters at query time via w.mode(), so
-                    // no secondary index needs updating.
+                //
+                // workers_for_mode filters at query time via w.mode(), so no
+                // secondary index needs updating.
+                match registry.get(&id) {
+                    Some(w) => {
+                        tracing::info!("discovery: ~worker {id} mode→{mode:?}");
+                        w.set_mode(mode);
+                    }
+                    None => {
+                        tracing::warn!(
+                            id = %id,
+                            mode = ?mode,
+                            "discovery: ModeChanged for unknown worker — out-of-order event from backend",
+                        );
+                    }
                 }
             }
         }
