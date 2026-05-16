@@ -8,12 +8,17 @@ use std::sync::Arc;
 
 /// RAII guard that increments `active_requests` on construction and
 /// decrements on drop.  Obtain via [`Worker::load_guard`].
+///
+/// `#[must_use]`: a statement-form call like `worker.load_guard();` would
+/// drop the guard on the same line, so the counter would never see the
+/// in-flight request.  The compile-time warning catches that misuse.
+#[must_use = "LoadGuard must be held for the request's lifetime; dropping it immediately decrements active_requests"]
 pub struct LoadGuard {
     counter: Arc<AtomicUsize>,
 }
 
 impl LoadGuard {
-    pub fn new(counter: Arc<AtomicUsize>) -> Self {
+    pub(crate) fn new(counter: Arc<AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
         Self { counter }
     }
@@ -34,11 +39,17 @@ impl WorkerMode {
         }
     }
 
+    /// Inverse of [`Self::as_u8`].  The only writers of the underlying
+    /// `AtomicU8` are `as_u8`-derived values, so any out-of-range byte
+    /// indicates memory corruption or a stale store from an
+    /// incompatible build — fail loudly rather than silently mislabel
+    /// the worker as `Decode`.
     fn from_u8(v: u8) -> Self {
         match v {
             0 => WorkerMode::Plain,
             1 => WorkerMode::Prefill,
-            _ => WorkerMode::Decode,
+            2 => WorkerMode::Decode,
+            other => unreachable!("invalid WorkerMode discriminant {other}"),
         }
     }
 }

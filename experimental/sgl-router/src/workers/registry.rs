@@ -21,9 +21,17 @@ impl WorkerRegistry {
 
     /// Add a worker, optionally supplying a circuit-breaker config.
     /// Pass `None` to use the circuit-breaker default (threshold = 3).
+    ///
+    /// Re-adding an existing `WorkerId` is an upsert: the prior entry's
+    /// `by_model` memberships are cleared first so a model that the new
+    /// spec no longer serves stops resolving to this worker.  Without the
+    /// pre-removal step a worker whose model set shrank would still appear
+    /// in `workers_for(<dropped model>)` because `by_id.get(...)` would
+    /// return the new worker via the stale model→id index.
     pub fn add_with_cb(&self, spec: WorkerSpec, cb: Option<CircuitBreakerConfig>) {
         let w = Arc::new(Worker::with_cb_config(spec, cb));
         let id = w.id.clone();
+        self.remove(&id);
         for m in &w.model_ids {
             self.by_model
                 .entry(m.clone())
@@ -143,5 +151,47 @@ mod tests {
         let prefill = r.workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill);
         assert_eq!(plain.len(), 1);
         assert_eq!(prefill.len(), 1);
+    }
+
+    /// Re-adding a worker with a shrunken `model_ids` must drop the worker
+    /// from the models it no longer serves.  The earlier implementation
+    /// only updated `by_id`, leaving the stale `by_model` entries pointing
+    /// at the new worker.
+    #[test]
+    fn re_add_with_shrunken_model_set_drops_stale_indexes() {
+        let r = WorkerRegistry::default();
+        r.add(spec("w1", WorkerMode::Plain, &["m1", "m2"]));
+        assert_eq!(r.workers_for(&ModelId("m2".into())).len(), 1);
+
+        r.add(spec("w1", WorkerMode::Plain, &["m1"]));
+        assert_eq!(
+            r.workers_for(&ModelId("m2".into())).len(),
+            0,
+            "w1 no longer serves m2 after re-add"
+        );
+        assert_eq!(
+            r.workers_for(&ModelId("m1".into())).len(),
+            1,
+            "w1 still serves m1"
+        );
+    }
+
+    /// Re-adding the same id with a different mode reflects in
+    /// `workers_for_mode`.
+    #[test]
+    fn re_add_with_different_mode_updates_mode_filter() {
+        let r = WorkerRegistry::default();
+        r.add(spec("w1", WorkerMode::Prefill, &["m"]));
+        r.add(spec("w1", WorkerMode::Decode, &["m"]));
+        assert_eq!(
+            r.workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
+                .len(),
+            0,
+        );
+        assert_eq!(
+            r.workers_for_mode(&ModelId("m".into()), WorkerMode::Decode)
+                .len(),
+            1,
+        );
     }
 }
