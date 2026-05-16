@@ -697,7 +697,7 @@ jobs:
             --step-summary
 
       - name: Publish to sglang-ci-data
-        if: always() && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
+        if: always()
         env:
           GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
