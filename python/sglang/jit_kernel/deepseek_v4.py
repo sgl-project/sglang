@@ -279,7 +279,7 @@ def _jit_hisparse_transfer_module() -> Module:
         make_name("hisparse_transfer"),
         cuda_files=["deepseek_v4/hisparse_transfer.cuh"],
         cuda_wrappers=[
-            ("hisparse_transfer", "hisparse_transfer"),
+            ("hisparse_offload_to_host", "hisparse_offload_to_host"),
             ("hisparse_load_to_device", "hisparse_load_to_device"),
         ],
     )
@@ -292,7 +292,7 @@ def hisparse_offload_to_host(
     cpu_indices: torch.Tensor,
 ) -> None:
     module = _jit_hisparse_transfer_module()
-    module.hisparse_transfer(gpu_ptrs, cpu_ptrs, gpu_indices, cpu_indices)
+    module.hisparse_offload_to_host(gpu_ptrs, cpu_ptrs, gpu_indices, cpu_indices)
 
 
 def hisparse_load_to_device(

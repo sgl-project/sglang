@@ -64,7 +64,7 @@ OFFLOAD_KERNEL void load_to_gpu(const __grid_constant__ IOParams params) {
 }
 
 [[maybe_unused]]
-void hisparse_transfer(
+void hisparse_offload_to_host(
     tvm::ffi::TensorView gpu_ptrs,
     tvm::ffi::TensorView cpu_ptrs,
     tvm::ffi::TensorView gpu_indices,
