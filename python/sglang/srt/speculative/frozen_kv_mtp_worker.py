@@ -355,7 +355,23 @@ class FrozenKVMTPWorker(TpModelWorker):
         mm_input_embeds: Optional[torch.Tensor] = None,
         draft_input: Optional[FrozenKVMTPDraftInput] = None,
     ) -> None:
-        """Run the one-token assistant seed step against frozen target KV."""
+        """Stash seed inputs on ``batch.spec_info`` for the next draft iter.
+
+        Historically this ran a one-token assistant forward eagerly to (a)
+        emit the first draft token's topk distribution and (b) update the
+        recurrent hidden into the assistant's space. That forward is now
+        the first iteration of the captured draft cuda graph (see
+        ``FrozenKVMTPCudaGraphRunner`` and ``draft_forward``'s seed iter),
+        so this hook only has to pass the inputs forward.
+
+        ``seq_lens_cpu`` / ``mm_input_embeds`` / ``draft_input`` are kept
+        in the signature for caller compatibility; they are unused now.
+        ``mm_input_embeds`` in particular is dropped because the seed
+        consumes a single text bonus token, which the assistant resolves
+        via its own embedding lookup.
+        """
+        del seq_lens_cpu, mm_input_embeds, draft_input
+
         if batch.forward_mode.is_idle() or last_token_ids.numel() == 0:
             batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
                 device=batch.device,
@@ -366,51 +382,29 @@ class FrozenKVMTPWorker(TpModelWorker):
             )
             return
 
-        if draft_input is None:
-            draft_input = FrozenKVMTPDraftInput()
-
-        draft_input.bonus_tokens = last_token_ids.to(torch.int64)
-        draft_input.hidden_states = last_hidden_states
-        draft_input.capture_hidden_mode = CaptureHiddenMode.LAST
-        draft_input.num_tokens_per_req = 1
-        draft_input.num_tokens_for_logprob_per_req = 1
-        draft_input.positions = self._position_for_batch(batch)
-
-        forward_mode_backup = batch.forward_mode
-        input_ids_backup = batch.input_ids
-        return_hidden_states_backup = batch.return_hidden_states
-        return_logprob_backup = batch.return_logprob
-        spec_info_backup = batch.spec_info
-
-        batch.forward_mode = ForwardMode.DECODE
-        batch.input_ids = draft_input.bonus_tokens
-        batch.return_hidden_states = False
-        batch.return_logprob = False
-        batch.spec_info = draft_input
-
-        try:
-            batch.seq_lens_cpu_cache = seq_lens_cpu
-            forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
-            forward_batch.return_logprob = False
-            if mm_input_embeds is not None:
-                forward_batch.mm_input_embeds = mm_input_embeds
-            self._set_positions(forward_batch)
-            self._init_frozen_kv_metadata(forward_batch)
-            with self._target_kv_pool_view(forward_batch):
-                logits_output = self.draft_model_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
-                ).logits_output
-            maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_seed")
-            self._capture_for_decode(logits_output, draft_input)
-        finally:
-            batch.forward_mode = forward_mode_backup
-            batch.input_ids = input_ids_backup
-            batch.return_hidden_states = return_hidden_states_backup
-            batch.return_logprob = return_logprob_backup
-            # Keep the seeded draft state; only restore the old object on error paths
-            # before the assignment above could have happened.
-            if batch.spec_info is not draft_input:
-                batch.spec_info = spec_info_backup
+        stashed = FrozenKVMTPDraftInput()
+        stashed.bonus_tokens = last_token_ids.to(torch.int64)
+        stashed.hidden_states = last_hidden_states
+        # `EagleDraftInput.filter_batch` / `merge_batch` (inherited) slice and
+        # concatenate `topk_p` / `topk_index` whenever requests join or leave
+        # the running batch. Pre-Option-A the eager seed step populated these
+        # via `_capture_for_decode`; now that the seed runs inside the captured
+        # cuda graph, the values are produced after `replay()` -- but the
+        # scheduler still touches them between iters, so we need real-shaped
+        # tensors here. Zeros are fine; the captured seed iter overwrites them
+        # before any downstream code reads them.
+        bs = last_token_ids.shape[0]
+        device = last_token_ids.device
+        stashed.topk_p = torch.zeros(
+            (bs, self.topk), device=device, dtype=torch.float32
+        )
+        stashed.topk_index = torch.zeros(
+            (bs, self.topk), device=device, dtype=torch.int64
+        )
+        stashed.capture_hidden_mode = CaptureHiddenMode.LAST
+        stashed.num_tokens_per_req = 1
+        stashed.num_tokens_for_logprob_per_req = 1
+        batch.spec_info = stashed
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -646,20 +640,73 @@ class FrozenKVMTPWorker(TpModelWorker):
     ):
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, FrozenKVMTPDraftInput)
-        topk_p, topk_index, hidden_states = (
-            spec_info.topk_p,
-            spec_info.topk_index,
-            spec_info.hidden_states,
-        )
-        maybe_detect_nan(topk_p, "frozen_kv_mtp_draft: initial topk_p")
 
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
 
-        if not skip_attn_backend_init and self.speculative_num_steps > 1:
+        # The seed iter + N-1 draft model forwards all run at the same
+        # `seq_lens - 1` rope position (see `set_frozen_kv_positions`'s
+        # "Rope phase = last written target slot, not advanced per draft
+        # step." docstring), so a single attention init covers the whole
+        # captured loop. The seed iter always runs at least one
+        # `model.forward`, so attention metadata must be initialized even
+        # when `speculative_num_steps == 1` (which was the previous gate).
+        if not skip_attn_backend_init:
             self._init_frozen_kv_metadata(forward_batch)
 
+        # === Seed iteration ===========================================
+        # Absorbs the previously-eager `_run_assistant_seed_step`. Runs the
+        # assistant once on (bonus_token, target_h) to convert the target's
+        # hidden state into the assistant's recurrent space and emit the
+        # first draft token's topk distribution. The result feeds the
+        # existing N-step recurrent loop as iter 0's `(topk_p, topk_index,
+        # hidden_states)`.
+        #
+        # Topk>1: replicate the per-req bonus token / target hidden out to
+        # `bs*topk` so kernel shapes match the rest of the captured loop,
+        # then slice the duplicated rows back down to per-req before
+        # softmax. Topk==1 makes the replicate/slice a no-op.
+        bonus_tokens = spec_info.bonus_tokens
+        target_hidden = spec_info.hidden_states
+        if self.topk > 1:
+            seed_input_ids = bonus_tokens.repeat_interleave(self.topk, dim=0)
+            seed_prev_hidden = target_hidden.repeat_interleave(self.topk, dim=0)
+        else:
+            seed_input_ids = bonus_tokens
+            seed_prev_hidden = target_hidden
+
+        forward_batch.input_ids = seed_input_ids
+        forward_batch.spec_info.hidden_states = seed_prev_hidden
+        self._set_positions(forward_batch)
+
+        with self._target_kv_pool_view(forward_batch):
+            seed_output = self.draft_model_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            ).logits_output
+
+        maybe_detect_nan(
+            seed_output.next_token_logits, "frozen_kv_mtp_draft: seed iter"
+        )
+
+        if self.topk > 1:
+            seed_next_logits = seed_output.next_token_logits[:: self.topk]
+            seed_hidden_per_req = seed_output.hidden_states[:: self.topk]
+        else:
+            seed_next_logits = seed_output.next_token_logits
+            seed_hidden_per_req = seed_output.hidden_states
+
+        probs = torch.softmax(seed_next_logits, dim=-1)
+        topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        maybe_detect_oob(
+            topk_index,
+            0,
+            seed_next_logits.shape[-1],
+            "frozen_kv_mtp_draft: seed topk_index OOB",
+        )
+        hidden_states = seed_hidden_per_req
+
+        # === Recurrent draft loop =====================================
         scores = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
