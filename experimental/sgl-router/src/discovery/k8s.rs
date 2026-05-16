@@ -85,14 +85,14 @@ fn labels_match_selector(labels: &BTreeMap<String, String>, selector: &str) -> b
 ///
 /// Skips endpoints whose `conditions.ready` is explicitly `Some(false)`.
 /// Per the EndpointSlice API spec, `conditions.ready = None` (absent) means
-/// the endpoint **should be considered ready** (BLOCK 4 fix).
+/// the endpoint should be considered ready.
 ///
 /// The worker URL is `http://<addr>:<port>` where port comes from
 /// `EndpointSlice.ports[0].port`, defaulting to `30000` if absent.
 ///
-/// The [`WorkerId`] includes the slice's namespace and name to avoid
-/// cross-namespace IP collisions on overlay networks or with service-mesh
-/// sidecars: `{ns}/{slice_name}/{addr}:{port}` (IMPORTANT-10 fix).
+/// The [`WorkerId`] is `{ns}/{slice_name}/{addr}:{port}` so that pods with
+/// identical IPs in different namespaces (overlay networks, service-mesh
+/// sidecars) never collide on the same key.
 ///
 /// `model_ids` is intentionally left empty — model membership is resolved
 /// by the worker manager via `/server_info` introspection after the
@@ -105,15 +105,11 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
         .and_then(|p| p.port)
         .unwrap_or(30000);
 
-    // IMPORTANT-10: include namespace + slice name in the ID so that pods
-    // with identical IPs in different namespaces (overlay nets, sidecars)
-    // never share a WorkerId.
     let ns = es.metadata.namespace.as_deref().unwrap_or("");
     let slice_name = es.metadata.name.as_deref().unwrap_or("");
 
     let mut out = Vec::new();
     for ep in es.endpoints.iter() {
-        // BLOCK 4: None → true per EndpointSlice API spec.
         let is_ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
         if !is_ready {
             continue;
@@ -142,19 +138,16 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
 /// side; in PD mode the watch is unfiltered and per-slice classification
 /// happens client-side via `classify_mode`.
 ///
-/// **BLOCK 2:** if `cfg.namespace` is empty, `Api::all(client)` is used so
-/// that the watcher is truly cluster-wide. `Api::namespaced(client, "")` is
-/// namespace-scoped to the empty-named namespace, which is almost never what
-/// callers intend.
+/// Empty `cfg.namespace` triggers a cluster-wide watch via `Api::all(client)`.
+/// `Api::namespaced(client, "")` is namespace-scoped to the empty-named
+/// namespace, which is almost never what callers intend.
 ///
-/// **BLOCK 1:** state is tracked as a two-level map
-/// `per_slice: HashMap<SliceUid, HashMap<WorkerId, WorkerSpec>>`.
-/// K8s auto-shards Services with >100 endpoints and CNIs often shard per
-/// AZ, emitting multiple `EndpointSlice` objects per Service.  Using a
-/// flat state map meant each slice's event would silently drop all workers
-/// from sibling slices.  Now each slice's submap is replaced independently;
-/// the global union is recomputed from all submaps and diffed against
-/// `prev_union`.
+/// State is tracked per-slice as `HashMap<SliceUid, HashMap<WorkerId,
+/// WorkerSpec>>`. K8s auto-shards Services with >100 endpoints and CNIs often
+/// shard per AZ, so multiple `EndpointSlice` objects can exist per Service; a
+/// flat state map would let each slice's event silently drop all workers from
+/// sibling slices. The global union is recomputed from all submaps on every
+/// event and diffed against `prev_union` to produce `DiscoveryEvent`s.
 ///
 /// The returned `JoinHandle` runs until the channel is closed or the watcher
 /// stream ends (server restart, etc.).
@@ -168,7 +161,6 @@ pub async fn spawn(
         .await
         .context("kube client default config")?;
 
-    // BLOCK 2: empty namespace → cluster-wide watch.
     let api: Api<EndpointSlice> = if cfg.namespace.is_empty() {
         Api::all(client)
     } else {
@@ -187,7 +179,6 @@ pub async fn spawn(
     let watcher_cfg = watcher::Config::default().labels(&server_side_selector);
 
     let handle = tokio::spawn(async move {
-        // BLOCK 1: per-slice state to handle multi-slice Services correctly.
         // Key: EndpointSlice UID (String).  Value: workers in that slice.
         let mut per_slice: HashMap<String, HashMap<WorkerId, WorkerSpec>> = HashMap::new();
         let mut prev_union: HashMap<WorkerId, WorkerSpec> = HashMap::new();
@@ -405,9 +396,8 @@ mod tests {
         assert!(extract_workers(&s, WorkerMode::Plain).is_empty());
     }
 
-    /// BLOCK 4: conditions.ready = None must default to ready=true per
-    /// EndpointSlice API spec ("undefined → endpoint should be considered
-    /// ready").
+    /// `conditions.ready = None` must default to ready=true per EndpointSlice
+    /// API spec ("undefined → endpoint should be considered ready").
     #[test]
     fn is_ready_none_defaults_to_ready() {
         let mut s = make_slice(&["10.0.0.1"], 30000, false /* overridden below */);
@@ -420,8 +410,8 @@ mod tests {
         );
     }
 
-    /// IMPORTANT 10: WorkerId must include namespace + slice name to avoid
-    /// cross-namespace IP collisions.
+    /// WorkerId must include namespace + slice name to avoid cross-namespace
+    /// IP collisions on overlay networks.
     #[test]
     fn worker_id_includes_namespace_and_slice_name() {
         let mut s = make_slice(&["10.0.0.1"], 30000, true);
@@ -431,8 +421,8 @@ mod tests {
         assert_eq!(ws[0].id.0, "prod/svc-abc-xyz/10.0.0.1:30000");
     }
 
-    /// IMPORTANT 10: WorkerId with no namespace (cluster-scoped) should
-    /// produce a valid ID with empty-namespace prefix (leading slash).
+    /// A cluster-scoped slice (no namespace metadata) must still produce a
+    /// valid `WorkerId` — empty-namespace prefix yields a leading slash.
     #[test]
     fn worker_id_handles_missing_namespace() {
         // make_slice_ns with empty ns leaves metadata.namespace = None.

@@ -27,7 +27,6 @@ impl std::fmt::Display for ModelId {
 /// Prefill/Decode/Plain role of a worker.
 ///
 /// Serialises as `"plain"`, `"prefill"`, `"decode"` (snake_case).
-/// Only `Plain` is actively dispatched until M4 introduces PD routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerMode {
@@ -68,7 +67,6 @@ pub enum DiscoveryEvent {
         id: WorkerId,
     },
     /// Used by the k8s backend when only the PD label flips (rare).
-    /// Full implementation lands in M4.
     ModeChanged {
         id: WorkerId,
         mode: WorkerMode,

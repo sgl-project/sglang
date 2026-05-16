@@ -8,9 +8,9 @@ Tests verify that:
 3. After a simulated watch-connection interruption (router restarted), the
    registry converges back to the correct worker set.
 
-Note: sgl-router M2 does NOT expose a Prometheus /metrics endpoint (deferred
-to M6). The SMG test_reconciliation metric assertions are therefore dropped.
-Disconnect/reconnect coverage is provided by test_lifecycle.TestRouterRestart.
+Note: sgl-router does not currently expose a Prometheus /metrics endpoint,
+so the SMG-style metric assertions are not used here. Disconnect/reconnect
+coverage is provided by test_lifecycle.TestRouterRestart.
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ class TestStaleEndpointRemoval:
     """When fake-worker replicas drop, the router must stop routing to the
     removed endpoints.
 
-    Because sgl-router has no /workers admin API in M2, we verify removal
+    Because sgl-router has no /workers admin API, we verify removal
     indirectly: scale to 0, assert the router returns non-200 (or at least
     that scaling back to 2 restores routing), then restore.
     """

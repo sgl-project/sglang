@@ -18,12 +18,8 @@ pub const DISCOVERY_CHANNEL_CAP: usize = 128;
 /// Spawn the configured discovery backend.
 ///
 /// Returns the consumer end of the event channel and a [`tokio::task::JoinHandle`]
-/// for the producer task.
-///
-/// * Task 4 implements the `static_file` path.
-/// * Task 12 implements the `k8s` path.
-///
-/// Until then both arms return `anyhow::bail!("… not implemented yet")`.
+/// for the producer task.  The producer task runs until the channel is closed
+/// or the underlying watcher / file-notify source ends.
 pub async fn spawn_discovery(
     cfg: &Config,
 ) -> Result<(mpsc::Receiver<DiscoveryEvent>, tokio::task::JoinHandle<()>)> {

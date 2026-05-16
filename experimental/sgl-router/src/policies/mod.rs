@@ -11,8 +11,9 @@ use crate::workers::Worker;
 use dashmap::DashMap;
 use std::sync::Arc;
 
-/// Selection input — carries enough context for cache-aware (M4) without
-/// reshaping the trait. M2 policies only use `workers`.
+/// Selection input — carries the request body so that cache-aware policies
+/// can hash prefix tokens without reshaping the [`Policy`] trait.  Today's
+/// policies (round-robin, random, power-of-two) only read `workers`.
 pub struct SelectionContext<'a> {
     pub model: &'a ModelId,
     pub request_body: Option<&'a [u8]>,

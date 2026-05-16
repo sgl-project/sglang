@@ -6,8 +6,8 @@ Covers:
 3. Router restart — after the router pod is killed, the Deployment restarts
    it and it re-lists the existing EndpointSlice entries without duplicates.
 
-These tests DO NOT use a /workers admin API (sgl-router has none in M2).
-Instead they verify behaviour through /v1/chat/completions responses and
+These tests DO NOT use a /workers admin API (sgl-router does not expose
+one). They verify behaviour through /v1/chat/completions responses and
 by driving the deployment scale.
 """
 

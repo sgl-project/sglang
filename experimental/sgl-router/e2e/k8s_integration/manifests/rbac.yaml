@@ -10,7 +10,7 @@ metadata:
   name: sgl-router
   namespace: sgl-router-test
 rules:
-  # EndpointSlice watch (M2 discovery backend)
+  # EndpointSlice watch (k8s discovery backend)
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
