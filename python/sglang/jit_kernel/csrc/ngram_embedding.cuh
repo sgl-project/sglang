@@ -13,6 +13,9 @@
 
 namespace device::ngram_embedding {
 
+constexpr int kDecodeBlockSize = 256;
+constexpr int kMaxComputeNGramIdsDecodeBlocks = 65535;
+
 __global__ void ComputeNGramIdsKernel(
     int batch_size,
     int ne_n,
@@ -88,44 +91,44 @@ __global__ void ComputeNGramIdsDecodeKernel(
     int batch_size,
     int ne_n,
     int ne_k,
-    int* ne_weights,                      // [ne_n-1,ne_k,ne_n]
-    int* ne_mods,                         // [ne_n-1,ne_k]
-    int* exclusive_ne_embeder_size_sums,  // [(ne_n-1)*ne_k]
-    int* ne_token_table,                  // [max_running_reqs, max_context_len]
-    int max_context_len,                  // max_context_len
-    long* row_indices,                    // [batch_size]
-    int* column_starts,                   // [batch_size]
-    int* n_gram_ids                       // [batch_size, (ne_n-1)*ne_k]
+    const int* __restrict__ ne_weights,                      // [ne_n-1,ne_k,ne_n]
+    const int* __restrict__ ne_mods,                         // [ne_n-1,ne_k]
+    const int* __restrict__ exclusive_ne_embeder_size_sums,  // [(ne_n-1)*ne_k]
+    const int* __restrict__ ne_token_table,                  // [max_running_reqs, max_context_len]
+    int max_context_len,                                     // max_context_len
+    const int64_t* __restrict__ row_indices,                 // [batch_size]
+    const int* __restrict__ column_starts,                   // [batch_size]
+    int* __restrict__ n_gram_ids                             // [batch_size, (ne_n-1)*ne_k]
 ) {
   const int num_configs = (ne_n - 1) * ne_k;
   const int total_outputs = batch_size * num_configs;
 
-  for (int out_idx = blockIdx.x * blockDim.x + threadIdx.x; out_idx < total_outputs;
-       out_idx += blockDim.x * gridDim.x) {
-    const int req_id = out_idx / num_configs;
-    const int config_id = out_idx - req_id * num_configs;
-    const int k = config_id % ne_k;
-    const int n = config_id / ne_k;
-    const int ne_weight_base_idx = n * ne_k * ne_n + k * ne_n;
-    const int ne_mod = ne_mods[n * ne_k + k];
+  for (int output_idx = blockIdx.x * blockDim.x + threadIdx.x; output_idx < total_outputs;
+       output_idx += blockDim.x * gridDim.x) {
+    const int req_id = output_idx / num_configs;
+    const int config_idx = output_idx - req_id * num_configs;
+    const int k_idx = config_idx % ne_k;
+    const int n_idx = config_idx / ne_k;
+    const int weight_offset = n_idx * ne_k * ne_n + k_idx * ne_n;
+    const int ne_mod = ne_mods[n_idx * ne_k + k_idx];
 
     uint64_t n_gram_id = 0;
-    const int req_token_table_index = row_indices[req_id] * max_context_len;
-    const int current_token_table_index = req_token_table_index + column_starts[req_id];
-    for (int j = 0; j < n + 2; j++) {
-      if (current_token_table_index - j < req_token_table_index) {
+    const int64_t req_token_table_offset = row_indices[req_id] * static_cast<int64_t>(max_context_len);
+    const int64_t current_token_table_offset = req_token_table_offset + column_starts[req_id];
+    for (int j = 0; j < n_idx + 2; j++) {
+      if (current_token_table_offset - j < req_token_table_offset) {
         break;
       }
-      const int token = ne_token_table[current_token_table_index - j];
+      const int token = ne_token_table[current_token_table_offset - j];
       if (token < 0) {
         break;
       }
-      const uint64_t term = (uint64_t)token * (uint64_t)ne_weights[ne_weight_base_idx + j];
+      const uint64_t term = static_cast<uint64_t>(token) * static_cast<uint64_t>(ne_weights[weight_offset + j]);
       n_gram_id += term % ne_mod;
     }
     n_gram_id %= ne_mod;
-    n_gram_id += exclusive_ne_embeder_size_sums[n * ne_k + k];
-    n_gram_ids[out_idx] = (int)(n_gram_id);
+    n_gram_id += exclusive_ne_embeder_size_sums[n_idx * ne_k + k_idx];
+    n_gram_ids[output_idx] = static_cast<int>(n_gram_id);
   }
 }
 
@@ -318,21 +321,23 @@ struct NgramEmbeddingKernel {
     const int total_outputs = bs * num_configs;
     const auto stream = LaunchKernel::resolve_device(device_.unwrap());
 
-    constexpr int BLOCK_THREADS = 256;
-    const int grid_size = std::min(65535, static_cast<int>(div_ceil(total_outputs, BLOCK_THREADS)));
+    constexpr int kBlockSize = device::ngram_embedding::kDecodeBlockSize;
+    const int grid_size = std::min(
+        device::ngram_embedding::kMaxComputeNGramIdsDecodeBlocks,
+        static_cast<int>(div_ceil(total_outputs, kBlockSize)));
 
-    LaunchKernel(grid_size, BLOCK_THREADS, stream)(
+    LaunchKernel(grid_size, kBlockSize, stream)(
         device::ngram_embedding::ComputeNGramIdsDecodeKernel,
         bs,
         static_cast<int>(ne_n),
         static_cast<int>(ne_k),
-        static_cast<int*>(ne_weights.data_ptr()),
-        static_cast<int*>(ne_mods.data_ptr()),
-        static_cast<int*>(exclusive_ne_embeder_size_sums.data_ptr()),
-        static_cast<int*>(ne_token_table.data_ptr()),
+        static_cast<const int*>(ne_weights.data_ptr()),
+        static_cast<const int*>(ne_mods.data_ptr()),
+        static_cast<const int*>(exclusive_ne_embeder_size_sums.data_ptr()),
+        static_cast<const int*>(ne_token_table.data_ptr()),
         max_context_len,
-        static_cast<long*>(row_indices.data_ptr()),
-        static_cast<int*>(column_starts.data_ptr()),
+        static_cast<const int64_t*>(row_indices.data_ptr()),
+        static_cast<const int*>(column_starts.data_ptr()),
         static_cast<int*>(n_gram_ids.data_ptr()));
   }
 
