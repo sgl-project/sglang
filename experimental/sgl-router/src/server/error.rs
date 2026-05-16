@@ -20,9 +20,14 @@ pub enum ApiError {
     /// Could not reach the upstream worker (connect refused, DNS, TLS, request
     /// build error). `source` captures the full anyhow chain for server-side
     /// logging; clients see a generic message.
+    ///
+    /// `worker` is the typed `reqwest::Url` so we don't re-stringify a value
+    /// that is already a `Url` at the construction site. Rendering goes
+    /// through `Display`, which produces the same canonical form as
+    /// `Url::as_str()`.
     #[error("upstream unreachable: worker {worker}")]
     UpstreamUnreachable {
-        worker: String,
+        worker: reqwest::Url,
         #[source]
         source: anyhow::Error,
     },
@@ -37,8 +42,11 @@ pub enum ApiError {
 
     /// Wall-clock timeout exceeded while waiting for the upstream worker's
     /// response (per-request `request_timeout`).
+    ///
+    /// `worker` is the typed `reqwest::Url` for the same reason as
+    /// `UpstreamUnreachable`.
     #[error("upstream timed out: worker {worker}")]
-    UpstreamTimeout { worker: String },
+    UpstreamTimeout { worker: reqwest::Url },
 
     #[error("internal: {0}")]
     Internal(#[from] anyhow::Error),
@@ -168,10 +176,11 @@ mod tests {
 
     #[test]
     fn upstream_unreachable_envelope_has_code_and_no_leak() {
-        let worker = "http://10.0.0.42:30000";
+        let worker_str = "http://10.0.0.42:30000/";
+        let worker = reqwest::Url::parse(worker_str).unwrap();
         let secret = "TLS_HANDSHAKE_FAILED at /etc/secret_ca.pem";
         let err = ApiError::UpstreamUnreachable {
-            worker: worker.into(),
+            worker: worker.clone(),
             source: anyhow::anyhow!("{secret}"),
         };
         let resp = err.into_response();
@@ -186,7 +195,7 @@ mod tests {
         assert!(body.contains("\"code\":\"upstream_unreachable\""), "{body}");
         assert!(body.contains("\"type\":\"server_error\""), "{body}");
         assert!(
-            !body.contains(worker) && !body.contains(secret),
+            !body.contains(worker_str) && !body.contains(secret),
             "client body must NOT leak worker URL or reqwest source chain; got: {body}",
         );
     }
@@ -210,9 +219,10 @@ mod tests {
 
     #[test]
     fn upstream_timeout_envelope_has_code_and_no_leak() {
-        let worker = "http://10.0.0.42:30000";
+        let worker_str = "http://10.0.0.42:30000/";
+        let worker = reqwest::Url::parse(worker_str).unwrap();
         let err = ApiError::UpstreamTimeout {
-            worker: worker.into(),
+            worker: worker.clone(),
         };
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -225,7 +235,7 @@ mod tests {
         let body = collect_body(resp);
         assert!(body.contains("\"code\":\"upstream_timeout\""), "{body}");
         assert!(
-            !body.contains(worker),
+            !body.contains(worker_str),
             "client body must NOT leak worker URL; got: {body}",
         );
     }
