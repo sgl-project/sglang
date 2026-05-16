@@ -531,6 +531,49 @@ async fn chat_rejects_string_body_400() {
 }
 
 #[tokio::test]
+async fn non_streaming_mid_body_drop_classified_as_upstream_status() {
+    // Regression: when the upstream replies with a status line and headers
+    // but drops the connection mid-body, the failure is NOT
+    // "upstream_unreachable" (the upstream demonstrably DID reply). It must
+    // be classified as `upstream_status` so the operator-visible envelope
+    // reflects that the worker partially served the request.
+    let worker = common::mock_worker::MockWorker::start_returning_partial_body(
+        StatusCode::OK,
+        b"{\"partial\": ",
+    )
+    .await;
+    let cfg = config(&worker.url);
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(worker.url.parse().unwrap(), TEST_TIMEOUT).unwrap());
+    let app = build_router(Arc::new(AppContext::new(cfg, tokenizers, proxy)));
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_GATEWAY,
+        "mid-body drop must surface as 502",
+    );
+    assert_eq!(
+        res.headers().get("x-router-error-code").unwrap(),
+        "upstream_status",
+        "mid-body drop must be upstream_status (worker DID reply), not upstream_unreachable",
+    );
+}
+
+#[tokio::test]
 async fn malformed_json_returns_400_bad_request() {
     // Regression: a malformed JSON request body must return 400 with
     // bad_request envelope from the router itself; we must NOT forward

@@ -79,10 +79,33 @@ impl Proxy {
             .await
             .map_err(|e| self.classify_reqwest_error(e, path))?;
         let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| self.classify_reqwest_error(e, path))?;
+        // Parity with forward_streaming: log non-2xx upstream responses so a
+        // 5xx spike on non-streaming requests is visible server-side, not
+        // streaming-only.
+        if !status.is_success() {
+            tracing::warn!(
+                upstream = %url,
+                path = path,
+                status = %status,
+                "upstream returned non-2xx on non-streaming request",
+            );
+        }
+        // Headers + status were already received; a mid-body read failure
+        // here is NOT "unreachable" (the upstream demonstrably replied). We
+        // surface it as `UpstreamStatus { status }` with a server-side log
+        // so operators can see the worker started a response and dropped.
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    upstream = %url,
+                    status = %status,
+                    error = ?e,
+                    "upstream dropped connection mid-body",
+                );
+                return Err(ApiError::UpstreamStatus { status });
+            }
+        };
         let mut out = Response::new(Body::from(bytes));
         *out.status_mut() = status;
         out.headers_mut().insert(
