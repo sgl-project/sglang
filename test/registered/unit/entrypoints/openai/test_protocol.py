@@ -19,6 +19,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageContentImageURL,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -436,6 +437,46 @@ class TestFunctionDeferLoading(unittest.TestCase):
         self.assertEqual(parts[0].type, "tool_reference")
         self.assertEqual(parts[0].name, "search_db")
         self.assertEqual(parts[1].type, "text")
+
+
+class TestImageURLPixelFields(unittest.TestCase):
+    """Test min_pixels / max_pixels on ChatCompletionMessageContentImageURL."""
+
+    def test_defaults_to_none(self):
+        obj = ChatCompletionMessageContentImageURL(url="http://example.com/img.jpg")
+        self.assertIsNone(obj.min_pixels)
+        self.assertIsNone(obj.max_pixels)
+
+    def test_accepts_and_roundtrips(self):
+        obj = ChatCompletionMessageContentImageURL(
+            url="http://example.com/img.jpg", min_pixels=256, max_pixels=1048576
+        )
+        self.assertEqual(obj.min_pixels, 256)
+        self.assertEqual(obj.max_pixels, 1048576)
+        data = obj.model_dump()
+        self.assertEqual(data["min_pixels"], 256)
+        self.assertEqual(data["max_pixels"], 1048576)
+
+    def test_chat_request_with_pixel_fields(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "http://example.com/img.jpg",
+                            "min_pixels": 128,
+                            "max_pixels": 512000,
+                        },
+                    }
+                ],
+            }
+        ]
+        request = ChatCompletionRequest(model="test-model", messages=messages)
+        img_part = request.messages[0].content[0]
+        self.assertEqual(img_part.image_url.min_pixels, 128)
+        self.assertEqual(img_part.image_url.max_pixels, 512000)
 
 
 class TestValidationEdgeCases(unittest.TestCase):

@@ -179,6 +179,33 @@ class TestProcessMmDataKwargs(unittest.TestCase):
             call_kwargs.kwargs.get("videos_kwargs"), {"max_pixels": 602112}
         )
 
+    def test_per_request_images_kwargs_overrides_server_config(self):
+        """Per-request images_kwargs should override server-level image_config."""
+        config = {"image": {"max_pixels": 1000000, "min_pixels": 100}}
+        proc, mock_proc, _ = self._make_base_processor(config)
+
+        proc.process_mm_data(
+            "test", images=["img1"], images_kwargs={"max_pixels": 500000}
+        )
+
+        call_kwargs = mock_proc.__call__.call_args
+        images_kw = call_kwargs.kwargs.get("images_kwargs", {})
+        self.assertEqual(images_kw["max_pixels"], 500000)
+        self.assertEqual(images_kw["min_pixels"], 100)
+
+    def test_per_request_images_kwargs_without_server_config(self):
+        """Per-request images_kwargs works even with empty server config."""
+        proc, mock_proc, _ = self._make_base_processor({})
+
+        proc.process_mm_data(
+            "test", images=["img1"], images_kwargs={"max_pixels": 500000}
+        )
+
+        call_kwargs = mock_proc.__call__.call_args
+        self.assertEqual(
+            call_kwargs.kwargs.get("images_kwargs"), {"max_pixels": 500000}
+        )
+
     def test_empty_config_no_kwargs_injected(self):
         proc, mock_proc, _ = self._make_base_processor({})
 

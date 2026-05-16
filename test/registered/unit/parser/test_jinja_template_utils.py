@@ -468,6 +468,64 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         result = detect_jinja_template_content_format(template)
         self.assertEqual(result, "string")
 
+    def test_process_content_image_with_min_max_pixels(self):
+        """Test that min_pixels/max_pixels are extracted into ImageData.preprocess_kwargs."""
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "http://example.com/img.jpg",
+                        "min_pixels": 256,
+                        "max_pixels": 1048576,
+                    },
+                }
+            ],
+        }
+        image_data = []
+        result = process_content_for_template_format(
+            msg_dict, "openai", image_data, [], [], []
+        )
+        self.assertEqual(len(image_data), 1)
+        self.assertEqual(
+            image_data[0].preprocess_kwargs,
+            {"min_pixels": 256, "max_pixels": 1048576},
+        )
+
+    def test_process_content_image_without_pixels_has_no_preprocess_kwargs(self):
+        """preprocess_kwargs should be None when no pixel fields are provided."""
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "http://example.com/img.jpg"},
+                }
+            ],
+        }
+        image_data = []
+        process_content_for_template_format(msg_dict, "openai", image_data, [], [], [])
+        self.assertIsNone(image_data[0].preprocess_kwargs)
+
+    def test_process_content_image_with_only_min_pixels(self):
+        """Only min_pixels provided — max_pixels should not appear in preprocess_kwargs."""
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "http://example.com/img.jpg",
+                        "min_pixels": 128,
+                    },
+                }
+            ],
+        }
+        image_data = []
+        process_content_for_template_format(msg_dict, "openai", image_data, [], [], [])
+        self.assertEqual(image_data[0].preprocess_kwargs, {"min_pixels": 128})
+
     def test_detect_msg_content_without_multimodal_keywords(self):
         """Test AST detection of 'for item in msg.content' without keyword shortcut.
         Templates that contain 'image'/'video'/'audio'/'vision' take a shortcut.
