@@ -321,6 +321,15 @@ jobs:
         # cells could be checked, the test hard-fails under SGLANG_IS_IN_CI.
         run: cargo test --release --test component tokenizer::parity
 
+      - name: Tokenizer parity matrix (uses HF cache populated by e2e)
+        working-directory: experimental/sgl-router
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        # Runs after pytest so the Qwen3-0.6B tokenizer.json is cached by the
+        # SGLang worker. Cells without a cached snapshot are skipped; if no
+        # cells could be checked, the test hard-fails under SGLANG_IS_IN_CI.
+        run: cargo test --release --test tokenizer_parity_test
+
   sgl-router-finish:
     name: finish
     needs:
