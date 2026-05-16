@@ -12,10 +12,15 @@
 //! Each fixture cell needs the model's `tokenizer.json` on disk; the test
 //! looks in the local HuggingFace cache (`HF_HOME` or `~/.cache/huggingface`).
 //! Cells whose snapshot isn't cached are skipped (with a warning); cells
-//! whose snapshot IS cached are asserted bit-identical. When no cells can
-//! be checked (e.g., on a fresh CI runner) the test emits a warning and
-//! passes — the authoritative CI parity gate is the e2e HTTP tokenize test
-//! (Task 11), which exercises dynamo-tokenizers against a live model.
+//! whose snapshot IS cached are asserted bit-identical.
+//!
+//! Locally, when no fixtures can be checked (fresh cache) the test emits a
+//! warning and passes — useful for contributors without the model snapshots.
+//! In CI (`SGLANG_IS_IN_CI=true`) the same condition is a hard failure: a
+//! parity matrix that validates nothing is worse than no test at all, since
+//! it gives a false sense of coverage. The e2e HTTP tokenize test (Task 11)
+//! remains the authoritative live-model parity gate, but this matrix must
+//! actually run against cached snapshots when present in CI.
 //!
 //! ## Regenerating fixtures
 //!
@@ -115,11 +120,27 @@ fn parity_matrix() {
         checked + skipped.len()
     );
     if checked == 0 {
-        eprintln!(
-            "parity_matrix: no fixtures could be checked — HF cache empty? skipped {} cells. \
-             E2E tokenize test (Task 11) is the authoritative CI parity gate.",
-            skipped.len()
+        let families: Vec<String> = skipped
+            .iter()
+            .map(|(m, _)| m.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let msg = format!(
+            "parity_matrix: no fixtures could be checked — HF cache empty? skipped {} cells \
+             across model families: [{}]. E2E tokenize test (Task 11) is the authoritative \
+             CI parity gate.",
+            skipped.len(),
+            families.join(", "),
         );
+        if std::env::var("SGLANG_IS_IN_CI").as_deref() == Ok("true") {
+            panic!(
+                "{msg}\n\nThis is a hard failure in CI: a parity test that validates zero \
+                 cells provides no coverage. Either pre-populate the HF cache for these \
+                 model families on the runner, or remove the parity test."
+            );
+        }
+        eprintln!("{msg}");
     } else {
         eprintln!(
             "parity: {checked} cells passed, {} skipped (no HF snapshot)",
