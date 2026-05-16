@@ -283,6 +283,7 @@ def build_deepseek_v4_hicache_stack(
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    # TODO(hzh0425): Support PP for deepseek v4 with hicache
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
     swa_layer_mapping = {
