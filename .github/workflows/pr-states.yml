@@ -36,8 +36,11 @@ jobs:
             // Event-agnostic PR lookup.
             // - pull_request_target: PR is in the payload.
             // - workflow_run: pull_requests[] is populated for same-repo PRs;
-            //   for fork PRs it's empty and we must reverse-lookup by head_sha.
-            //   Bail out cleanly if no open PR matches (e.g. push to main).
+            //   for fork PRs it's empty and we reverse-lookup by head ref
+            //   ("forkOwner:branch"), which is the GH-documented fork-PR query
+            //   pattern and avoids the "commit must be in default branch" caveat
+            //   of listPullRequestsAssociatedWithCommit. Bail cleanly when no
+            //   open PR matches (e.g. workflow run from a push to main).
             let prNumber;
             if (context.payload.pull_request) {
               prNumber = context.payload.pull_request.number;
@@ -45,18 +48,25 @@ jobs:
               const wr = context.payload.workflow_run;
               if (wr.pull_requests && wr.pull_requests.length > 0) {
                 prNumber = wr.pull_requests[0].number;
-              } else {
-                const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              } else if (wr.head_repository && wr.head_branch) {
+                const headSpec = `${wr.head_repository.owner.login}:${wr.head_branch}`;
+                const { data: prs } = await github.rest.pulls.list({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  commit_sha: wr.head_sha,
+                  state: 'open',
+                  head: headSpec,
                 });
-                const openPr = prs.find(p => p.state === 'open');
-                if (!openPr) {
-                  core.info(`No open PR for head_sha=${wr.head_sha}; skipping.`);
+                // Multiple PRs could share a head ref if a branch was reused;
+                // match by head_sha to pick the right one.
+                const match = prs.find(p => p.head.sha === wr.head_sha) || prs[0];
+                if (!match) {
+                  core.info(`No open PR for head=${headSpec}; skipping.`);
                   return;
                 }
-                prNumber = openPr.number;
+                prNumber = match.number;
+              } else {
+                core.info(`workflow_run has no PR linkage; skipping.`);
+                return;
               }
             }
             const { data: pr } = await github.rest.pulls.get({
