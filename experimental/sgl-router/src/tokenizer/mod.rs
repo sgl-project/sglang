@@ -158,8 +158,7 @@ mod tests {
         for (i, text) in inputs.into_iter().enumerate() {
             let shared = Arc::clone(&t);
             set.spawn(async move {
-                let ids = adapter::encode(&shared, &text)
-                    .expect("concurrent encode must not fail");
+                let ids = adapter::encode(&shared, &text).expect("concurrent encode must not fail");
                 (i, ids)
             });
         }
