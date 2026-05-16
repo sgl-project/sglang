@@ -12,6 +12,9 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from tqdm import tqdm
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -1099,8 +1102,11 @@ SurfaceExtractors = {
 }
 
 
-class VectsetVAE(nn.Module):
+class VectsetVAE(nn.Module, LayerwiseOffloadableModuleMixin):
     """Base VAE class for vector set encoding."""
+
+    layerwise_offload_default_enabled = False
+    layer_names = ["transformer.resblocks"]
 
     def __init__(self, volume_decoder=None, surface_extractor=None):
         super().__init__()

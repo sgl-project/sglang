@@ -263,12 +263,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
+        skip_init_workspace_buffer: bool = False,
     ):
         super().__init__(
             model_runner,
             skip_prefill,
             kv_indptr_buf,
             q_indptr_decode_buf,
+            skip_init_workspace_buffer=True,
         )
 
         config = model_runner.model_config
@@ -294,14 +296,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        global global_zero_init_workspace_buffer
-        if global_zero_init_workspace_buffer is None:
-            global_zero_init_workspace_buffer = torch.zeros(
-                self.workspace_size,
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
-        self.workspace_buffer = global_zero_init_workspace_buffer
+        if skip_init_workspace_buffer:
+            self.workspace_buffer = None
+        else:
+            global global_zero_init_workspace_buffer
+            if global_zero_init_workspace_buffer is None:
+                global_zero_init_workspace_buffer = torch.zeros(
+                    self.workspace_size,
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+            self.workspace_buffer = global_zero_init_workspace_buffer
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -377,6 +382,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         return block_kv_indices
+
+    def init_mha_chunk_metadata(self, forward_batch: "ForwardBatch") -> None:
+        """Skip parent's flashinfer wrapper plan()."""
+        return None
 
     def init_cuda_graph_state(
         self,
@@ -671,9 +680,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:
             return super().init_forward_metadata(forward_batch)
-
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
-        super().init_mha_chunk_metadata(forward_batch, disable_flashinfer_ragged=True)
 
     def pad_draft_extend_query(
         self,
