@@ -275,7 +275,9 @@ class RMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 if post_residual_addition.shape[0] != residual.shape[0]:
-                    post_residual_addition = post_residual_addition.chunk(self.attn_tp_size)[self.attn_tp_rank]
+                    post_residual_addition = post_residual_addition.tensor_split(
+                        self.attn_tp_size
+                    )[self.attn_tp_rank]
                 residual = residual + post_residual_addition
             out, _, residual_out = torch_npu.npu_add_rms_norm(
                 residual, x, self.weight.data, self.variance_epsilon
