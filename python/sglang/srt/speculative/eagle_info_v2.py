@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.nn.functional as F
@@ -95,6 +95,31 @@ class EagleDraftInputV2(EagleDraftInput):
     V1 path constructs `EagleDraftInput`; V2 path constructs this subclass so
     `prepare_for_decode` / `prepare_for_v2_draft` are dispatched correctly.
     """
+
+    @classmethod
+    def create_idle_input(
+        cls,
+        device: torch.device,
+        hidden_size: Optional[int],
+        dtype: Optional[torch.dtype],
+        topk: int,
+        capture_hidden_mode: CaptureHiddenMode,
+    ):
+        # V2's future_map buffer (`overlap_utils._lazy_init_buf`) reads
+        # `draft_input.new_seq_lens[0]` to derive shape, so V2's idle input
+        # must populate it. V1 leaves it None (see base impl).
+        return cls(
+            bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
+            hidden_states=(
+                torch.empty((0, hidden_size), device=device, dtype=dtype)
+                if hidden_size is not None
+                else None
+            ),
+            topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
+            topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+            capture_hidden_mode=capture_hidden_mode,
+            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
+        )
 
     def prepare_for_decode(self, batch: ScheduleBatch):
         batch.maybe_evict_swa()

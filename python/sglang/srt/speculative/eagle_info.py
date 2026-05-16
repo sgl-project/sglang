@@ -735,6 +735,13 @@ class EagleDraftInput(SpecInput):
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
     ):
+        # `new_seq_lens` stays None: it is a V2-overlap signal that the worker
+        # has computed next iter's seq_lens. V1 must leave it None so the
+        # scheduler's `is not None` gate in `run_batch` doesn't overwrite
+        # `batch.seq_lens` with a 0-length tensor while `batch.reqs` still
+        # holds the finished reqs (which then crashes the next filter_batch).
+        # V2 overrides this method to populate `new_seq_lens` for its
+        # future_map buffer (see `overlap_utils._lazy_init_buf`).
         return cls(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             hidden_states=(
@@ -745,7 +752,6 @@ class EagleDraftInput(SpecInput):
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
-            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
         )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
