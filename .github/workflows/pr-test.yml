@@ -148,7 +148,7 @@ jobs:
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - "python/pyproject.toml"
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
-              - "python/sglang/jit_kernel/diffusion/**"
+              - "python/sglang/jit_kernel/**"
               - "python/sglang/jit_kernel/tests/diffusion/**"
               - "python/sglang/jit_kernel/benchmark/diffusion/**"
               - "python/sglang/cli/**"
@@ -158,7 +158,8 @@ jobs:
               - "python/pyproject.toml"
               - "python/sglang/jit_kernel/**"
             sgl_kernel:
-              - ".github/workflows/pr-test-sgl-kernel.yml"
+              # Intentionally excludes ".github/workflows/pr-test-sgl-kernel.yml" —
+              # see API-side detector below for rationale.
               - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
 
       # For /rerun-stage (workflow_dispatch with target_stage), dorny/paths-filter doesn't work
@@ -192,7 +193,15 @@ jobs:
           echo "..."
 
           # Check for sgl-kernel changes
-          if echo "$CHANGED_FILES" | grep -qE "^(sgl-kernel/|\.github/workflows/pr-test-sgl-kernel\.yml)"; then
+          # Note: edits to .github/workflows/pr-test-sgl-kernel.yml are intentionally
+          # NOT considered sgl-kernel changes. That filter line used to be included
+          # so workflow refactors got retested, but in practice it only catches the
+          # workflow's *consumers* (test job definitions), not the wheel build steps
+          # themselves — and gating sgl_kernel=true on it forces a 20-30 min wheel
+          # rebuild + the stage-a-test-1-gpu-small gate for pure CI-yaml edits that
+          # can't actually affect kernel behavior. PRs that touch wheel-build logic
+          # in scripts/ci/cuda/ or sgl-kernel/ still trigger correctly.
+          if echo "$CHANGED_FILES" | grep -qE "^sgl-kernel/"; then
             echo "sgl_kernel=true" >> $GITHUB_OUTPUT
             echo "Detected sgl-kernel changes"
           else
@@ -355,6 +364,8 @@ jobs:
   # These jobs poll GitHub API to wait for previous stages to complete.
   # For PR runs: wait jobs run and enforce sequential execution via polling.
   # For scheduled runs: wait jobs are skipped, enabling parallel execution for easier retry.
+  # For PRs with the `bypass-fastfail` label: wait jobs run but return success immediately
+  # (handled inside the wait-for-jobs action), so downstream stages dispatch in parallel.
 
   wait-for-stage-a:
     needs: [check-changes, call-gate]
@@ -1180,7 +1191,6 @@ jobs:
     timeout-minutes: 240
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
-      CU_VERSION: cu129
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1417,6 +1427,110 @@ jobs:
         if: always()
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
+  stage-c-test-dsv4-4-gpu-b200:
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-c-test-dsv4-4-gpu-b200') ||
+        (
+          !inputs.target_stage &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v6
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda*
+
+      - name: Install dependencies
+        timeout-minutes: 30
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dsv4_dep.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-4-gpu-b200 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+
+  stage-c-test-dsv4-8-gpu-h200:
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-c-test-dsv4-8-gpu-h200') ||
+        (
+          !inputs.target_stage &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    runs-on: 8-gpu-h200
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda*
+
+      - name: Install dependencies
+        timeout-minutes: 30
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dsv4_dep.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-8-gpu-h200 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+
   # NOTE: GB200 stage temporarily disabled — no company-owned GB200 runner available yet.
   # Re-enable when a 4-gpu-gb200 runner is provisioned.
   # stage-c-test-4-gpu-gb200:
@@ -1498,6 +1612,8 @@ jobs:
         stage-c-test-deepep-4-gpu-h100,
         stage-c-test-deepep-8-gpu-h200,
         stage-c-test-4-gpu-b200,
+        stage-c-test-dsv4-4-gpu-b200,
+        stage-c-test-dsv4-8-gpu-h200,
         # stage-c-test-4-gpu-gb200,  # Temporarily disabled — no GB200 runner
       ]
     if: always()

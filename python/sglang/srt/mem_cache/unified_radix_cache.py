@@ -287,6 +287,16 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
 
+        self._empty_match_result = MatchResult(
+            device_indices=torch.empty(
+                (0,),
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            last_device_node=self.root_node,
+            last_host_node=self.root_node,
+        )
+
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -340,16 +350,10 @@ class UnifiedRadixCache(BasePrefixCache):
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
-            return MatchResult(
-                device_indices=torch.empty(
-                    (0,),
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                last_device_node=self.root_node,
-                last_host_node=self.root_node,
-            )
+            return self._empty_match_result
         key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return self._empty_match_result
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
         return self._match_post_processor(params, value, last_node, best_value_len)
@@ -703,7 +707,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if best_value_len > 0:
             device_indices = torch.cat(value[:best_value_len])
         else:
-            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+            device_indices = self._empty_match_result.device_indices
         result = MatchResult(
             device_indices=device_indices,
             last_device_node=last_device_node,
@@ -1397,7 +1401,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 last_node = last_node.parent
 
         return (
-            torch.empty((0,), dtype=torch.int64, device=self.device),
+            self._empty_match_result.device_indices,
             last_node,
         )
 

@@ -38,6 +38,21 @@ def pad_or_narrow_weight(
     )
 
 
+def is_strict_contiguous(x: torch.Tensor) -> bool:
+    expected_stride = 1
+    for size, stride in zip(reversed(x.shape), reversed(x.stride())):
+        if stride != expected_stride:
+            return False
+        expected_stride *= size
+    return True
+
+
+def strict_contiguous(x: torch.Tensor) -> torch.Tensor:
+    if is_strict_contiguous(x):
+        return x
+    return x.clone(memory_format=torch.contiguous_format)
+
+
 def copy_or_rebind_param(
     module: torch.nn.Module, name: str, new_value: torch.Tensor
 ) -> None:

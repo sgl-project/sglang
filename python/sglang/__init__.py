@@ -3,9 +3,10 @@
 # Install stubs early for platforms where certain dependencies are unavailable
 # (e.g. macOS/MPS has no triton, and torch.mps lacks Stream / set_device /
 # get_device_properties).  This must run before any downstream imports.
+import platform as _platform
 import sys as _sys
 
-if _sys.platform == "darwin":
+if _sys.platform == "darwin" and _platform.machine() == "arm64":
     try:
         import torch as _torch
 
@@ -22,6 +23,7 @@ if _sys.platform == "darwin":
         del _torch
     except ImportError:
         pass
+del _platform
 del _sys
 
 from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches

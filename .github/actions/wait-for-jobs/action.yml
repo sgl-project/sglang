@@ -1,5 +1,5 @@
 name: Wait for Jobs
-description: Poll and wait for specified jobs in the current workflow run to complete
+description: Poll and wait for specified jobs in the current workflow run to complete. Returns success immediately when the PR carries the `bypass-fastfail` label, letting downstream stages dispatch in parallel (same effect as scheduled runs).
 
 inputs:
   stage-name:
@@ -48,6 +48,32 @@ runs:
           const maxWaitMinutes = parseInt(process.env.INPUT_MAX_WAIT_MINUTES);
           const pollIntervalSeconds = parseInt(process.env.INPUT_POLL_INTERVAL_SECONDS);
           const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
+
+          // bypass-fastfail label opts the PR out of stage-to-stage waiting,
+          // letting all stages dispatch in parallel like scheduled runs do.
+          let labels = [];
+          if (context.payload.pull_request?.labels) {
+            labels = context.payload.pull_request.labels.map(l => l.name);
+          } else {
+            const ref = context.payload.pull_request?.head?.sha || context.sha;
+            try {
+              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: ref,
+              });
+              if (prs.length > 0) {
+                labels = prs[0].labels.map(l => l.name);
+              }
+            } catch (e) {
+              console.log(`Could not fetch PR labels for ${ref}: ${e.message}`);
+            }
+          }
+          if (labels.includes('bypass-fastfail')) {
+            console.log(`Skipping ${stageName} wait (bypass-fastfail label present)`);
+            core.setOutput('result', 'success');
+            return;
+          }
 
           // Normalize job specs into a uniform format
           const normalizedSpecs = jobSpecs.map(spec => {

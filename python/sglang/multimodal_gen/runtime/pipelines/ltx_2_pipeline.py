@@ -193,7 +193,6 @@ class LTX2SigmaPreparationStage(PipelineStage):
                     int(batch.num_inference_steps),
                     number_of_tokens=latent_num_frames * latent_height * latent_width,
                 )
-                batch.sigmas.append(0.0011)
             else:
                 batch.sigmas = build_official_ltx2_sigmas(
                     int(batch.num_inference_steps)

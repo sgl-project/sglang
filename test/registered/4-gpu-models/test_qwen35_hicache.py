@@ -1,10 +1,14 @@
 import shutil
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 
 import requests
+import zmq
+from msgspec.msgpack import Decoder
 
+from sglang.srt.disaggregation.kv_events import BlockStored, KVEventBatch
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -72,6 +76,8 @@ class TestQwen35WithHiCache(CustomTestCase):
                 "file",
                 "--hicache-storage-prefetch-policy",
                 "wait_complete",
+                "--kv-events-config",
+                '{"publisher": "zmq", "topic": "kv-events"}',
             ],
         )
 
@@ -124,6 +130,42 @@ class TestQwen35WithHiCache(CustomTestCase):
             f"HiCache prefetch accuracy drift too large: "
             f"first={first_metrics['score']}, second={second_metrics['score']}",
         )
+
+    def test_kv_events_smoke(self):
+        decoder = Decoder(type=KVEventBatch)
+        context = zmq.Context()
+        sub = context.socket(zmq.SUB)
+        sub.connect("tcp://localhost:5557")
+        sub.setsockopt_string(zmq.SUBSCRIBE, "kv-events")
+
+        try:
+            time.sleep(1.0)
+            res = requests.post(
+                f"{self.base_url}/generate",
+                json={
+                    "text": "HiCache KV event compatibility check. " * 64,
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+                },
+                timeout=120,
+            )
+            res.raise_for_status()
+
+            events = []
+            deadline = time.time() + 10
+            while time.time() < deadline and not any(
+                isinstance(event, BlockStored) for event in events
+            ):
+                if sub.poll(timeout=100):
+                    _, _, payload = sub.recv_multipart()
+                    events.extend(decoder.decode(payload).events)
+
+            self.assertTrue(
+                any(isinstance(event, BlockStored) for event in events),
+                "Expected at least one BlockStored event from Qwen3.5 HiCache server",
+            )
+        finally:
+            sub.close()
+            context.term()
 
 
 if __name__ == "__main__":

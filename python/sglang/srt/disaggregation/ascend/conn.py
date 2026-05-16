@@ -35,10 +35,11 @@ class AscendKVManager(MooncakeKVManager):
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
         )
         # Batch register state/extra pool data buffers
-        if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
-            self.engine.batch_register(
-                self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
-            )
+        for component_ptrs, component_lens in zip(
+            self.kv_args.state_data_ptrs or [],
+            self.kv_args.state_data_lens or [],
+        ):
+            self.engine.batch_register(component_ptrs, component_lens)
 
     def send_kvcache(
         self,

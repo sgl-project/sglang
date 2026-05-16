@@ -932,6 +932,18 @@ class MoriEPDispatcher(BaseDispatcher):
 
         self.deepep_mode = deepep_mode
 
+        async_mode = self.deepep_mode.enable_low_latency()
+        if get_bool_env_var("SGLANG_ROCM_USE_MULTI_STREAM") and not async_mode:
+            logger.warning_once(
+                "SGLANG_ROCM_USE_MULTI_STREAM=1 is set but Mori AsyncLL is "
+                "not enabled (--deepep-mode=%s). The alt-stream overlap only "
+                "frees up CUs when dispatch/combine runs on the AsyncLL "
+                "copy-engine kernel; otherwise it stays on CUs and competes "
+                "with the alt-stream work. Pass --deepep-mode low_latency "
+                "(or auto) to enable the AsyncLL kernel.",
+                self.deepep_mode.value,
+            )
+
         common_kwargs = dict(
             group=group,
             router_topk=router_topk,

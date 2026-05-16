@@ -124,7 +124,12 @@ class EagleDraftInputV2Mixin:
         num_needed_tokens = 0
         for i, r in enumerate(batch.reqs):
             cur = r.kv_allocated_len
-            nxt = r.kv_committed_len + double_alloc
+            # max(cur, ...) clamps so adaptive downswitch (smaller alloc_len_per_decode)
+            # cannot make nxt < cur and corrupt allocator state. kv_committed_len lags
+            # batch.seq_lens by ~1 verify in overlap mode, so we react to adaptive
+            # switches one batch later than a seq_lens-based baseline; the 2*alloc
+            # over-allocation buffer absorbs that lag.
+            nxt = max(cur, r.kv_committed_len + double_alloc)
             cur_kv_lens[i] = cur
             nxt_kv_lens[i] = nxt
             num_needed_tokens += nxt - cur
@@ -322,13 +327,13 @@ class EagleVerifyInputV2Mixin:
         """
         if batch.forward_mode.is_idle():
             predict = torch.empty(0, dtype=torch.int32, device=batch.input_ids.device)
-            num_accepted_drafts = torch.empty(
+            num_correct_drafts = torch.empty(
                 0, dtype=torch.int32, device=batch.input_ids.device
             )
             accept_index = torch.empty(
                 0, dtype=torch.int32, device=batch.input_ids.device
             )
-            return predict, num_accepted_drafts, accept_index
+            return predict, num_correct_drafts, accept_index
 
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
@@ -370,16 +375,16 @@ class EagleVerifyInputV2Mixin:
         accept_index = torch.full(
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
         )
-        num_accepted_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Sample tokens
         if sampling_info.is_all_greedy or _is_npu or _is_hip:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
-            predict, accept_index, num_accepted_drafts = verify_tree_greedy_func(
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
-                accept_token_num=num_accepted_drafts,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
                 candidates=candidates,
                 retrieve_index=self.retrieve_index,
                 retrieve_next_token=self.retrieve_next_token,
@@ -421,7 +426,7 @@ class EagleVerifyInputV2Mixin:
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
-                accept_token_num=num_accepted_drafts,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
                 candidates=candidates,
                 # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
                 retrive_index=self.retrieve_index,
@@ -448,30 +453,30 @@ class EagleVerifyInputV2Mixin:
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_accepted_drafts, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
 
         if SIMULATE_ACC_LEN > 0:
             # Do simulation
             accept_index = generate_simulated_accept_index(
                 accept_index=accept_index,
                 predict=predict,  # mutable
-                num_accepted_drafts=num_accepted_drafts,  # mutable
+                num_correct_drafts=num_correct_drafts,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
 
-        # `num_accepted_drafts` stays drafts-only inside this function; the returned
+        # `num_correct_drafts` stays drafts-only inside this function; the returned
         # tensor includes the trailing/bonus token via out-of-place +1 so the
         # name no longer flips semantics mid-function (naming doc C2).
-        return predict, num_accepted_drafts + 1, accept_index
+        return predict, num_correct_drafts + 1, accept_index
 
 
 @triton.jit
-def fill_new_verified_id(
-    verified_id,
+def fill_bonus_tokens(
+    accept_tokens,
     accept_lens,
-    new_verified_id,
+    bonus_tokens_ptr,
     num_draft_tokens: tl.constexpr,
 ):
     # NOTE: we cannot fuse any in-place operations of `accept_lens` inside this kernel
@@ -480,9 +485,9 @@ def fill_new_verified_id(
     # `accept_lens` includes the bonus token; the last accepted slot is at -1.
     accept_len = tl.load(accept_lens + pid)
 
-    verified_id_idx = num_draft_tokens * pid + accept_len - 1
-    verified_id_data = tl.load(verified_id + verified_id_idx)
-    tl.store(new_verified_id + pid, verified_id_data)
+    bonus_token_idx = num_draft_tokens * pid + accept_len - 1
+    bonus_token = tl.load(accept_tokens + bonus_token_idx)
+    tl.store(bonus_tokens_ptr + pid, bonus_token)
 
 
 @triton.jit

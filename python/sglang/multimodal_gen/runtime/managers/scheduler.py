@@ -8,9 +8,10 @@ import pickle
 import tempfile
 import time
 from collections import deque
+from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
-from typing import Any, List
+from typing import Any, Iterator, List
 
 import zmq
 
@@ -34,6 +35,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
+)
+from sglang.multimodal_gen.runtime.ipc_array import (
+    is_local_endpoint,
+    spill_large_arrays_to_file_refs,
 )
 from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
 from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
@@ -608,7 +613,37 @@ class Scheduler(SchedulerDisaggMixin):
         replies to client, only on rank 0
         """
         if not is_warmup and self.receiver is not None and identity is not None:
-            self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
+            # if the server is local, use temp file to spill the frame array instead of
+            # leaving it in OutputBatch to be pickled later
+            if is_local_endpoint(self.server_args.scheduler_endpoint):
+                with self._record_return_stage(
+                    output_batch, "Scheduler.return_result.spill_arrays"
+                ):
+                    output_batch.output = spill_large_arrays_to_file_refs(
+                        output_batch.output
+                    )
+
+            with self._record_return_stage(
+                output_batch, "Scheduler.return_result.pickle"
+            ):
+                payload = pickle.dumps(output_batch)
+
+            with self._record_return_stage(
+                output_batch, "Scheduler.return_result.send"
+            ):
+                self.receiver.send_multipart([identity, b"", payload])
+
+    @contextmanager
+    def _record_return_stage(
+        self, output_batch: OutputBatch, stage_name: str
+    ) -> Iterator[None]:
+        """helper function to record a stage metric"""
+        start_time = time.perf_counter()
+        yield
+        if output_batch.metrics is not None:
+            output_batch.metrics.record_stage(
+                stage_name, time.perf_counter() - start_time
+            )
 
     def _try_merge_generation_reqs(self, reqs: List[Req]) -> Req | None:
         """Create a batched generation request from compatible requests.
