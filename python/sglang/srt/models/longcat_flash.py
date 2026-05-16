@@ -32,7 +32,7 @@
 
 import concurrent.futures
 import logging
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -339,13 +339,16 @@ class LongcatFlashDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: Optional[Any] = None,
+        moe_alt_stream: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.moe_alt_stream = moe_alt_stream
+        self.device_module = torch.get_device_module()
         self.is_first_layer = layer_id == 0
         self.is_last_layer = layer_id == config.num_hidden_layers - 1
         self.self_attn = nn.ModuleList(
@@ -484,28 +487,78 @@ class LongcatFlashDecoderLayer(nn.Module):
             mlp_residual = residual.clone()
         mlp_hidden_states = hidden_states.clone()
 
-        # moe
-        hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        moe_hidden_states = self.mlp(hidden_states)
-        moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
-            moe_hidden_states, moe_residual, forward_batch
+        enable_double_stream = (
+            self.moe_alt_stream is not None
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
-        hidden_states, residual = self.forward_mlp(
-            mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator
-        )
-        if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
-            hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
-                self.attn_tp_rank
-            ]
+        if enable_double_stream:
+            main_stream = self.device_module.current_stream()
+            first_attn_finished = self.device_module.Event()
+            fia_ffn_finished_event = self.device_module.Event()
 
-        hidden_states = moe_hidden_states + hidden_states
+            hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            first_attn_finished.record(main_stream)
+
+            moe_hidden_states = None
+            with self.device_module.stream(self.moe_alt_stream):
+                self.device_module.current_stream().wait_event(first_attn_finished)
+                moe_hidden_states = self.mlp(hidden_states)
+                self.device_module.current_stream().wait_event(fia_ffn_finished_event)
+                moe_hidden_states, moe_residual = (
+                    self.moe_layer_communicator.postprocess_layer(
+                        moe_hidden_states, moe_residual, forward_batch
+                    )
+                )
+                moe_hidden_states.record_stream(main_stream)
+
+            mlp_hidden_states, residual = self.forward_mlp(
+                mlp_hidden_states,
+                positions,
+                mlp_residual,
+                forward_batch,
+                zero_allocator,
+                fia_ffn_finished_event,
+            )
+            if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
+                mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
+                    self.attn_tp_rank
+                ]
+
+            main_stream.wait_stream(self.moe_alt_stream)
+            hidden_states = moe_hidden_states + mlp_hidden_states
+        else:
+            hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+            moe_hidden_states = self.mlp(hidden_states)
+            moe_hidden_states, moe_residual = (
+                self.moe_layer_communicator.postprocess_layer(
+                    moe_hidden_states, moe_residual, forward_batch
+                )
+            )
+
+            hidden_states, residual = self.forward_mlp(
+                mlp_hidden_states, positions, mlp_residual, forward_batch, zero_allocator
+            )
+            if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
+                hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
+                    self.attn_tp_rank
+                ]
+
+            hidden_states = moe_hidden_states + hidden_states
         return hidden_states, residual
 
     def forward_mlp(
-        self, hidden_states, positions, residual, forward_batch, zero_allocator
+        self,
+        hidden_states,
+        positions,
+        residual,
+        forward_batch,
+        zero_allocator,
+        fia_ffn_finished_event=None,
     ):
         # first_mlp
         hidden_states, residual = self.mlp_layer_communicator[0].prepare_mlp(
@@ -538,6 +591,8 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
         hidden_states = self.mlps[1](hidden_states)
+        if fia_ffn_finished_event is not None:
+            self.device_module.current_stream().record_event(fia_ffn_finished_event)
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
@@ -577,7 +632,9 @@ class LongcatFlashModel(nn.Module):
                 use_attn_tp_group=is_dp_attention_enabled(),
             )
 
-        self.alt_stream = torch.cuda.Stream()
+        device_module = torch.get_device_module()
+        self.alt_stream = device_module.Stream()
+        self.moe_alt_stream = device_module.Stream()
         self.layers = nn.ModuleList(
             [
                 LongcatFlashDecoderLayer(
@@ -586,6 +643,7 @@ class LongcatFlashModel(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
                     alt_stream=self.alt_stream,
+                    moe_alt_stream=self.moe_alt_stream,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
