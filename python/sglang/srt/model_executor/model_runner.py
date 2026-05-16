@@ -2422,10 +2422,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_tokens_per_bs = 1
         if self.spec_algorithm.is_speculative():
             if self.is_draft_worker:
-                if not self.spec_algorithm.is_dflash():
+                if not self.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+            num_tokens_per_bs = (
+                self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    self.server_args.speculative_num_draft_tokens, self.is_draft_worker
+                )
+            )
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL

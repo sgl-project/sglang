@@ -64,6 +64,9 @@ class CustomSpecAlgo:
     def is_ngram(self) -> bool:
         return False
 
+    def supports_target_verify_for_draft(self) -> bool:
+        return False
+
     def supports_spec_v2(self) -> bool:
         return self.supports_overlap
 
@@ -73,6 +76,11 @@ class CustomSpecAlgo:
                 f"Speculative algorithm {self.name} does not support overlap scheduling."
             )
         return self.factory(server_args)
+
+    def get_num_tokens_per_bs_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        return num_draft_tokens
 
 
 _REGISTRY: Dict[str, CustomSpecAlgo] = {}
