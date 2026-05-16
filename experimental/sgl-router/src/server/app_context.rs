@@ -37,6 +37,7 @@ impl AppContext {
 
     #[cfg(test)]
     pub fn stub() -> Self {
+        let url = reqwest::Url::parse("http://x:30000").expect("stub url parses");
         Self {
             config: Config {
                 server: crate::config::ServerConfig {
@@ -46,14 +47,13 @@ impl AppContext {
                 observability: Default::default(),
                 models: vec![],
                 workers: vec![crate::config::WorkerConfig {
-                    url: "http://x".into(),
+                    url: url.clone(),
                     request_timeout_ms: None,
                 }],
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
             proxy: Arc::new(
-                Proxy::new("http://x".into(), std::time::Duration::from_secs(60))
-                    .expect("stub proxy"),
+                Proxy::new(url, std::time::Duration::from_secs(60)).expect("stub proxy"),
             ),
             ready: AtomicBool::new(false),
         }

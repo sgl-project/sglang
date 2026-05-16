@@ -68,10 +68,20 @@ async fn main() -> Result<()> {
     // Default 60s request timeout; per-worker override via `request_timeout_ms`
     // in config. Streaming endpoints do NOT apply this timeout (long
     // generations are valid).
+    //
+    // `Config::validate()` rejects an empty workers list, so `.first()` is
+    // safe today — but using the typed `Option` here keeps the static-config
+    // invariant explicit at the callsite. When M2 introduces dynamic worker
+    // discovery the invariant goes away and this becomes a real error path
+    // instead of a latent panic on `workers[0]`.
+    let primary_worker = cfg
+        .workers
+        .first()
+        .context("config has no workers (validate() should have rejected this)")?;
     let request_timeout =
-        std::time::Duration::from_millis(cfg.workers[0].request_timeout_ms.unwrap_or(60_000));
+        std::time::Duration::from_millis(primary_worker.request_timeout_ms.unwrap_or(60_000));
     let proxy = Arc::new(
-        sgl_router::proxy::Proxy::new(cfg.workers[0].url.clone(), request_timeout)
+        sgl_router::proxy::Proxy::new(primary_worker.url.clone(), request_timeout)
             .context("build proxy client")?,
     );
 

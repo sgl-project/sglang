@@ -57,7 +57,7 @@ mod tests {
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             }],
             workers: vec![crate::config::WorkerConfig {
-                url: "http://x".into(),
+                url: reqwest::Url::parse("http://x:30000").unwrap(),
                 request_timeout_ms: None,
             }],
         }
