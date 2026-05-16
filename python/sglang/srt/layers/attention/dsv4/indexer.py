@@ -108,10 +108,8 @@ def topk_transform_512_pytorch_vectorized(
     page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
     page_mask = page_size - 1
 
-    sequential_indices = (
-        torch.arange(TOPK, device=device, dtype=torch.int32)
-        .unsqueeze(0)
-        .expand(batch_size, -1)
+    sequential_indices = torch.arange(TOPK, device=device, dtype=torch.int32).unsqueeze(
+        0
     )
     sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
     negative_indices = torch.full_like(sequential_indices, -1)
@@ -122,9 +120,7 @@ def topk_transform_512_pytorch_vectorized(
         )
         valid_topk = sequential_valid
     else:
-        positions = (
-            torch.arange(max_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        )
+        positions = torch.arange(max_seq_len, device=device).unsqueeze(0)
         valid_mask = positions < seq_lens.unsqueeze(1)
 
         masked_scores = scores.masked_fill(~valid_mask, float("-inf"))
@@ -133,15 +129,11 @@ def topk_transform_512_pytorch_vectorized(
         )
         raw_indices = raw_indices.to(torch.int32)
 
-        batch_indices = (
-            torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, TOPK)
-        )
-        gathered_scores = scores[
-            batch_indices.flatten(), raw_indices.clamp(min=0).flatten()
-        ].view(batch_size, TOPK)
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+        gathered_scores = scores[batch_indices, raw_indices]
 
         valid_topk = gathered_scores != float("-inf")
-        needs_sequential = (seq_lens <= TOPK).unsqueeze(1).expand(-1, TOPK)
+        needs_sequential = (seq_lens <= TOPK).unsqueeze(1)
         raw_indices = torch.where(
             needs_sequential,
             torch.where(sequential_valid, sequential_indices, negative_indices),
