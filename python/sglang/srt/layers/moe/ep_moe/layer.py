@@ -94,8 +94,6 @@ class DeepEPMoE(FusedMoE):
         )
         if _use_aiter:
             self.deprecate_flag = True
-            if quant_config is None and hasattr(self.dispatcher, "set_quant_config"):
-                self.dispatcher.set_quant_config({"bf16_dispatch": True})
         elif _is_npu:
             self.deprecate_flag = False
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
