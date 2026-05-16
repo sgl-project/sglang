@@ -1174,7 +1174,7 @@ def _remap_topk_for_deepep(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     num_fused_shared_experts: int,
-    num_physical_routed_experts: int,
+    n_routed_experts: int,
     topk_config: TopKConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Remap TopK output to DeepEP interleaved expert layout.
@@ -1192,7 +1192,7 @@ def _remap_topk_for_deepep(
 
     ep_size = get_moe_expert_parallel_world_size()
     ep_rank = get_moe_expert_parallel_rank()
-    num_local_routed = num_physical_routed_experts // ep_size
+    num_local_routed = n_routed_experts // ep_size
     num_local_experts = num_local_routed + num_fused_shared_experts
 
     # Remap routed IDs: insert gaps for shared expert slots (single fused op)
@@ -1273,16 +1273,11 @@ def _post_process_topk_ids(
     # DeepEP: remap to interleaved expert layout where each rank's shared
     # expert has a unique ID for dispatch routing.
     if num_fused_shared_experts > 0 and is_deepep_class_backend():
-        num_physical_routed_experts = (
-            expert_location_dispatch_info.num_physical_experts
-            if expert_location_dispatch_info is not None
-            else router_logits.shape[1]
-        )
         topk_ids, topk_weights = _remap_topk_for_deepep(
             topk_ids,
             topk_weights,
             num_fused_shared_experts,
-            num_physical_routed_experts,
+            router_logits.shape[1],
             topk_config,
         )
 
