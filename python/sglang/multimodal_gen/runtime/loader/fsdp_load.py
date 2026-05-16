@@ -186,6 +186,7 @@ def _record_dtype_mismatch(
     quantized_dtype_mismatch_counts: Counter[tuple[torch.dtype, torch.dtype]],
     quantized_dtype_mismatch_examples: dict[tuple[torch.dtype, torch.dtype], list[str]],
 ) -> None:
+    """record mismatched dtype between source (checkpoints) and target (model) tensor into quantized_dtype_mismatch_examples and non_quantized_dtype_mismatch_examples"""
     if full_tensor.dtype == target_dtype:
         return
 
@@ -257,6 +258,7 @@ def _load_non_fsdp_tensor(
     target_dtype: torch.dtype,
     cpu_offload: bool,
 ) -> torch.Tensor:
+    """convert the full_tensor (read from checkpoint) into a state_dict that is ready to fit into the target model"""
     full_tensor = full_tensor.to(device=device, dtype=target_dtype)
     actual_param = _get_param_for_weight_loading(model, param_dict, target_param_name)
     weight_loader = (
@@ -400,12 +402,10 @@ def maybe_load_fsdp_model(
     )
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     if use_runai_distributed_streaming:
-        logger.info("Using streaming state-dict load for RunAI distributed streamer")
         load_model_from_streamed_state_dict(
             model,
             weight_iterator,
             device,
-            param_dtype,
             strict=strict,
             cpu_offload=cpu_offload,
             param_names_mapping=param_names_mapping_fn,
@@ -522,12 +522,14 @@ def load_model_from_streamed_state_dict(
     model: torch.nn.Module,
     full_sd_iterator: Generator[tuple[str, torch.Tensor], None, None],
     device: torch.device,
-    param_dtype: torch.dtype | None,
     strict: bool = False,
     cpu_offload: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
 ) -> _IncompatibleKeys:
-    """Load non-FSDP models while consuming checkpoint tensors one by one."""
+    """Load non-FSDP models while consuming checkpoint tensors one by one.
+
+    Used only with use_runai_distributed_streaming=True
+    """
     meta_sd = model.state_dict()
     if _is_fsdp_state_dict(model, meta_sd):
         raise ValueError("streamed state-dict load does not support FSDP parameters")

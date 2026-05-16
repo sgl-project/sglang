@@ -10,6 +10,7 @@ import os
 import tempfile
 from collections import defaultdict
 from collections.abc import Generator, Iterable
+from functools import lru_cache
 from pathlib import Path
 
 import filelock
@@ -180,6 +181,7 @@ def _raise_if_duplicate_safetensors_keys(hf_weights_files: list[str]) -> None:
     )
 
 
+@lru_cache(maxsize=None)
 def can_use_runai_distributed_streamer() -> bool:
     return (
         HAS_RUNAI_MODEL_STREAMER

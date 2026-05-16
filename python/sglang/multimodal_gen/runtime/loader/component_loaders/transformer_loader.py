@@ -65,6 +65,7 @@ def _has_merged_param_mapping(model_cls: type[torch.nn.Module]) -> bool:
 
 
 def _checkpoint_size_gib(safetensors_list: list[str]) -> float | None:
+    """infer the model size from checkpoint (GiB)"""
     if not safetensors_list:
         return None
 
@@ -84,6 +85,7 @@ def _should_use_runai_distributed_streaming(
     quant_spec,
     safetensors_list: list[str],
 ) -> tuple[bool, str]:
+    """distributed runai_model_streaming load faster for large components"""
     if not can_use_runai_distributed_streamer():
         return False, "runai distributed streamer is not available"
     if component_server_args.dit_cpu_offload:
