@@ -43,10 +43,24 @@ where
         let pump = AssertUnwindSafe(async move {
             let mut s = stream;
             while let Some(chunk) = s.next().await {
-                let item: Result<Bytes, std::io::Error> =
-                    chunk.map_err(|e| std::io::Error::other(e.to_string()));
-                // tx.send err means the receiver was dropped (client disconnect); stop reading.
+                let item: Result<Bytes, std::io::Error> = chunk.map_err(|e| {
+                    let msg = e.to_string();
+                    tracing::warn!(error = %msg, "upstream SSE stream errored mid-flight");
+                    std::io::Error::other(msg)
+                });
+                let is_err_chunk = item.is_err();
                 if tx.send(item).await.is_err() {
+                    // Receiver dropped. If we were about to ship an upstream
+                    // error there's nothing left to report; otherwise this is
+                    // a clean client-side disconnect — log at debug since it's
+                    // not a router-side fault.
+                    if !is_err_chunk {
+                        tracing::debug!("SSE client disconnected mid-stream");
+                    }
+                    break;
+                }
+                if is_err_chunk {
+                    // Surfaced upstream error to client; stop reading.
                     break;
                 }
             }
