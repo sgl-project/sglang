@@ -88,7 +88,7 @@ mod tests {
         let ids = adapter::encode(&t, "hello world").unwrap();
         assert!(!ids.is_empty());
         let text = adapter::decode_complete(&t, &ids, true).unwrap();
-        // gpt2 reproduces "hello world" exactly
+        // tiny BPE fixture is byte-level and lossless for ASCII.
         assert_eq!(text, "hello world");
     }
 

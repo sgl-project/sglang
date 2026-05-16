@@ -2,11 +2,11 @@
 
 Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
-**Status:** scaffold (M0). Not yet usable — see roadmap.
-
-## Roadmap
-
-See the design spec: `~/.claude/projects/-Users-kangyan-zhou-sglang-workspace-sglang/specs/2026-05-14-sgl-router-slim-design.md`
+**Status:** functional single-worker HTTP proxy. Exposes `/v1/tokenize`,
+`/v1/detokenize`, `/v1/models`, `/v1/chat/completions` (buffered and SSE),
+plus `/healthz` / `/readyz`. Forwards to one configured worker via reqwest;
+parity-tested against `transformers.AutoTokenizer`. Multi-worker routing,
+service discovery, and observability still pending.
 
 ## Building
 

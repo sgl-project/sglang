@@ -156,7 +156,7 @@ url = "http://127.0.0.1:30000"
         assert!(err.to_string().contains("yaml") && err.to_string().contains("toml"));
     }
 
-    // -- I11: worker URL is typed at config-load time -----------------------
+    // Worker URL parsing.
     //
     // The field is `reqwest::Url` (re-export of `url::Url`). The `url` crate
     // normalizes a bare authority to include a `/` path: parsing

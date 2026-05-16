@@ -38,10 +38,9 @@ struct StreamProbe {
     stream: Option<bool>,
 }
 
-/// POST /v1/chat/completions — forward to the worker. M1 routes to a
-/// single hardcoded worker (no policy). If the request opts into
-/// streaming (`stream: true`), we pipe SSE bytes back; otherwise
-/// buffer.
+/// POST /v1/chat/completions — forward to the configured worker (no
+/// routing policy yet). If the request opts into streaming
+/// (`stream: true`), we pipe SSE bytes back; otherwise buffer.
 pub async fn chat_completions(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,

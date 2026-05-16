@@ -29,9 +29,9 @@ use tokio_stream::wrappers::ReceiverStream;
 ///
 /// # Panic safety
 /// The pump future is wrapped in `AssertUnwindSafe(..).catch_unwind()`. If the
-/// upstream stream panics, we surface a loud `io::Error` to the client instead
-/// of letting tokio silently swallow the panic and EOF the body — the worst
-/// failure class (truncated output that looks like success).
+/// upstream stream panics, we surface a loud `io::Error` to the client; without
+/// this, the body would EOF cleanly and clients couldn't distinguish that from
+/// success — the worst failure class (truncated output that looks complete).
 pub fn bytes_stream_to_body<S, E>(stream: S) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
