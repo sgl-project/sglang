@@ -45,6 +45,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::config::PolicyKind;
+
     fn cfg() -> crate::config::Config {
         crate::config::Config {
             server: crate::config::ServerConfig {
@@ -55,7 +57,7 @@ mod tests {
             models: vec![crate::config::ModelConfig {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
-                policy: "round_robin".into(),
+                policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
             }],
             discovery: crate::config::DiscoveryConfig {

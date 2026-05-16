@@ -25,10 +25,8 @@ fn selects_lower_load() {
     b.active_requests.store(2, Ordering::Relaxed);
     let p = PowerOfTwoChoicesPolicy::new();
     let ws = vec![a.clone(), b.clone()];
-    let ctx = SelectionContext {
-        model: &ModelId("m".into()),
-        request_body: None,
-    };
+    let model_id = ModelId("m".into());
+    let ctx = SelectionContext::new(&model_id, None);
     let chosen = p.select(&ws, &ctx).unwrap();
     assert_eq!(chosen.id.0, "b");
 }
@@ -41,10 +39,8 @@ fn distribution_skews_to_lower_load() {
     workers[2].active_requests.store(100, Ordering::Relaxed); // c is loaded
 
     let p = PowerOfTwoChoicesPolicy::new();
-    let ctx = SelectionContext {
-        model: &ModelId("m".into()),
-        request_body: None,
-    };
+    let model_id = ModelId("m".into());
+    let ctx = SelectionContext::new(&model_id, None);
     let mut counts = std::collections::HashMap::new();
     for _ in 0..1000 {
         let w = p.select(&workers, &ctx).unwrap();
@@ -61,10 +57,8 @@ fn distribution_skews_to_lower_load() {
 fn empty_returns_none() {
     let p = PowerOfTwoChoicesPolicy::new();
     let ws: Vec<Arc<Worker>> = vec![];
-    let ctx = SelectionContext {
-        model: &ModelId("m".into()),
-        request_body: None,
-    };
+    let model_id = ModelId("m".into());
+    let ctx = SelectionContext::new(&model_id, None);
     assert!(p.select(&ws, &ctx).is_none());
 }
 
@@ -72,9 +66,7 @@ fn empty_returns_none() {
 fn single_worker_returns_it() {
     let p = PowerOfTwoChoicesPolicy::new();
     let ws = vec![worker("only")];
-    let ctx = SelectionContext {
-        model: &ModelId("m".into()),
-        request_body: None,
-    };
+    let model_id = ModelId("m".into());
+    let ctx = SelectionContext::new(&model_id, None);
     assert_eq!(p.select(&ws, &ctx).unwrap().id.0, "only");
 }

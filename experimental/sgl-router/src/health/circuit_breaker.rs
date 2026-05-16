@@ -8,20 +8,21 @@
 // paused-time test, preventing the Open → HalfOpen transition from being
 // exercised deterministically.
 
+use std::num::NonZeroU32;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
-    pub threshold: u32,
+    pub threshold: NonZeroU32,
     pub cool_down: Duration,
 }
 
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
-            threshold: 3,
+            threshold: NonZeroU32::new(3).expect("3 is non-zero"),
             cool_down: Duration::from_secs(30),
         }
     }
@@ -101,7 +102,7 @@ impl CircuitBreaker {
         match g.state {
             State::Closed | State::HalfOpen { .. } => {
                 g.consecutive_failures += 1;
-                if g.consecutive_failures >= self.config.threshold {
+                if g.consecutive_failures >= self.config.threshold.get() {
                     g.state = State::Open {
                         opened_at: Instant::now(),
                     };

@@ -23,7 +23,7 @@ use sgl_router::workers::{Worker, WorkerRegistry};
 #[tokio::test(start_paused = true)]
 async fn breaker_half_open_admits_only_one_probe_concurrently() {
     let cb = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
-        threshold: 1,
+        threshold: std::num::NonZeroU32::new(1).unwrap(),
         cool_down: Duration::from_millis(50),
     }));
 

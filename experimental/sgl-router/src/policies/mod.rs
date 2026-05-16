@@ -14,9 +14,30 @@ use std::sync::Arc;
 /// Selection input — carries the request body so that cache-aware policies
 /// can hash prefix tokens without reshaping the [`Policy`] trait.  Today's
 /// policies (round-robin, random, power-of-two) only read `workers`.
+///
+/// Constructed via [`Self::new`]; accessors expose immutable references so
+/// callers cannot mutate the model id or swap in a different body without
+/// going through the constructor.
 pub struct SelectionContext<'a> {
-    pub model: &'a ModelId,
-    pub request_body: Option<&'a [u8]>,
+    model: &'a ModelId,
+    request_body: Option<&'a [u8]>,
+}
+
+impl<'a> SelectionContext<'a> {
+    pub fn new(model: &'a ModelId, request_body: Option<&'a [u8]>) -> Self {
+        Self {
+            model,
+            request_body,
+        }
+    }
+
+    pub fn model(&self) -> &ModelId {
+        self.model
+    }
+
+    pub fn request_body(&self) -> Option<&[u8]> {
+        self.request_body
+    }
 }
 
 pub trait Policy: Send + Sync + std::fmt::Debug {

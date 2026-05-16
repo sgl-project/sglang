@@ -6,7 +6,7 @@ use std::time::Duration;
 
 fn cb() -> CircuitBreaker {
     CircuitBreaker::with_config(CircuitBreakerConfig {
-        threshold: 3,
+        threshold: std::num::NonZeroU32::new(3).unwrap(),
         cool_down: Duration::from_millis(100),
     })
 }
@@ -80,7 +80,7 @@ async fn open_breaker_recovery_is_not_delayed_by_continued_failures() {
     // refreshed opened_at, so a failure storm pinned the breaker open
     // forever. Now the cool_down is measured from first-open.
     let b = CircuitBreaker::with_config(CircuitBreakerConfig {
-        threshold: 3,
+        threshold: std::num::NonZeroU32::new(3).unwrap(),
         cool_down: Duration::from_millis(100),
     });
     // Open it.
