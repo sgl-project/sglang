@@ -16,7 +16,10 @@ struct Cli {
 
 /// Install the global tracing subscriber.
 ///
-/// Idempotent: a second call returns `Ok` without panicking.
+/// Idempotent: a second call returns `Ok` without panicking. When
+/// `try_init` errors, some other code has already installed a subscriber,
+/// so the `tracing::debug!` below is delivered through THAT subscriber —
+/// no recursive init.
 fn init_tracing(default_level: &str) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
@@ -26,7 +29,13 @@ fn init_tracing(default_level: &str) -> Result<()> {
         .try_init()
     {
         // A second install attempt; the existing subscriber is fine.
-        eprintln!("tracing subscriber already initialized: {e}");
+        // Surface the attempted default level so an operator can see
+        // what we tried.
+        tracing::debug!(
+            default_level = %default_level,
+            error = %e,
+            "tracing subscriber already installed; continuing"
+        );
     }
     Ok(())
 }
