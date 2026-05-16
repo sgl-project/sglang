@@ -143,8 +143,7 @@ class ResidentStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        if use.target_dtype is not None:
-            _module_to_local_device(module, dtype=use.target_dtype)
+        _module_to_local_device(module, dtype=use.target_dtype)
 
 
 class SnapshotModuleResidency:
