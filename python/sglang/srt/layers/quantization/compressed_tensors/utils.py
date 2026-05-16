@@ -60,7 +60,7 @@ def should_ignore_layer(
             elif should_ignore_shard != should_ignore_layer:
                 raise ValueError(
                     f"Found a different quantization schemes for "
-                    f"{shard_proj_names} in {layer_name}. vLLM "
+                    f"{shard_proj_names} in {layer_name}. SGLang "
                     "requires all to use the same scheme."
                 )
 
