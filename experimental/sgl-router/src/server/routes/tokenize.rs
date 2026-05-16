@@ -118,7 +118,7 @@ mod tests {
             }],
             workers: vec![crate::config::WorkerConfig {
                 url: reqwest::Url::parse("http://x:30000").unwrap(),
-                request_timeout_ms: None,
+                request_timeout: None,
             }],
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();

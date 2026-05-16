@@ -385,6 +385,117 @@ workers:
         }
     }
 
+    // `request_timeout` parsing.
+    //
+    // The field is `Option<Duration>` deserialized via `humantime_serde`, so
+    // operators write human-readable strings (`"60s"`, `"500ms"`, `"2m"`)
+    // rather than raw milliseconds. Malformed input must be rejected at
+    // config-load — a silent fallback to a default hides typos in
+    // production configs.
+
+    #[test]
+    fn loads_request_timeout_in_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models: []
+workers:
+  - url: "http://127.0.0.1:30000"
+    request_timeout: "60s"
+"#,
+        )
+        .unwrap();
+        let c = Config::from_path(&p).unwrap();
+        assert_eq!(
+            c.workers[0].request_timeout,
+            Some(std::time::Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn loads_request_timeout_in_ms() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models: []
+workers:
+  - url: "http://127.0.0.1:30000"
+    request_timeout: "500ms"
+"#,
+        )
+        .unwrap();
+        let c = Config::from_path(&p).unwrap();
+        assert_eq!(
+            c.workers[0].request_timeout,
+            Some(std::time::Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn loads_request_timeout_default_when_absent() {
+        // Absent => None at the config layer. main.rs picks the default
+        // (currently 60 s). Keeping the default in main.rs (not here) lets
+        // tests build a `WorkerConfig` without committing to a magic number
+        // at the type-system boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models: []
+workers:
+  - url: "http://127.0.0.1:30000"
+"#,
+        )
+        .unwrap();
+        let c = Config::from_path(&p).unwrap();
+        assert_eq!(c.workers[0].request_timeout, None);
+    }
+
+    #[test]
+    fn loads_request_timeout_rejects_garbage() {
+        // Reject malformed input loudly. Cases that should never silently
+        // become the 60 s default: a non-numeric word and a negative
+        // duration (humantime rejects negatives at the lexer; humantime
+        // also rejects "infinity").
+        for bad in ["infinity", "-5s", "5 fortnights"] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("c.yaml");
+            std::fs::write(
+                &p,
+                format!(
+                    r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models: []
+workers:
+  - url: "http://127.0.0.1:30000"
+    request_timeout: "{bad}"
+"#
+                ),
+            )
+            .unwrap();
+            assert!(
+                Config::from_path(&p).is_err(),
+                "expected `request_timeout: {bad:?}` to fail to parse, but it succeeded"
+            );
+        }
+    }
+
     #[test]
     fn url_join_drops_existing_path_for_absolute_input() {
         // Pin the Url::join semantics we rely on in proxy::forward_*. An

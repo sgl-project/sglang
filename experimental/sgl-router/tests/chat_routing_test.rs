@@ -31,7 +31,7 @@ fn config(worker_url: &str) -> Config {
         }],
         workers: vec![WorkerConfig {
             url: worker_url.parse().expect("worker URL must parse"),
-            request_timeout_ms: None,
+            request_timeout: None,
         }],
     }
 }

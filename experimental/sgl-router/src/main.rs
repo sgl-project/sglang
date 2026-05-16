@@ -73,8 +73,11 @@ async fn main() -> Result<()> {
         .workers
         .first()
         .context("config has no workers (validate() should have rejected this)")?;
-    let request_timeout =
-        std::time::Duration::from_millis(primary_worker.request_timeout_ms.unwrap_or(60_000));
+    // Field is `Option<Duration>` after the humantime-serde refactor; only
+    // the default needs picking here.
+    let request_timeout = primary_worker
+        .request_timeout
+        .unwrap_or_else(|| std::time::Duration::from_secs(60));
     let proxy = Arc::new(
         sgl_router::proxy::Proxy::new(primary_worker.url.clone(), request_timeout)
             .context("build proxy client")?,
