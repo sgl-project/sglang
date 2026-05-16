@@ -27,17 +27,13 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        const VALID_POLICIES: &[&str] = &["round_robin", "random", "power_of_two"];
-
+        // Unknown policy names are rejected by serde via `PolicyKind`'s
+        // `rename_all = "snake_case"`; threshold = 0 is rejected by
+        // `NonZeroU32`.  Only fields without a type-system constraint are
+        // checked here.
         for m in &self.models {
             if m.id.is_empty() {
                 return Err(anyhow!("model.id must be non-empty"));
-            }
-            if !VALID_POLICIES.contains(&m.policy.as_str()) {
-                return Err(anyhow!(
-                    "model.policy = {:?} not recognized; valid: {VALID_POLICIES:?}",
-                    m.policy
-                ));
             }
         }
         match &self.discovery.backend {
@@ -174,7 +170,7 @@ path = "/etc/experimental/sgl-router/workers.toml"
             }
             _ => panic!("expected static_file backend"),
         }
-        assert_eq!(c.models[0].policy, "round_robin");
+        assert_eq!(c.models[0].policy, PolicyKind::RoundRobin);
     }
 
     #[test]
@@ -461,6 +457,6 @@ path = "/tmp/w.toml"
         )
         .unwrap();
         let c = Config::from_path(&p).unwrap();
-        assert_eq!(c.models[0].policy, "round_robin");
+        assert_eq!(c.models[0].policy, PolicyKind::RoundRobin);
     }
 }

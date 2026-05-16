@@ -107,6 +107,56 @@ fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerC
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::cb_config_for_spec;
+    use crate::config::{
+        CircuitBreakerConfig as RawCbConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig,
+        PolicyKind, ServerConfig, StaticFileDiscoveryConfig,
+    };
+    use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use std::num::NonZeroU32;
+
+    fn cfg_with_model_cb(id: &str, threshold: u32, cool_down_secs: u64) -> Config {
+        Config {
+            server: ServerConfig {
+                host: "0".into(),
+                port: 0,
+            },
+            observability: Default::default(),
+            models: vec![ModelConfig {
+                id: id.into(),
+                tokenizer_path: "/tmp/x".into(),
+                policy: PolicyKind::RoundRobin,
+                circuit_breaker: Some(RawCbConfig {
+                    threshold: NonZeroU32::new(threshold).unwrap(),
+                    cool_down_secs,
+                }),
+            }],
+            discovery: DiscoveryConfig {
+                backend: DiscoveryBackend::StaticFile(StaticFileDiscoveryConfig {
+                    path: "/tmp/w".into(),
+                    poll_interval_ms: 200,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn cb_config_for_spec_carries_threshold_and_cool_down() {
+        let cfg = cfg_with_model_cb("m", 5, 60);
+        let spec = WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("m".into())],
+        };
+        let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
+        assert_eq!(cb.threshold.get(), 5);
+        assert_eq!(cb.cool_down, std::time::Duration::from_secs(60));
+    }
+}
+
 pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistry>) {
     run_with_config(rx, registry, None).await;
 }

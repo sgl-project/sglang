@@ -44,6 +44,8 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    use crate::config::PolicyKind;
+
     #[tokio::test]
     async fn lists_configured_models() {
         let mut ctx = crate::server::app_context::AppContext::stub();
@@ -51,13 +53,13 @@ mod tests {
             crate::config::ModelConfig {
                 id: "qwen3".into(),
                 tokenizer_path: "x".into(),
-                policy: "round_robin".into(),
+                policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
             },
             crate::config::ModelConfig {
                 id: "deepseek".into(),
                 tokenizer_path: "y".into(),
-                policy: "round_robin".into(),
+                policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
             },
         ];

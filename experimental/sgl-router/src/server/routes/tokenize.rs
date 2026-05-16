@@ -105,6 +105,8 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    use crate::config::PolicyKind;
+
     fn ctx_with_tiny() -> Arc<AppContext> {
         let cfg = crate::config::Config {
             server: crate::config::ServerConfig {
@@ -115,7 +117,7 @@ mod tests {
             models: vec![crate::config::ModelConfig {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
-                policy: "round_robin".into(),
+                policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
             }],
             discovery: crate::config::DiscoveryConfig {

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -7,6 +8,25 @@ pub struct Config {
     pub observability: ObservabilityConfig,
     pub models: Vec<ModelConfig>,
     pub discovery: DiscoveryConfig,
+}
+
+/// Routing policy selector — the enum form lets serde reject unknown
+/// values at deserialization time and removes the runtime string match in
+/// the policy factory.
+///
+/// Serialised as `"round_robin"` / `"random"` / `"power_of_two"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyKind {
+    RoundRobin,
+    Random,
+    PowerOfTwo,
+}
+
+impl Default for PolicyKind {
+    fn default() -> Self {
+        PolicyKind::RoundRobin
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,26 +49,26 @@ fn default_log_level() -> String {
 pub struct ModelConfig {
     pub id: String,
     pub tokenizer_path: String,
-    #[serde(default = "default_policy")]
-    pub policy: String,
+    #[serde(default)]
+    pub policy: PolicyKind,
     #[serde(default)]
     pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
-fn default_policy() -> String {
-    "round_robin".to_string()
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitBreakerConfig {
+    /// Consecutive failures required before the breaker opens.  Encoded
+    /// as `NonZeroU32` so a config setting `threshold = 0` (which would
+    /// open the breaker before any failure) is rejected at deserialization
+    /// rather than silently behaving as "always open".
     #[serde(default = "default_cb_threshold")]
-    pub threshold: u32,
+    pub threshold: NonZeroU32,
     #[serde(default = "default_cb_cool_down")]
     pub cool_down_secs: u64,
 }
 
-fn default_cb_threshold() -> u32 {
-    3
+fn default_cb_threshold() -> NonZeroU32 {
+    NonZeroU32::new(3).expect("3 is non-zero")
 }
 fn default_cb_cool_down() -> u64 {
     30

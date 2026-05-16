@@ -6,8 +6,8 @@ mod common;
 use axum::body::Body;
 use axum::http::Request;
 use sgl_router::config::{
-    Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig, ServerConfig,
-    StaticFileDiscoveryConfig,
+    Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig, PolicyKind,
+    ServerConfig, StaticFileDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry as build_policy_registry;
@@ -32,7 +32,7 @@ async fn forwards_whitelisted_headers_strips_others() {
         models: vec![ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
-            policy: "round_robin".into(),
+            policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
         }],
         discovery: DiscoveryConfig {

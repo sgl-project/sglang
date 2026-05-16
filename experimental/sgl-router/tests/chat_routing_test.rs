@@ -4,8 +4,8 @@
 mod common;
 
 use sgl_router::config::{
-    Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig, ServerConfig,
-    StaticFileDiscoveryConfig,
+    Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig, PolicyKind,
+    ServerConfig, StaticFileDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry as build_policy_registry;
@@ -34,7 +34,7 @@ fn config_for(_worker_url: &str) -> Config {
         models: vec![ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
-            policy: "round_robin".into(),
+            policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
         }],
         discovery: DiscoveryConfig {
@@ -676,7 +676,7 @@ async fn forward_json_to_records_failure_on_5xx() {
 
     let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
-        threshold: 1,
+        threshold: std::num::NonZeroU32::new(1).unwrap(),
         cool_down: Duration::from_secs(30),
     }));
 
@@ -708,7 +708,7 @@ async fn forward_json_to_rejects_when_breaker_open() {
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
     let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
-        threshold: 1,
+        threshold: std::num::NonZeroU32::new(1).unwrap(),
         cool_down: Duration::from_secs(30),
     }));
     breaker.record_failure(); // open immediately
@@ -746,7 +746,7 @@ async fn forward_json_to_malformed_url_returns_worker_misconfigured_and_trips_br
 
     let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
-        threshold: 1,
+        threshold: std::num::NonZeroU32::new(1).unwrap(),
         cool_down: Duration::from_secs(30),
     }));
 

@@ -65,9 +65,9 @@ model_ids = ["tiny"]
         models: vec![ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
-            policy: "round_robin".into(),
+            policy: PolicyKind::RoundRobin,
             circuit_breaker: Some(CircuitBreakerConfig {
-                threshold: 1, // open after first failure
+                threshold: std::num::NonZeroU32::new(1).unwrap(), // open after first failure
                 cool_down_secs: 30,
             }),
         }],

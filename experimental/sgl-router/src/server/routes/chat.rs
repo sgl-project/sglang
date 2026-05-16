@@ -70,10 +70,7 @@ pub async fn chat_completions(
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
-    let selection_ctx = SelectionContext {
-        model: &model_id,
-        request_body: Some(&body),
-    };
+    let selection_ctx = SelectionContext::new(&model_id, Some(&body));
     let worker = policy
         .select(&workers, &selection_ctx)
         .ok_or_else(|| ApiError::PolicySelectionFailed {
