@@ -18,19 +18,24 @@ class SpecResourceContext:
     """Resource + config shared across the spec-worker layers (coordinator and
     inner draft executor).
 
-    Constructed once at coordinator `__init__` and passed (or re-read) by the
-    inner draft executor. Replaces the duplicated `self.topk = ...` /
-    `self.speculative_num_steps = ...` / ... boilerplate copied across nine
-    worker `__init__` methods.
+    Built once at coordinator `__init__` and reused (same object) by the inner
+    draft executor — see `NullDraftExecutor(ctx)` / `DFlashDraftExecutor(...,
+    ctx)` / the V2 draft executor `ctx` kwarg. Replaces the duplicated
+    `self.topk = ...` / `self.speculative_num_steps = ...` boilerplate
+    previously copied across each worker `__init__`.
+
+    Mutability: non-frozen on purpose so the adaptive controller can swap
+    `speculative_num_steps` / `speculative_num_draft_tokens` through the
+    setters on `DraftExecutor` / `SpecCoordinator`. The scheduler runs all
+    spec workers single-threaded, so there is no cross-thread concurrency on
+    `_ctx` — but anything that holds a reference must accept that those two
+    fields may be rewritten.
 
     Rank coordinates (gpu_id / tp_rank / dp_rank / ...) are intentionally
-    *not* held here:
-    - V1 monolithic workers inherit `TpModelWorker`, which stores those as
-      instance attributes itself.
-    - V2 workers store them as instance attributes too, since they pass them
-      through to the inner `TpModelWorker`.
-    Centralizing them here would clash with `TpModelWorker.__init__`'s own
-    assignments (the property would refuse the instance assignment).
+    *not* held here. `TpModelWorker.__init__` writes them as instance
+    attributes on its host (or on the inner draft `TpModelWorker`), so
+    centralizing them via property would clash with that instance-level
+    assignment (the property has no setter).
     """
 
     server_args: "ServerArgs"
@@ -82,9 +87,12 @@ class DraftExecutor(ABC):
 
     The `_ctx` field is the single source of truth for shared config; the
     properties below forward to it. Properties cover only attributes that
-    `TpModelWorker.__init__` does *not* itself set (otherwise workers that
-    delegate to an inner `TpModelWorker` could see instance-level writes
-    rejected by the property if it has no setter).
+    `TpModelWorker.__init__` does *not* itself set — e.g. spec-derived config
+    (topk, speculative_num_steps) and `target_worker`. Rank coords and
+    `server_args` / `req_to_token_pool` are not forwarded here because
+    `TpModelWorker.__init__` writes them as instance attrs, and a property
+    without setter would reject those writes (relevant for the host
+    coordinator's `TpModelWorker.__init__` call on `FrozenKVMTPWorker`).
     `eagle_use_aux_hidden_state` stays an instance attribute because it is
     derived later, after the draft model is loaded.
     """
@@ -177,14 +185,17 @@ class NullDraftExecutor(DraftExecutor):
 class SpecCoordinator(ABC):
     """Contract for the spec-pipeline-coordinating layer.
 
-    A `SpecCoordinator` drives the draft / verify / extend pipeline. It holds a
-    `target_worker` (target model) and a `draft_worker` (a `DraftExecutor`,
-    possibly `self` for V1 monolithic workers, or `NullDraftExecutor` for
-    no-draft-model algorithms).
+    A `SpecCoordinator` drives the draft / verify / extend pipeline. It holds
+    a `target_worker` (target model) and a `draft_worker` (a `DraftExecutor`).
+    The `draft_worker` is `self` for monolithic workers that inherit both
+    `TpModelWorker` and `DraftExecutor` (currently only `FrozenKVMTPWorker`),
+    a `NullDraftExecutor` for algorithms with no draft model (NGRAM), or a
+    dedicated `DraftExecutor` instance otherwise.
 
     The `_ctx` field is shared with the inner `DraftExecutor` (same object,
-    not a copy). Forwarding properties match `DraftExecutor` so coordinator
-    code reads `self.topk` / `self.target_worker` / ... uniformly.
+    not a copy — V2 workers pass `ctx=self._ctx` to the executor ctor).
+    Forwarding properties match `DraftExecutor` so coordinator code reads
+    `self.topk` / `self.target_worker` / ... uniformly.
     """
 
     _ctx: SpecResourceContext

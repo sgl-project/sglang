@@ -112,10 +112,17 @@ class EagleDraftWorker(DraftExecutor):
         moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
+        *,
+        ctx: Optional[SpecResourceContext] = None,
     ):
         # Shared spec config + memory-pool refs; properties on `DraftExecutor`
         # forward `self.topk` / `self.target_worker` / ... to this context.
-        self._ctx = SpecResourceContext.from_server_args(server_args, target_worker)
+        # If a host coordinator already built a ctx, reuse it (same object) so
+        # mutations (e.g. adaptive `speculative_num_steps` override) stay
+        # consistent across coordinator/executor.
+        self._ctx = ctx or SpecResourceContext.from_server_args(
+            server_args, target_worker
+        )
 
         # Rank coordinates + memory-pool aliases (this class doesn't inherit
         # `TpModelWorker`; both are forwarded into the inner draft TpModelWorker
@@ -690,6 +697,7 @@ class EAGLEWorkerV2(SpecCoordinator):
             moe_dp_rank,
             nccl_port,
             target_worker,
+            ctx=self._ctx,
         )
 
         # Adaptive speculative

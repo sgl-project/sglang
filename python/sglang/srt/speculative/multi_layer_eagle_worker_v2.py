@@ -92,9 +92,14 @@ class MultiLayerEagleDraftWorker(DraftExecutor):
         moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
+        *,
+        ctx: Optional[SpecResourceContext] = None,
     ):
-        # Shared spec config + memory-pool refs.
-        self._ctx = SpecResourceContext.from_server_args(server_args, target_worker)
+        # Shared spec config + memory-pool refs (reuse host coordinator's ctx
+        # when provided, so adaptive mutations stay consistent).
+        self._ctx = ctx or SpecResourceContext.from_server_args(
+            server_args, target_worker
+        )
 
         # Rank coordinates + memory-pool aliases.
         self.server_args = server_args
@@ -653,6 +658,7 @@ class MultiLayerEagleWorkerV2(SpecCoordinator):
             moe_dp_rank,
             nccl_port,
             target_worker,
+            ctx=self._ctx,
         )
 
         # Some dummy tensors
