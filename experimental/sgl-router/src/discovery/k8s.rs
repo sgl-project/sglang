@@ -10,13 +10,9 @@
 use crate::config::{K8sDiscoveryConfig, K8sDiscoveryMode};
 use crate::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
 use anyhow::{Context, Result};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use kube::{
-    api::Api,
-    runtime::{watcher, WatchStreamExt},
-    Client,
-};
+use kube::{api::Api, runtime::watcher, Client};
 use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc;
 
@@ -138,19 +134,179 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
 /// side; in PD mode the watch is unfiltered and per-slice classification
 /// happens client-side via `classify_mode`.
 ///
+/// Stable per-slice key.
+///
+/// Uses `metadata.uid` when present (the normal case in a real cluster), and
+/// falls back to `{ns}/{name}` for slices without a UID (rare: CR shims,
+/// tests, certain fake/in-memory backends).  The fallback is unique per slice
+/// because EndpointSlice names are unique within a namespace.
+fn slice_key(es: &EndpointSlice) -> String {
+    if let Some(uid) = es.metadata.uid.as_deref() {
+        if !uid.is_empty() {
+            return uid.to_string();
+        }
+    }
+    let ns = es.metadata.namespace.as_deref().unwrap_or("");
+    let name = es.metadata.name.as_deref().unwrap_or("");
+    format!("{ns}/{name}")
+}
+
+/// Send all `Added` / `Removed` / `ModeChanged` events that bring the
+/// consumer from `prev_union` to the recomputed union of `per_slice`.
+///
+/// Returns `Err` on the first send failure (consumer dropped); the caller is
+/// expected to exit the watcher loop.  Updates `prev_union` in place to the
+/// new union on success.
+async fn emit_diff(
+    tx: &mpsc::Sender<DiscoveryEvent>,
+    per_slice: &HashMap<String, HashMap<WorkerId, WorkerSpec>>,
+    prev_union: &mut HashMap<WorkerId, WorkerSpec>,
+) -> Result<(), mpsc::error::SendError<DiscoveryEvent>> {
+    let union: HashMap<WorkerId, WorkerSpec> = per_slice
+        .values()
+        .flat_map(|s| s.iter().map(|(k, v)| (k.clone(), v.clone())))
+        .collect();
+
+    for (id, spec) in &union {
+        match prev_union.get(id) {
+            Some(prev) => {
+                if prev.mode != spec.mode {
+                    tx.send(DiscoveryEvent::ModeChanged {
+                        id: id.clone(),
+                        mode: spec.mode,
+                    })
+                    .await?;
+                }
+                if prev.url != spec.url || prev.model_ids != spec.model_ids {
+                    tx.send(DiscoveryEvent::Removed { id: id.clone() }).await?;
+                    tx.send(DiscoveryEvent::Added(spec.clone())).await?;
+                }
+            }
+            None => {
+                tx.send(DiscoveryEvent::Added(spec.clone())).await?;
+            }
+        }
+    }
+
+    let dropped: Vec<WorkerId> = prev_union
+        .keys()
+        .filter(|id| !union.contains_key(id))
+        .cloned()
+        .collect();
+    for id in dropped {
+        tx.send(DiscoveryEvent::Removed { id }).await?;
+    }
+
+    *prev_union = union;
+    Ok(())
+}
+
+/// Drive the event-processing loop for a stream of `watcher::Event`s.
+///
+/// Handles the full set of `kube` watcher events:
+/// * `Init` / `InitApply` / `InitDone` — full-LIST resync.  Objects are
+///   buffered until `InitDone`, then swapped in atomically.  Any slices that
+///   were present before but not seen during the resync are diffed out as
+///   `Removed`, which catches deletions that occurred while the watcher was
+///   disconnected.
+/// * `Apply` — single-object upsert into `per_slice`.
+/// * `Delete` — single-object removal from `per_slice`; the diff emits
+///   `Removed` for every worker that lived in that slice.
+///
+/// On any watcher error the kube-runtime watcher auto-restarts and emits a
+/// new `Init` cycle, so the resync logic above is what reconciles state
+/// after transient errors — no separate state reset is required.
+///
+/// The loop returns when the input stream ends (logged at WARN) or when the
+/// consumer drops the receiving end of `tx` (logged at INFO).
+async fn process_events<S>(
+    mut stream: S,
+    tx: mpsc::Sender<DiscoveryEvent>,
+    mode: K8sDiscoveryMode,
+) where
+    S: Stream<Item = Result<watcher::Event<EndpointSlice>, watcher::Error>> + Unpin,
+{
+    let mut per_slice: HashMap<String, HashMap<WorkerId, WorkerSpec>> = HashMap::new();
+    let mut prev_union: HashMap<WorkerId, WorkerSpec> = HashMap::new();
+    let mut init_buffer: Option<HashMap<String, HashMap<WorkerId, WorkerSpec>>> = None;
+
+    fn workers_for_slice(
+        es: &EndpointSlice,
+        mode: &K8sDiscoveryMode,
+    ) -> HashMap<WorkerId, WorkerSpec> {
+        match classify_mode(es, mode) {
+            Some(wm) => extract_workers(es, wm)
+                .into_iter()
+                .map(|w| (w.id.clone(), w))
+                .collect(),
+            None => HashMap::new(),
+        }
+    }
+
+    while let Some(event) = stream.next().await {
+        let result = match event {
+            Ok(watcher::Event::Init) => {
+                init_buffer = Some(HashMap::new());
+                Ok(())
+            }
+            Ok(watcher::Event::InitApply(es)) => {
+                let key = slice_key(&es);
+                let workers = workers_for_slice(&es, &mode);
+                if let Some(buf) = init_buffer.as_mut() {
+                    buf.insert(key, workers);
+                    Ok(())
+                } else {
+                    // Defensive: InitApply outside an Init cycle.  Treat as Apply.
+                    per_slice.insert(key, workers);
+                    emit_diff(&tx, &per_slice, &mut prev_union).await
+                }
+            }
+            Ok(watcher::Event::InitDone) => {
+                if let Some(buf) = init_buffer.take() {
+                    per_slice = buf;
+                    emit_diff(&tx, &per_slice, &mut prev_union).await
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(watcher::Event::Apply(es)) => {
+                let key = slice_key(&es);
+                let workers = workers_for_slice(&es, &mode);
+                per_slice.insert(key, workers);
+                emit_diff(&tx, &per_slice, &mut prev_union).await
+            }
+            Ok(watcher::Event::Delete(es)) => {
+                let key = slice_key(&es);
+                per_slice.remove(&key);
+                emit_diff(&tx, &per_slice, &mut prev_union).await
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "k8s watcher error; awaiting auto-restart");
+                Ok(())
+            }
+        };
+        if result.is_err() {
+            tracing::info!("k8s discovery: event channel closed; exiting watcher");
+            return;
+        }
+    }
+    tracing::warn!("k8s watcher stream ended; discovery task exiting");
+}
+
 /// Empty `cfg.namespace` triggers a cluster-wide watch via `Api::all(client)`.
 /// `Api::namespaced(client, "")` is namespace-scoped to the empty-named
 /// namespace, which is almost never what callers intend.
 ///
-/// State is tracked per-slice as `HashMap<SliceUid, HashMap<WorkerId,
-/// WorkerSpec>>`. K8s auto-shards Services with >100 endpoints and CNIs often
-/// shard per AZ, so multiple `EndpointSlice` objects can exist per Service; a
-/// flat state map would let each slice's event silently drop all workers from
-/// sibling slices. The global union is recomputed from all submaps on every
-/// event and diffed against `prev_union` to produce `DiscoveryEvent`s.
+/// State is tracked per-slice as `HashMap<SliceKey, HashMap<WorkerId,
+/// WorkerSpec>>`.  K8s auto-shards Services with >100 endpoints and CNIs
+/// often shard per AZ, so multiple `EndpointSlice` objects can exist per
+/// Service; a flat state map would let each slice's event silently drop all
+/// workers from sibling slices.  The global union is recomputed from all
+/// submaps on every event and diffed against `prev_union` to produce
+/// `DiscoveryEvent`s.
 ///
 /// The returned `JoinHandle` runs until the channel is closed or the watcher
-/// stream ends (server restart, etc.).
+/// stream ends (server restart, RBAC change, etc.).
 pub async fn spawn(
     cfg: K8sDiscoveryConfig,
     tx: mpsc::Sender<DiscoveryEvent>,
@@ -179,63 +335,9 @@ pub async fn spawn(
     let watcher_cfg = watcher::Config::default().labels(&server_side_selector);
 
     let handle = tokio::spawn(async move {
-        // Key: EndpointSlice UID (String).  Value: workers in that slice.
-        let mut per_slice: HashMap<String, HashMap<WorkerId, WorkerSpec>> = HashMap::new();
-        let mut prev_union: HashMap<WorkerId, WorkerSpec> = HashMap::new();
-
-        let stream = watcher(api, watcher_cfg).applied_objects();
+        let stream = watcher(api, watcher_cfg);
         tokio::pin!(stream);
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(es) => {
-                    let slice_uid = es.metadata.uid.clone().unwrap_or_default();
-                    let next_slice: HashMap<WorkerId, WorkerSpec> =
-                        match classify_mode(&es, &mode) {
-                            Some(wm) => extract_workers(&es, wm)
-                                .into_iter()
-                                .map(|w| (w.id.clone(), w))
-                                .collect(),
-                            None => HashMap::new(),
-                        };
-                    per_slice.insert(slice_uid, next_slice);
-
-                    // Recompute union across all slices.
-                    let union: HashMap<WorkerId, WorkerSpec> = per_slice
-                        .values()
-                        .flat_map(|s| s.iter().map(|(k, v)| (k.clone(), v.clone())))
-                        .collect();
-
-                    // Diff union against prev_union.
-                    for (id, spec) in &union {
-                        if let Some(p) = prev_union.get(id) {
-                            if p.mode != spec.mode {
-                                let _ = tx
-                                    .send(DiscoveryEvent::ModeChanged {
-                                        id: id.clone(),
-                                        mode: spec.mode,
-                                    })
-                                    .await;
-                            }
-                            if p.url != spec.url || p.model_ids != spec.model_ids {
-                                let _ = tx.send(DiscoveryEvent::Removed { id: id.clone() }).await;
-                                let _ = tx.send(DiscoveryEvent::Added(spec.clone())).await;
-                            }
-                        } else {
-                            let _ = tx.send(DiscoveryEvent::Added(spec.clone())).await;
-                        }
-                    }
-                    for id in prev_union.keys() {
-                        if !union.contains_key(id) {
-                            let _ = tx.send(DiscoveryEvent::Removed { id: id.clone() }).await;
-                        }
-                    }
-                    prev_union = union;
-                }
-                Err(e) => {
-                    tracing::warn!("k8s watcher error: {e:?}");
-                }
-            }
-        }
+        process_events(stream, tx, mode).await;
     });
     Ok(handle)
 }
@@ -437,5 +539,186 @@ mod tests {
             "empty ns => id starts with '/', got: {}",
             ws[0].id.0
         );
+    }
+
+    /// Two slices with no `metadata.uid` must hash to distinct per-slice
+    /// keys; otherwise an event for slice B would overwrite slice A's state.
+    #[test]
+    fn slice_key_falls_back_to_ns_and_name_when_uid_missing() {
+        let a = make_slice_ns(None, &["m"], &["10.0.0.1"], 30000, true, "ns1", "a");
+        let b = make_slice_ns(None, &["m"], &["10.0.0.2"], 30000, true, "ns1", "b");
+        assert_ne!(slice_key(&a), slice_key(&b));
+        assert_eq!(slice_key(&a), "ns1/a");
+    }
+
+    #[test]
+    fn slice_key_uses_uid_when_present() {
+        let mut a = make_slice_ns(None, &["m"], &["10.0.0.1"], 30000, true, "ns1", "a");
+        a.metadata.uid = Some("uid-abc".into());
+        assert_eq!(slice_key(&a), "uid-abc");
+    }
+
+    fn with_uid(mut es: EndpointSlice, uid: &str) -> EndpointSlice {
+        es.metadata.uid = Some(uid.into());
+        es
+    }
+
+    /// Apply → Delete on the same slice removes its workers from the union
+    /// (the missing variant for `.applied_objects()` before the rewrite).
+    #[tokio::test]
+    async fn delete_event_emits_removed_for_workers_in_slice() {
+        let s = with_uid(make_slice_ns(&["10.0.0.1"], 30000, true, "ns", "svc"), "u1");
+        let events = vec![
+            Ok(watcher::Event::Apply(s.clone())),
+            Ok(watcher::Event::Delete(s)),
+        ];
+        let (tx, mut rx) = mpsc::channel(16);
+        let stream = futures::stream::iter(events);
+        process_events(stream, tx, plain_mode()).await;
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e);
+        }
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(matches!(out[0], DiscoveryEvent::Added(_)));
+        assert!(matches!(out[1], DiscoveryEvent::Removed { .. }));
+    }
+
+    /// Init/InitDone replaces state atomically: any worker present before
+    /// the Init cycle but not seen during it is diffed out as Removed.  This
+    /// covers the "slice deleted while watcher was disconnected" case.
+    #[tokio::test]
+    async fn init_cycle_diffs_out_unseen_slices() {
+        let a = with_uid(make_slice_ns(&["10.0.0.1"], 30000, true, "ns", "a"), "u-a");
+        let b = with_uid(make_slice_ns(&["10.0.0.2"], 30000, true, "ns", "b"), "u-b");
+
+        let events = vec![
+            // Initial state: both slices live.
+            Ok(watcher::Event::Apply(a.clone())),
+            Ok(watcher::Event::Apply(b.clone())),
+            // Watcher restart resyncs and only sees `a` (b was deleted offline).
+            Ok(watcher::Event::Init),
+            Ok(watcher::Event::InitApply(a.clone())),
+            Ok(watcher::Event::InitDone),
+        ];
+        let (tx, mut rx) = mpsc::channel(16);
+        process_events(futures::stream::iter(events), tx, plain_mode()).await;
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e);
+        }
+        let removed: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                DiscoveryEvent::Removed { id } => Some(id.0.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            removed.contains(&"ns/b/10.0.0.2:30000"),
+            "init resync should diff out the deleted slice: out={out:?}"
+        );
+        assert!(
+            !removed.contains(&"ns/a/10.0.0.1:30000"),
+            "live slice must not be removed: out={out:?}"
+        );
+    }
+
+    /// When the consumer drops the receiver, the watcher loop exits cleanly
+    /// rather than continuing to process events into the void.
+    #[tokio::test]
+    async fn watcher_exits_when_consumer_drops_receiver() {
+        use std::time::Duration;
+        let s = with_uid(make_slice_ns(&["10.0.0.1"], 30000, true, "ns", "a"), "u-a");
+        // A stream that never ends — only consumer drop should stop the loop.
+        let events = futures::stream::iter(std::iter::repeat_with(move || {
+            Ok(watcher::Event::Apply(s.clone()))
+        }));
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let handle = tokio::spawn(process_events(events, tx, plain_mode()));
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("process_events must exit promptly when consumer drops")
+            .expect("task should not panic");
+    }
+
+    /// Watcher errors are logged but state is preserved; the next successful
+    /// event continues to diff against the pre-error union.
+    #[tokio::test]
+    async fn watcher_error_preserves_state_and_diffs_against_pre_error_union() {
+        let s = with_uid(make_slice_ns(&["10.0.0.1"], 30000, true, "ns", "a"), "u-a");
+        let events = vec![
+            Ok(watcher::Event::Apply(s.clone())),
+            Err(watcher::Error::NoResourceVersion),
+            // Same slice; nothing should be re-emitted because state survived.
+            Ok(watcher::Event::Apply(s)),
+        ];
+        let (tx, mut rx) = mpsc::channel(16);
+        process_events(futures::stream::iter(events), tx, plain_mode()).await;
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e);
+        }
+        // Exactly one Added — the second Apply is a no-op against the
+        // existing union.
+        let added = out
+            .iter()
+            .filter(|e| matches!(e, DiscoveryEvent::Added(_)))
+            .count();
+        assert_eq!(added, 1, "out={out:?}");
+    }
+
+    /// In PD mode, only slices whose labels match one of the role selectors
+    /// produce workers; unrelated slices in the same namespace are dropped
+    /// without registration.
+    #[tokio::test]
+    async fn pd_mode_drops_slices_whose_labels_match_no_role_selector() {
+        let prefill_slice = with_uid(
+            make_slice_full(
+                &["10.0.0.1"],
+                30000,
+                true,
+                "ns",
+                "p",
+                &[("app", "sglang"), ("role", "prefill")],
+            ),
+            "u-p",
+        );
+        let unrelated_slice = with_uid(
+            make_slice_full(
+                &["10.0.0.2"],
+                30000,
+                true,
+                "ns",
+                "x",
+                &[("app", "sglang"), ("role", "router")],
+            ),
+            "u-x",
+        );
+        let events = vec![
+            Ok(watcher::Event::Apply(prefill_slice)),
+            Ok(watcher::Event::Apply(unrelated_slice)),
+        ];
+        let (tx, mut rx) = mpsc::channel(16);
+        process_events(futures::stream::iter(events), tx, pd_mode()).await;
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e);
+        }
+        let added: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                DiscoveryEvent::Added(spec) => Some(spec),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            added.len(),
+            1,
+            "only the prefill-labelled slice should be registered: out={out:?}"
+        );
+        assert_eq!(added[0].mode, WorkerMode::Prefill);
+        assert_eq!(added[0].id.0, "ns/p/10.0.0.1:30000");
     }
 }
