@@ -57,6 +57,10 @@ def _module_ready_on_local_device(
     return dtype is None or tensor.dtype == dtype
 
 
+def is_fsdp_managed_module(module: nn.Module) -> bool:
+    return module.__class__.__name__.startswith("FSDP")
+
+
 class ComponentResidencyStrategy:
     """Baseclass for describing how a component should be treated (regarding where its weights locates)
 
@@ -143,6 +147,8 @@ class ResidentStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
+        if is_fsdp_managed_module(module):
+            return
         _module_to_local_device(module, dtype=use.target_dtype)
 
 
