@@ -2432,35 +2432,24 @@ class ServerArgs:
         is_h20_device = (
             device_name and "H20" in device_name and "H200" not in device_name
         )
-        flashinfer_allreduce_fusion_archs = [
-            "DeepseekV3ForCausalLM",
-            "DeepseekV32ForCausalLM",
-            "GptOssForCausalLM",
-            "GlmMoeDsaForCausalLM",
-            "Glm4MoeForCausalLM",
-            "Glm4MoeLiteForCausalLM",
-            "MistralLarge3ForCausalLM",
-            "Qwen3MoeForCausalLM",
-            "Qwen3NextForCausalLM",
-            "KimiK25ForConditionalGeneration",
-            "Qwen3_5MoeForConditionalGeneration",
-            "InternS2PreviewForConditionalGeneration",
-            "Qwen3_5ForConditionalGeneration",
-        ]
-        text_model_archs = getattr(
-            getattr(self.get_model_config(), "hf_text_config", None),
-            "architectures",
-            None,
-        )
-        text_model_arch = text_model_archs[0] if text_model_archs else None
-        flashinfer_allreduce_fusion_arch = (
-            text_model_arch
-            if text_model_arch in flashinfer_allreduce_fusion_archs
-            else model_arch
-        )
         if (
             not self.enable_flashinfer_allreduce_fusion
-            and flashinfer_allreduce_fusion_arch in flashinfer_allreduce_fusion_archs
+            and model_arch
+            in [
+                "DeepseekV3ForCausalLM",
+                "DeepseekV32ForCausalLM",
+                "GptOssForCausalLM",
+                "GlmMoeDsaForCausalLM",
+                "Glm4MoeForCausalLM",
+                "Glm4MoeLiteForCausalLM",
+                "MistralLarge3ForCausalLM",
+                "Qwen3MoeForCausalLM",
+                "Qwen3NextForCausalLM",
+                "KimiK25ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+                "InternS2PreviewForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+            ]
             and (is_sm90_supported() or is_sm100_supported())
             and self.tp_size > 1
             and not self.enable_dp_attention
@@ -2470,8 +2459,7 @@ class ServerArgs:
         ):
             self.enable_flashinfer_allreduce_fusion = True
             logger.info(
-                "Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for "
-                f"{flashinfer_allreduce_fusion_arch}"
+                f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
             )
 
         # Apply enforce_disable_flashinfer_allreduce_fusion after all model-specific adjustments
