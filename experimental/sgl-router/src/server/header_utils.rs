@@ -63,4 +63,55 @@ mod tests {
             "transfer-encoding"
         )));
     }
+
+    /// Prefix-match negatives: names that LOOK similar to `x-request-id-*`
+    /// or `x-sgl-*` but must NOT be forwarded. Guards against a future
+    /// regression that loosens the rule (e.g., a `contains` instead of
+    /// `starts_with`, or a missing hyphen anchor).
+    #[test]
+    fn whitelist_prefix_negatives() {
+        // `x-request-id` itself is an exact match and MUST forward —
+        // pin this so a future "tighten prefix to require trailing hyphen"
+        // refactor doesn't silently drop the canonical name.
+        assert!(
+            should_forward_request_header(&HeaderName::from_static("x-request-id")),
+            "x-request-id (exact match) must forward",
+        );
+
+        // No trailing hyphen between `id` and the suffix: not a child of
+        // `x-request-id-*`, must NOT forward.
+        assert!(
+            !should_forward_request_header(&HeaderName::from_static("x-request-id2")),
+            "x-request-id2 (no hyphen separator) must not forward",
+        );
+        assert!(
+            !should_forward_request_header(&HeaderName::from_static("x-request-idfoo")),
+            "x-request-idfoo (no hyphen separator) must not forward",
+        );
+
+        // Typo of the `x-sgl-` prefix (missing 'l'): must NOT forward.
+        assert!(
+            !should_forward_request_header(&HeaderName::from_static("x-sg-foo")),
+            "x-sg-foo (typo of x-sgl-) must not forward",
+        );
+
+        // Extra leading character: `xx-request-id-foo` does not start with
+        // `x-request-id-`, must NOT forward.
+        assert!(
+            !should_forward_request_header(&HeaderName::from_static("xx-request-id-foo")),
+            "xx-request-id-foo (extra leading char) must not forward",
+        );
+        // Same shape for the x-sgl- family.
+        assert!(
+            !should_forward_request_header(&HeaderName::from_static("xx-sgl-foo")),
+            "xx-sgl-foo (extra leading char) must not forward",
+        );
+
+        // Substring-but-not-prefix: must NOT forward (guards against a
+        // `contains`-based regression).
+        assert!(
+            !should_forward_request_header(&HeaderName::from_static("foo-x-sgl-bar")),
+            "foo-x-sgl-bar (substring, not prefix) must not forward",
+        );
+    }
 }

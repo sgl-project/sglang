@@ -60,10 +60,24 @@ async fn forwards_whitelisted_headers_strips_others() {
     app.oneshot(req).await.unwrap();
 
     let seen = worker.captured.lock().unwrap();
-    // Whitelisted headers are forwarded.
-    assert!(seen.seen.contains("authorization"));
-    assert!(seen.seen.contains("x-request-id"));
-    assert!(seen.seen.contains("x-sgl-route-key"));
+    // Whitelisted headers are forwarded with their inbound VALUES intact —
+    // a regression that mangles, uppercases, or drops the value (e.g.,
+    // forwarding the name but not the value) must fail this assertion.
+    assert_eq!(
+        seen.headers.get("authorization").map(String::as_str),
+        Some("Bearer test"),
+        "authorization must be forwarded with its inbound value verbatim",
+    );
+    assert_eq!(
+        seen.headers.get("x-request-id").map(String::as_str),
+        Some("abc-123"),
+        "x-request-id must be forwarded with its inbound value verbatim",
+    );
+    assert_eq!(
+        seen.headers.get("x-sgl-route-key").map(String::as_str),
+        Some("k1"),
+        "x-sgl-route-key must be forwarded with its inbound value verbatim",
+    );
     // Cookie must be stripped.
     assert!(!seen.seen.contains("cookie"));
     // transfer-encoding is hop-by-hop and must not be forwarded (reqwest does not
