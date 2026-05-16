@@ -285,6 +285,107 @@ workers:
     }
 
     #[test]
+    fn loads_config_rejects_url_with_path() {
+        // A worker URL with a non-trivial path silently loses the path when
+        // we later join `/v1/tokenize` etc., so we reject up-front.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models: []
+workers:
+  - url: "http://x:30000/api/"
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("path"),
+            "expected path-rejection error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn loads_config_rejects_url_with_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models: []
+workers:
+  - url: "http://x:30000/?key=foo"
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("query"),
+            "expected query-rejection error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn loads_config_rejects_url_with_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(
+            &p,
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models: []
+workers:
+  - url: "http://x:30000/#frag"
+"#,
+        )
+        .unwrap();
+        let err = Config::from_path(&p).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("fragment"),
+            "expected fragment-rejection error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn loads_config_accepts_bare_authority() {
+        // Both with and without trailing slash must pass — they're the
+        // canonical forms our deserializer allows.
+        for url in &["http://x:30000", "http://x:30000/"] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("c.yaml");
+            std::fs::write(
+                &p,
+                format!(
+                    r#"
+server:
+  host: "0.0.0.0"
+  port: 8090
+models: []
+workers:
+  - url: "{url}"
+"#
+                ),
+            )
+            .unwrap();
+            let c = Config::from_path(&p)
+                .unwrap_or_else(|e| panic!("expected {url} to pass, got: {e}"));
+            assert_eq!(c.workers[0].url.as_str(), "http://x:30000/");
+        }
+    }
+
+    #[test]
     fn url_join_drops_existing_path_for_absolute_input() {
         // Pin the Url::join semantics we rely on in proxy::forward_*. An
         // absolute path ("/v1/...") replaces the existing path, so a

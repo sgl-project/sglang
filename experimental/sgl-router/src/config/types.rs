@@ -60,10 +60,19 @@ pub struct WorkerConfig {
 }
 
 /// Deserialize a worker URL with the validation we want at config-load
-/// time: must be a syntactically valid URL AND its scheme must be `http`
-/// or `https`. Anything else (empty string, missing scheme like
-/// `"x:30000"` which would parse as scheme `"x"`, opaque schemes like
-/// `file://`) is rejected with a useful message.
+/// time:
+///   * syntactically valid URL
+///   * scheme is `http` or `https`
+///   * no non-trivial path (i.e. path is `/` or empty after normalization)
+///   * no query string
+///   * no fragment
+///
+/// The path/query/fragment restrictions exist because downstream code builds
+/// upstream URLs via [`Url::join`] with an absolute path (`"/v1/..."`), which
+/// silently replaces any base path and drops the query. Allowing
+/// `http://x:30000/api/?key=foo` at config-load would let an operator put a
+/// load-balancer prefix here and have every request silently routed away
+/// from it.
 fn deserialize_http_url<'de, D>(d: D) -> Result<Url, D::Error>
 where
     D: Deserializer<'de>,
@@ -75,9 +84,34 @@ where
     }
     let url = Url::parse(&s).map_err(|e| D::Error::custom(format!("worker.url {s:?}: {e}")))?;
     match url.scheme() {
-        "http" | "https" => Ok(url),
-        other => Err(D::Error::custom(format!(
-            "worker.url {s:?}: unsupported scheme {other:?}; want http or https"
-        ))),
+        "http" | "https" => {}
+        other => {
+            return Err(D::Error::custom(format!(
+                "worker.url {s:?}: unsupported scheme {other:?}; want http or https"
+            )))
+        }
     }
+    // `url::Url::parse("http://x:30000")` normalizes to a path of `/`, so
+    // anything beyond that is an operator-supplied path prefix that would
+    // be lost on `Url::join("/v1/...")`.
+    if url.path() != "/" && !url.path().is_empty() {
+        return Err(D::Error::custom(format!(
+            "worker.url {s:?}: path {:?} is not allowed; \
+             provide only scheme://host[:port] (path prefix would be dropped on join)",
+            url.path()
+        )));
+    }
+    if url.query().is_some() {
+        return Err(D::Error::custom(format!(
+            "worker.url {s:?}: query string is not allowed; \
+             provide only scheme://host[:port] (query would be dropped on join)"
+        )));
+    }
+    if url.fragment().is_some() {
+        return Err(D::Error::custom(format!(
+            "worker.url {s:?}: fragment is not allowed; \
+             provide only scheme://host[:port]"
+        )));
+    }
+    Ok(url)
 }
