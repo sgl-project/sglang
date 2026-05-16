@@ -1132,7 +1132,7 @@ class DeepseekV4AttnBackend(
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
-        elif compress_ratio in (4, 128):
+        else:
             extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
             if compress_ratio == 128:
@@ -1154,8 +1154,6 @@ class DeepseekV4AttnBackend(
             n_compressed = flat_token_ids.shape[0]
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
-        else:
-            raise NotImplementedError(f"prefill {compress_ratio=} not yet wired")
 
         if compressed_slice is not None:
             dequantize_k_cache_paged(

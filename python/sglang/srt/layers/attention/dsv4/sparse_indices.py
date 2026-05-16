@@ -37,6 +37,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
+from sglang.srt.utils import ceil_align
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
 # for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
@@ -49,10 +50,7 @@ WORKSPACE_DIM = DIM_NOPE + DIM_ROPE
 def combined_topk_width(topk: int, window_size: int) -> int:
     """Width of the padded combined_indices last dim that
     ``combine_topk_swa_indices`` would produce for these args."""
-    return (
-        (topk + window_size + SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
-        // SPARSE_PREFILL_TOPK_ALIGNMENT
-    ) * SPARSE_PREFILL_TOPK_ALIGNMENT
+    return ceil_align(topk + window_size, SPARSE_PREFILL_TOPK_ALIGNMENT)
 
 
 def combine_topk_swa_indices(
@@ -480,9 +478,8 @@ class SparsePrefillChunkCache:
     c4_compressed_base: Optional[torch.Tensor] = None     # (num_reqs,) int32
     c4_swa_base: Optional[torch.Tensor] = None            # (num_reqs,) int32
     c4_workspace: Optional[torch.Tensor] = None
-    # Per-layer combine writes into these reusable buffers. Allocated on the
-    # first c4 layer with -1 fill; subsequent layers' kernel writes overwrite
-    # only the valid prefix (chunk-invariant length), leaving the tail at -1.
+    # Tail stays at the -1 sentinel because the valid prefix length is
+    # chunk-invariant per request — subsequent layers only overwrite that prefix.
     c4_combined_indices: Optional[torch.Tensor] = None
     c4_combined_lens: Optional[torch.Tensor] = None
 
