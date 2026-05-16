@@ -374,8 +374,14 @@ async fn non_streaming_upstream_500_preserved() {
 async fn non_streaming_upstream_4xx_body_passthrough() {
     // Regression: the worker's response bytes must reach the client
     // unmodified — no router envelope wrap, no field rewriting.
+    //
+    // After the M2 wiring, the model is resolved against the registry
+    // before forwarding. We register `tiny` as the model and have the
+    // worker simulate the upstream 4xx — the test is about *upstream-
+    // returned* errors passing through, not about a router-side
+    // model-not-found error.
     let upstream_body = serde_json::json!({
-        "error": {"type": "invalid_request_error", "message": "bad model"}
+        "error": {"type": "invalid_request_error", "message": "bad input"}
     });
     let worker = common::mock_worker::MockWorker::start_returning_error(
         StatusCode::BAD_REQUEST,
@@ -391,7 +397,7 @@ async fn non_streaming_upstream_4xx_body_passthrough() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&serde_json::json!({
-                "model": "missing-model",
+                "model": "tiny",
                 "messages": [{"role": "user", "content": "hi"}],
             }))
             .unwrap(),
@@ -629,8 +635,7 @@ async fn forward_json_to_records_failure_on_5xx() {
     )
     .await;
 
-    let proxy =
-        Proxy::new(worker.url.parse().unwrap(), Duration::from_secs(5)).unwrap();
+    let proxy = Proxy::new(worker.url.parse().unwrap(), Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
         threshold: 1,
         cool_down: Duration::from_secs(30),
@@ -662,8 +667,7 @@ async fn forward_json_to_rejects_when_breaker_open() {
     use std::time::Duration;
 
     let worker = common::mock_worker::MockWorker::start(vec![]).await;
-    let proxy =
-        Proxy::new(worker.url.parse().unwrap(), Duration::from_secs(5)).unwrap();
+    let proxy = Proxy::new(worker.url.parse().unwrap(), Duration::from_secs(5)).unwrap();
     let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
         threshold: 1,
         cool_down: Duration::from_secs(30),
@@ -704,11 +708,8 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
         "data: [DONE]\n\n",
     ];
     // Each chunk is delayed by 50ms, total ~200ms of streaming.
-    let worker = common::mock_worker::MockWorker::start_slow_stream(
-        chunks,
-        std::time::Duration::from_millis(50),
-    )
-    .await;
+    let worker =
+        common::mock_worker::MockWorker::start_slow_stream(chunks, Duration::from_millis(50)).await;
 
     let cfg = config_for(&worker.url);
     let registry = Arc::new(WorkerRegistry::default());
@@ -755,7 +756,7 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
 
     // The handler has returned (headers arrived).  Wait a moment for the
     // first chunk's delay to pass, then assert load is still held.
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(
         w_handle.active_load() >= 1,
         "load should be >= 1 mid-stream, got {}",
@@ -767,7 +768,7 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
 
     // After the body is fully consumed and dropped, the guard must be
     // released.  Give the spawned task a brief moment to clean up.
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(
         w_handle.active_load(),
         0,

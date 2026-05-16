@@ -82,7 +82,6 @@ impl Proxy {
         }
     }
 
-
     /// One-shot health check against the configured worker. Returns `Ok(())`
     /// if the worker responded with any 2xx or 3xx within the timeout;
     /// `Err` otherwise. Result is informational — callers log and continue.
