@@ -3053,24 +3053,33 @@ class Scheduler(
             # probe routes through Pi0.forward and crashes in
             # ``populate_from_forward_batch``.
             #
-            # We intentionally DO NOT set ``is_prefill_only=True`` to skip
-            # ``sample()``: that flag is also consumed by CUDA-graph capture
-            # plumbing and forces the extend path through a decode-mode
-            # graph that expects initialized ``sampling_info.temperatures``,
-            # crashing during replay. Instead we let ``sample()`` run
-            # (harmless), extract the action chunks from
-            # ``next_token_logits``, and clear ``next_token_ids`` below so
-            # no downstream reader sees the bogus argmax.
+            # We pass ``skip_sample=True`` to the worker instead of using
+            # ``is_prefill_only=True``: the latter is also consumed by
+            # CUDA-graph capture plumbing and forces the extend path
+            # through a decode-mode graph that expects initialized
+            # ``sampling_info.temperatures``, crashing during replay.
+            # ``skip_sample`` is a narrow override that only short-circuits
+            # ``model_runner.sample`` after the model forward.
+            #
+            # This is load-bearing for /generate parity: ``Sampler.forward``
+            # mutates ``next_token_logits`` in place via
+            # ``logits[:] = torch.softmax(logits, dim=-1)``. With the
+            # earlier "let sample() run, then read logits back" strategy,
+            # the scheduler's ``actions_flat`` was reading softmax
+            # probabilities, not the action chunk — observed end-to-end as
+            # ``server_mean ≈ 6.25e-4`` (uniformly normalized) instead of
+            # the LeRobot reference ``-0.0535``.
             model_worker_batch = batch.get_model_worker_batch()
             with self.record_forward_metrics(batch):
                 batch_result = self.tp_worker.forward_batch_generation(
-                    model_worker_batch
+                    model_worker_batch, skip_sample=True
                 )
             # ``Pi0ForActionPrediction.forward`` packs the action chunks into
             # ``next_token_logits`` with shape ``(batch_size, horizon*dim)``
-            # so SGLang's existing plumbing can carry them. We split back into
-            # a per-request list here; the tokenizer manager re-shapes on the
-            # way out.
+            # so SGLang's existing plumbing can carry them. With the sampler
+            # bypassed this is the raw action chunk, not softmax(actions).
+            # We split into a per-request list here; the tokenizer manager
+            # re-shapes on the way out.
             actions_flat = (
                 batch_result.logits_output.next_token_logits
                 if batch_result.logits_output is not None
@@ -3080,8 +3089,10 @@ class Scheduler(
                 actions_list = list(actions_flat.unbind(0))
             else:
                 actions_list = []
-            # Null out the sampled token ids so nothing downstream can read
-            # garbage (they were argmaxed over action-chunk floats).
+            # Defensive: with ``skip_sample`` the worker never sets
+            # ``next_token_ids``, but if a future refactor flips that
+            # contract we still want to drop them so no downstream reader
+            # mistakes them for real tokens.
             if batch_result.next_token_ids is not None:
                 batch_result.next_token_ids = None
             # Populate ``batch.output_ids`` with dummy zeros. Downstream
@@ -3095,6 +3106,7 @@ class Scheduler(
                 len(batch.reqs), dtype=torch.long, device=self.device
             )
             ret = VLABatchResult(actions=actions_list)
+
         elif self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.

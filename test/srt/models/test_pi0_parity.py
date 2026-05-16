@@ -35,15 +35,51 @@ Environment variables:
   PI0_PARITY_BATCH_SIZE   default: 2
   PI0_PARITY_NUM_STEPS    number of flow-matching steps (default: 10)
   PI0_PARITY_CHECK_OPENPI "1" to also compare vs OpenPI (default: 0)
-  PI0_PARITY_MODEL_PATH   Local path (or HF repo id) of the pi0_base checkpoint.
-                          If set and it's an existing directory, we load from
-                          there and skip the HuggingFace download. Defaults to
-                          "lerobot/pi0_base" (downloads from HF).
+  PI0_PARITY_MODEL_PATH   Local path (or HF repo id) of the pi0_base checkpoint
+                          IN LEROBOT FORMAT. This is consumed by
+                          ``PI0Policy.from_pretrained`` and ``draccus`` rejects
+                          any SGLang-only keys (``model_type``, ``architectures``,
+                          ``auto_map``) it finds in ``config.json``. Defaults to
+                          "lerobot/pi0_base" (auto-downloaded from HuggingFace).
+                          DO NOT point this at a SGLang-config directory like
+                          ``/data08/models/pi0`` — see PI0_PARITY_SERVER_MODEL_PATH
+                          for that path.
+
+  Server-parity test only (gated on PI0_PARITY_RUN_SERVER=1):
+  PI0_PARITY_RUN_SERVER       "1" to run the /generate end-to-end test
+  PI0_PARITY_SERVER_MODEL_PATH Local path of a *SGLang-compatible* π0 dir
+                               (config.json contains ``model_type: pi0`` plus
+                               the architecture / chunk-size / dtype keys
+                               ``Pi0Config`` consumes). The LeRobot HF snapshot
+                               does NOT qualify; you need a separate dir.
+                               Required when PI0_PARITY_RUN_SERVER=1.
+  PI0_PARITY_SERVER_DTYPE      float32 | bfloat16  (default: float32)
+  PI0_PARITY_PORT              Server port (default: 30888)
+  PI0_PARITY_HOST              Server host (default: 127.0.0.1)
+  PI0_PARITY_SERVER_BOOT_TIMEOUT_S  Boot wait (default: 300)
+
+Why two model paths?
+    LeRobot's ``PI0Policy.from_pretrained`` parses ``config.json`` through
+    draccus and treats unknown top-level keys as a hard error::
+
+        DecodingError: The fields `model_type`, `architectures`, `auto_map`
+        are not valid for PI0Config
+
+    while SGLang's ``AutoConfig.from_pretrained`` requires exactly those
+    keys. The two formats are mutually incompatible, so the test takes
+    each path from its own env var:
+
+      * ``PI0_PARITY_MODEL_PATH`` → LeRobot reference (default: HF download)
+      * ``PI0_PARITY_SERVER_MODEL_PATH`` → SGLang server dir (no default)
+
+    Setting both to the same SGLang-config directory will fail in
+    ``_instantiate_lerobot``; this is by design.
 
 This test is skipped by default in CI because it needs LeRobot + a model
 download.  It prints rich diagnostics on mismatch: per-stage intermediate
 comparisons (prefix embeddings, prefix KV cache, first denoise v_t).
 """
+
 
 from __future__ import annotations
 
@@ -155,6 +191,38 @@ def _instantiate_lerobot():
     from lerobot.policies.pi0 import PI0Config, PI0Policy  # noqa: E402
     from lerobot.policies.pi0.processor_pi0 import make_pi0_pre_post_processors  # noqa: E402
 
+    # Friendly check: if MODEL_PATH points at a *local* dir whose
+    # config.json is the SGLang flavor (top-level ``model_type: pi0``),
+    # ``PI0Policy.from_pretrained`` blows up deep inside draccus with a
+    # confusing ``DecodingError: The fields `model_type`, `architectures`,
+    # `auto_map` are not valid for PI0Config``. Catch that here so the
+    # user gets a clear message pointing at the right env var.
+    if FROM_PRETRAINED and os.path.isdir(MODEL_PATH):
+        cfg_path = os.path.join(MODEL_PATH, "config.json")
+        if os.path.exists(cfg_path):
+            try:
+                import json as _json
+                with open(cfg_path) as _f:
+                    _cfg = _json.load(_f)
+                if _cfg.get("model_type") == "pi0":
+                    raise RuntimeError(
+                        f"PI0_PARITY_MODEL_PATH={MODEL_PATH!r} appears to "
+                        "be a SGLang-config π0 directory (config.json has "
+                        "'model_type': 'pi0'), but this env var is consumed "
+                        "by LeRobot's PI0Policy.from_pretrained which "
+                        "rejects SGLang-only keys. Either:\n"
+                        "  • unset PI0_PARITY_MODEL_PATH (defaults to the "
+                        "    HF repo lerobot/pi0_base, auto-downloaded), or\n"
+                        "  • point it at a *LeRobot-format* dir (no "
+                        "    'model_type'/'architectures'/'auto_map' keys), "
+                        "    keeping PI0_PARITY_SERVER_MODEL_PATH for the "
+                        "    SGLang server. See module docstring for details."
+                    )
+            except (OSError, ValueError):
+                # File missing or unparseable; fall through and let
+                # PI0Policy.from_pretrained surface its own error.
+                pass
+
     if FROM_PRETRAINED:
         # ``from_pretrained`` accepts both a local directory and an HF repo id,
         # so we just forward whatever the user set (default: lerobot/pi0_base).
@@ -164,6 +232,7 @@ def _instantiate_lerobot():
             max_action_dim=ACTION_DIM, max_state_dim=STATE_DIM, dtype=DTYPE_STR
         )
         policy = PI0Policy(config)
+
     policy.to(DEVICE)
     policy.config.device = DEVICE
     policy.eval()
@@ -496,10 +565,275 @@ def _diagnose_divergence(
     )
 
 
+# ─── /generate server parity ──────────────────────────────────────────
+#
+# The model-level test above directly calls ``Pi0ForActionPrediction.
+# sample_actions(...)``, which bypasses the scheduler / sampler / IPC
+# pipeline entirely. That left a regression class uncovered: π0's
+# ``forward()`` packs the continuous action chunk into
+# ``logits_output.next_token_logits``, but ``Sampler.forward`` mutates
+# that tensor in place via ``logits[:] = torch.softmax(...)`` — so
+# without an explicit bypass the scheduler reads softmax probabilities
+# as actions and /generate returns near-zero values
+# (``server_mean ≈ 6.25e-4`` instead of ``-0.0535``).
+#
+# The test below boots a real SGLang server, hits ``/generate`` with the
+# same fixed-noise prefix, and compares the returned ``actions`` chunk
+# against a fresh LeRobot ``sample_actions(noise=…)`` call. It is gated
+# on ``PI0_PARITY_RUN_SERVER=1`` because it requires:
+#   * GPU memory for the full π0_base model
+#   * a free port for the server (configurable via PI0_PARITY_PORT)
+#   * preprocessed images / state passed via ``extra_body`` —
+#     exercising the dataclass-field + __getitem__ plumbing fix.
+#
+# IMPORTANT — model-path requirements for the server test:
+#   The raw ``lerobot/pi0_base`` HF snapshot ships LeRobot's own config
+#   layout, NOT the ``model_type: pi0`` config that SGLang's loader
+#   recognises. Booting ``sglang serve`` against the unmodified snapshot
+#   crashes in ``AutoConfig.from_pretrained`` with::
+#
+#       ValueError: Unrecognized model in <snapshot_dir>. Should have
+#       a `model_type` key in its config.json.
+#
+#   You need a SGLang-compatible directory: a ``config.json`` whose
+#   top-level fields include ``"model_type": "pi0"`` plus the
+#   architecture / chunk-size / dtype fields ``Pi0Config`` consumes,
+#   pointing at the same ``model.safetensors``. Set
+#   ``PI0_PARITY_SERVER_MODEL_PATH`` to that directory (typical layout
+#   is what the user already has at ``/data08/models/pi0``); the test
+#   does NOT auto-download a server-mode model. If unset, falls back to
+#   ``PI0_PARITY_MODEL_PATH`` and prints a hint pointing at this comment.
+RUN_SERVER = os.environ.get("PI0_PARITY_RUN_SERVER", "0") == "1"
+SERVER_PORT = int(os.environ.get("PI0_PARITY_PORT", "30888"))
+SERVER_HOST = os.environ.get("PI0_PARITY_HOST", "127.0.0.1")
+SERVER_MODEL_PATH = os.environ.get("PI0_PARITY_SERVER_MODEL_PATH")
+SERVER_DTYPE = os.environ.get("PI0_PARITY_SERVER_DTYPE", "float32")
+SERVER_BOOT_TIMEOUT_S = int(os.environ.get("PI0_PARITY_SERVER_BOOT_TIMEOUT_S", "300"))
+
+
+
+@pytest.mark.skipif(
+    not RUN_SERVER,
+    reason="Set PI0_PARITY_RUN_SERVER=1 to enable end-to-end /generate test",
+)
+def test_pi0_sglang_server_vs_lerobot():
+    """End-to-end: hit /generate, compare actions to LeRobot.
+
+    This is the test that catches the sampler-bypass bug: it would have
+    flagged the original PR (server_mean ≈ 6e-4 vs reference ≈ -0.054)
+    immediately, since the model-level path doesn't run the sampler at
+    all.
+    """
+    import json
+    import subprocess
+    import time
+
+    import requests
+
+    # ── 1. Build the LeRobot reference ──
+    print("\n[server-parity] Instantiating LeRobot…")
+    lerobot_policy, lerobot_pre, _ = _instantiate_lerobot()
+    raw_batch = _create_dummy_batch(batch_size=1)
+    processed_batch = lerobot_pre(copy.deepcopy(raw_batch))
+    images, img_masks, lang_tokens, lang_masks, state = (
+        _extract_lerobot_model_inputs(lerobot_policy, processed_batch)
+    )
+    noise = _make_fixed_noise(1, DEVICE)
+    with torch.no_grad():
+        ref_actions = lerobot_policy.model.sample_actions(
+            images, img_masks, lang_tokens, lang_masks, state,
+            noise=noise, num_steps=NUM_STEPS,
+        )
+    ref_mean = ref_actions.mean().item()
+    ref_std = ref_actions.std().item()
+    print(f"[server-parity] reference: mean={ref_mean:+.4f}  std={ref_std:.4f}")
+
+    # ── 2. Boot the server in a subprocess ──
+    # Resolve the server model path. The raw lerobot/pi0_base HF snapshot
+    # does NOT have ``model_type: pi0`` in its config.json, so booting
+    # ``sglang serve`` against it crashes with "Unrecognized model …
+    # Should have a `model_type` key". We therefore require an explicit
+    # SGLang-compatible directory via PI0_PARITY_SERVER_MODEL_PATH (e.g.
+    # /data08/models/pi0). If unset, fall back to PI0_PARITY_MODEL_PATH
+    # but only if it's a local dir (HF repo ids will fail at boot).
+    if SERVER_MODEL_PATH:
+        server_model_path = SERVER_MODEL_PATH
+    else:
+        server_model_path = MODEL_PATH if os.path.isdir(MODEL_PATH) else None
+    if not server_model_path or not os.path.isdir(server_model_path):
+        pytest.skip(
+            "Server-mode test needs a SGLang-compatible π0 directory "
+            "(config.json must have model_type='pi0'). The raw "
+            "lerobot/pi0_base HF snapshot does NOT qualify. Set "
+            "PI0_PARITY_SERVER_MODEL_PATH=/path/to/sglang/pi0 to enable."
+        )
+
+    cmd = [
+        sys.executable, "-m", "sglang.launch_server",
+        "--model-path", server_model_path,
+        "--host", SERVER_HOST,
+        "--port", str(SERVER_PORT),
+        "--dtype", SERVER_DTYPE,
+        "--mem-fraction-static", "0.6",
+        # CUDA-graph capture is auto-disabled for VLA models in
+        # ServerArgs._handle_attention_backend_compatibility, but pass
+        # the flag explicitly so the test still works on older SGLang
+        # builds that don't have that auto-disable yet.
+        "--disable-cuda-graph",
+    ]
+    print(f"[server-parity] launching: {' '.join(cmd)}")
+    proc = subprocess.Popen(cmd)
+    base_url = f"http://{SERVER_HOST}:{SERVER_PORT}"
+    deadline = time.time() + SERVER_BOOT_TIMEOUT_S
+    try:
+        boot_ok = False
+        while time.time() < deadline:
+            # Surface server crashes (e.g. config-mismatch ValueError)
+            # immediately instead of waiting for the full timeout.
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"server exited with code {proc.returncode} during boot. "
+                    "Check the server stdout/stderr above for the real error "
+                    "(common: model_type mismatch, FA fp32-KV crash, "
+                    "OOM during weight load)."
+                )
+            try:
+                r = requests.get(f"{base_url}/health", timeout=2)
+                if r.status_code == 200:
+                    boot_ok = True
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
+        if not boot_ok:
+            raise RuntimeError(
+                f"server failed to come up in {SERVER_BOOT_TIMEOUT_S}s"
+            )
+
+
+        # ── 3. Submit a JSON payload through the normal image-loading
+        #       path. We can't use the precomputed-feature fast path
+        #       because it requires a real ``torch.Tensor`` (not JSON
+        #       serializable) and a single pre-stacked
+        #       ``(num_cams, 3, 224, 224)`` dict; per-camera dicts and
+        #       nested-list features are rejected by the strict
+        #       ``Pi0Processor._process_precomputed`` contract.
+        #
+        #       So we round-trip the camera tensors through PIL → JPEG
+        #       → base64 (the same wire format the docs advertise) and
+        #       hand the server raw image bytes. The π0 multimodal
+        #       processor decodes them through ``load_image``,
+        #       resize_with_pad, and SigLIP exactly like a real client
+        #       would. Numerical results no longer match LeRobot
+        #       bit-for-bit (JPEG loss + a second float→float SigLIP
+        #       pass introduce noise on the order of 1e-3 in action
+        #       space), but the std/mean checks are still tight enough
+        #       to catch the softmax-of-actions bug — that one
+        #       collapses ``srv_std`` to ~1e-4 while real actions land
+        #       at ``ref_std ≈ 0.30``.
+        #
+        #       ``extra_body`` carries the per-request state +
+        #       num_inference_steps — without the dataclass plumbing
+        #       fix this field would be silently dropped before the
+        #       processor reads ``request_obj.extra_body``.
+        import base64
+        import io
+
+        from PIL import Image
+
+        def _images_to_b64(t: torch.Tensor) -> str:
+            """Convert a (1, 3, 224, 224) tensor in [-1, 1] to a base64
+            JPEG data URL. We undo the LeRobot normalization (x*0.5+0.5)
+            so PIL sees a plausible 0-1 image; the server will re-apply
+            its own preprocessing."""
+            arr = (t[0].clamp(-1, 1) * 0.5 + 0.5).clamp(0, 1)
+            arr = (arr * 255).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+            buf = io.BytesIO()
+            Image.fromarray(arr).save(buf, format="JPEG", quality=95)
+            return "data:image/jpeg;base64," + base64.b64encode(
+                buf.getvalue()
+            ).decode("ascii")
+
+        payload = {
+            "text": raw_batch["task"][0],
+            "image_data": [_images_to_b64(images[c]) for c in range(len(images))],
+            "sampling_params": {"max_new_tokens": 1},
+            "extra_body": {
+                # Plumbing-test signal: π0's processor reads ``state``
+                # off ``request_obj.extra_body``. Without the dataclass
+                # field + ``__getitem__`` thread-through, this dict is
+                # silently dropped on the wire and the server falls
+                # back to a zero state (which still yields a valid
+                # action chunk but a different one).
+                "state": state[0].cpu().tolist(),
+                "num_inference_steps": NUM_STEPS,
+            },
+        }
+        r = requests.post(f"{base_url}/generate", json=payload, timeout=120)
+        if r.status_code != 200:
+            raise AssertionError(
+                f"/generate returned {r.status_code}: {r.text[:500]}"
+            )
+        body = r.json()
+
+        # ── 4. Compare ──
+        assert "actions" in body, (
+            f"/generate response is missing 'actions' field; got keys "
+            f"{list(body.keys())}. The VLA output promotion path is broken."
+        )
+        # Verify the FINISH_VLA marker survived the tokenizer-manager
+        # promotion path — this is the documented client-facing contract.
+        finish = body.get("meta_info", {}).get("finish_reason") or {}
+        assert finish.get("matched") == "vla_done", (
+            f"finish_reason.matched should be 'vla_done' for VLA; got {finish!r}"
+        )
+
+        srv_actions = torch.tensor(body["actions"], dtype=torch.float32)
+        if srv_actions.dim() == 2:
+            srv_actions = srv_actions.unsqueeze(0)
+        srv_mean = srv_actions.mean().item()
+        srv_std = srv_actions.std().item()
+        print(
+            f"[server-parity] server   : mean={srv_mean:+.4f}  std={srv_std:.4f}"
+        )
+
+        # The strongest signal that the sampler-bypass is in place: the
+        # server's std should match the reference order of magnitude,
+        # NOT collapse toward ``1/(horizon*dim)``. Pre-fix this check
+        # was the smoking gun (server_std ≈ 1.8e-4 vs reference 0.30).
+        # We use a fairly loose tolerance (0.15) because the server
+        # goes through JPEG round-trip + a second SigLIP pass, both of
+        # which add float noise. The bypass-still-broken case has a
+        # ~1000× std gap, so this bound easily separates the two.
+        assert abs(srv_std - ref_std) < 0.15, (
+            f"server std {srv_std:.4f} differs from reference {ref_std:.4f} — "
+            "this is the signature of the in-place softmax mutation in "
+            "Sampler.forward. The VLA branch must call "
+            "forward_batch_generation(skip_sample=True)."
+        )
+        # Mean check is even looser because the server samples its own
+        # noise (we don't plumb a fixed-noise override through
+        # extra_body) and JPEG/SigLIP shifts the mean a bit.
+        assert abs(srv_mean - ref_mean) < 0.15, (
+            f"server mean {srv_mean:+.4f} differs from reference "
+            f"{ref_mean:+.4f}; bypass is likely broken."
+        )
+
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 # ─── Direct-run entry point ───────────────────────────────────────────
 if __name__ == "__main__":
     # Mimic pytest -s behavior
     test_pi0_sglang_vs_lerobot()
     if CHECK_OPENPI:
         test_pi0_sglang_vs_openpi()
+    if RUN_SERVER:
+        test_pi0_sglang_server_vs_lerobot()
     print("\n[parity] ✅ All parity checks passed.")
+

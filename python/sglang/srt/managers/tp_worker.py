@@ -451,9 +451,19 @@ class TpModelWorker(BaseTpWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
+        skip_sample: bool = False,
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
+        #
+        # ``skip_sample`` is set by the VLA path in the scheduler. π0-style
+        # models pack a continuous action chunk into ``next_token_logits``,
+        # not a vocab distribution; if we let the normal sampler run it
+        # would mutate that tensor in-place via ``softmax`` (see
+        # ``Sampler.forward`` → ``logits[:] = torch.softmax(...)``) and the
+        # scheduler would read softmax probabilities back as actions —
+        # exactly the bug observed at /generate where
+        # ``server_mean ≈ 6e-4`` instead of the true ``-0.0535``.
 
         # Get forward batch from model worker batch
         if model_worker_batch is not None:
@@ -487,6 +497,12 @@ class TpModelWorker(BaseTpWorker):
                 # Skip sampling and return logits for target forward
                 return batch_result
 
+            if skip_sample:
+                # VLA path: ``next_token_logits`` carries the action chunk
+                # verbatim; the scheduler will read it directly. No sampler
+                # runs, so no in-place softmax mutation.
+                return batch_result
+
             if (
                 self.enable_overlap
                 and not self.enable_spec
@@ -509,6 +525,7 @@ class TpModelWorker(BaseTpWorker):
                 )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
+
                 # The size should match the batch size (number of sequences), not total tokens
                 batch_result.next_token_ids = torch.zeros(
                     len(model_worker_batch.seq_lens),

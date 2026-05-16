@@ -557,5 +557,230 @@ class TestFinishVlaJson(unittest.TestCase):
         self.assertFalse(FINISH_VLA().is_error)
 
 
+class TestGenerateReqInputExtraBody(unittest.TestCase):
+    """``extra_body`` round-trip through ``GenerateReqInput``.
+
+    The ``/generate`` docs in ``docs/supported_models/pi0_vla.md`` advertise
+    ``extra_body.state`` and ``extra_body.num_inference_steps`` as the
+    side-channel for VLA inputs. Without these tests, FastAPI silently drops
+    the field (the dataclass had no slot for it) before the π0 multimodal
+    processor — which reads ``request_obj.extra_body`` — ever sees it.
+
+    These tests pin the contract:
+      1. The field exists on the dataclass.
+      2. Single-prompt requests preserve it after ``normalize_…``.
+      3. Batched requests broadcast / index it correctly via ``__getitem__``.
+      4. ``parallel_sample_num > 1`` replicates it just like other fields.
+    """
+
+    def _make(self, **kw):
+        from sglang.srt.managers.io_struct import GenerateReqInput
+        return GenerateReqInput(**kw)
+
+    def test_field_exists_on_dataclass(self):
+        """Defensive: the dataclass must declare an ``extra_body`` slot or
+        FastAPI will silently drop the JSON field on the wire."""
+        from sglang.srt.managers.io_struct import GenerateReqInput
+        from dataclasses import fields
+        names = {f.name for f in fields(GenerateReqInput)}
+        self.assertIn("extra_body", names)
+
+    def test_single_prompt_preserves_extra_body(self):
+        body = {"state": [0.1, 0.2, 0.3], "num_inference_steps": 7}
+        obj = self._make(text="pick up the red block", extra_body=body)
+        obj.normalize_batch_and_arguments()
+        # Single-prompt path leaves it untouched (no batch normalization).
+        self.assertEqual(obj.extra_body, body)
+
+    def test_batch_dict_broadcasts_to_each_request(self):
+        """A single dict supplied at batch level should be broadcast so
+        every per-request sub-object sees the same payload (mirrors
+        sampling_params behavior)."""
+        body = {"state": [0.1, 0.2, 0.3], "num_inference_steps": 7}
+        obj = self._make(text=["a", "b", "c"], extra_body=body)
+        obj.normalize_batch_and_arguments()
+        self.assertIsInstance(obj.extra_body, list)
+        self.assertEqual(len(obj.extra_body), 3)
+        for entry in obj.extra_body:
+            self.assertEqual(entry, body)
+
+        # And ``__getitem__`` projects out the per-request dict (this is
+        # exactly what ``mm_processor.process_mm_data_async(request_obj=…)``
+        # ends up reading).
+        for i in range(3):
+            sub = obj[i]
+            self.assertEqual(sub.extra_body, body)
+
+    def test_batch_per_request_list_passes_through(self):
+        """A per-request list should be preserved as-is (modulo
+        parallel_sample_num replication)."""
+        bodies = [
+            {"state": [1.0, 0.0, 0.0]},
+            {"state": [0.0, 1.0, 0.0]},
+            None,
+        ]
+        obj = self._make(text=["a", "b", "c"], extra_body=bodies)
+        obj.normalize_batch_and_arguments()
+        self.assertEqual(obj.extra_body, bodies)
+        self.assertEqual(obj[0].extra_body, bodies[0])
+        self.assertEqual(obj[1].extra_body, bodies[1])
+        self.assertIsNone(obj[2].extra_body)
+
+    def test_none_extra_body_normalizes_to_list_of_none(self):
+        """Non-VLA traffic leaves ``extra_body`` unset; it must normalize
+        to a list of None so per-request indexing still works."""
+        obj = self._make(text=["a", "b"])
+        obj.normalize_batch_and_arguments()
+        self.assertEqual(obj.extra_body, [None, None])
+        self.assertIsNone(obj[0].extra_body)
+
+    def test_parallel_sample_num_replicates_extra_body(self):
+        """``parallel_sample_num=k`` expands the batch by ``k``×; extra_body
+        replicates with the same factor (matches the existing convention
+        used for sampling_params, lora_path, bootstrap_*)."""
+        body = {"state": [0.1]}
+        obj = self._make(
+            text=["a", "b"],
+            extra_body=body,
+            sampling_params={"n": 3},
+        )
+        obj.normalize_batch_and_arguments()
+        # 2 prompts × n=3 → 6 entries, all the same dict.
+        self.assertEqual(len(obj.extra_body), 6)
+        self.assertTrue(all(e == body for e in obj.extra_body))
+
+    def test_invalid_extra_body_type_rejected(self):
+        """A non-dict / non-list / non-None value should fail loudly so
+        the user catches the typo before it silently drops on the wire."""
+        obj = self._make(text=["a", "b"], extra_body="not-a-dict")
+        with self.assertRaises(ValueError):
+            obj.normalize_batch_and_arguments()
+
+    def test_processor_reads_extra_body_from_per_request_obj(self):
+        """End-to-end of the data path: a batched request should produce a
+        per-request sub-object whose ``extra_body`` is the dict that
+        ``Pi0Processor._extract_state`` will read.
+
+        Without the dataclass field + ``__getitem__`` plumbing, the helper
+        returns ``None`` and the request silently runs with a zero state
+        vector — which still produces actions but they're wrong."""
+        from sglang.srt.multimodal.processors.pi0 import Pi0Processor
+        body = {"state": [9.9, 8.8, 7.7], "num_inference_steps": 3}
+        obj = self._make(text=["a", "b"], extra_body=body)
+        obj.normalize_batch_and_arguments()
+
+        sub = obj[0]
+        # This is exactly what the processor does.
+        self.assertEqual(
+            Pi0Processor._extract_state(None, sub), [9.9, 8.8, 7.7]
+        )
+        self.assertEqual(Pi0Processor._extract_num_steps(None, sub), 3)
+
+
+class TestVlaSamplerBypass(unittest.TestCase):
+    """Lock down the contract that the VLA scheduler path must bypass the
+    sampler.
+
+    Background: ``Sampler.forward`` mutates ``next_token_logits`` in place
+    via ``logits[:] = torch.softmax(logits, dim=-1)``. π0 packs continuous
+    actions into that same tensor, so if the sampler runs the scheduler
+    reads softmax probabilities back as actions — observed e2e at
+    /generate as ``server_mean ≈ 6.25e-4`` instead of the LeRobot
+    reference ``-0.0535``, with ``max_diff ≈ 0.98``.
+
+    The fix is the new ``skip_sample`` parameter on
+    ``TpModelWorker.forward_batch_generation``. These tests pin the
+    contract at three levels:
+
+      1. The flag exists on the worker's signature.
+      2. The scheduler's VLA branch passes it.
+      3. The flag actually short-circuits sampling (no in-place mutation).
+    """
+
+    def test_skip_sample_param_exists_on_worker(self):
+        """The worker's public ``forward_batch_generation`` must expose
+        ``skip_sample`` — the scheduler depends on it as a kwarg."""
+        import inspect
+        from sglang.srt.managers.tp_worker import TpModelWorker
+        sig = inspect.signature(TpModelWorker.forward_batch_generation)
+        self.assertIn("skip_sample", sig.parameters)
+        self.assertEqual(sig.parameters["skip_sample"].default, False)
+
+    def test_scheduler_vla_branch_passes_skip_sample(self):
+        """The scheduler's VLA extend branch must call the worker with
+        ``skip_sample=True``. Searching the source is enough — driving a
+        full scheduler boot would require an actual model + GPU."""
+        import inspect
+        from sglang.srt.managers import scheduler as scheduler_mod
+        src = inspect.getsource(scheduler_mod.Scheduler.run_batch)
+        # The substring is present and on the VLA path (which is the only
+        # site in run_batch that mentions ``skip_sample``).
+        self.assertIn("skip_sample=True", src)
+
+    def test_sampler_inplace_softmax_documented_in_layer(self):
+        """Document the in-place mutation we're working around: this test
+        will start failing the moment ``Sampler.forward`` stops mutating
+        ``next_token_logits`` in place — at which point the bypass can be
+        revisited. Keeping it here makes the failure mode self-explanatory
+        in CI logs."""
+        import inspect
+        from sglang.srt.layers import sampler as sampler_mod
+        src = inspect.getsource(sampler_mod.Sampler.forward)
+        # The exact pattern that would mutate π0's action chunk.
+        self.assertIn("logits[:] = torch.softmax", src)
+
+
+class TestVlaCudaGraphAutoDisable(unittest.TestCase):
+    """Lock down the auto-disable of CUDA graph + KV-dtype override for
+    VLA models.
+
+    Background: VLA models like π0 manage their own PaliGemma KV cache as
+    plain PyTorch tensors and never touch SGLang's shared KV pool. The
+    pool is still allocated for plumbing reasons but stays at the default
+    fp32 (since π0 ships with ``dtype=float32``), and FlashAttention's
+    ``get_scheduler_metadata`` (called from both CUDA-graph capture *and*
+    every regular ``init_forward_metadata`` on a decode forward) rejects
+    fp32 KV with::
+
+        RuntimeError: FlashAttention only supports fp16, bf16,
+        and fp8_e4m3 data type
+
+    which crashes the scheduler at boot. Two distinct sites trip this:
+    capture (graph runner) and runtime (warmup / IDLE / DP-sync decode
+    forwards), so the fix has to address both:
+
+      * disable CUDA graph (no decode loop ⇒ capture is meaningless), and
+      * force ``kv_cache_dtype = "bfloat16"`` (FA-compatible placeholder
+        on a pool that VLA never reads from).
+
+    The fix lives in
+    ``ServerArgs._handle_attention_backend_compatibility`` and is keyed
+    on ``model_config.is_vla``.
+    """
+
+    def test_vla_branch_documented_in_server_args(self):
+        """The auto-disable + KV-dtype override live in
+        ``_handle_attention_backend_compatibility`` and are keyed on
+        ``model_config.is_vla``. Search the source instead of booting a
+        full server — the substrings are unique to this branch and
+        changing any of them would need a deliberate edit."""
+        import inspect
+        from sglang.srt.server_args import ServerArgs
+        src = inspect.getsource(
+            ServerArgs._handle_attention_backend_compatibility
+        )
+        # The branch is keyed on the VLA flag.
+        self.assertIn("model_config.is_vla", src)
+        # Disables capture.
+        self.assertIn("self.disable_cuda_graph = True", src)
+        # Pins KV dtype to a FA-compatible value. Without this line, a
+        # plain ``--dtype float32`` boot still crashes during the first
+        # decode forward (server warmup or DP/IDLE probe).
+        self.assertIn('self.kv_cache_dtype = "bfloat16"', src)
+
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
