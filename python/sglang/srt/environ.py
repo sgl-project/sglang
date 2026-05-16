@@ -329,6 +329,9 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # Enable LongCat Flash double-stream overlap. When enabled together with
+    # DeepEP, LongCat uses a dedicated communication group for routed experts.
+    SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM = EnvBool(False)
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)

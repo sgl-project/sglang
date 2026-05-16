@@ -42,6 +42,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
@@ -634,7 +635,10 @@ class LongcatFlashModel(nn.Module):
 
         device_module = torch.get_device_module()
         self.alt_stream = device_module.Stream()
-        self.moe_alt_stream = device_module.Stream()
+        if envs.SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM.get():
+            self.moe_alt_stream = device_module.Stream()
+        else:
+            self.moe_alt_stream = None
         self.layers = nn.ModuleList(
             [
                 LongcatFlashDecoderLayer(

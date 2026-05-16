@@ -1500,6 +1500,7 @@ def get_attn_cp_group() -> GroupCoordinator:
 _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
+_DOUBLE_STREAM_EP: Optional[GroupCoordinator] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
@@ -1516,6 +1517,9 @@ def get_moe_tp_group() -> GroupCoordinator:
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
 
+def get_double_stream_ep_group() -> GroupCoordinator:
+    assert _DOUBLE_STREAM_EP is not None, "double stream parallel group is not initialized"
+    return _DOUBLE_STREAM_EP
 
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
@@ -2015,6 +2019,15 @@ def initialize_model_parallel(
             group_name="moe_tp",
             recovered_rank=recovered_rank,
         )
+
+    global _DOUBLE_STREAM_EP
+    assert _DOUBLE_STREAM_EP is None, "double stream expert parallel group is already initialized"
+    _DOUBLE_STREAM_EP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        group_name="double_stream_ep",
+    )
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
