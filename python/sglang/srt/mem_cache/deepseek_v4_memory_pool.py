@@ -637,13 +637,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         ), "Only c4 layers have indexer states."
         return indexer_compress_state_pool
 
-    def _swa_layer_id(self, layer_id: int) -> int:
-        """Convert absolute layer_id to SWA-pool-local index."""
+    def _swa_local_layer_id(self, layer_id: int) -> int:
+        """Convert absolute model layer_id to SWA-pool-local (PP-stage-local) index."""
         return layer_id - self._stage_start
 
     def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
-        return self.swa_kv_pool.get_key_buffer(self._swa_layer_id(layer_id))
+        return self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id))
 
     def set_swa_key_buffer(
         self,
@@ -652,7 +652,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ) -> None:
         self.swa_kv_pool.set_key_buffer(
-            self._swa_layer_id(layer_id), loc, cache_nope_fp8_rope_bf16_pack
+            self._swa_local_layer_id(layer_id), loc, cache_nope_fp8_rope_bf16_pack
         )
 
     def get_extra_key_page_size(self, layer_id: int) -> int:
@@ -733,12 +733,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> None:
         swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         self.swa_kv_pool.set_key_buffer(
-            self._swa_layer_id(layer_id), swa_loc, cache_nope_fp8_rope_bf16_pack
+            self._swa_local_layer_id(layer_id), swa_loc, cache_nope_fp8_rope_bf16_pack
         )
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
-        return self.swa_kv_pool.get_key_buffer(self._swa_layer_id(layer_id))
+        return self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id))
 
     def set_swa_key_buffer_radix_fused(
         self,
@@ -753,7 +753,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         else:
             swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         return self.swa_kv_pool.set_key_buffer_fused(
-            self._swa_layer_id(layer_id), swa_loc, cache_k
+            self._swa_local_layer_id(layer_id), swa_loc, cache_k
         )
 
     def set_swa_key_buffer_radix_fused_norm_rope(
@@ -779,7 +779,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             freqs_cis=freqs_cis,
             positions=positions,
             out_loc=swa_loc,
-            kvcache=self.swa_kv_pool.kv_buffer[self._swa_layer_id(layer_id)],
+            kvcache=self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)],
             page_size=self.swa_kv_pool.page_size,
         )
 
