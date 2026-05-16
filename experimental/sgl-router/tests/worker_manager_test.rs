@@ -189,3 +189,96 @@ async fn mode_changed_preserves_active_requests_and_breaker() {
     drop(tx);
     h.await.unwrap();
 }
+
+/// An out-of-order `ModeChanged` for a worker the registry does not know
+/// about (e.g. a buggy discovery backend reordered `Removed` and
+/// `ModeChanged`) must not panic, must not silently log INFO claiming the
+/// mode flip happened, and must leave the registry untouched.
+#[tokio::test]
+async fn manager_handles_orphan_mode_changed_without_panic() {
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::ModeChanged {
+        id: WorkerId("ghost".into()),
+        mode: WorkerMode::Decode,
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        registry.get(&WorkerId("ghost".into())).is_none(),
+        "an orphan ModeChanged must not create a phantom worker",
+    );
+    assert_eq!(
+        registry.workers_for(&ModelId("m".into())).len(),
+        0,
+        "registry must be empty after an orphan event",
+    );
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// A `Removed` for an unknown id is a no-op — registry stays empty, manager
+/// keeps running.
+#[tokio::test]
+async fn manager_handles_orphan_removed_without_panic() {
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Removed {
+        id: WorkerId("ghost".into()),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(registry.is_empty());
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// Duplicate `Added` for the same id is an upsert — the registry must end
+/// up with exactly one worker carrying the latest spec's `model_ids`.
+#[tokio::test]
+async fn manager_handles_duplicate_added_as_upsert() {
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Added(spec(
+        "w1",
+        "http://x:30000",
+        WorkerMode::Plain,
+        &["m1", "m2"],
+    )))
+    .await
+    .unwrap();
+    tx.send(DiscoveryEvent::Added(spec(
+        "w1",
+        "http://x:30000",
+        WorkerMode::Plain,
+        &["m1"],
+    )))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        registry.workers_for(&ModelId("m1".into())).len(),
+        1,
+        "w1 still serves m1 after the second Added",
+    );
+    assert_eq!(
+        registry.workers_for(&ModelId("m2".into())).len(),
+        0,
+        "w1 must drop out of m2's index after the model set shrank",
+    );
+
+    drop(tx);
+    h.await.unwrap();
+}
