@@ -218,6 +218,8 @@ async def eval_mmmu(args) -> None:
         )
 
     if args.concurrency == 1:
+        # For concurrency == 1, run in sequential mode to ensure consistent order
+        # this is mainly for profiling
         for sample in tqdm(samples):
             _, response = await process_sample(
                 client,

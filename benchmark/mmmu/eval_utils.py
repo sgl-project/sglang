@@ -276,6 +276,7 @@ def prepare_samples(eval_args: EvalArgs):
         image_paths = []
         for idx, img in enumerate(images):
             suffix = f"_{idx}" if len(images) > 1 else ""
+            # Use a unique identifier for the image path to avoid potential collisions if indices reset
             image_path = f"{images_path}/image_{sample['id']}{suffix}.png"
             if not os.path.exists(image_path):
                 img.save(image_path)
@@ -416,7 +417,7 @@ def parse_multi_choice_response(response, all_choices, index2ans):
         elif len(found) > 1:
             first_pos = {c: tokens.index(c) for c in found}
             pred_index = min(first_pos, key=first_pos.get)
-        else:
+        else:  # still not get answer, randomly choose one.
             pred_index = random.choice(all_choices)
     elif len(candidates) > 1:
         start_indexes = []
@@ -614,6 +615,7 @@ def eval_open(gold_i, pred_i):
     """
     correct = False
     if isinstance(gold_i, list):
+        # use float to avoid trivial matches
         norm_answers = []
         raw_answers = [str(a).strip().lower() for a in gold_i]
         for answer in gold_i:
@@ -621,9 +623,10 @@ def eval_open(gold_i, pred_i):
     else:
         norm_answers = normalize_str(gold_i)
         raw_answers = [str(gold_i).strip().lower()]
-    for pred in pred_i:
-        if isinstance(pred, str):
+    for pred in pred_i:  # pred is already normalized in parse response phase
+        if isinstance(pred, str):  # if it's a string, then find if ans in the pred_i
             for norm_ans in norm_answers:
+                # only see if the string answer in the string pred
                 if isinstance(norm_ans, str) and norm_ans in pred:
                     if not correct:
                         correct = True
@@ -750,7 +753,9 @@ def eval_result(model_answer_path, answer_dict, eval_output_path=None):
             question_type = cat_answers[data_id]["question_type"]
             if question_type != "multiple-choice":
                 raw_response = parsed_pred
-                parsed_pred = parse_open_response(raw_response)
+                parsed_pred = parse_open_response(
+                    raw_response
+                )  # mainly for type consistency (make it number, etc.)
                 parsed_pred.append(raw_response.lower())
             exampels_to_eval.append(
                 {

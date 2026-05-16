@@ -117,7 +117,7 @@ def process_single_sample(data, multi_images=False):
         for img_path in current_o_imgs_paths:
             o_imgs_paths.append(img_path)
 
-    if len(o_imgs_paths) > 1:  # multiple images in options, not supported
+    if len(o_imgs_paths) > 1:  # multiple images in options
         return {
             "id": data["id"],
             "question": question,
