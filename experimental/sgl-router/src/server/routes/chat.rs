@@ -127,6 +127,55 @@ mod tests {
     }
 
     #[test]
+    fn parse_streaming_handles_nested_messages_with_stream_true() {
+        // Well-formed object with nested arrays/objects (real chat-completions
+        // payloads carry `messages: [{role, content: [{type, text}]}]`). The
+        // two-step deserialize must not balk on this — only the top-level
+        // object shape and the `stream` field matter.
+        let b = Bytes::from_static(
+            br#"{
+              "model": "x",
+              "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+              "stream": true
+            }"#,
+        );
+        assert!(parse_streaming(&b).unwrap());
+    }
+
+    #[test]
+    fn parse_streaming_handles_nested_messages_with_stream_false() {
+        // Same nested shape but stream=false.
+        let b = Bytes::from_static(
+            br#"{
+              "model": "x",
+              "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+              "stream": false
+            }"#,
+        );
+        assert!(!parse_streaming(&b).unwrap());
+    }
+
+    #[test]
+    fn parse_streaming_handles_duplicate_stream_keys() {
+        // RFC 8259 says "names within an object SHOULD be unique" but a
+        // parser MAY accept duplicates. Step 1 (HashMap) silently
+        // last-wins, but step 2 deserializes into the typed `StreamProbe`
+        // struct, and `serde_json`'s `#[derive(Deserialize)]` REJECTS
+        // duplicate fields with a `duplicate field` error.
+        //
+        // We map that to `BadRequest` (same path as other malformed input).
+        // Pinning "reject" rather than "last-wins" is intentional —
+        // ambiguous bodies should fail loudly at the edge, not silently
+        // route based on which copy serde happened to see last.
+        let b = Bytes::from_static(br#"{"stream": true, "stream": false}"#);
+        let err = parse_streaming(&b).unwrap_err();
+        match err {
+            ApiError::BadRequest(_) => {}
+            other => panic!("expected BadRequest on duplicate `stream` key, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_streaming_bad_request_message_does_not_leak_serde_detail() {
         // Info-leak guard: the client-visible message must be a fixed
         // string, not the serde error (which can contain line/column
