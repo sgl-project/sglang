@@ -18,8 +18,27 @@ pub enum ApiError {
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
-    #[error("upstream worker error: {0}")]
-    UpstreamWorker(String),
+    /// Could not reach the upstream worker (connect refused, DNS, TLS, request
+    /// build error). `source` captures the full anyhow chain for server-side
+    /// logging; clients see a generic message.
+    #[error("upstream unreachable: worker {worker}")]
+    UpstreamUnreachable {
+        worker: String,
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// Upstream worker replied with a non-2xx status code that the router
+    /// itself surfaced (vs. forwarding the worker's body). Currently unused in
+    /// the proxy path (we forward the worker's body verbatim), reserved for
+    /// future use by structured retries / circuit-breakers.
+    #[error("upstream returned status {status}")]
+    UpstreamStatus { status: StatusCode },
+
+    /// Wall-clock timeout exceeded while waiting for the upstream worker's
+    /// response (per-request `request_timeout`).
+    #[error("upstream timed out: worker {worker}")]
+    UpstreamTimeout { worker: String },
 
     #[error("internal: {0}")]
     Internal(#[from] anyhow::Error),
@@ -30,7 +49,11 @@ impl ApiError {
         match self {
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             ApiError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "model_not_found"),
-            ApiError::UpstreamWorker(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
+            ApiError::UpstreamUnreachable { .. } => {
+                (StatusCode::BAD_GATEWAY, "upstream_unreachable")
+            }
+            ApiError::UpstreamStatus { .. } => (StatusCode::BAD_GATEWAY, "upstream_status"),
+            ApiError::UpstreamTimeout { .. } => (StatusCode::BAD_GATEWAY, "upstream_timeout"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         }
     }
@@ -56,7 +79,8 @@ impl IntoResponse for ApiError {
             400..=499 => "invalid_request_error",
             _ => "server_error",
         };
-        // For Internal: log full chain server-side, return generic message to client.
+        // Pick a client-facing message that NEVER leaks worker URLs or raw
+        // source chains; full structured details are logged server-side.
         let message = match &self {
             ApiError::Internal(e) => {
                 // `{:#}` prints the anyhow chain (top error + sources) — `?e`
@@ -64,7 +88,26 @@ impl IntoResponse for ApiError {
                 tracing::error!("internal error serving request: {e:#}");
                 "internal error".to_string()
             }
-            _ => self.to_string(),
+            ApiError::UpstreamUnreachable { worker, source } => {
+                tracing::warn!(
+                    upstream = %worker,
+                    error = %format_args!("{source:#}"),
+                    "upstream worker unreachable",
+                );
+                "upstream unavailable".to_string()
+            }
+            ApiError::UpstreamStatus { status } => {
+                tracing::warn!(
+                    upstream_status = %status,
+                    "upstream returned an error status",
+                );
+                "upstream returned an error status".to_string()
+            }
+            ApiError::UpstreamTimeout { worker } => {
+                tracing::warn!(upstream = %worker, "upstream request timed out");
+                "upstream request timed out".to_string()
+            }
+            ApiError::BadRequest(_) | ApiError::ModelNotFound(_) => self.to_string(),
         };
         let mut resp = (
             status,
@@ -83,17 +126,85 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
 
-    #[test]
-    fn internal_error_response_sanitizes_anyhow_chain() {
-        use http_body_util::BodyExt;
-        let secret_msg = "internal /opt/secret/credential.json missing";
-        let err = ApiError::Internal(anyhow::anyhow!("{secret_msg}"));
-        let resp = err.into_response();
+    fn collect_body(resp: Response) -> String {
         let bytes = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(async { BodyExt::collect(resp.into_body()).await.unwrap().to_bytes() });
-        let body_str = String::from_utf8_lossy(&bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn upstream_unreachable_envelope_has_code_and_no_leak() {
+        let worker = "http://10.0.0.42:30000";
+        let secret = "TLS_HANDSHAKE_FAILED at /etc/secret_ca.pem";
+        let err = ApiError::UpstreamUnreachable {
+            worker: worker.into(),
+            source: anyhow::anyhow!("{secret}"),
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.headers()
+                .get("x-router-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("upstream_unreachable"),
+        );
+        let body = collect_body(resp);
+        assert!(body.contains("\"code\":\"upstream_unreachable\""), "{body}");
+        assert!(body.contains("\"type\":\"server_error\""), "{body}");
+        assert!(
+            !body.contains(worker) && !body.contains(secret),
+            "client body must NOT leak worker URL or reqwest source chain; got: {body}",
+        );
+    }
+
+    #[test]
+    fn upstream_status_envelope_has_code() {
+        let err = ApiError::UpstreamStatus {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.headers()
+                .get("x-router-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("upstream_status"),
+        );
+        let body = collect_body(resp);
+        assert!(body.contains("\"code\":\"upstream_status\""), "{body}");
+    }
+
+    #[test]
+    fn upstream_timeout_envelope_has_code_and_no_leak() {
+        let worker = "http://10.0.0.42:30000";
+        let err = ApiError::UpstreamTimeout {
+            worker: worker.into(),
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.headers()
+                .get("x-router-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("upstream_timeout"),
+        );
+        let body = collect_body(resp);
+        assert!(body.contains("\"code\":\"upstream_timeout\""), "{body}");
+        assert!(
+            !body.contains(worker),
+            "client body must NOT leak worker URL; got: {body}",
+        );
+    }
+
+    #[test]
+    fn internal_error_response_sanitizes_anyhow_chain() {
+        let secret_msg = "internal /opt/secret/credential.json missing";
+        let err = ApiError::Internal(anyhow::anyhow!("{secret_msg}"));
+        let resp = err.into_response();
+        let body_str = collect_body(resp);
         // Generic to client:
         assert!(
             body_str.contains("\"code\":\"internal_error\""),

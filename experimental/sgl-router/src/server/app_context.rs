@@ -47,10 +47,14 @@ impl AppContext {
                 models: vec![],
                 workers: vec![crate::config::WorkerConfig {
                     url: "http://x".into(),
+                    request_timeout_ms: None,
                 }],
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
-            proxy: Arc::new(Proxy::new("http://x".into()).expect("stub proxy")),
+            proxy: Arc::new(
+                Proxy::new("http://x".into(), std::time::Duration::from_secs(60))
+                    .expect("stub proxy"),
+            ),
             ready: AtomicBool::new(false),
         }
     }

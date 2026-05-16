@@ -12,20 +12,32 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use reqwest::Client;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct Proxy {
     pub worker_url: String,
     pub client: Client,
+    /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
+    /// requests deliberately do not use this (long generations are valid).
+    pub request_timeout: Duration,
 }
 
 impl Proxy {
-    pub fn new(worker_url: String) -> Result<Self, anyhow::Error> {
+    /// Build a proxy. `request_timeout` is the per-request wall-clock budget for
+    /// non-streaming forwards. Connect timeout is hard-coded to 5 s — even a
+    /// streaming request fails fast at TCP setup if the worker is unreachable.
+    pub fn new(worker_url: String, request_timeout: Duration) -> Result<Self, anyhow::Error> {
         let client = Client::builder()
             .pool_max_idle_per_host(64)
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .context("build reqwest client")?;
-        Ok(Self { worker_url, client })
+        Ok(Self {
+            worker_url,
+            client,
+            request_timeout,
+        })
     }
 
     /// Forward a JSON POST to the worker and return the buffered response.
@@ -44,16 +56,18 @@ impl Proxy {
                 req = req.header(k, v);
             }
         }
-        req = req.header("content-type", "application/json");
+        req = req
+            .header("content-type", "application/json")
+            .timeout(self.request_timeout);
         let resp = req
             .send()
             .await
-            .map_err(|e| ApiError::UpstreamWorker(format!("{e}")))?;
+            .map_err(|e| self.classify_reqwest_error(e, path))?;
         let status = resp.status();
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| ApiError::UpstreamWorker(format!("read body: {e}")))?;
+            .map_err(|e| self.classify_reqwest_error(e, path))?;
         let mut out = Response::new(Body::from(bytes));
         *out.status_mut() = status;
         out.headers_mut().insert(
@@ -63,10 +77,32 @@ impl Proxy {
         Ok(out)
     }
 
+    /// Classify a reqwest error into the right `ApiError` variant. The
+    /// classification feeds the structured `code` clients see and the
+    /// structured fields tracing logs; the human source chain is preserved
+    /// via `anyhow::Error::context` for the server-side log.
+    fn classify_reqwest_error(&self, e: reqwest::Error, path: &str) -> ApiError {
+        let worker = self.worker_url.clone();
+        let source = anyhow::Error::new(e).context(format!("worker {worker}: post {path}"));
+        // Walk the source chain to detect timeouts even when wrapped.
+        let is_timeout = source.chain().any(|c| {
+            c.downcast_ref::<reqwest::Error>()
+                .is_some_and(|r| r.is_timeout())
+        }) || source.chain().any(|c| {
+            c.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        });
+        if is_timeout {
+            ApiError::UpstreamTimeout { worker }
+        } else {
+            ApiError::UpstreamUnreachable { worker, source }
+        }
+    }
+
     /// One-shot health check against the configured worker. Returns `Ok(())`
     /// if the worker responded with any 2xx or 3xx within the timeout;
     /// `Err` otherwise. Result is informational — callers log and continue.
-    pub async fn probe_health(&self, timeout: std::time::Duration) -> Result<(), String> {
+    pub async fn probe_health(&self, timeout: Duration) -> Result<(), String> {
         let url = format!("{}/health", self.worker_url);
         match tokio::time::timeout(timeout, self.client.get(&url).send()).await {
             Ok(Ok(resp)) if resp.status().is_success() || resp.status().is_redirection() => Ok(()),
@@ -81,6 +117,12 @@ impl Proxy {
 
     /// Forward a JSON POST and stream the SSE response back unmodified.
     /// Adds `accept: text/event-stream` to the outbound request.
+    ///
+    /// Note: streaming requests deliberately do NOT set a wall-clock
+    /// `.timeout(...)` — long generations are valid and clients drive
+    /// cancellation by dropping the response stream. The client-level
+    /// `connect_timeout` configured in [`Self::new`] still applies, so a
+    /// worker that never accepts TCP fails fast at request initiation.
     pub async fn forward_streaming(
         &self,
         path: &str,
@@ -100,7 +142,7 @@ impl Proxy {
         let resp = req
             .send()
             .await
-            .map_err(|e| ApiError::UpstreamWorker(format!("{e}")))?;
+            .map_err(|e| self.classify_reqwest_error(e, path))?;
         let status = resp.status();
         // Capture content-type BEFORE consuming resp via bytes_stream().
         let upstream_ct = resp
@@ -147,7 +189,7 @@ mod tests {
                 .await;
         });
 
-        let p = Proxy::new(format!("http://{addr}")).unwrap();
+        let p = Proxy::new(format!("http://{addr}"), Duration::from_secs(5)).unwrap();
         let res = p.probe_health(Duration::from_secs(2)).await;
         assert!(res.is_ok(), "expected probe to succeed, got: {res:?}");
         let _ = tx.send(());
@@ -156,7 +198,7 @@ mod tests {
     #[tokio::test]
     async fn new_returns_result_not_panic() {
         // Smoke: Proxy::new returns Result<Self>; the happy path works.
-        let p = Proxy::new("http://127.0.0.1:1".to_string()).unwrap();
+        let p = Proxy::new("http://127.0.0.1:1".to_string(), Duration::from_secs(5)).unwrap();
         assert_eq!(p.worker_url, "http://127.0.0.1:1");
     }
 
@@ -167,7 +209,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let p = Proxy::new(format!("http://{addr}")).unwrap();
+        let p = Proxy::new(format!("http://{addr}"), Duration::from_secs(5)).unwrap();
         let res = p.probe_health(Duration::from_millis(500)).await;
         let err = res.expect_err("expected probe to fail against a closed port");
         assert!(

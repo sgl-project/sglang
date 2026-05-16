@@ -39,8 +39,14 @@ async fn main() -> Result<()> {
         sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
             .context("load tokenizers")?,
     );
+    // Default 60s request timeout; per-worker override via `request_timeout_ms`
+    // in config. Streaming endpoints do NOT apply this timeout (long
+    // generations are valid).
+    let request_timeout =
+        std::time::Duration::from_millis(cfg.workers[0].request_timeout_ms.unwrap_or(60_000));
     let proxy = Arc::new(
-        sgl_router::proxy::Proxy::new(cfg.workers[0].url.clone()).context("build proxy client")?,
+        sgl_router::proxy::Proxy::new(cfg.workers[0].url.clone(), request_timeout)
+            .context("build proxy client")?,
     );
 
     match proxy.probe_health(std::time::Duration::from_secs(2)).await {

@@ -58,6 +58,7 @@ mod tests {
             }],
             workers: vec![crate::config::WorkerConfig {
                 url: "http://x".into(),
+                request_timeout_ms: None,
             }],
         }
     }
