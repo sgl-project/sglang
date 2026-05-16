@@ -19,14 +19,7 @@ class TestSWARadixCacheKL(KLDivergenceMixin, DefaultServerBase):
         "--mem-fraction-static",
         "0.70",
         "--disable-piecewise-cuda-graph",
-        # Pin attention reduction order. Without this the ragged-prefill and
-        # paged-decode kernels accumulate bf16 partial sums in different
-        # orders, producing ~0.01-0.05 logprob drift per token between the
-        # decode-time output_logprob and the prefill-time input_logprob even
-        # for the same token at the same context. PR #25429 (temperature
-        # 1 -> 0.0 in kl_test_utils) removed the sampling-noise averaging
-        # that previously kept this drift under the 0.002 threshold.
-        # KL test should measure cache consistency, not fp noise.
+        # Pin attention reduction order so test measures cache consistency, not bf16 noise.
         "--enable-deterministic-inference",
     ]
 
