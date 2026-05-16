@@ -1,22 +1,37 @@
-// DeepSeek-V4 deployment generator.
+// Shared deployment skeleton — the ENGINE half of the SGLang cookbook
+// deployment-command generator. Pair this with a per-model config file under
+// `/src/snippets/configs/<vendor>/<model>.jsx` and an MDX page that imports
+// both:
 //
-// MINTLIFY CONSTRAINT (confirmed by experiment): Mintlify's `.jsx` snippet
-// loader strips ALL module-level statements — only the exported component
-// function survives — AND it replaces every capitalized JSX tag with a
-// `_provideComponents()` context lookup, ignoring `import` statements for
-// custom components. So we can't share a `<DeploymentGenerator/>` across
-// snippets; the entire generator engine has to live inside the wrapper
-// function. This file is the proof-of-concept of "config-driven, no bespoke
-// rendering logic per cookbook" — the generator code below is identical for
-// every model and is meant to be copy-pasted (or codegen'd) into each
-// cookbook's snippet. The only model-specific section is the
-// `config = { ... cells: [ ... ] }` literal further down.
-export const DeepSeekV4Deployment = () => {
+//     import { Deployment } from "/src/snippets/_deployment.jsx";
+//     import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4.jsx";
+//     <Deployment config={config} />
+//
+// This file contains nothing model-specific. Add a new cookbook recipe by
+// dropping a new config file and pointing an MDX at it — no engine edits
+// required. To improve the engine (new button, new UI feature, VRAM update),
+// edit this file once and every cookbook gets the upgrade.
+//
+// Mintlify caveats this file routes around:
+//   - Module-level statements inside a `.jsx` snippet are stripped — so every
+//     helper / hook / handler stays inside the wrapper function body below.
+//   - Capitalized JSX tags inside a snippet's function body get rebound via
+//     `_provideComponents()`, so we use only lowercase HTML tags here (and
+//     factor sub-regions into `renderButton()` / `renderFlatSection()` helper
+//     functions, not into sub-components).
+//   - Imports of plain-data exports from other `.jsx` files DO work when the
+//     import lives in an MDX file (validated by EXPERIMENT_RESULTS.md). So
+//     the per-model config is imported at MDX level and passed through here
+//     as the `config` prop.
+
+export const Deployment = ({ config }) => {
+  if (!config) {
+    return <div style={{padding: 12, color: "#b91c1c"}}>Deployment: missing <code>config</code> prop</div>;
+  }
+
   // ==========================================================================
-  // === KEEP IN SYNC WITH deepseek-v4-playground.jsx (begin) ===
-  // The cell catalog and per-cookbook config below are duplicated verbatim in
-  // the §3.3 Playground snippet. When changing one, update the other. Mintlify
-  // can't share data across `.jsx` snippets so duplication is unavoidable.
+  // 1. Hardware catalog (shared across cookbooks — single source of truth)
+  // VRAM is reported as per-GPU on-chip memory (HBM3/3e/E), not per-module.
   // ==========================================================================
   // 1. Hardware catalog (shared across cookbooks — keep identical when copying)
   // VRAM is reported as per-GPU on-chip memory (HBM3/3e/E), not per-module.
@@ -37,365 +52,6 @@ export const DeepSeekV4Deployment = () => {
       { id: "mi355x", label: "MI355X", vram: "288GB" },
     ],
   };
-
-  // ==========================================================================
-  // 2. Cell catalog — the only section that differs per cookbook
-  // ==========================================================================
-
-  // ----- 2.a Shared flag fragments -----
-  const HEAD = ["--trust-remote-code", "--model-path {{MODEL_NAME}}"];
-  const TAIL = ["--host {{HOST_IP}}", "--port {{PORT}}"];
-
-  const MTP_314 = [
-    "--speculative-algo EAGLE",
-    "--speculative-num-steps 3",
-    "--speculative-eagle-topk 1",
-    "--speculative-num-draft-tokens 4",
-  ];
-  const MTP_112 = [
-    "--speculative-algo EAGLE",
-    "--speculative-num-steps 1",
-    "--speculative-eagle-topk 1",
-    "--speculative-num-draft-tokens 2",
-  ];
-  // DeepEP large-SMS config (single-quoted JSON so users can copy-paste without escaping).
-  const DEEPEP_LARGE_SMS =
-    `--deepep-config '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'`;
-  // B200/B300 Pro accuracy-verified env block (same 5 vars across all 3 strategies for b200|big).
-  const B200_PRO_ACC_ENV = [
-    "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-    "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-    "SGLANG_OPT_USE_JIT_NORM=1",
-    "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-    "SGLANG_OPT_USE_TOPK_V2=1",
-  ];
-
-  // ----- 2.b Cell factory -----
-  const cellOf = (match, { verified = true, env = [], flags = [] } = {}) => ({
-    match, verified, env, flags,
-  });
-  const cloneToHw = (cells, fromHw, toHw) =>
-    cells.filter((c) => c.match.hw === fromHw)
-         .map((c) => ({ ...c, match: { ...c.match, hw: toHw } }));
-
-  // ----- 2.c Cells -----
-  const baseCells = [
-    // ----- B200 + FP4 -----
-    cellOf({ hw: "b200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
-      env: [],
-      flags: [...HEAD, "--tp 4", "--moe-runner-backend flashinfer_mxfp4", ...MTP_314,
-              "--chunked-prefill-size 4096", "--disable-flashinfer-autotune",
-              "--swa-full-tokens-ratio 0.1", ...TAIL],
-    }),
-    cellOf({ hw: "b200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" }, {
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", ...MTP_112, DEEPEP_LARGE_SMS, ...TAIL],
-    }),
-    cellOf({ hw: "b200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", DEEPEP_LARGE_SMS, ...TAIL],
-    }),
-    cellOf({ hw: "b200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
-      env: [...B200_PRO_ACC_ENV],
-      flags: [...HEAD, "--tp 8", "--moe-runner-backend flashinfer_mxfp4", ...MTP_314,
-              "--chunked-prefill-size 8192", "--disable-flashinfer-autotune",
-              "--swa-full-tokens-ratio 0.1", "--mem-fraction-static 0.90", ...TAIL],
-    }),
-    cellOf({ hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" }, {
-      env: [...B200_PRO_ACC_ENV],
-      flags: [...HEAD, "--tp 8", "--dp 8", "--enable-dp-attention",
-              "--moe-runner-backend flashinfer_mxfp4", "--disable-flashinfer-autotune",
-              "--chunked-prefill-size 32768", "--swa-full-tokens-ratio 0.1", ...MTP_112,
-              "--mem-fraction-static 0.92", "--cuda-graph-max-bs 256",
-              DEEPEP_LARGE_SMS, ...TAIL],
-    }),
-    cellOf({ hw: "b200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
-      env: [...B200_PRO_ACC_ENV,
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
-            "NVSHMEM_DISABLE_IB=1",
-            "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1",
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
-      flags: [...HEAD, "--tp 8", "--dp 8", "--enable-dp-attention",
-              "--moe-a2a-backend megamoe", "--mem-fraction-static 0.835",
-              "--cuda-graph-max-bs 544", "--swa-full-tokens-ratio 0.075",
-              "--chunked-prefill-size 65536", "--tokenizer-worker-num 8",
-              "--enable-prefill-delayer", DEEPEP_LARGE_SMS, ...TAIL],
-    }),
-
-    // ----- GB200 + FP4 -----
-    cellOf({ hw: "gb200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
-      env: [],
-      flags: [...HEAD, "--tp 4", "--moe-runner-backend flashinfer_mxfp4", ...MTP_314,
-              "--chunked-prefill-size 4096", "--disable-flashinfer-autotune",
-              "--swa-full-tokens-ratio 0.1", ...TAIL],
-    }),
-    cellOf({ hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" }, {
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", ...MTP_112, DEEPEP_LARGE_SMS, ...TAIL],
-    }),
-    cellOf({ hw: "gb200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", DEEPEP_LARGE_SMS, ...TAIL],
-    }),
-    // GB200 Pro requires 2 nodes; multi-node wiring (--nnodes / --node-rank /
-    // --dist-init-addr) added by the renderer below.
-    cellOf({ hw: "gb200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" }, {
-      env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1",
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
-      flags: [...HEAD, "--tp 8", "--moe-runner-backend flashinfer_mxfp4", ...MTP_314,
-              "--chunked-prefill-size 4096", "--disable-flashinfer-autotune",
-              "--swa-full-tokens-ratio 0.1", "--mem-fraction-static 0.88", ...TAIL],
-    }),
-    cellOf({ hw: "gb200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" }, {
-      env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1",
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
-      flags: [...HEAD, "--tp 8", "--dp 8", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", ...MTP_112,
-              "--mem-fraction-static 0.78", "--cuda-graph-max-bs 64",
-              "--max-running-requests 128", ...TAIL],
-    }),
-    cellOf({ hw: "gb200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "multi-2" }, {
-      env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1",
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
-      flags: [...HEAD, "--tp 8", "--dp 8", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", "--mem-fraction-static 0.78",
-              "--cuda-graph-max-bs 64", "--max-running-requests 256", ...TAIL],
-    }),
-
-    // ----- GB300 + FP4 -----
-    cellOf({ hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
-      env: [],
-      flags: [...HEAD, "--tp 4", "--moe-runner-backend flashinfer_mxfp4", ...MTP_314,
-              "--chunked-prefill-size 4096", "--disable-flashinfer-autotune",
-              "--swa-full-tokens-ratio 0.1", ...TAIL],
-    }),
-    cellOf({ hw: "gb300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" }, {
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", ...MTP_112, DEEPEP_LARGE_SMS, ...TAIL],
-    }),
-    cellOf({ hw: "gb300", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
-      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", DEEPEP_LARGE_SMS, ...TAIL],
-    }),
-    cellOf({ hw: "gb300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
-      env: [],
-      flags: [...HEAD, "--tp 4", "--moe-runner-backend flashinfer_mxfp4", ...MTP_314,
-              "--chunked-prefill-size 4096", "--disable-flashinfer-autotune",
-              "--swa-full-tokens-ratio 0.1", "--mem-fraction-static 0.88", ...TAIL],
-    }),
-    cellOf({ hw: "gb300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" }, {
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
-      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", ...MTP_112,
-              "--mem-fraction-static 0.9", "--cuda-graph-max-bs 128",
-              "--max-running-requests 256", DEEPEP_LARGE_SMS, ...TAIL],
-    }),
-    cellOf({ hw: "gb300", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
-      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", "--mem-fraction-static 0.9",
-              "--cuda-graph-max-bs 128", "--max-running-requests 256",
-              DEEPEP_LARGE_SMS, ...TAIL],
-    }),
-
-    // ----- H200 + FP8 -----
-    cellOf({ hw: "h200", variant: "flash", quant: "fp8", strategy: "low-latency", nodes: "single" }, {
-      env: ["SGLANG_DSV4_FP4_EXPERTS=0"],
-      flags: [...HEAD, "--tp 4", ...MTP_314, ...TAIL],
-    }),
-    cellOf({ hw: "h200", variant: "flash", quant: "fp8", strategy: "balanced", nodes: "single" }, {
-      env: ["SGLANG_DSV4_FP4_EXPERTS=0", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
-      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", ...MTP_112,
-              "--cuda-graph-max-bs 128", "--max-running-requests 128",
-              DEEPEP_LARGE_SMS, ...TAIL],
-    }),
-    cellOf({ hw: "h200", variant: "flash", quant: "fp8", strategy: "max-throughput", nodes: "single" }, {
-      env: ["SGLANG_DSV4_FP4_EXPERTS=0", "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
-      flags: [...HEAD, "--tp 4", "--dp 4", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", "--cuda-graph-max-bs 128",
-              "--max-running-requests 256", DEEPEP_LARGE_SMS, ...TAIL],
-    }),
-    // H200 Pro FP8: low-latency exposes BOTH single-node (TP=8 Marlin) and
-    // multi-2 (TP=16 DP-attn + DeepEP) — the old combined block, split.
-    cellOf({ hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single" }, {
-      env: ["SGLANG_DSV4_FP4_EXPERTS=0"],
-      flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin", ...MTP_314,
-              "--chunked-prefill-size 4096", "--disable-flashinfer-autotune",
-              "--mem-fraction-static 0.88", ...TAIL],
-    }),
-    cellOf({ hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "multi-2" }, {
-      env: ["SGLANG_DSV4_FP4_EXPERTS=0", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
-      flags: [...HEAD, "--tp 16", "--dp 16", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", "--cuda-graph-max-bs 8",
-              "--max-running-requests 32", ...MTP_314,
-              "--mem-fraction-static 0.88", ...TAIL],
-    }),
-    cellOf({ hw: "h200", variant: "pro", quant: "fp8", strategy: "balanced", nodes: "multi-2" }, {
-      env: ["SGLANG_DSV4_FP4_EXPERTS=0", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
-      flags: [...HEAD, "--tp 16", "--dp 16", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", ...MTP_112,
-              "--mem-fraction-static 0.88", "--cuda-graph-max-bs 8",
-              "--max-running-requests 32", ...TAIL],
-    }),
-    cellOf({ hw: "h200", variant: "pro", quant: "fp8", strategy: "max-throughput", nodes: "multi-2" }, {
-      env: ["SGLANG_DSV4_FP4_EXPERTS=0", "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"],
-      flags: [...HEAD, "--tp 16", "--dp 16", "--enable-dp-attention",
-              "--moe-a2a-backend deepep", "--mem-fraction-static 0.88",
-              "--cuda-graph-max-bs 128", "--max-running-requests 256", ...TAIL],
-    }),
-
-    // ----- H200 + FP4 (Marlin, single-node only) -----
-    cellOf({ hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
-      env: [], flags: [...HEAD, "--tp 4", "--moe-runner-backend marlin", ...MTP_314, ...TAIL],
-    }),
-    cellOf({ hw: "h200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" }, {
-      env: [], flags: [...HEAD, "--tp 4", "--moe-runner-backend marlin", ...MTP_112, ...TAIL],
-    }),
-    cellOf({ hw: "h200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
-      env: [], flags: [...HEAD, "--tp 4", "--moe-runner-backend marlin", ...TAIL],
-    }),
-    cellOf({ hw: "h200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
-      env: [], flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin", ...MTP_314,
-                       "--mem-fraction-static 0.88", ...TAIL],
-    }),
-    cellOf({ hw: "h200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" }, {
-      env: [], flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin", ...MTP_112,
-                       "--mem-fraction-static 0.88", ...TAIL],
-    }),
-    cellOf({ hw: "h200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
-      env: [], flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin",
-                       "--mem-fraction-static 0.88", ...TAIL],
-    }),
-
-    // ----- H100 + FP4 (Marlin) -----
-    cellOf({ hw: "h100", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" }, {
-      env: [], flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin", ...MTP_314, ...TAIL],
-    }),
-    cellOf({ hw: "h100", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" }, {
-      env: [], flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin", ...MTP_112, ...TAIL],
-    }),
-    cellOf({ hw: "h100", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" }, {
-      env: [], flags: [...HEAD, "--tp 8", "--moe-runner-backend marlin", ...TAIL],
-    }),
-    cellOf({ hw: "h100", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" }, {
-      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
-      flags: [...HEAD, "--tp 16", "--moe-runner-backend marlin", ...MTP_314,
-              "--mem-fraction-static 0.9", "--cuda-graph-max-bs 8",
-              "--max-running-requests 32", ...TAIL],
-    }),
-    cellOf({ hw: "h100", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" }, {
-      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
-      flags: [...HEAD, "--tp 16", "--moe-runner-backend marlin", ...MTP_112,
-              "--mem-fraction-static 0.9", "--cuda-graph-max-bs 8",
-              "--max-running-requests 32", ...TAIL],
-    }),
-    cellOf({ hw: "h100", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "multi-2" }, {
-      env: ["SGLANG_SHARED_EXPERT_TP1=1"],
-      flags: [...HEAD, "--tp 16", "--moe-runner-backend marlin",
-              "--mem-fraction-static 0.9", ...TAIL],
-    }),
-  ];
-
-  // B300 mirrors B200 in the original generator. Materialise the duplicates.
-  const allCells = [...baseCells, ...cloneToHw(baseCells, "b200", "b300")];
-
-  const MULTI_NODE_HINTS = {
-    gb200: [
-      "The following env vars may be needed depending on your cluster:",
-      "  GLOO_SOCKET_IFNAME=<your-nic>",
-      "  NVSHMEM_ENABLE_NIC_PE_MAPPING=1",
-      "  NVSHMEM_HCA_LIST=<your-hca-list>",
-    ],
-  };
-
-  // Per-hardware Docker image. Mirrors the "Docker Images by Hardware Platform"
-  // table in §2 of DeepSeek-V4.mdx; if you change one, change both.
-  const DOCKER_IMAGES = {
-    h100:  "lmsysorg/sglang:dev",
-    h200:  "lmsysorg/sglang:deepseek-v4-hopper",
-    b200:  "lmsysorg/sglang:deepseek-v4-blackwell",
-    b300:  "lmsysorg/sglang:deepseek-v4-b300",
-    gb200: "lmsysorg/sglang:deepseek-v4-grace-blackwell",
-    gb300: "lmsysorg/sglang:deepseek-v4-grace-blackwell",
-  };
-
-  // ==========================================================================
-  // 3. Final config object
-  // ==========================================================================
-  const config = {
-    modelName: "DeepSeek-V4",
-    // `supportedHardware` is the catalog-visibility list, NOT the
-    // has-runnable-cells list. Listing AMD ids here makes those buttons appear
-    // in the UI; since no cell references them, `isOptionAvailable` will
-    // return false for each one and they render greyed out automatically.
-    // Drop an id from this list to hide it from the UI entirely.
-    supportedHardware: [
-      "h100", "h200", "b200", "b300", "gb200", "gb300",
-      "mi300x", "mi325x", "mi350x", "mi355x",
-    ],
-    variants: [
-      { id: "flash", label: "Flash", subtitle: "285B" },
-      { id: "pro",   label: "Pro",   subtitle: "1.6T" },
-    ],
-    quantizations: [
-      { id: "fp8", label: "FP8" },
-      { id: "fp4", label: "FP4" },
-    ],
-    strategies: [
-      { id: "low-latency",    label: "Low-Latency"    },
-      { id: "balanced",       label: "Balanced"       },
-      { id: "max-throughput", label: "Max-Throughput" },
-    ],
-    // Nodes dimension. The id format `multi-N` carries the node count so the
-    // renderer can emit `--nnodes N` automatically. We expose just one
-    // multi-node option here using 2 nodes as the canonical example; cookbooks
-    // that need a different N (e.g. 4 nodes) can add `multi-4` here AND in the
-    // matching cells without any renderer change.
-    nodesOptions: [
-      { id: "single",  label: "Single Node" },
-      { id: "multi-2", label: "Multi-Nodes" },
-    ],
-    // HF slug: layered lookup. `${hw}|${variant}|${quant}` (override) → `${variant}|${quant}` (base).
-    // Both `--model-path` (via {{MODEL_NAME}} in cell.flags) and the cURL body's
-    // `"model"` field resolve from the same map.
-    modelNames: {
-      "flash|fp4": "deepseek-ai/DeepSeek-V4-Flash",
-      "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
-      "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
-      "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
-      // H200 FP8 needs the sgl-project repackaging (Hopper can't run FP4-mixed Instruct).
-      "h200|flash|fp8": "sgl-project/DeepSeek-V4-Flash-FP8",
-      "h200|pro|fp8":   "sgl-project/DeepSeek-V4-Pro-FP8",
-    },
-    placeholders: {
-      HOST_IP:   { target: "command", label: "Bind host",       default: "0.0.0.0"  },
-      PORT:      { target: "command", label: "Bind port",       default: "30000"    },
-      NODE0_IP:  { target: "command", label: "Head node IP",    default: "<node0-ip>"   },
-      NODE_RANK: { target: "command", label: "This node rank",  default: "<node-rank>"  },
-      // HuggingFace access token — used only by the Docker output for the
-      // `--env "HF_TOKEN=..."` line; Python mode never injects it. Kept in the
-      // "command" group (not "curl") so it appears alongside HOST_IP / PORT in
-      // the Env modal, sharing the same persistence pathway.
-      HF_TOKEN:  { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
-      CURL_HOST: { target: "curl",    label: "Server host",     default: "localhost" },
-      CURL_PORT: { target: "curl",    label: "Server port",     default: "30000"     },
-    },
-    curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
-  -H 'Content-Type: application/json' \\
-  -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
-    cells: allCells,
-    multiNodeHints: MULTI_NODE_HINTS,
-    dockerImages: DOCKER_IMAGES,
-  };
-  // === KEEP IN SYNC WITH deepseek-v4-playground.jsx (end) ===
 
   // ==========================================================================
   // 4. Style helper (dark-mode-aware)
@@ -671,7 +327,10 @@ export const DeepSeekV4Deployment = () => {
     const modelName = resolveModelName(sel);
     const nnodes = parseNnodes(sel.nodes);
     const multinode = nnodes > 1;
-    const flags = [...cell.flags];
+    // Per-model configs are pure flat literals — cell.env and cell.flags are
+    // consumed verbatim. No fragment expansion, no aliasing, no preprocessing.
+    const cellEnv = cell.env || [];
+    const flags = [...(cell.flags || [])];
     if (multinode) {
       const i = flags.findIndex((f) => f.startsWith("--model-path"));
       flags.splice(i + 1, 0,
@@ -694,7 +353,7 @@ export const DeepSeekV4Deployment = () => {
         "  -p {{PORT}}:{{PORT}}",
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
-        ...cell.env.map((e) => `  --env ${e}`),
+        ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,
         "  sglang serve",
@@ -703,7 +362,7 @@ export const DeepSeekV4Deployment = () => {
       cmd = dockerLines.join(" \\\n");
     } else {
       const flagBlock = flags.map((f) => "  " + f).join(" \\\n");
-      const envBlock = cell.env.length ? cell.env.join(" \\\n") + " \\\n" : "";
+      const envBlock = cellEnv.length ? cellEnv.join(" \\\n") + " \\\n" : "";
       cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
     }
 

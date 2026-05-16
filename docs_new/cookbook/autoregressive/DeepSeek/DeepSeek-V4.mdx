@@ -129,9 +129,10 @@ SGLang supports three main serving recipes for DeepSeek-V4 with different latenc
 
 **Interactive Command Generator**: Use the selector below to generate the deployment command for your hardware + recipe combination.
 
-import { DeepSeekV4Deployment } from "/src/snippets/autoregressive/deepseek-v4-deployment.jsx";
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4.jsx";
 
-<DeepSeekV4Deployment />
+<Deployment config={config} />
 
 ### 3.2 Configuration Tips
 
@@ -176,9 +177,9 @@ The §3.1 generator emits only **verified** cells. Use the Playground below to l
 
 Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. Until a configuration is verified end-to-end, the badge stays Auto-Estimated.
 
-import { DeepSeekV4Playground } from "/src/snippets/autoregressive/deepseek-v4-playground.jsx";
+import { Playground } from "/src/snippets/_playground.jsx";
 
-<DeepSeekV4Playground />
+<Playground config={config} />
 
 ## 4. Model Invocation
 
