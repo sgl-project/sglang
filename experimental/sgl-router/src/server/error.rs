@@ -127,12 +127,43 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
+    use serde::Deserialize;
 
     fn collect_body(resp: Response) -> String {
         let bytes = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(async { BodyExt::collect(resp.into_body()).await.unwrap().to_bytes() });
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Pin the exact JSON envelope shape that clients see. Renaming any of
+    /// these fields (or removing one) breaks every downstream consumer
+    /// silently, so we deserialize into a fixed struct rather than
+    /// regex-matching the rendered JSON.
+    #[derive(Deserialize)]
+    struct ErrEnv {
+        error: ErrField,
+    }
+
+    #[derive(Deserialize)]
+    struct ErrField {
+        #[serde(rename = "type")]
+        typ: String,
+        code: String,
+        message: String,
+    }
+
+    fn parse_envelope(resp: Response) -> (StatusCode, Option<String>, ErrEnv) {
+        let status = resp.status();
+        let code_header = resp
+            .headers()
+            .get("x-router-error-code")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body_str = collect_body(resp);
+        let env: ErrEnv = serde_json::from_str(&body_str)
+            .unwrap_or_else(|e| panic!("envelope did not match expected shape: {e}: {body_str}"));
+        (status, code_header, env)
     }
 
     #[test]
@@ -197,6 +228,47 @@ mod tests {
             !body.contains(worker),
             "client body must NOT leak worker URL; got: {body}",
         );
+    }
+
+    #[test]
+    fn bad_request_envelope_has_expected_shape() {
+        let msg = "invalid_request: body must be an object";
+        let err = ApiError::BadRequest(msg.into());
+        let resp = err.into_response();
+        let (status, code_header, env) = parse_envelope(resp);
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code_header.as_deref(), Some("bad_request"));
+        assert_eq!(env.error.code, "bad_request");
+        assert_eq!(env.error.typ, "invalid_request_error");
+        assert!(
+            !env.error.message.is_empty(),
+            "message must not be empty: {:?}",
+            env.error.message,
+        );
+        // Sanity: variants must not collide on the canonical code.
+        assert_ne!(env.error.code, "internal_error");
+        assert_ne!(env.error.code, "model_not_found");
+    }
+
+    #[test]
+    fn model_not_found_envelope_has_expected_shape() {
+        let err = ApiError::ModelNotFound("ghost-7b".into());
+        let resp = err.into_response();
+        let (status, code_header, env) = parse_envelope(resp);
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(code_header.as_deref(), Some("model_not_found"));
+        assert_eq!(env.error.code, "model_not_found");
+        assert_eq!(env.error.typ, "invalid_request_error");
+        assert!(
+            !env.error.message.is_empty(),
+            "message must not be empty: {:?}",
+            env.error.message,
+        );
+        // Sanity: variants must not collide on the canonical code.
+        assert_ne!(env.error.code, "internal_error");
+        assert_ne!(env.error.code, "bad_request");
     }
 
     #[test]
