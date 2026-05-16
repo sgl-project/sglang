@@ -46,8 +46,8 @@ def _reshape_kv_for_fia_nz(
 
 logger = logging.getLogger(__name__)
 
-# default max value of sliding window size
-SWA_INT_MAX = 2147483647
+# default max value of full attention window size
+FULL_ATTENTION_WINDOW = 2147483647
 
 
 @dataclass
@@ -1655,8 +1655,10 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_qlen=actual_seq_lengths,
                 actual_seq_kvlen=actual_seq_lengths_kv,
                 sparse_mode=4 if is_swa_layer else 3,
-                pre_tokens=layer.sliding_window_size if is_swa_layer else SWA_INT_MAX,
-                next_tokens=0 if is_swa_layer else SWA_INT_MAX,
+                pre_tokens=(
+                    layer.sliding_window_size if is_swa_layer else FULL_ATTENTION_WINDOW
+                ),
+                next_tokens=0 if is_swa_layer else FULL_ATTENTION_WINDOW,
                 learnable_sink=sinks,
             )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
