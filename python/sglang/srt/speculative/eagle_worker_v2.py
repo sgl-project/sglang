@@ -49,6 +49,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
     EagleVerifyInput,
+    EagleVerifyOutput,
 )
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
@@ -574,11 +575,12 @@ class EagleDraftWorker(BaseDraftWorker):
         self,
         batch: ModelWorkerBatch,
         batch_result: GenerationBatchResult,
+        verify_output: EagleVerifyOutput,
     ):
         # Batch 2: Draft extend. verify already built draft_extend_input with
         # hidden_states / num_correct_drafts / num_accept_tokens; we only need
         # to set the per-req padding info for this forward.
-        draft_extend_input = batch_result.verify_output.draft_extend_input
+        draft_extend_input = verify_output.draft_extend_input
         draft_extend_input.num_tokens_per_req = self.speculative_num_steps + 1
         draft_extend_input.num_tokens_for_logprob_per_req = (
             self.speculative_num_steps + 1
@@ -820,7 +822,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self._draft_done_event = torch.get_device_module(self.device).Event()
                 self._draft_done_event.record()
             model_worker_batch.spec_info = verify_input
-            batch_output = self.verify(model_worker_batch)
+            batch_output, verify_output = self.verify(model_worker_batch)
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
@@ -829,7 +831,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 speculative_moe_a2a_backend_context(),
             ):
                 self.draft_worker._draft_extend_for_decode(
-                    model_worker_batch, batch_output
+                    model_worker_batch, batch_output, verify_output
                 )
 
             return batch_output
@@ -975,7 +977,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 sa.speculative_num_draft_tokens,
             ) = backup
 
-    def verify(self, batch: ModelWorkerBatch):
+    def verify(
+        self, batch: ModelWorkerBatch
+    ) -> tuple[GenerationBatchResult, EagleVerifyOutput]:
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
@@ -1121,17 +1125,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
             verify_done=verify_done,
         )
 
-        return GenerationBatchResult(
+        batch_result = GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=verify_output.predict,
             can_run_cuda_graph=can_run_cuda_graph,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             next_draft_input=next_draft_input,
-            verify_output=verify_output,
             accept_lens=accept_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
         )
+        # verify_output is V2-internal: consumed by _draft_extend_for_decode in
+        # the same forward_batch_generation call. Returning as tuple (not on
+        # batch_result) keeps GenerationBatchResult scheduler-facing only.
+        return batch_result, verify_output
 
     def _mamba_verify_update(
         self,

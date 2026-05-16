@@ -16,7 +16,6 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.speculative.eagle_info import EagleVerifyOutput
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -52,10 +51,6 @@ class GenerationBatchResult:
     # algos that need cross-iter draft state (EAGLE V1/V2, MultiLayer V1/V2,
     # FrozenKV MTP, DFLASH). Ngram is excluded — see ngram_worker for why.
     next_draft_input: Optional[SpecInput] = None
-    # V2 only: passed from worker.verify to worker._draft_extend_for_decode in
-    # the same forward_batch_generation call. Carries `draft_extend_input` +
-    # `predict` (the V2 raw target output). Not consumed by scheduler.
-    verify_output: Optional[EagleVerifyOutput] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
