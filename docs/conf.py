@@ -29,6 +29,7 @@ extensions = [
     "sphinxcontrib.mermaid",
     "nbsphinx",
     "sphinx.ext.mathjax",
+    "sphinx_sitemap",
 ]
 
 nbsphinx_allow_errors = True
@@ -204,3 +205,5 @@ nbsphinx_prolog = """
         }
     </style>
 """
+html_baseurl = "https://docs.sglang.io/"
+sitemap_url_scheme = "{link}"
