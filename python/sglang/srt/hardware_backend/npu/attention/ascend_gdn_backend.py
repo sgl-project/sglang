@@ -162,6 +162,32 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 forward_batch.extend_seq_lens_cpu
             )
             self.forward_metadata.cu_seqlens_cpu = cu_seqlens_cpu
+
+            # Host-side scalars consumed by causal_conv1d_fn_npu. Pre-computing
+            # them here keeps the per-layer hot path free of any device→host
+            # synchronization (no .item() / .any() / .max() on device tensors).
+            seq_lens_cpu_list = (
+                forward_batch.extend_seq_lens_cpu.tolist()
+                if isinstance(forward_batch.extend_seq_lens_cpu, torch.Tensor)
+                else list(forward_batch.extend_seq_lens_cpu)
+            )
+            self.forward_metadata.seq_lens_cpu_list = seq_lens_cpu_list
+            self.forward_metadata.max_query_len = (
+                max(seq_lens_cpu_list) if seq_lens_cpu_list else 0
+            )
+            self.forward_metadata.cu_seq_len = int(cu_seqlens_cpu[-1])
+
+            # extend_prefix_lens_cpu is a CPU tensor/list; reading `.any()` here
+            # does NOT cause a NPU→CPU sync.
+            prefix_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+            if prefix_cpu is None:
+                has_initial_state_any = False
+            elif isinstance(prefix_cpu, torch.Tensor):
+                has_initial_state_any = bool((prefix_cpu > 0).any())
+            else:
+                has_initial_state_any = any(p > 0 for p in prefix_cpu)
+            self.forward_metadata.has_initial_state_any = has_initial_state_any
+
             if self._gdn_num_heads is not None:
                 self._gdn_meta_per_step[self._gdn_num_heads] = (
                     build_gdn_chunked_prefill_meta(
@@ -172,6 +198,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 )
         else:
             self.forward_metadata.cu_seqlens_cpu = None
+            self.forward_metadata.seq_lens_cpu_list = None
+            self.forward_metadata.max_query_len = None
+            self.forward_metadata.cu_seq_len = None
+            self.forward_metadata.has_initial_state_any = None
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -346,10 +376,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             ).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
-            if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
+            # Use the host bool already computed in init_forward_metadata
+            # (base class) instead of calling .any() on a device tensor.
+            if forward_metadata.has_mamba_track_mask:
                 conv_dst = forward_batch.mamba_track_indices
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
@@ -369,7 +398,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                seq_lens_cpu=forward_metadata.seq_lens_cpu_list,
+                max_query_len=forward_metadata.max_query_len,
+                cu_seq_len=forward_metadata.cu_seq_len,
+                has_initial_state_any=forward_metadata.has_initial_state_any,
             ).transpose(0, 1)[:seq_len]
             conv_states[:, -(kernel_size - 1) :, :] = conv_states_tmp.transpose(
                 1, 2
