@@ -130,10 +130,7 @@ def _dequantize_k_cache_paged_kernel(
             (fp8_vals * scale_pow2).to(output_ptr.dtype.element_ty),
         )
 
-    rope_offs = tl.arange(0, TILE_SIZE)
-    rope_mask = rope_offs < DIM_ROPE
+    rope_offs = tl.arange(0, DIM_ROPE)
     bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
-    rope_data = tl.load(buf_bf16_ptr + bf16_off, mask=rope_mask, other=0.0)
-    tl.store(
-        output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data, mask=rope_mask
-    )
+    rope_data = tl.load(buf_bf16_ptr + bf16_off)
+    tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
