@@ -93,13 +93,8 @@ def _fused_moe_lora_kernel(
     USE_GDC: tl.constexpr,
     launch_pdl: tl.constexpr,
     IS_PRIMARY: tl.constexpr,
-    # c_map indirection — when set, the kernel reads/writes via
-    # ``c_map[offs_token]`` instead of ``offs_token``. Lets the caller keep
-    # tensors in expert-sorted layout and skip explicit ``shuffle_rows`` round
-    # trips. ``USE_C_MAP_INPUT`` applies when the input row is per-pair
-    # (down path: input is already expert-sorted intermediate);
-    # ``USE_C_MAP_OUTPUT`` applies when the output accumulator buffer is
-    # expert-sorted. Both default off so existing callers compile identically.
+    # c_map: when set, the kernel reads/writes ``c_map[offs_token]`` instead of
+    # ``offs_token`` to address expert-sorted layout without a shuffle_rows pass.
     USE_C_MAP_INPUT: tl.constexpr,
     USE_C_MAP_OUTPUT: tl.constexpr,
 ):
@@ -156,10 +151,6 @@ def _fused_moe_lora_kernel(
     )
     token_mask = offs_token < num_valid_tokens
 
-    # c_map[offs_token] maps a token-major pair index back to the expert-sorted
-    # position used by ``cutlass_fp4_group_mm`` outputs. Only read if at least
-    # one side asks for the remap; constexpr-False keeps the load out of the
-    # SASS for existing callers.
     if USE_C_MAP_INPUT or USE_C_MAP_OUTPUT:
         offs_token_sorted = tl.load(
             c_map_ptr + offs_token, mask=token_mask, other=0
@@ -169,14 +160,9 @@ def _fused_moe_lora_kernel(
 
     # get a_ptrs,b_ptrs
     if USE_C_MAP_INPUT:
-        # Input is already expert-sorted (down path with sorted intermediate):
-        # read row at sorted_pos = c_map[pair_idx].
         a_row = offs_token_sorted
     else:
-        # Existing behavior: ``offs_token // top_k`` gives the M-index for
-        # the gate_up path (where ``a`` is token-major hidden_states), or
-        # ``offs_token`` itself when ``top_k == 1`` (down path with
-        # token-major intermediate, the existing default).
+        # gate_up reads source token (pair // top_k); down with top_k==1 reads pair.
         a_row = offs_token // top_k
     a_ptrs = cur_a_ptr + (a_row[:, None] * stride_am + offs_k[None, :] * stride_ak)
 
@@ -222,9 +208,6 @@ def _fused_moe_lora_kernel(
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
     accumulator = accumulator.to(c_ptr.dtype.element_ty)
-    # Write back the block of the output. For the sorted-layout path we land
-    # the delta at the expert-sorted row (sorted_pos), matching where the
-    # base GEMM output lives in the caller's buffer.
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     if USE_C_MAP_OUTPUT:
         c_row = offs_token_sorted
@@ -336,9 +319,6 @@ def _fused_moe_lora_shrink(
         ),
         MUL_ROUTED_WEIGHT=False,
         IS_PRIMARY=True,
-        # Shrink reads input via c_map only when caller marks the input as
-        # already expert-sorted (down path); the scratch ``a_intermediate``
-        # stays token-major regardless.
         USE_C_MAP_INPUT=bool(input_is_sorted),
         USE_C_MAP_OUTPUT=False,
         **shrink_config,
@@ -444,11 +424,6 @@ def _fused_moe_lora_expand(
         top_k=1,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         IS_PRIMARY=False,
-        # Expand writes ``b_intermediate_cache1`` at expert-sorted positions
-        # via c_map iff the caller hands a c_map. The downstream Python
-        # accumulate (``output += b_intermediate_cache1``) then lands the
-        # delta on the matching expert-sorted row of ``output``. Caller is
-        # responsible for interpreting ``output`` in the expected layout.
         USE_C_MAP_INPUT=False,
         USE_C_MAP_OUTPUT=c_map is not None,
         **expand_config,
@@ -537,10 +512,8 @@ def _fused_moe_lora(
         device=device,
     )
 
-    # When the caller marks the layout sorted (``c_map is not None``) AND the
-    # input row is per-pair (``input_is_expanded``), the shrink reads its
-    # input via c_map. Gate-up path keeps M-index addressing regardless,
-    # because hidden_states is always token-major.
+    # Down path with a sorted-layout caller: shrink reads input via c_map.
+    # Gate-up keeps M-index addressing (hidden_states is always token-major).
     shrink_input_is_sorted = c_map is not None and input_is_expanded
     _fused_moe_lora_shrink(
         a_intermediate_cache1,

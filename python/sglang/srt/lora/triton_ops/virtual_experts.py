@@ -156,6 +156,7 @@ def _moe_lora_shrink_splitk_kernel(
     sorted_token_ids_ptr,  # type: ignore
     expert_ids_ptr,  # type: ignore
     num_tokens_post_padded_ptr,  # type: ignore
+    c_map_ptr,  # type: ignore  # NULL unless USE_C_MAP_INPUT
     # Dimensions
     N,  # type: ignore
     K,  # type: ignore
@@ -170,6 +171,7 @@ def _moe_lora_shrink_splitk_kernel(
     stride_cn,  # type: ignore
     # Constexprs
     top_k: tl.constexpr,
+    USE_C_MAP_INPUT: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -208,9 +210,14 @@ def _moe_lora_shrink_splitk_kernel(
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
 
-    a_ptrs = a_ptr + (
-        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-    )
+    if USE_C_MAP_INPUT:
+        # Sorted-layout input: c_map[pair_idx] -> physical row.
+        a_row = tl.load(c_map_ptr + offs_token, mask=token_mask, other=0).to(tl.int64)
+    else:
+        # Token-major: gate_up reads source token; down with top_k==1 reads pair.
+        a_row = offs_token // top_k
+
+    a_ptrs = a_ptr + (a_row[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = (
         b_ptr
         + off_expert * stride_be
@@ -255,6 +262,8 @@ def _invoke_moe_lora_shrink_splitk(
     num_tokens_post_padded: torch.Tensor,
     top_k: int,
     config: dict[str, Any],
+    c_map: torch.Tensor | None = None,
+    input_is_sorted: bool = False,
 ) -> None:
     """Launch split-K shrink kernel for LoRA A with few virtual experts."""
     N = weight.shape[1]
@@ -279,6 +288,7 @@ def _invoke_moe_lora_shrink_splitk(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
+        c_map,
         N,
         K,
         topk_ids.numel(),
@@ -290,6 +300,7 @@ def _invoke_moe_lora_shrink_splitk(
         output.stride(0),
         output.stride(1),
         top_k=top_k,
+        USE_C_MAP_INPUT=input_is_sorted,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -507,6 +518,9 @@ def _merged_experts_fused_moe_lora_add_fake(
     mul_routed_weight: bool,
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
+    c_map: torch.Tensor | None = None,
+    input_is_sorted: bool = False,
+    output_is_sorted: bool = False,
 ) -> None:
     return
 
@@ -523,13 +537,19 @@ def _merged_experts_fused_moe_lora_add_impl(
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
     routing_cache: dict | None = None,
+    c_map: torch.Tensor | None = None,
+    input_is_sorted: bool = False,
+    output_is_sorted: bool = False,
 ) -> None:
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
     2. Flatten LoRA weights from [max_loras, num_experts, ...] to [max_loras * num_experts, ...].
-    3. Run regular SGLang fused-MoE kernels for LoRA A and LoRA B.
+    3. Run LoRA A shrink, then LoRA B expand/add with optional c_map layout.
     4. Mask out tokens with token_lora_mapping == -1 on the add path.
     """
+    if (input_is_sorted or output_is_sorted) and c_map is None:
+        raise ValueError("c_map is required when sorted virtual-expert layout is used")
+
     max_loras, _, max_lora_rank, _ = lora_a.shape
     input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
 
@@ -637,10 +657,6 @@ def _merged_experts_fused_moe_lora_add_impl(
 
         return result
 
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
-        invoke_fused_moe_kernel,
-    )
-
     lora_a_virtual = _merge_lora_expert_weight(lora_a)
     lora_b_virtual = _merge_lora_expert_weight(lora_b)
     num_experts_a = lora_a.shape[1]
@@ -676,6 +692,8 @@ def _merged_experts_fused_moe_lora_add_impl(
         num_tokens_post_padded,
         input_top_k,
         a_stage_config,
+        c_map=c_map,
+        input_is_sorted=input_is_sorted,
     )
 
     b_stage_config = _get_stage_config(lora_b_virtual, 1)
@@ -692,33 +710,59 @@ def _merged_experts_fused_moe_lora_add_impl(
         b_stage_config["BLOCK_SIZE_M"],
     )
 
-    invoke_fused_moe_kernel(
-        intermediate.view(-1, max_lora_rank),
-        lora_b_virtual,
-        None,
-        output,
-        None,
-        None,
-        None,
-        topk_weights,
-        topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        mul_routed_weight,
-        1,
-        b_stage_config,
-        tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
-        False,
-        False,
-        False,
-        False,
-        False,
-        None,
-        fuse_add_to_output=True,
-        add_output_mask=token_lora_mask,
-        router_topk=topk_ids.shape[1],
+    # Gated MLP: lora_a stacks [gate|up] along rank (=2r), lora_b keeps rank=r
+    # but stacks gate/up along the output dim. Run expand twice with matching
+    # A and B slices so the up rank slice isn't dropped.
+    expand_rank = lora_b_virtual.shape[-1]
+    is_gated_expand = max_lora_rank > expand_rank
+    intermediate_2d = intermediate.view(-1, max_lora_rank)
+    out_dim = lora_b_virtual.shape[1]
+
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+        invoke_fused_moe_kernel,
     )
+
+    def _do_expand(a_slice_2d, b_slice_3d, out_slice):
+        invoke_fused_moe_kernel(
+            a_slice_2d,
+            b_slice_3d,
+            None,
+            out_slice,
+            None,
+            None,
+            None,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            1,
+            b_stage_config,
+            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
+            False,
+            False,
+            False,
+            False,
+            False,
+            None,
+            fuse_add_to_output=True,
+            add_output_mask=token_lora_mask,
+            router_topk=topk_ids.shape[1],
+            c_map=c_map if output_is_sorted else None,
+        )
+
+    if is_gated_expand:
+        n_half = out_dim // 2
+        output_full_2d = output.view(-1, out_dim)
+        for s in range(2):
+            _do_expand(
+                intermediate_2d[:, s * expand_rank : (s + 1) * expand_rank],
+                lora_b_virtual[:, s * n_half : (s + 1) * n_half, :],
+                output_full_2d[:, s * n_half : (s + 1) * n_half],
+            )
+    else:
+        _do_expand(intermediate_2d, lora_b_virtual, output)
 
 
 def _merged_experts_fused_moe_lora_add_op(
@@ -732,6 +776,9 @@ def _merged_experts_fused_moe_lora_add_op(
     mul_routed_weight: bool,
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
+    c_map: torch.Tensor | None = None,
+    input_is_sorted: bool = False,
+    output_is_sorted: bool = False,
 ) -> None:
     _merged_experts_fused_moe_lora_add_impl(
         output,
@@ -744,6 +791,9 @@ def _merged_experts_fused_moe_lora_add_op(
         mul_routed_weight,
         experts_shared_outer_loras_a,
         experts_shared_outer_loras_b,
+        c_map=c_map,
+        input_is_sorted=input_is_sorted,
+        output_is_sorted=output_is_sorted,
     )
 
 
@@ -769,6 +819,9 @@ def merged_experts_fused_moe_lora_add(
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
     routing_cache: dict | None = None,
+    c_map: torch.Tensor | None = None,
+    input_is_sorted: bool = False,
+    output_is_sorted: bool = False,
 ) -> None:
     """Public API: wraps the registered op with routing_cache support."""
     _merged_experts_fused_moe_lora_add_impl(
@@ -783,4 +836,7 @@ def merged_experts_fused_moe_lora_add(
         experts_shared_outer_loras_a,
         experts_shared_outer_loras_b,
         routing_cache,
+        c_map=c_map,
+        input_is_sorted=input_is_sorted,
+        output_is_sorted=output_is_sorted,
     )

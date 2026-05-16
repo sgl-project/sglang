@@ -195,6 +195,7 @@ class LoRAInfo:
     c_map: torch.Tensor | None = None
     sorted_layout: bool = False
 
+
 @dataclass
 class LoRAHooks:
     """Hook callbacks for injecting LoRA deltas into the MoE pipeline."""
@@ -326,6 +327,10 @@ def _compute_lora_alignment(
     )
 
 
+def _sorted_layout_active(lora_info: LoRAInfo) -> bool:
+    return lora_info.sorted_layout and lora_info.c_map is not None
+
+
 def _add_lora_gate_up_delta(
     hidden_states: torch.Tensor,
     intermediate_cache: torch.Tensor,
@@ -388,6 +393,8 @@ def _add_lora_gate_up_delta(
         lora_b_stacked = [gate_up_b]
 
     if lora_info.lora_use_virtual_experts:
+        sorted_layout_active = _sorted_layout_active(lora_info)
+
         merged_experts_fused_moe_lora_add(
             output=intermediate_cache,
             hidden_states=hidden_states,
@@ -400,6 +407,9 @@ def _add_lora_gate_up_delta(
             experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
             experts_shared_outer_loras_b=False,
             routing_cache=routing_cache,
+            c_map=lora_info.c_map if sorted_layout_active else None,
+            input_is_sorted=False,
+            output_is_sorted=sorted_layout_active,
         )
     else:
         blk = _get_moe_lora_block_config(r)
@@ -471,6 +481,7 @@ def _add_lora_down_delta(
         offset = 0
 
     if lora_info.lora_use_virtual_experts:
+        sorted_layout_active = _sorted_layout_active(lora_info)
         merged_experts_fused_moe_lora_add(
             output=intermediate_cache,
             hidden_states=intermediate_input,
@@ -479,18 +490,19 @@ def _add_lora_down_delta(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             token_lora_mapping=token_lora_mapping,
-            mul_routed_weight=True,
+            mul_routed_weight=not sorted_layout_active,
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
             routing_cache=routing_cache,
+            c_map=lora_info.c_map if sorted_layout_active else None,
+            input_is_sorted=sorted_layout_active,
+            output_is_sorted=sorted_layout_active,
         )
     else:
         blk = _get_moe_lora_block_config(lora_info.max_lora_rank)
-        # Sorted-layout callers apply router weights *after* the LoRA delta is
-        # accumulated into the expert-sorted output; running mul_routed_weight
-        # inside the kernel here would double-weight (Bug 4 reborn under the
-        # new layout). Token-major callers keep the existing single-weighting.
-        kernel_mul_routed_weight = not lora_info.sorted_layout
+        # Sorted-layout callers apply router weights themselves over base+delta;
+        # don't let the kernel pre-weight or we double-weight.
+        kernel_mul_routed_weight = not _sorted_layout_active(lora_info)
         fused_moe_lora(
             output=intermediate_cache,
             qcurr_hidden_states=intermediate_input,

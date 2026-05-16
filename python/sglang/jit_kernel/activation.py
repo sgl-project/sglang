@@ -88,15 +88,12 @@ def run_activation(
 ) -> torch.Tensor:
     """Apply ``op_name`` activation followed by element-wise multiplication.
 
-    ``swap_halves`` controls which half feeds the activation. ``False`` (default)
-    computes ``act(first) * second`` — the standard ``[Gate | Up]`` convention.
-    ``True`` computes ``act(second) * first`` — for ``[Up | Gate]`` layouts
-    (e.g. Kimi-K2.5 on FlashInfer-CUTLASS NVFP4 MoE).
+    ``swap_halves=False`` (default) computes ``act(first) * second`` ([Gate|Up]);
+    ``True`` computes ``act(second) * first`` ([Up|Gate]).
 
     When ``expert_ids`` is provided, output rows are skipped for tokens whose
-    routed expert id is ``-1``. ``expert_step`` is 1 for per-token routing and
-    ``BLOCK_SIZE_M`` for sorted/TMA routing — i.e. ``expert_ids[token_id //
-    expert_step]`` is consulted before computing each row.
+    routed expert id is ``-1``. ``expert_ids[token_id // expert_step]`` is
+    consulted before computing each row.
     """
     assert op_name in SUPPORTED_ACTIVATIONS, f"Unsupported activation: {op_name}"
     hidden_size = input.shape[-1] // 2
