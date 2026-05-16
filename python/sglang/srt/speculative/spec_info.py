@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-    from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
 
 class SpeculativeAlgorithm(Enum):
@@ -137,7 +136,7 @@ class SpeculativeAlgorithm(Enum):
 
     def create_worker(
         self, server_args: ServerArgs
-    ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
+    ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker]]]:
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
