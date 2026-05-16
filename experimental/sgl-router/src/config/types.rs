@@ -1,5 +1,6 @@
 use reqwest::Url;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -54,9 +55,17 @@ pub struct WorkerConfig {
     /// Total wall-clock timeout per non-streaming upstream request. Streaming
     /// endpoints do NOT honour this (long generations are valid). Connect
     /// timeout is a separate, hard-coded 5 s.
-    /// Defaults to 60 s when missing.
-    #[serde(default)]
-    pub request_timeout_ms: Option<u64>,
+    ///
+    /// Accepts any `humantime`-formatted duration: `"60s"`, `"500ms"`,
+    /// `"2m"`, `"1m30s"`. Reject-on-load for malformed input (`"infinity"`,
+    /// negative values) — typos in production configs should fail loudly at
+    /// startup, not silently flip to a default.
+    ///
+    /// `None` (field absent) means the caller picks a default (currently
+    /// 60 s in `main.rs`); tests can construct a `WorkerConfig` with
+    /// `request_timeout: None` without forcing a magic-number choice here.
+    #[serde(default, with = "humantime_serde")]
+    pub request_timeout: Option<Duration>,
 }
 
 /// Deserialize a worker URL with the validation we want at config-load

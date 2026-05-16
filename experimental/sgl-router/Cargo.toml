@@ -37,6 +37,10 @@ reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], defau
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+# `humantime-serde` lets `WorkerConfig.request_timeout` accept human-readable
+# durations like `"60s"` / `"500ms"` / `"2m"` in YAML / TOML, rather than
+# forcing operators to write raw milliseconds.
+humantime-serde = "1"
 
 # Utilities
 anyhow = "1"

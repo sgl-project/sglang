@@ -29,7 +29,7 @@ async fn forwards_whitelisted_headers_strips_others() {
         }],
         workers: vec![WorkerConfig {
             url: worker.url.parse().unwrap(),
-            request_timeout_ms: None,
+            request_timeout: None,
         }],
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());

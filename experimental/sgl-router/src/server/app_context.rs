@@ -48,7 +48,7 @@ impl AppContext {
                 models: vec![],
                 workers: vec![crate::config::WorkerConfig {
                     url: url.clone(),
-                    request_timeout_ms: None,
+                    request_timeout: None,
                 }],
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
