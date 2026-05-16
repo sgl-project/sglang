@@ -156,4 +156,73 @@ mod tests {
             "expected error message to mention pump panic, got: {msg}"
         );
     }
+
+    /// Regression guard for the backpressure-via-disconnect invariant.
+    ///
+    /// The doc on `bytes_stream_to_body` claims "when the axum Body is dropped
+    /// the receiver is closed; `tx.send()` then returns `Err`, which breaks the
+    /// loop — no upstream bytes are read after the client disconnects." This
+    /// test pins that contract: a refactor that swaps the `if tx.send().await.
+    /// is_err() { break; }` for `let _ = tx.send().await;` would silently
+    /// regress (leaked upstream reads on every client cancel, visible only as
+    /// ops-side memory growth).
+    #[tokio::test]
+    async fn bytes_stream_to_body_breaks_on_client_disconnect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A stream that yields N Ok chunks readily, counting polls via a shared
+        // atomic. After we read 1 chunk and drop the body, the pump must hit
+        // tx.send-err and break — not drain all 1000 chunks.
+        struct CountingStream {
+            polls: Arc<AtomicUsize>,
+            yielded: usize,
+            max: usize,
+        }
+
+        impl futures::Stream for CountingStream {
+            type Item = Result<Bytes, std::io::Error>;
+
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                if self.yielded >= self.max {
+                    return std::task::Poll::Ready(None);
+                }
+                self.yielded += 1;
+                std::task::Poll::Ready(Some(Ok(Bytes::from_static(b"chunk"))))
+            }
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let stream = CountingStream {
+            polls: polls.clone(),
+            yielded: 0,
+            max: 1000, // way more than we'll let it consume
+        };
+        let body = bytes_stream_to_body(stream);
+
+        // Read exactly one frame, then drop the body to simulate client disconnect.
+        let mut data_stream = body.into_data_stream();
+        let first = data_stream.next().await;
+        assert!(first.is_some(), "expected at least one chunk before drop");
+        drop(data_stream);
+
+        // Give the pump generous time to make additional polls if its break is
+        // broken. Healthy code: pump fills the 64-slot channel, then on the
+        // next iteration tx.send().await detects receiver-drop and breaks.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let final_polls = polls.load(Ordering::SeqCst);
+        assert!(
+            final_polls <= 70,
+            "pump kept polling upstream after client disconnect: {final_polls} polls (expected <=70, channel bound + slack)"
+        );
+        // And: the pump must NOT have drained all 1000 chunks.
+        assert!(
+            final_polls < 1000,
+            "pump drained the entire upstream after client disconnect ({final_polls} polls); the break-on-tx.send-err path is dead"
+        );
+    }
 }
