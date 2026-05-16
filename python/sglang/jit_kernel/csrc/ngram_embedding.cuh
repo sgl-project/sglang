@@ -13,6 +13,9 @@
 
 namespace device::ngram_embedding {
 
+constexpr int kDecodeBlockSize = 256;
+constexpr int kMaxUpdateTokenTableDecodeBlocks = 1024;
+
 __global__ void ComputeNGramIdsKernel(
     int batch_size,
     int ne_n,
@@ -123,15 +126,16 @@ __global__ void UpdateTokenTableKernel(
 
 __global__ void UpdateTokenTableDecodeKernel(
     int batch_size,
-    int* tokens,          // [batch_size]
-    int* ne_token_table,  // [max_running_reqs, max_context_len]
-    int max_context_len,  // max_context_len
-    long* row_indices,    // [batch_size]
-    int* column_starts    // [batch_size]
+    const int* __restrict__ tokens,          // [batch_size]
+    int* __restrict__ ne_token_table,        // [max_running_reqs, max_context_len]
+    int max_context_len,                     // max_context_len
+    const int64_t* __restrict__ row_indices,  // [batch_size]
+    const int* __restrict__ column_starts     // [batch_size]
 ) {
   for (int req_id = blockIdx.x * blockDim.x + threadIdx.x; req_id < batch_size; req_id += blockDim.x * gridDim.x) {
-    const int current_token_table_index = row_indices[req_id] * max_context_len + column_starts[req_id];
-    ne_token_table[current_token_table_index] = tokens[req_id];
+    const int64_t token_table_offset =
+        row_indices[req_id] * static_cast<int64_t>(max_context_len) + column_starts[req_id];
+    ne_token_table[token_table_offset] = tokens[req_id];
   }
 }
 
@@ -343,17 +347,19 @@ struct NgramEmbeddingKernel {
     const int max_context_len = static_cast<int>(ne_token_table.size(1));
     const auto stream = LaunchKernel::resolve_device(device_.unwrap());
 
-    constexpr int BLOCK_THREADS = 256;
-    const int grid_size = std::min(1024, static_cast<int>(host::div_ceil(bs, BLOCK_THREADS)));
+    constexpr int kBlockSize = device::ngram_embedding::kDecodeBlockSize;
+    const int grid_size = std::min(
+        device::ngram_embedding::kMaxUpdateTokenTableDecodeBlocks,
+        static_cast<int>(host::div_ceil(bs, kBlockSize)));
 
-    LaunchKernel(grid_size, BLOCK_THREADS, stream)(
+    LaunchKernel(grid_size, kBlockSize, stream)(
         device::ngram_embedding::UpdateTokenTableDecodeKernel,
         bs,
-        static_cast<int*>(tokens.data_ptr()),
+        static_cast<const int*>(tokens.data_ptr()),
         static_cast<int*>(ne_token_table.data_ptr()),
         max_context_len,
-        static_cast<long*>(row_indices.data_ptr()),
-        static_cast<int*>(column_starts.data_ptr()));
+        static_cast<const int64_t*>(row_indices.data_ptr()),
+        static_cast<const int*>(column_starts.data_ptr()));
   }
 };
 
