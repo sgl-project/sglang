@@ -21,13 +21,10 @@ on:
         description: "Suffix appended to the upload-artifact name. '' for x86, '-aarch64' for arm."
         type: string
         default: ''
-      pr_head_sha:
-        type: string
-        default: ''
       git_ref:
         type: string
         default: ''
-      skip_stage_health_check:
+      skip_pr_test_health_check:
         description: 'Forwarded from the caller workflow input of the same name. Not consumed inside this reusable workflow today, but mirrored so the resulting env context matches the inline-job baseline.'
         type: boolean
         default: false
@@ -42,7 +39,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check && 'true' || 'false' }}
   FORCE_REBUILD_DEEPEP: '1'
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -56,8 +53,6 @@ jobs:
         include:
           - python-version: "3.10"
             cuda-version: "13.0"
-          - python-version: "3.10"
-            cuda-version: "12.9"
     name: ${{ inputs.job_display_name }}
     steps:
       - name: Cleanup
@@ -71,7 +66,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
 

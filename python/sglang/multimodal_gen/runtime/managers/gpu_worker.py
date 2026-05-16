@@ -41,8 +41,8 @@ from sglang.multimodal_gen.runtime.loader.weights_updater import (
     WeightsUpdater,
     get_updatable_modules,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
-    OffloadableDiTMixin,
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    configure_layerwise_offload_modules,
     iter_materialized_weights,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
@@ -165,23 +165,12 @@ class GPUWorker:
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
-        if self.server_args.dit_layerwise_offload:
-            # enable layerwise offload if possible
-            for module_name in [
-                "transformer",
-                "transformer_2",
-                "video_dit",
-                "video_dit_2",
-                "audio_dit",
-            ]:
-                dit = self.pipeline.get_module(module_name)
-                if dit:
-                    if isinstance(dit, OffloadableDiTMixin):
-                        dit.configure_layerwise_offload(self.server_args)
-                    else:
-                        logger.info(
-                            f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
-                        )
+        if self.server_args.layerwise_offload_components:
+            configure_layerwise_offload_modules(
+                self.pipeline.modules,
+                self.server_args,
+                component_names=self.server_args.layerwise_offload_components,
+            )
 
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
@@ -234,7 +223,7 @@ class GPUWorker:
             elif component in ("text_encoder", "text_encoder_2"):
                 arg = "--text-encoder-cpu-offload"
             elif component == "transformer":
-                if self.server_args.dit_layerwise_offload:
+                if self.server_args.is_dit_layerwise_offload_selected:
                     arg = "--dit-layerwise-offload"
                 elif self.server_args.dit_cpu_offload:
                     arg = "--dit-cpu-offload"
@@ -740,7 +729,7 @@ class GPUWorker:
         # If the flag is True, it is currently offloaded, so it is a candidate to stay resident.
         offload_flags = {
             "transformer": self.server_args.dit_cpu_offload
-            or self.server_args.dit_layerwise_offload,
+            or self.server_args.is_dit_layerwise_offload_selected,
             "vae": self.server_args.vae_cpu_offload,
             "text_encoder": self.server_args.text_encoder_cpu_offload,
             "text_encoder_2": self.server_args.text_encoder_cpu_offload,

@@ -107,6 +107,7 @@ class RadixCacheCpp(BasePrefixCache):
             device_indices=self._merge_tensor(device_indices_vec),
             last_device_node=node_gpu,
             last_host_node=node_cpu,
+            best_match_node=node_cpu,
             host_hit_length=host_indices_length,
         )
 
