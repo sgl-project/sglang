@@ -282,6 +282,22 @@ def has_sgl_kernel_changes(pr):
         return False
 
 
+def _dispatch_pr_states_refresh(gh_repo, pr):
+    """
+    Trigger pr-states.yml via workflow_dispatch so the CI-states block in
+    the PR body is refreshed after the slash command changed something it
+    cares about (labels or pr-test* run status). Neither label changes via
+    GITHUB_TOKEN nor `run.rerun()` refires pull_request_target, so the
+    workflow_dispatch route is the only way pr-states learns the change.
+    """
+    try:
+        workflow = gh_repo.get_workflow("pr-states.yml")
+        workflow.create_dispatch(ref="main", inputs={"pr_number": str(pr.number)})
+        print(f"Dispatched pr-states.yml refresh for PR #{pr.number}.")
+    except Exception as e:
+        print(f"Failed to dispatch pr-states refresh: {e}")
+
+
 def handle_tag_run_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /tag-run-ci-label command.
@@ -293,6 +309,7 @@ def handle_tag_run_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
 
     print("Permission granted. Adding 'run-ci' label.")
     pr.add_to_labels("run-ci")
+    _dispatch_pr_states_refresh(gh_repo, pr)
 
     if react_on_success:
         comment.create_reaction("+1")
@@ -395,6 +412,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
 
     if rerun_count > 0:
         print(f"Triggered rerun for {rerun_count} workflows.")
+        _dispatch_pr_states_refresh(gh_repo, pr)
         if react_on_success:
             comment.create_reaction("+1")
         return True

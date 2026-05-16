@@ -7,13 +7,19 @@ name: PR States
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to refresh
+        required: true
+        type: string
 
 permissions:
   pull-requests: write
   actions: read
 
 concurrency:
-  group: pr-states-${{ github.event.pull_request.number }}
+  group: pr-states-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
@@ -24,8 +30,22 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const sha = context.payload.pull_request.head.sha;
-            const labels = context.payload.pull_request.labels.map(l => l.name);
+            // Event-agnostic PR lookup. pull_request_target carries the PR
+            // in the payload; workflow_dispatch passes only pr_number and we
+            // fetch fresh metadata via the API. The latter path is used by
+            // the slash-command-handler so a `/tag-and-rerun-ci` (which adds
+            // labels and reruns workflows via GITHUB_TOKEN — neither of which
+            // refires pull_request_target) still refreshes the body.
+            const prNumber = context.payload.pull_request
+              ? context.payload.pull_request.number
+              : Number(context.payload.inputs.pr_number);
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            const sha = pr.head.sha;
+            const labels = pr.labels.map(l => l.name);
             const hasCI = labels.includes('run-ci');
             const hasExtra = labels.includes('run-ci-extra');
 
@@ -90,11 +110,6 @@ jobs:
               outerEnd,
             ].join('\n');
 
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-            });
             const body = pr.body || '';
 
             const blockRe = new RegExp(`(?:\\n+---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
@@ -112,7 +127,7 @@ jobs:
               await github.rest.pulls.update({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                pull_number: context.issue.number,
+                pull_number: prNumber,
                 body: newBody,
               });
             }
