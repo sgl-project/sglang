@@ -138,6 +138,56 @@ mod tests {
         }
     }
 
+    /// A stream that yields one Ok chunk, then panics with a non-string
+    /// payload (`i32`). Used to exercise the `<non-string panic payload>`
+    /// fallback in the downcast ladder — the existing
+    /// `PanicOnSecondPoll` test only covers the `&'static str` arm.
+    struct PanicAnyOnSecondPoll {
+        polls: usize,
+    }
+
+    impl futures::Stream for PanicAnyOnSecondPoll {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.polls += 1;
+            match self.polls {
+                1 => std::task::Poll::Ready(Some(Ok(Bytes::from_static(b"first-chunk")))),
+                _ => std::panic::panic_any(42_i32),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bytes_stream_to_body_handles_non_string_panic_payload() {
+        // `panic_any(42_i32)` skips the formatter entirely — neither the
+        // `&'static str` nor the `String` downcast arms match, so the
+        // catch_unwind handler must fall through to the
+        // `"<non-string panic payload>"` literal. If a refactor deletes
+        // that arm, the closure unwrap-or-elses would panic itself or
+        // produce an empty message, which this test catches.
+        let s = PanicAnyOnSecondPoll { polls: 0 };
+        let body = bytes_stream_to_body(s);
+        let result = body.collect().await;
+        assert!(
+            result.is_err(),
+            "expected body collect to surface non-string panic as Err, got Ok"
+        );
+        let err = result.err().unwrap();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("<non-string panic payload>"),
+            "expected fallback message for non-string panic payload, got: {msg}"
+        );
+        assert!(
+            msg.contains("SSE pump panicked"),
+            "expected wrapper message to remain, got: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn bytes_stream_to_body_propagates_pump_panic() {
         // The pump task panics mid-stream. The client must see a loud Err,
