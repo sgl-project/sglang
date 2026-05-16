@@ -85,7 +85,7 @@ jobs:
               '---',
               '### CI States',
               '',
-              `Latest PR Test: ${ptStart}${ptText}${ptEnd}`,
+              `Latest PR Test (Base): ${ptStart}${ptText}${ptEnd}`,
               `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
               outerEnd,
             ].join('\n');
