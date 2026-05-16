@@ -71,6 +71,23 @@ export const DeepSeekV4Deployment = () => {
         { id: "enabled",  label: "Enabled",  default: false, subtitle: "deepseekv4" },
       ],
     },
+    hicache: {
+      name: "hicache",
+      title: "HiCache",
+      items: [
+        { id: "disabled", label: "Disabled", default: true  },
+        { id: "l2",       label: "L2",       default: false, subtitle: "GPU+CPU" },
+      ],
+    },
+    megamoe: {
+      name: "megamoe",
+      title: "MegaMoE",
+      items: [
+        { id: "disabled", label: "Disabled", default: true  },
+        { id: "w4a8",     label: "W4A8",     default: false },
+        { id: "w4a4",     label: "W4A4",     default: false, subtitle: "FP4 acts" },
+      ],
+    },
   };
 
   // Recipes that are not supported on the Marlin (FP4) Hopper paths
@@ -295,7 +312,7 @@ export const DeepSeekV4Deployment = () => {
   // === SHARED END ===
 
   const generateCommand = () => {
-    const { hardware: rawHardware, modelSize, recipe, reasoningParser, toolcall } = values;
+    const { hardware: rawHardware, modelSize, recipe, reasoningParser, toolcall, hicache, megamoe } = values;
     // B300 usage is identical to B200 — alias so we don't duplicate every spec entry.
     const hardware = rawHardware === "b300" ? "b200" : rawHardware;
     const specKey = `${hardware}|${modelSize}`;
@@ -338,10 +355,21 @@ export const DeepSeekV4Deployment = () => {
       if (isBig) fp4Flags.push("  --mem-fraction-static 0.88");
       if (toolcall === "enabled") fp4Flags.push("  --tool-call-parser deepseekv4");
       if (reasoningParser === "enabled") fp4Flags.push("  --reasoning-parser deepseek-v4");
+      if (hicache === "l2") {
+        fp4Flags.push("  --enable-hierarchical-cache");
+        fp4Flags.push("  --hicache-ratio 2");
+        fp4Flags.push("  --hicache-size 0");
+        fp4Flags.push("  --hicache-write-policy write_through");
+        fp4Flags.push("  --hicache-io-backend direct");
+        fp4Flags.push("  --hicache-mem-layout page_first_direct");
+      }
       fp4Flags.push("  --host 0.0.0.0");
       fp4Flags.push("  --port 30000");
 
-      const fp4Cmd = `sglang serve \\\n${fp4Flags.join(" \\\n")}`;
+      const fp4Env = [];
+      if (hicache === "l2") fp4Env.push("SGLANG_ENABLE_UNIFIED_RADIX_TREE=1");
+      const fp4EnvBlock = fp4Env.length ? fp4Env.join(" \\\n") + " \\\n" : "";
+      const fp4Cmd = `${fp4EnvBlock}sglang serve \\\n${fp4Flags.join(" \\\n")}`;
       return VERIFIED_RECIPES.has(verifyKey)
         ? fp4Cmd
         : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(fp4Cmd)}`;
@@ -421,39 +449,13 @@ export const DeepSeekV4Deployment = () => {
       } else if (hardware === "gb200" && isBig) {
         recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
       }
-      // B200/B300 Pro accuracy-verified env vars.
-      if (isBig && hardware === "b200") {
-        recipeEnv.push(
-          "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-          "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-          "SGLANG_OPT_USE_JIT_NORM=1",
-          "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-          "SGLANG_OPT_USE_TOPK_V2=1",
-          "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
-        );
-      }
     } else if (recipe === "balanced") {
       if (hardware === "h200") {
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
       } else if (isBig && hardware === "b200") {
-        // B200/B300 Pro accuracy-verified env vars.
-        recipeEnv.push(
-          "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-          "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-          "SGLANG_OPT_USE_JIT_NORM=1",
-          "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-          "SGLANG_OPT_USE_TOPK_V2=1",
-          "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
-          "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN=1",
-          "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=0",
-          "SGLANG_OPT_USE_FAST_MASK_EP=1",
-          "SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1",
-          "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
-          "SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1",
-          "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
-        );
+        // B200/B300 Pro: no extra env vars needed.
       } else {
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
@@ -461,38 +463,15 @@ export const DeepSeekV4Deployment = () => {
       }
     } else if (recipe === "max-throughput") {
       if (hardware === "h200") {
-        if (!isBig) {
-          recipeEnv.push("SGLANG_JIT_DEEPGEMM_PRECOMPILE=0");
-        }
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
-      } else if (isBig && hardware === "b200") {
-        // B200/B300 Pro accuracy-verified env vars.
-        recipeEnv.push(
-          "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-          "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-          "SGLANG_OPT_USE_JIT_NORM=1",
-          "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-          "SGLANG_OPT_USE_TOPK_V2=1",
-          "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
-          "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN=1",
-          "SGLANG_OPT_USE_FAST_MASK_EP=1",
-          "SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1",
-          "SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1",
-          "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
-          "NVSHMEM_DISABLE_IB=1",
-          "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1",
-          "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1",
-          "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-        );
       } else {
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       }
     } else if (recipe === "cp") {
-      recipeEnv.push("SGLANG_OPT_USE_JIT_INDEXER_METADATA=1");
       if (hardware === "h200") {
         recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       } else {
@@ -676,11 +655,52 @@ export const DeepSeekV4Deployment = () => {
     if (toolcall === "enabled") flags.push("  --tool-call-parser deepseekv4");
     if (reasoningParser === "enabled") flags.push("  --reasoning-parser deepseek-v4");
 
+    // HiCache flags (opt-in toggle, not in allinone).
+    if (hicache === "l2") {
+      flags.push("  --enable-hierarchical-cache");
+      flags.push("  --hicache-ratio 2");
+      flags.push("  --hicache-size 0");
+      flags.push("  --hicache-write-policy write_through");
+      flags.push("  --hicache-io-backend direct");
+      flags.push("  --hicache-mem-layout page_first_direct");
+    }
+
+    // MegaMoE: override --moe-a2a-backend deepep → megamoe in generated flags.
+    if (megamoe !== "disabled") {
+      const idx = flags.indexOf("  --moe-a2a-backend deepep");
+      if (idx !== -1) {
+        flags[idx] = "  --moe-a2a-backend megamoe";
+      } else {
+        flags.push("  --moe-a2a-backend megamoe");
+      }
+    }
+
     flags.push("  --host 0.0.0.0");
     flags.push("  --port 30000");
 
-    // Assemble: [HW env] [recipe env] \ sglang serve \ flags...
-    const envAll = [...HW_ENV, ...recipeEnv];
+    // HiCache env vars.
+    const hicacheEnv = [];
+    if (hicache === "l2") {
+      hicacheEnv.push("SGLANG_ENABLE_UNIFIED_RADIX_TREE=1");
+    }
+
+    // MegaMoE env vars.
+    const megamoeEnv = [];
+    if (megamoe !== "disabled" && recipe === "max-throughput") {
+      megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320");
+    }
+    if (megamoe === "w4a4") {
+      megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1");
+      megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1");
+    }
+
+    // When MegaMoE is enabled, DeepEP dispatch buffer env is not needed — filter it out.
+    const filteredRecipeEnv = megamoe !== "disabled"
+      ? recipeEnv.filter((e) => !e.startsWith("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="))
+      : recipeEnv;
+
+    // Assemble: [HW env] [recipe env] [hicache env] [megamoe env] \ sglang serve \ flags...
+    const envAll = [...HW_ENV, ...filteredRecipeEnv, ...hicacheEnv, ...megamoeEnv];
     const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
     // B200/B300 Pro recipes carry many accuracy-verified env vars that will be
     // consolidated; prepend a shell comment so users know these are temporary.
@@ -982,31 +1002,6 @@ python3 -m sglang_router.launch_router \\
       <div style={cardStyle}>
         <div style={titleStyle}>Run this Command:</div>
         <pre style={commandDisplayStyle}>{generateCommand()}</pre>
-      </div>
-      <div style={{ padding: "12px 16px", background: isDark ? "#1a2332" : "#f0f7ff", borderRadius: "6px", border: `1px solid ${isDark ? "#2d4a6f" : "#c8ddf5"}`, fontSize: "13px", lineHeight: "1.6", color: isDark ? "#c8ddf5" : "#1e3a5f" }}>
-        <strong style={{ display: "block", marginBottom: "6px" }}>Enabling MegaMoE</strong>
-        <p style={{ margin: "0" }}>
-          MegaMoE fuses expert dispatch + GEMM into a single kernel for higher throughput on MoE layers.
-          It is currently verified on B200/B300 Pro (balanced &amp; max-throughput recipes above).
-          We have not yet tested the full hardware/recipe matrix, but it should work on other platforms (GB200, GB300, Flash).
-          To enable it, add the flag and env vars:
-        </p>
-        <pre style={{ margin: "8px 0 0 0", padding: "8px 12px", background: isDark ? "#111827" : "#f5f5f5", borderRadius: "4px", fontSize: "12px", lineHeight: "1.5", overflowX: "auto" }}>{
-`# Add this flag to the sglang serve command:
---moe-a2a-backend deepep
-
-# And set these env vars:
-SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1
-SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1
-SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1
-SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320
-SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0`
-        }</pre>
-        <p style={{ margin: "6px 0 0 0", fontSize: "12px", opacity: 0.85, lineHeight: "1.8" }}>
-          Adjust <code>SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK</code> based on your chunked prefill size (e.g. 4096 for balanced, 8320 for max-throughput).<br/>
-          <code>SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0</code> — if your config mentions DeepEP dispatch buffer constraints, they do not apply when this is set to 0.<br/>
-          These flags are expected to be simplified in a future release.
-        </p>
       </div>
     </div>
   );
