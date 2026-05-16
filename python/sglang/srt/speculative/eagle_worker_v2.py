@@ -168,8 +168,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
-        # Alias for better readability
-        self.draft_runner = self.draft_worker.model_runner
+        # Alias for better readability. Backed by `_draft_runner` because
+        # `DraftExecutor` declares `draft_runner` as an abstract @property.
+        self._draft_runner = self.draft_worker.model_runner
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
             eagle_config = getattr(
@@ -197,6 +198,10 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    @property
+    def draft_runner(self):
+        return self._draft_runner
 
     def init_token_map(self):
         # Load hot token ids
