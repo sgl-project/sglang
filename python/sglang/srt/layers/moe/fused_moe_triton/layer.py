@@ -312,9 +312,10 @@ class FusedMoE(torch.nn.Module):
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             or get_moe_runner_backend().is_flashinfer_trtllm()
         ):
-            logging.warning(
-                "Setting inplace to False for FlashInfer TRTLLM MoE backend."
-            )
+            if self.moe_runner_config.inplace:
+                logging.info(
+                    "Setting inplace to False for FlashInfer TRTLLM MoE backend."
+                )
             self.moe_runner_config.inplace = False
 
         self.should_fuse_routed_scaling_factor_in_topk = (
