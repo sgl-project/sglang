@@ -148,10 +148,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import (
-    has_shm_features,
-    unwrap_shm_features,
-)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -212,7 +208,6 @@ from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
-    broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
     freeze_gc,
@@ -221,7 +216,6 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_mps,
     kill_itself_when_parent_died,
-    point_to_point_pyobj,
     require_mlp_sync,
     set_gpu_proc_affinity,
     set_random_seed,
@@ -1388,9 +1382,7 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests(
-                self.request_receiver,
-            )
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1426,9 +1418,7 @@ class Scheduler(
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests(
-                self.request_receiver,
-            )
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1501,201 +1491,6 @@ class Scheduler(
         )
 
         return disable_overlap_for_batch or need_grammar_sync
-
-    @staticmethod
-    def recv_limit_reached(
-        self: "SchedulerRequestReceiver", num_recv_reqs: int
-    ) -> bool:
-        if self.max_recv_per_poll < 0:
-            return False
-        return num_recv_reqs >= self.max_recv_per_poll
-
-    @staticmethod
-    def recv_requests(
-        self: "SchedulerRequestReceiver",
-    ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
-        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-
-        if self.recv_skipper is not None:
-            if not self.recv_skipper.handle(self.get_last_forward_mode()):
-                return []
-
-        if self.ps.pp_rank == 0:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                recv_reqs = []
-
-                while True:
-                    try:
-                        if Scheduler.recv_limit_reached(self, len(recv_reqs)):
-                            break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        if Scheduler.recv_limit_reached(self, len(recv_reqs)):
-                            break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
-            else:
-                recv_reqs = None
-        else:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
-                recv_reqs = point_to_point_pyobj(
-                    [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                    self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                )
-            else:
-                recv_reqs = None
-
-        if self.input_blocker is not None:
-            recv_reqs = self.input_blocker.handle(recv_reqs)
-
-        if self.server_args.enable_dp_attention:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                work_reqs, control_reqs = Scheduler._split_work_and_control_reqs(
-                    self, recv_reqs
-                )
-            else:
-                work_reqs = None
-                control_reqs = None
-
-            if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
-
-            if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
-
-            # When dp_attention_local_control_broadcast is enabled, each DP
-            # group leader already receives control messages from the DP
-            # controller, so we broadcast within attn_tp_group + attn_cp_group
-            # instead of the full tp_group.  This avoids an expensive
-            # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
-            if _local_ctrl:
-                if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        src=self.attn_tp_group.ranks[0],
-                    )
-                if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
-                        src=self.attn_cp_group.ranks[0],
-                    )
-            elif self.ps.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
-                )
-            recv_reqs = work_reqs + control_reqs
-        elif self.ps.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
-
-        # Process MM requests under EPD-disaggregation mode
-        if (
-            self.ps.pp_rank == 0
-            and self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
-        ):
-            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
-            for req, error_msg, error_code in abort_reqs:
-                status_code = (
-                    HTTPStatus.BAD_REQUEST
-                    if error_code == 400
-                    else HTTPStatus.INTERNAL_SERVER_ERROR
-                )
-                prepare_abort(req, error_msg, status_code=status_code)
-                self.stream_output([req], req.return_logprob)
-
-        # Unwrap shared memory features AFTER all broadcasts complete,
-        # so that ShmPointerMMData metadata (not full tensor data) is what
-        # gets serialized during broadcast_pyobj.
-        if recv_reqs:
-            # Barrier for the non-DP-attention path only: there is a single
-            # broadcast_pyobj on tp_cpu_group where the source rank returns
-            # the original objects immediately while other ranks are still in
-            # pickle.loads (-> __setstate__ -> shm_open).  Without a barrier
-            # the source can call materialize() / shm_unlink before others
-            # open the segment.  recv_reqs is consistent across all ranks
-            # here (same broadcast), so the guard is deadlock-free.
-            #
-            # Under DP-attention no barrier is needed: the control_reqs
-            # broadcast on tp_cpu_group (step 3) is a collective that forces
-            # every rank to complete the earlier attn_tp / attn_cp work_reqs
-            # deserializations (steps 1-2, which call shm_open) before any
-            # rank returns from step 3.  POSIX guarantees shm_unlink only
-            # removes the name; already-open handles stay valid.
-            if (
-                not self.server_args.enable_dp_attention
-                and self.ps.tp_size > 1
-                and self.model_config.is_multimodal
-                and has_shm_features(recv_reqs)
-            ):
-                barrier(group=self.tp_cpu_group)
-            for req in recv_reqs:
-                unwrap_shm_features(req)
-
-        return recv_reqs
-
-    @staticmethod
-    def _split_work_and_control_reqs(self: "SchedulerRequestReceiver", recv_reqs: List):
-        work_reqs = [
-            req
-            for req in recv_reqs
-            if isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                ),
-            )
-        ]
-        control_reqs = [
-            req
-            for req in recv_reqs
-            if not isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                ),
-            )
-        ]
-        return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
