@@ -824,6 +824,15 @@ class Req(ReqDllmMixin):
         self.indexer_topk: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, num_indexer_layers, index_topk)
         )
+        # Snapshot of routed experts already generated before the most recent
+        # retract(s). Stitched in front of the post-re-prefill suffix in
+        # ``Scheduler.maybe_collect_routed_experts`` so the final response
+        # exposes the full per-token routing trajectory across retraction
+        # boundaries. ``_retract_snapshot_seqlen`` records the seqlen at the
+        # time of the last snapshot so the next snapshot only captures new
+        # tokens generated since then.
+        self._retract_routed_experts_prefix: Optional[torch.Tensor] = None
+        self._retract_snapshot_seqlen: int = 0
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
@@ -2243,6 +2252,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
+        # Snapshot routed experts BEFORE we release the KV cache. After
+        # ``release_kv_cache`` the per-token mapping in ``req_to_token_pool``
+        # is no longer guaranteed to point at this request's expert ids in
+        # the host cache, so the snapshot must happen here.
+        if req.return_routed_experts:
+            self._snapshot_routed_experts_for_retract(req)
+
         # TODO (csy): for preempted requests, we may want to insert into the tree
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -2250,6 +2266,53 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
 
         req.reset_for_retract()
+
+    def _snapshot_routed_experts_for_retract(self, req: Req) -> None:
+        """Capture routed expert ids generated since the last snapshot.
+
+        Without this snapshot, retracted (preempted) requests lose all
+        routing information from their pre-retract decode steps because
+        ``release_kv_cache`` frees the host-cache slots backing them.
+        After re-prefill, ``maybe_collect_routed_experts`` stitches this
+        prefix in front of the post-re-prefill suffix so the final
+        response exposes the complete per-token routing trajectory.
+        """
+        try:
+            from sglang.srt.state_capturer.routed_experts import (
+                get_global_experts_capturer,
+            )
+
+            capturer = get_global_experts_capturer()
+            if capturer is None:
+                return
+
+            # ``seqlen - 1`` mirrors ``get_topk`` upper bound (the last token
+            # has no completed routing decision yet).
+            end_index = req.seqlen - 1
+            start_index = max(0, req._retract_snapshot_seqlen - 1)
+            if start_index >= end_index:
+                return
+
+            new_snap = capturer.get_topk(
+                req_pool_idx=req.req_pool_idx,
+                seqlen=req.seqlen,
+                req_to_token_pool=self.req_to_token_pool,
+                start_len=start_index,
+            )
+
+            if req._retract_routed_experts_prefix is None:
+                req._retract_routed_experts_prefix = new_snap
+            else:
+                req._retract_routed_experts_prefix = torch.cat(
+                    [req._retract_routed_experts_prefix, new_snap], dim=0
+                )
+            req._retract_snapshot_seqlen = int(req.seqlen)
+        except Exception as exc:
+            logger.warning(
+                "Failed to snapshot routed experts for rid=%s: %r",
+                getattr(req, "rid", "N/A"),
+                exc,
+            )
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status
