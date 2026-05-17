@@ -36,21 +36,27 @@ from sglang.srt.managers.io_struct import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.weight_updater import (
+        SchedulerWeightUpdaterManager,
+    )
 
 logger = logging.getLogger(__name__)
 
 
 class SchedulerUpdateWeightsMixin:
-    def flush_cache_after_weight_update(self: Scheduler, recv_req) -> None:
+    @staticmethod
+    def flush_cache_after_weight_update(
+        self: "SchedulerWeightUpdaterManager", recv_req
+    ) -> None:
         if recv_req.flush_cache:
             flush_cache_success = self.flush_cache(
                 empty_cache=recv_req.torch_empty_cache
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
 
+    @staticmethod
     def update_weights_from_disk(
-        self: Scheduler, recv_req: UpdateWeightFromDiskReqInput
+        self: "SchedulerWeightUpdaterManager", recv_req: UpdateWeightFromDiskReqInput
     ):
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
@@ -58,39 +64,44 @@ class SchedulerUpdateWeightsMixin:
         if success and self.draft_worker is not None:
             success, message = self.draft_worker.update_weights_from_disk(recv_req)
         if tp_success:
-            self.flush_cache_after_weight_update(recv_req)
+            SchedulerUpdateWeightsMixin.flush_cache_after_weight_update(self, recv_req)
         if not success:
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
 
+    @staticmethod
     def init_weights_update_group(
-        self: Scheduler, recv_req: InitWeightsUpdateGroupReqInput
+        self: "SchedulerWeightUpdaterManager", recv_req: InitWeightsUpdateGroupReqInput
     ):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
         return InitWeightsUpdateGroupReqOutput(success, message)
 
+    @staticmethod
     def destroy_weights_update_group(
-        self: Scheduler, recv_req: DestroyWeightsUpdateGroupReqInput
+        self: "SchedulerWeightUpdaterManager",
+        recv_req: DestroyWeightsUpdateGroupReqInput,
     ):
         """Destroy the online model parameter update group."""
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
         return DestroyWeightsUpdateGroupReqOutput(success, message)
 
+    @staticmethod
     def update_weights_from_distributed(
-        self,
+        self: "SchedulerWeightUpdaterManager",
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
-            self.flush_cache_after_weight_update(recv_req)
+            SchedulerUpdateWeightsMixin.flush_cache_after_weight_update(self, recv_req)
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
 
+    @staticmethod
     def update_weights_from_tensor(
-        self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
+        self: "SchedulerWeightUpdaterManager", recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
         if recv_req.disable_draft_model:
@@ -99,14 +110,15 @@ class SchedulerUpdateWeightsMixin:
             worker = self.draft_worker or self.tp_worker
         success, message = worker.update_weights_from_tensor(recv_req)
         if success:
-            self.flush_cache_after_weight_update(recv_req)
+            SchedulerUpdateWeightsMixin.flush_cache_after_weight_update(self, recv_req)
         else:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
+    @staticmethod
     def update_weights_from_ipc(
-        self: Scheduler, recv_req: UpdateWeightsFromIPCReqInput
+        self: "SchedulerWeightUpdaterManager", recv_req: UpdateWeightsFromIPCReqInput
     ):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         success, message = self.tp_worker.update_weights_from_ipc(recv_req)
@@ -114,18 +126,22 @@ class SchedulerUpdateWeightsMixin:
         if success and self.draft_worker is not None:
             success, message = self.draft_worker.update_weights_from_ipc(recv_req)
         if tp_success:
-            self.flush_cache_after_weight_update(recv_req)
+            SchedulerUpdateWeightsMixin.flush_cache_after_weight_update(self, recv_req)
         if not success:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromIPCReqOutput(success, message)
 
-    def get_weights_by_name(self: Scheduler, recv_req: GetWeightsByNameReqInput):
+    @staticmethod
+    def get_weights_by_name(
+        self: "SchedulerWeightUpdaterManager", recv_req: GetWeightsByNameReqInput
+    ):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
 
+    @staticmethod
     def release_memory_occupation(
-        self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
+        self: "SchedulerWeightUpdaterManager", recv_req: ReleaseMemoryOccupationReqInput
     ):
         assert (
             self.is_fully_idle()
@@ -157,8 +173,9 @@ class SchedulerUpdateWeightsMixin:
 
         return ReleaseMemoryOccupationReqOutput()
 
+    @staticmethod
     def resume_memory_occupation(
-        self: Scheduler, recv_req: ResumeMemoryOccupationReqInput
+        self: "SchedulerWeightUpdaterManager", recv_req: ResumeMemoryOccupationReqInput
     ):
         tags = recv_req.tags
 
@@ -185,7 +202,10 @@ class SchedulerUpdateWeightsMixin:
 
         return ResumeMemoryOccupationReqOutput()
 
-    def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
+    @staticmethod
+    def check_weights(
+        self: "SchedulerWeightUpdaterManager", recv_req: CheckWeightsReqInput
+    ):
         try:
             payload = self.tp_worker.model_runner.check_weights(action=recv_req.action)
             return CheckWeightsReqOutput(
@@ -196,7 +216,8 @@ class SchedulerUpdateWeightsMixin:
             traceback.print_exc()
             return CheckWeightsReqOutput(success=False, message=f"{e}")
 
-    def save_remote_model(self: Scheduler, params):
+    @staticmethod
+    def save_remote_model(self: "SchedulerWeightUpdaterManager", params):
         url = params["url"]
 
         self.tp_worker.model_runner.save_remote_model(url)
@@ -208,7 +229,8 @@ class SchedulerUpdateWeightsMixin:
             ), "draft_url must be provided when draft model is enabled"
             self.draft_worker.model_runner.save_remote_model(draft_url)
 
-    def save_sharded_model(self: Scheduler, params):
+    @staticmethod
+    def save_sharded_model(self: "SchedulerWeightUpdaterManager", params):
         self.tp_worker.model_runner.save_sharded_model(
             path=params["path"],
             pattern=params["pattern"],
