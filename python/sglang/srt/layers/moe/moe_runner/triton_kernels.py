@@ -137,12 +137,19 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
                 **common_kwargs,
             )
 
+        tokens = runner_input.hidden_states.shape[0]
+        hidden = runner_input.hidden_states.shape[-1]
+        total_rows = output.shape[0]
+        top_k = runner_input.n_expts_act
+        assert total_rows == tokens * top_k, (
+            "Triton-kernels MoE output rows must match tokens * active experts, "
+            f"got {total_rows=} for {tokens=} and {top_k=}"
+        )
+
         if self.config.no_combine:
-            tokens = runner_input.hidden_states.shape[0]
-            hidden = runner_input.hidden_states.shape[-1]
-            total_rows = output.shape[0]
-            top_k = total_rows // tokens
             output = output.view(tokens, top_k, hidden)
+        else:
+            output = output.view(tokens, top_k, hidden).sum(dim=1)
 
         return TritonKernelsRunnerOutput(hidden_states=output)
 
