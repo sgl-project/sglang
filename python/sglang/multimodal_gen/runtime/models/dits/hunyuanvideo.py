@@ -37,7 +37,9 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     unpatchify,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.utils import modulate
 from sglang.multimodal_gen.runtime.platforms import (
@@ -418,7 +420,7 @@ class MMSingleStreamBlock(nn.Module):
         return self.output_residual(output, mod_gate, x)
 
 
-class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
+class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     HunyuanVideo Transformer backbone adapted for distributed training.
 
