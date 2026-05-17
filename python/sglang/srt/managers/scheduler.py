@@ -3087,6 +3087,9 @@ class Scheduler(
                 # Overlap path (V2): worker computed next iter's seq_lens
                 # under the forward stream. Sync the schedule-side seq_lens so
                 # subsequent batch preparation sees the up-to-date value.
+                # `new_seq_lens` is declared on `SpecInput` base (default None),
+                # so this generalizes across algos (DFLASH / non-overlap algos
+                # leave it None).
                 if batch_result.next_draft_input.new_seq_lens is not None:
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
 
