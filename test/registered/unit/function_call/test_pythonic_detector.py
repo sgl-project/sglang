@@ -244,8 +244,13 @@ class TestPythonicDetector(CustomTestCase):
         detector = PythonicDetector()
         result = detector.parse_streaming_increment("[get_weather(city=", self.tools)
         self.assertEqual(len(result.calls), 0)
-        # Buffer should be held, no normal text emitted yet
         self.assertEqual(result.normal_text, "")
+
+        # Test with leading text
+        detector2 = PythonicDetector()
+        result = detector2.parse_streaming_increment("Hello! [search(query=", self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, "Hello! ")
 
     # ==================== structure_info / supports_structural_tag Tests ====================
 
