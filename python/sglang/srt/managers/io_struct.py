@@ -260,7 +260,19 @@ class GenerateReqInput(BaseReq):
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
+    # OpenAI-style ``extra_body`` passthrough for raw ``/generate`` requests.
+    # Used by VLA models (e.g. π0) to ferry per-request side-channel inputs
+    # — the robot proprioceptive ``state`` vector and an optional
+    # ``num_inference_steps`` override — that don't fit the text/image schema.
+    # Without this field, FastAPI silently drops the JSON ``extra_body`` block
+    # before the multimodal processor (which reads ``request_obj.extra_body``)
+    # ever sees it. Per-request: a single dict (or None). Batch-level: a list
+    # of dicts/None aligned with the prompts; ``__getitem__`` projects out
+    # the i-th element so per-request processing sees a plain dict.
+    extra_body: Optional[Union[List[Optional[Dict]], Dict]] = None
+
     def contains_mm_input(self) -> bool:
+
         return (
             has_valid_data(self.image_data)
             or has_valid_data(self.video_data)
@@ -405,6 +417,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_extra_body(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -607,7 +620,29 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
+    def _normalize_extra_body(self, num):
+        """Normalize ``extra_body`` for batch processing.
+
+        Mirrors the conventions used elsewhere in this method: a single dict
+        is broadcast across the batch; a per-request list is replicated for
+        ``parallel_sample_num``. ``None`` (the common case for non-VLA
+        traffic) becomes a list of ``None``s so ``__getitem__`` can index
+        uniformly without a None-check.
+        """
+        if self.extra_body is None:
+            self.extra_body = [None] * num
+        elif isinstance(self.extra_body, dict):
+            self.extra_body = [self.extra_body] * num
+        elif isinstance(self.extra_body, list):
+            self.extra_body = self.extra_body * self.parallel_sample_num
+        else:
+            raise ValueError(
+                "extra_body must be a dict, a list of dicts/None, or None; "
+                f"got {type(self.extra_body).__name__}."
+            )
+
     def _validate_session_params(self):
+
         """Validate that session parameters are properly formatted."""
         if self.session_params is not None:
             if not isinstance(self.session_params, dict) and not isinstance(
@@ -702,6 +737,14 @@ class GenerateReqInput(BaseReq):
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+            # Forward the per-request ``extra_body`` slot. After
+            # ``_normalize_extra_body`` this is always a list, so a plain
+            # index is sufficient (it may be ``None`` for non-VLA traffic).
+            extra_body=(
+                self.extra_body[i]
+                if isinstance(self.extra_body, list)
+                else self.extra_body
+            ),
         )
         cache[i] = sub
         return sub
@@ -709,6 +752,7 @@ class GenerateReqInput(BaseReq):
 
 @dataclass
 class TokenizedGenerateReqInput(BaseReq):
+
     # The input text
     input_text: str
     # The input token ids
@@ -1137,6 +1181,13 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
 
+    # VLA (Vision-Language-Action) per-request action chunks.
+    # vla_actions[i] is a nested list of shape (action_horizon, action_dim)
+    # for VLA requests, or ``None`` for non-VLA requests. Set by the
+    # scheduler's VLA result path and consumed by the tokenizer manager to
+    # surface ``actions`` as a top-level response field.
+    vla_actions: Optional[List[Optional[List[List[float]]]]] = None
+
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
@@ -1202,6 +1253,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
+
+    # VLA action chunks — see ``BatchTokenIDOutput.vla_actions`` for schema.
+    vla_actions: Optional[List[Optional[List[List[float]]]]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None

@@ -326,6 +326,7 @@ class ModelConfig:
         self.is_local_attention_model = is_local_attention_model(
             self.hf_config.architectures
         )
+        self.is_vla = is_vla_model(self.hf_config.architectures)
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
@@ -1553,6 +1554,11 @@ multimodal_model_archs = [
     "MiDashengLMModel",
     "StepVLForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
+    # VLA — π0 processes images + language; it has no nested vision_config
+    # on its HF config (SigLIP dims are derived from paligemma_variant), so
+    # we rely on this list to route the request through get_processor /
+    # get_mm_processor.
+    "Pi0ForActionPrediction",
 ]
 
 piecewise_cuda_graph_disabled_model_archs = [
@@ -1577,6 +1583,16 @@ def is_multimodal_model(model_architectures: List[str]):
         return True
     else:
         return False
+
+
+def is_vla_model(model_architectures: List[str]):
+    """Check if the model is a Vision-Language-Action (VLA) model.
+
+    VLA models output continuous action vectors instead of text tokens.
+    They require a different forward/output path in the scheduler.
+    """
+    vla_archs = {"Pi0ForActionPrediction"}
+    return any(arch in vla_archs for arch in model_architectures)
 
 
 def is_audio_model(model_architectures: List[str]):

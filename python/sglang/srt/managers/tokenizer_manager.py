@@ -1835,6 +1835,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ):
                     out_dict["pooled_hidden_state"] = recv_obj.pooled_hidden_states[i]
 
+            # VLA (Vision-Language-Action) models: promote the typed action
+            # chunk from the batch output into a top-level ``actions`` key so
+            # clients don't have to parse any text. Logic lives in the
+            # module-level ``_promote_vla_actions`` helper so it can be unit
+            # tested without spinning up the full TokenizerManager. Skip
+            # when ``out_dict`` is ``None`` (non-stream, non-finished text
+            # path where the tokenizer manager defers the dict build).
+            if out_dict is not None:
+                _promote_vla_actions(out_dict, recv_obj, i)
+
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
@@ -2782,6 +2792,36 @@ def _get_processor_wrapper(server_args):
         else:
             raise e
     return processor
+
+
+def _promote_vla_actions(
+    out_dict: Dict[str, Any],
+    recv_obj: Union[BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput],
+    i: int,
+) -> None:
+    """Promote a VLA action chunk from ``recv_obj.vla_actions[i]`` onto
+    ``out_dict["actions"]`` when present.
+
+    Extracted as a module-level pure function (no ``self``) so it can be
+    unit-tested without spinning up a full ``TokenizerManager``. The
+    invariant we lock down:
+
+    * if ``recv_obj.vla_actions`` is ``None`` or the request's slot is
+      ``None``, ``out_dict`` is left untouched (no ``actions`` key);
+    * otherwise, ``out_dict["actions"]`` gets the nested list of shape
+      ``(action_horizon, action_dim)`` as-is.
+
+    See ``scheduler.process_batch_result_vla`` for where it's produced.
+    """
+    vla_actions = getattr(recv_obj, "vla_actions", None)
+    if vla_actions is None:
+        return
+    if i >= len(vla_actions):
+        return
+    action_chunk = vla_actions[i]
+    if action_chunk is None:
+        return
+    out_dict["actions"] = action_chunk
 
 
 def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:

@@ -179,8 +179,15 @@ def get_processor(
 
     if config.model_type not in {"llava", "clip"}:
         kwargs["use_fast"] = use_fast
+    # Models that only have a tokenizer (no HF processor / image_processor).
+    # π0 uses the PaliGemma tokenizer directly; AutoProcessor would fail because
+    # the lerobot/pi0_base checkpoint ships no processor_config.json.
+    _tokenizer_only_model_types = {"internvl_chat", "pi0"}
     try:
-        if "InternVL3_5" in tokenizer_name:
+        if (
+            "InternVL3_5" in tokenizer_name
+            or config.model_type in _tokenizer_only_model_types
+        ):
             processor = AutoTokenizer.from_pretrained(
                 tokenizer_name,
                 *args,

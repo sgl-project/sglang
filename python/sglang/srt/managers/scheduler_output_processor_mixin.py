@@ -1057,6 +1057,13 @@ class SchedulerOutputProcessorMixin:
 
         time_stats = []
 
+        # VLA models attach continuous action chunks to the request instead
+        # of emitting tokens. We collect them here and ship through the
+        # BatchTokenIDOutput so the tokenizer manager can surface them as a
+        # top-level ``actions`` field on the response. Kept lazily-allocated
+        # — stays ``None`` for plain text generation requests.
+        vla_actions: Optional[List[Optional[List[List[float]]]]] = None
+
         if return_logprob:
             input_token_logprobs_val = []
             input_token_logprobs_idx = []
@@ -1251,6 +1258,18 @@ class SchedulerOutputProcessorMixin:
                             v[send_token_offset : len(output_ids_)]
                         )
 
+                # VLA action chunk (set by process_batch_result_vla).
+                req_actions = getattr(req, "vla_actions", None)
+                if req_actions is not None:
+                    if vla_actions is None:
+                        # Back-fill ``None`` for any earlier non-VLA reqs we
+                        # already appended in this batch (keeps indices aligned
+                        # with ``rids``).
+                        vla_actions = [None] * (len(rids) - 1)
+                    vla_actions.append(req_actions)
+                elif vla_actions is not None:
+                    vla_actions.append(None)
+
             if (
                 req.finished()
                 and self.ps.attn_tp_rank == 0
@@ -1305,6 +1324,7 @@ class SchedulerOutputProcessorMixin:
                     retraction_counts=retraction_counts,
                     load=load,
                     dp_ranks=dp_ranks,
+                    vla_actions=vla_actions,
                 )
             )
 

@@ -182,6 +182,23 @@ class FINISH_LENGTH(BaseFinishReason):
         }
 
 
+class FINISH_VLA(BaseFinishReason):
+    """Finish reason for a VLA request.
+
+    VLA models have no decode loop — a single prefill forward produces the
+    entire action chunk, so the request is immediately "done". We report
+    ``type="stop"`` to stay OpenAI-compatible (same as
+    ``FINISH_MATCHED_STR`` / ``FINISH_MATCHED_TOKEN``); clients can
+    distinguish VLA responses by the presence of the ``actions`` field.
+    """
+
+    def to_json(self):
+        return {
+            "type": "stop",
+            "matched": "vla_done",
+        }
+
+
 class FINISH_ABORT(BaseFinishReason):
     def __init__(self, message=None, status_code=None, err_type=None):
         super().__init__()

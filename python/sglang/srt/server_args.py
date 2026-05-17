@@ -2661,7 +2661,67 @@ class ServerArgs:
             logger.info("Radix cache is disabled for Whisper")
             self.disable_radix_cache = True
 
+        # VLA models (e.g. π0) manage their own PaliGemma KV cache as plain
+        # PyTorch tensors inside ``PaliGemmaWithActionExpert.forward`` and
+        # never go through SGLang's shared KV pool / attention backend.
+        # The shared pool is still allocated for plumbing reasons (DP sync,
+        # CUDA-graph capture, server warmup probes, idle/health checks all
+        # touch it), but it stays at the default ``kv_cache_dtype="auto"``
+        # → fp32 when the user passes ``--dtype float32`` (the LeRobot π0
+        # default).
+        #
+        # That tripped two distinct FlashAttention checks at boot:
+        #
+        #   1. CUDA-graph capture calls ``get_scheduler_metadata`` over
+        #      the pool during capture (failed with the fp32 RuntimeError
+        #      below before we disabled capture).
+        #   2. The first decode forward (warmup or any non-VLA probe
+        #      reaching ``forward_decode``) also calls
+        #      ``init_forward_metadata`` →
+        #      ``flashattention_backend._compute_scheduler_metadata``,
+        #      which hits the same FA gate even with capture off.
+        #
+        # The error in both cases is::
+        #
+        #     RuntimeError: FlashAttention only supports fp16, bf16,
+        #     and fp8_e4m3 data type
+        #
+        # We address (1) by disabling capture — VLA has no decode loop, so
+        # capture is meaningless. We address (2) by forcing the KV dtype
+        # to bfloat16 (the cheapest FA-compatible option). The pool is
+        # still never read by π0's actual forward, so this is purely a
+        # placeholder dtype to satisfy the backend's input check and has
+        # no effect on action-chunk outputs.
+        #
+        # Users can still override via explicit ``--kv-cache-dtype`` if
+        # some future VLA architecture actually uses the shared pool.
+        if model_config.is_vla:
+            if not self.disable_cuda_graph:
+                logger.info(
+                    "Cuda graph is disabled for VLA models: they manage "
+                    "their own KV cache and have no decode loop, so "
+                    "capture is unnecessary and trips FlashAttention's "
+                    "fp32 KV check."
+                )
+                self.disable_cuda_graph = True
+            if self.kv_cache_dtype == "auto":
+                # ``auto`` would resolve to ``self.dtype`` (fp32 for the
+                # default π0 config), which FlashAttention rejects in
+                # ``init_forward_metadata`` for non-VLA decode probes
+                # that reach the FA backend (server warmup, IDLE / DP
+                # sync forwards, health checks). Pin to bf16 — VLA never
+                # actually reads from the pool, so this is just a
+                # type-compat placeholder.
+                logger.info(
+                    "KV cache dtype is set to 'bfloat16' for VLA models "
+                    "to satisfy FlashAttention's fp16/bf16/fp8 input "
+                    "check; the pool is unused by VLA forward, so this "
+                    "has no effect on action outputs."
+                )
+                self.kv_cache_dtype = "bfloat16"
+
         # Major NVIDIA platforms backends
+
         if (
             self.attention_backend == "flashmla"
             or self.decode_attention_backend == "flashmla"
