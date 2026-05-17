@@ -728,15 +728,23 @@ def _parse_host_port(addr: str) -> tuple[str, int | None]:
     return addr, None
 
 
+def _normalize_layout_host(host: str) -> str:
+    """Normalize host strings used only for layout display/grouping."""
+    host = host.strip()
+    if host.startswith("[") and host.endswith("]"):
+        return host[1:-1]
+    return host
+
+
 def _host_from_endpoint(endpoint: str) -> str:
     """Extract the host from a tcp://host:port endpoint."""
     endpoint = endpoint.removeprefix("tcp://")
     if endpoint.startswith("["):
         end = endpoint.find("]")
         if end != -1:
-            return endpoint[1:end]
+            return _normalize_layout_host(endpoint[1:end])
     host, _ = _parse_host_port(endpoint)
-    return host
+    return _normalize_layout_host(host)
 
 
 def _pick_free_local_port() -> int:
@@ -983,7 +991,7 @@ def print_decoupled_spec_layout(
 ) -> None:
     node_hosts = sorted(
         {
-            node["NodeManagerAddress"]
+            _normalize_layout_host(node["NodeManagerAddress"])
             for node in ray.nodes()
             if node.get("Alive") and node.get("NodeManagerAddress")
         }
@@ -992,7 +1000,8 @@ def print_decoupled_spec_layout(
 
     for verifier_rank, pg in enumerate(verifier_pgs):
         bundle_hosts = _get_pg_bundle_hosts(pg, target_nnodes)
-        for bundle_index, host in enumerate(bundle_hosts):
+        for bundle_index, raw_host in enumerate(bundle_hosts):
+            host = _normalize_layout_host(raw_host)
             node_layout.setdefault(host, [])
             label = f"verifier{verifier_rank}(tp={args.target_tp_size}"
             if target_nnodes > 1:
