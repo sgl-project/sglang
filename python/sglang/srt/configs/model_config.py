@@ -766,6 +766,9 @@ class ModelConfig:
         self.spec_hidden_size = (
             self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
         )
+        # mHC-flattened hidden size; None when not running an mHC model
+        # (e.g. non-DeepSeek-V4 configs without ``hc_mult``).
+        self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:

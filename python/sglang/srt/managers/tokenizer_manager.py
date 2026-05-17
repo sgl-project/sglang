@@ -398,7 +398,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.dump_request_list: List[Tuple] = []
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
-        self.straggler_request_list: List[Tuple] = []
 
         # Initialize performance metrics loggers with proper skip names
         _, obj_skip_names, out_skip_names = self.request_logger.metadata
@@ -445,7 +444,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        self.bootstrap_server = start_disagg_service(self.server_args)
+        start_disagg_service(self.server_args)
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 

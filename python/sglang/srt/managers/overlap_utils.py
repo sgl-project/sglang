@@ -49,7 +49,7 @@ class FutureMap:
         chunked_prefill_size: int,
         context_len: int,
         device: torch.device,
-        spec_algo: Optional[SpeculativeAlgorithm] = None,
+        spec_algo: SpeculativeAlgorithm,
     ):
         # FIXME: the calculation of future_limit and future_buffer_len maybe too conservative
         self.future_ct = 0
@@ -163,6 +163,9 @@ class FutureMap:
     ):
         if self.spec_algo.is_none():
             intv = future_indices.interval
+            if self.is_empty_slice(intv):
+                # idle indices in dp attention do not need store info
+                return
             self.token_ids_buf[intv] = batch_result.next_token_ids
         else:
             draft_input: EagleDraftInput = batch_result.next_draft_input
