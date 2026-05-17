@@ -10,9 +10,13 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _ModelOptFp8OffloadAdapter,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    component_resident_strategies as component_resident_strategies_mod,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
     layerwise_offload as layerwise_offload_mod,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
     build_component_residency_strategy,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
@@ -344,6 +348,50 @@ def test_component_cpu_offload_strategy_remains_flag_driven():
         "unknown_component", _DummyModel(), _server_args(text_encoder_cpu_offload=True)
     )
     assert isinstance(strategy, ResidentStrategy)
+
+
+def test_resident_strategy_prepares_local_device_without_dtype(monkeypatch):
+    calls = []
+
+    def fake_module_to_local_device(module, *, dtype=None):
+        calls.append((module, dtype))
+
+    monkeypatch.setattr(
+        component_resident_strategies_mod,
+        "_module_to_local_device",
+        fake_module_to_local_device,
+    )
+    module = _DummyModel()
+
+    ResidentStrategy().prepare_for_use(
+        module,
+        ComponentUse(stage_name="DenoisingStage", component_name="transformer"),
+        SimpleNamespace(),
+    )
+
+    assert calls == [(module, None)]
+
+
+def test_resident_strategy_keeps_fsdp_managed_module_owned_by_fsdp(monkeypatch):
+    calls = []
+
+    def fake_module_to_local_device(module, *, dtype=None):
+        calls.append((module, dtype))
+
+    monkeypatch.setattr(
+        component_resident_strategies_mod,
+        "_module_to_local_device",
+        fake_module_to_local_device,
+    )
+    module = type("FSDPDummyModel", (_DummyModel,), {})()
+
+    ResidentStrategy().prepare_for_use(
+        module,
+        ComponentUse(stage_name="TextEncodingStage", component_name="text_encoder"),
+        SimpleNamespace(),
+    )
+
+    assert calls == []
 
 
 def test_layerwise_offload_aligns_contiguous_tensor_offsets(monkeypatch):

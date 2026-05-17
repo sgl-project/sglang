@@ -179,8 +179,9 @@ class LTX2PipelineConfig(PipelineConfig):
 
     # Audio VAE configuration
     vae_config: LTXVideoVAEConfig = field(default_factory=LTXVideoVAEConfig)
+    vae_precision: str = "bf16"
     audio_vae_config: LTXAudioVAEConfig = field(default_factory=LTXAudioVAEConfig)
-    audio_vae_precision: str = "fp32"
+    audio_vae_precision: str = "bf16"
 
     @property
     def vae_scale_factor(self):

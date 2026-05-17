@@ -56,7 +56,7 @@ class KVArgs:
     # reconstruct PP sub-ranges when kv_data_ptrs does not use a flat
     # layer-indexed layout (e.g. DeepSeek V4's buffer-type-organized flat
     # list).
-    prefill_end_layer: int
+    prefill_end_layer: Optional[int]
     # For DeepSeek V4 (and other compressed-MLA) memory pools only.
     # Full-model compression ratio per layer (entries are 0/4/128). Used by
     # the connection layer to slice the buffer-type-organized flat list in a
