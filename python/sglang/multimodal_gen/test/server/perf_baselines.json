@@ -1350,7 +1350,7 @@
         },
         "fastwan2_2_ti2v_5b": {
             "stages_ms": {
-                "InputValidationStage": 31.26,
+                "InputValidationStage": 380.0,
                 "TextEncodingStage": 685.05,
                 "TimestepPreparationStage": 36.07,
                 "LatentPreparationStage": 0.12,
@@ -1358,13 +1358,13 @@
                 "DecodingStage": 1524.82
             },
             "denoise_step_ms": {
-                "0": 46.17,
-                "1": 179.5,
-                "2": 171.27
+                "0": 33.2,
+                "1": 112.7,
+                "2": 124.7
             },
             "expected_e2e_ms": 2684.91,
-            "expected_avg_denoise_ms": 132.32,
-            "expected_median_denoise_ms": 171.27,
+            "expected_avg_denoise_ms": 90.0,
+            "expected_median_denoise_ms": 115.0,
             "estimated_full_test_time_s": 125.2
         },
         "fast_hunyuan_video": {
@@ -1770,7 +1770,7 @@
                 "DecodingStage": 563.07
             },
             "denoise_step_ms": {
-                "0": 84.27,
+                "0": 90.0,
                 "1": 141.31,
                 "2": 146.15,
                 "3": 145.23,
@@ -2552,7 +2552,7 @@
                 "LTX2AVDenoisingStage": 16162.58,
                 "LTX2UpsampleStage": 3.23,
                 "LTX2RefinementStage": 1593.51,
-                "LTX2AVDecodingStage": 500.05,
+                "LTX2AVDecodingStage": 600.0,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
@@ -2566,7 +2566,7 @@
                 "7": 843.37,
                 "8": 808.52,
                 "9": 715.13,
-                "10": 707.18,
+                "10": 1000.0,
                 "11": 717.4,
                 "12": 790.42,
                 "13": 761.88,
@@ -2576,8 +2576,8 @@
                 "17": 451.66
             },
             "expected_e2e_ms": 20870.15,
-            "expected_avg_denoise_ms": 810.79,
-            "expected_median_denoise_ms": 799.47,
+            "expected_avg_denoise_ms": 850.0,
+            "expected_median_denoise_ms": 920.0,
             "estimated_full_test_time_s": 363.2
         }
     }
