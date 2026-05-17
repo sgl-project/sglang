@@ -1430,7 +1430,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     is_extend_in_batch: bool = False
-    all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
@@ -2567,7 +2566,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             is_extend_in_batch=self.is_extend_in_batch,
-            all_extend_in_batch=self.all_extend_in_batch,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             tbo_split_seq_index=self.tbo_split_seq_index,
             global_forward_mode=self.global_forward_mode,
@@ -2632,7 +2630,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
-            all_extend_in_batch=self.all_extend_in_batch,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
@@ -2774,7 +2771,6 @@ class ModelWorkerBatch:
     global_num_tokens: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
     is_extend_in_batch: bool
-    all_extend_in_batch: bool
     can_run_dp_cuda_graph: bool
     tbo_split_seq_index: Optional[int]
     global_forward_mode: Optional[ForwardMode]
