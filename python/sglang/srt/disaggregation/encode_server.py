@@ -5,6 +5,7 @@ import logging
 import multiprocessing as mp
 import os
 import pickle
+import threading
 import time
 import traceback
 from http import HTTPStatus
@@ -1416,6 +1417,54 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
         traceback.print_exc()
 
 
+def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
+    """Register this encoder server's URL with one or more prefill servers.
+
+    Called after the encoder is initialized.  Iterates over all URLs in
+    ``server_args.encoder_register_urls`` and registers with each.
+    Retries on failure to handle the case where a prefill server may not
+    be ready immediately.
+    """
+    import time
+
+    import requests as http_requests
+
+    encoder_url = server_args.url()
+    payload = {"url": encoder_url}
+    max_retries = 5
+    retry_delay = 2.0
+
+    for bootstrap_url in server_args.encoder_register_urls:
+        register_endpoint = f"{bootstrap_url}/register_encoder_url"
+        registered = False
+        for attempt in range(max_retries):
+            try:
+                resp = http_requests.post(register_endpoint, json=payload, timeout=5)
+                if resp.status_code == 200:
+                    logger.info(
+                        f"Registered encoder URL '{encoder_url}' with prefill server at {bootstrap_url}"
+                    )
+                    registered = True
+                    break
+                else:
+                    logger.warning(
+                        f"Failed to register with {bootstrap_url} (attempt {attempt + 1}/{max_retries}): "
+                        f"{resp.status_code}, {resp.text}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to register with {bootstrap_url} (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+
+        if not registered:
+            logger.error(
+                f"Could not register encoder URL '{encoder_url}' with {bootstrap_url} "
+                f"after {max_retries} attempts. Encoder discovery may be incomplete."
+            )
+
+
 def launch_server(server_args: ServerArgs):
     global encoder
     ctx = mp.get_context("spawn")
@@ -1440,6 +1489,11 @@ def launch_server(server_args: ServerArgs):
             daemon=True,
         ).start()
     encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
+
+    # Register this encoder's URL with prefill server(s) if configured.
+    if server_args.encoder_register_urls:
+        _register_encoder_url_with_bootstrap(server_args)
+
     uvicorn.run(app, host=server_args.host, port=server_args.port)
 
 
@@ -1709,3 +1763,50 @@ async def stop_profile_async():
     return Response(
         content=(msg or "Stop profiling failed.\n"), status_code=HTTPStatus.BAD_REQUEST
     )
+
+
+"""Thread-safe encoder URL registry for dynamic encoder discovery in EPD mode.
+
+When ``--language-only`` is set the prefill server embeds bootstrap endpoints
+(``/register_encoder_url``, ``/unregister_encoder_url``, ``/list_encoder_urls``)
+in its main HTTP server.  The :class:`EncoderURLRegistry` backing those
+endpoints is created in :pymethod:`TokenizerManager.init_disaggregation` and
+stored on the manager so that the HTTP layer can access it via ``_global_state``.
+"""
+
+
+class EncoderURLRegistry:
+    """Thread-safe registry of encoder URLs.
+
+    Created in ``TokenizerManager.init_disaggregation()`` when
+    ``--language-only`` is set.  The HTTP endpoints in ``http_server.py``
+    delegate to methods on this object.
+    """
+
+    def __init__(self):
+        self._urls: List[str] = []
+        self._lock = threading.Lock()
+
+    def register(self, url: str) -> bool:
+        """Add *url* if not already present.  Returns True if added."""
+        with self._lock:
+            if url not in self._urls:
+                self._urls.append(url)
+                logger.info(f"Registered encoder URL: {url}")
+                return True
+            logger.debug(f"Encoder URL already registered: {url}")
+            return False
+
+    def unregister(self, url: str) -> bool:
+        """Remove *url* if present.  Returns True if removed."""
+        with self._lock:
+            if url in self._urls:
+                self._urls.remove(url)
+                logger.info(f"Unregistered encoder URL: {url}")
+                return True
+            return False
+
+    def list_urls(self) -> List[str]:
+        """Return a snapshot of all registered encoder URLs."""
+        with self._lock:
+            return list(self._urls)

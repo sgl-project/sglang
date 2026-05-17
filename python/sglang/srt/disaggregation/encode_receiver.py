@@ -630,10 +630,20 @@ class MMReceiverBase(ABC):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
+        encoder_url_registry=None,
     ):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
-        self.encode_urls = server_args.encoder_urls
+        self.encode_urls = list(server_args.encoder_urls)
+        self.encoder_bootstrap_url = server_args.encoder_bootstrap_url
+        # Local registry for short-circuiting self-referential bootstrap calls.
+        # When the bootstrap URL points to the same server, using a synchronous
+        # HTTP call would deadlock the event loop.  The registry allows us to
+        # query encoder URLs directly in-process.
+        self._encoder_url_registry = encoder_url_registry
+        # Timestamp of last bootstrap refresh; used to rate-limit requests.
+        self._last_bootstrap_refresh: float = 0.0
+        self._bootstrap_refresh_interval: float = 5.0
         self.host = get_local_ip_auto(server_args.host)
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
@@ -712,12 +722,142 @@ class MMReceiverBase(ABC):
     def process_waiting_requests(self, recv_reqs):
         pass
 
+    def _refresh_encoder_urls_from_bootstrap(self, bootstrap_url=None):
+        """Fetch encoder URLs from a bootstrap server and update the local list.
+
+        Called on every request when a bootstrap URL is configured, so that
+        dynamically registered or deregistered encoders are reflected immediately.
+        Rate-limited to at most one HTTP call per ``_bootstrap_refresh_interval``
+        seconds to avoid hammering the bootstrap server.
+
+        Args:
+            bootstrap_url: Optional override for the bootstrap server URL.
+                When provided (e.g. per-request ``epd_bootstrap_addr`` for nEmP),
+                this URL is used instead of the server-level
+                ``self.encoder_bootstrap_url``.  Rate-limiting still applies
+                to the server-level URL; per-request URLs bypass rate-limiting
+                and return the fetched URLs directly without caching on ``self``.
+
+        Returns:
+            When *bootstrap_url* is provided (per-request): a ``list[str]`` of
+            encoder URLs, or ``None`` on failure.
+            When *bootstrap_url* is ``None`` (server-level): always ``None``
+            (results are stored on ``self.encode_urls``).
+        """
+        import time
+
+        import requests as http_requests
+
+        url = bootstrap_url or self.encoder_bootstrap_url
+        if not url:
+            return None
+
+        # Short-circuit: when the bootstrap URL points to this server and we
+        # have a local registry, query it directly to avoid a synchronous HTTP
+        # call that would deadlock the event loop.
+        if self._encoder_url_registry is not None and url.rstrip("/") == (
+            self.encoder_bootstrap_url or ""
+        ).rstrip("/"):
+            urls = self._encoder_url_registry.list_urls()
+            if bootstrap_url is not None:
+                # Per-request path: return directly.
+                if urls:
+                    logger.info(
+                        f"Fetched {len(urls)} encoder URLs from local registry "
+                        f"(bootstrap {bootstrap_url} is self): {urls}"
+                    )
+                return urls
+            else:
+                # Server-level path: cache on self.
+                self.encode_urls = urls
+                if urls:
+                    logger.info(
+                        f"Fetched {len(urls)} encoder URLs from local registry: {urls}"
+                    )
+                else:
+                    logger.info(
+                        "Local registry has no encoder URLs yet; "
+                        "will retry on next request"
+                    )
+                return None
+
+        # Per-request bootstrap: always fetch, return directly.
+        if bootstrap_url is not None:
+            try:
+                resp = http_requests.get(
+                    f"{bootstrap_url}/list_encoder_urls", timeout=5
+                )
+                if resp.status_code == 200:
+                    urls = resp.json().get("encoder_urls", [])
+                    if urls:
+                        logger.info(
+                            f"Fetched {len(urls)} encoder URLs from per-request bootstrap "
+                            f"{bootstrap_url}: {urls}"
+                        )
+                    return urls
+                else:
+                    logger.warning(
+                        f"Failed to fetch encoder URLs from per-request bootstrap "
+                        f"{bootstrap_url}: {resp.status_code}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to fetch encoder URLs from per-request bootstrap "
+                    f"{bootstrap_url}: {e}"
+                )
+            return None
+
+        # Server-level bootstrap: rate-limited, results cached on self.
+        now = time.monotonic()
+        if now - self._last_bootstrap_refresh < self._bootstrap_refresh_interval:
+            return None
+        self._last_bootstrap_refresh = now
+
+        try:
+            resp = http_requests.get(
+                f"{self.encoder_bootstrap_url}/list_encoder_urls", timeout=5
+            )
+            if resp.status_code == 200:
+                urls = resp.json().get("encoder_urls", [])
+                # Always overwrite the cached list so that newly registered
+                # encoders are picked up and departed encoders are evicted.
+                self.encode_urls = urls
+                if urls:
+                    logger.info(
+                        f"Fetched {len(urls)} encoder URLs from bootstrap: {urls}"
+                    )
+                else:
+                    logger.info(
+                        "Bootstrap server returned no encoder URLs yet; "
+                        "will retry on next request"
+                    )
+            else:
+                logger.warning(
+                    f"Failed to fetch encoder URLs from bootstrap: {resp.status_code}"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to fetch encoder URLs from bootstrap: {e}")
+        return None
+
     async def recv_mm_data(
         self, request_obj, mm_processor, prompt, need_wait_for_mm_inputs=True
     ):
         req_id = None
         try:
-            if len(self.encode_urls) == 0 or not need_wait_for_mm_inputs:
+            # Determine the effective encoder URL list.  A per-request
+            # ``epd_bootstrap_addr`` (nEmP) takes priority over the
+            # server-level ``encoder_bootstrap_url`` (nE1P).
+            per_req_bootstrap = getattr(request_obj, "epd_bootstrap_addr", None)
+            if per_req_bootstrap:
+                encode_urls = (
+                    self._refresh_encoder_urls_from_bootstrap(per_req_bootstrap) or []
+                )
+            else:
+                if self.encoder_bootstrap_url:
+                    self._refresh_encoder_urls_from_bootstrap()
+                encode_urls = self.encode_urls
+
+            if len(encode_urls) == 0 or not need_wait_for_mm_inputs:
                 return None
             req_id = uuid.uuid4().hex
             embedding_port, recv_socket = get_zmq_socket_on_host(
@@ -725,7 +865,14 @@ class MMReceiverBase(ABC):
             )
             mm_data = self._extract_url_data(request_obj)
             asyncio.create_task(
-                self.encode(req_id, mm_data, embedding_port, "encode", "send")
+                self.encode(
+                    req_id,
+                    mm_data,
+                    embedding_port,
+                    "encode",
+                    "send",
+                    encode_urls=encode_urls,
+                )
             )
             return await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
@@ -845,12 +992,37 @@ class MMReceiverBase(ABC):
         mm_data = self._extract_url_data(obj)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
-        if mm_data and self.encode_urls:
-            logger.info(f"Processing {len(mm_data)} mm items for request {obj.rid}")
+
+        # Determine effective encoder URLs.  A per-request epd_bootstrap_addr
+        # (nEmP) takes priority over the server-level encoder_bootstrap_url.
+        per_req_bootstrap = getattr(obj, "epd_bootstrap_addr", None)
+        if per_req_bootstrap:
+            encode_urls = (
+                self._refresh_encoder_urls_from_bootstrap(per_req_bootstrap) or []
+            )
+        else:
+            # Refresh encoder URLs from bootstrap on every request when dynamic
+            # discovery is configured, so newly registered or departed encoders
+            # are reflected without a server restart.
+            bootstrap_url = self.encoder_bootstrap_url
+            if mm_data and bootstrap_url:
+                if not self.encode_urls:
+                    logger.info(
+                        f"No encoder URLs available; querying bootstrap at "
+                        f"{bootstrap_url} for request {obj.rid}"
+                    )
+                self._refresh_encoder_urls_from_bootstrap()
+            encode_urls = self.encode_urls
+
+        if mm_data and encode_urls:
+            logger.info(
+                f"Dispatching {len(mm_data)} mm items to {len(encode_urls)} "
+                f"encoder(s) {encode_urls} for request {obj.rid}"
+            )
             obj.need_wait_for_mm_inputs = True
 
             num_items_assigned = self._assign_items_by_modality(
-                mm_data, len(self.encode_urls)
+                mm_data, len(encode_urls)
             )
             obj.num_items_assigned = num_items_assigned
             encode_thread = threading.Thread(
@@ -861,10 +1033,24 @@ class MMReceiverBase(ABC):
                     "encode",
                     num_items_assigned,
                     None,
+                    encode_urls,
                 ),
                 daemon=True,
             )
             encode_thread.start()
+        else:
+            # No encoder URLs available (bootstrap may not have any registered yet);
+            # reset the flag so the scheduler does not wait for embeddings that will
+            # never arrive.  A warning is emitted so the user can diagnose why
+            # disaggregation is not happening for this request.
+            if mm_data:
+                effective_bootstrap = per_req_bootstrap or self.encoder_bootstrap_url
+                logger.warning(
+                    f"No encoder URLs available for request {obj.rid} "
+                    f"(bootstrap_url={effective_bootstrap}); "
+                    "processing without encoder disaggregation."
+                )
+            obj.need_wait_for_mm_inputs = False
 
     # For zmq_to_scheduler
     def _process_waiting_requests(self, recv_reqs, waiting_cls):
@@ -874,11 +1060,28 @@ class MMReceiverBase(ABC):
                 isinstance(recv_req, TokenizedGenerateReqInput)
                 and recv_req.need_wait_for_mm_inputs is True
             ):
+                # Determine effective encoder URLs.  Per-request
+                # epd_bootstrap_addr (nEmP) takes priority.
+                per_req_bootstrap = getattr(recv_req, "epd_bootstrap_addr", None)
+                if per_req_bootstrap:
+                    encode_urls = (
+                        self._refresh_encoder_urls_from_bootstrap(per_req_bootstrap)
+                        or []
+                    )
+                else:
+                    # The scheduler subprocess has its own MMReceiverHTTP instance.
+                    # Always refresh from the bootstrap server (subject to rate
+                    # limiting) so that newly registered or departed encoders are
+                    # reflected without a server restart.
+                    if self.encoder_bootstrap_url:
+                        self._refresh_encoder_urls_from_bootstrap()
+                    encode_urls = self.encode_urls
+
                 waiting_req = waiting_cls(
                     rid=recv_req.rid,
                     recv_req=recv_req,
                     mm_processor=self.mm_processor,
-                    encoder_urls=self.encode_urls,
+                    encoder_urls=encode_urls,
                     host_name=self.hostname,
                     receive_count=self.tp_size,
                 )
@@ -941,7 +1144,13 @@ class MMReceiverBase(ABC):
         return new_recv_reqs, abort_reqs
 
     def _run_encode_in_thread(
-        self, req_id, mm_data, endpoint_encode, num_items_assigned, embedding_port
+        self,
+        req_id,
+        mm_data,
+        endpoint_encode,
+        num_items_assigned,
+        embedding_port,
+        encode_urls=None,
     ):
         try:
             asyncio.run(
@@ -952,6 +1161,7 @@ class MMReceiverBase(ABC):
                     endpoint_encode=endpoint_encode,
                     endpoint_send=None,
                     num_items_assigned=num_items_assigned,
+                    encode_urls=encode_urls,
                 )
             )
         except Exception as e:
@@ -1099,6 +1309,7 @@ class MMReceiverHTTP(MMReceiverBase):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
+        encoder_url_registry=None,
     ):
         super().__init__(
             server_args,
@@ -1108,6 +1319,7 @@ class MMReceiverHTTP(MMReceiverBase):
             tp_rank=tp_rank,
             tp_group=tp_group,
             scheduler=scheduler,
+            encoder_url_registry=encoder_url_registry,
         )
 
     # For zmq_to_scheduler
@@ -1122,9 +1334,12 @@ class MMReceiverHTTP(MMReceiverBase):
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
+        encode_urls=None,
     ):
         if len(mm_data) == 0:
             return
+
+        effective_urls = encode_urls if encode_urls is not None else self.encode_urls
 
         # get unique modalities with order preserved
         modalities = [mm_item.get("modality") for mm_item in mm_data]
@@ -1133,7 +1348,7 @@ class MMReceiverHTTP(MMReceiverBase):
 
         if num_items_assigned is None:
             num_items_assigned = self._assign_items_by_modality(
-                mm_data, len(self.encode_urls)
+                mm_data, len(effective_urls)
             )
 
         # Calculate total num_parts across all modalities
@@ -1186,7 +1401,7 @@ class MMReceiverHTTP(MMReceiverBase):
 
             tasks = [
                 session.post(
-                    f"{self.encode_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
+                    f"{effective_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
                     json=encode_request,
                 )
                 for encode_request in encode_requests
@@ -1240,7 +1455,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 )
                 metadata_tasks.append(
                     session.post(
-                        f"{self.encode_urls[response_json['encoder_idx']]}/{endpoint_send}",
+                        f"{effective_urls[response_json['encoder_idx']]}/{endpoint_send}",
                         json=response_json,
                     )
                 )
@@ -1258,6 +1473,7 @@ class MMReceiverGrpc(MMReceiverBase):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
+        encoder_url_registry=None,
     ):
         super().__init__(
             server_args,
@@ -1267,6 +1483,7 @@ class MMReceiverGrpc(MMReceiverBase):
             tp_rank=tp_rank,
             tp_group=tp_group,
             scheduler=scheduler,
+            encoder_url_registry=encoder_url_registry,
         )
 
     def build_and_send_encode_request(self, image_urls, rid):
@@ -1289,9 +1506,12 @@ class MMReceiverGrpc(MMReceiverBase):
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
+        encode_urls=None,
     ):
         if not mm_data:
             return
+
+        effective_urls = encode_urls if encode_urls is not None else self.encode_urls
 
         # gRPC currently only supports image; flatten new dict formats to simple lists
         if mm_data and isinstance(mm_data[0], dict):
@@ -1312,10 +1532,10 @@ class MMReceiverGrpc(MMReceiverBase):
 
         encode_requests = []
         if num_items_assigned is None:
-            encode_idx = list(range(len(self.encode_urls)))
+            encode_idx = list(range(len(effective_urls)))
             random.shuffle(encode_idx)
             num_items_assigned = [
-                (idx + len(img_data)) // len(self.encode_urls) for idx in encode_idx
+                (idx + len(img_data)) // len(effective_urls) for idx in encode_idx
             ]
         num_parts = sum(1 for x in num_items_assigned if x != 0)
         cum_num_items = 0
@@ -1342,7 +1562,7 @@ class MMReceiverGrpc(MMReceiverBase):
         grpc_tasks = [
             asyncio.to_thread(
                 _grpc_encode_request,
-                _grpc_target(self.encode_urls[encode_request["encoder_idx"]]),
+                _grpc_target(effective_urls[encode_request["encoder_idx"]]),
                 encode_request,
             )
             for encode_request in encode_requests
@@ -1393,7 +1613,7 @@ class MMReceiverGrpc(MMReceiverBase):
             grpc_metadata_tasks.append(
                 asyncio.to_thread(
                     _grpc_send_request,
-                    _grpc_target(self.encode_urls[response_json["encoder_idx"]]),
+                    _grpc_target(effective_urls[response_json["encoder_idx"]]),
                     response_json,
                 )
             )
@@ -1438,6 +1658,7 @@ def create_mm_receiver(
     tp_group: Optional[GroupCoordinator] = None,
     scheduler: Optional["Scheduler"] = None,
     transport_mode: Optional[str] = None,
+    encoder_url_registry=None,
 ):
     if transport_mode is None:
         transport_mode = envs.SGLANG_ENCODER_MM_RECEIVER_MODE.get()
@@ -1457,4 +1678,5 @@ def create_mm_receiver(
         tp_rank=tp_rank,
         tp_group=tp_group,
         scheduler=scheduler,
+        encoder_url_registry=encoder_url_registry,
     )

@@ -57,7 +57,12 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    ORJSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -1131,6 +1136,64 @@ async def remote_instance_transfer_engine_info(rank: int = None):
         {"error": {"message": f"Failed to get transfer engine info for rank {rank}"}},
         status_code=HTTPStatus.BAD_REQUEST,
     )
+
+
+@app.post("/register_encoder_url")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def register_encoder_url(data: dict):
+    """Register an encoder URL (embedded bootstrap endpoint for --language-only)."""
+    registry = getattr(_global_state.tokenizer_manager, "encoder_url_registry", None)
+    if registry is None:
+        return ORJSONResponse(
+            {
+                "error": {
+                    "message": "Encoder URL registry not available (--language-only not set)"
+                }
+            },
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    url = data.get("url")
+    if not url:
+        return ORJSONResponse(
+            {"error": {"message": "Missing or empty 'url' field in request body"}},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    registry.register(url)
+    return PlainTextResponse("OK")
+
+
+@app.delete("/unregister_encoder_url")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def unregister_encoder_url(data: dict):
+    """Unregister an encoder URL (embedded bootstrap endpoint for --language-only)."""
+    registry = getattr(_global_state.tokenizer_manager, "encoder_url_registry", None)
+    if registry is None:
+        return ORJSONResponse(
+            {
+                "error": {
+                    "message": "Encoder URL registry not available (--language-only not set)"
+                }
+            },
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    url = data.get("url")
+    if not url:
+        return ORJSONResponse(
+            {"error": {"message": "Missing or empty 'url' field in request body"}},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    registry.unregister(url)
+    return PlainTextResponse("OK")
+
+
+@app.get("/list_encoder_urls")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def list_encoder_urls():
+    """List encoder URLs from the embedded bootstrap registry."""
+    registry = getattr(_global_state.tokenizer_manager, "encoder_url_registry", None)
+    if registry is None:
+        return {"encoder_urls": []}
+    return {"encoder_urls": registry.list_urls()}
 
 
 @app.post("/init_weights_update_group")

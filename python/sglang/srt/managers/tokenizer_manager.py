@@ -449,10 +449,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.fake_bootstrap_room_counter = 0
 
         # Encoder Disaggregation
+        self.encoder_url_registry = None
         if self.server_args.language_only:
+            from sglang.srt.disaggregation.encode_server import (
+                EncoderURLRegistry,
+            )
+
+            self.encoder_url_registry = EncoderURLRegistry()
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
+                encoder_url_registry=self.encoder_url_registry,
             )
 
     def init_metric_collector_watchdog(self):
@@ -1035,6 +1042,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                epd_bootstrap_addr=getattr(obj, "epd_bootstrap_addr", None),
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
