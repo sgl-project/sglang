@@ -36,7 +36,7 @@ class HiCacheStorageConfig:
 
 @dataclass
 class HiCacheStorageExtraInfo:
-    prefix_keys: Optional[List[str]] = (None,)
+    prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
 
 

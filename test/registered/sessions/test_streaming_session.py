@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=691, stage="stage-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=691, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestStreamingSession(StreamingSessionServerBase, StreamingSessionKitMixin):
