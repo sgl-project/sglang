@@ -454,7 +454,15 @@ class Scheduler(
         self.init_cache_with_memory_pool()
 
         # Register draft KV pool (when spec + HiCache co-enabled).
-        self._maybe_register_hicache_draft()
+        Scheduler.maybe_register_hicache_draft(
+            tree_cache=self.tree_cache,
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+            enable_overlap=self.enable_overlap,
+            page_size=self.page_size,
+        )
 
         # Init running status
         self.init_running_status()
@@ -999,16 +1007,26 @@ class Scheduler(
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
-    def _maybe_register_hicache_draft(self) -> None:
+    @staticmethod
+    def maybe_register_hicache_draft(
+        *,
+        tree_cache: "BasePrefixCache",
+        draft_worker: "BaseTpWorker",
+        spec_algorithm: SpeculativeAlgorithm,
+        server_args: ServerArgs,
+        enable_hierarchical_cache: bool,
+        enable_overlap: bool,
+        page_size: int,
+    ) -> None:
         """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
-        if not self.enable_hierarchical_cache:
+        if not enable_hierarchical_cache:
             return
 
         draft_kv_pool, _ = kv_cache_builder.get_draft_kv_pool(
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
-            enable_overlap=self.enable_overlap,
+            draft_worker=draft_worker,
+            spec_algorithm=spec_algorithm,
+            server_args=server_args,
+            enable_overlap=enable_overlap,
         )
         if draft_kv_pool is None:
             return
@@ -1029,12 +1047,12 @@ class Scheduler(
 
         # Create host pool for draft with the same slot count as the target host pool,
         # so that host indices stay 1-to-1 between target and draft KV caches.
-        primary = self.tree_cache.cache_controller.mem_pool_host
+        primary = tree_cache.cache_controller.mem_pool_host
         kw = dict(
             host_to_device_ratio=primary.size / pool.size,
             host_size=0,
-            page_size=self.page_size,
-            layout=self.server_args.hicache_mem_layout,
+            page_size=page_size,
+            layout=server_args.hicache_mem_layout,
         )
         if isinstance(pool, MHATokenToKVPool):
             draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
@@ -1047,7 +1065,7 @@ class Scheduler(
             )
             return
 
-        self.tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+        tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
