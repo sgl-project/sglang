@@ -1482,7 +1482,7 @@ class Scheduler(
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (
                     GetLoadsReqInput,
-                    lambda req: self.get_loads(self.load_inquirer, req),
+                    lambda req: self.load_inquirer.get_loads(req),
                 ),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
@@ -2658,8 +2658,7 @@ class Scheduler(
             adder,
             self.running_batch.reqs,
             self.enable_priority_scheduling,
-            num_pending_tokens=self._get_num_pending_tokens(
-                self.load_inquirer,
+            num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
                     self.chunked_req.extend_input_len
                     if self.chunked_req is not None
