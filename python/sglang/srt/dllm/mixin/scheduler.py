@@ -89,7 +89,7 @@ class SchedulerDllmMixin:
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
 
-            self.stream_output(self.output_streamer, batch.reqs, batch.return_logprob)
+            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
