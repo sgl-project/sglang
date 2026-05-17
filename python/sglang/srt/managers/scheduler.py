@@ -22,7 +22,6 @@ import sys
 import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -40,7 +39,6 @@ from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -90,8 +88,6 @@ from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
-    BaseBatchReq,
-    BaseReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     CheckWeightsReqInput,
@@ -170,8 +166,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.dp_attn import (
     SchedulerDPAttnAdapter,
 )
+from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
+    create_scheduler_watchdog,
 )
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
@@ -187,6 +185,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
@@ -205,7 +204,12 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
-from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.managers.utils import (
+    EmbeddingBatchResult,
+    GenerationBatchResult,
+    is_health_check_generate_req,
+    validate_input_length,
+)
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -213,7 +217,6 @@ from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
-    real_time,
     set_schedule_time_batch,
     set_time_batch,
 )
@@ -224,6 +227,7 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -250,7 +254,6 @@ from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.watchdog import WatchdogRaw
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
@@ -271,92 +274,6 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
-
-
-@dataclass
-class EmbeddingBatchResult:
-    """Result from an embedding/classification forward pass.
-
-    Attributes:
-        embeddings: Model output — pooled embeddings or classification logits.
-        pooled_hidden_states: Raw hidden states before the task head.  Present
-            only when the batch contained ``return_pooled_hidden_states=True``
-            requests.  Tensor (uniform shapes) or list of tensors (MIS).
-        copy_done: CUDA event recorded after the async CPU copy completes.
-    """
-
-    embeddings: torch.Tensor
-    pooled_hidden_states: Optional[torch.Tensor] = None
-    copy_done: Optional[torch.cuda.Event] = None
-
-    def copy_to_cpu(self):
-        """Copy embeddings and pooled hidden states to CPU for overlap scheduling."""
-        if isinstance(self.embeddings, torch.Tensor):
-            self.copy_done = torch.get_device_module(self.embeddings.device).Event()
-            self.embeddings = self.embeddings.to("cpu", non_blocking=True)
-        else:
-            assert isinstance(self.embeddings, list)
-            if len(self.embeddings) == 0:
-                return
-
-            self.copy_done = torch.get_device_module(self.embeddings[0].device).Event()
-            self.embeddings = [
-                emb.to("cpu", non_blocking=True) for emb in self.embeddings
-            ]
-
-        if self.pooled_hidden_states is not None:
-            if isinstance(self.pooled_hidden_states, list):
-                self.pooled_hidden_states = [
-                    t.to("cpu", non_blocking=True) for t in self.pooled_hidden_states
-                ]
-            else:
-                self.pooled_hidden_states = self.pooled_hidden_states.to(
-                    "cpu", non_blocking=True
-                )
-
-        self.copy_done.record()
-
-
-def validate_dflash_request(req: Req) -> Optional[str]:
-    if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
-
-    if (
-        req.sampling_params.json_schema is not None
-        or req.sampling_params.regex is not None
-        or req.sampling_params.ebnf is not None
-        or req.sampling_params.structural_tag is not None
-    ):
-        return (
-            "DFLASH speculative decoding does not support "
-            "grammar-constrained decoding yet."
-        )
-
-    return None
-
-
-def create_scheduler_watchdog(
-    scheduler: "Scheduler", watchdog_timeout: float, soft: bool = False
-) -> WatchdogRaw:
-    def dump_info() -> str:
-        if scheduler.is_initializing:
-            return ""
-        _, messages = scheduler.invariant_checker._check_all_pools(
-            scheduler.pool_stats_observer.get_pool_stats(),
-        )
-        return (
-            f"{scheduler.cur_batch.batch_size()=}\n"
-            f"{scheduler.cur_batch.reqs=}\n" + "\n".join(messages)
-        )
-
-    return WatchdogRaw(
-        debug_name="Scheduler",
-        get_counter=lambda: scheduler.forward_ct,
-        is_active=lambda: scheduler.is_initializing or scheduler.cur_batch is not None,
-        watchdog_timeout=watchdog_timeout,
-        soft=soft,
-        dump_info=dump_info,
-    )
 
 
 class Scheduler(
@@ -3790,41 +3707,6 @@ class Scheduler(
         pass
 
 
-class IdleSleeper:
-    """
-    In setups which have long inactivity periods it is desirable to reduce
-    system power consumption when sglang does nothing. This would lead not only
-    to power savings, but also to more CPU thermal headroom when a request
-    eventually comes. This is important in cases when multiple GPUs are connected
-    as each GPU would otherwise pin one thread at 100% CPU usage.
-
-    The simplest solution is to use zmq.Poller on all sockets that may receive
-    data that needs handling immediately.
-    """
-
-    def __init__(self, sockets):
-        self.poller = zmq.Poller()
-        self.last_empty_time = real_time()
-        for s in sockets:
-            self.poller.register(s, zmq.POLLIN)
-
-        self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
-
-    def maybe_sleep(self):
-        self.poller.poll(1000)
-        if (
-            self.empty_cache_interval > 0
-            and real_time() - self.last_empty_time > self.empty_cache_interval
-        ):
-            self.last_empty_time = real_time()
-            current_platform.empty_cache()
-
-
-def is_health_check_generate_req(recv_req):
-    rid = getattr(recv_req, "rid", None)
-    return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
-
-
 def is_work_request(recv_req):
     return isinstance(
         recv_req,
@@ -3835,29 +3717,6 @@ def is_work_request(recv_req):
             BatchTokenizedEmbeddingReqInput,
         ),
     )
-
-
-class SenderWrapper:
-    def __init__(self, socket: zmq.Socket):
-        self.socket = socket
-
-    def send_output(
-        self,
-        output: Union[BaseReq, BaseBatchReq],
-        recv_obj: Optional[Union[BaseReq, BaseBatchReq]] = None,
-    ):
-        if self.socket is None:
-            return
-
-        if (
-            isinstance(recv_obj, BaseReq)
-            and recv_obj.http_worker_ipc is not None
-            and output.http_worker_ipc is None
-        ):
-            # handle communicator reqs for multi-http worker case
-            output.http_worker_ipc = recv_obj.http_worker_ipc
-
-        self.socket.send_pyobj(output)
 
 
 def dispatch_event_loop(scheduler: Scheduler):

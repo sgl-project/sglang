@@ -44,6 +44,10 @@ if TYPE_CHECKING:
         SchedulerOutputStreamer,
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
+    from sglang.srt.managers.utils import (
+        EmbeddingBatchResult,
+        GenerationBatchResult,
+    )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
