@@ -44,10 +44,6 @@ class LoRABatchInfo:
     # Used by lm_head LoRA to validate input shape without GPU sync.
     expected_tokens: Optional[int] = None
 
-    # CPU-side flag: True when at least one request uses a LoRA adapter.
-    # Computed from Python lists in prepare_lora_batch to avoid GPU sync.
-    has_active_lora: bool = False
-
     # Per-request segment indptrs, shape (bs + 1,). Required by MoE virtual
     # experts which map tokens to requests regardless of the dense-LoRA
     # backend's internal segmentation.  For the triton backend these are
