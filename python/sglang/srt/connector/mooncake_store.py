@@ -13,6 +13,51 @@ from sglang.srt.connector.utils import pull_files_from_db
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
+FILE_INDEX_KEY_PREFIX = "__index__"
+
+
+def _check_batch_get_results(
+    keys: List[str], results: List[int], tensor_sizes: List[int]
+) -> None:
+    if len(results) != len(keys):
+        raise RuntimeError(
+            "Mooncake batch_get_into returned %d results for %d keys"
+            % (len(results), len(keys))
+        )
+
+    failures = []
+    for key, result, tensor_size in zip(keys, results, tensor_sizes):
+        if result < 0:
+            failures.append(f"{key}: error={result}")
+        elif result != tensor_size:
+            failures.append(
+                f"{key}: expected {tensor_size} bytes, got {result}"
+            )
+
+    if failures:
+        raise RuntimeError(
+            "Mooncake batch_get_into failed for some tensors: "
+            + "; ".join(failures)
+        )
+
+
+def _check_batch_put_results(keys: List[str], results: List[int]) -> None:
+    if len(results) != len(keys):
+        raise RuntimeError(
+            "Mooncake batch_put_from returned %d results for %d keys"
+            % (len(results), len(keys))
+        )
+
+    failures = [
+        f"{key}: error={result}"
+        for key, result in zip(keys, results)
+        if result != 0
+    ]
+    if failures:
+        raise RuntimeError(
+            "Mooncake batch_put_from failed for some tensors: "
+            + "; ".join(failures)
+        )
 
 
 class MooncakeStoreConnector(BaseKVConnector):
@@ -80,6 +125,7 @@ class MooncakeStoreConnector(BaseKVConnector):
     def batch_get_into(self, keys: List[str], tensors: List[torch.Tensor]) -> None:
         tensor_ptrs = [tensor.data_ptr() for tensor in tensors]
         tensor_sizes = [tensor.untyped_storage().nbytes() for tensor in tensors]
+        full_keys = [f"{self.model_name}/{key}" for key in keys]
 
         for tensor in tensors:
             ret_code = self.store.register_buffer(
@@ -90,10 +136,8 @@ class MooncakeStoreConnector(BaseKVConnector):
                     f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
                 )
 
-        results = self.store.batch_get_into(
-            [f"{self.model_name}/{key}" for key in keys], tensor_ptrs, tensor_sizes
-        )
-        print(results)
+        results = self.store.batch_get_into(full_keys, tensor_ptrs, tensor_sizes)
+        _check_batch_get_results(full_keys, results, tensor_sizes)
 
     def get_into(self, key: str, tensor: torch.Tensor) -> None:
         tensor_size = tensor.untyped_storage().nbytes()
@@ -138,7 +182,7 @@ class MooncakeStoreConnector(BaseKVConnector):
         results = self.store.batch_put_from(
             keys, tensor_ptrs, tensor_sizes, self._rep_config
         )
-        print(results)
+        _check_batch_put_results(keys, results)
 
     def setstr(self, key: str, obj: str) -> None:
         ret_code = self.store.put(key, obj.encode("utf-8"), self._rep_config)
@@ -147,35 +191,27 @@ class MooncakeStoreConnector(BaseKVConnector):
                 f"Failed to put string key '{key}' into Mooncake store, error code: {ret_code}"
             )
 
+        prefix, _, _ = key.rpartition("/")
+        self._register_key_in_index(key, f"{prefix}/")
+
     def list(self, prefix: str) -> List[str]:
         """
         Mooncake store does not expose a native scan/list API, so we rely on
         a sentinel index key that stores a newline-separated list of keys
         written under that prefix.
         """
-        # index_key = f"__index__{prefix}"
-        # data = self.store.get(index_key)
-        # if data is None:
-        #     return []
-        # content = data.decode("utf-8").strip()
-        # if not content:
-        #     return []
-        # return content.split("\n")
-        return [
-            f"{prefix}{key}"
-            for key in [
-                "config.json",
-                "vocab.json",
-                "tokenizer_config.json",
-                "model.safetensors.index.json",
-                "generation_config.json",
-                "tokenizer.json",
-            ]
-        ]
+        index_key = f"{FILE_INDEX_KEY_PREFIX}{prefix}"
+        data = self.store.get(index_key)
+        if data is None:
+            return []
+        content = data.decode("utf-8").strip()
+        if not content:
+            return []
+        return content.split("\n")
 
     def _register_key_in_index(self, key: str, prefix: str) -> None:
         """Maintain a simple index for list() support."""
-        index_key = f"__index__{prefix}"
+        index_key = f"{FILE_INDEX_KEY_PREFIX}{prefix}"
         existing = self.store.get(index_key)
         if existing is None:
             keys_list = [key]
@@ -183,7 +219,13 @@ class MooncakeStoreConnector(BaseKVConnector):
             keys_list = existing.decode("utf-8").strip().split("\n")
             if key not in keys_list:
                 keys_list.append(key)
-        self.store.put(index_key, "\n".join(keys_list).encode("utf-8"))
+        ret_code = self.store.put(
+            index_key, "\n".join(keys_list).encode("utf-8"), self._rep_config
+        )
+        if ret_code != 0:
+            raise RuntimeError(
+                f"Failed to update Mooncake file index '{index_key}', error code: {ret_code}"
+            )
 
     # ------------------------------------------------------------------
     # BaseConnector interface
