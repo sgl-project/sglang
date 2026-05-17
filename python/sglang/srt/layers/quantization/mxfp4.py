@@ -164,8 +164,8 @@ def _patch_sm120_mxfp4_min_warps():
 
     import inspect
 
-    from triton_kernels.matmul_ogs_details.opt_flags_details import opt_flags_nvidia
-    from triton_kernels.tensor import get_layout
+    from triton_kernels.matmul_details.opt_flags_details import opt_flags_nvidia
+    from triton_kernels.tensor import Tensor
     from triton_kernels.tensor_details.layout import StridedLayout
 
     compute_num_warps = opt_flags_nvidia.compute_num_warps
@@ -176,13 +176,17 @@ def _patch_sm120_mxfp4_min_warps():
     ):
 
         def _compute_num_warps_sm120_mxfp4(
-            block_m, block_n, is_persistent, precision_config
+            block_m, block_n, is_persistent, precision_config, constraints
         ):
             selected_num_warps = compute_num_warps(
-                block_m, block_n, is_persistent, precision_config
+                block_m, block_n, is_persistent, precision_config, constraints
             )
-            weight_scale = getattr(precision_config, "weight_scale", None)
-            weight_scale_layout = get_layout(weight_scale)
+            weight_scale = getattr(precision_config, "b_mx_scale", None)
+            weight_scale_layout = (
+                weight_scale.storage.layout
+                if isinstance(weight_scale, Tensor)
+                else None
+            )
             if (
                 not is_persistent
                 and weight_scale is not None
@@ -202,7 +206,7 @@ def _patch_sm120_mxfp4_min_warps():
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
-    import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
+    import triton_kernels.matmul_details.opt_flags as opt_flags
     from triton_kernels.numerics import InFlexData
     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
     from triton_kernels.tensor_details import layout
@@ -821,7 +825,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.use_triton_kernels:
 
-            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+            from triton_kernels.matmul import FlexCtx, PrecisionConfig
 
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
             w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
@@ -839,10 +843,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             self.w13_precision_config = PrecisionConfig(
-                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
             )
             self.w2_precision_config = PrecisionConfig(
-                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
             )
 
             self.w13_weight_triton_tensor = w13_weight

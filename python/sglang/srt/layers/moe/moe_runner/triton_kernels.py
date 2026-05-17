@@ -19,12 +19,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
-    from triton_kernels.matmul_ogs import (
-        GatherIndx,
-        PrecisionConfig,
-        RoutingData,
-        ScatterIndx,
-    )
+    from triton_kernels.matmul import PrecisionConfig
+    from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
 
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
@@ -42,9 +38,11 @@ class TritonKernelsRunnerInput(RunnerInput):
     """Input bundle passed to the triton-kernels runner core."""
 
     hidden_states: torch.Tensor
-    routing_data: "RoutingData"
-    gather_indx: "GatherIndx"
-    scatter_indx: "ScatterIndx"
+    a_ragged_metadata: "RaggedTensorMetadata"
+    gather_indx: torch.Tensor
+    scatter_indx: torch.Tensor
+    gate_scal: torch.Tensor
+    n_expts_act: int
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -102,9 +100,11 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
         hidden_states = runner_input.hidden_states
 
         common_kwargs = dict(
-            routing_data=runner_input.routing_data,
+            a_ragged_metadata=runner_input.a_ragged_metadata,
             gather_indx=runner_input.gather_indx,
             scatter_indx=None if self.config.no_combine else runner_input.scatter_indx,
+            gate_scal=runner_input.gate_scal,
+            n_expts_act=runner_input.n_expts_act,
             inplace=False,
             activation=self.config.activation,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
@@ -172,13 +172,15 @@ def pre_permute_standard_to_triton_kernels(
         topk_output
     ), "Triton-kernel runner expects TritonKernelTopKOutput"
 
-    routing_data, gather_indx, scatter_indx = topk_output
+    a_ragged_metadata, gather_indx, scatter_indx, gate_scal, n_expts_act = topk_output
 
     return TritonKernelsRunnerInput(
         hidden_states=hidden_states,
-        routing_data=routing_data,
+        a_ragged_metadata=a_ragged_metadata,
         gather_indx=gather_indx,
         scatter_indx=scatter_indx,
+        gate_scal=gate_scal,
+        n_expts_act=n_expts_act,
     )
 
 
