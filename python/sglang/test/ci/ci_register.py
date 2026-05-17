@@ -17,7 +17,7 @@ __all__ = [
 ]
 
 # `suite` stays in positional slot 2 for backward compat with existing
-# `register_cpu_ci(5, "stage-a-test-cpu")` style positional calls. New fields
+# `register_cpu_ci(5, "base-a-test-cpu")` style positional calls. New fields
 # (`stage`, `runner_config`) are kwarg-only.
 _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
 _KWARG_ONLY = ("stage", "runner_config")
