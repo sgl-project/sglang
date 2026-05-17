@@ -185,6 +185,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -998,37 +999,12 @@ class Scheduler(
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
-    @staticmethod
-    def get_draft_kv_pool(
-        *,
-        draft_worker: "BaseTpWorker",
-        spec_algorithm: SpeculativeAlgorithm,
-        server_args: ServerArgs,
-        enable_overlap: bool,
-    ):
-        """Return (draft_token_to_kv_pool, draft_model_config) for the current
-        draft worker, or (None, None) when no draft KV pool is available."""
-        if draft_worker is None or spec_algorithm.is_ngram():
-            return None, None
-
-        if spec_algorithm.supports_spec_v2() and enable_overlap:
-            if server_args.enable_multi_layer_eagle:
-                draft_runner = draft_worker.draft_worker.draft_runner_list[0]
-            else:
-                draft_runner = draft_worker.draft_worker.draft_runner
-            return draft_runner.token_to_kv_pool, draft_runner.model_config
-
-        return (
-            draft_worker.model_runner.token_to_kv_pool,
-            draft_worker.model_config,
-        )
-
     def _maybe_register_hicache_draft(self) -> None:
         """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
         if not self.enable_hierarchical_cache:
             return
 
-        draft_kv_pool, _ = Scheduler.get_draft_kv_pool(
+        draft_kv_pool, _ = kv_cache_builder.get_draft_kv_pool(
             draft_worker=self.draft_worker,
             spec_algorithm=self.spec_algorithm,
             server_args=self.server_args,
@@ -1228,7 +1204,7 @@ class Scheduler(
         )
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-        draft_token_to_kv_pool, model_config = Scheduler.get_draft_kv_pool(
+        draft_token_to_kv_pool, model_config = kv_cache_builder.get_draft_kv_pool(
             draft_worker=self.draft_worker,
             spec_algorithm=self.spec_algorithm,
             server_args=self.server_args,
