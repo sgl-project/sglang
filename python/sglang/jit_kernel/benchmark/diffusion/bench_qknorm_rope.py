@@ -37,6 +37,13 @@ BENCH_CASES = (
     # Z-Image-Turbo default 1024x1024 config: dim=3840, num_heads=30 -> head_dim=128.
     CaseSpec("zimage_1024", 1, 4096, 30, 128, 128, False),
     CaseSpec("batch2_medium", 2, 2048, 24, 128, 128, False),
+    # HunyuanVideo: num_heads=24, attention_head_dim=128, rope_axes_dim
+    # sums to 128 (16 + 56 + 56). Token counts cover the image-stream
+    # input to a single attention call for a short-clip / medium-clip
+    # configuration. The text-stream (~256 tokens, no RoPE) is covered
+    # by bench_qknorm.py.
+    CaseSpec("hunyuanvideo_short", 1, 8192, 24, 128, 128, False),
+    CaseSpec("hunyuanvideo_medium", 1, 24576, 24, 128, 128, False),
 )
 CASE_BY_NAME = {case.name: case for case in BENCH_CASES}
 CASE_NAMES = get_benchmark_range(
