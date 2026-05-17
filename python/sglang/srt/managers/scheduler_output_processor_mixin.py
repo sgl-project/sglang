@@ -340,7 +340,9 @@ class SchedulerOutputProcessorMixin:
                                 )
                             logprob_pt += num_input_logprobs
 
-                    req.time_stats.set_last_chunked_prefill_finish_time()
+                    req.time_stats.set_last_chunked_prefill_finish_time(
+                        attrs={"chunked_prefill_remaining": req.is_chunked}
+                    )
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -394,7 +396,9 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
-                    req.time_stats.set_last_chunked_prefill_finish_time()
+                    req.time_stats.set_last_chunked_prefill_finish_time(
+                        attrs={"chunked_prefill_remaining": req.is_chunked}
+                    )
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 

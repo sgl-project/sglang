@@ -584,7 +584,12 @@ class SchedulerDisaggregationPrefillMixin:
 
                 if self.enable_overlap:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
-                req.time_stats.set_last_chunked_prefill_finish_time()
+                req.time_stats.set_last_chunked_prefill_finish_time(
+                    attrs={
+                        "chunked_prefill_remaining": req.is_chunked,
+                        "chunked_prefill_end_index": req.tmp_end_idx,
+                    }
+                )
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
