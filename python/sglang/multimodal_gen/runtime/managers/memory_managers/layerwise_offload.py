@@ -518,7 +518,7 @@ class LayerwiseOffloadManager:
                 if i == 0:
                     self.prepare_for_next_req(non_blocking=False)
                 if i not in self._gpu_layers:
-                    # some models execute ModuleList entries in reverse or custom order
+                    # LTX audio VAE traverses decoder.up in reverse order
                     self.prefetch_layer(i, non_blocking=False)
                 if i in self._prefetch_events:
                     torch.get_device_module().current_stream().wait_event(
