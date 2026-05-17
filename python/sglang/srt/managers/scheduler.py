@@ -331,8 +331,7 @@ def create_scheduler_watchdog(
     def dump_info() -> str:
         if scheduler.is_initializing:
             return ""
-        _, messages = scheduler._check_all_pools(
-            scheduler.invariant_checker,
+        _, messages = scheduler.invariant_checker._check_all_pools(
             scheduler.pool_stats_observer.get_pool_stats(),
         )
         return (
@@ -1523,7 +1522,7 @@ class Scheduler(
             # Update last_batch
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.self_check_during_busy(self.invariant_checker)
+                self.invariant_checker.self_check_during_busy()
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -1578,7 +1577,7 @@ class Scheduler(
             self.last_batch = batch
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.self_check_during_busy(self.invariant_checker)
+                self.invariant_checker.self_check_during_busy()
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
@@ -3105,16 +3104,15 @@ class Scheduler(
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:
-            has_leak, messages = self._check_all_pools(
-                self.invariant_checker,
+            has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
             )
             if has_leak:
-                self._report_leak(self.invariant_checker, "pool", "\n".join(messages))
-            self._check_req_pool(self.invariant_checker)
+                self.invariant_checker._report_leak("pool", "\n".join(messages))
+            self.invariant_checker._check_req_pool()
 
         # tree cache sanity check
-        self._check_tree_cache(self.invariant_checker)
+        self.invariant_checker._check_tree_cache()
 
         # metrics every 30s
         self._maybe_log_idle_metrics()
