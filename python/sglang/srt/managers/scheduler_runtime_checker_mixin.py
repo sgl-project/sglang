@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.observability.metrics_collector import QueueCount
+from sglang.srt.observability.metrics_collector import (
+    QueueCount,
+    compute_normalized_queue_pressure,
+)
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
 from sglang.srt.utils.watchdog import WatchdogRaw
 
@@ -523,6 +526,11 @@ class SchedulerRuntimeCheckerMixin:
         self.stats.num_queue_reqs = QueueCount.from_reqs(
             self.waiting_queue, priority_enabled
         )
+        self.stats.scheduler_queue_pressure_capacity = (
+            compute_normalized_queue_pressure(
+                self.stats.num_queue_reqs.total, self.max_running_requests
+            )
+        )
         self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
@@ -531,6 +539,10 @@ class SchedulerRuntimeCheckerMixin:
             self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
                 self.disagg_prefill_inflight_queue, priority_enabled
             )
+            deferred_queue_reqs = (
+                self.stats.num_prefill_bootstrap_queue_reqs.total
+                + self.stats.num_prefill_inflight_queue_reqs.total
+            )
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
                 self.disagg_decode_prealloc_queue.queue, priority_enabled
@@ -538,6 +550,21 @@ class SchedulerRuntimeCheckerMixin:
             self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                 self.disagg_decode_transfer_queue.queue, priority_enabled
             )
+            deferred_queue_reqs = (
+                self.stats.num_decode_prealloc_queue_reqs.total
+                + self.stats.num_decode_transfer_queue_reqs.total
+                + len(self.disagg_decode_prealloc_queue.retracted_queue)
+            )
+        if self.disaggregation_mode not in (
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.DECODE,
+        ):
+            deferred_queue_reqs = 0
+        self.stats.scheduler_queue_pressure_deferred = (
+            compute_normalized_queue_pressure(
+                deferred_queue_reqs, self.max_running_requests
+            )
+        )
         self.metrics_collector.log_stats(self.stats)
 
     def _check_tree_cache(self: Scheduler):

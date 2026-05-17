@@ -65,6 +65,8 @@ class SchedulerStats:
     # Basics
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    scheduler_queue_pressure_capacity: float = 0.0
+    scheduler_queue_pressure_deferred: float = 0.0
     num_grammar_queue_reqs: int = 0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
@@ -162,6 +164,13 @@ def compute_routing_key_stats(routing_keys: List[Optional[str]]) -> tuple:
     return len(key_counts), list(key_counts.values())
 
 
+def compute_normalized_queue_pressure(queued_reqs: int, capacity: int) -> float:
+    """Returns queue pressure normalized by configured capacity."""
+    if capacity <= 0:
+        return 0.0
+    return queued_reqs / capacity
+
+
 @dataclass
 class DPCooperationInfo:
     # Users can derive that, except for cases with idle, num_decode_ranks=world_size-num_prefill_ranks
@@ -215,6 +224,17 @@ class SchedulerMetricsCollector:
             name="sglang:num_queue_reqs",
             documentation="The number of requests in the waiting queue.",
             labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.scheduler_queue_pressure = Gauge(
+            name="sglang:scheduler_queue_pressure",
+            documentation=(
+                "Normalized scheduler queue pressure, computed as queued requests "
+                "divided by configured max_running_requests. "
+                "reason=capacity tracks the main waiting queue; reason=deferred tracks "
+                "secondary disaggregation queues."
+            ),
+            labelnames=list(labels.keys()) + ["reason"],
             multiprocess_mode="mostrecent",
         )
         self.num_grammar_queue_reqs = Gauge(
@@ -956,6 +976,13 @@ class SchedulerMetricsCollector:
                 labels["priority"] = str(priority)
                 gauge.labels(**labels).set(value)
 
+    def _log_gauge_with_reason(
+        self, gauge: Gauge, reason: str, data: Union[int, float]
+    ) -> None:
+        labels = dict(self.labels)
+        labels["reason"] = reason
+        gauge.labels(**labels).set(data)
+
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
 
@@ -1107,6 +1134,16 @@ class SchedulerMetricsCollector:
         # Basics
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
+        self._log_gauge_with_reason(
+            self.scheduler_queue_pressure,
+            "capacity",
+            stats.scheduler_queue_pressure_capacity,
+        )
+        self._log_gauge_with_reason(
+            self.scheduler_queue_pressure,
+            "deferred",
+            stats.scheduler_queue_pressure_deferred,
+        )
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)

@@ -8,6 +8,7 @@ from prometheus_client.samples import Sample
 from sglang.srt.environ import envs
 from sglang.srt.observability.metrics_collector import (
     ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
+    compute_normalized_queue_pressure,
     compute_routing_key_stats,
 )
 from sglang.srt.utils import kill_process_tree
@@ -162,6 +163,7 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:token_usage",
             "sglang:gen_throughput",
             "sglang:num_queue_reqs",
+            "sglang:scheduler_queue_pressure",
             "sglang:num_grammar_queue_reqs",
             "sglang:cache_hit_rate",
             "sglang:spec_accept_length",
@@ -216,6 +218,13 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
+
+        pressure_reasons = {
+            sample.labels.get("reason")
+            for sample in metrics["sglang:scheduler_queue_pressure"]
+        }
+        self.assertIn("capacity", pressure_reasons)
+        self.assertIn("deferred", pressure_reasons)
 
         if expect_mfu_metrics:
             # Estimated perf metrics may have multiple series (e.g., by rank). Ensure
@@ -300,6 +309,13 @@ class TestComputeRoutingKeyStats(unittest.TestCase):
         num_unique, req_counts = compute_routing_key_stats(routing_keys)
         self.assertEqual(num_unique, 4)
         self.assertEqual(sorted(req_counts), [1, 5, 15, 250])
+
+
+class TestComputeNormalizedQueuePressure(unittest.TestCase):
+    def test_normalized_queue_pressure(self):
+        self.assertEqual(compute_normalized_queue_pressure(5, 10), 0.5)
+        self.assertEqual(compute_normalized_queue_pressure(0, 10), 0.0)
+        self.assertEqual(compute_normalized_queue_pressure(7, 0), 0.0)
 
 
 if __name__ == "__main__":
