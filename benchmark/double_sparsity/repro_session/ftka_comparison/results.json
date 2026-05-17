@@ -8,11 +8,11 @@
       "version": "0.6.11.post1"
     },
     "ftka": {
-      "available": false,
-      "version": "",
-      "installed_commit": "",
+      "available": true,
+      "version": "<unknown>",
+      "installed_commit": "<unknown>",
       "target_commit": "d8803b29961c44d77a747636ad4282bd7a9094af",
-      "skip_reason": "ftka package not installed"
+      "skip_reason": ""
     },
     "n_shapes": 76
   },
@@ -29,8 +29,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 93.39971467852592,
-      "score_us": 18.5241736471653,
+      "mean_us": 92.07712486386299,
+      "score_us": 19.122883677482605,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -49,8 +49,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 74.16348904371262,
-      "score_us": 18.5241736471653,
+      "mean_us": 74.95172321796417,
+      "score_us": 19.122883677482605,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -68,14 +68,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.5241736471653,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 30.045285820961,
+      "score_us": 19.122883677482605,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -88,14 +88,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -109,8 +109,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.50313383340836,
-      "score_us": 18.835030496120453,
+      "mean_us": 91.63491427898407,
+      "score_us": 18.64902675151825,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -129,8 +129,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 74.08004254102707,
-      "score_us": 18.835030496120453,
+      "mean_us": 79.14921268820763,
+      "score_us": 18.64902675151825,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -148,14 +148,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.835030496120453,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 33.99644047021866,
+      "score_us": 18.64902675151825,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -168,14 +168,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -189,8 +189,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.05429393053055,
-      "score_us": 18.117856234312057,
+      "mean_us": 88.37955072522163,
+      "score_us": 18.775537610054016,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -209,8 +209,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 74.24507290124893,
-      "score_us": 18.117856234312057,
+      "mean_us": 73.72839376330376,
+      "score_us": 18.775537610054016,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -228,14 +228,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.117856234312057,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 37.47876733541489,
+      "score_us": 18.775537610054016,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -248,14 +248,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -269,8 +269,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 93.58298033475876,
-      "score_us": 18.56677234172821,
+      "mean_us": 89.06984701752663,
+      "score_us": 18.74467357993126,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -290,7 +290,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.56677234172821,
+      "score_us": 18.74467357993126,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -308,14 +308,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.56677234172821,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 39.75456580519676,
+      "score_us": 18.74467357993126,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -328,14 +328,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -349,8 +349,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 92.54299104213715,
-      "score_us": 18.75445246696472,
+      "mean_us": 88.42671290040016,
+      "score_us": 18.351469188928604,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -370,7 +370,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.75445246696472,
+      "score_us": 18.351469188928604,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -388,14 +388,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.75445246696472,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 43.39102655649185,
+      "score_us": 18.351469188928604,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -408,14 +408,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -429,8 +429,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.55961093306541,
-      "score_us": 18.39989796280861,
+      "mean_us": 89.0156626701355,
+      "score_us": 18.639210611581802,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -449,8 +449,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.80843162536621,
-      "score_us": 18.39989796280861,
+      "mean_us": 73.69495928287506,
+      "score_us": 18.639210611581802,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -468,14 +468,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.39989796280861,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 31.434204429388046,
+      "score_us": 18.639210611581802,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -488,14 +488,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -509,8 +509,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.34697136282921,
-      "score_us": 18.614381551742554,
+      "mean_us": 88.85884657502174,
+      "score_us": 18.512476235628128,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -529,8 +529,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.5168531537056,
-      "score_us": 18.614381551742554,
+      "mean_us": 74.93734359741211,
+      "score_us": 18.512476235628128,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -548,14 +548,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.614381551742554,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 33.7790884077549,
+      "score_us": 18.512476235628128,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -568,14 +568,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -589,8 +589,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.66293185949326,
-      "score_us": 18.593352288007736,
+      "mean_us": 89.02061730623245,
+      "score_us": 18.583033233880997,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -609,8 +609,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.79520684480667,
-      "score_us": 18.593352288007736,
+      "mean_us": 74.02995601296425,
+      "score_us": 18.583033233880997,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -628,14 +628,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.593352288007736,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 37.54597157239914,
+      "score_us": 18.583033233880997,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -648,14 +648,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -669,8 +669,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.40530940890312,
-      "score_us": 18.528252840042114,
+      "mean_us": 88.20794522762299,
+      "score_us": 18.458310514688492,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -690,7 +690,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.528252840042114,
+      "score_us": 18.458310514688492,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -708,14 +708,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.528252840042114,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 39.95753824710846,
+      "score_us": 18.458310514688492,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -728,14 +728,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -749,8 +749,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.58159014582634,
-      "score_us": 18.21262761950493,
+      "mean_us": 88.17953988909721,
+      "score_us": 18.42312514781952,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -770,7 +770,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.21262761950493,
+      "score_us": 18.42312514781952,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -788,14 +788,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.21262761950493,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 42.9801270365715,
+      "score_us": 18.42312514781952,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -808,14 +808,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -829,8 +829,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.29781445860863,
-      "score_us": 18.096361309289932,
+      "mean_us": 89.19516578316689,
+      "score_us": 18.646959215402603,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -849,8 +849,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 103.39213535189629,
-      "score_us": 18.096361309289932,
+      "mean_us": 73.8774798810482,
+      "score_us": 18.646959215402603,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -868,14 +868,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.096361309289932,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 31.15635365247726,
+      "score_us": 18.646959215402603,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -888,14 +888,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -909,8 +909,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.3128832578659,
-      "score_us": 18.25392246246338,
+      "mean_us": 89.45122361183167,
+      "score_us": 18.434152007102966,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -929,8 +929,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.90238344669342,
-      "score_us": 18.25392246246338,
+      "mean_us": 73.6665166914463,
+      "score_us": 18.434152007102966,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -948,14 +948,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.25392246246338,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 33.704973757267,
+      "score_us": 18.434152007102966,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -968,14 +968,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -989,8 +989,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.20371362566948,
-      "score_us": 18.132254481315613,
+      "mean_us": 89.38029408454895,
+      "score_us": 18.722452223300934,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1009,8 +1009,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.60480725765228,
-      "score_us": 18.132254481315613,
+      "mean_us": 74.07506927847862,
+      "score_us": 18.722452223300934,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1028,14 +1028,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.132254481315613,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 37.84053027629852,
+      "score_us": 18.722452223300934,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -1048,14 +1048,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -1069,8 +1069,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.59717878699303,
-      "score_us": 18.303655087947845,
+      "mean_us": 89.06025439500809,
+      "score_us": 33.72896462678909,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1090,7 +1090,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.303655087947845,
+      "score_us": 33.72896462678909,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -1108,14 +1108,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.303655087947845,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 40.58847203850746,
+      "score_us": 33.72896462678909,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -1128,14 +1128,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -1149,8 +1149,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.24765342473984,
-      "score_us": 18.072612583637238,
+      "mean_us": 89.2634317278862,
+      "score_us": 18.460508435964584,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1170,7 +1170,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.072612583637238,
+      "score_us": 18.460508435964584,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -1188,14 +1188,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.072612583637238,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 43.04610192775726,
+      "score_us": 18.460508435964584,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -1208,14 +1208,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -1229,8 +1229,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 91.12605825066566,
-      "score_us": 18.441807478666306,
+      "mean_us": 88.9798067510128,
+      "score_us": 18.74854788184166,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1249,8 +1249,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.08658212423325,
-      "score_us": 18.441807478666306,
+      "mean_us": 74.18259978294373,
+      "score_us": 18.74854788184166,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1268,14 +1268,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.441807478666306,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 31.633190810680386,
+      "score_us": 18.74854788184166,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -1288,14 +1288,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -1309,8 +1309,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.6802730858326,
-      "score_us": 18.380675464868546,
+      "mean_us": 88.57341483235359,
+      "score_us": 18.445495516061783,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1329,8 +1329,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 74.12310689687729,
-      "score_us": 18.380675464868546,
+      "mean_us": 73.51463660597801,
+      "score_us": 18.445495516061783,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1348,14 +1348,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.380675464868546,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 34.20179709792137,
+      "score_us": 18.445495516061783,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -1368,14 +1368,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -1389,8 +1389,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.65488523244858,
-      "score_us": 18.25481653213501,
+      "mean_us": 89.1205482184887,
+      "score_us": 18.771812319755554,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1409,8 +1409,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 74.40544664859772,
-      "score_us": 18.25481653213501,
+      "mean_us": 73.43798875808716,
+      "score_us": 18.771812319755554,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1428,14 +1428,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.25481653213501,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 37.83009946346283,
+      "score_us": 18.771812319755554,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -1448,14 +1448,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -1469,8 +1469,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.3075747191906,
-      "score_us": 18.15788447856903,
+      "mean_us": 88.87309581041336,
+      "score_us": 18.320586532354355,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1490,7 +1490,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.15788447856903,
+      "score_us": 18.320586532354355,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -1508,14 +1508,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.15788447856903,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 40.615200996398926,
+      "score_us": 18.320586532354355,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -1528,14 +1528,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -1549,8 +1549,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.5984453856945,
-      "score_us": 18.311887979507446,
+      "mean_us": 88.73960003256798,
+      "score_us": 18.480997532606125,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1570,7 +1570,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.311887979507446,
+      "score_us": 18.480997532606125,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -1588,14 +1588,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.311887979507446,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 44.54204812645912,
+      "score_us": 18.480997532606125,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -1608,14 +1608,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -1629,8 +1629,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.93737399578094,
-      "score_us": 18.472615629434586,
+      "mean_us": 89.23139423131943,
+      "score_us": 18.651969730854034,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1649,8 +1649,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.71213287115097,
-      "score_us": 18.472615629434586,
+      "mean_us": 74.10723716020584,
+      "score_us": 18.651969730854034,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1668,14 +1668,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.472615629434586,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 31.5200537443161,
+      "score_us": 18.651969730854034,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -1688,14 +1688,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -1709,8 +1709,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.73918855190277,
-      "score_us": 18.562953919172287,
+      "mean_us": 88.7330062687397,
+      "score_us": 18.86848360300064,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1729,8 +1729,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.75108078122139,
-      "score_us": 18.562953919172287,
+      "mean_us": 73.63332435488701,
+      "score_us": 18.86848360300064,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1748,14 +1748,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.562953919172287,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 34.713298082351685,
+      "score_us": 18.86848360300064,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -1768,14 +1768,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -1789,8 +1789,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.32182395458221,
-      "score_us": 18.45983788371086,
+      "mean_us": 89.1217403113842,
+      "score_us": 18.681474030017853,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1809,8 +1809,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.96489381790161,
-      "score_us": 18.45983788371086,
+      "mean_us": 73.794424533844,
+      "score_us": 18.681474030017853,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1828,14 +1828,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.45983788371086,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 38.199182599782944,
+      "score_us": 18.681474030017853,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -1848,14 +1848,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -1869,8 +1869,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.46759456396103,
-      "score_us": 18.600579351186752,
+      "mean_us": 88.55508640408516,
+      "score_us": 18.66467297077179,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1890,7 +1890,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.600579351186752,
+      "score_us": 18.66467297077179,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -1908,14 +1908,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.600579351186752,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 41.29977896809578,
+      "score_us": 18.66467297077179,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -1928,14 +1928,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -1949,8 +1949,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.85674008727074,
-      "score_us": 18.592532724142075,
+      "mean_us": 88.90120312571526,
+      "score_us": 20.126011222600937,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -1970,7 +1970,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.592532724142075,
+      "score_us": 20.126011222600937,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -1988,14 +1988,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.592532724142075,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 45.054685324430466,
+      "score_us": 20.126011222600937,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2008,14 +2008,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2029,8 +2029,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 88.39299902319908,
-      "score_us": 18.204879015684128,
+      "mean_us": 87.64596655964851,
+      "score_us": 18.383581191301346,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2049,8 +2049,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.60521703958511,
-      "score_us": 18.204879015684128,
+      "mean_us": 72.9568861424923,
+      "score_us": 18.383581191301346,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2068,14 +2068,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.204879015684128,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 73.99206981062889,
+      "score_us": 18.383581191301346,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2088,14 +2088,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2109,8 +2109,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.07241746783257,
-      "score_us": 18.15466210246086,
+      "mean_us": 88.35691958665848,
+      "score_us": 18.37562769651413,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2129,8 +2129,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 72.99859076738358,
-      "score_us": 18.15466210246086,
+      "mean_us": 72.98551499843597,
+      "score_us": 18.37562769651413,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2148,14 +2148,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.15466210246086,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 80.13682439923286,
+      "score_us": 18.37562769651413,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2168,14 +2168,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2189,8 +2189,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.4571840763092,
-      "score_us": 18.263179808855057,
+      "mean_us": 88.66827934980392,
+      "score_us": 18.74985173344612,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2209,8 +2209,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.00648838281631,
-      "score_us": 18.263179808855057,
+      "mean_us": 73.22058081626892,
+      "score_us": 18.74985173344612,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2228,14 +2228,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.263179808855057,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 88.72225880622864,
+      "score_us": 18.74985173344612,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2248,14 +2248,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2269,8 +2269,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 88.99901062250137,
-      "score_us": 18.215477466583252,
+      "mean_us": 88.49643170833588,
+      "score_us": 18.679331988096237,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2290,7 +2290,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.215477466583252,
+      "score_us": 18.679331988096237,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -2308,14 +2308,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.215477466583252,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 96.90359234809875,
+      "score_us": 18.679331988096237,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2328,14 +2328,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2349,8 +2349,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 88.81626650691032,
-      "score_us": 18.321219831705093,
+      "mean_us": 88.11401203274727,
+      "score_us": 18.408000469207764,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2370,7 +2370,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.321219831705093,
+      "score_us": 18.408000469207764,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -2388,14 +2388,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.321219831705093,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 102.30492800474167,
+      "score_us": 18.408000469207764,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2408,14 +2408,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2429,8 +2429,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 88.60655128955841,
-      "score_us": 17.98117533326149,
+      "mean_us": 87.6861996948719,
+      "score_us": 18.2989239692688,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2449,8 +2449,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 74.07166063785553,
-      "score_us": 17.98117533326149,
+      "mean_us": 73.71289655566216,
+      "score_us": 18.2989239692688,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2468,14 +2468,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 17.98117533326149,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 73.52212443947792,
+      "score_us": 18.2989239692688,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2488,14 +2488,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2509,8 +2509,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.36233818531036,
-      "score_us": 18.077343702316284,
+      "mean_us": 88.55190128087997,
+      "score_us": 18.622837960720062,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2529,8 +2529,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.94593209028244,
-      "score_us": 18.077343702316284,
+      "mean_us": 74.41548630595207,
+      "score_us": 18.622837960720062,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2548,14 +2548,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.077343702316284,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 80.43086156249046,
+      "score_us": 18.622837960720062,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2568,14 +2568,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2589,8 +2589,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.15729820728302,
-      "score_us": 18.12206581234932,
+      "mean_us": 88.26740086078644,
+      "score_us": 18.769707530736923,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2609,8 +2609,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 72.7902539074421,
-      "score_us": 18.12206581234932,
+      "mean_us": 73.67022335529327,
+      "score_us": 18.769707530736923,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2628,14 +2628,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.12206581234932,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 88.4057767689228,
+      "score_us": 18.769707530736923,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2648,14 +2648,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2669,8 +2669,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.18382227420807,
-      "score_us": 18.27748492360115,
+      "mean_us": 88.58148008584976,
+      "score_us": 18.136929720640182,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2690,7 +2690,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.27748492360115,
+      "score_us": 18.136929720640182,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -2708,14 +2708,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.27748492360115,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 96.84856981039047,
+      "score_us": 18.136929720640182,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2728,14 +2728,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2749,8 +2749,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.43118155002594,
-      "score_us": 18.28506588935852,
+      "mean_us": 88.21746334433556,
+      "score_us": 18.566381186246872,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2770,7 +2770,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.28506588935852,
+      "score_us": 18.566381186246872,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -2788,14 +2788,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.28506588935852,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 102.41659358143806,
+      "score_us": 18.566381186246872,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2808,14 +2808,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2829,8 +2829,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.74691852927208,
-      "score_us": 18.256865441799164,
+      "mean_us": 88.94231170415878,
+      "score_us": 18.327515572309494,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2849,8 +2849,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.81012663245201,
-      "score_us": 18.256865441799164,
+      "mean_us": 73.19370284676552,
+      "score_us": 18.327515572309494,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2868,14 +2868,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.256865441799164,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 74.90403950214386,
+      "score_us": 18.327515572309494,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2888,14 +2888,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2909,8 +2909,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.92809802293777,
-      "score_us": 18.144473433494568,
+      "mean_us": 88.74243125319481,
+      "score_us": 18.66806298494339,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2929,8 +2929,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.9486888051033,
-      "score_us": 18.144473433494568,
+      "mean_us": 73.74608889222145,
+      "score_us": 18.66806298494339,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -2948,14 +2948,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.144473433494568,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 82.03554898500443,
+      "score_us": 18.66806298494339,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -2968,14 +2968,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -2989,8 +2989,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.84455838799477,
-      "score_us": 18.272437155246735,
+      "mean_us": 89.17897939682007,
+      "score_us": 18.970482051372528,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3009,8 +3009,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.42498749494553,
-      "score_us": 18.272437155246735,
+      "mean_us": 73.80813360214233,
+      "score_us": 18.970482051372528,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3028,14 +3028,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.272437155246735,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 90.00368416309357,
+      "score_us": 18.970482051372528,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -3048,14 +3048,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -3069,8 +3069,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.14621376991272,
-      "score_us": 18.58765259385109,
+      "mean_us": 88.8342410326004,
+      "score_us": 18.29022541642189,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3090,7 +3090,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.58765259385109,
+      "score_us": 18.29022541642189,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -3108,14 +3108,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.58765259385109,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 98.77486154437065,
+      "score_us": 18.29022541642189,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -3128,14 +3128,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -3149,8 +3149,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.09122848510742,
-      "score_us": 18.59065145254135,
+      "mean_us": 88.95643055438995,
+      "score_us": 18.21005716919899,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3170,7 +3170,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.59065145254135,
+      "score_us": 18.21005716919899,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -3188,14 +3188,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.59065145254135,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 102.26534679532051,
+      "score_us": 18.21005716919899,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -3208,14 +3208,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -3229,8 +3229,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.64575827121735,
-      "score_us": 18.5232050716877,
+      "mean_us": 88.41179311275482,
+      "score_us": 18.776487559080124,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3249,8 +3249,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.17140698432922,
-      "score_us": 18.5232050716877,
+      "mean_us": 73.67551326751709,
+      "score_us": 18.776487559080124,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3268,14 +3268,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.5232050716877,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 76.02393627166748,
+      "score_us": 18.776487559080124,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -3288,14 +3288,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -3309,8 +3309,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.622363448143,
-      "score_us": 18.580500036478043,
+      "mean_us": 88.09912949800491,
+      "score_us": 18.672756850719452,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3329,8 +3329,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.75851273536682,
-      "score_us": 18.580500036478043,
+      "mean_us": 74.12882521748543,
+      "score_us": 18.672756850719452,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3348,14 +3348,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.580500036478043,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 81.88487961888313,
+      "score_us": 18.672756850719452,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -3368,14 +3368,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -3389,8 +3389,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.36205878853798,
-      "score_us": 18.60152930021286,
+      "mean_us": 88.37360888719559,
+      "score_us": 18.502045422792435,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3409,8 +3409,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.80306720733643,
-      "score_us": 18.60152930021286,
+      "mean_us": 73.63667711615562,
+      "score_us": 18.502045422792435,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3428,14 +3428,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.60152930021286,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 90.32206609845161,
+      "score_us": 18.502045422792435,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -3448,14 +3448,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -3469,8 +3469,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.74460884928703,
-      "score_us": 18.450915813446045,
+      "mean_us": 88.45100179314613,
+      "score_us": 18.371790647506714,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3490,7 +3490,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.450915813446045,
+      "score_us": 18.371790647506714,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -3508,14 +3508,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.450915813446045,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 99.15990754961967,
+      "score_us": 18.371790647506714,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -3528,14 +3528,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -3549,8 +3549,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 91.73348546028137,
-      "score_us": 18.53024587035179,
+      "mean_us": 89.00890126824379,
+      "score_us": 18.511395901441574,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3570,7 +3570,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.53024587035179,
+      "score_us": 18.511395901441574,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -3588,14 +3588,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.53024587035179,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 104.14106771349907,
+      "score_us": 18.511395901441574,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -3608,14 +3608,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -3629,8 +3629,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 92.77841076254845,
-      "score_us": 32.1521982550621,
+      "mean_us": 90.38524702191353,
+      "score_us": 32.034534960985184,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3649,8 +3649,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.81521165370941,
-      "score_us": 32.1521982550621,
+      "mean_us": 74.24263283610344,
+      "score_us": 32.034534960985184,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3668,14 +3668,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 32.1521982550621,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 77.99262180924416,
+      "score_us": 32.034534960985184,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -3688,14 +3688,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -3709,8 +3709,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 93.66340935230255,
-      "score_us": 32.108500599861145,
+      "mean_us": 90.73834866285324,
+      "score_us": 32.015033066272736,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3729,8 +3729,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.86786863207817,
-      "score_us": 32.108500599861145,
+      "mean_us": 74.01609793305397,
+      "score_us": 32.015033066272736,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3748,14 +3748,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 32.108500599861145,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 84.91253480315208,
+      "score_us": 32.015033066272736,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -3768,14 +3768,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -3789,8 +3789,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 94.83497589826584,
-      "score_us": 32.1817584335804,
+      "mean_us": 92.44384244084358,
+      "score_us": 32.00851380825043,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3809,8 +3809,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 73.6556388437748,
-      "score_us": 32.1817584335804,
+      "mean_us": 74.45389404892921,
+      "score_us": 32.00851380825043,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3828,14 +3828,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 32.1817584335804,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 91.59091860055923,
+      "score_us": 32.00851380825043,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -3848,14 +3848,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -3869,8 +3869,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 95.87470442056656,
-      "score_us": 32.16726705431938,
+      "mean_us": 93.3760404586792,
+      "score_us": 32.06901252269745,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3890,7 +3890,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 32.16726705431938,
+      "score_us": 32.06901252269745,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -3908,14 +3908,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 32.16726705431938,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 99.28995743393898,
+      "score_us": 32.06901252269745,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -3928,14 +3928,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -3949,8 +3949,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 98.22336956858635,
-      "score_us": 32.1325846016407,
+      "mean_us": 95.41075676679611,
+      "score_us": 32.03924745321274,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -3970,7 +3970,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 32.1325846016407,
+      "score_us": 32.03924745321274,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -3988,14 +3988,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 32.1325846016407,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 106.69048875570297,
+      "score_us": 32.03924745321274,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4008,14 +4008,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4029,8 +4029,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.27963674068451,
-      "score_us": 18.21044832468033,
+      "mean_us": 87.88533508777618,
+      "score_us": 18.24166625738144,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4049,8 +4049,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 77.55393162369728,
-      "score_us": 18.21044832468033,
+      "mean_us": 76.92474871873856,
+      "score_us": 18.24166625738144,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4068,14 +4068,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.21044832468033,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 132.9723373055458,
+      "score_us": 18.24166625738144,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4088,14 +4088,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4109,8 +4109,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 88.79892528057098,
-      "score_us": 18.34828406572342,
+      "mean_us": 88.43231946229935,
+      "score_us": 18.63855868577957,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4129,8 +4129,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 80.46383038163185,
-      "score_us": 18.34828406572342,
+      "mean_us": 79.75894957780838,
+      "score_us": 18.63855868577957,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4148,14 +4148,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.34828406572342,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 139.91966843605042,
+      "score_us": 18.63855868577957,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4168,14 +4168,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4189,8 +4189,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.21720087528229,
-      "score_us": 18.210001289844513,
+      "mean_us": 88.22355419397354,
+      "score_us": 18.37925985455513,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4209,8 +4209,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 85.98379790782928,
-      "score_us": 18.210001289844513,
+      "mean_us": 85.28795093297958,
+      "score_us": 18.37925985455513,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4228,14 +4228,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.210001289844513,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 152.11937949061394,
+      "score_us": 18.37925985455513,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4248,14 +4248,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4269,8 +4269,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.46407586336136,
-      "score_us": 18.161889165639877,
+      "mean_us": 88.34294974803925,
+      "score_us": 18.282737582921982,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4290,7 +4290,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.161889165639877,
+      "score_us": 18.282737582921982,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -4308,14 +4308,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.161889165639877,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 168.31832006573677,
+      "score_us": 18.282737582921982,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4328,14 +4328,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4349,8 +4349,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 88.97438645362854,
-      "score_us": 18.173139542341232,
+      "mean_us": 88.49985897541046,
+      "score_us": 18.21529120206833,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4370,7 +4370,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.173139542341232,
+      "score_us": 18.21529120206833,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -4388,14 +4388,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.173139542341232,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 186.0649511218071,
+      "score_us": 18.21529120206833,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4408,14 +4408,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4429,8 +4429,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.33074602484703,
-      "score_us": 18.240883946418762,
+      "mean_us": 87.47028186917305,
+      "score_us": 18.741991370916367,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4449,8 +4449,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 79.69655096530914,
-      "score_us": 18.240883946418762,
+      "mean_us": 78.8869708776474,
+      "score_us": 18.741991370916367,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4468,14 +4468,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.240883946418762,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 132.87674635648727,
+      "score_us": 18.741991370916367,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4488,14 +4488,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4509,8 +4509,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 88.83263915777206,
-      "score_us": 18.171165138483047,
+      "mean_us": 88.05779740214348,
+      "score_us": 18.37797462940216,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4529,8 +4529,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 82.87008851766586,
-      "score_us": 18.171165138483047,
+      "mean_us": 82.02960714697838,
+      "score_us": 18.37797462940216,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4548,14 +4548,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.171165138483047,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 139.95928689837456,
+      "score_us": 18.37797462940216,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4568,14 +4568,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4589,8 +4589,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 88.82476016879082,
-      "score_us": 18.24812963604927,
+      "mean_us": 87.35133334994316,
+      "score_us": 18.469281494617462,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4609,8 +4609,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.33417329192162,
-      "score_us": 18.24812963604927,
+      "mean_us": 89.48838338255882,
+      "score_us": 18.469281494617462,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4628,14 +4628,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.24812963604927,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 151.74966305494308,
+      "score_us": 18.469281494617462,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4648,14 +4648,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4669,8 +4669,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 88.29310536384583,
-      "score_us": 18.288809806108475,
+      "mean_us": 87.60830387473106,
+      "score_us": 18.393397331237793,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4690,7 +4690,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.288809806108475,
+      "score_us": 18.393397331237793,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -4708,14 +4708,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.288809806108475,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 168.77010464668274,
+      "score_us": 18.393397331237793,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4728,14 +4728,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4749,8 +4749,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.18553590774536,
-      "score_us": 18.321443349123,
+      "mean_us": 87.36642077565193,
+      "score_us": 18.414650112390518,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4770,7 +4770,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.321443349123,
+      "score_us": 18.414650112390518,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -4788,14 +4788,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.321443349123,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 186.38649955391884,
+      "score_us": 18.414650112390518,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4808,14 +4808,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4829,8 +4829,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.05235508084297,
-      "score_us": 18.555615097284317,
+      "mean_us": 89.06198665499687,
+      "score_us": 18.842928111553192,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4849,8 +4849,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 81.74579590559006,
-      "score_us": 18.555615097284317,
+      "mean_us": 80.87098598480225,
+      "score_us": 18.842928111553192,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4868,14 +4868,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.555615097284317,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 133.2356594502926,
+      "score_us": 18.842928111553192,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4888,14 +4888,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4909,8 +4909,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.5768404006958,
-      "score_us": 18.720868974924088,
+      "mean_us": 88.67906406521797,
+      "score_us": 18.908921629190445,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4929,8 +4929,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 84.20657366514206,
-      "score_us": 18.720868974924088,
+      "mean_us": 83.37879553437233,
+      "score_us": 18.908921629190445,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -4948,14 +4948,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.720868974924088,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 141.33775606751442,
+      "score_us": 18.908921629190445,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -4968,14 +4968,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -4989,8 +4989,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.28054773807526,
-      "score_us": 18.51225271821022,
+      "mean_us": 91.03765711188316,
+      "score_us": 18.79146322607994,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5009,8 +5009,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.01387283205986,
-      "score_us": 18.51225271821022,
+      "mean_us": 89.33708071708679,
+      "score_us": 18.79146322607994,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5028,14 +5028,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.51225271821022,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 153.69489789009094,
+      "score_us": 18.79146322607994,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -5048,14 +5048,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -5069,8 +5069,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.64186364412308,
-      "score_us": 18.810294568538666,
+      "mean_us": 88.73842656612396,
+      "score_us": 18.56096088886261,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5090,7 +5090,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.810294568538666,
+      "score_us": 18.56096088886261,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -5108,14 +5108,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.810294568538666,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 169.72173005342484,
+      "score_us": 18.56096088886261,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -5128,14 +5128,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -5149,8 +5149,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 93.6446525156498,
-      "score_us": 18.378663808107376,
+      "mean_us": 91.0089910030365,
+      "score_us": 18.58040690422058,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5170,7 +5170,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 18.378663808107376,
+      "score_us": 18.58040690422058,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -5188,14 +5188,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 18.378663808107376,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 187.16977909207344,
+      "score_us": 18.58040690422058,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -5208,14 +5208,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -5229,8 +5229,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 97.32602164149284,
-      "score_us": 32.1354903280735,
+      "mean_us": 94.98436003923416,
+      "score_us": 32.01238811016083,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5249,8 +5249,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 82.67823606729507,
-      "score_us": 32.1354903280735,
+      "mean_us": 81.84265345335007,
+      "score_us": 32.01238811016083,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5268,14 +5268,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 32.1354903280735,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 133.96795839071274,
+      "score_us": 32.01238811016083,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -5288,14 +5288,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -5309,8 +5309,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 97.37865999341011,
-      "score_us": 32.123830169439316,
+      "mean_us": 94.60696950554848,
+      "score_us": 32.014381140470505,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5329,8 +5329,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 86.17488667368889,
-      "score_us": 32.123830169439316,
+      "mean_us": 85.35539731383324,
+      "score_us": 32.014381140470505,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5348,14 +5348,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 32.123830169439316,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 141.81021600961685,
+      "score_us": 32.014381140470505,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -5368,14 +5368,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -5389,8 +5389,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 99.71028193831444,
-      "score_us": 32.12129697203636,
+      "mean_us": 96.88332676887512,
+      "score_us": 31.992644071578976,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5409,8 +5409,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 93.78492832183838,
-      "score_us": 32.12129697203636,
+      "mean_us": 93.52574124932289,
+      "score_us": 31.992644071578976,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5428,14 +5428,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 32.12129697203636,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 153.84651720523834,
+      "score_us": 31.992644071578976,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -5448,14 +5448,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -5469,8 +5469,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 101.35388001799583,
-      "score_us": 32.11081027984619,
+      "mean_us": 99.11533445119858,
+      "score_us": 31.99515864253044,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5490,7 +5490,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 32.11081027984619,
+      "score_us": 31.99515864253044,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -5508,14 +5508,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 32.11081027984619,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 171.21467739343643,
+      "score_us": 31.99515864253044,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -5528,14 +5528,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -5549,8 +5549,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 105.3071953356266,
-      "score_us": 32.14538097381592,
+      "mean_us": 102.63722389936447,
+      "score_us": 32.00532868504524,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5570,7 +5570,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 32.14538097381592,
+      "score_us": 32.00532868504524,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -5588,14 +5588,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 32.14538097381592,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 189.1733892261982,
+      "score_us": 32.00532868504524,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -5608,14 +5608,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -5629,8 +5629,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 117.97886341810226,
-      "score_us": 87.06137537956238,
+      "mean_us": 115.1328906416893,
+      "score_us": 87.12565526366234,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5649,8 +5649,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 85.36927402019501,
-      "score_us": 87.06137537956238,
+      "mean_us": 83.96275341510773,
+      "score_us": 87.12565526366234,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5668,14 +5668,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 87.06137537956238,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 138.35174962878227,
+      "score_us": 87.12565526366234,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -5688,14 +5688,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -5709,8 +5709,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 117.54987761378288,
-      "score_us": 87.16188371181488,
+      "mean_us": 114.76811021566391,
+      "score_us": 88.28908205032349,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5729,8 +5729,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 90.04225954413414,
-      "score_us": 87.16188371181488,
+      "mean_us": 89.06111121177673,
+      "score_us": 88.28908205032349,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5748,14 +5748,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 87.16188371181488,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 145.59706673026085,
+      "score_us": 88.28908205032349,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -5768,14 +5768,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -5789,8 +5789,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 119.04647573828697,
-      "score_us": 87.07933127880096,
+      "mean_us": 116.20992794632912,
+      "score_us": 86.7355428636074,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5809,8 +5809,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 93.87113153934479,
-      "score_us": 87.07933127880096,
+      "mean_us": 92.9754413664341,
+      "score_us": 86.7355428636074,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5828,14 +5828,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 87.07933127880096,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 156.96372836828232,
+      "score_us": 86.7355428636074,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -5848,14 +5848,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -5869,8 +5869,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 121.04121968150139,
-      "score_us": 87.25851774215698,
+      "mean_us": 120.29597535729408,
+      "score_us": 86.87246590852737,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5890,7 +5890,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 87.25851774215698,
+      "score_us": 86.87246590852737,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -5908,14 +5908,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 87.25851774215698,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 181.28005787730217,
+      "score_us": 86.87246590852737,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -5928,14 +5928,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -5949,8 +5949,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 125.97816064953803,
-      "score_us": 86.04126051068306,
+      "mean_us": 123.55461716651918,
+      "score_us": 89.33644741773605,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -5970,7 +5970,7 @@
       },
       "status": "skipped",
       "mean_us": null,
-      "score_us": 86.04126051068306,
+      "score_us": 89.33644741773605,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
@@ -5988,14 +5988,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 86.04126051068306,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 243.58883500099182,
+      "score_us": 89.33644741773605,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -6008,14 +6008,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     },
     {
       "path": "torch",
@@ -6029,8 +6029,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 95.2126644551754,
-      "score_us": 60.48303097486496,
+      "mean_us": 91.6767306625843,
+      "score_us": 60.867927968502045,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -6049,8 +6049,8 @@
         "seq_len": null
       },
       "status": "ok",
-      "mean_us": 89.3072597682476,
-      "score_us": 60.48303097486496,
+      "mean_us": 87.69843727350235,
+      "score_us": 60.867927968502045,
       "parity_match": true,
       "graph_status": "ok",
       "graph_detail": "",
@@ -6068,14 +6068,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
-      "mean_us": null,
-      "score_us": 60.48303097486496,
-      "parity_match": null,
-      "graph_status": null,
-      "graph_detail": null,
+      "status": "ok",
+      "mean_us": 91.79625660181046,
+      "score_us": 60.867927968502045,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": null
     },
     {
       "path": "ftka_gemv+ftka_topk",
@@ -6088,14 +6088,14 @@
         "recent": 64,
         "seq_len": null
       },
-      "status": "skipped",
+      "status": "error",
       "mean_us": null,
       "score_us": null,
       "parity_match": null,
       "graph_status": null,
       "graph_detail": null,
       "layout_transform_us": null,
-      "error": "ftka package not installed"
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
     }
   ]
 }
