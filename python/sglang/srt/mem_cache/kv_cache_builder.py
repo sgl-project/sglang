@@ -4,6 +4,23 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class KVCacheBuildResult:
+    is_hybrid_swa: bool
+    is_hybrid_ssm: bool
+    sliding_window_size: Optional[int]
+    full_tokens_per_layer: Optional[int]
+    swa_tokens_per_layer: Optional[int]
+    req_to_token_pool: object
+    token_to_kv_pool_allocator: object
+    disable_radix_cache: bool
+    tree_cache: object
+
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
