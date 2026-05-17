@@ -102,6 +102,13 @@ class TestPythonicDetector(CustomTestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
 
+    def test_positional_arguments_ignored(self):
+        # Current implementation only parses keywords; positional args are ignored
+        text = "[get_weather('Tokyo')]"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].parameters, '{}')
+
     def test_multiple_tool_calls(self):
         text = "[get_weather(city='Tokyo'), search(query='restaurants')]"
         result = self.detector.detect_and_parse(text, self.tools)
