@@ -388,6 +388,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
     is_extend_in_batch: bool = False
+    # Mirrors ScheduleBatch.all_extend_in_batch; kept for downstream forks.
+    all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -502,6 +504,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             is_extend_in_batch=batch.is_extend_in_batch,
+            all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,

@@ -1422,6 +1422,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     is_extend_in_batch: bool = False
+    # Plumbing for prefill cudagraph + DP attention (introduced in PR #19639).
+    # Has no consumer in upstream main today, but a downstream fork may rely on
+    # it; keep the field and its pass-through wiring intact.
+    all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
@@ -2541,6 +2545,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
+            all_extend_in_batch=self.all_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
