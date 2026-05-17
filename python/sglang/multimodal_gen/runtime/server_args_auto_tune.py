@@ -150,14 +150,19 @@ class ServerArgsAutoTuner:
             return
         if not current_platform.is_cuda():
             return
-        if not (args.text_encoder_cpu_offload or args.image_encoder_cpu_offload):
+        layerwise_components: list[str] = []
+        if args.text_encoder_cpu_offload:
+            layerwise_components.append("text_encoder")
+        if args.image_encoder_cpu_offload:
+            layerwise_components.append("image_encoder")
+        if not layerwise_components:
             return
 
         logger.info(
             "Automatically enable default encoder layerwise offload for %s",
             args.pipeline_config.__class__.__name__,
         )
-        args.layerwise_offload_components = [LAYERWISE_OFFLOAD_DEFAULT_GROUP]
+        args.layerwise_offload_components = layerwise_components
 
     def maybe_replace_cpu_offloaded_components_with_layerwise(self) -> None:
         args = self.server_args
