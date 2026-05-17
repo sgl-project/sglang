@@ -29,6 +29,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
+    MEGAMOE = "megamoe"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -61,8 +62,20 @@ class MoeA2ABackend(Enum):
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
+    def is_megamoe(self):
+        return self == MoeA2ABackend.MEGAMOE
+
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
+
+    def supports_aiter(self) -> bool:
+        return self in (
+            MoeA2ABackend.NONE,
+            MoeA2ABackend.DEEPEP,
+            MoeA2ABackend.MOONCAKE,
+            MoeA2ABackend.NIXL,
+            MoeA2ABackend.MORI,
+        )
 
 
 class MoeRunnerBackend(Enum):
