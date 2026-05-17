@@ -179,6 +179,7 @@ class LoRAInfo:
     max_lora_rank: int  # Maximum LoRA rank across all adapters
 
     num_experts: int
+    has_active_lora: bool = True
     experts_shared_outer_loras: bool = False
     cg_buffers: dict | None = None
 
@@ -337,10 +338,8 @@ def _add_lora_gate_up_delta(
 
     if lora_info is None or lora_info.max_lora_rank == 0:
         return
-    # Always launch the LoRA Triton kernel — it early-exits per program when
-    # adapter_enabled[i] == 0, matching the CUDA-graph-capture behavior.
-    # The previous .any().item() guard forced a cudaStreamSynchronize on every
-    # layer call, creating ~100ms of GPU bubbles across 48 layers.
+    if not get_is_capture_mode() and not lora_info.has_active_lora:
+        return
 
     M, top_k, gate_up_dim = intermediate_cache.shape
     r = lora_info.max_lora_rank
@@ -506,6 +505,11 @@ def build_lora_hooks(
     closures that capture them for the two injection points.
     """
     if lora_info is None or lora_info.max_lora_rank == 0:
+        return LoRAHooks()
+    # Skip alignment/mapping work entirely when the batch has no active adapter.
+    # During CUDA graph capture we still need to record the kernels into the
+    # graph (adapter_enabled is all-zero, kernels early-exit on GPU).
+    if not get_is_capture_mode() and not lora_info.has_active_lora:
         return LoRAHooks()
 
     # Compute alignment / mapping (once, shared by both hooks)

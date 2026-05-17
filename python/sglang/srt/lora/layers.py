@@ -980,6 +980,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         )
         req_to_lora = wi
 
+        # Single source of truth: lora_manager precomputes this per-batch from
+        # the Python weight_indices list, no GPU sync needed.
+        has_active_lora = bool(getattr(batch_info, "has_active_lora", False))
+
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
             gate_up_lora_b_weights=self.gate_up_lora_b_weights,
@@ -989,6 +993,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             req_to_lora=req_to_lora,
             lora_ranks=lora_ranks,
             adapter_enabled=adapter_enabled,
+            has_active_lora=has_active_lora,
             max_lora_rank=max_lora_rank,
             num_experts=self.base_layer.num_experts,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
