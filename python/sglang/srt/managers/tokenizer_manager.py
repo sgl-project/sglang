@@ -182,6 +182,10 @@ class ReqState:
     input_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
     output_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
     output_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
+    input_top_p_logprobs_val: List = dataclasses.field(default_factory=list)
+    input_top_p_logprobs_idx: List = dataclasses.field(default_factory=list)
+    output_top_p_logprobs_val: List = dataclasses.field(default_factory=list)
+    output_top_p_logprobs_idx: List = dataclasses.field(default_factory=list)
     input_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
@@ -192,6 +196,8 @@ class ReqState:
     output_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
     input_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    input_top_p_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    output_top_p_logprobs: List[Any] = dataclasses.field(default_factory=list)
     input_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
 
@@ -1010,6 +1016,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.logprob_start_len,
                 obj.top_logprobs_num,
                 obj.token_ids_logprob,
+                obj.top_logprobs_p,
                 obj.stream,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
@@ -1957,7 +1964,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             meta_info["input_top_logprobs"] = state.input_top_logprobs
             meta_info["output_top_logprobs"] = state.output_top_logprobs
 
-        # 3. Handle token_ids_logprob
+        # 3. Handle top-p logprobs
+        top_logprobs_p = getattr(state.obj, "top_logprobs_p", 0.0) or 0.0
+        if top_logprobs_p > 0.0:
+            if len(state.input_top_p_logprobs_val) > len(state.input_top_p_logprobs):
+                state.input_top_p_logprobs.extend(
+                    self.detokenize_top_logprobs_tokens(
+                        state.input_top_p_logprobs_val[
+                            len(state.input_top_p_logprobs) :
+                        ],
+                        state.input_top_p_logprobs_idx[
+                            len(state.input_top_p_logprobs) :
+                        ],
+                        return_text_in_logprobs,
+                    )
+                )
+            if len(state.output_top_p_logprobs_val) > len(
+                state.output_top_p_logprobs
+            ):
+                state.output_top_p_logprobs.extend(
+                    self.detokenize_top_logprobs_tokens(
+                        state.output_top_p_logprobs_val[
+                            len(state.output_top_p_logprobs) :
+                        ],
+                        state.output_top_p_logprobs_idx[
+                            len(state.output_top_p_logprobs) :
+                        ],
+                        return_text_in_logprobs,
+                    )
+                )
+
+            meta_info["input_top_p_logprobs"] = state.input_top_p_logprobs
+            meta_info["output_top_p_logprobs"] = state.output_top_p_logprobs
+
+        # 4. Handle token_ids_logprob
         if token_ids_logprob is not None:
             if len(state.input_token_ids_logprobs_val) > len(
                 state.input_token_ids_logprobs
@@ -1990,6 +2030,127 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             meta_info["input_token_ids_logprobs"] = state.input_token_ids_logprobs
             meta_info["output_token_ids_logprobs"] = state.output_token_ids_logprobs
+
+        # 5. Handle base64 encoding for top-k and top-p logprobs
+        return_logprobs_in_base64 = getattr(
+            state.obj, "return_logprobs_in_base64", False
+        )
+        if return_logprobs_in_base64:
+            self._encode_logprobs_as_base64(meta_info, state, top_logprobs_num)
+
+    @staticmethod
+    def _encode_logprobs_as_base64(
+        meta_info: dict, state: ReqState, top_logprobs_num: int
+    ):
+        """Encode top-k and top-p logprobs as base64-encoded numpy arrays.
+
+        For fixed-length top-k logprobs, encodes as:
+          - {key}_val_base64: base64-encoded float32 numpy array of shape [num_positions, k]
+          - {key}_idx_base64: base64-encoded int32 numpy array of shape [num_positions, k]
+          - {key}_shape: [num_positions, k]
+
+        For variable-length top-p logprobs, encodes as:
+          - {key}_val_base64: base64-encoded float32 numpy array (flattened)
+          - {key}_idx_base64: base64-encoded int32 numpy array (flattened)
+          - {key}_lengths: list of lengths per position
+        """
+        import numpy as np
+        import pybase64
+
+        def encode_fixed_length(vals_raw, idxs_raw, key_prefix):
+            """Encode fixed-length logprobs (top-k) as base64 from raw val/idx arrays.
+
+            vals_raw/idxs_raw: List[Optional[List[float]]] - raw numeric data per position.
+            """
+            if not vals_raw:
+                return
+            # Filter out None entries (first position for input logprobs)
+            filtered_vals = []
+            filtered_idxs = []
+            none_positions = []
+            for pos_i, (v, x) in enumerate(zip(vals_raw, idxs_raw)):
+                if v is None:
+                    none_positions.append(pos_i)
+                else:
+                    filtered_vals.append(v)
+                    filtered_idxs.append(x)
+            if not filtered_vals:
+                return
+            val_arr = np.array(filtered_vals, dtype=np.float32)
+            idx_arr = np.array(filtered_idxs, dtype=np.int32)
+            meta_info[f"{key_prefix}_val_base64"] = pybase64.b64encode(
+                val_arr.tobytes()
+            ).decode("utf-8")
+            meta_info[f"{key_prefix}_idx_base64"] = pybase64.b64encode(
+                idx_arr.tobytes()
+            ).decode("utf-8")
+            meta_info[f"{key_prefix}_shape"] = list(val_arr.shape)
+            if none_positions:
+                meta_info[f"{key_prefix}_none_positions"] = none_positions
+            # Remove the list-based version to save bandwidth
+            if key_prefix in meta_info:
+                del meta_info[key_prefix]
+
+        def encode_variable_length(vals_raw, idxs_raw, key_prefix):
+            """Encode variable-length logprobs (top-p) as base64 from raw val/idx arrays.
+
+            vals_raw/idxs_raw: List[Optional[List[List[float]]]] - variable-length per position.
+            Each position can be None, or a list of float values.
+            """
+            if not vals_raw:
+                return
+            flat_vals = []
+            flat_idxs = []
+            lengths = []
+            for v, x in zip(vals_raw, idxs_raw):
+                if v is None:
+                    lengths.append(-1)  # sentinel for None
+                elif isinstance(v, list):
+                    lengths.append(len(v))
+                    flat_vals.extend(v)
+                    flat_idxs.extend(x)
+                else:
+                    lengths.append(0)
+            if not flat_vals:
+                meta_info[f"{key_prefix}_lengths"] = lengths
+                return
+            val_arr = np.array(flat_vals, dtype=np.float32)
+            idx_arr = np.array(flat_idxs, dtype=np.int32)
+            meta_info[f"{key_prefix}_val_base64"] = pybase64.b64encode(
+                val_arr.tobytes()
+            ).decode("utf-8")
+            meta_info[f"{key_prefix}_idx_base64"] = pybase64.b64encode(
+                idx_arr.tobytes()
+            ).decode("utf-8")
+            meta_info[f"{key_prefix}_lengths"] = lengths
+            # Remove the list-based version
+            if key_prefix in meta_info:
+                del meta_info[key_prefix]
+
+        if top_logprobs_num > 0:
+            encode_fixed_length(
+                state.input_top_logprobs_val,
+                state.input_top_logprobs_idx,
+                "input_top_logprobs",
+            )
+            encode_fixed_length(
+                state.output_top_logprobs_val,
+                state.output_top_logprobs_idx,
+                "output_top_logprobs",
+            )
+
+        top_logprobs_p = getattr(state.obj, "top_logprobs_p", 0.0) or 0.0
+        if top_logprobs_p > 0.0:
+            encode_variable_length(
+                state.input_top_p_logprobs_val,
+                state.input_top_p_logprobs_idx,
+                "input_top_p_logprobs",
+            )
+            encode_variable_length(
+                state.output_top_p_logprobs_val,
+                state.output_top_p_logprobs_idx,
+                "output_top_p_logprobs",
+            )
 
     def convert_logprob_style(
         self,
@@ -2035,6 +2196,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             state.output_top_logprobs_idx.extend(
                 recv_obj.output_top_logprobs_idx[recv_obj_index]
             )
+
+        top_logprobs_p = getattr(state.obj, "top_logprobs_p", 0.0) or 0.0
+        if top_logprobs_p > 0.0:
+            if (
+                recv_obj.input_top_p_logprobs_val is not None
+                and len(recv_obj.input_top_p_logprobs_val) > 0
+                and recv_obj.input_top_p_logprobs_val[recv_obj_index]
+            ):
+                state.input_top_p_logprobs_val.extend(
+                    recv_obj.input_top_p_logprobs_val[recv_obj_index]
+                )
+                state.input_top_p_logprobs_idx.extend(
+                    recv_obj.input_top_p_logprobs_idx[recv_obj_index]
+                )
+            if (
+                recv_obj.output_top_p_logprobs_val is not None
+                and len(recv_obj.output_top_p_logprobs_val) > 0
+            ):
+                state.output_top_p_logprobs_val.extend(
+                    recv_obj.output_top_p_logprobs_val[recv_obj_index]
+                )
+                state.output_top_p_logprobs_idx.extend(
+                    recv_obj.output_top_p_logprobs_idx[recv_obj_index]
+                )
 
         if token_ids_logprob is not None:
             if len(recv_obj.input_token_ids_logprobs_val) > 0:

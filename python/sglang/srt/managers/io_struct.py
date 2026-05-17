@@ -163,8 +163,13 @@ class GenerateReqInput(BaseReq):
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
+    # If return logprobs, the top-p threshold for returning variable-length top logprobs per position.
+    # When set (> 0.0), returns the smallest set of tokens whose cumulative probability >= top_logprobs_p.
+    top_logprobs_p: Optional[Union[List[float], float]] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
+    # Whether to return logprobs encoded in base64 format (faster than nested lists).
+    return_logprobs_in_base64: bool = False
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -384,6 +389,8 @@ class GenerateReqInput(BaseReq):
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        if self.top_logprobs_p is None:
+            self.top_logprobs_p = 0.0
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -547,6 +554,9 @@ class GenerateReqInput(BaseReq):
         self.top_logprobs_num = normalize_param(
             self.top_logprobs_num, 0, "top_logprobs_num"
         )
+        self.top_logprobs_p = normalize_param(
+            self.top_logprobs_p, 0.0, "top_logprobs_p"
+        )
 
         # Handle token_ids_logprob specially due to its nested structure
         if not self.token_ids_logprob:  # covers both None and []
@@ -647,7 +657,9 @@ class GenerateReqInput(BaseReq):
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
+            top_logprobs_p=self.top_logprobs_p[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
+            return_logprobs_in_base64=self.return_logprobs_in_base64,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(
@@ -725,6 +737,8 @@ class TokenizedGenerateReqInput(BaseReq):
     top_logprobs_num: int
     # If return logprobs, the token id to return logprob for
     token_ids_logprob: List[int]
+    # If return logprobs, the top-p threshold for variable-length top logprobs
+    top_logprobs_p: float
     # Whether to stream output
     stream: bool
 
@@ -1099,6 +1113,10 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
+    input_top_p_logprobs_val: List[List]
+    input_top_p_logprobs_idx: List[List]
+    output_top_p_logprobs_val: List[List]
+    output_top_p_logprobs_idx: List[List]
     input_token_ids_logprobs_val: List[List]
     input_token_ids_logprobs_idx: List[List]
     output_token_ids_logprobs_val: List[List]
@@ -1165,6 +1183,10 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
+    input_top_p_logprobs_val: List[List]
+    input_top_p_logprobs_idx: List[List]
+    output_top_p_logprobs_val: List[List]
+    output_top_p_logprobs_idx: List[List]
     input_token_ids_logprobs_val: List[List]
     input_token_ids_logprobs_idx: List[List]
     output_token_ids_logprobs_val: List[List]

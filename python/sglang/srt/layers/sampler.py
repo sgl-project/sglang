@@ -12,7 +12,11 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.hash import murmur_hash32
-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.layers.utils.logprob import (
+    get_token_ids_logprobs,
+    get_top_logprobs,
+    get_top_p_logprobs,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
@@ -96,6 +100,7 @@ class Sampler(nn.Module):
         sampling_info: SamplingBatchInfo,
         return_logprob: bool,
         top_logprobs_nums: List[int],
+        top_logprobs_ps: Optional[List[float]],
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
     ):
@@ -193,6 +198,7 @@ class Sampler(nn.Module):
                 logits_output,
                 logprobs,
                 top_logprobs_nums,
+                top_logprobs_ps,
                 token_ids_logprobs,
                 sampling_info,
                 batch_next_token_ids,
@@ -331,6 +337,7 @@ class Sampler(nn.Module):
         logits_output: LogitsProcessorOutput,
         logprobs: torch.Tensor,
         top_logprobs_nums: List[int],
+        top_logprobs_ps: Optional[List[float]],
         token_ids_logprobs: List[List[int]],
         sampling_info: SamplingBatchInfo,
         batch_next_token_ids: torch.Tensor,
@@ -344,6 +351,13 @@ class Sampler(nn.Module):
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
             ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+
+        # Attach top-p logprobs
+        if top_logprobs_ps is not None and any(x > 0.0 for x in top_logprobs_ps):
+            (
+                logits_output.next_token_top_p_logprobs_val,
+                logits_output.next_token_top_p_logprobs_idx,
+            ) = get_top_p_logprobs(logprobs, top_logprobs_ps)
 
         if any(x is not None for x in token_ids_logprobs):
             (

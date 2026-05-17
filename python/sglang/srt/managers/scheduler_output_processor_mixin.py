@@ -588,6 +588,14 @@ class SchedulerOutputProcessorMixin:
                         req.output_top_logprobs_idx.append(
                             logits_output.next_token_top_logprobs_idx[flat_idx]
                         )
+                    if req.top_logprobs_p > 0.0 and logits_output.next_token_top_p_logprobs_val is not None:
+                        flat_idx = i * max_accept + j
+                        req.output_top_p_logprobs_val.append(
+                            logits_output.next_token_top_p_logprobs_val[flat_idx]
+                        )
+                        req.output_top_p_logprobs_idx.append(
+                            logits_output.next_token_top_p_logprobs_idx[flat_idx]
+                        )
                     if req.token_ids_logprob is not None:
                         flat_idx = i * max_accept + j
                         req.output_token_ids_logprobs_val.append(
@@ -766,6 +774,35 @@ class SchedulerOutputProcessorMixin:
         req.temp_input_top_logprobs_idx = None
         req.temp_input_top_logprobs_val = None
 
+    def _process_input_top_p_logprobs(self: Scheduler, req: Req) -> None:
+        """Process input top-p logprobs."""
+        if req.top_logprobs_p <= 0.0:
+            return
+
+        is_multi_item_scoring = self._is_multi_item_scoring(req)
+
+        # Initialize arrays - multi-item scoring starts empty, others start with None
+        req.input_top_p_logprobs_val = [] if is_multi_item_scoring else [None]
+        req.input_top_p_logprobs_idx = [] if is_multi_item_scoring else [None]
+
+        # Extend arrays with temp values
+        for val, idx in zip(
+            req.temp_input_top_p_logprobs_val,
+            req.temp_input_top_p_logprobs_idx,
+            strict=True,
+        ):
+            req.input_top_p_logprobs_val.extend(val)
+            req.input_top_p_logprobs_idx.extend(idx)
+
+        # Remove last token (sampling token) for non multi-item scoring requests
+        if not is_multi_item_scoring:
+            req.input_top_p_logprobs_val.pop()
+            req.input_top_p_logprobs_idx.pop()
+
+        # Clean up temp storage
+        req.temp_input_top_p_logprobs_idx = None
+        req.temp_input_top_p_logprobs_val = None
+
     def _process_input_token_ids_logprobs(self: Scheduler, req: Req) -> None:
         """Process input token IDs logprobs."""
         if req.token_ids_logprob is None:
@@ -873,6 +910,10 @@ class SchedulerOutputProcessorMixin:
             req.temp_input_top_logprobs_val = []
         if req.temp_input_top_logprobs_idx is None:
             req.temp_input_top_logprobs_idx = []
+        if req.temp_input_top_p_logprobs_val is None:
+            req.temp_input_top_p_logprobs_val = []
+        if req.temp_input_top_p_logprobs_idx is None:
+            req.temp_input_top_p_logprobs_idx = []
         if req.temp_input_token_ids_logprobs_val is None:
             req.temp_input_token_ids_logprobs_val = []
         if req.temp_input_token_ids_logprobs_idx is None:
@@ -897,6 +938,10 @@ class SchedulerOutputProcessorMixin:
             req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i])
             req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i])
 
+        if req.top_logprobs_p > 0.0 and output.input_top_p_logprobs_val is not None:
+            req.temp_input_top_p_logprobs_val.append(output.input_top_p_logprobs_val[i])
+            req.temp_input_top_p_logprobs_idx.append(output.input_top_p_logprobs_idx[i])
+
         if req.token_ids_logprob is not None:
             req.temp_input_token_ids_logprobs_val.append(
                 output.input_token_ids_logprobs_val[i]
@@ -916,6 +961,7 @@ class SchedulerOutputProcessorMixin:
             # Process all input logprob types using helper functions
             self._process_input_token_logprobs(req, input_token_logprobs)
             self._process_input_top_logprobs(req)
+            self._process_input_top_p_logprobs(req)
 
             self._process_input_token_ids_logprobs(req)
 
@@ -958,6 +1004,10 @@ class SchedulerOutputProcessorMixin:
             req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
             req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
 
+        if req.top_logprobs_p > 0.0 and output.next_token_top_p_logprobs_val is not None:
+            req.output_top_p_logprobs_val.append(output.next_token_top_p_logprobs_val[i])
+            req.output_top_p_logprobs_idx.append(output.next_token_top_p_logprobs_idx[i])
+
         if (
             req.token_ids_logprob is not None
             and output.next_token_token_ids_logprobs_val is not None
@@ -988,6 +1038,10 @@ class SchedulerOutputProcessorMixin:
             req.input_top_logprobs_val = []
         if req.input_top_logprobs_idx is None:
             req.input_top_logprobs_idx = []
+        if req.input_top_p_logprobs_val is None:
+            req.input_top_p_logprobs_val = []
+        if req.input_top_p_logprobs_idx is None:
+            req.input_top_p_logprobs_idx = []
         if req.input_token_ids_logprobs_val is None:
             req.input_token_ids_logprobs_val = []
         if req.input_token_ids_logprobs_idx is None:
@@ -1066,6 +1120,10 @@ class SchedulerOutputProcessorMixin:
             input_top_logprobs_idx = []
             output_top_logprobs_val = []
             output_top_logprobs_idx = []
+            input_top_p_logprobs_val = []
+            input_top_p_logprobs_idx = []
+            output_top_p_logprobs_val = []
+            output_top_p_logprobs_idx = []
             input_token_ids_logprobs_val = []
             input_token_ids_logprobs_idx = []
             output_token_ids_logprobs_val = []
@@ -1076,8 +1134,12 @@ class SchedulerOutputProcessorMixin:
             ) = output_token_logprobs_idx = input_top_logprobs_val = (
                 input_top_logprobs_idx
             ) = output_top_logprobs_val = output_top_logprobs_idx = (
-                input_token_ids_logprobs_val
-            ) = input_token_ids_logprobs_idx = output_token_ids_logprobs_val = (
+                input_top_p_logprobs_val
+            ) = input_top_p_logprobs_idx = output_top_p_logprobs_val = (
+                output_top_p_logprobs_idx
+            ) = input_token_ids_logprobs_val = (
+                input_token_ids_logprobs_idx
+            ) = output_token_ids_logprobs_val = (
                 output_token_ids_logprobs_idx
             ) = None
 
@@ -1174,6 +1236,8 @@ class SchedulerOutputProcessorMixin:
                         input_token_logprobs_idx.append(req.input_token_logprobs_idx)
                         input_top_logprobs_val.append(req.input_top_logprobs_val)
                         input_top_logprobs_idx.append(req.input_top_logprobs_idx)
+                        input_top_p_logprobs_val.append(req.input_top_p_logprobs_val)
+                        input_top_p_logprobs_idx.append(req.input_top_p_logprobs_idx)
                         input_token_ids_logprobs_val.append(
                             req.input_token_ids_logprobs_val
                         )
@@ -1186,6 +1250,8 @@ class SchedulerOutputProcessorMixin:
                         input_token_logprobs_idx.append([])
                         input_top_logprobs_val.append([])
                         input_top_logprobs_idx.append([])
+                        input_top_p_logprobs_val.append([])
+                        input_top_p_logprobs_idx.append([])
                         input_token_ids_logprobs_val.append([])
                         input_token_ids_logprobs_idx.append([])
 
@@ -1211,6 +1277,20 @@ class SchedulerOutputProcessorMixin:
                                 send_output_token_logprobs_offset:logprob_end
                             ]
                         )
+                        output_top_p_logprobs_val.append(
+                            req.output_top_p_logprobs_val[
+                                send_output_token_logprobs_offset:logprob_end
+                            ]
+                            if req.output_top_p_logprobs_val
+                            else []
+                        )
+                        output_top_p_logprobs_idx.append(
+                            req.output_top_p_logprobs_idx[
+                                send_output_token_logprobs_offset:logprob_end
+                            ]
+                            if req.output_top_p_logprobs_idx
+                            else []
+                        )
                         output_token_ids_logprobs_val.append(
                             req.output_token_ids_logprobs_val[
                                 send_output_token_logprobs_offset:logprob_end
@@ -1227,6 +1307,8 @@ class SchedulerOutputProcessorMixin:
                         output_token_logprobs_idx.append([])
                         output_top_logprobs_val.append([])
                         output_top_logprobs_idx.append([])
+                        output_top_p_logprobs_val.append([])
+                        output_top_p_logprobs_idx.append([])
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
 
@@ -1291,6 +1373,10 @@ class SchedulerOutputProcessorMixin:
                     input_top_logprobs_idx=input_top_logprobs_idx,
                     output_top_logprobs_val=output_top_logprobs_val,
                     output_top_logprobs_idx=output_top_logprobs_idx,
+                    input_top_p_logprobs_val=input_top_p_logprobs_val,
+                    input_top_p_logprobs_idx=input_top_p_logprobs_idx,
+                    output_top_p_logprobs_val=output_top_p_logprobs_val,
+                    output_top_p_logprobs_idx=output_top_p_logprobs_idx,
                     input_token_ids_logprobs_val=input_token_ids_logprobs_val,
                     input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
                     output_token_ids_logprobs_val=output_token_ids_logprobs_val,

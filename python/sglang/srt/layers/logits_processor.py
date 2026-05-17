@@ -48,6 +48,7 @@ from sglang.srt.layers.utils.logprob import (
     get_token_ids_logprobs_prefill,
     get_top_logprobs_chunk,
     get_top_logprobs_prefill,
+    get_top_p_logprobs_prefill,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
@@ -79,6 +80,9 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
     next_token_top_logprobs_idx: Optional[List] = None
+    # The logprobs and ids of the top-p tokens in output positions (variable-length per position)
+    next_token_top_p_logprobs_val: Optional[List] = None
+    next_token_top_p_logprobs_idx: Optional[List] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
     next_token_token_ids_logprobs_val: Optional[
@@ -92,6 +96,9 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
     input_top_logprobs_val: Optional[List] = None
     input_top_logprobs_idx: Optional[List] = None
+    # The logprobs and ids of the top-p tokens in input positions (variable-length per position)
+    input_top_p_logprobs_val: Optional[List] = None
+    input_top_p_logprobs_idx: Optional[List] = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization)
     input_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
@@ -116,12 +123,14 @@ class LogitsMetadata:
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
+    extend_return_top_p_logprob: bool = False
     extend_token_ids_logprob: bool = False
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
     top_logprobs_nums: Optional[List[int]] = None
+    top_logprobs_ps: Optional[List[float]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
@@ -161,6 +170,10 @@ class LogitsMetadata:
             extend_return_top_logprob = any(
                 x > 0 for x in forward_batch.top_logprobs_nums
             )
+            extend_return_top_p_logprob = (
+                forward_batch.top_logprobs_ps is not None
+                and any(x > 0.0 for x in forward_batch.top_logprobs_ps)
+            )
             extend_token_ids_logprob = any(
                 x is not None for x in forward_batch.token_ids_logprobs
             )
@@ -175,6 +188,8 @@ class LogitsMetadata:
                 extend_logprob_pruned_lens_cpu.append(extend_len - start_len)
         else:
             extend_return_logprob = extend_return_top_logprob = (
+                extend_return_top_p_logprob
+            ) = (
                 extend_token_ids_logprob
             ) = extend_logprob_pruned_lens_cpu = False
 
@@ -184,12 +199,14 @@ class LogitsMetadata:
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
+            extend_return_top_p_logprob=extend_return_top_p_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
+            top_logprobs_ps=forward_batch.top_logprobs_ps,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             padded_static_len=forward_batch.padded_static_len,
@@ -396,6 +413,8 @@ class LogitsProcessor(nn.Module):
             input_token_logprobs=logprobs_result.input_token_logprobs,
             input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
+            input_top_p_logprobs_val=logprobs_result.input_top_p_logprobs_val,
+            input_top_p_logprobs_idx=logprobs_result.input_top_p_logprobs_idx,
             input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
             mm_input_embeds=logits_metadata.mm_input_embeds,
@@ -640,6 +659,15 @@ class LogitsProcessor(nn.Module):
         else:
             input_top_logprobs_val = input_top_logprobs_idx = None
 
+        # Get the logprob of top-p tokens
+        if logits_metadata.extend_return_top_p_logprob:
+            (
+                input_top_p_logprobs_val,
+                input_top_p_logprobs_idx,
+            ) = get_top_p_logprobs_prefill(input_logprobs, logits_metadata)
+        else:
+            input_top_p_logprobs_val = input_top_p_logprobs_idx = None
+
         # Get the logprob of given token id
         if logits_metadata.extend_token_ids_logprob:
             (
@@ -658,6 +686,8 @@ class LogitsProcessor(nn.Module):
             input_token_logprobs=input_token_logprobs,
             input_top_logprobs_val=input_top_logprobs_val,
             input_top_logprobs_idx=input_top_logprobs_idx,
+            input_top_p_logprobs_val=input_top_p_logprobs_val,
+            input_top_p_logprobs_idx=input_top_p_logprobs_idx,
             input_token_ids_logprobs_val=input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
         )

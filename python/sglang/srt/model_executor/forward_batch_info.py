@@ -313,6 +313,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For logprob
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
+    top_logprobs_ps: Optional[List[float]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # For logits and logprobs post processing
@@ -466,6 +467,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             orig_seq_lens=batch.orig_seq_lens,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
+            top_logprobs_ps=batch.top_logprobs_ps,
             token_ids_logprobs=batch.token_ids_logprobs,
             is_extend_in_batch=batch.is_extend_in_batch,
             all_extend_in_batch=batch.all_extend_in_batch,

@@ -25,6 +25,8 @@ class InputLogprobsResult:
     input_token_logprobs: torch.Tensor
     input_top_logprobs_val: Optional[List] = None
     input_top_logprobs_idx: Optional[List] = None
+    input_top_p_logprobs_val: Optional[List] = None
+    input_top_p_logprobs_idx: Optional[List] = None
     input_token_ids_logprobs_val: Optional[List] = None
     input_token_ids_logprobs_idx: Optional[List] = None
 
@@ -98,6 +100,95 @@ def get_top_logprobs_raw(
     return top_logprobs_val, top_logprobs_idx
 
 
+def get_top_p_logprobs_raw(
+    logprobs: torch.Tensor,
+    top_logprobs_ps: List[float],
+    stage: LogprobStage,
+    extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
+    no_copy_to_cpu: bool = False,
+):
+    """Get top-p logprobs: return tokens whose cumulative probability >= top_p threshold.
+
+    For each position, sort tokens by probability descending, then return the smallest
+    set of tokens whose cumulative probability is >= top_p.
+
+    Args:
+        logprobs: Log probabilities tensor of shape [num_tokens, vocab_size]
+        top_logprobs_ps: List of top-p thresholds per sequence (0.0 means disabled)
+        stage: PREFILL or DECODE
+        extend_logprob_pruned_lens_cpu: For prefill, the pruned lengths per sequence
+        no_copy_to_cpu: If True, keep results on GPU (not supported for top-p, ignored)
+
+    Returns:
+        Tuple of (values_list, indices_list) where each element is variable-length
+    """
+    # Sort by log probability descending directly
+    sorted_logprobs, sorted_indices = logprobs.sort(dim=-1, descending=True)
+    sorted_probs = sorted_logprobs.exp()
+
+    # Compute cumulative probabilities
+    cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    top_logprobs_val = []
+    top_logprobs_idx = []
+
+    if stage == LogprobStage.DECODE:
+        # cumsum and sorted are already computed for all rows
+        cumsum_cpu = cumsum_probs.cpu()
+        sorted_logprobs_cpu = sorted_logprobs.cpu()
+        sorted_indices_cpu = sorted_indices.cpu()
+
+        for i, p in enumerate(top_logprobs_ps):
+            if p <= 0.0:
+                top_logprobs_val.append([])
+                top_logprobs_idx.append([])
+                continue
+            # Find the first index where cumsum >= p, then include up to that index
+            mask = cumsum_cpu[i] >= p
+            if mask.any():
+                # first index where cumsum >= p
+                cutoff = mask.nonzero(as_tuple=True)[0][0].item() + 1
+            else:
+                cutoff = sorted_logprobs_cpu.shape[1]
+            # Always include at least 1 token
+            cutoff = max(cutoff, 1)
+            top_logprobs_val.append(sorted_logprobs_cpu[i, :cutoff].tolist())
+            top_logprobs_idx.append(sorted_indices_cpu[i, :cutoff].tolist())
+    else:
+        cumsum_cpu = cumsum_probs.cpu()
+        sorted_logprobs_cpu = sorted_logprobs.cpu()
+        sorted_indices_cpu = sorted_indices.cpu()
+
+        pt = 0
+        for p, pruned_len in zip(top_logprobs_ps, extend_logprob_pruned_lens_cpu):
+            if pruned_len <= 0:
+                top_logprobs_val.append([])
+                top_logprobs_idx.append([])
+                continue
+
+            pos_vals = []
+            pos_idxs = []
+            for j in range(pruned_len):
+                row = pt + j
+                if p <= 0.0:
+                    pos_vals.append([])
+                    pos_idxs.append([])
+                    continue
+                mask = cumsum_cpu[row] >= p
+                if mask.any():
+                    cutoff = mask.nonzero(as_tuple=True)[0][0].item() + 1
+                else:
+                    cutoff = sorted_logprobs_cpu.shape[1]
+                cutoff = max(cutoff, 1)
+                pos_vals.append(sorted_logprobs_cpu[row, :cutoff].tolist())
+                pos_idxs.append(sorted_indices_cpu[row, :cutoff].tolist())
+            top_logprobs_val.append(pos_vals)
+            top_logprobs_idx.append(pos_idxs)
+            pt += pruned_len
+
+    return top_logprobs_val, top_logprobs_idx
+
+
 def get_top_logprobs_prefill(
     all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata
 ):
@@ -117,6 +208,30 @@ def get_top_logprobs(
     return get_top_logprobs_raw(
         logprobs,
         top_logprobs_nums,
+        stage=LogprobStage.DECODE,
+        no_copy_to_cpu=no_copy_to_cpu,
+    )
+
+
+def get_top_p_logprobs_prefill(
+    all_logprobs: torch.Tensor, logits_metadata: "LogitsMetadata"
+):
+    return get_top_p_logprobs_raw(
+        all_logprobs,
+        logits_metadata.top_logprobs_ps,
+        stage=LogprobStage.PREFILL,
+        extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
+    )
+
+
+def get_top_p_logprobs(
+    logprobs: torch.Tensor,
+    top_logprobs_ps: List[float],
+    no_copy_to_cpu: bool = False,
+):
+    return get_top_p_logprobs_raw(
+        logprobs,
+        top_logprobs_ps,
         stage=LogprobStage.DECODE,
         no_copy_to_cpu=no_copy_to_cpu,
     )
