@@ -186,9 +186,6 @@ from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
     create_scheduler_watchdog,
 )
-from sglang.srt.managers.scheduler_update_weights_mixin import (
-    SchedulerUpdateWeightsMixin,
-)
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
@@ -324,7 +321,6 @@ def validate_dflash_request(req: Req) -> Optional[str]:
 
 class Scheduler(
     SchedulerOutputProcessorMixin,
-    SchedulerUpdateWeightsMixin,
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -1312,19 +1308,15 @@ class Scheduler(
                 (CloseSessionReqInput, self.close_session),
                 (
                     UpdateWeightFromDiskReqInput,
-                    lambda req: self.update_weights_from_disk(self.weight_updater, req),
+                    self.weight_updater.update_weights_from_disk,
                 ),
                 (
                     InitWeightsUpdateGroupReqInput,
-                    lambda req: self.init_weights_update_group(
-                        self.weight_updater, req
-                    ),
+                    self.weight_updater.init_weights_update_group,
                 ),
                 (
                     DestroyWeightsUpdateGroupReqInput,
-                    lambda req: self.destroy_weights_update_group(
-                        self.weight_updater, req
-                    ),
+                    self.weight_updater.destroy_weights_update_group,
                 ),
                 (
                     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1336,37 +1328,31 @@ class Scheduler(
                 ),
                 (
                     UpdateWeightsFromDistributedReqInput,
-                    lambda req: self.update_weights_from_distributed(
-                        self.weight_updater, req
-                    ),
+                    self.weight_updater.update_weights_from_distributed,
                 ),
                 (
                     UpdateWeightsFromTensorReqInput,
-                    lambda req: self.update_weights_from_tensor(
-                        self.weight_updater, req
-                    ),
+                    self.weight_updater.update_weights_from_tensor,
                 ),
                 (
                     UpdateWeightsFromIPCReqInput,
-                    lambda req: self.update_weights_from_ipc(self.weight_updater, req),
+                    self.weight_updater.update_weights_from_ipc,
                 ),
                 (
                     GetWeightsByNameReqInput,
-                    lambda req: self.get_weights_by_name(self.weight_updater, req),
+                    self.weight_updater.get_weights_by_name,
                 ),
                 (
                     ReleaseMemoryOccupationReqInput,
-                    lambda req: self.release_memory_occupation(
-                        self.weight_updater, req
-                    ),
+                    self.weight_updater.release_memory_occupation,
                 ),
                 (
                     ResumeMemoryOccupationReqInput,
-                    lambda req: self.resume_memory_occupation(self.weight_updater, req),
+                    self.weight_updater.resume_memory_occupation,
                 ),
                 (
                     CheckWeightsReqInput,
-                    lambda req: self.check_weights(self.weight_updater, req),
+                    self.weight_updater.check_weights,
                 ),
                 (SlowDownReqInput, self.slow_down),
                 (
@@ -3286,10 +3272,10 @@ class Scheduler(
         )
 
     def save_remote_model(self, **kwargs):
-        SchedulerUpdateWeightsMixin.save_remote_model(self.weight_updater, kwargs)
+        self.weight_updater.save_remote_model(kwargs)
 
     def save_sharded_model(self, **kwargs):
-        SchedulerUpdateWeightsMixin.save_sharded_model(self.weight_updater, kwargs)
+        self.weight_updater.save_sharded_model(kwargs)
 
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
