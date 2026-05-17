@@ -203,8 +203,8 @@ class SchedulerUpdateWeightsMixin:
         dispatch used by ``Scheduler.handle_rpc_request``.
         """
         if params is not None:
-            url = params["url"] if url is None else url
-            draft_url = params.get("draft_url", draft_url)
+            url = url if url is not None else params.get("url")
+            draft_url = draft_url if draft_url is not None else params.get("draft_url")
 
         assert url is not None, "url must be provided"
         self.tp_worker.model_runner.save_remote_model(url)
@@ -224,9 +224,9 @@ class SchedulerUpdateWeightsMixin:
         dispatch used by ``Scheduler.handle_rpc_request``.
         """
         if params is not None:
-            path = params["path"] if path is None else path
-            pattern = params.get("pattern", pattern)
-            max_size = params.get("max_size", max_size)
+            path = path if path is not None else params.get("path")
+            pattern = pattern if pattern is not None else params.get("pattern")
+            max_size = max_size if max_size is not None else params.get("max_size")
 
         assert path is not None, "path must be provided"
         self.tp_worker.model_runner.save_sharded_model(

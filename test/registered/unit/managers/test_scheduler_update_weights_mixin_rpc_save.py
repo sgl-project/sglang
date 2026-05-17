@@ -77,6 +77,39 @@ class TestSchedulerUpdateWeightsMixinRpcSave(CustomTestCase):
             "s3://bucket/tp"
         )
 
+    def test_save_sharded_model_kwargs_take_priority_over_params_dict(self):
+        SchedulerUpdateWeightsMixin.save_sharded_model(
+            self.scheduler,
+            {"path": "/from-dict", "pattern": "from-dict", "max_size": 1},
+            path="/from-kwargs",
+            pattern="from-kwargs",
+            max_size=2,
+        )
+
+        self.scheduler.tp_worker.model_runner.save_sharded_model.assert_called_once_with(
+            path="/from-kwargs",
+            pattern="from-kwargs",
+            max_size=2,
+        )
+
+    def test_save_sharded_model_missing_path_raises_assertion_not_keyerror(self):
+        with self.assertRaises(AssertionError) as ctx:
+            SchedulerUpdateWeightsMixin.save_sharded_model(
+                self.scheduler,
+                {"pattern": "only-pattern"},
+            )
+
+        self.assertIn("path must be provided", str(ctx.exception))
+
+    def test_save_remote_model_missing_url_raises_assertion_not_keyerror(self):
+        with self.assertRaises(AssertionError) as ctx:
+            SchedulerUpdateWeightsMixin.save_remote_model(
+                self.scheduler,
+                {"draft_url": "s3://bucket/draft"},
+            )
+
+        self.assertIn("url must be provided", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
