@@ -10,7 +10,7 @@ from sglang.test.server_fixtures.dsa_mtp_fixture import (
 
 register_cuda_ci(
     est_time=400,
-    stage="stage-c",
+    stage="base-c",
     runner_config="8-gpu-h200",
 )
 

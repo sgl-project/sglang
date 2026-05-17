@@ -110,7 +110,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             "FrozenKVMTPWorker should only be instantiated for "
             "SpeculativeAlgorithm.FROZEN_KV_MTP, got "
             f"{self.speculative_algorithm.name}. The dispatch happens in "
-            "server_args._handle_speculative_decoding -> "
+            "arg_groups.speculative_hook.handle_speculative_decoding -> "
             "_resolve_speculative_algorithm_alias."
         )
 
