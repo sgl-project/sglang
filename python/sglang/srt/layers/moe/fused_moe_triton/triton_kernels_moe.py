@@ -311,8 +311,9 @@ def triton_kernel_fused_experts_with_bias(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
+    output_rows = M if scatter_indx is not None else M * n_expts_act
     output = torch.empty(
-        (1, M, K), device=hidden_states.device, dtype=hidden_states.dtype
+        (1, output_rows, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
 
     matmul(
@@ -337,4 +338,4 @@ def triton_kernel_fused_experts_with_bias(
         gammas=None if apply_router_weight_on_input else gate_scal,
         c=output,
     )
-    return output.view(M, K)
+    return output.view(output_rows, K)
