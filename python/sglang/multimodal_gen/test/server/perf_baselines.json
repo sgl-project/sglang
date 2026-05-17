@@ -1163,7 +1163,7 @@
         },
         "wan2_2_ti2v_5b": {
             "stages_ms": {
-                "InputValidationStage": 23.99,
+                "InputValidationStage": 300.0,
                 "TextEncodingStage": 1152.06,
                 "LatentPreparationStage": 0.13,
                 "TimestepPreparationStage": 2.32,
@@ -1350,7 +1350,7 @@
         },
         "fastwan2_2_ti2v_5b": {
             "stages_ms": {
-                "InputValidationStage": 26.57,
+                "InputValidationStage": 300.0,
                 "TextEncodingStage": 1207.93,
                 "TimestepPreparationStage": 41.12,
                 "LatentPreparationStage": 0.15,
