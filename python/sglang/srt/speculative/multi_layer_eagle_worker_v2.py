@@ -701,7 +701,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     topk=self.topk * self.speculative_num_steps,
                     capture_hidden_mode=capture_mode,
                 )
-            draft_input: EagleDraftInput = batch.spec_info
             verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             # Record a CUDA event after draft() GPU work is dispatched.
