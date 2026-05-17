@@ -381,7 +381,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.process_prefill_chunk()
 
         batch = self.get_new_batch_prefill()
-        batch = self.maybe_prepare_mlp_sync_batch(batch)
+        batch = self.maybe_prepare_mlp_sync_batch(self.dp_attn_adapter, batch)
 
         if batch:
             set_schedule_time_batch(batch)
