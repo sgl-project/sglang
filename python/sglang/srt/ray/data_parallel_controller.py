@@ -147,7 +147,7 @@ class RayDataParallelController(DataParallelController):
 
                     if server_args.enable_dp_attention:
                         # DP attention: derive dp_rank from tp_rank
-                        _, _, actual_dp_rank = compute_dp_attention_world_info(
+                        _, _, actual_dp_rank, _ = compute_dp_attention_world_info(
                             server_args.enable_dp_attention,
                             tp_rank,
                             server_args.tp_size,
