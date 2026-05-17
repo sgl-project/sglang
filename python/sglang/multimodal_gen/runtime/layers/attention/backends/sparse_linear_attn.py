@@ -323,8 +323,8 @@ class SparseLinearAttentionImpl(AttentionImpl, nn.Module):
         )
 
         # Apply feature maps
-        query = self.feature_map_q(query).contiguous().to(self.dtype)  # c_q
-        key = self.feature_map_k(key).contiguous().to(self.dtype)  # c_k
+        query = self.feature_map_q(query).to(self.dtype)  # c_q
+        key = self.feature_map_k(key).to(self.dtype)  # c_k
         # Linear attention computation
         o_l = self._calc_linear_attention_with_torch(query, key, value)
 
@@ -681,8 +681,8 @@ class SageSparseLinearAttentionImpl(AttentionImpl, nn.Module):
         ########## SPARGE END ##########
 
         # Linear attention with feature maps
-        q_linear = self.feature_map_q(q).contiguous().to(self.dtype)
-        k_linear = self.feature_map_k(k).contiguous().to(self.dtype)
+        q_linear = self.feature_map_q(q).to(self.dtype)
+        k_linear = self.feature_map_k(k).to(self.dtype)
         o_l = self._calc_linear_attention_with_torch(q_linear, k_linear, v)
 
         # Project linear attention output and combine
