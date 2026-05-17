@@ -192,6 +192,8 @@ class FlashInferAttnBackend(AttentionBackend):
             self.disable_cuda_graph_kv_split = True
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
+        self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
+
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
@@ -489,7 +491,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix = False
             else:
                 use_ragged = (
-                    not self.enable_deterministic and not is_in_piecewise_cuda_graph()
+                    not self.enable_deterministic
+                    and not is_in_piecewise_cuda_graph()
+                    and not self.use_paged
                 )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
@@ -698,7 +702,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=prefill_wrappers,
-                use_ragged=True,
+                use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens,
                 spec_info=None,
             )
@@ -762,7 +766,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=True,
+                use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )

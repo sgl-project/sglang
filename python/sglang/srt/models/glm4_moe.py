@@ -61,7 +61,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_use_dp_reduce_scatterv,
+    should_skip_post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -314,6 +314,18 @@ class Glm4MoeAttention(nn.Module):
         else:
             if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
                 self.rotary_emb.get_cos_sin_with_position(positions)
+            if self.use_qk_norm:
+                eps = self.q_norm.variance_epsilon
+                q_weight = self.q_norm.weight
+                k_weight = self.k_norm.weight
+                q_bias = getattr(self.q_norm, "bias", None)
+                k_bias = getattr(self.k_norm, "bias", None)
+            else:
+                eps = None
+                q_weight = None
+                k_weight = None
+                q_bias = None
+                k_bias = None
             q, k, v = split_qkv_rmsnorm_rope(
                 qkv,
                 self.rotary_emb.position_sin,
@@ -321,11 +333,11 @@ class Glm4MoeAttention(nn.Module):
                 self.q_size,
                 self.kv_size,
                 self.head_dim,
-                eps=self.q_norm.variance_epsilon,
-                q_weight=self.q_norm.weight,
-                k_weight=self.k_norm.weight,
-                q_bias=getattr(self.q_norm, "bias", None),
-                k_bias=getattr(self.k_norm, "bias", None),
+                eps=eps,
+                q_weight=q_weight,
+                k_weight=k_weight,
+                q_bias=q_bias,
+                k_bias=k_bias,
             )
 
         inner_state = q, k, v, forward_batch
@@ -594,12 +606,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
-            and not should_use_dp_reduce_scatterv()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -629,12 +639,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
-            and not should_use_dp_reduce_scatterv()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states

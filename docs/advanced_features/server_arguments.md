@@ -119,6 +119,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--modelopt-export-path` | Path to export the quantized model in HuggingFace format after ModelOpt quantization. The exported model can then be used directly with SGLang for inference. If not provided, the model will not be exported. | `None` | Type: str |
 | `--quantize-and-serve` | Quantize the model with ModelOpt and immediately serve it without exporting. This is useful for development and prototyping. For production, it's recommended to use separate quantization and deployment steps. | `False` | bool flag (set to enable) |
 | `--rl-quant-profile` | Path to the FlashRL quantization profile. Required when using --load-format flash_rl. | `None` | Type: str |
+| `--enable-quant-communications` | Enable INT8 quantization of TP communications (Supported only for NPU for Qwen3 series). | `False` | bool flag (set to enable) |
 
 ## Memory and scheduling
 | Argument | Description | Defaults | Options |
@@ -144,6 +145,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-prefill-delayer` | Enable prefill delayer for DP attention to reduce idle time. | `False` | bool flag (set to enable) |
 | `--prefill-delayer-max-delay-passes` | Maximum forward passes to delay prefill. | `30` | Type: int |
 | `--prefill-delayer-token-usage-low-watermark` | Token usage low watermark for prefill delayer. | `None` | Type: float |
+| `--prefill-delayer-queue-min-ratio` | Opt-in to the adaptive queue-based delay trigger (independent of the slot-based one). Defers prefill until the waiting queue reaches `min(running_req * ratio, max_prefill_bs)` so small fragments batch into a larger prefill. Unset keeps the original slot-only behavior. Typical: `0.1`–`0.5`. | `None` | Type: float |
+| `--prefill-delayer-max-delay-ms` | Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, prefill is force-released to bound worst-case TTFT. Only consulted when `--prefill-delayer-queue-min-ratio` is set. Typical: `1000`–`5000`. | `5000` | Type: float |
 | `--prefill-delayer-forward-passes-buckets` | Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added. | `None` | List[float] |
 | `--prefill-delayer-wait-seconds-buckets` | Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added. | `None` | List[float] |
 
@@ -257,6 +260,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--lora-eviction-policy` | LoRA adapter eviction policy when the GPU memory pool is full. | `lru` | `lru`, `fifo` |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | `csgmv` | `triton`, `csgmv`, `ascend`, `torch_native` |
 | `--max-lora-chunk-size` | Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when `--lora-backend` is `csgmv`. Larger values may improve performance. | `16` | `16`, `32`, `64`, `128` |
+| `--lora-drain-wait-threshold` | When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default). | `0.0` | Type: float |
 
 ## Kernel Backends (Attention, Sampling, Grammar, GEMM)
 | Argument | Description | Defaults | Options |
@@ -332,6 +336,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--elastic-ep-backend` | Specify the collective communication backend for elastic EP. Currently supports 'mooncake'. | `none` | `none`, `mooncake` |
 | `--enable-elastic-expert-backup` | Enable elastic EP backend to backup expert weights in DRAM feature. Currently supports 'mooncake'.| `False` | bool flag (set to enable) |
 | `--mooncake-ib-device` | The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled. | `None` | Type: str |
+| `--enable-deepep-waterfill` | Enable DeepEP Waterfill: dispatch the shared expert as the 9th routed expert to the least-loaded EP rank. Automatically sets `--moe-a2a-backend deepep`, implicitly enables shared-expert fusion, and supports `--deepep-mode auto`, `normal`, or `low_latency`. Use `auto` or `low_latency` for production decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2. By default, Waterfill uses the static local-batch path; set `SGLANG_DISABLE_STATIC_WATERFILL=1` to force dynamic Waterfill with runtime EP all-reduce. | `False` | bool flag (set to enable) |
+| `--elastic-ep-rejoin` | Indicates that this process is a relaunched elastic EP rank that should rejoin an existing process group during rank recovery. | `False` | bool flag (set to enable) |
 
 ## Mamba Cache
 | Argument | Description | Defaults | Options |

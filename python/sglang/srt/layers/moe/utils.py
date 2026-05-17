@@ -29,6 +29,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
+    MEGAMOE = "megamoe"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -61,6 +62,9 @@ class MoeA2ABackend(Enum):
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
+    def is_megamoe(self):
+        return self == MoeA2ABackend.MEGAMOE
+
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
 
@@ -78,6 +82,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
+    AITER = "aiter"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -111,6 +116,9 @@ class MoeRunnerBackend(Enum):
 
     def is_marlin(self):
         return self == MoeRunnerBackend.MARLIN
+
+    def is_aiter(self):
+        return self == MoeRunnerBackend.AITER
 
 
 class DeepEPMode(Enum):
@@ -148,7 +156,6 @@ MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
-RECORD_NOLORA_GRAPH: bool = False
 DEEPEP_MODE: Optional[DeepEPMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
 IS_SBO_ENABLED: Optional[bool] = None
@@ -163,7 +170,6 @@ def initialize_moe_config(server_args: ServerArgs):
     global MOE_RUNNER_BACKEND
     global SPECULATIVE_MOE_RUNNER_BACKEND
     global SPECULATIVE_MOE_A2A_BACKEND
-    global RECORD_NOLORA_GRAPH
     global DEEPEP_MODE
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
@@ -174,25 +180,6 @@ def initialize_moe_config(server_args: ServerArgs):
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
-    # Dual CUDA graphs only validated for triton MoE backends.
-    _triton_ok = MOE_RUNNER_BACKEND in (
-        MoeRunnerBackend.TRITON,
-        MoeRunnerBackend.TRITON_KERNELS,
-    )
-    if (
-        bool(server_args.record_nolora_graph)
-        and bool(server_args.enable_lora)
-        and not _triton_ok
-    ):
-        logger.warning(
-            f"record_nolora_graph only validated for triton MoE backend, "
-            f"but moe_runner_backend={server_args.moe_runner_backend}. Disabling."
-        )
-    RECORD_NOLORA_GRAPH = (
-        bool(server_args.record_nolora_graph)
-        and bool(server_args.enable_lora)
-        and _triton_ok
-    )
     SPECULATIVE_MOE_RUNNER_BACKEND = (
         MoeRunnerBackend(server_args.speculative_moe_runner_backend)
         if server_args.speculative_moe_runner_backend is not None
@@ -246,10 +233,6 @@ def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
         )
         SPECULATIVE_MOE_A2A_BACKEND = MoeA2ABackend.NONE
     return SPECULATIVE_MOE_A2A_BACKEND
-
-
-def should_record_nolora_graph() -> bool:
-    return RECORD_NOLORA_GRAPH
 
 
 def get_deepep_mode() -> DeepEPMode:
@@ -344,6 +327,39 @@ def should_use_dp_reduce_scatterv():
         and get_attention_dp_size() > 1
         and get_moe_expert_parallel_world_size() == get_attention_dp_size()
     )
+
+
+def should_skip_post_experts_all_reduce(
+    *,
+    is_tp_path: bool,
+    use_reduce_scatter: bool = False,
+    should_allreduce_fusion: bool = False,
+) -> bool:
+    """Whether to skip the post-experts all-reduce (EP or TP) because a
+    downstream component will fuse, replace, or absorb it.
+
+    Skip reasons, in order:
+      - ``should_allreduce_fusion``: LayerCommunicator will fuse the all-reduce
+        with the next layer's residual all-reduce.
+      - ``use_reduce_scatter``: LayerCommunicator's post-attention scatter will
+        do reduce-scatter, which would double-reduce on top of an all-reduce.
+      - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
+        path replaces the all-reduce with a reduce-scatterv.
+      - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
+        the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
+        the post-experts TP all-reduce. Not relevant to the EP all-reduce.
+
+    The first two args are layer-context flags from ``LayerCommunicator`` and
+    default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
+    for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
+    """
+    if should_allreduce_fusion or use_reduce_scatter:
+        return True
+    if should_use_dp_reduce_scatterv():
+        return True
+    if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        return True
+    return False
 
 
 @contextmanager

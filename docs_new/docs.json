@@ -4,7 +4,8 @@
   "name": "SGLang Documentation",
   "seo": {
     "metatags": {
-      "google-site-verification": "bX3ofyYQhraIpAYf4DpyZQXZO_G4xLR_RqeBAKnJA7g"
+      "google-site-verification": "bX3ofyYQhraIpAYf4DpyZQXZO_G4xLR_RqeBAKnJA7g",
+      "canonical": "https://docs.sglang.io"
     }
   },
   "redirects": [
@@ -363,6 +364,10 @@
     {
       "source": "/diffusion/performance/attention_backends.html",
       "destination": "/docs/sglang-diffusion/attention_backends"
+    },
+    {
+      "source": "/diffusion/performance/dynamic_batching.html",
+      "destination": "/docs/sglang-diffusion/dynamic_batching"
     },
     {
       "source": "/diffusion/performance/cache/cache_dit.html",
@@ -825,7 +830,8 @@
                   "docs/developer_guide/bench_serving"
                 ]
               },
-              "docs/developer_guide/evaluating_new_models"
+              "docs/developer_guide/evaluating_new_models",
+              "docs/developer_guide/msprobe_debugging_guide"
             ]
           },
           {
@@ -890,11 +896,16 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_examples",
                   "docs/hardware-platforms/ascend-npus/mindspore_backend",
                   "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_optimization",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables"
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_faq"
                 ]
               },
               "docs/hardware-platforms/cpu_server",
@@ -1005,6 +1016,7 @@
                   {
                     "group": "NVIDIA",
                     "pages": [
+                      "cookbook/autoregressive/NVIDIA/Nemotron3-Nano-Omni",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Super"
                     ]
@@ -1026,6 +1038,8 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ring-2.6-1T",
+                      "cookbook/autoregressive/InclusionAI/Ling-2.6",
                       "cookbook/autoregressive/InclusionAI/Ling-2.5-1T",
                       "cookbook/autoregressive/InclusionAI/Ring-2.5-1T",
                       "cookbook/autoregressive/InclusionAI/LLaDA-2.1"
@@ -1034,6 +1048,7 @@
                   {
                     "group": "InternLM",
                     "pages": [
+                      "cookbook/autoregressive/InternLM/Intern-S2-Preview",
                       "cookbook/autoregressive/InternLM/Intern-S1"
                     ]
                   },
@@ -1041,6 +1056,12 @@
                     "group": "InternVL",
                     "pages": [
                       "cookbook/autoregressive/InternVL/InternVL3.5"
+                    ]
+                  },
+                  {
+                    "group": "OpenBMB",
+                    "pages": [
+                      "cookbook/autoregressive/OpenBMB/MiniCPM-V-4_6"
                     ]
                   },
                   {
@@ -1054,12 +1075,14 @@
                     "pages": [
                       "cookbook/autoregressive/Mistral/Ministral-3",
                       "cookbook/autoregressive/Mistral/Mistral-Small-4",
+                      "cookbook/autoregressive/Mistral/Mistral-Medium-3.5",
                       "cookbook/autoregressive/Mistral/Devstral-2"
                     ]
                   },
                   {
                     "group": "Xiaomi",
                     "pages": [
+                      "cookbook/autoregressive/Xiaomi/MiMo-V2.5",
                       "cookbook/autoregressive/Xiaomi/MiMo-V2-Flash"
                     ]
                   },
@@ -1073,6 +1096,12 @@
                     "group": "Tencent",
                     "pages": [
                       "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
+                    ]
+                  },
+                  {
+                    "group": "Poolside",
+                    "pages": [
+                      "cookbook/autoregressive/Poolside/Laguna-XS.2"
                     ]
                   }
                 ]
@@ -1097,7 +1126,7 @@
                   {
                     "group": "LTX",
                     "pages": [
-                      "cookbook/diffusion/LTX/LTX"
+                      "cookbook/diffusion/LTX/LTX2 & LTX2.3"
                     ]
                   },
                   {
@@ -1165,6 +1194,12 @@
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/attention_backends",
+                  {
+                    "group": "Inference Batching",
+                    "pages": [
+                      "docs/sglang-diffusion/dynamic_batching"
+                    ]
+                  },
                   "docs/sglang-diffusion/profiling",
                   "docs/sglang-diffusion/ci_perf"
                 ]

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
 from __future__ import annotations
 
@@ -17,8 +19,7 @@ class DummyConfig:
 CompressedTensorsConfig = DummyConfig
 
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
-from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
-from sglang.srt.layers.quantization.awq_cpu import CPUAWQConfig
+from sglang.srt.layers.quantization.awq import AWQConfig, AWQCPUConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -30,6 +31,7 @@ from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.gptq_cpu import CPUGPTQConfig
+from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -49,6 +51,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
     is_hip,
+    is_mps,
     is_npu,
     mxfp_supported,
 )
@@ -95,12 +98,21 @@ if is_cuda() or (_is_mxfp_supported and is_hip()):
         }
     )
 
+
+if is_mps():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "mlx_q4": MlxQuantizationConfig,
+            "mlx_q8": MlxQuantizationConfig,
+        }
+    )
+
 # subset of above quant methods, supported on CPU
 CPU_QUANTIZATION_METHODS = {
     "fp8": Fp8Config,
     "w8a8_int8": W8A8Int8Config,
     "compressed-tensors": CompressedTensorsConfig,
-    "awq": CPUAWQConfig,
+    "awq": AWQCPUConfig,
     "gptq": CPUGPTQConfig,
 }
 

@@ -62,6 +62,17 @@ def create_trtllm_mla_backend(runner):
     return TRTLLMMLABackend(runner)
 
 
+@register_attention_backend("tokenspeed_mla")
+def create_tokenspeed_mla_backend(runner):
+    if not runner.use_mla_backend:
+        raise ValueError("tokenspeed_mla backend can only be used with MLA models.")
+    from sglang.srt.layers.attention.tokenspeed_mla_backend import (
+        TokenspeedMLABackend,
+    )
+
+    return TokenspeedMLABackend(runner)
+
+
 @register_attention_backend("aiter")
 def create_aiter_backend(runner):
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -90,6 +101,15 @@ def create_nsa_backend(runner):
     from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 
     return NativeSparseAttnBackend(runner)
+
+
+@register_attention_backend("dsv4")
+def create_dsv4_backend(runner):
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        DeepseekV4AttnBackend,
+    )
+
+    return DeepseekV4AttnBackend(runner)
 
 
 @register_attention_backend("triton")
@@ -200,11 +220,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
     if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.fla.utils import check_environments
-        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-            HybridLinearAttnBackend,
-            Mamba2AttnBackend,
-        )
-        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         from sglang.srt.layers.attention.linear.lightning_backend import (
             LightningAttentionBackend,
@@ -213,6 +228,23 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             initialize_linear_attn_config,
         )
         from sglang.srt.utils import is_blackwell, is_npu
+
+        if not is_npu():
+            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                HybridLinearAttnBackend,
+                Mamba2AttnBackend,
+            )
+            from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        else:
+            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
+                AscendGDNAttnBackend as GDNAttnBackend,
+            )
+            from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+                AscendHybridLinearAttnBackend as HybridLinearAttnBackend,
+            )
+            from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+                AscendMamba2AttnBackend as Mamba2AttnBackend,
+            )
 
         check_environments()
         initialize_linear_attn_config(runner.server_args)

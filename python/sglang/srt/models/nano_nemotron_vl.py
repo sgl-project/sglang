@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -372,4 +374,8 @@ class NemotronH_Nano_VL_V2(EVS):
             self.sound_encoder.load_weights(sound_weights)
 
 
-EntryClass = [NemotronH_Nano_VL_V2]
+class NemotronH_Nano_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
+    pass
+
+
+EntryClass = [NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3]
