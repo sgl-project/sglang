@@ -2343,9 +2343,9 @@ class Scheduler(
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
-            max_pool_usage = self.get_pool_stats(
-                self.pool_stats_observer,
-            ).get_max_pool_usage()
+            max_pool_usage = (
+                self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
+            )
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
@@ -3061,9 +3061,7 @@ class Scheduler(
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:
             has_leak, messages = self._check_all_pools(
-                self.get_pool_stats(
-                    self.pool_stats_observer,
-                )
+                self.pool_stats_observer.get_pool_stats()
             )
             if has_leak:
                 self._report_leak("pool", "\n".join(messages))
