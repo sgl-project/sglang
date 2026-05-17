@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     EvictResult,
+    InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
     MatchResult,
@@ -48,7 +49,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 @dataclass(frozen=True)
@@ -908,6 +909,8 @@ class UnifiedRadixCacheSuite:
         """Verify readonly match does not modify tree structure (no split)."""
         if self.cfg.page_size > 1 or self.cfg.has_mamba or self.cfg.has_swa:
             self.skipTest("Full-only page_size=1 only")
+        if not hasattr(UnifiedRadixCache, "_match_prefix_helper_readonly"):
+            self.skipTest("_match_prefix_helper_readonly is not available")
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         self._insert(tree, allocator, req_to_token_pool, [1, 2, 3, 4, 5])
@@ -922,19 +925,27 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(node_count_before, 2)
 
         tree._match_prefix_helper(RadixKey([1, 2]))
-        value, best_node, best_value_len = tree._match_prefix_helper(
-            RadixKey([1, 2, 3, 4])
-        )
+        (
+            value,
+            best_match_node,
+            best_match_device_node,
+            best_value_len,
+        ) = tree._match_prefix_helper(RadixKey([1, 2, 3, 4]))
         self.assertEqual(best_value_len, 2)
-        self.assertEqual(best_node.key.token_ids, [3, 4])
+        self.assertEqual(best_match_node.key.token_ids, [3, 4])
+        self.assertIs(best_match_device_node, best_match_node)
         node_count_after_regular = count_nodes(tree.root_node)
         self.assertEqual(node_count_after_regular, node_count_before + 2)
 
-        value, best_node, best_value_len = tree._match_prefix_helper_readonly(
-            RadixKey([1, 2, 3])
-        )
+        (
+            value,
+            best_match_node,
+            best_match_device_node,
+            best_value_len,
+        ) = tree._match_prefix_helper_readonly(RadixKey([1, 2, 3]))
         self.assertEqual(best_value_len, 1)
-        self.assertEqual(best_node.key.token_ids, [1, 2])
+        self.assertEqual(best_match_node.key.token_ids, [1, 2])
+        self.assertIs(best_match_device_node, best_match_node)
         node_count_after_readonly = count_nodes(tree.root_node)
         self.assertEqual(node_count_after_readonly, node_count_after_regular)
 
@@ -943,6 +954,62 @@ class UnifiedRadixCacheSuite:
     # ================================================================
     # Evict chain tests covering demotion, cascade, and tombstone cleanup.
     # ================================================================
+
+    def test_aux_evict_full_locked_leaf_tombstones_aux_only(self):
+        aux_types = [
+            ct
+            for ct in (ComponentType.SWA, ComponentType.MAMBA)
+            if ct in self.cfg.components
+        ]
+        if not aux_types:
+            self.skipTest("requires an auxiliary component")
+        if len(aux_types) > 1:
+            self.skipTest("single-aux case keeps cascade expectations precise")
+        aux = aux_types[0]
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        node = match.last_device_node
+        full_cd = node.component_data[ComponentType.FULL]
+        aux_cd = node.component_data[aux]
+        self.assertEqual(len(node.children), 0)
+        self.assertIsNotNone(full_cd.value)
+        self.assertIsNotNone(aux_cd.value)
+
+        lock_result = tree.inc_lock_ref(node)
+        self.assertGreater(full_cd.lock_ref, 0)
+        self.assertGreater(aux_cd.lock_ref, 0)
+
+        aux_len = len(aux_cd.value)
+        tree.component_protected_size_[aux] -= aux_len
+        tree.component_evictable_size_[aux] += aux_len
+        aux_cd.lock_ref = 0
+        self.assertNotIn(node, tree.evictable_device_leaves)
+
+        evict_params = EvictParams(num_tokens=0)
+        if aux == ComponentType.SWA:
+            evict_params.swa_num_tokens = aux_len
+        else:
+            evict_params.mamba_num = aux_len
+        result = tree.evict(evict_params)
+
+        self.assertEqual(result.num_tokens_evicted, 0)
+        if aux == ComponentType.SWA:
+            self.assertEqual(result.swa_num_tokens_evicted, aux_len)
+        else:
+            self.assertEqual(result.mamba_num_evicted, aux_len)
+        self.assertIsNotNone(full_cd.value)
+        self.assertIsNone(aux_cd.value)
+        self.assertFalse(tree.lru_lists[aux].in_list(node))
+
+        tree.dec_lock_ref(
+            node,
+            DecLockRefParams(swa_uuid_for_lock=lock_result.swa_uuid_for_lock),
+        )
+        tree.sanity_check()
 
     def test_evict_leaf_frees_all_components(self):
         """Evicting a device leaf frees Full and all aux components atomically."""
@@ -1202,8 +1269,8 @@ class UnifiedRadixCacheSuite:
     # ================================================================
 
     def _skip_unsupported_hicache_test(self):
-        if self.cfg.has_swa:
-            self.skipTest("HiCache tests do not run on SWA stacks")
+        if self.cfg.has_swa and self.cfg.has_mamba:
+            self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
         return False
 
     def _simulate_backup(self, tree, node):
@@ -1287,14 +1354,14 @@ class UnifiedRadixCacheSuite:
                 self._backup_node(tree, node)
 
     def _load_back_node(self, tree, node):
-        device_indices = tree.load_back(node)
-        self.assertIsNotNone(device_indices)
+        loaded = tree.load_back(node)
+        self.assertTrue(loaded)
         producer_id = tree.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
         for _, finish_event, _ in list(tree.cache_controller.ack_load_queue):
             finish_event.synchronize()
         tree.loading_check()
-        return device_indices
+        return node.component_data[ComponentType.FULL].value
 
     def _get_full_kv_pool(self, allocator):
         kv_pool = allocator.get_kvcache()
@@ -1414,6 +1481,49 @@ class UnifiedRadixCacheSuite:
         )
         m = tree.match_prefix(MatchPrefixParams(key=RadixKey(leaf)))
         self.assertGreaterEqual(len(m.device_indices), len(base))
+        tree.sanity_check()
+
+    def test_hicache_partial_match_splits_evicted_backed_up_node(self):
+        """Partial matches on host-only nodes must keep the host prefix usable."""
+        if self._skip_unsupported_hicache_test():
+            return
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        ps = self.cfg.page_size
+        seq = self._make_seq(1, 4)
+        expected_prefix = seq[: 2 * ps]
+        expected_suffix = seq[len(expected_prefix) :]
+        query = expected_prefix + self._make_seq(9000, 1)
+
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        node = m.last_device_node
+        self._backup_node(tree, node)
+
+        tree.evict(EvictParams(num_tokens=len(seq)))
+        self.assertTrue(node.evicted)
+        self.assertTrue(node.backuped)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(query)))
+
+        self.assertEqual(len(m.device_indices), 0)
+        self.assertIs(m.last_device_node, tree.root_node)
+
+        split_parent = node.parent
+        self.assertIsNot(split_parent, tree.root_node)
+        self.assertTrue(split_parent.evicted)
+        self.assertTrue(split_parent.backuped)
+        self.assertEqual(split_parent.key.token_ids, expected_prefix)
+        self.assertEqual(node.key.token_ids, expected_suffix)
+
+        if self.cfg.has_mamba:
+            self.assertEqual(m.host_hit_length, 0)
+            self.assertIs(m.last_host_node, tree.root_node)
+            self.assertIsNone(
+                split_parent.component_data[ComponentType.MAMBA].host_value
+            )
+        else:
+            self.assertEqual(m.host_hit_length, len(expected_prefix))
+            self.assertIs(m.last_host_node, split_parent)
         tree.sanity_check()
 
     def test_hicache_d_leaf_h_leaf_mutual_exclusion(self):
@@ -1587,6 +1697,244 @@ class UnifiedRadixCacheSuite:
         chain.reverse()
         return chain
 
+    def _release_ongoing_load_back_locks(self, tree):
+        for node, lock_params in list(tree.ongoing_load_back.values()):
+            tree.dec_lock_ref(node, lock_params)
+        tree.ongoing_load_back.clear()
+
+    def _finish_pending_loads(self, tree):
+        producer_id = tree.ready_to_load_host_cache()
+        self.assertNotEqual(producer_id, -1)
+        for _, finish_event, _ in list(tree.cache_controller.ack_load_queue):
+            finish_event.synchronize()
+        tree.loading_check()
+
+    def _match_tokens_for_chain(self, chain):
+        tokens: list[int] = []
+        for node in chain:
+            tokens.extend(node.key.token_ids)
+        return tokens
+
+    def _set_aux_host_tombstone(self, tree, node, component_type):
+        cd = node.component_data[component_type]
+        self.assertIsNotNone(cd.value)
+        if cd.host_value is None:
+            cd.host_value = cd.value.clone()
+        old_value = cd.value
+        cd.value = None
+        if component_type in tree.lru_lists and tree.lru_lists[component_type].in_list(
+            node
+        ):
+            tree.lru_lists[component_type].remove_node(node)
+        tree.host_lru_lists[component_type].insert_mru(node)
+        tree.component_evictable_size_[component_type] -= len(old_value)
+
+    def test_match_prefix_best_and_device_node_without_hicache(self):
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        min_tokens = 2 * ps
+        if self.cfg.has_swa:
+            min_tokens = max(min_tokens, self.cfg.sliding_window_size + ps)
+        seq = self._make_seq(1, (min_tokens + ps - 1) // ps)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+
+        self.assertEqual(len(result.device_indices), len(seq))
+        self.assertIs(result.best_match_node, result.last_device_node)
+        self.assertIs(result.last_host_node, result.last_device_node)
+        self.assertEqual(result.host_hit_length, 0)
+
+    def test_hicache_mamba_host_best_match_keeps_device_anchor(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        parent = chain[-2]
+        tokens = self._match_tokens_for_chain(chain)
+
+        self._backup_node(tree, leaf)
+        tree.evict(EvictParams(num_tokens=len(leaf.key)))
+        self.assertTrue(leaf.evicted)
+
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+
+        self.assertIs(result.best_match_node, leaf)
+        self.assertIs(result.last_device_node, parent)
+        self.assertEqual(len(result.device_indices), len(tokens) - len(leaf.key))
+        self.assertEqual(result.host_hit_length, len(leaf.key))
+
+    def test_hicache_swa_host_best_match_keeps_device_anchor(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+SWA")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        parent = chain[-2]
+        tokens = self._match_tokens_for_chain(chain)
+
+        self._backup_node(tree, leaf)
+        tree.evict(EvictParams(num_tokens=len(leaf.key)))
+        self.assertTrue(leaf.evicted)
+
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+
+        self.assertIs(result.best_match_node, leaf)
+        self.assertIs(result.last_device_node, parent)
+        self.assertEqual(len(result.device_indices), len(tokens) - len(leaf.key))
+        self.assertEqual(result.host_hit_length, 1)
+
+    def test_mamba_branching_seqlen_disabled_under_hicache(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        chunk_size = get_global_server_args().mamba_cache_chunk_size
+        tokens = self._make_seq(1, chunk_size + 1)
+        self._insert(tree, allocator, req_to_token_pool, tokens)
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens))
+        ).last_device_node
+
+        mamba_cd = leaf.component_data[ComponentType.MAMBA]
+        mamba_cd.value = None
+        no_hicache = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        self.assertIs(no_hicache.best_match_node, tree.root_node)
+        self.assertIs(no_hicache.last_device_node, tree.root_node)
+        self.assertEqual(no_hicache.mamba_branching_seqlen, chunk_size)
+
+        tree_h, allocator_h, req_to_token_pool_h = self._build_hicache_fixture()
+        self._insert(tree_h, allocator_h, req_to_token_pool_h, tokens)
+        leaf_h = tree_h.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens))
+        ).last_device_node
+        self._backup_node(tree_h, leaf_h)
+        tree_h.evict(EvictParams(num_tokens=len(tokens)))
+        with_hicache = tree_h.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        self.assertIs(with_hicache.best_match_node, leaf_h)
+        self.assertIs(with_hicache.last_device_node, tree_h.root_node)
+        self.assertIsNone(with_hicache.mamba_branching_seqlen)
+
+    def test_scheduler_hicache_full_mamba_init_load_back_appends_new_indices(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        tokens = self._match_tokens_for_chain(chain)
+
+        self._backup_node(tree, leaf)
+        tree.evict(EvictParams(num_tokens=len(leaf.key)))
+        self.assertTrue(leaf.evicted)
+
+        req = self._make_req(req_to_token_pool)
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens), req=req))
+        req.prefix_indices = match.device_indices
+        req.last_node = match.last_device_node
+        req.best_match_node = match.best_match_node
+        req.host_hit_length = match.host_hit_length
+
+        new_indices, new_node = tree.init_load_back(
+            InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=req.host_hit_length,
+                req=req,
+            )
+        )
+
+        self.assertIs(new_node, leaf)
+        self.assertEqual(len(torch.cat([req.prefix_indices, new_indices])), len(tokens))
+        self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].value)
+        self._finish_pending_loads(tree)
+        self._release_ongoing_load_back_locks(tree)
+
+    def test_scheduler_hicache_aux_only_load_back_appends_full_device_indices(self):
+        if self.cfg.page_size != 1:
+            self.skipTest("page_size=1 keeps the expected suffix precise")
+        aux = None
+        if self.cfg.has_swa and not self.cfg.has_mamba:
+            aux = ComponentType.SWA
+        elif self.cfg.has_mamba and not self.cfg.has_swa:
+            aux = ComponentType.MAMBA
+        if aux is None:
+            self.skipTest("requires exactly one aux component")
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        tokens = self._match_tokens_for_chain(chain)
+        leaf_full = leaf.component_data[ComponentType.FULL].value.clone()
+        self._backup_node(tree, leaf)
+        self._set_aux_host_tombstone(tree, leaf, aux)
+
+        req = self._make_req(req_to_token_pool)
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens), req=req))
+        req.prefix_indices = match.device_indices
+        req.last_node = match.last_device_node
+        req.best_match_node = match.best_match_node
+        req.host_hit_length = match.host_hit_length
+
+        new_indices, new_node = tree.init_load_back(
+            InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=req.host_hit_length,
+                req=req,
+            )
+        )
+
+        self.assertIs(new_node, leaf)
+        self.assertEqual(new_indices.tolist(), leaf_full.tolist())
+        self.assertEqual(len(torch.cat([req.prefix_indices, new_indices])), len(tokens))
+        self.assertEqual(
+            leaf.component_data[ComponentType.FULL].value.tolist(),
+            leaf_full.tolist(),
+        )
+        self.assertIsNotNone(leaf.component_data[aux].value)
+        self._finish_pending_loads(tree)
+        self._release_ongoing_load_back_locks(tree)
+
+    def test_scheduler_hicache_load_back_fallback_keeps_old_anchor(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        tokens = self._match_tokens_for_chain(chain)
+
+        self._backup_node(tree, leaf)
+        tree.evict(EvictParams(num_tokens=len(leaf.key)))
+
+        req = self._make_req(req_to_token_pool)
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens), req=req))
+        req.prefix_indices = match.device_indices
+        req.last_node = match.last_device_node
+        req.best_match_node = match.best_match_node
+        req.host_hit_length = match.host_hit_length
+
+        new_indices, new_node = tree.init_load_back(
+            InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=req.host_hit_length,
+                req=req,
+                mem_quota=-1_000_000,
+            )
+        )
+
+        self.assertEqual(len(new_indices), 0)
+        self.assertIs(new_node, match.last_device_node)
+        self.assertIsNone(leaf.component_data[ComponentType.FULL].value)
+        self.assertIsNone(leaf.component_data[ComponentType.MAMBA].value)
+
     def test_hicache_swa_load_back_min_suffix(self):
         """LOAD_BACK collects only the suffix nodes needed to cover sliding_window_size."""
         if not self.cfg.has_swa:
@@ -1724,6 +2072,7 @@ class UnifiedRadixCacheSuite:
                     ),
                     last_device_node=leaf,
                     last_host_node=leaf,
+                    best_match_node=leaf,
                     host_hit_length=0,
                 )
                 result = swa_comp.finalize_match_result(
@@ -1807,6 +2156,250 @@ class UnifiedRadixCacheSuite:
             tree.component_evictable_size_[ComponentType.SWA] - pre_evictable,
             n_swa,
         )
+
+    def _swa_anchor_chain_tokens(self, num_pages: int) -> list[int]:
+        """Reproduce the token sequence used by _build_chain_pages."""
+        tokens: list[int] = []
+        for i in range(num_pages):
+            tokens.extend(self._make_seq(1000 * (i + 1), 1))
+        return tokens
+
+    def _swa_anchor_setup(self):
+        """Chain layout (root-to-leaf):
+
+            ... top padding ...
+            chain[-(window_pages + 1)] = N : SWA tombstone
+            chain[-(window_pages)]     = Y : SWA host-only, FULL host-backed
+            chain[-(window_pages - 1)..-2] : SWA device, FULL.host=None
+            chain[-1]                  = X : SWA device, FULL.host=None
+
+        Anchor=X has window_pages of device pages below N, so the SWA
+        load_back walker accumulates n_swa >= sliding_window_size and
+        exits before reaching N. Anchor=Y has only 1 page and walks into
+        N's tombstone.
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+        ps = self.cfg.page_size
+        sw = self.cfg.sliding_window_size
+        if ps >= sw:
+            self.skipTest("test scenario requires ps < sw")
+        window_pages = (sw + ps - 1) // ps
+        chain_pages = window_pages + 3
+        if chain_pages * ps > self.cfg.kv_size // 2:
+            self.skipTest("kv_size too small for the desired chain")
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, chain_pages)
+        if len(chain) < chain_pages:
+            self.skipTest("chain too short")
+        self._backup_tree(tree)
+
+        x = chain[-1]
+        y = chain[-window_pages]
+        n = chain[-(window_pages + 1)]
+
+        n.component_data[ComponentType.SWA].value = None
+        n.component_data[ComponentType.SWA].host_value = None
+        y.component_data[ComponentType.SWA].value = None
+        # Strip FULL.host on X + intermediates so last_host_node walks past
+        # them to Y. Y.FULL untouched preserves the leaf-up evict invariant.
+        for node in chain[-(window_pages - 1) :]:
+            node.component_data[ComponentType.FULL].host_value = None
+
+        tokens = self._swa_anchor_chain_tokens(len(chain))
+        return tree, chain, n, y, x, tokens
+
+    def test_hicache_swa_match_prefix_picks_best_match_node_above_last_host(self):
+        tree, _, n, y, x, tokens = self._swa_anchor_setup()
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        self.assertIs(result.best_match_node, x)
+        self.assertIs(result.last_device_node, n.parent)
+        self.assertIs(result.last_host_node, y)
+
+    def test_hicache_swa_load_back_anchored_on_best_match_node(self):
+        tree, _, _, y, x, _ = self._swa_anchor_setup()
+        ps = self.cfg.page_size
+        swa_comp = tree.components[ComponentType.SWA]
+
+        transfers = swa_comp.build_hicache_transfers(x, CacheTransferPhase.LOAD_BACK)
+        self.assertEqual(len(transfers), 1)
+        xfer = transfers[0]
+        self.assertEqual(xfer.name, PoolName.SWA)
+        self.assertEqual(xfer.nodes_to_load, [y])
+        self.assertEqual(int(xfer.host_indices.numel()), ps)
+
+        with self.assertRaises(AssertionError):
+            swa_comp.build_hicache_transfers(y, CacheTransferPhase.LOAD_BACK)
+
+    def test_hicache_swa_finalize_anchored_on_best_match_node(self):
+        tree, _, _, y, x, _ = self._swa_anchor_setup()
+        swa_comp = tree.components[ComponentType.SWA]
+
+        base = MatchResult(
+            device_indices=torch.empty((0,), dtype=torch.int64, device=tree.device),
+            last_device_node=x,
+            last_host_node=y,
+            best_match_node=x,
+            host_hit_length=0,
+        )
+        result = swa_comp.finalize_match_result(
+            result=base,
+            params=MatchPrefixParams(key=RadixKey(self._make_seq(1, 1))),
+            value_chunks=[],
+            best_value_len=0,
+        )
+        self.assertEqual(result.host_hit_length, 1)
+
+    def test_hicache_swa_temp_lock_does_not_release_restored_tombstone(self):
+        """A temporary scheduler lock that skipped a SWA tombstone must not
+        release later load-back/request locks after the tombstone is restored.
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+
+        tree, allocator, _, chain, _ = self._swa_finalize_setup()
+        leaf = chain[-1]
+        tombstone = leaf
+        cd = tombstone.component_data[ComponentType.SWA]
+        old_swa = cd.value
+        self.assertIsNotNone(old_swa)
+
+        cd.value = None
+        tree.lru_lists[ComponentType.SWA].remove_node(tombstone)
+        tree.host_lru_lists[ComponentType.SWA].insert_mru(tombstone)
+        tree.component_evictable_size_[ComponentType.SWA] -= len(old_swa)
+
+        temp_lock = tree.inc_lock_ref(leaf)
+        self.assertEqual(cd.lock_ref, 0)
+
+        xfer = tree.components[ComponentType.SWA].build_hicache_transfers(
+            leaf, CacheTransferPhase.LOAD_BACK
+        )[0]
+        new_swa = allocator.swa_attn_allocator.alloc(int(xfer.host_indices.numel()))
+        self.assertIsNotNone(new_swa)
+        xfer.device_indices = new_swa
+        tree.components[ComponentType.SWA].commit_hicache_transfer(
+            leaf, CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+        )
+
+        load_back_lock = tree.inc_lock_ref(leaf)
+        request_lock = tree.inc_lock_ref(leaf)
+        self.assertEqual(cd.lock_ref, 2)
+
+        tree.dec_lock_ref(leaf, temp_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 2)
+
+        tree.dec_lock_ref(leaf, load_back_lock.to_dec_params())
+        tree.dec_lock_ref(leaf, request_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 0)
+
+    def test_hicache_full_temp_lock_skips_evicted_anchor_and_mirrors_on_release(
+        self,
+    ):
+        """Acquire records the evicted anchor in skip_lock_node_ids (phase 1)
+        and locks device-on ancestors only (phase 2). After load_back
+        restores the anchor, a second acquire covers it; releasing the
+        first must mirror the skip so the anchor's lock_ref is not
+        decremented twice.
+        """
+        if self._skip_unsupported_hicache_test():
+            return
+        ps = self.cfg.page_size
+        if 3 * ps > self.cfg.kv_size // 2:
+            self.skipTest("kv_size too small")
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        a, y, anchor = chain
+        self._simulate_backup_tree(tree)
+
+        cd_anchor = anchor.component_data[ComponentType.FULL]
+        cd_a = a.component_data[ComponentType.FULL]
+        cd_y = y.component_data[ComponentType.FULL]
+        anchor_value = cd_anchor.value
+        cd_anchor.value = None
+
+        self.assertEqual(cd_anchor.lock_ref, 0)
+        self.assertEqual(cd_y.lock_ref, 0)
+        self.assertEqual(cd_a.lock_ref, 0)
+
+        temp_lock = tree.inc_lock_ref(anchor)
+        self.assertEqual(cd_anchor.lock_ref, 0)
+        self.assertEqual(cd_y.lock_ref, 1)
+        self.assertEqual(cd_a.lock_ref, 1)
+        self.assertIn(ComponentType.FULL, temp_lock.skip_lock_node_ids)
+        self.assertIn(anchor.id, temp_lock.skip_lock_node_ids[ComponentType.FULL])
+
+        cd_anchor.value = anchor_value
+
+        second_lock = tree.inc_lock_ref(anchor)
+        self.assertEqual(cd_anchor.lock_ref, 1)
+        self.assertEqual(cd_y.lock_ref, 2)
+        self.assertEqual(cd_a.lock_ref, 2)
+
+        tree.dec_lock_ref(anchor, temp_lock.to_dec_params())
+        self.assertEqual(cd_anchor.lock_ref, 1)
+        self.assertEqual(cd_y.lock_ref, 1)
+        self.assertEqual(cd_a.lock_ref, 1)
+
+        tree.dec_lock_ref(anchor, second_lock.to_dec_params())
+        self.assertEqual(cd_anchor.lock_ref, 0)
+        self.assertEqual(cd_y.lock_ref, 0)
+        self.assertEqual(cd_a.lock_ref, 0)
+
+    def test_hicache_mamba_temp_lock_does_not_release_restored_tombstone(self):
+        """A temporary scheduler lock that skipped a Mamba tombstone must not
+        release later load-back/request locks after the tombstone is restored.
+        """
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba component")
+        if self.cfg.has_swa:
+            self.skipTest("Mamba-only path keeps the chain construction simple")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        node = m.last_device_node
+        cd = node.component_data[ComponentType.MAMBA]
+        old_mamba = cd.value
+        self.assertIsNotNone(old_mamba)
+        self._simulate_backup(tree, node)
+
+        cd.value = None
+        tree.lru_lists[ComponentType.MAMBA].remove_node(node)
+        tree.host_lru_lists[ComponentType.MAMBA].insert_mru(node)
+        tree.component_evictable_size_[ComponentType.MAMBA] -= len(old_mamba)
+
+        temp_lock = tree.inc_lock_ref(node)
+        self.assertEqual(cd.lock_ref, 0)
+
+        xfer = tree.components[ComponentType.MAMBA].build_hicache_transfers(
+            node, CacheTransferPhase.LOAD_BACK
+        )[0]
+        new_mamba = req_to_token_pool.mamba_pool.alloc(1)
+        self.assertIsNotNone(new_mamba)
+        xfer.device_indices = new_mamba
+        tree.components[ComponentType.MAMBA].commit_hicache_transfer(
+            node, CacheTransferPhase.LOAD_BACK, transfers=[xfer]
+        )
+
+        load_back_lock = tree.inc_lock_ref(node)
+        request_lock = tree.inc_lock_ref(node)
+        self.assertEqual(cd.lock_ref, 2)
+
+        tree.dec_lock_ref(node, temp_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 2)
+
+        tree.dec_lock_ref(node, load_back_lock.to_dec_params())
+        tree.dec_lock_ref(node, request_lock.to_dec_params())
+        self.assertEqual(cd.lock_ref, 0)
 
     def test_hicache_mixed_backup_evict_insert(self):
         """Complex scenario: backup some, evict, insert new, verify invariants."""

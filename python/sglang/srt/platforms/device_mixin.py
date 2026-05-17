@@ -26,10 +26,11 @@ Method status annotations:
 """
 
 import enum
-from typing import TYPE_CHECKING, NamedTuple, Optional
+import random
+from typing import NamedTuple, Optional
 
-if TYPE_CHECKING:
-    import torch
+import numpy as np
+import torch
 
 
 class PlatformEnum(enum.Enum):
@@ -203,19 +204,12 @@ class DeviceMixin:
     @classmethod
     def inference_mode(cls):
         """[Planned] Return inference mode context manager."""
-        import torch
-
         return torch.inference_mode(mode=True)
 
     @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:
         """[Planned] Set random seeds for reproducibility across all libraries."""
         if seed is not None:
-            import random
-
-            import numpy as np
-            import torch
-
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)

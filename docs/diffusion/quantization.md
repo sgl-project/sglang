@@ -10,8 +10,10 @@ Use these paths:
 - `--model-path`: the base or original model
 - `--transformer-path`: a quantized transformers-style transformer component directory that already contains its own `config.json`
 - `--transformer-weights-path`: quantized transformer weights provided as a single safetensors file, a sharded safetensors directory, a local path, or a Hugging Face repo ID
+- `--quantization`: apply online quantization to unquantized models at load time (activations are quantized dynamically)
+- `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
 
-Recommended example:
+Recommended example for pre-quantized checkpoints:
 
 ```bash
 sglang generate \
@@ -40,13 +42,66 @@ Here, `quant_family` means a checkpoint and loading family with shared CLI
 usage and loader behavior. It is not just the numeric precision or a kernel
 backend.
 
-| quant_family      | checkpoint form                                                                            | canonical CLI                                                          | supported models                        | extra dependency                      | platform / notes                                                                                                                       |
-|-------------------|--------------------------------------------------------------------------------------------|------------------------------------------------------------------------|-----------------------------------------|---------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
-| `fp8`             | Quantized transformer component folder, or safetensors with `quantization_config` metadata | `--transformer-path` or `--transformer-weights-path`                   | ALL                                     | None                                  | Component-folder and single-file flows are both supported                                                                              |
+| quant_family     | checkpoint form                                                                            | canonical CLI                                        | supported models                                             | extra dependency                      | platform / notes                                                                                                      |
+|------------------|--------------------------------------------------------------------------------------------|------------------------------------------------------|--------------------------------------------------------------|---------------------------------------|-----------------------------------------------------------------------------------------------------------------------|
+| `fp8` / `mxfp4` (online quantization)  | Unquantized checkpoint (offline via AMD Quark coming soon) | `--quantization {fp8,mxfp4}` | Z-Image-Turbo (validated), others likely work. More support coming soon. | MXFP4: `aiter` on ROCm | MXFP4 requires ROCm and MI350+ (gfx95x). Weights quantized at load time, activations quantized to `fp8` / `mxfp4` dynamically. |
+| `fp8` (offline quantization) | Quantized transformer component folder, or safetensors with `quantization_config` metadata | `--transformer-path` or `--transformer-weights-path`                   | ALL                                     | None                                  | Component-folder and single-file flows are both supported                                                                              |
 | `modelopt-fp8`    | Converted ModelOpt FP8 transformer directory or repo with `config.json`                    | `--transformer-path`                                                    | FLUX.1, FLUX.2, Wan2.2, HunyuanVideo, Qwen Image, Qwen Image Edit | None                                  | Serialized config stays `quant_method=modelopt` with `quant_algo=FP8`; `dit_layerwise_offload` is supported and `dit_cpu_offload` stays disabled |
 | `modelopt-nvfp4`  | Mixed transformer directory/repo with `config.json`, or raw NVFP4 safetensors export/repo | `--transformer-path` for mixed overrides; `--transformer-weights-path` for raw exports | FLUX.1, FLUX.2, Wan2.2                  | None                                  | Mixed override repos keep the base model separate; raw exports such as `black-forest-labs/FLUX.2-dev-NVFP4` still use the weights-path flow |
 | `nunchaku-svdq`   | Pre-quantized Nunchaku transformer weights, usually named `svdq-{int4\|fp4}_r{rank}-...`   | `--transformer-weights-path`                                           | Model-specific support such as Qwen-Image, FLUX, and Z-Image | `nunchaku`                            | SGLang can infer precision and rank from the filename and supports both `int4` and `nvfp4`                                             |
 | `msmodelslim`     | Pre-quantized msmodelslim transformer weights                                              | `--model-path`                                                         | Wan2.2 family                           | None                                  | Currently only compatible with the Ascend NPU family and supports both `w8a8` and `w4a4`                                               |
+
+## Online Quantization
+
+Online quantization applies quantization to unquantized models at load time. This is useful for when pre-quantized checkpoints are not available.
+
+### FP8 Online Quantization
+
+Apply FP8 quantization to any unquantized model:
+
+```bash
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --quantization fp8 \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+### MXFP4 Online Quantization
+
+MXFP4 provides aggressive 4-bit compression with online quantization. **Note: Requires ROCm and MI350+ (gfx95x) GPU.**
+
+```bash
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --quantization mxfp4 \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+**Note:** Requires `aiter` package with MXFP4 kernel support
+
+### Skipping Layers
+
+By default, online quantization quantizes every linear layer in
+the transformer. However, `--quantization-ignored-layers` can be used to keep specific layers in their original precision:
+
+```bash
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --quantization fp8 \
+  --quantization-ignored-layers attention.to_ \
+  --prompt "a beautiful sunset" \
+  --save-output
+
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --quantization mxfp4 \
+  --quantization-ignored-layers attention.to_ \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.to_q`). A layer is skipped and left unquantizd if its prefix contains any of the given patterns.
 
 ## Validated ModelOpt Checkpoints
 
