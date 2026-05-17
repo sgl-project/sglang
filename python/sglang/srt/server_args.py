@@ -641,6 +641,26 @@ class ServerArgs:
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
 
+    # Double Sparsity (per-KV-head channel-aware sparse decode; opt-in, FA3 only)
+    enable_double_sparsity: bool = False
+    double_sparsity_config: Optional[str] = None
+    double_sparsity_heavy_channels: int = 32
+    double_sparsity_token_budget: int = 1024
+    double_sparsity_recent_tokens: int = 64
+    double_sparsity_sink_tokens: int = 4
+    double_sparsity_min_seq_len: int = 4096
+    double_sparsity_max_selected_per_request: int = 8192
+    double_sparsity_gqa_reduction: str = "max_abs"
+    double_sparsity_klabel_dtype: str = "bf16"
+    # v1.1 selection-kernel knobs (two-stage block-topk + merge).
+    double_sparsity_block_t: int = 1024
+    double_sparsity_k_block: int = 64
+    # Top-k selector backend for the native DS sparse-decode pipeline.
+    # `torch` is the default (`torch.topk` + fused build kernel). Other
+    # choices replace just the topk + page-table lookup step; see
+    # `mem_cache.sparsity.algorithms.selector_backends`.
+    double_sparsity_selector_backend: str = "torch"
+
     # LMCache
     enable_lmcache: bool = False
 
@@ -906,6 +926,7 @@ class ServerArgs:
         self._handle_linear_attn_backend()
         self._handle_kv4_compatibility()
         self._handle_page_size()
+        self._handle_double_sparsity()
         self._handle_amd_specifics()
         self._handle_nccl_pre_warm()
         self._handle_grammar_backend()
@@ -2926,6 +2947,77 @@ class ServerArgs:
                 self.page_size = 1
             else:
                 self.page_size = 64
+
+    def _handle_double_sparsity(self):
+        """Validate DS flags. Backend-resolution check runs in ModelRunner (M5)."""
+        if not self.enable_double_sparsity:
+            return
+        if not self.double_sparsity_config:
+            raise ValueError(
+                "--enable-double-sparsity requires --double-sparsity-config "
+                "(path to a calibration JSON produced by "
+                "scripts/double_sparsity/calibrate.py)."
+            )
+        if self.enable_hisparse:
+            raise ValueError(
+                "--enable-double-sparsity is mutually exclusive with --enable-hisparse "
+                "(both register a sparse coordinator and the factory has a single global slot)."
+            )
+        if self.kv_cache_dtype not in ("auto", "bfloat16", "bf16", "float16", "fp16"):
+            raise ValueError(
+                f"--enable-double-sparsity does not support kv_cache_dtype={self.kv_cache_dtype!r} in v1; "
+                f"use bfloat16 or float16."
+            )
+        if self.page_size != 1:
+            raise ValueError(
+                f"--enable-double-sparsity requires --page-size 1; got page_size={self.page_size}."
+            )
+        if self.speculative_algorithm:
+            raise ValueError(
+                "--enable-double-sparsity is not compatible with speculative decoding in v1."
+            )
+        if self.double_sparsity_recent_tokens < 1:
+            raise ValueError(
+                "--double-sparsity-recent-tokens must be >= 1 so the current decode position "
+                "is always retained in the selected set."
+            )
+        if (
+            self.double_sparsity_min_seq_len
+            > self.double_sparsity_max_selected_per_request
+        ):
+            raise ValueError(
+                f"--double-sparsity-min-seq-len ({self.double_sparsity_min_seq_len}) must be <= "
+                f"--double-sparsity-max-selected-per-request "
+                f"({self.double_sparsity_max_selected_per_request}); otherwise dense-fallback "
+                f"rows would not fit the captured FA3 page-table."
+            )
+        # The v1.1 selection path uses two Triton kernels (stage-1 block-
+        # topk, stage-2 merge) plus a bounded-shape torch-on-CUDA union
+        # pass. All scratch is preallocated; no tensor scales with
+        # `max_ctx`; no `.item()` / Python loop. This is capture-safe
+        # under full CUDA graphs (verified by
+        # test_double_sparsity_union.py::TestUnionCudaGraphCaptureReplay
+        # and test_double_sparsity_adaptor.py::TestCudaGraphCaptureReplay).
+        # Full CUDA graphs stay enabled.
+        #
+        # Piecewise CUDA graph (torch.compile / breakable graph) is a
+        # separate problem: lifting the auto-disable requires the
+        # selection entry point to be registered as a split op
+        # (`register_custom_op` + `register_split_op`) so torch.compile
+        # treats it as opaque rather than tracing through the union's
+        # `sort` / `gather` / advanced indexing. Without that, compile
+        # graph-breaks mid-selection on shape changes between batches.
+        # Wrapping `ds_select_tokens_triton` as a split op is a v1.2
+        # follow-up (it requires a fake_impl + the selection signature
+        # restructured to accept preallocated outputs). Until then,
+        # auto-disable piecewise CUDA graph when DS is on.
+        if not self.disable_piecewise_cuda_graph:
+            logger.warning(
+                "--enable-double-sparsity requires --disable-piecewise-cuda-graph "
+                "(selection entry point not yet a registered split op; v1.2 will "
+                "lift). Auto-setting --disable-piecewise-cuda-graph=True."
+            )
+            self.disable_piecewise_cuda_graph = True
 
     def _handle_amd_specifics(self):
         if is_hip():
@@ -5910,6 +6002,113 @@ class ServerArgs:
             default=ServerArgs.hisparse_config,
             help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
             'Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
+        )
+
+        # Double Sparsity
+        parser.add_argument(
+            "--enable-double-sparsity",
+            action="store_true",
+            help="Enable Double Sparsity attention (opt-in, FA3 only). Requires "
+            "--double-sparsity-config and --page-size 1.",
+        )
+        parser.add_argument(
+            "--double-sparsity-config",
+            type=str,
+            default=ServerArgs.double_sparsity_config,
+            help="Path to the calibration JSON file produced by "
+            "scripts/double_sparsity/calibrate.py.",
+        )
+        parser.add_argument(
+            "--double-sparsity-heavy-channels",
+            type=int,
+            default=ServerArgs.double_sparsity_heavy_channels,
+            help="Number of heavy K channels per KV head (S in the paper). Must "
+            "match the calibration file's heavy_channels.",
+        )
+        parser.add_argument(
+            "--double-sparsity-token-budget",
+            type=int,
+            default=ServerArgs.double_sparsity_token_budget,
+            help="Per-KV-head sparse-decode token budget (top-k count).",
+        )
+        parser.add_argument(
+            "--double-sparsity-recent-tokens",
+            type=int,
+            default=ServerArgs.double_sparsity_recent_tokens,
+            help="Recency window forced into the selected set (must be >= 1 so "
+            "the current decode position is always retained).",
+        )
+        parser.add_argument(
+            "--double-sparsity-sink-tokens",
+            type=int,
+            default=ServerArgs.double_sparsity_sink_tokens,
+            help="Number of leading sink tokens forced into the selected set.",
+        )
+        parser.add_argument(
+            "--double-sparsity-min-seq-len",
+            type=int,
+            default=ServerArgs.double_sparsity_min_seq_len,
+            help="Below this seq_len a row falls back to dense FA3 device-side. "
+            "Must be <= --double-sparsity-max-selected-per-request.",
+        )
+        parser.add_argument(
+            "--double-sparsity-max-selected-per-request",
+            type=int,
+            default=ServerArgs.double_sparsity_max_selected_per_request,
+            help="Hard cap on the per-request selected token count fed to FA3. "
+            "Drives the captured-graph max_seq_len_k.",
+        )
+        parser.add_argument(
+            "--double-sparsity-gqa-reduction",
+            type=str,
+            choices=["max_abs", "mean", "soq"],
+            default=ServerArgs.double_sparsity_gqa_reduction,
+            help="GQA group reduction for per-KV-head scoring (default max_abs).",
+        )
+        parser.add_argument(
+            "--double-sparsity-klabel-dtype",
+            type=str,
+            choices=["bf16", "fp32"],
+            default=ServerArgs.double_sparsity_klabel_dtype,
+            help="dtype for the K_label side cache (default bf16).",
+        )
+        parser.add_argument(
+            "--double-sparsity-block-t",
+            type=int,
+            choices=[256, 512, 1024, 2048],
+            default=ServerArgs.double_sparsity_block_t,
+            help="Stage-1 block size (tokens scored per Triton program). "
+            "Sweep {512, 1024} to find the sweet spot.",
+        )
+        parser.add_argument(
+            "--double-sparsity-k-block",
+            type=int,
+            choices=[16, 32, 64, 128, 256],
+            default=ServerArgs.double_sparsity_k_block,
+            help="Stage-1 per-block top-k count emitted to stage-2. Sweep "
+            "{32, 64, 128}. Effective budget = min(token_budget, "
+            "num_blocks * k_block).",
+        )
+        parser.add_argument(
+            "--double-sparsity-selector-backend",
+            type=str,
+            choices=[
+                "torch",
+                "flashinfer_topk_page_table",
+                "sgl_fast_topk_transform",
+                "ftka_raft_topk",
+                "jit_fused_selector",
+            ],
+            default=ServerArgs.double_sparsity_selector_backend,
+            help="Top-k selector backend for the native DS sparse-decode "
+            "pipeline. 'torch' (default) uses torch.topk + a fused build "
+            "kernel; 'flashinfer_topk_page_table' fuses top-k + page-table "
+            "lookup via FlashInfer; 'sgl_fast_topk_transform' is the "
+            "SGLang counterpart; 'ftka_raft_topk' substitutes torch.topk "
+            "with ftka.cuda_ops.raft_topk (RAFT radix top-k, optional dep "
+            "from tsinghua-ideal/flash-topk-attention — experimental, "
+            "not yet qualified for production); 'jit_fused_selector' is "
+            "reserved for a future hand-written fused kernel.",
         )
 
         # LMCache

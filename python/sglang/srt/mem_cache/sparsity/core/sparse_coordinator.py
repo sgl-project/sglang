@@ -161,12 +161,15 @@ class SparseCoordinator:
         """
         Handle forward pass begin event. Called before each forward pass starts.
 
-        Wait for pending KVCache offloading operations to complete before forward pass.
-        Ensures memory consistency for subsequent sparse attention operations.
+        Delegates to the algorithm's per-step ``forward_begin`` hook if it
+        defines one (e.g. ``DoubleSparsityAlgorithm`` uses this slot to
+        gather ``req_to_token[req_pool_indices]`` once per decode step
+        instead of once per layer). Algorithms without a hook get the
+        original no-op behavior.
         """
-        # TODO: Implement forward begin handling
-        # - Check if there are pending offloading operations
-        pass
+        algo_hook = getattr(self.algorithm, "forward_begin", None)
+        if algo_hook is not None:
+            algo_hook(forward_batch)
 
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
         """
@@ -242,8 +245,14 @@ class SparseCoordinator:
         **kwargs,
     ) -> Optional[torch.Tensor]:
         req_pool_indices = forward_batch.req_pool_indices
-        # Compute Topk
-        sparse_mask = self._compute_sparse_mask(req_pool_indices)
+        # Effective mask: default is prompt_lens-based, algorithms can override
+        # when their gating depends on runtime state (DS uses current seq_lens).
+        # Threaded into BOTH retrieve_topk and adapt_for_attn_metadata so the
+        # adaptor never sees a different mask than the algorithm did.
+        default_mask = self._compute_sparse_mask(req_pool_indices)
+        sparse_mask = self.algorithm.effective_sparse_mask(
+            forward_batch, req_pool_indices, default_mask
+        )
         selected_indices, valid_lengths = self.algorithm.retrieve_topk(
             queries=query,
             layer_id=layer.layer_id,

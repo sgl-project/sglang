@@ -1,0 +1,6101 @@
+{
+  "meta": {
+    "torch_version": "2.11.0+cu130",
+    "device": "NVIDIA H200",
+    "platform": "Linux-5.15.0-94-generic-x86_64-with-glibc2.39",
+    "flashinfer": {
+      "available": true,
+      "version": "0.6.11.post1"
+    },
+    "ftka": {
+      "available": true,
+      "version": "<unknown>",
+      "installed_commit": "<unknown>",
+      "target_commit": "d8803b29961c44d77a747636ad4282bd7a9094af",
+      "skip_reason": ""
+    },
+    "n_shapes": 76
+  },
+  "results": [
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 92.07712486386299,
+      "score_us": 19.122883677482605,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.95172321796417,
+      "score_us": 19.122883677482605,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 30.045285820961,
+      "score_us": 19.122883677482605,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 91.63491427898407,
+      "score_us": 18.64902675151825,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 79.14921268820763,
+      "score_us": 18.64902675151825,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 33.99644047021866,
+      "score_us": 18.64902675151825,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.37955072522163,
+      "score_us": 18.775537610054016,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.72839376330376,
+      "score_us": 18.775537610054016,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 37.47876733541489,
+      "score_us": 18.775537610054016,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.06984701752663,
+      "score_us": 18.74467357993126,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.74467357993126,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 39.75456580519676,
+      "score_us": 18.74467357993126,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.42671290040016,
+      "score_us": 18.351469188928604,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.351469188928604,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 43.39102655649185,
+      "score_us": 18.351469188928604,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.0156626701355,
+      "score_us": 18.639210611581802,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.69495928287506,
+      "score_us": 18.639210611581802,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 31.434204429388046,
+      "score_us": 18.639210611581802,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.85884657502174,
+      "score_us": 18.512476235628128,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.93734359741211,
+      "score_us": 18.512476235628128,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 33.7790884077549,
+      "score_us": 18.512476235628128,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.02061730623245,
+      "score_us": 18.583033233880997,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.02995601296425,
+      "score_us": 18.583033233880997,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 37.54597157239914,
+      "score_us": 18.583033233880997,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.20794522762299,
+      "score_us": 18.458310514688492,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.458310514688492,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 39.95753824710846,
+      "score_us": 18.458310514688492,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.17953988909721,
+      "score_us": 18.42312514781952,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.42312514781952,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 42.9801270365715,
+      "score_us": 18.42312514781952,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.19516578316689,
+      "score_us": 18.646959215402603,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.8774798810482,
+      "score_us": 18.646959215402603,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 31.15635365247726,
+      "score_us": 18.646959215402603,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.45122361183167,
+      "score_us": 18.434152007102966,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.6665166914463,
+      "score_us": 18.434152007102966,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 33.704973757267,
+      "score_us": 18.434152007102966,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.38029408454895,
+      "score_us": 18.722452223300934,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.07506927847862,
+      "score_us": 18.722452223300934,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 37.84053027629852,
+      "score_us": 18.722452223300934,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.06025439500809,
+      "score_us": 33.72896462678909,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 33.72896462678909,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 40.58847203850746,
+      "score_us": 33.72896462678909,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.2634317278862,
+      "score_us": 18.460508435964584,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.460508435964584,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 43.04610192775726,
+      "score_us": 18.460508435964584,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.9798067510128,
+      "score_us": 18.74854788184166,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.18259978294373,
+      "score_us": 18.74854788184166,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 31.633190810680386,
+      "score_us": 18.74854788184166,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.57341483235359,
+      "score_us": 18.445495516061783,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.51463660597801,
+      "score_us": 18.445495516061783,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 34.20179709792137,
+      "score_us": 18.445495516061783,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.1205482184887,
+      "score_us": 18.771812319755554,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.43798875808716,
+      "score_us": 18.771812319755554,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 37.83009946346283,
+      "score_us": 18.771812319755554,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.87309581041336,
+      "score_us": 18.320586532354355,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.320586532354355,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 40.615200996398926,
+      "score_us": 18.320586532354355,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.73960003256798,
+      "score_us": 18.480997532606125,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.480997532606125,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 44.54204812645912,
+      "score_us": 18.480997532606125,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.23139423131943,
+      "score_us": 18.651969730854034,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.10723716020584,
+      "score_us": 18.651969730854034,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 31.5200537443161,
+      "score_us": 18.651969730854034,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.7330062687397,
+      "score_us": 18.86848360300064,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.63332435488701,
+      "score_us": 18.86848360300064,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 34.713298082351685,
+      "score_us": 18.86848360300064,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.1217403113842,
+      "score_us": 18.681474030017853,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.794424533844,
+      "score_us": 18.681474030017853,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 38.199182599782944,
+      "score_us": 18.681474030017853,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.55508640408516,
+      "score_us": 18.66467297077179,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.66467297077179,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 41.29977896809578,
+      "score_us": 18.66467297077179,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.90120312571526,
+      "score_us": 20.126011222600937,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 20.126011222600937,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 45.054685324430466,
+      "score_us": 20.126011222600937,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 87.64596655964851,
+      "score_us": 18.383581191301346,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 72.9568861424923,
+      "score_us": 18.383581191301346,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.99206981062889,
+      "score_us": 18.383581191301346,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.35691958665848,
+      "score_us": 18.37562769651413,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 72.98551499843597,
+      "score_us": 18.37562769651413,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 80.13682439923286,
+      "score_us": 18.37562769651413,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.66827934980392,
+      "score_us": 18.74985173344612,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.22058081626892,
+      "score_us": 18.74985173344612,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.72225880622864,
+      "score_us": 18.74985173344612,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.49643170833588,
+      "score_us": 18.679331988096237,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.679331988096237,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 96.90359234809875,
+      "score_us": 18.679331988096237,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.11401203274727,
+      "score_us": 18.408000469207764,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.408000469207764,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 102.30492800474167,
+      "score_us": 18.408000469207764,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 87.6861996948719,
+      "score_us": 18.2989239692688,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.71289655566216,
+      "score_us": 18.2989239692688,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.52212443947792,
+      "score_us": 18.2989239692688,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.55190128087997,
+      "score_us": 18.622837960720062,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.41548630595207,
+      "score_us": 18.622837960720062,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 80.43086156249046,
+      "score_us": 18.622837960720062,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.26740086078644,
+      "score_us": 18.769707530736923,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.67022335529327,
+      "score_us": 18.769707530736923,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.4057767689228,
+      "score_us": 18.769707530736923,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.58148008584976,
+      "score_us": 18.136929720640182,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.136929720640182,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 96.84856981039047,
+      "score_us": 18.136929720640182,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.21746334433556,
+      "score_us": 18.566381186246872,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.566381186246872,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 102.41659358143806,
+      "score_us": 18.566381186246872,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.94231170415878,
+      "score_us": 18.327515572309494,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.19370284676552,
+      "score_us": 18.327515572309494,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.90403950214386,
+      "score_us": 18.327515572309494,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.74243125319481,
+      "score_us": 18.66806298494339,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.74608889222145,
+      "score_us": 18.66806298494339,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 82.03554898500443,
+      "score_us": 18.66806298494339,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.17897939682007,
+      "score_us": 18.970482051372528,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.80813360214233,
+      "score_us": 18.970482051372528,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.00368416309357,
+      "score_us": 18.970482051372528,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.8342410326004,
+      "score_us": 18.29022541642189,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.29022541642189,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 98.77486154437065,
+      "score_us": 18.29022541642189,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.95643055438995,
+      "score_us": 18.21005716919899,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.21005716919899,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 102.26534679532051,
+      "score_us": 18.21005716919899,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.41179311275482,
+      "score_us": 18.776487559080124,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.67551326751709,
+      "score_us": 18.776487559080124,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 76.02393627166748,
+      "score_us": 18.776487559080124,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.09912949800491,
+      "score_us": 18.672756850719452,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.12882521748543,
+      "score_us": 18.672756850719452,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 81.88487961888313,
+      "score_us": 18.672756850719452,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.37360888719559,
+      "score_us": 18.502045422792435,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.63667711615562,
+      "score_us": 18.502045422792435,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.32206609845161,
+      "score_us": 18.502045422792435,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.45100179314613,
+      "score_us": 18.371790647506714,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.371790647506714,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 99.15990754961967,
+      "score_us": 18.371790647506714,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.00890126824379,
+      "score_us": 18.511395901441574,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.511395901441574,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 104.14106771349907,
+      "score_us": 18.511395901441574,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.38524702191353,
+      "score_us": 32.034534960985184,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.24263283610344,
+      "score_us": 32.034534960985184,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 77.99262180924416,
+      "score_us": 32.034534960985184,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.73834866285324,
+      "score_us": 32.015033066272736,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.01609793305397,
+      "score_us": 32.015033066272736,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 84.91253480315208,
+      "score_us": 32.015033066272736,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 92.44384244084358,
+      "score_us": 32.00851380825043,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.45389404892921,
+      "score_us": 32.00851380825043,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 91.59091860055923,
+      "score_us": 32.00851380825043,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 93.3760404586792,
+      "score_us": 32.06901252269745,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.06901252269745,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 99.28995743393898,
+      "score_us": 32.06901252269745,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 95.41075676679611,
+      "score_us": 32.03924745321274,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.03924745321274,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 106.69048875570297,
+      "score_us": 32.03924745321274,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 87.88533508777618,
+      "score_us": 18.24166625738144,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 76.92474871873856,
+      "score_us": 18.24166625738144,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 132.9723373055458,
+      "score_us": 18.24166625738144,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.43231946229935,
+      "score_us": 18.63855868577957,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 79.75894957780838,
+      "score_us": 18.63855868577957,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 139.91966843605042,
+      "score_us": 18.63855868577957,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.22355419397354,
+      "score_us": 18.37925985455513,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 85.28795093297958,
+      "score_us": 18.37925985455513,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 152.11937949061394,
+      "score_us": 18.37925985455513,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.34294974803925,
+      "score_us": 18.282737582921982,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.282737582921982,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 168.31832006573677,
+      "score_us": 18.282737582921982,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.49985897541046,
+      "score_us": 18.21529120206833,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.21529120206833,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 186.0649511218071,
+      "score_us": 18.21529120206833,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 87.47028186917305,
+      "score_us": 18.741991370916367,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 78.8869708776474,
+      "score_us": 18.741991370916367,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 132.87674635648727,
+      "score_us": 18.741991370916367,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.05779740214348,
+      "score_us": 18.37797462940216,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 82.02960714697838,
+      "score_us": 18.37797462940216,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 139.95928689837456,
+      "score_us": 18.37797462940216,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 87.35133334994316,
+      "score_us": 18.469281494617462,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.48838338255882,
+      "score_us": 18.469281494617462,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 151.74966305494308,
+      "score_us": 18.469281494617462,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 87.60830387473106,
+      "score_us": 18.393397331237793,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.393397331237793,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 168.77010464668274,
+      "score_us": 18.393397331237793,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 87.36642077565193,
+      "score_us": 18.414650112390518,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.414650112390518,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 186.38649955391884,
+      "score_us": 18.414650112390518,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.06198665499687,
+      "score_us": 18.842928111553192,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 80.87098598480225,
+      "score_us": 18.842928111553192,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 133.2356594502926,
+      "score_us": 18.842928111553192,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.67906406521797,
+      "score_us": 18.908921629190445,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 83.37879553437233,
+      "score_us": 18.908921629190445,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 141.33775606751442,
+      "score_us": 18.908921629190445,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 91.03765711188316,
+      "score_us": 18.79146322607994,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.33708071708679,
+      "score_us": 18.79146322607994,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 153.69489789009094,
+      "score_us": 18.79146322607994,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.73842656612396,
+      "score_us": 18.56096088886261,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.56096088886261,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 169.72173005342484,
+      "score_us": 18.56096088886261,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 91.0089910030365,
+      "score_us": 18.58040690422058,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.58040690422058,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 187.16977909207344,
+      "score_us": 18.58040690422058,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 94.98436003923416,
+      "score_us": 32.01238811016083,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 81.84265345335007,
+      "score_us": 32.01238811016083,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 133.96795839071274,
+      "score_us": 32.01238811016083,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 94.60696950554848,
+      "score_us": 32.014381140470505,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 85.35539731383324,
+      "score_us": 32.014381140470505,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 141.81021600961685,
+      "score_us": 32.014381140470505,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 96.88332676887512,
+      "score_us": 31.992644071578976,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 93.52574124932289,
+      "score_us": 31.992644071578976,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 153.84651720523834,
+      "score_us": 31.992644071578976,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 99.11533445119858,
+      "score_us": 31.99515864253044,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 31.99515864253044,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 171.21467739343643,
+      "score_us": 31.99515864253044,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 102.63722389936447,
+      "score_us": 32.00532868504524,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.00532868504524,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 189.1733892261982,
+      "score_us": 32.00532868504524,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 115.1328906416893,
+      "score_us": 87.12565526366234,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 83.96275341510773,
+      "score_us": 87.12565526366234,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 138.35174962878227,
+      "score_us": 87.12565526366234,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 114.76811021566391,
+      "score_us": 88.28908205032349,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.06111121177673,
+      "score_us": 88.28908205032349,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 145.59706673026085,
+      "score_us": 88.28908205032349,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 116.20992794632912,
+      "score_us": 86.7355428636074,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 92.9754413664341,
+      "score_us": 86.7355428636074,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 156.96372836828232,
+      "score_us": 86.7355428636074,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 120.29597535729408,
+      "score_us": 86.87246590852737,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 86.87246590852737,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 181.28005787730217,
+      "score_us": 86.87246590852737,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 123.55461716651918,
+      "score_us": 89.33644741773605,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 89.33644741773605,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 243.58883500099182,
+      "score_us": 89.33644741773605,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 8,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 91.6767306625843,
+      "score_us": 60.867927968502045,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 8,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 87.69843727350235,
+      "score_us": 60.867927968502045,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 8,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 91.79625660181046,
+      "score_us": 60.867927968502045,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 8,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "error",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "setup: RuntimeError: P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: FTKA's batched_sparse_gemv hardcodes HEAD_DIM=128 at csrc/src/ftka_ops.cu:70 (BatchedSparseGEMV<128, ...>) but DS K-label cache uses S=32. Running this path against the DS layout would crash or compute over uninitialized memory. To unblock, either recompile FTKA with HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute penalty) \u2014 neither is in scope for an implementation-substitute evaluation. See REPORT.md section on P4."
+    }
+  ]
+}

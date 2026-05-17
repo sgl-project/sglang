@@ -1064,6 +1064,16 @@ class CudaGraphRunner:
         if forward_batch.hisparse_coordinator is not None:
             forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
 
+        # Double-Sparsity: prefill the per-step req_to_token scratch before
+        # capturing run_once so the captured try_native_sparse_decode reads
+        # an already-populated buffer (no per-layer index_select inside
+        # the graph). The same write runs again from ModelRunner.forward
+        # at replay-time, refreshing the scratch contents in-place through
+        # the captured device pointer.
+        ds_coordinator = getattr(self.model_runner, "ds_coordinator", None)
+        if ds_coordinator is not None:
+            ds_coordinator.forward_begin(forward_batch)
+
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 

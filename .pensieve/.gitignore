@@ -1,0 +1,2 @@
+# Runtime state (reports, markers, caches, graph snapshots)
+.state/

@@ -386,6 +386,10 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        # Double Sparsity: per-step hooks call into a registered SparseCoordinator.
+        # Acquired from ModelRunner once initialization is complete.
+        self.enable_double_sparsity = server_args.enable_double_sparsity
+        self.ds_coordinator = None
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -980,6 +984,12 @@ class Scheduler(
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        if self.enable_double_sparsity:
+            # Coordinator constructed inside ModelRunner._init_double_sparsity_coordinator
+            # before CUDA graph capture. Just hold a reference for scheduler-side
+            # request lifecycle hooks.
+            self.ds_coordinator = self.tp_worker.model_runner.ds_coordinator
 
         if (
             server_args.disaggregation_mode == "decode"

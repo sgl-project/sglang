@@ -29,6 +29,29 @@ class BaseSparseAlgorithm(ABC):
         self.req_to_token_pool = None
         self.states = None
 
+    def effective_sparse_mask(
+        self,
+        forward_batch: "ForwardBatch",
+        req_pool_indices: torch.Tensor,
+        default_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the per-row sparse mask the coordinator should pass through this layer.
+
+        Default returns `default_mask` (the coordinator's
+        `_compute_sparse_mask(req_pool_indices)` result, which gates on
+        `prompt_lens >= min_sparse_prompt_len`). Algorithms override
+        this when their gating depends on runtime state the coordinator
+        can't see — e.g. Double Sparsity uses `forward_batch.seq_lens`
+        so a request whose seq_len crosses `min_seq_len` during decode
+        becomes sparse without re-admission.
+
+        The coordinator threads this mask into BOTH `retrieve_topk` and
+        `adapt_for_attn_metadata`; if only `retrieve_topk` were
+        overridden, the adaptor would still see the stale mask and
+        late-crossing rows would stay dense.
+        """
+        return default_mask
+
     def initialize_representation_pool(
         self,
         start_layer: int,

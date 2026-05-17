@@ -1,0 +1,68 @@
+{
+  "concurrencies": [
+    1,
+    16
+  ],
+  "results": [
+    {
+      "config": "branch_ds_on",
+      "model": "meta-llama/Llama-3.1-70B-Instruct",
+      "context_len": 131072,
+      "output_len": 512,
+      "n_requests": 8,
+      "concurrency": 1,
+      "decode_tok_per_s": 61.60590109169107,
+      "aggregate_tok_per_s": 27.389856094656952,
+      "e2e_latency_s": 18.692981272935867,
+      "ttft_ms_p50": 10399.41668510437,
+      "ttft_ms_p95": 10421.286654472351,
+      "tbt_ms_p50": 16.224145889282227,
+      "tbt_ms_p95": 16.312670707702637,
+      "niah_accuracy": 0.4,
+      "block_t": 1024,
+      "k_block": 64,
+      "calibration_mode": "wikitext",
+      "extra": {
+        "tp_size": 8.0,
+        "mem_fraction_static": 0.85,
+        "max_running_requests": 16.0,
+        "niah_n_samples": 10.0,
+        "token_budget": 2048.0,
+        "recent_tokens": 64.0,
+        "sink_tokens": 4.0,
+        "min_seq_len": 4096.0,
+        "max_selected_per_request": 8192.0
+      }
+    },
+    {
+      "config": "branch_ds_on",
+      "model": "meta-llama/Llama-3.1-70B-Instruct",
+      "context_len": 131072,
+      "output_len": 512,
+      "n_requests": 16,
+      "concurrency": 16,
+      "decode_tok_per_s": 6.515662100928511,
+      "aggregate_tok_per_s": 44.69959511524361,
+      "e2e_latency_s": 165.95988088846207,
+      "ttft_ms_p50": 86790.22085666656,
+      "ttft_ms_p95": 158350.5420088768,
+      "tbt_ms_p50": 23.38266372680664,
+      "tbt_ms_p95": 23.55724573135376,
+      "niah_accuracy": null,
+      "block_t": 1024,
+      "k_block": 64,
+      "calibration_mode": "wikitext",
+      "extra": {
+        "tp_size": 8.0,
+        "mem_fraction_static": 0.85,
+        "max_running_requests": 16.0,
+        "niah_n_samples": 10.0,
+        "token_budget": 2048.0,
+        "recent_tokens": 64.0,
+        "sink_tokens": 4.0,
+        "min_seq_len": 4096.0,
+        "max_selected_per_request": 8192.0
+      }
+    }
+  ]
+}

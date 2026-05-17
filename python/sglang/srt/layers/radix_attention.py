@@ -101,6 +101,11 @@ class RadixAttention(nn.Module):
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
+        # Set to True at model load by ModelRunner when --enable-double-sparsity
+        # is set (see ModelRunner._init_double_sparsity_coordinator). Read at
+        # trace time as a Python-static attribute — never branched on a device
+        # tensor under graph replay.
+        self.ds_enabled = False
 
     def forward(
         self,
@@ -120,6 +125,72 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
+        # Common path FIRST: byte-for-byte unchanged from the dense codepath
+        # when DS is off (the vast majority of users).
+        if not self.ds_enabled:
+            return self._forward_inner(q, k, v, forward_batch, save_kv_cache, **kwargs)
+
+        # DS path. Existing inner branches preserved; DS hooks wrap them.
+        from sglang.srt.mem_cache.sparsity import get_sparse_coordinator
+
+        coordinator = get_sparse_coordinator()
+        if coordinator is None:
+            # Defensive: if the coordinator was torn down but ds_enabled wasn't
+            # cleared, fall back to dense rather than crash.
+            return self._forward_inner(q, k, v, forward_batch, save_kv_cache, **kwargs)
+
+        # Decode-only: try the native sparse-decode path first (bypasses FA3
+        # entirely; runs its own Triton score + topk + sparse-attn kernels).
+        # If it returns a tensor, the attention output is already computed —
+        # skip both attention_begin (no FA3 metadata rewrite) and
+        # _forward_inner (no FA3 backend call). Only attention_end runs to
+        # write K_label for the new decode token.
+        # Falls through to the legacy FA3 + DSFlashAttentionAdaptor path
+        # when not eligible (short seq_len, missing scratch, etc.).
+        if forward_batch.forward_mode.is_decode_or_idle():
+            try_native = getattr(
+                coordinator.algorithm, "try_native_sparse_decode", None
+            )
+            # The native sparse-decode path doesn't yet support q_rope /
+            # k_rope / sinks (split-RoPE and sink-token attention). Other
+            # kwargs (e.g. instrumentation tags) pass through harmlessly.
+            _NATIVE_UNSUPPORTED_KWARGS = {"q_rope", "k_rope", "sinks"}
+            if try_native is not None and not (
+                kwargs.keys() & _NATIVE_UNSUPPORTED_KWARGS
+            ):
+                native_out = try_native(
+                    q, k, v, self, forward_batch, save_kv_cache=save_kv_cache
+                )
+                if native_out is not None:
+                    if save_kv_cache:
+                        coordinator.attention_end(native_out, self, forward_batch)
+                    return native_out
+
+            attn_metadata = getattr(
+                forward_batch.attn_backend, "forward_metadata", None
+            )
+            coordinator.attention_begin(q, k, v, self, forward_batch, attn_metadata)
+
+        ret = self._forward_inner(q, k, v, forward_batch, save_kv_cache, **kwargs)
+
+        # K_label write hook. Skip entirely when save_kv_cache=False —
+        # otherwise the side cache desyncs from the KV pool (the inner call
+        # didn't write K, so we'd read stale rows from out_cache_loc and
+        # update K_label with garbage). The algorithm has a defensive
+        # `getattr(forward_batch, "save_kv_cache", True)` check too, but
+        # save_kv_cache lives on this function arg, not on forward_batch.
+        if save_kv_cache:
+            coordinator.attention_end(ret, self, forward_batch)
+        return ret
+
+    def _forward_inner(self, q, k, v, forward_batch, save_kv_cache, **kwargs):
+        """Existing inner attention dispatch — DO NOT MODIFY semantics here.
+
+        Two paths preserved verbatim from main:
+          - extend with `get_forward_context()`: through the registered split
+            op `unified_attention_with_output` (or the bcg variant).
+          - everything else: direct `attn_backend.forward(...)`.
+        """
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))

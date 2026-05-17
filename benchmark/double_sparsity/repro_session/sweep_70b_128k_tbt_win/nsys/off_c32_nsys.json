@@ -1,0 +1,25 @@
+{
+  "config": "branch_ds_off",
+  "model": "meta-llama/Llama-3.1-70B-Instruct",
+  "context_len": 131072,
+  "output_len": 64,
+  "n_requests": 32,
+  "concurrency": 32,
+  "decode_tok_per_s": 0.7540288416477757,
+  "aggregate_tok_per_s": 6.192165757411086,
+  "e2e_latency_s": 253.0658020377159,
+  "ttft_ms_p50": 168583.17875862122,
+  "ttft_ms_p95": 313420.19119262695,
+  "tbt_ms_p50": 34.63757038116455,
+  "tbt_ms_p95": 36.46939992904663,
+  "niah_accuracy": null,
+  "block_t": null,
+  "k_block": null,
+  "calibration_mode": null,
+  "extra": {
+    "tp_size": 8.0,
+    "mem_fraction_static": 0.85,
+    "max_running_requests": 32.0,
+    "niah_n_samples": 5.0
+  }
+}

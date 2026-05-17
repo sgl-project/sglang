@@ -100,6 +100,8 @@ class SchedulerOutputProcessorMixin:
                 req.time_stats.set_quick_finish_time()
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                if self.enable_double_sparsity and self.ds_coordinator is not None:
+                    self.ds_coordinator.on_request_end(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -259,6 +261,11 @@ class SchedulerOutputProcessorMixin:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
+                        if (
+                            self.enable_double_sparsity
+                            and self.ds_coordinator is not None
+                        ):
+                            self.ds_coordinator.on_request_begin(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -654,6 +661,8 @@ class SchedulerOutputProcessorMixin:
             else:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                if self.enable_double_sparsity and self.ds_coordinator is not None:
+                    self.ds_coordinator.on_request_end(req)
                 release_kv_cache(req, self.tree_cache)
 
             req.time_stats.set_completion_time()
