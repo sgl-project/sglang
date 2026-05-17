@@ -47,7 +47,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         input_size_per_partition: int,
         params_dtype: torch.dtype,
         weight_loader: Callable,
-        **kwargs
+        **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
         layer.logical_widths = output_partition_sizes

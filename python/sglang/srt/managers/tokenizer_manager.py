@@ -398,7 +398,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.dump_request_list: List[Tuple] = []
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
-        self.straggler_request_list: List[Tuple] = []
 
         # Initialize performance metrics loggers with proper skip names
         _, obj_skip_names, out_skip_names = self.request_logger.metadata
@@ -445,7 +444,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        self.bootstrap_server = start_disagg_service(self.server_args)
+        start_disagg_service(self.server_args)
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 
@@ -689,9 +688,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
-            encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
-            input_ids = encoded["input_ids"]
-            token_type_ids = encoded.get("token_type_ids") if is_cross_encoder else None
+
+            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
+                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
+                token_type_ids = None
+            else:
+                encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
+                input_ids = encoded["input_ids"]
+                token_type_ids = (
+                    encoded.get("token_type_ids") if is_cross_encoder else None
+                )
 
         # Step 4: Extract results based on input format
         return self._extract_tokenizer_results(
@@ -2107,37 +2113,45 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if (
             hasattr(recv_obj, "spec_verify_ct")
             and recv_obj.spec_verify_ct[i] > 0
-            and hasattr(recv_obj, "spec_accepted_drafts")
-            and len(recv_obj.spec_accepted_drafts) > i
+            and hasattr(recv_obj, "spec_num_correct_drafts")
+            and len(recv_obj.spec_num_correct_drafts) > i
         ):
             # Total number of proposed draft tokens per request.
-            all_drafts = recv_obj.spec_verify_ct[i] * (
+            num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
                 self.server_args.speculative_num_draft_tokens - 1
             )
-            accepted_drafts = recv_obj.spec_accepted_drafts[i]
+            num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
 
             # Calculate per-request acceptance rate and average acceptance length.
-            if all_drafts > 0:
-                # accept_rate: accepted_drafts / total_proposed_drafts (strict count, no bonus).
-                meta_info["spec_accept_rate"] = accepted_drafts / all_drafts
+            if num_proposed_drafts > 0:
+                # accept_rate: num_correct_drafts / num_proposed_drafts (strict count, no bonus).
+                meta_info["spec_accept_rate"] = num_correct_drafts / num_proposed_drafts
                 # accept_length: completion_tokens / verify_ct (includes bonus token).
                 meta_info["spec_accept_length"] = (
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
 
-                meta_info["spec_accepted_drafts"] = accepted_drafts
-                meta_info["spec_proposed_drafts"] = all_drafts
+                meta_info["spec_num_correct_drafts"] = num_correct_drafts
+                meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+
+                # FIXME: backward-compat aliases, remove in next release.
+                meta_info["spec_accepted_drafts"] = num_correct_drafts
+                meta_info["spec_proposed_drafts"] = num_proposed_drafts
 
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
-                recv_obj.spec_acceptance_histogram
-                and len(recv_obj.spec_acceptance_histogram) > i
-                and recv_obj.spec_acceptance_histogram[i]
+                recv_obj.spec_correct_drafts_histogram
+                and len(recv_obj.spec_correct_drafts_histogram) > i
+                and recv_obj.spec_correct_drafts_histogram[i]
             ):
-                meta_info["spec_accept_histogram"] = recv_obj.spec_acceptance_histogram[
-                    i
-                ]
+                meta_info["spec_correct_drafts_histogram"] = (
+                    recv_obj.spec_correct_drafts_histogram[i]
+                )
+                # FIXME: backward-compat alias, remove in next release.
+                meta_info["spec_accept_histogram"] = (
+                    recv_obj.spec_correct_drafts_histogram[i]
+                )
 
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (
