@@ -2,7 +2,7 @@
 
 ## Lifecycle State
 - Last Event: self-improve
-- Last Note: auto-improve: review fixes + retrieval calib + FlashInfer boundaries
+- Last Note: auto-improve: FTKA evaluation harness + selector-only scope decision + layout-mismatch knowledge
 
 ## Project Paths
 - Project Root: `/workspace/sglang`
@@ -10,7 +10,7 @@
 - Runtime State: `.pensieve/.state/`
 
 ## Short-Term
-- Total: 5
+- Total: 7
 - Due for refine: 0 (created 7+ days ago)
 
 ## Graph
