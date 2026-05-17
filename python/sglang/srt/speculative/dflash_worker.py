@@ -1109,9 +1109,7 @@ class DFlashWorker:
         )
 
     def forward_batch_generation(
-        self,
-        batch: ScheduleBatch,
-        **kwargs,
+        self, batch: ScheduleBatch, **kwargs
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
             raise RuntimeError(
