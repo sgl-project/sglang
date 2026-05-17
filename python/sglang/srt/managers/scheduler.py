@@ -176,6 +176,9 @@ from sglang.srt.managers.scheduler_components.kv_events_publisher import (
 from sglang.srt.managers.scheduler_components.load_inquirer import (
     SchedulerLoadInquirer,
 )
+from sglang.srt.managers.scheduler_components.logprob_result_processor import (
+    SchedulerLogprobResultProcessor,
+)
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     RECORD_STEP_TIME,
     PrefillStats,
@@ -732,6 +735,11 @@ class Scheduler(
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+        )
+
+        self.logprob_result_processor = SchedulerLogprobResultProcessor(
+            server_args=self.server_args,
+            model_config=self.model_config,
         )
 
         self.is_initializing = False
