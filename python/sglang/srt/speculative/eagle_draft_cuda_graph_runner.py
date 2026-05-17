@@ -398,6 +398,12 @@ class EAGLEDraftCudaGraphRunner:
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
+        original_batch_size = forward_batch.batch_size
+        original_positions = forward_batch.positions
+        original_seq_lens = forward_batch.seq_lens
+        original_req_pool_indices = forward_batch.req_pool_indices
+        original_out_cache_loc = forward_batch.out_cache_loc
+        original_seq_lens_cpu = forward_batch.seq_lens_cpu
 
         # Pad
         if self.require_mlp_tp_gather:
@@ -415,6 +421,8 @@ class EAGLEDraftCudaGraphRunner:
         bs = self.capture_bs[index]
         if bs != raw_bs:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
+            # Padded graph lanes must write to reserved cache slot 0.
+            # DSv4 replay metadata relies on these zero-filled padding slots.
             buffers.out_cache_loc.zero_()
             buffers.positions.zero_()
             buffers.topk_p.zero_()
@@ -461,6 +469,11 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.batch_size = bs
             forward_batch.seq_lens = buffers.seq_lens[:bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
+            # Replay metadata must see the same padded cache-location layout as
+            # the captured graph, not the raw request batch.
+            forward_batch.out_cache_loc = buffers.out_cache_loc[
+                : num_tokens * self.speculative_num_steps
+            ]
             forward_batch.positions = buffers.positions[:num_tokens]
 
         if forward_batch.seq_lens_cpu is not None:
@@ -469,24 +482,28 @@ class EAGLEDraftCudaGraphRunner:
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
-        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-            forward_batch, bs
-        )
-        self.raw_bs = raw_bs
-        self.bs = bs
-        # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
+        try:
+            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+                forward_batch, bs
+            )
+            self.raw_bs = raw_bs
+            self.bs = bs
+            # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
 
-        # Replay
-        self._replay(forward_batch)
+            # Replay
+            self._replay(forward_batch)
+        finally:
+            if bs != raw_bs:
+                forward_batch.batch_size = original_batch_size
+                forward_batch.positions = original_positions
+                forward_batch.seq_lens = original_seq_lens
+                forward_batch.req_pool_indices = original_req_pool_indices
+                forward_batch.out_cache_loc = original_out_cache_loc
+                forward_batch.seq_lens_cpu = original_seq_lens_cpu
+
         out = self.output_buffers[bs]
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)
-            forward_batch.batch_size = raw_bs
-            forward_batch.positions = buffers.positions[:raw_num_token]
-            forward_batch.seq_lens = buffers.seq_lens[:raw_bs]
-            forward_batch.req_pool_indices = buffers.req_pool_indices[:raw_bs]
-            if forward_batch.seq_lens_cpu is not None:
-                forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
 
         return out

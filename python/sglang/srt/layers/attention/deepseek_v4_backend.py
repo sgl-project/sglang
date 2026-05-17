@@ -805,7 +805,6 @@ class DeepseekV4AttnBackend(
             device = seq_lens.device
             seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
             seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
-            seq_lens_sum = bs
             req_pool_indices = torch.zeros(
                 bs, dtype=req_pool_indices.dtype, device=device
             )
@@ -823,6 +822,12 @@ class DeepseekV4AttnBackend(
         if bucket == _GraphBucket.DECODE_OR_IDLE:
             assert out_cache_loc is not None
             assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
+            if len(out_cache_loc) > bs:
+                raise ValueError(
+                    "DSv4 decode replay metadata expects one out_cache_loc per "
+                    f"graph batch entry; got {len(out_cache_loc)} locations for "
+                    f"{bs=}. Multi-step EAGLE replay must pass a per-step slice."
+                )
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
                 pad=(0, bs - len(out_cache_loc)),
@@ -1227,26 +1232,63 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         if self.speculative_num_steps == 1:
             return
 
-        self.attn_backends[0]._replay_forward_batch = forward_batch
-        self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=forward_batch.spec_info,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
+        # EAGLE stores draft cache locations request-major, while each captured
+        # decode step consumes one step-major slice.
+        step_out_cache_locs = _split_eagle_draft_out_cache_loc_by_step(
+            forward_batch.out_cache_loc,
+            batch_size=bs,
+            topk=self.topk,
+            speculative_num_steps=self.speculative_num_steps,
         )
-        self.attn_backends[0]._replay_forward_batch = None
-        temp_metadata = self.attn_backends[0].forward_metadata
+        original_out_cache_loc = forward_batch.out_cache_loc
+        try:
+            for i in range(self.speculative_num_steps - 1):
+                backend = self.attn_backends[i]
+                forward_batch.out_cache_loc = step_out_cache_locs[i]
+                backend._replay_forward_batch = forward_batch
+                backend.init_forward_metadata_replay_cuda_graph(
+                    bs=bs,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    seq_lens_sum=forward_batch.seq_lens_sum,
+                    encoder_lens=None,
+                    forward_mode=ForwardMode.DECODE,
+                    spec_info=forward_batch.spec_info,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                )
+                backend._replay_forward_batch = None
+        finally:
+            forward_batch.out_cache_loc = original_out_cache_loc
+            for backend in self.attn_backends:
+                backend._replay_forward_batch = None
 
-        for i in range(1, self.speculative_num_steps - 1):
-            self.attn_backends[i].replay_cuda_graph_metadata_from(
-                bs=bs,
-                temp_metadata=temp_metadata,
-                bucket=_GraphBucket.DECODE_OR_IDLE,
-            )
+
+def _split_eagle_draft_out_cache_loc_by_step(
+    out_cache_loc: torch.Tensor,
+    *,
+    batch_size: int,
+    topk: int,
+    speculative_num_steps: int,
+) -> torch.Tensor:
+    """Match the request-major EAGLE draft layout used by draft_forward.
+
+    Keep this in sync with the equivalent reshape/permute in eagle_worker.py
+    and eagle_worker_v2.py.
+    """
+    expected_num_locs = batch_size * topk * speculative_num_steps
+    if out_cache_loc.numel() != expected_num_locs:
+        raise ValueError(
+            "EAGLE draft out_cache_loc must be padded to the CUDA graph batch "
+            f"before DSv4 replay metadata is initialized: got {out_cache_loc.numel()} "
+            f"locations, expected {expected_num_locs} for {batch_size=} {topk=} "
+            f"{speculative_num_steps=}."
+        )
+
+    return (
+        out_cache_loc.reshape(batch_size, topk, speculative_num_steps)
+        .permute(2, 0, 1)
+        .reshape(speculative_num_steps, batch_size * topk)
+    )
 
 
 def _pad_tensor_to_size(tensor: torch.Tensor, size: int, *, value: int = 0):
