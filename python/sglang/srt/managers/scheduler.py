@@ -21,7 +21,7 @@ import signal
 import sys
 import time
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -3005,6 +3005,47 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = (batch, attr_snapshot)
 
+    @contextmanager
+    def _overlap_forward_isolation(self, batch: ScheduleBatch):
+        """Make SB transactional across one overlap forward.
+
+        1. Snapshot SB fields so V2's mid-forward mutations (forward_mode /
+           input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
+           only need sampling_info restored - V1 carries spec_info forward as
+           next-iter draft input.
+        2. Substitute sampling_info with a forward-only copy (orchestrator=None,
+           shares the pre-accumulated penalty buffer) so V2's multiple init_new
+           calls don't double-accumulate penalties.
+        3. Pin (batch, snapshot) into batch_record_buf for 2 iters so GPU
+           tensors in the snapshot survive the caching allocator past the
+           forward stream. Must run AFTER the sampling_info swap so the
+           forward-only copy gets pinned.
+        """
+        # 1. snapshot
+        snapshot_v2_full = batch.is_spec_v2
+        sched_snapshot = (
+            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+            if snapshot_v2_full
+            else None
+        )
+        sched_sampling_info = batch.sampling_info
+
+        # 2. sampling_info substitute
+        if sched_sampling_info is not None:
+            batch.sampling_info = sched_sampling_info.copy_for_forward()
+
+        # 3. pin for 2-iter tensor lifetime
+        self.record_batch_in_overlap(batch)
+
+        try:
+            yield
+        finally:
+            if snapshot_v2_full:
+                for name, value in sched_snapshot.items():
+                    setattr(batch, name, value)
+            else:
+                batch.sampling_info = sched_sampling_info
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -3027,42 +3068,10 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                # Spec V2 mutates SB mid-forward (forward_mode, input_ids,
-                # seq_lens, spec_info, ...) and downstream process_batch_result
-                # expects pre-forward state; snapshot all fields and restore.
-                # V1 manages its own state and intentionally carries spec_info
-                # forward, so only sampling_info gets restored for V1 / non-spec.
-                snapshot_v2_full = batch.is_spec_v2
-                sched_snapshot = (
-                    {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
-                    if snapshot_v2_full
-                    else None
-                )
-                sched_sampling_info = batch.sampling_info
+                with self._overlap_forward_isolation(batch):
+                    bs = len(batch.seq_lens)
+                    future_indices = self.future_map.alloc_future_indices(bs)
 
-                # Forward consumes a copy of sampling_info with
-                # penalizer_orchestrator=None (penalty already accumulated
-                # into a buffer once via update_penalties); avoids
-                # double-accumulation across the multiple
-                # ForwardBatch.init_new calls inside spec V2.
-                if sched_sampling_info is not None:
-                    batch.sampling_info = sched_sampling_info.copy_for_forward()
-
-                # Record AFTER the sampling_info swap so attr_snapshot keeps
-                # the forward-only copy alive across the 2-iter buffer window.
-                # The copy holds freshly allocated acc_additive_penalties /
-                # acc_scaling_penalties tensors; if only the original is kept
-                # alive (which `update_penalties` reallocates next iter), the
-                # caching allocator may reuse the underlying memory while the
-                # forward stream is still reading it -> NaN/inf in probability.
-                # Pre-MWB-removal MWB held the copy and lived in this same buf,
-                # giving it a 2-iter lifetime by construction.
-                self.record_batch_in_overlap(batch)
-
-                bs = len(batch.seq_lens)
-                future_indices = self.future_map.alloc_future_indices(bs)
-
-                try:
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
                         self.future_map.resolve_future(batch)
@@ -3080,13 +3089,6 @@ class Scheduler(
                             )
                         else:
                             batch_result.future_indices = future_indices
-                finally:
-                    if snapshot_v2_full:
-                        for name, value in sched_snapshot.items():
-                            setattr(batch, name, value)
-                    else:
-                        # V1 / non-spec: only undo our own sampling_info swap.
-                        batch.sampling_info = sched_sampling_info
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
