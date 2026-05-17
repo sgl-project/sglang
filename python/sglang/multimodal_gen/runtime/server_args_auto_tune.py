@@ -11,7 +11,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
-    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+    LAYERWISE_OFFLOAD_DIT_GROUP,
+    LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
+    LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
+    LAYERWISE_OFFLOAD_VAE_GROUP,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -22,6 +25,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 PERFORMANCE_MODES = ("manual", "auto", "speed", "memory")
+
+DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
+    (LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP, "text_encoder_cpu_offload"),
+    (LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP, "image_encoder_cpu_offload"),
+    (LAYERWISE_OFFLOAD_VAE_GROUP, "vae_cpu_offload"),
+)
 
 
 class ServerArgsAutoTuner:
@@ -60,6 +69,13 @@ class ServerArgsAutoTuner:
             logger.info("Applying performance_mode=memory")
             if args.use_fsdp_inference:
                 self._set_gpu_resident_defaults(use_fsdp=True)
+                if (
+                    args.layerwise_offload_components is None
+                    and self._can_apply_default_layerwise_offload_policy()
+                ):
+                    args.layerwise_offload_components = (
+                        self._default_layerwise_components_for_unset_placement() or None
+                    )
                 return
             args.use_fsdp_inference = False
             if self._can_apply_default_layerwise_offload_policy():
@@ -96,15 +112,34 @@ class ServerArgsAutoTuner:
                 components = tuple(
                     component for component in components if component != "dit"
                 )
-            if args.dit_cpu_offload and "dit" in components:
+            if (
+                args.dit_cpu_offload
+                and "dit" in components
+                and not args.is_arg_explicitly_set("dit_cpu_offload")
+            ):
                 args.dit_cpu_offload = False
                 changed.append("dit_cpu_offload=False")
-            if args.text_encoder_cpu_offload and "text_encoder" in components:
+            if (
+                args.text_encoder_cpu_offload
+                and LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP in components
+                and not args.is_arg_explicitly_set("text_encoder_cpu_offload")
+            ):
                 args.text_encoder_cpu_offload = False
                 changed.append("text_encoder_cpu_offload=False")
-            if args.image_encoder_cpu_offload and "image_encoder" in components:
+            if (
+                args.image_encoder_cpu_offload
+                and LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP in components
+                and not args.is_arg_explicitly_set("image_encoder_cpu_offload")
+            ):
                 args.image_encoder_cpu_offload = False
                 changed.append("image_encoder_cpu_offload=False")
+            if (
+                args.vae_cpu_offload
+                and LAYERWISE_OFFLOAD_VAE_GROUP in components
+                and not args.is_arg_explicitly_set("vae_cpu_offload")
+            ):
+                args.vae_cpu_offload = False
+                changed.append("vae_cpu_offload=False")
             if changed:
                 logger.info(
                     "Disabling component offload for %s because minimum available memory on selected GPUs is %.2f GiB: %s",
@@ -134,56 +169,30 @@ class ServerArgsAutoTuner:
             self._enable_cfg_parallel_if_supported()
 
     def maybe_adjust_auto_default_layerwise_offload(self) -> None:
-        """adjust the default layerwise offload policy"""
+        """Enable verified non-DiT layerwise defaults for unset component placement."""
         args = self.server_args
+        if args.performance_mode != "auto":
+            return
         if not self.could_override_server_args():
             return
-        if self._explicit_memory_policy:
-            return
-        deployment_config = self._deployment_config()
-        if envs.SGLANG_CACHE_DIT_ENABLED:
-            return
         if (
-            not deployment_config.auto_dit_layerwise_offload
-            or args.dit_layerwise_offload is not None
+            args.layerwise_offload_components is not None
+            or args.dit_layerwise_offload is True
         ):
             return
-        if args.use_fsdp_inference:
-            # if fsdp is enabled, layerwise-offload is weakened since the parameter has already been sharded
-            args.dit_layerwise_offload = False
+        if not current_platform.is_cuda():
             return
 
-        auto_enable_layerwise_offload = (
-            current_platform.enable_dit_layerwise_offload_for_wan_by_default()
-        )
-        disable_threshold_gb = (
-            deployment_config.auto_dit_layerwise_offload_high_memory_disable_gb
-        )
-        if (
-            auto_enable_layerwise_offload
-            and current_platform.is_cuda()
-            and disable_threshold_gb is not None
-        ):
-            # auto turn off layerwise-offload if we have sufficient VRAM headroom
-            device_total_memory_gb = current_platform.get_device_total_memory() / (
-                1 << 30
-            )
-            if device_total_memory_gb >= disable_threshold_gb:
-                logger.info(
-                    "Skipping automatic dit_layerwise_offload for %s on a high-memory CUDA GPU (e.g. H200/B200/B300-class, %.2f GiB total)",
-                    args.pipeline_config.__class__.__name__,
-                    device_total_memory_gb,
-                )
-                auto_enable_layerwise_offload = False
-                args.dit_layerwise_offload = False
+        layerwise_components = self._default_layerwise_components_for_unset_placement()
+        if not layerwise_components:
+            return
 
-        if auto_enable_layerwise_offload:
-            logger.info(
-                "Automatically enable dit_layerwise_offload for %s for low memory and performance balance",
-                args.pipeline_config.__class__.__name__,
-            )
-            args.dit_layerwise_offload = True
-            args.dit_cpu_offload = False
+        logger.info(
+            "Automatically enable default non-DiT layerwise offload for %s: %s",
+            args.pipeline_config.__class__.__name__,
+            layerwise_components,
+        )
+        args.layerwise_offload_components = layerwise_components
 
     def maybe_replace_cpu_offloaded_components_with_layerwise(self) -> None:
         args = self.server_args
@@ -200,18 +209,22 @@ class ServerArgsAutoTuner:
 
         layerwise_components: list[str] = []
         if args.dit_layerwise_offload:
-            layerwise_components.append(LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS)
+            layerwise_components.append(LAYERWISE_OFFLOAD_DIT_GROUP)
 
         changed: list[str] = []
-        if args.text_encoder_cpu_offload:
-            layerwise_components.append("text_encoder")
-            changed.append("text_encoder")
-        if args.image_encoder_cpu_offload:
-            layerwise_components.append("image_encoder")
-            changed.append("image_encoder")
-        if args.vae_cpu_offload:
-            layerwise_components.append("vae")
-            changed.append("vae")
+        if args.text_encoder_cpu_offload and not args.is_arg_explicitly_set(
+            "text_encoder_cpu_offload"
+        ):
+            layerwise_components.append(LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP)
+            changed.append(LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP)
+        if args.image_encoder_cpu_offload and not args.is_arg_explicitly_set(
+            "image_encoder_cpu_offload"
+        ):
+            layerwise_components.append(LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP)
+            changed.append(LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP)
+        if args.vae_cpu_offload and not args.is_arg_explicitly_set("vae_cpu_offload"):
+            layerwise_components.append(LAYERWISE_OFFLOAD_VAE_GROUP)
+            changed.append(LAYERWISE_OFFLOAD_VAE_GROUP)
 
         if not changed:
             return
@@ -301,25 +314,46 @@ class ServerArgsAutoTuner:
 
     def _set_layerwise_offload_defaults(self) -> None:
         args = self.server_args
-        if args.dit_layerwise_offload is None:
-            args.dit_layerwise_offload = True
+        if args.layerwise_offload_components is None:
+            args.layerwise_offload_components = (
+                self._default_layerwise_components_for_unset_placement() or None
+            )
         if args.dit_cpu_offload is None:
-            args.dit_cpu_offload = False
+            args.dit_cpu_offload = True
         if args.text_encoder_cpu_offload is None:
-            args.text_encoder_cpu_offload = True
+            args.text_encoder_cpu_offload = False
         if args.image_encoder_cpu_offload is None:
-            args.image_encoder_cpu_offload = True
+            args.image_encoder_cpu_offload = False
 
     def _can_apply_default_layerwise_offload_policy(self) -> bool:
-        return (
-            self._deployment_config().auto_dit_layerwise_offload
-            and not envs.SGLANG_CACHE_DIT_ENABLED
-            and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
-        )
+        return current_platform.is_cuda()
+
+    def _default_layerwise_components_for_unset_placement(self) -> list[str]:
+        args = self.server_args
+        if (
+            args.is_arg_explicitly_set("layerwise_offload_components")
+            or args.dit_layerwise_offload is True
+        ):
+            # The legacy --dit-layerwise-offload flag is a DiT-only selector.
+            # Do not merge implicit non-DiT defaults into that explicit mode.
+            return []
+
+        # `*_cpu_offload` is the component placement knob. If a user explicitly
+        # set it to either true or false, keep that component out of default
+        # layerwise selection.
+        return [
+            component_name
+            for component_name, arg_name in DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES
+            if not args.is_arg_explicitly_set(arg_name)
+        ]
 
     def _auto_uses_dit_offload(self) -> bool:
         args = self.server_args
-        return bool(args.dit_cpu_offload or args.dit_layerwise_offload)
+        return bool(
+            args.dit_cpu_offload
+            or args.dit_layerwise_offload
+            or args.is_dit_layerwise_offload_selected
+        )
 
     def _get_min_available_device_memory_gb(self) -> float | None:
         args = self.server_args
@@ -339,23 +373,24 @@ class ServerArgsAutoTuner:
 
     def _has_explicit_memory_policy(self) -> bool:
         args = self.server_args
-        return (
-            args.use_fsdp_inference is not None
-            or args.dit_cpu_offload is not None
-            or args.dit_layerwise_offload is not None
-            or args.layerwise_offload_components is not None
-            or args.text_encoder_cpu_offload is not None
-            or args.image_encoder_cpu_offload is not None
+        return any(
+            args.is_arg_explicitly_set(arg_name)
+            for arg_name in (
+                "use_fsdp_inference",
+                "dit_cpu_offload",
+                "dit_layerwise_offload",
+                "layerwise_offload_components",
+            )
         )
 
     def _has_explicit_layerwise_replacement_policy(self) -> bool:
         args = self.server_args
-        return (
-            args.dit_layerwise_offload is not None
-            or args.layerwise_offload_components is not None
-            or args.text_encoder_cpu_offload is not None
-            or args.image_encoder_cpu_offload is not None
-            or args.vae_cpu_offload is True
+        return any(
+            args.is_arg_explicitly_set(arg_name)
+            for arg_name in (
+                "dit_layerwise_offload",
+                "layerwise_offload_components",
+            )
         )
 
     def _has_explicit_parallel_policy(self) -> bool:

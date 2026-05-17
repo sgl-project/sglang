@@ -17,7 +17,7 @@ logger = init_logger(__name__)
 class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
     """Deep Compression Autoencoder wrapper with 32x spatial compression."""
 
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
     layer_names = ["_inner_model.encoder.down_blocks", "_inner_model.decoder.up_blocks"]
 
     def __init__(self, config: SanaVAEConfig = None, **kwargs):
