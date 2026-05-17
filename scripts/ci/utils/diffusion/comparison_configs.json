@@ -148,7 +148,7 @@
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup --pipeline-class-name LTX2TwoStagePipeline",
+                    "serve_args": "--enable-torch-compile --warmup --pipeline-class-name LTX2TwoStagePipeline --cfg-parallel-size 2",
                     "extra_env": {}
                 }
             }

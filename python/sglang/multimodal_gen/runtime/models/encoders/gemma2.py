@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -280,10 +283,12 @@ class Gemma2DecoderLayer(nn.Module):
         return hidden_states
 
 
-class Gemma2Model(nn.Module):
+class Gemma2Model(nn.Module, LayerwiseOffloadableModuleMixin):
     """Gemma2 text encoder model for SANA pipeline."""
 
     _fsdp_shard_conditions = []
+    layerwise_offload_default_enabled = False
+    layer_names = ["layers"]
 
     def __init__(self, config: Gemma2Config, **kwargs):
         super().__init__()

@@ -28,6 +28,7 @@ class FakeKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.kv_args = args
         self.req_to_decode_prefix_len = {}
 
     def register_to_bootstrap(self):

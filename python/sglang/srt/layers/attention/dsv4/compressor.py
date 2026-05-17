@@ -334,7 +334,8 @@ class Compressor(nn.Module):
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
-    def _get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
+    # NOTE: used by v2 compressor backend
+    def get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
         token_to_kv_pool = forward_batch.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         if self.is_in_indexer:
@@ -346,11 +347,8 @@ class Compressor(nn.Module):
 
         return ret
 
-    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
-        if forward_batch.forward_mode.is_idle():
-            assert x.shape[0] == 0
-            return x.new_empty(0, self.head_dim)
-
+    # NOTE: used by v2 compressor backend
+    def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
         if nsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
@@ -359,11 +357,19 @@ class Compressor(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+        return kv_score
+
+    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
+
+        kv_score = self.compute_kv_score(x, forward_batch)
 
         backend = forward_batch.attn_backend
         if TYPE_CHECKING:
             assert isinstance(backend, DeepseekV4AttnBackend)
-        kv_score_buffer = self._get_state_pool(forward_batch)
+        kv_score_buffer = self.get_state_pool(forward_batch)
         kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
         return backend.forward_compress(
             kv_score_buffer=kv_score_buffer,

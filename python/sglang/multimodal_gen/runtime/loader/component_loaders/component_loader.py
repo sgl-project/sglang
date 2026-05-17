@@ -25,6 +25,15 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     component_name_to_loader_cls,
     get_memory_usage_of_component,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    configure_layerwise_offload_modules,
+    is_layerwise_offloaded_module,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_ALL_COMPONENTS,
+    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+    layerwise_component_matches_selection,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -96,6 +105,66 @@ class ComponentLoader(ABC):
         else:
             return get_local_torch_device()
 
+    def customized_load_kwargs_for_component(
+        self, _server_args: ServerArgs, _component_name: str
+    ) -> dict[str, Any]:
+        return {}
+
+    @staticmethod
+    def _is_component_set_as_layerwise_load(
+        server_args: ServerArgs, component_name: str
+    ) -> bool:
+        """if a component should be loaded in a layerwise-fashion"""
+        selected_component_names = server_args.layerwise_offload_components
+        if selected_component_names is None:
+            return False
+        selected_component_names = set(selected_component_names)
+        if LAYERWISE_OFFLOAD_ALL_COMPONENTS in selected_component_names:
+            return True
+        explicit_component_names = selected_component_names - {
+            LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS
+        }
+        return any(
+            layerwise_component_matches_selection(component_name, selected_component)
+            for selected_component in explicit_component_names
+        )
+
+    def _maybe_configure_layerwise_after_startup_cpu_staging(
+        self,
+        component: AutoModel,
+        server_args: ServerArgs,
+        component_name: str,
+        load_kwargs: dict[str, Any],
+    ) -> AutoModel:
+        if not load_kwargs.get("cpu_offload_flag"):
+            return component
+        if not isinstance(component, nn.Module):
+            return component
+
+        # try to configure layerwise-offload with the component
+        configured_components = configure_layerwise_offload_modules(
+            {component_name: component},
+            server_args,
+            component_names=server_args.layerwise_offload_components,
+            warn_missing=False,
+        )
+        if is_layerwise_offloaded_module(component):
+            logger.info(
+                "Configured layerwise offload for %s immediately after startup CPU staging",
+                component_name,
+            )
+            return component
+
+        logger.warning(
+            "Layerwise startup CPU staging was requested for %s, but the loaded "
+            "module did not enable layerwise offload. Moving it to GPU.",
+            component_name,
+        )
+        # ensures the module is on GPU
+        if component_name in configured_components:
+            return component
+        return component.to(get_local_torch_device())
+
     def load(
         self,
         component_model_path: str,
@@ -135,8 +204,15 @@ class ComponentLoader(ABC):
             with component_attn_backend_context_manager(
                 attn_backend, component_name=component_attn_name
             ):
+                load_kwargs = self.customized_load_kwargs_for_component(
+                    server_args, component_name
+                )
                 component = self.load_customized(
-                    component_model_path, server_args, component_name
+                    component_model_path, server_args, component_name, **load_kwargs
+                )
+                # configure layerwise to make enough VRAM headroom
+                component = self._maybe_configure_layerwise_after_startup_cpu_staging(
+                    component, server_args, component_name, load_kwargs
                 )
             source = "sgl-diffusion"
         except Exception as e:

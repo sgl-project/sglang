@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn as nn
@@ -11,7 +20,11 @@ import triton
 import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.jit_kernel.deepseek_v4 import fused_rope, rmsnorm_self
+from sglang.jit_kernel.deepseek_v4 import (
+    fused_norm_rope_inplace,
+    fused_q_norm_rope,
+    fused_rope_inplace,
+)
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
@@ -25,7 +38,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
@@ -46,7 +58,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
-from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
@@ -59,6 +71,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
 )
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
@@ -82,10 +95,8 @@ if TYPE_CHECKING:
         DeepseekV4AttnBackend,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
-    from sglang.srt.model_executor.forward_batch_info import (
-        ForwardBatch,
-        PPProxyTensors,
-    )
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 @triton.jit
@@ -315,8 +326,9 @@ class MQALayer(nn.Module):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
-        self.overlap_store_cache = envs.SGLANG_OPT_USE_OVERLAP_STORE_CACHE.get()
-        self.use_jit_norm = envs.SGLANG_OPT_USE_JIT_NORM.get()
+        # KV cache write is always fused into the K kernel
+        # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
+        # has no effect here -- the fused path is on by default.
 
     def _compute_q_a(
         self,
@@ -327,52 +339,69 @@ class MQALayer(nn.Module):
             q = qkv_a[..., : self.q_lora_rank]
         else:
             q, _ = self.wq_a(x)
-        q = self.q_norm(q)
-        q_lora = q
-        return q_lora
+        return self.q_norm(q)
 
     def _compute_q_b(
         self,
         q: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
+        positions: torch.Tensor,
+        q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.use_jit_norm:
-            q = rmsnorm_self(q, self.eps)
-        else:
-            q = rms_normalize_triton(q, self.eps)
-        if positions is not None:
-            fused_rope(
-                q[..., -self.qk_rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
-            )
-        else:
-            apply_rotary_emb_triton(q[..., -self.qk_rope_head_dim :], self.freqs_cis)
-        return q
+        if q_out is None:
+            q_out = torch.empty_like(q)
+        # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
+        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+        return q_out
 
-    def _compute_kv(
+    def _compute_kv_to_cache(
         self,
         x: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
         qkv_a: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> None:
+        """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
+
+        Replaces the bf16-kv-intermediate path. Used everywhere except the NSA
+        prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
+        """
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
-        kv = self.kv_norm(kv)
-        if positions is not None:
-            fused_rope(
-                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-                None,
-                self.freqs_cis,
-                positions=positions,
-            )
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        if TYPE_CHECKING:
+            assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
+            layer_id=self.layer_id,
+            raw_loc=forward_batch.out_cache_loc,
+            kv=kv,
+            kv_weight=self.kv_norm.weight.data,
+            eps=self.eps,
+            freqs_cis=self.freqs_cis,
+            positions=positions,
+        )
+
+    def _compute_kv_bf16(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        qkv_a: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Bf16-kv path used by the NSA prefill-CP case (needs all-gather)."""
+        if qkv_a is not None:
+            kv = qkv_a[..., self.q_lora_rank :]
         else:
-            apply_rotary_emb_triton(kv[..., -self.qk_rope_head_dim :], self.freqs_cis)
+            kv, _ = self.wkv(x)
+        fused_norm_rope_inplace(
+            kv,
+            self.kv_norm.weight.data,
+            self.eps,
+            self.freqs_cis,
+            positions,
+        )
         return kv
 
     def _forward_prepare_multi_stream(
@@ -382,7 +411,7 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
 
@@ -417,13 +446,8 @@ class MQALayer(nn.Module):
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
-            kv = self._compute_kv(x, positions, qkv_a=qkv_a)
-            if self.overlap_store_cache:
-                attn_backend.store_cache(
-                    layer_id=self.layer_id,
-                    swa_k=kv,
-                    forward_batch=forward_batch,
-                )
+            # Fused norm + rope + cache write -- no bf16 KV intermediate.
+            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
 
         del qkv_a
 
@@ -433,15 +457,12 @@ class MQALayer(nn.Module):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_lora, positions)
-        if q_out is not None:
-            q_out.copy_(q)
-
+        q = self._compute_q_b(q_lora, positions, q_out)
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
 
-        return q, kv
+        return q
 
     def _forward_prepare(
         self,
@@ -450,47 +471,38 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x)
-            q = qkv_a[..., : self.q_lora_rank]
-            kv = qkv_a[..., self.q_lora_rank :]
-            del qkv_a
+            q_lora = qkv_a[..., : self.q_lora_rank]
         else:
-            kv, _ = self.wkv(x)
-            q, _ = self.wq_a(x)
-        q = self.q_norm(q)
-        q_lora = q
-        q, _ = self.wq_b(q)
-        q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.use_jit_norm:
-            q = rmsnorm_self(q, self.eps)
-        else:
-            q = rms_normalize_triton(q, self.eps)
+            q_lora, _ = self.wq_a(x)
+            qkv_a = None
+        q_lora = self.q_norm(q_lora)
+        q = self._compute_q_b(q_lora, positions, q_out)
 
-        kv = self.kv_norm(kv)
-
-        fused_rope(
-            q[..., -self.qk_rope_head_dim :],
-            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-            self.freqs_cis,
-            positions=positions,
-        )
-
-        if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
+        use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
+        kv: Optional[torch.Tensor]
+        if use_cp:
+            # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
+            # write to the FlashMLA cache after gather.
+            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
             kv = cp_all_gather_rerange_output(
                 kv.contiguous(),
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-
-        if self.overlap_store_cache:
             attn_backend.store_cache(
                 layer_id=self.layer_id,
                 swa_k=kv,
                 forward_batch=forward_batch,
             )
+        else:
+            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
+            kv = None
+
+        del qkv_a
 
         if self.indexer is not None:
             self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
@@ -502,8 +514,6 @@ class MQALayer(nn.Module):
                 self.compressor,
             )
 
-        if q_out is not None:
-            q_out.copy_(q)
         return q, kv
 
     def forward(
@@ -538,26 +548,34 @@ class MQALayer(nn.Module):
             q_out = q_padded[:, tp_slice, :]
 
         if enable_multi_stream:
-            q, kv = self._forward_prepare_multi_stream(
+            # Multi-stream path always fuses cache write into the K kernel,
+            # so the bf16 KV intermediate is gone.
+            q = self._forward_prepare_multi_stream(
                 x, positions, forward_batch, attn_backend, q_out
             )
+            kv = None
         else:
             q, kv = self._forward_prepare(
                 x, positions, forward_batch, attn_backend, q_out
             )
 
+        # The cache write is always fused / already done by _forward_prepare* --
+        # tell the backend to skip its own store_cache. When `kv is None`
+        # (no NSA-CP), pass `q` as a sentinel for the `k is v` assert; the
+        # attention path doesn't read it once `save_kv_cache=False`.
+        attn_k = kv if kv is not None else q
         o = attn_backend.forward(
             q=q_padded if q_padded is not None else q,
-            k=kv,
-            v=kv,
+            k=attn_k,
+            v=attn_k,
             layer=self.attn_mqa,
             forward_batch=forward_batch,
             compress_ratio=self.compress_ratio,
             attn_sink=self.attn_sink,
-            save_kv_cache=not self.overlap_store_cache,
+            save_kv_cache=False,
         )
         o = o[:, tp_slice, :]
-        fused_rope(
+        fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],
             None,
             self.freqs_cis,
@@ -859,11 +877,15 @@ class DeepseekV4Model(nn.Module):
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
-        )
+        self.hidden_size = config.hidden_size
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                enable_tp=not is_dp_attention_enabled(),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
         self.alt_streams = (
             [torch.cuda.Stream() for _ in range(5)] if (_is_cuda or _is_hip) else None
@@ -881,17 +903,21 @@ class DeepseekV4Model(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
         self.gemm_output_zero_allocator_size = 0
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
-        hc_dim = hc_mult * config.hidden_size
-        self.hc_head_fn = nn.Parameter(
-            torch.empty(hc_mult, hc_dim, dtype=torch.float32)
-        )
-        self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
-        self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+        if self.pp_group.is_last_rank:
+            hc_dim = hc_mult * config.hidden_size
+            self.hc_head_fn = nn.Parameter(
+                torch.empty(hc_mult, hc_dim, dtype=torch.float32)
+            )
+            self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
+            self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -929,9 +955,19 @@ class DeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            hidden_states = self.embed_tokens(input_ids)
+            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            # Unflatten 2D PP IPC tensor back to 3D mHC shape.
+            if hidden_states.ndim == 2:
+                hidden_states = hidden_states.view(
+                    hidden_states.shape[0], self.hc_mult, self.hidden_size
+                )
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -945,7 +981,8 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = input_ids
 
         if nsa_use_prefill_cp(forward_batch):
-            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         for i in range(self.start_layer, self.end_layer):
@@ -958,13 +995,18 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        if nsa_use_prefill_cp(forward_batch):
+        # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
+        if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+
+        if not self.pp_group.is_last_rank:
+            # Flatten 3D mHC tensor for PP IPC.
+            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -992,27 +1034,36 @@ class DeepseekV4ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.pp_group = get_pp_group()
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                )
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-            )
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
         get_attn_tp_context().init_context(config.q_lora_rank, is_nsa=True)
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, deepseek_v2.DeepseekV2MoE)
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(
+                    self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE
+                )
             }
         )
+
+        # Expose start_layer/end_layer for model_runner PP support
+        self.start_layer = self.model.start_layer
+        self.end_layer = self.model.end_layer
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -1066,8 +1117,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
-                input_ids, positions, forward_batch, input_embeds
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
@@ -1084,7 +1138,13 @@ class DeepseekV4ForCausalLM(nn.Module):
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from deep_gemm import transform_sf_into_required_layout
 
-        layers = self.model.layers
+        if is_nextn:
+            layers = [self.model.decoder]
+        else:
+            layers = [
+                self.model.layers[layer_id]
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+            ]
         for layer in layers:
             attn = layer.self_attn
             G = attn.n_local_groups
@@ -1107,7 +1167,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
-        for layer in self.model.layers:
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
             if self_attn.compress_ratio != 0 and not self_attn.compressor.ape_converted:
                 self_attn.compressor.apply_ape_hotfix()
@@ -1375,7 +1436,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and not self.pp_group.is_first_rank
                             ):
                                 continue
-                            if ".norm." in name and not self.pp_group.is_last_rank:
+                            if (
+                                name == "model.norm.weight"
+                                and not self.pp_group.is_last_rank
+                            ):
+                                continue
+                            if (
+                                name.startswith("model.hc_head_")
+                                or name == "lm_head.weight"
+                            ) and not self.pp_group.is_last_rank:
                                 continue
                             elif COMPRESSOR_PART in name:
                                 is_kv = name.endswith(".wkv.weight")
@@ -1479,6 +1548,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
+        if not self.pp_group.is_first_rank:
+            skipped_checking_patterns.append("embed_tokens")
+        if not self.pp_group.is_last_rank:
+            skipped_checking_patterns.append("model.norm.")
+            skipped_checking_patterns.extend(["lm_head", "hc_head_"])
         if is_nextn:
             skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
         unloaded_params = {

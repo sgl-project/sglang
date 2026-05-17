@@ -6,13 +6,19 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 
-class AutoencoderDC(nn.Module):
+class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
     """Deep Compression Autoencoder wrapper with 32x spatial compression."""
+
+    layerwise_offload_default_enabled = False
+    layer_names = ["_inner_model.encoder.down_blocks", "_inner_model.decoder.up_blocks"]
 
     def __init__(self, config: SanaVAEConfig = None, **kwargs):
         super().__init__()
