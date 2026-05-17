@@ -1880,11 +1880,11 @@ class Scheduler(
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
         # Keep this bound consistent with PrefillAdder's admission budget:
-        # ceil_page(input_len) + max_new_tokens + page_size must be strictly
-        # smaller than max_total_num_tokens. Otherwise a request can be accepted
-        # into the waiting queue but can never be scheduled, blocking the queue
-        # and eventually making health checks fail.
-        paged_input_len = -(-input_len // self.page_size) * self.page_size
+        # new_tokens_for_alloc(prefix=0, input_len + max_new_tokens, page_size)
+        # <= input_len + max_new_tokens + page_size - 1 must be strictly smaller
+        # than max_total_num_tokens. Otherwise a request can be accepted into
+        # the waiting queue but can never be scheduled, blocking the queue and
+        # eventually making health checks fail.
         req.sampling_params.max_new_tokens = max(
             0,
             min(
@@ -1894,7 +1894,7 @@ class Scheduler(
                     else 1 << 30
                 ),
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens - paged_input_len - self.page_size - 1,
+                self.max_total_num_tokens - input_len - self.page_size,
             ),
         )
 
