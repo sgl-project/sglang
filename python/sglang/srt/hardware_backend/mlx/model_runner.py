@@ -208,6 +208,7 @@ class MlxModelRunner:
             self.model_path,
             tokenizer_config={"trust_remote_code": self.trust_remote_code},
             return_config=True,
+            lazy=True,
         )
         self.model, _tokenizer, config = loaded
 
@@ -241,6 +242,7 @@ class MlxModelRunner:
                     group_size=group_size,
                     bits=bits,
                 )
+                mx.eval(self.model.parameters())
                 bytes_after = sum(
                     p.size * p.itemsize
                     for _, p in tree_flatten(self.model.parameters())
