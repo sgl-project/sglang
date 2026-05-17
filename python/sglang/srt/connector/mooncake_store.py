@@ -122,6 +122,14 @@ class MooncakeStoreConnector(BaseKVConnector):
     # BaseKVConnector interface
     # ------------------------------------------------------------------
 
+    def _key_exists(self, key: str) -> bool:
+        ret_code = self.store.is_exist(key)
+        if ret_code < 0:
+            raise RuntimeError(
+                f"Failed to query Mooncake key '{key}', error code: {ret_code}"
+            )
+        return ret_code == 1
+
     def batch_get_into(self, keys: List[str], tensors: List[torch.Tensor]) -> None:
         tensor_ptrs = [tensor.data_ptr() for tensor in tensors]
         tensor_sizes = [tensor.untyped_storage().nbytes() for tensor in tensors]
@@ -157,10 +165,11 @@ class MooncakeStoreConnector(BaseKVConnector):
         raise NotImplementedError("Use batch_get_into() instead for performance.")
 
     def getstr(self, key: str) -> Optional[str]:
-        data = self.store.get(key)
-        if data is None:
+        if not self._key_exists(key):
             logger.error("Key %s not found in Mooncake store", key)
             return None
+
+        data = self.store.get(key)
         return data.decode("utf-8")
 
     def set(self, key: str, tensor: torch.Tensor) -> None:
@@ -201,9 +210,10 @@ class MooncakeStoreConnector(BaseKVConnector):
         written under that prefix.
         """
         index_key = f"{FILE_INDEX_KEY_PREFIX}{prefix}"
-        data = self.store.get(index_key)
-        if data is None:
+        if not self._key_exists(index_key):
             return []
+
+        data = self.store.get(index_key)
         content = data.decode("utf-8").strip()
         if not content:
             return []
@@ -212,10 +222,10 @@ class MooncakeStoreConnector(BaseKVConnector):
     def _register_key_in_index(self, key: str, prefix: str) -> None:
         """Maintain a simple index for list() support."""
         index_key = f"{FILE_INDEX_KEY_PREFIX}{prefix}"
-        existing = self.store.get(index_key)
-        if existing is None:
+        if not self._key_exists(index_key):
             keys_list = [key]
         else:
+            existing = self.store.get(index_key)
             keys_list = existing.decode("utf-8").strip().split("\n")
             if key not in keys_list:
                 keys_list.append(key)
