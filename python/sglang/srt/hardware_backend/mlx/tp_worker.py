@@ -125,8 +125,7 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_active_rids |= current_rids
 
     def _forward_batch_generation_mlx(
-        self,
-        batch: ScheduleBatch,
+        self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
         """Run forward pass through the MLX model runner (greedy only)."""
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -226,10 +225,7 @@ class MlxTpModelWorker(TpModelWorker):
             can_run_cuda_graph=False,
         )
 
-    def async_forward_batch_generation_mlx(
-        self,
-        batch: ScheduleBatch,
-    ) -> tuple[
+    def async_forward_batch_generation_mlx(self, batch: ScheduleBatch) -> tuple[
         Union[mx.array, None],
         list[MlxPendingPrefill],
         list[MlxPendingExtend],
@@ -283,10 +279,7 @@ class MlxTpModelWorker(TpModelWorker):
             f"MLX async runner does not support forward mode: {forward_mode}"
         )
 
-    def _async_extend_batch(
-        self,
-        batch: ScheduleBatch,
-    ) -> tuple[
+    def _async_extend_batch(self, batch: ScheduleBatch) -> tuple[
         Union[mx.array, None],
         list[MlxPendingPrefill],
         list[MlxPendingExtend],
