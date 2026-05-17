@@ -35,8 +35,12 @@ else:
         create_paged_compressor_data,
     )
 
+from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
+    dequantize_k_cache_paged,
+)
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
+    _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
     copy_metadata,
     maybe_copy_inplace,
@@ -46,9 +50,6 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 )
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
-)
-from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
-    dequantize_k_cache_paged,
 )
 from sglang.srt.layers.attention.dsv4.sparse_indices import (
     SparsePrefillChunkCache,
@@ -1043,9 +1044,8 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            if (
+            if q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD or (
                 forward_batch.forward_mode.is_extend()
-                and compress_ratio in (0, 4, 128)
                 and envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
             ):
                 return self._forward_prefill_sparse(
