@@ -1426,10 +1426,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     is_extend_in_batch: bool = False
-    # Plumbing for prefill cudagraph + DP attention (introduced in PR #19639).
-    # Has no consumer in upstream main today, but a downstream fork may rely on
-    # it; keep the field and its pass-through wiring intact.
-    all_extend_in_batch: bool = False
+    all_extend_in_batch: bool = False  # plumbing for downstream forks (PR #19639)
     can_run_dp_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
