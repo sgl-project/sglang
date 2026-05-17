@@ -180,11 +180,11 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         opt_flags.update_opt_flags_constraints(constraints)
     else:
         value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-            mx_axis=1
+            mx_axis=-2
         )
         scale_layout, scale_layout_opts = (
             layout.make_default_matmul_mxfp4_w_scale_layout(
-                mx_axis=1, num_warps=num_warps
+                mx_axis=-2, num_warps=num_warps
             )
         )
         if is_sm100_supported():

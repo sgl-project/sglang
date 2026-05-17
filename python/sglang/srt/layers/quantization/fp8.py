@@ -164,7 +164,7 @@ class Fp8Config(QuantizationConfig):
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
-                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
+                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
             if len(weight_block_size) != 2:
                 raise ValueError(
@@ -1300,7 +1300,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             scale_layout, scale_layout_opts = (
                 layout.make_default_matmul_mxfp4_w_scale_layout(
-                    mx_axis=1, num_warps=num_warps
+                    mx_axis=-2, num_warps=num_warps
                 )
             )
             scale = scale.transpose(-2, -1)
