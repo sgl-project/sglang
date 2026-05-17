@@ -319,9 +319,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_src: Source indices into last_recurrent_state buffer (for aligned seqs)
             track_ssm_final_dst: Destination cache slot indices (for aligned seqs)
         """
-        chunk_size = getattr(
-            self, "mamba_chunk_size", get_global_server_args().mamba_cache_chunk_size
-        )
+        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
         # Move to CPU to avoid kernel launches for masking operations
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -331,11 +329,10 @@ class MambaAttnBackendBase(AttentionBackend):
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
         # Calculate the number of hidden states per request
-        is_mamba2 = hasattr(self, "mamba_chunk_size")
-        if is_mamba2:
-            num_h_states = extend_seq_lens // chunk_size
+        if isinstance(self, Mamba2AttnBackend):
+            num_h_states = extend_seq_lens // mamba_cache_chunk_size
         else:
-            num_h_states = (extend_seq_lens - 1) // chunk_size + 1
+            num_h_states = (extend_seq_lens - 1) // mamba_cache_chunk_size + 1
 
         # Calculate the starting offset for each sequence in the packed batch
         track_ssm_src_offset = torch.zeros_like(num_h_states)
@@ -348,17 +345,17 @@ class MambaAttnBackendBase(AttentionBackend):
         dst_masked = mamba_track_indices[mamba_track_mask]
 
         # Determine if the sequence ends at a chunk boundary
-        is_aligned = (lens_masked % chunk_size) == 0
+        is_aligned = (lens_masked % mamba_cache_chunk_size) == 0
 
         # Case 1: Aligned. Use last_recurrent_state from ssm_states.
         track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
         track_ssm_final_dst = dst_masked[is_aligned]
 
         # Case 2: Unaligned. Use intermediate state from h.
-        # TODO: if support chunk_size % page size != 0, then need to modify this
+        # TODO: if support mamba_cache_chunk_size % page size != 0, then need to modify this
         not_aligned = ~is_aligned
         track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // chunk_size
+            lens_masked[not_aligned] // mamba_cache_chunk_size
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 
