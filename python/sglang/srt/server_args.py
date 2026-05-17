@@ -6360,6 +6360,7 @@ class ServerArgs:
                 "torch",
                 "flashinfer_topk_page_table",
                 "sgl_fast_topk_transform",
+                "ftka_raft_topk",
                 "jit_fused_selector",
             ],
             default=ServerArgs.double_sparsity_selector_backend,
@@ -6367,8 +6368,11 @@ class ServerArgs:
             "pipeline. 'torch' (default) uses torch.topk + a fused build "
             "kernel; 'flashinfer_topk_page_table' fuses top-k + page-table "
             "lookup via FlashInfer; 'sgl_fast_topk_transform' is the "
-            "SGLang counterpart; 'jit_fused_selector' is reserved for a "
-            "future hand-written fused kernel.",
+            "SGLang counterpart; 'ftka_raft_topk' substitutes torch.topk "
+            "with ftka.cuda_ops.raft_topk (RAFT radix top-k, optional dep "
+            "from tsinghua-ideal/flash-topk-attention — experimental, "
+            "not yet qualified for production); 'jit_fused_selector' is "
+            "reserved for a future hand-written fused kernel.",
         )
 
         # LMCache

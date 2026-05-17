@@ -1,0 +1,6101 @@
+{
+  "meta": {
+    "torch_version": "2.11.0+cu130",
+    "device": "NVIDIA H200",
+    "platform": "Linux-5.15.0-94-generic-x86_64-with-glibc2.39",
+    "flashinfer": {
+      "available": true,
+      "version": "0.6.11.post1"
+    },
+    "ftka": {
+      "available": false,
+      "version": "",
+      "installed_commit": "",
+      "target_commit": "d8803b29961c44d77a747636ad4282bd7a9094af",
+      "skip_reason": "ftka package not installed"
+    },
+    "n_shapes": 76
+  },
+  "results": [
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 93.39971467852592,
+      "score_us": 18.5241736471653,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.16348904371262,
+      "score_us": 18.5241736471653,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.5241736471653,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.50313383340836,
+      "score_us": 18.835030496120453,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.08004254102707,
+      "score_us": 18.835030496120453,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.835030496120453,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.05429393053055,
+      "score_us": 18.117856234312057,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.24507290124893,
+      "score_us": 18.117856234312057,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.117856234312057,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 93.58298033475876,
+      "score_us": 18.56677234172821,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.56677234172821,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.56677234172821,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 92.54299104213715,
+      "score_us": 18.75445246696472,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.75445246696472,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.75445246696472,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.55961093306541,
+      "score_us": 18.39989796280861,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.80843162536621,
+      "score_us": 18.39989796280861,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.39989796280861,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.34697136282921,
+      "score_us": 18.614381551742554,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.5168531537056,
+      "score_us": 18.614381551742554,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.614381551742554,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.66293185949326,
+      "score_us": 18.593352288007736,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.79520684480667,
+      "score_us": 18.593352288007736,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.593352288007736,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.40530940890312,
+      "score_us": 18.528252840042114,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.528252840042114,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.528252840042114,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.58159014582634,
+      "score_us": 18.21262761950493,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.21262761950493,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.21262761950493,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.29781445860863,
+      "score_us": 18.096361309289932,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 103.39213535189629,
+      "score_us": 18.096361309289932,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.096361309289932,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.3128832578659,
+      "score_us": 18.25392246246338,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.90238344669342,
+      "score_us": 18.25392246246338,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.25392246246338,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.20371362566948,
+      "score_us": 18.132254481315613,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.60480725765228,
+      "score_us": 18.132254481315613,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.132254481315613,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.59717878699303,
+      "score_us": 18.303655087947845,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.303655087947845,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.303655087947845,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.24765342473984,
+      "score_us": 18.072612583637238,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.072612583637238,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.072612583637238,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 91.12605825066566,
+      "score_us": 18.441807478666306,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.08658212423325,
+      "score_us": 18.441807478666306,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.441807478666306,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.6802730858326,
+      "score_us": 18.380675464868546,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.12310689687729,
+      "score_us": 18.380675464868546,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.380675464868546,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.65488523244858,
+      "score_us": 18.25481653213501,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.40544664859772,
+      "score_us": 18.25481653213501,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.25481653213501,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.3075747191906,
+      "score_us": 18.15788447856903,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.15788447856903,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.15788447856903,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.5984453856945,
+      "score_us": 18.311887979507446,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.311887979507446,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.311887979507446,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.93737399578094,
+      "score_us": 18.472615629434586,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.71213287115097,
+      "score_us": 18.472615629434586,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.472615629434586,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.73918855190277,
+      "score_us": 18.562953919172287,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.75108078122139,
+      "score_us": 18.562953919172287,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.562953919172287,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.32182395458221,
+      "score_us": 18.45983788371086,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.96489381790161,
+      "score_us": 18.45983788371086,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.45983788371086,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.46759456396103,
+      "score_us": 18.600579351186752,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.600579351186752,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.600579351186752,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.85674008727074,
+      "score_us": 18.592532724142075,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.592532724142075,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.592532724142075,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 32768,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.39299902319908,
+      "score_us": 18.204879015684128,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.60521703958511,
+      "score_us": 18.204879015684128,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.204879015684128,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.07241746783257,
+      "score_us": 18.15466210246086,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 72.99859076738358,
+      "score_us": 18.15466210246086,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.15466210246086,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.4571840763092,
+      "score_us": 18.263179808855057,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.00648838281631,
+      "score_us": 18.263179808855057,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.263179808855057,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.99901062250137,
+      "score_us": 18.215477466583252,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.215477466583252,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.215477466583252,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.81626650691032,
+      "score_us": 18.321219831705093,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.321219831705093,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.321219831705093,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.60655128955841,
+      "score_us": 17.98117533326149,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 74.07166063785553,
+      "score_us": 17.98117533326149,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 17.98117533326149,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.36233818531036,
+      "score_us": 18.077343702316284,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.94593209028244,
+      "score_us": 18.077343702316284,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.077343702316284,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.15729820728302,
+      "score_us": 18.12206581234932,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 72.7902539074421,
+      "score_us": 18.12206581234932,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.12206581234932,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.18382227420807,
+      "score_us": 18.27748492360115,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.27748492360115,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.27748492360115,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.43118155002594,
+      "score_us": 18.28506588935852,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.28506588935852,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.28506588935852,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.74691852927208,
+      "score_us": 18.256865441799164,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.81012663245201,
+      "score_us": 18.256865441799164,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.256865441799164,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.92809802293777,
+      "score_us": 18.144473433494568,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.9486888051033,
+      "score_us": 18.144473433494568,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.144473433494568,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.84455838799477,
+      "score_us": 18.272437155246735,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.42498749494553,
+      "score_us": 18.272437155246735,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.272437155246735,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.14621376991272,
+      "score_us": 18.58765259385109,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.58765259385109,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.58765259385109,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.09122848510742,
+      "score_us": 18.59065145254135,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.59065145254135,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.59065145254135,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.64575827121735,
+      "score_us": 18.5232050716877,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.17140698432922,
+      "score_us": 18.5232050716877,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.5232050716877,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.622363448143,
+      "score_us": 18.580500036478043,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.75851273536682,
+      "score_us": 18.580500036478043,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.580500036478043,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.36205878853798,
+      "score_us": 18.60152930021286,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.80306720733643,
+      "score_us": 18.60152930021286,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.60152930021286,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.74460884928703,
+      "score_us": 18.450915813446045,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.450915813446045,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.450915813446045,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 91.73348546028137,
+      "score_us": 18.53024587035179,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.53024587035179,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.53024587035179,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 92.77841076254845,
+      "score_us": 32.1521982550621,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.81521165370941,
+      "score_us": 32.1521982550621,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.1521982550621,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 93.66340935230255,
+      "score_us": 32.108500599861145,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.86786863207817,
+      "score_us": 32.108500599861145,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.108500599861145,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 94.83497589826584,
+      "score_us": 32.1817584335804,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 73.6556388437748,
+      "score_us": 32.1817584335804,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.1817584335804,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 95.87470442056656,
+      "score_us": 32.16726705431938,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.16726705431938,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.16726705431938,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 98.22336956858635,
+      "score_us": 32.1325846016407,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.1325846016407,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.1325846016407,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 65536,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.27963674068451,
+      "score_us": 18.21044832468033,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 77.55393162369728,
+      "score_us": 18.21044832468033,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.21044832468033,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.79892528057098,
+      "score_us": 18.34828406572342,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 80.46383038163185,
+      "score_us": 18.34828406572342,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.34828406572342,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.21720087528229,
+      "score_us": 18.210001289844513,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 85.98379790782928,
+      "score_us": 18.210001289844513,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.210001289844513,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.46407586336136,
+      "score_us": 18.161889165639877,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.161889165639877,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.161889165639877,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.97438645362854,
+      "score_us": 18.173139542341232,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.173139542341232,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.173139542341232,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 1,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.33074602484703,
+      "score_us": 18.240883946418762,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 79.69655096530914,
+      "score_us": 18.240883946418762,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.240883946418762,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.83263915777206,
+      "score_us": 18.171165138483047,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 82.87008851766586,
+      "score_us": 18.171165138483047,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.171165138483047,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.82476016879082,
+      "score_us": 18.24812963604927,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.33417329192162,
+      "score_us": 18.24812963604927,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.24812963604927,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 88.29310536384583,
+      "score_us": 18.288809806108475,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.288809806108475,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.288809806108475,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.18553590774536,
+      "score_us": 18.321443349123,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.321443349123,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.321443349123,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.05235508084297,
+      "score_us": 18.555615097284317,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 81.74579590559006,
+      "score_us": 18.555615097284317,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.555615097284317,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.5768404006958,
+      "score_us": 18.720868974924088,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 84.20657366514206,
+      "score_us": 18.720868974924088,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.720868974924088,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.28054773807526,
+      "score_us": 18.51225271821022,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.01387283205986,
+      "score_us": 18.51225271821022,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.51225271821022,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.64186364412308,
+      "score_us": 18.810294568538666,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.810294568538666,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.810294568538666,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 93.6446525156498,
+      "score_us": 18.378663808107376,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.378663808107376,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 18.378663808107376,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 8,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 97.32602164149284,
+      "score_us": 32.1354903280735,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 82.67823606729507,
+      "score_us": 32.1354903280735,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.1354903280735,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 97.37865999341011,
+      "score_us": 32.123830169439316,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 86.17488667368889,
+      "score_us": 32.123830169439316,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.123830169439316,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 99.71028193831444,
+      "score_us": 32.12129697203636,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 93.78492832183838,
+      "score_us": 32.12129697203636,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.12129697203636,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 101.35388001799583,
+      "score_us": 32.11081027984619,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.11081027984619,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.11081027984619,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 105.3071953356266,
+      "score_us": 32.14538097381592,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.14538097381592,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 32.14538097381592,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 16,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 117.97886341810226,
+      "score_us": 87.06137537956238,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 85.36927402019501,
+      "score_us": 87.06137537956238,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 87.06137537956238,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 512,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 117.54987761378288,
+      "score_us": 87.16188371181488,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 90.04225954413414,
+      "score_us": 87.16188371181488,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 87.16188371181488,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 1024,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 119.04647573828697,
+      "score_us": 87.07933127880096,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 93.87113153934479,
+      "score_us": 87.07933127880096,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 87.07933127880096,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 121.04121968150139,
+      "score_us": 87.25851774215698,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 87.25851774215698,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 87.25851774215698,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 4096,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 125.97816064953803,
+      "score_us": 86.04126051068306,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 86.04126051068306,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "top_k>2048 ceiling"
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 86.04126051068306,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 32,
+        "h_kv": 1,
+        "max_ctx": 131072,
+        "top_k": 8192,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "torch",
+      "shape": {
+        "bs": 4,
+        "h_kv": 8,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 95.2126644551754,
+      "score_us": 60.48303097486496,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "flashinfer_topk_page_table",
+      "shape": {
+        "bs": 4,
+        "h_kv": 8,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "ok",
+      "mean_us": 89.3072597682476,
+      "score_us": 60.48303097486496,
+      "parity_match": true,
+      "graph_status": "ok",
+      "graph_detail": "",
+      "layout_transform_us": null,
+      "error": null
+    },
+    {
+      "path": "ftka_raft_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 8,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": 60.48303097486496,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    },
+    {
+      "path": "ftka_gemv+ftka_topk",
+      "shape": {
+        "bs": 4,
+        "h_kv": 8,
+        "max_ctx": 65536,
+        "top_k": 2048,
+        "sink": 4,
+        "recent": 64,
+        "seq_len": null
+      },
+      "status": "skipped",
+      "mean_us": null,
+      "score_us": null,
+      "parity_match": null,
+      "graph_status": null,
+      "graph_detail": null,
+      "layout_transform_us": null,
+      "error": "ftka package not installed"
+    }
+  ]
+}

@@ -17,6 +17,16 @@ Backends (selected via ``DoubleSparsityRuntimeConfig.selector_backend``):
 * ``sgl_fast_topk_transform`` — ``sgl_kernel.fast_topk_transform_fused``
   is the SGLang-native counterpart; same shape contract as the flashinfer
   backend.
+* ``ftka_raft_topk`` — experimental: substitutes ``torch.topk`` with
+  ``ftka.cuda_ops.raft_topk`` (RAFT radix top-k from tsinghua-ideal/
+  flash-topk-attention, pinned to commit
+  ``d8803b29961c44d77a747636ad4282bd7a9094af``). Logical indices are then
+  routed through the same ``_build_selected_physical`` Triton kernel as
+  the torch backend. ``ftka`` is an optional dep; construction raises a
+  clear ``RuntimeError`` when the package is not importable. **Not yet
+  qualified for production** — used by the FTKA evaluation microbench
+  to gather per-call timing and CUDA-graph capture status before any
+  promotion decision.
 * ``jit_fused_selector`` — placeholder for a future single-kernel
   selector (score + topk + physical translation + sink/recent in one
   pass). Not yet implemented.
@@ -44,8 +54,14 @@ SUPPORTED_SELECTOR_BACKENDS = (
     "torch",
     "flashinfer_topk_page_table",
     "sgl_fast_topk_transform",
+    "ftka_raft_topk",
     "jit_fused_selector",
 )
+
+# tsinghua-ideal/flash-topk-attention commit hash this integration
+# targets. Recorded so the FTKA microbench and any parity test can verify
+# they're evaluating the expected build of the optional dep.
+FTKA_TARGET_COMMIT = "d8803b29961c44d77a747636ad4282bd7a9094af"
 
 
 class _BaseSelector:
@@ -267,18 +283,142 @@ class FlashInferTopKPageTableSelector(_BaseSelector):
         )
 
 
+class FtkaRaftTopKSelector(_BaseSelector):
+    """Experimental: top-k via ``ftka.cuda_ops.raft_topk`` (RAFT radix
+    top-k, BitsPerPass=8) + the existing ``_build_selected_physical``
+    Triton kernel for the logical->physical gather and sink/recent
+    append.
+
+    Substitutes ONLY the top-k step. The score kernel and the
+    sink/recent fill path are unchanged from the ``torch`` backend, so
+    the produced ``selected_physical`` set must equal the torch backend
+    modulo tie-breaking within the top-k slot. The parity test asserts
+    set equality.
+
+    Layout / arg mapping:
+      * Score rows are viewed as ``[bs*h_kv, max_ctx]`` fp32, same as the
+        FlashInfer backend.
+      * Output ``values_buf`` / ``indices_buf`` are preallocated at
+        construction so the per-step call does no device allocation
+        (capture-friendly *if* the underlying ``raft_topk`` kernel is
+        capture-safe; capture status is probed by the FTKA microbench
+        and reported in its JSON output).
+      * ``scratch_buf`` is an opaque int32 workspace passed to RAFT as
+        ``buf``. We size it generously (``max_bs * h_kv * max_ctx`` int32
+        cells), which covers the radix histograms + filtered-candidate
+        scratch RAFT consumes internally; the buffer is opaque and we
+        never read it back.
+
+    Constraints:
+      * ``max_top_k`` must be passed at construction time. The default
+        ``make_selector`` signature uses ``max_top_k=None``; when this
+        backend is requested without an explicit ``max_top_k``, the
+        factory raises ``ValueError`` instead of constructing a
+        crippled selector. Production code path: when the runtime
+        builds the selector via ``_allocate_native_scratch``, it must
+        pass ``max_top_k=token_budget``.
+      * ``ftka`` must be importable. Failure is loud (``RuntimeError``).
+    """
+
+    name = "ftka_raft_topk"
+
+    def __init__(
+        self,
+        *,
+        max_bs: int,
+        h_kv: int,
+        max_top_k: int,
+        max_ctx: int,
+        device: torch.device,
+    ) -> None:
+        super().__init__()
+        try:
+            from ftka.cuda_ops import raft_topk as _raft_topk  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                "ftka is required for "
+                "--double-sparsity-selector-backend=ftka_raft_topk. Install "
+                "from the pinned commit, e.g.: "
+                "`pip install git+https://github.com/tsinghua-ideal/"
+                f"flash-topk-attention.git@{FTKA_TARGET_COMMIT}#egg=ftka` "
+                f"(microbench targets commit {FTKA_TARGET_COMMIT})."
+            ) from e
+        self._raft_topk = _raft_topk
+        self._max_bs = max_bs
+        self._h_kv = h_kv
+        self._max_top_k = max_top_k
+        self._max_ctx = max_ctx
+        num_rows = max_bs * h_kv
+        self._values_buf = torch.empty(
+            (num_rows, max_top_k), dtype=torch.float32, device=device
+        )
+        self._indices_buf = torch.empty(
+            (num_rows, max_top_k), dtype=torch.int32, device=device
+        )
+        # Opaque RAFT workspace. Generous worst-case; bounded by max_ctx.
+        self._scratch_buf = torch.empty(
+            num_rows * max_ctx, dtype=torch.int32, device=device
+        )
+
+    def select(
+        self,
+        *,
+        att_out_approx: torch.Tensor,
+        req_to_token_indexed: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k: int,
+        sink_tokens: int,
+        recent_tokens: int,
+        out: torch.Tensor,
+    ) -> None:
+        bs, h_kv, max_ctx = att_out_approx.shape
+        if bs > self._max_bs or h_kv != self._h_kv or max_ctx > self._max_ctx:
+            raise ValueError(
+                f"FtkaRaftTopK selector built for max_bs={self._max_bs}/"
+                f"h_kv={self._h_kv}/max_ctx={self._max_ctx} but called with "
+                f"bs={bs}/h_kv={h_kv}/max_ctx={max_ctx}; constructor mismatch."
+            )
+        if top_k > self._max_top_k:
+            raise ValueError(
+                f"top_k={top_k} exceeds FtkaRaftTopK selector's preallocated "
+                f"max_top_k={self._max_top_k}; rebuild the selector with a "
+                f"larger max_top_k or lower the token_budget."
+            )
+
+        num_rows = bs * h_kv
+        scores = att_out_approx.view(num_rows, max_ctx)
+        values = self._values_buf[:num_rows, :top_k]
+        indices = self._indices_buf[:num_rows, :top_k]
+        self._raft_topk(scores, values, indices, self._scratch_buf, top_k)
+
+        topk_logical = indices.view(bs, h_kv, top_k)
+        _build_selected_physical(
+            topk_logical=topk_logical,
+            req_to_token_indexed=req_to_token_indexed,
+            seq_lens=seq_lens,
+            sink_tokens=sink_tokens,
+            recent_tokens=recent_tokens,
+            out=out,
+        )
+
+
 def make_selector(
     backend: str,
     *,
     max_bs: int = 1,
     h_kv: int = 1,
     device: torch.device = torch.device("cpu"),
+    max_top_k: int | None = None,
+    max_ctx: int | None = None,
 ) -> _BaseSelector:
     """Construct the requested selector.
 
     ``max_bs`` / ``h_kv`` / ``device`` are only consulted by backends
     that pre-allocate aux state at construction time (currently the
-    FlashInfer backend). Defaults keep ``make_selector('torch')``
+    FlashInfer and FTKA backends). ``max_top_k`` / ``max_ctx`` are
+    additionally required for ``ftka_raft_topk`` since RAFT top-k
+    needs its values/indices/workspace tensors sized up front to keep
+    ``select()`` allocation-free. Defaults keep ``make_selector('torch')``
     backward-compatible.
 
     Fails loud:
@@ -287,12 +427,30 @@ def make_selector(
         (``sgl_fast_topk_transform``, ``jit_fused_selector``) ->
         NotImplementedError with the gating rationale
       * the optional dep for a registered backend is missing
-        (FlashInfer) -> RuntimeError from the backend ctor
+        (FlashInfer, FTKA) -> RuntimeError from the backend ctor
+      * ``ftka_raft_topk`` without explicit ``max_top_k`` / ``max_ctx``
+        -> ValueError (no fallback default — the caller must size
+        scratch deliberately)
     """
     if backend == "torch":
         return TorchTopKSelector()
     if backend == "flashinfer_topk_page_table":
         return FlashInferTopKPageTableSelector(max_bs=max_bs, h_kv=h_kv, device=device)
+    if backend == "ftka_raft_topk":
+        if max_top_k is None or max_ctx is None:
+            raise ValueError(
+                "selector_backend='ftka_raft_topk' requires explicit "
+                "max_top_k and max_ctx kwargs to make_selector(); RAFT "
+                "top-k needs its scratch tensors sized at construction "
+                "to stay capture-safe."
+            )
+        return FtkaRaftTopKSelector(
+            max_bs=max_bs,
+            h_kv=h_kv,
+            max_top_k=max_top_k,
+            max_ctx=max_ctx,
+            device=device,
+        )
     if backend == "sgl_fast_topk_transform":
         # Registered but not wired: ``sgl_kernel.fast_topk_transform_fused``
         # in the installed build doesn't accept ``row_to_batch``, which
@@ -318,8 +476,11 @@ def make_selector(
 
 
 __all__ = [
-    "SUPPORTED_SELECTOR_BACKENDS",
+    "FLASHINFER_TOPK_MAX",
+    "FTKA_TARGET_COMMIT",
     "FlashInferTopKPageTableSelector",
+    "FtkaRaftTopKSelector",
+    "SUPPORTED_SELECTOR_BACKENDS",
     "TorchTopKSelector",
     "make_selector",
 ]

@@ -1,7 +1,7 @@
 """Parity tests for the DS native top-k selector backends.
 
-Each backend (torch / flashinfer_topk_page_table / sgl_fast_topk_transform)
-must:
+Each backend (torch / flashinfer_topk_page_table / sgl_fast_topk_transform
+/ ftka_raft_topk) must:
 
   * Produce the same SET of selected physical ids per ``(bs, h_kv)`` as
     the torch baseline (ordering inside the top-k slot is allowed to
@@ -9,10 +9,10 @@ must:
   * Lay out sink + recent in the documented slot order (top-k | sink |
     recent).
 
-FlashInfer / sgl_kernel are skipped when the optional dependency is not
-available; if the user explicitly requests them via the runtime config
-flag, ``make_selector`` raises with a clear message (covered by a
-separate construction test).
+FlashInfer / sgl_kernel / ftka are skipped when the optional dependency
+is not available; if the user explicitly requests them via the runtime
+config flag, ``make_selector`` raises with a clear message (covered by
+separate construction tests).
 """
 
 from __future__ import annotations
@@ -43,6 +43,10 @@ def _have_sgl_kernel_fast_topk() -> bool:
     import sgl_kernel
 
     return hasattr(sgl_kernel, "fast_topk_transform_fused")
+
+
+def _have_ftka() -> bool:
+    return importlib.util.find_spec("ftka") is not None
 
 
 def _make_inputs(
@@ -81,10 +85,17 @@ def _run_select(backend_name: str, att_out, r2t, seq_lens, top_k, sink, recent):
         make_selector,
     )
 
-    bs, h_kv, _ = att_out.shape
+    bs, h_kv, max_ctx = att_out.shape
     total = top_k + sink + recent
     out = torch.zeros((bs, h_kv, total), dtype=torch.int32, device=att_out.device)
-    selector = make_selector(backend_name, max_bs=bs, h_kv=h_kv, device=att_out.device)
+    selector = make_selector(
+        backend_name,
+        max_bs=bs,
+        h_kv=h_kv,
+        device=att_out.device,
+        max_top_k=top_k,
+        max_ctx=max_ctx,
+    )
     selector.select(
         att_out_approx=att_out,
         req_to_token_indexed=r2t,
@@ -171,6 +182,29 @@ class TestSelectorParity(CustomTestCase):
         )
         self._assert_layouts_match(out_torch, out_fi, top_k, sink, recent)
 
+    @unittest.skipUnless(_have_ftka(), "ftka required")
+    def test_ftka_raft_topk_matches_torch(self):
+        """FTKA's raft_topk substitutes only the top-k step; the
+        ``_build_selected_physical`` Triton path is shared with the torch
+        backend, so set parity must hold modulo within-top-k order."""
+        device = torch.device("cuda")
+        bs, h_kv, max_ctx, seq_len = 2, 1, 256, 128
+        sink, recent, top_k = 4, 8, 16
+        att_out, r2t, seq_lens = _make_inputs(
+            bs, h_kv, max_ctx, seq_len, sink, recent, device, seed=2
+        )
+        out_torch = _run_select("torch", att_out, r2t, seq_lens, top_k, sink, recent)
+        out_ftka = _run_select(
+            "ftka_raft_topk",
+            att_out,
+            r2t,
+            seq_lens,
+            top_k,
+            sink,
+            recent,
+        )
+        self._assert_layouts_match(out_torch, out_ftka, top_k, sink, recent)
+
     def test_sgl_backend_currently_not_implemented(self):
         """`sgl_fast_topk_transform` is registered but not yet wired; the
         installed sgl_kernel.fast_topk_transform_fused signature lacks the
@@ -224,6 +258,46 @@ class TestSelectorConstruction(CustomTestCase):
                 max_bs=1,
                 h_kv=1,
                 device=torch.device("cpu"),
+            )
+
+    def test_ftka_requires_max_top_k_and_max_ctx(self):
+        """``ftka_raft_topk`` must not silently fall back to a default
+        scratch size — RAFT top-k allocations are sized once at
+        construction. Calling ``make_selector`` without explicit
+        ``max_top_k`` / ``max_ctx`` is a constructor mistake, not an
+        intentional configuration; fail loud."""
+        from sglang.srt.mem_cache.sparsity.algorithms.selector_backends import (
+            make_selector,
+        )
+
+        with self.assertRaisesRegex(ValueError, "max_top_k"):
+            make_selector(
+                "ftka_raft_topk",
+                max_bs=1,
+                h_kv=1,
+                device=torch.device("cpu"),
+            )
+
+    @unittest.skipIf(
+        _have_ftka(), "ftka unavailable required (this asserts the failure path)"
+    )
+    def test_ftka_unavailable_raises_clearly(self):
+        """When ``ftka`` is not installed and the user explicitly selects
+        ``ftka_raft_topk``, the constructor must raise ``RuntimeError``
+        with installation guidance (rather than silently falling back
+        to torch)."""
+        from sglang.srt.mem_cache.sparsity.algorithms.selector_backends import (
+            make_selector,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "ftka"):
+            make_selector(
+                "ftka_raft_topk",
+                max_bs=1,
+                h_kv=1,
+                device=torch.device("cuda"),
+                max_top_k=128,
+                max_ctx=512,
             )
 
     def test_flashinfer_topk_ceiling_validated_in_runtime_config(self):

@@ -350,8 +350,17 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
                 make_selector,
             )
 
+            # max_top_k / max_ctx are only consumed by ftka_raft_topk;
+            # other backends ignore them. Sizing here mirrors the
+            # token_budget / req_to_token width that the algorithm
+            # already enforces.
             self._selector = make_selector(
-                rt.selector_backend, max_bs=bs, h_kv=h_kv, device=device
+                rt.selector_backend,
+                max_bs=bs,
+                h_kv=h_kv,
+                device=device,
+                max_top_k=rt.token_budget,
+                max_ctx=self._native_req_to_token_indexed.shape[1],
             )
             self._warmup_selector(bs, h_kv)
 
