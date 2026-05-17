@@ -312,7 +312,7 @@ class PrefillBootstrapQueue:
                 self.scheduler.stream_output([req], req.return_logprob)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
-                if self.scheduler.enable_metrics:
+                if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                 if self.scheduler.enable_hicache_storage:
                     # to release prefetch events associated with the request
@@ -588,6 +588,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
+            self.metrics_reporter,
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
@@ -659,7 +660,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
                 done_reqs.append(req)
-                if self.enable_metrics:
+                if self.metrics_reporter.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
                 logger.warning_once(
@@ -685,9 +686,9 @@ class SchedulerDisaggregationPrefillMixin:
             if metrics:
                 # Update last-value for REST API
                 if "latency_ms" in metrics:
-                    self.kv_transfer_latency_ms = metrics["latency_ms"]
+                    self.metrics_reporter.kv_transfer_latency_ms = metrics["latency_ms"]
                 if "speed_gb_s" in metrics:
-                    self.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
+                    self.metrics_reporter.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
         # Stream requests which have finished transfer
         self.stream_output(

@@ -80,7 +80,7 @@ class SchedulerDllmMixin:
                     continue
 
                 req.fill_ids[-new_tokens:] = next_token_ids[:]
-                self.num_generated_tokens += new_tokens
+                self.metrics_reporter.num_generated_tokens += new_tokens
 
                 req.output_ids.extend(next_token_ids)
                 req.check_finished(new_accepted_len=new_tokens)
@@ -94,6 +94,7 @@ class SchedulerDllmMixin:
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
+            self.metrics_reporter,
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
