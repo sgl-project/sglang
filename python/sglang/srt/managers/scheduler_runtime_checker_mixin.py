@@ -9,7 +9,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
-from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -281,27 +280,3 @@ class SchedulerRuntimeCheckerMixin:
             or (self.is_hybrid_ssm and self.tree_cache.supports_mamba())
         ):
             self.tree_cache.sanity_check()
-
-
-def create_scheduler_watchdog(
-    scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
-) -> WatchdogRaw:
-    def dump_info() -> str:
-        if scheduler.is_initializing:
-            return ""
-        _, messages = scheduler._check_all_pools(
-            scheduler.pool_stats_observer.get_pool_stats()
-        )
-        return (
-            f"{scheduler.cur_batch.batch_size()=}\n"
-            f"{scheduler.cur_batch.reqs=}\n" + "\n".join(messages)
-        )
-
-    return WatchdogRaw(
-        debug_name="Scheduler",
-        get_counter=lambda: scheduler.forward_ct,
-        is_active=lambda: scheduler.is_initializing or scheduler.cur_batch is not None,
-        watchdog_timeout=watchdog_timeout,
-        soft=soft,
-        dump_info=dump_info,
-    )
