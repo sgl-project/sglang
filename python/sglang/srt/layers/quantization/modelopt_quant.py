@@ -2049,22 +2049,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return self.runner.run(dispatch_output, quant_info)
 
         if self.enable_flashinfer_cutedsl_moe:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                CuteDslFp4MoeQuantInfo,
+                ensure_cutedsl_wrapper,
+            )
+
             if self._is_cutedsl_v1_deepep:
                 # v1 path: DeepEP low-latency + flashinfer_cutedsl_moe_masked.
                 # Weights are [Gate, Up] (non-interleaved) with swizzled blockscales.
-                from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
-                    CuteDslFp4DeepEPMoeQuantInfo,
-                )
-
-                quant_info = CuteDslFp4DeepEPMoeQuantInfo(
+                quant_info = CuteDslFp4MoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
-                    w13_blockscale_swizzled=layer.w13_blockscale_swizzled,
-                    w2_blockscale_swizzled=layer.w2_blockscale_swizzled,
-                    g1_alphas=layer.g1_alphas,
-                    g2_alphas=layer.g2_alphas,
-                    w13_input_scale_quant=layer.w13_input_scale_quant,
-                    w2_input_scale_quant=layer.w2_input_scale_quant,
+                    w13_weight_sf=layer.w13_blockscale_swizzled,
+                    w2_weight_sf=layer.w2_blockscale_swizzled,
+                    w1_alpha=layer.g1_alphas,
+                    w2_alpha=layer.g2_alphas,
+                    a1_scale=layer.w13_input_scale_quant,
+                    a2_scale=layer.w2_input_scale_quant,
                     use_nvfp4_dispatch=MOE_NVFP4_DISPATCH,
                     down_gemm_overlap_args=getattr(
                         self.runner, "down_gemm_overlap_args", None
@@ -2074,29 +2075,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # v2 standard path (a2a=none/flashinfer): uses CuteDslMoEWrapper
             # with [Up, Gate] interleaved weights and MMA blockscales.
-            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
-                CuteDslFp4MoeQuantInfo,
-                ensure_cutedsl_wrapper,
-            )
-
             ensure_cutedsl_wrapper(layer)
             w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
-            w1_weight_sf = getattr(
-                layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
-            )
-            w2_weight_sf = getattr(
-                layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled
-            )
             quant_info = CuteDslFp4MoeQuantInfo(
-                wrapper=layer._cutedsl_wrapper,
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
-                w13_weight_sf=w1_weight_sf,
-                w2_weight_sf=w2_weight_sf,
+                w13_weight_sf=getattr(
+                    layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
+                ),
+                w2_weight_sf=getattr(
+                    layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled
+                ),
                 w1_alpha=w1_alpha,
                 w2_alpha=w2_alpha,
-                fc2_input_scale=fc2_input_scale,
-                input_scale=layer._cutedsl_input_scale,
+                a1_scale=layer._cutedsl_input_scale,
+                a2_scale=fc2_input_scale,
+                wrapper=layer._cutedsl_wrapper,
             )
             return self.runner.run(dispatch_output, quant_info)
 
