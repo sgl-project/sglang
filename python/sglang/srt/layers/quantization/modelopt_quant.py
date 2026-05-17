@@ -2007,10 +2007,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        x = dispatch_output.hidden_states
-        x_sf = dispatch_output.hidden_states_scale
-        topk_output = dispatch_output.topk_output
-
+        # Note: dispatch_output may be a DeepEPLLDispatchOutput (no topk_output
+        # attribute -- topk_ids/topk_weights live directly on the dispatch
+        # tuple). Defer per-attribute access to the branches that actually
+        # consume them.
         activation = self.moe_runner_config.activation
 
         assert (
@@ -2102,6 +2102,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ), "apply_router_weight_on_input is not supported for Flashinfer"
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
+            x = dispatch_output.hidden_states
+            x_sf = dispatch_output.hidden_states_scale
+            topk_output = dispatch_output.topk_output
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
             output_dtype = torch.bfloat16
@@ -2155,6 +2158,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         output = cutlass_moe_fp4(
             a=x,
