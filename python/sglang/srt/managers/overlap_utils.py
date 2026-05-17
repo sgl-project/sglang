@@ -163,6 +163,9 @@ class FutureMap:
     ):
         if self.spec_algo.is_none():
             intv = future_indices.interval
+            if self.is_empty_slice(intv):
+                # idle indices in dp attention do not need store info
+                return
             self.token_ids_buf[intv] = batch_result.next_token_ids
         else:
             draft_input: EagleDraftInput = batch_result.next_draft_input

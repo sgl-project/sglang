@@ -29,6 +29,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
+    MEGAMOE = "megamoe"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -60,6 +61,9 @@ class MoeA2ABackend(Enum):
 
     def is_mori(self):
         return self == MoeA2ABackend.MORI
+
+    def is_megamoe(self):
+        return self == MoeA2ABackend.MEGAMOE
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED

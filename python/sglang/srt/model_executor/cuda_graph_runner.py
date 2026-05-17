@@ -170,6 +170,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
+        hc_hidden_size: Optional[int] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -203,10 +204,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
+                # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
+                is_mhc = hc_hidden_size is not None
+                hs = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
                 }
+                if not is_mhc:
+                    pp_proxy_tensors["residual"] = torch.zeros(
+                        (max_bs, hidden_size), dtype=dtype
+                    )
             else:
                 pp_proxy_tensors = None
 
@@ -686,6 +693,9 @@ class CudaGraphRunner:
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
             is_hybrid_swa=model_runner.is_hybrid_swa,
+            hc_hidden_size=getattr(
+                self.model_runner.model_config, "hc_hidden_size", None
+            ),
         )
         self.buffers.share_buffers()
 

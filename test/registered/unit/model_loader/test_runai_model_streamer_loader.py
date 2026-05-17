@@ -123,6 +123,24 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
 
         self.assertIsInstance(model_loader, loader_mod.RunaiModelStreamerLoader)
 
+    def test_get_model_loader_uses_remote_instance_for_prequantized_modelopt(self):
+        load_config = LoadConfig(
+            load_format=LoadFormat.REMOTE_INSTANCE,
+            model_loader_extra_config={},
+        )
+        model_config = cast(
+            ModelConfig,
+            SimpleNamespace(
+                quantization="modelopt_fp4",
+                modelopt_quant=False,
+                _is_already_quantized=lambda: True,
+            ),
+        )
+
+        model_loader = loader_mod.get_model_loader(load_config, model_config)
+
+        self.assertIsInstance(model_loader, loader_mod.RemoteInstanceModelLoader)
+
 
 if __name__ == "__main__":
     unittest.main()
