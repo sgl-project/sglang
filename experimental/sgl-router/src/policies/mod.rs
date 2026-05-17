@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod factory;
+pub mod kv_events;
 pub mod power_of_two;
 pub mod random;
 pub mod round_robin;

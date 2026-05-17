@@ -60,6 +60,13 @@ kube = { version = "0.96", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.23", features = ["v1_31"] }
 tokio-util = "0.7"
 
+# KV-event subsystem (M3) — msgpack-encoded events over ZMQ + xxhash3
+# block hashing.  Wire format authority is
+# `python/sglang/srt/disaggregation/kv_events.py`.
+rmp-serde = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+
 [dev-dependencies]
 dirs = "5"
 http-body-util = "0.1"
@@ -68,3 +75,6 @@ serde_json = "1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.42", features = ["test-util"] }
+# Low-level msgpack encoder used to hand-construct wire bytes in
+# kv_events golden-bytes tests (decode-only path uses rmp-serde).
+rmp = "0.8"
