@@ -196,9 +196,7 @@ class SchedulerUpdateWeightsMixin:
             traceback.print_exc()
             return CheckWeightsReqOutput(success=False, message=f"{e}")
 
-    def save_remote_model(
-        self: Scheduler, params=None, *, url=None, draft_url=None
-    ):
+    def save_remote_model(self: Scheduler, params=None, *, url=None, draft_url=None):
         """Save model weights through the scheduler RPC path.
 
         Accept both legacy ``params`` dict calls and the newer ``**kwargs`` RPC
