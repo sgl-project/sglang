@@ -50,7 +50,8 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     maybe_detect_nan,
     maybe_detect_oob,
-    record_sb_tensors_on_stream,
+    record_stream_each,
+    record_stream_for_v2_verify,
     select_top_k_tokens,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
@@ -723,7 +724,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # batch.input_ids and drops the only SB ref to the old tensor).
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
-        record_sb_tensors_on_stream(batch, verify_input, fwd_stream)
+        record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
         bs = len(batch.seq_lens)
 
@@ -746,9 +747,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # batch.out_cache_loc. Record both on forward_stream so subsequent
         # _draft_extend_for_decode rebinds (which drop these from SB) do not
         # release their memory before forward_stream finishes verify.
-        for t in (batch.input_ids, batch.out_cache_loc):
-            if isinstance(t, torch.Tensor) and t.is_cuda:
-                t.record_stream(fwd_stream)
+        record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:

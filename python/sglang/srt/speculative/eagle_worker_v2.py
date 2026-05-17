@@ -59,7 +59,8 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     maybe_detect_nan,
     maybe_detect_oob,
-    record_sb_tensors_on_stream,
+    record_stream_each,
+    record_stream_for_v2_verify,
     select_top_k_tokens,
 )
 from sglang.srt.utils.common import (
@@ -971,7 +972,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # per-field copy + Scheduler.batch_record_buf held one full iter.
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
-        record_sb_tensors_on_stream(batch, verify_input, fwd_stream)
+        record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
@@ -998,9 +999,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # on plan_stream). Record both on forward_stream so subsequent
         # _draft_extend_for_decode rebinds (which drop these from SB) do not
         # release their memory before forward_stream finishes verify.
-        for t in (batch.input_ids, batch.out_cache_loc):
-            if isinstance(t, torch.Tensor) and t.is_cuda:
-                t.record_stream(fwd_stream)
+        record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:

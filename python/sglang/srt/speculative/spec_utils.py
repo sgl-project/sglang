@@ -52,7 +52,18 @@ TREE_SPEC_KERNEL_AVAILABLE = (
 )  # This kernel is only available for CUDA and MUSA now
 
 
-def record_sb_tensors_on_stream(batch, verify_input, fwd_stream):
+def record_stream_each(tensors, stream):
+    """Call record_stream(stream) on each cuda tensor in `tensors`, skipping
+    non-tensor / non-cuda entries. Tells the caching allocator that the
+    tensors are also used on `stream`, so memory is not recycled while
+    queued work is still in flight after Python refs drop.
+    """
+    for t in tensors:
+        if isinstance(t, torch.Tensor) and t.is_cuda:
+            t.record_stream(stream)
+
+
+def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
     """Tell the caching allocator that the listed SB / spec_info GPU tensors
     are also used on `fwd_stream`. Without this, mid-forward Python rebinds
     on SB attributes (or on spec_info) can drop the only ref to a tensor
@@ -80,9 +91,7 @@ def record_sb_tensors_on_stream(batch, verify_input, fwd_stream):
                 )
             ]
         )
-    for t in candidates:
-        if isinstance(t, torch.Tensor) and t.is_cuda:
-            t.record_stream(fwd_stream)
+    record_stream_each(candidates, fwd_stream)
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
