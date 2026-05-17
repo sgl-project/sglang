@@ -1047,10 +1047,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
         quant_info = self._quant_info
 
-        # Run the only lora moe runner (Triton)
         combine_input = self._lora_runner.run(
             dispatch_output, quant_info, lora_info=lora_info
         )
