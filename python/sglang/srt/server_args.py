@@ -2192,13 +2192,19 @@ class ServerArgs:
             )
             self.disable_hybrid_swa_memory = True
         elif model_arch == "Gemma4ForConditionalGeneration":
-            if is_sm100_supported():
-                self.attention_backend = "trtllm_mha"
+            if self.is_attention_backend_not_set():
+                if is_sm100_supported():
+                    self.attention_backend = "trtllm_mha"
+                else:
+                    self.attention_backend = "triton"
+                logger.info(
+                    f"Use {self.attention_backend} as default attention backend for Gemma4"
+                )
             else:
-                self.attention_backend = "triton"
-            logger.info(
-                f"Use {self.attention_backend} as default attention backend for Gemma4"
-            )
+                assert self.attention_backend in ("trtllm_mha", "triton"), (
+                    f"Gemma4 only supports trtllm_mha or triton attention backend, "
+                    f"got {self.attention_backend}"
+                )
         elif model_arch == "MossVLForConditionalGeneration":
             if self.is_attention_backend_not_set():
                 self.prefill_attention_backend = "flashinfer"
