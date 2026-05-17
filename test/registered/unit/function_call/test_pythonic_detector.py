@@ -114,7 +114,11 @@ class TestPythonicDetector(CustomTestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].tool_index, 0)
+        self.assertEqual(result.calls[0].parameters, '{"city": "Tokyo"}')
         self.assertEqual(result.calls[1].name, "search")
+        self.assertEqual(result.calls[1].tool_index, 1)
+        self.assertEqual(result.calls[1].parameters, '{"query": "restaurants"}')
 
     def test_tool_call_with_leading_text(self):
         text = "I will check the weather for you. [get_weather(city='Tokyo')]"
