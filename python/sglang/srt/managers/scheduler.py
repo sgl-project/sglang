@@ -2998,11 +2998,7 @@ class Scheduler(
         # NOTE: - for all future tensors, we shall always read from future map
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
-        # Snapshot SB's current attribute values so that any post-forward
-        # attribute rebinds (e.g. spec V2 reassigns batch.seq_lens to
-        # next_draft_input.new_seq_lens) do not drop the old tensor refs while
-        # forward stream is still using their GPU memory. Pre-MWB-removal this
-        # was provided implicitly by ModelWorkerBatch's per-field copy.
+        # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
         attr_snapshot = [
             getattr(batch, f.name, None) for f in dataclasses.fields(batch)
         ]
