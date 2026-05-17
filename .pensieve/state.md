@@ -2,7 +2,7 @@
 
 ## Lifecycle State
 - Last Event: self-improve
-- Last Note: auto-improve: FTKA evaluation harness + selector-only scope decision + layout-mismatch knowledge
+- Last Note: FTKA P3 measured-out: REJECT verdict + new knowledge on one-block-per-batch radix scaling
 
 ## Project Paths
 - Project Root: `/workspace/sglang`
@@ -10,7 +10,7 @@
 - Runtime State: `.pensieve/.state/`
 
 ## Short-Term
-- Total: 7
+- Total: 8
 - Due for refine: 0 (created 7+ days ago)
 
 ## Graph

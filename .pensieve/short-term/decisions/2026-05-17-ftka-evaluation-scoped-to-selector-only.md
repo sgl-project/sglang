@@ -1,11 +1,11 @@
 ---
 id: 2026-05-17-ftka-evaluation-scoped-to-selector-only
 type: decision
-title: FTKA evaluation scoped to selector-only; score substitution rejected on layout grounds
+title: FTKA evaluation — selector-only scope; measured-out and REJECTED for DS production
 status: active
 created: 2026-05-17
 updated: 2026-05-17
-tags: [double-sparsity, ftka, sparse-attention, selector, benchmark]
+tags: [double-sparsity, ftka, sparse-attention, selector, benchmark, measured]
 ---
 
 # FTKA evaluation scoped to selector-only; score substitution rejected on layout grounds
@@ -111,3 +111,41 @@ microbench harness wouldn't accidentally drift into algorithm change.
   flat-indexed layout, or (c) Twilight's algorithmic ideas are
   separately approved for production (different decision, different
   scope), re-open this and re-evaluate.
+
+## Measured Outcome (2026-05-17, post-install)
+
+After resolving FTKA build glue against `flashinfer 0.6.11.post1` /
+`torch 2.11.0+cu130` / CUDA 13 (carved-out `ftka_topk_only.cu` TU; see
+REPORT §"FTKA build-glue port"), the full 76-shape microbench ran with
+P3 ftka_raft_topk actually measured. Parity 76/76, graph capture 76/76,
+top_k up to 8192 supported. But the speedup vs `torch.topk` is
+**strongly context-dependent**:
+
+| `max_ctx` | n | min ratio | median | max | regime |
+|---:|---:|---:|---:|---:|---|
+| 32K  | 25 | 1.97× | **2.36×** | 3.06× | torch under-utilized; RAFT wins |
+| 64K  | 26 | 0.85× | **1.00×** | 1.19× | wash |
+| 128K | 25 | 0.47× | **0.63×** | 0.83× | RAFT loses everywhere |
+
+**DS production target is `ctx ≥ 64K`, typically 128K.** Of the 20
+shapes in the production envelope (`bs ≥ 16, ctx ≥ 64K`), only **2**
+pass the ≥1.15× speedup gate and **14** fail outright (<0.95×). At
+the README headline operating points (bs ∈ {16, 32}, ctx = 128K,
+top_k ∈ {1024, 2048}), RAFT runs at **0.63×–0.79×** of torch — i.e.,
+21–37% slower.
+
+Root cause is the **one-block-per-batch radix** in RAFT's
+`decode_select_k` (see `[[knowledge/external-topk-one-block-radix-
+scaling-regime/content]]`). Documented in the report; no production
+code changed.
+
+**Final decision: REJECT P3 (`ftka_raft_topk`) for production.** PLAN
+gate "≥1.15× at bs≥16 / top_k ∈ {1024, 2048}" fails at every
+ctx ≥ 64K production shape. e2e (README headline) was not run —
+PLAN-gated on P3 passing the microbench gate, which it does not.
+
+P4 stays structurally rejected per the original decision body
+(`BatchedSparseGEMV<128, ...>` compile-time vs DS S=32) — confirmed by
+source at `csrc/src/ftka_ops.cu:70`.
+
+Default `--double-sparsity-selector-backend=torch` is unchanged.
