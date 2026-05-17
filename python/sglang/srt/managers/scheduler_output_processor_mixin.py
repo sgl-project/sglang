@@ -882,7 +882,7 @@ class SchedulerOutputProcessorMixin:
             # The input logprob has been already computed. It only happens
             # upon retract.
             if req.top_logprobs_num > 0:
-                assert req.input_token_logprobs_val is not None
+                assert req.input_top_logprobs_val is not None
             return
 
         # Important for the performance.
@@ -1172,13 +1172,13 @@ class SchedulerOutputProcessorMixin:
                     ):
                         input_token_logprobs_val.append(req.input_token_logprobs_val)
                         input_token_logprobs_idx.append(req.input_token_logprobs_idx)
-                        input_top_logprobs_val.append(req.input_top_logprobs_val)
-                        input_top_logprobs_idx.append(req.input_top_logprobs_idx)
+                        input_top_logprobs_val.append(req.input_top_logprobs_val or [])
+                        input_top_logprobs_idx.append(req.input_top_logprobs_idx or [])
                         input_token_ids_logprobs_val.append(
-                            req.input_token_ids_logprobs_val
+                            req.input_token_ids_logprobs_val or []
                         )
                         input_token_ids_logprobs_idx.append(
-                            req.input_token_ids_logprobs_idx
+                            req.input_token_ids_logprobs_idx or []
                         )
                         req.input_logprob_sent = True
                     else:
