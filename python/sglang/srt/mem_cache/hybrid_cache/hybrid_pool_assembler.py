@@ -283,7 +283,8 @@ def build_deepseek_v4_hicache_stack(
     pp_size: int = 1,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
-    transfer_layer_num = len(kvcache.compression_ratios)
+    # TODO(hzh0425): Support PP for deepseek v4 with hicache
+    transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
     swa_layer_mapping = {
         layer_id: layer_id for layer_id in range(len(kvcache.swa_kv_pool.kv_buffer))
@@ -293,7 +294,9 @@ def build_deepseek_v4_hicache_stack(
     c128_layer_mapping = {}
     c4_state_global_layers = []
     c128_state_global_layers = []
-    for layer_id, layer_item in enumerate(kvcache.layer_mapping):
+    for layer_id, layer_item in enumerate(
+        kvcache.layer_mapping[kvcache.start_layer : kvcache.end_layer]
+    ):
         if layer_item.compress_ratio == 4:
             c4_layer_mapping[layer_id] = layer_item.compress_layer_id
             c4_state_global_layers.append(layer_id)
@@ -730,7 +733,7 @@ def attach_hybrid_pool_to_unified_cache(
                             indices_from_pool=indices_from_pool,
                         )
                     )
-            transfer_layer_num = len(kvcache.compression_ratios)
+            transfer_layer_num = kvcache.end_layer - kvcache.start_layer
         elif mamba_stack:
             full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
             mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)

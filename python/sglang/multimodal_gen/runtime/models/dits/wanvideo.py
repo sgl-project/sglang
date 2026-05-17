@@ -49,7 +49,9 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     TimestepEmbedder,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.utils import (
     _use_aiter,
@@ -70,7 +72,6 @@ if _use_aiter:
 
 
 class WanImageEmbedding(torch.nn.Module):
-
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
 
@@ -87,7 +88,6 @@ class WanImageEmbedding(torch.nn.Module):
 
 
 class WanTimeTextImageEmbedding(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -130,7 +130,6 @@ class WanTimeTextImageEmbedding(nn.Module):
 
 
 class WanSelfAttention(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -247,7 +246,6 @@ class WanT2VCrossAttention(WanSelfAttention):
 
 
 class WanI2VCrossAttention(WanSelfAttention):
-
     def __init__(
         self,
         dim: int,
@@ -335,7 +333,6 @@ class WanI2VCrossAttention(WanSelfAttention):
 
 
 class WanTransformerBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -514,9 +511,14 @@ class WanTransformerBlock(nn.Module):
         else:
             # temb: batch_size, 6, inner_dim (wan2.1/wan2.2 14B)
             e = self.scale_shift_table + temb.float()
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                e.chunk(6, dim=1)
-            )
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                c_shift_msa,
+                c_scale_msa,
+                c_gate_msa,
+            ) = e.chunk(6, dim=1)
 
         assert shift_msa.dtype == torch.float32
 
@@ -611,7 +613,6 @@ class WanTransformerBlock(nn.Module):
 
 
 class WanTransformerBlock_VSA(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -855,7 +856,7 @@ class WanTransformerBlock_VSA(nn.Module):
         return hidden_states
 
 
-class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
+class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
     _supported_attention_backends = WanVideoConfig()._supported_attention_backends
@@ -1088,13 +1089,16 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         else:
             ts_seq_len = None
 
-        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
-            self.condition_embedder(
-                timestep,
-                encoder_hidden_states,
-                encoder_hidden_states_image,
-                timestep_seq_len=ts_seq_len,
-            )
+        (
+            temb,
+            timestep_proj,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+        ) = self.condition_embedder(
+            timestep,
+            encoder_hidden_states,
+            encoder_hidden_states_image,
+            timestep_seq_len=ts_seq_len,
         )
         if ts_seq_len is not None:
             # batch_size, seq_len, 6, inner_dim
