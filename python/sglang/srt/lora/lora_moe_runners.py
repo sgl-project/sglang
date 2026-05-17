@@ -175,7 +175,7 @@ class LoRAInfo:
 
     # LoRA config per adapter
     lora_ranks: torch.Tensor  # [num_loras]
-    adapter_enabled: torch.Tensor  # [num_loras] - which adapters are enabled
+    adapter_enabled: torch.Tensor  # [num_loras] - requested adapters with rank > 0
     max_lora_rank: int  # Maximum LoRA rank across all adapters
 
     num_experts: int
@@ -187,9 +187,6 @@ class LoRAInfo:
     tp_rank: int = 0
     hidden_size: int = 0
     lora_use_virtual_experts: bool = False
-
-    # True iff at least one batch request maps to a slot with rank > 0.
-    has_active_lora: bool = True
 
     # Set by the runner when its GEMM outputs are in expert-sorted layout.
     # When ``sorted_layout`` is True and ``c_map`` is set, hook kernels
@@ -224,7 +221,11 @@ def _compute_token_lora_mapping(
         token_positions,
         right=True,
     )
-    return lora_info.req_to_lora.to(torch.int32)[req_indices]
+    mapping = lora_info.req_to_lora.to(torch.int32)[req_indices]
+    valid = mapping >= 0
+    safe_mapping = mapping.clamp_min(0).long()
+    active = lora_info.adapter_enabled[safe_mapping] > 0
+    return torch.where(valid & active, mapping, torch.full_like(mapping, -1))
 
 
 def _compute_lora_alignment(
@@ -349,24 +350,7 @@ def _add_lora_gate_up_delta(
         merged_experts_fused_moe_lora_add,
     )
 
-    if get_is_capture_mode():
-        # During CUDA graph capture, always enter the LoRA path so that
-        # the LoRA kernels are recorded in the graph.  adapter_enabled is
-        # all-zeros during capture, so the Triton kernel early-exits per
-        # program (zero overhead).  During replay the tensor is updated
-        # in-place with the real adapter mask before graph.replay().
-        has_active_lora = True
-    else:
-        num_loras = len(lora_info.lora_ranks)
-        has_active_lora = (
-            (
-                lora_info.adapter_enabled[:num_loras]
-                * (lora_info.lora_ranks > 0).to(lora_info.adapter_enabled.dtype)
-            )
-            .any()
-            .item()
-        )
-    if not has_active_lora or lora_info is None or lora_info.max_lora_rank == 0:
+    if lora_info is None or lora_info.max_lora_rank == 0:
         return
 
     M, top_k, gate_up_dim = intermediate_cache.shape
@@ -547,16 +531,6 @@ def build_lora_hooks(
     closures that capture them for the two injection points.
     """
     if lora_info is None or lora_info.max_lora_rank == 0:
-        return LoRAHooks()
-
-    if get_is_capture_mode():
-        from sglang.srt.model_executor.cuda_graph_runner import get_capture_lora_variant
-
-        if get_capture_lora_variant() == "nolora":
-            return LoRAHooks()
-    elif not lora_info.has_active_lora:
-        # Eager-mode mirror of the graph-mode "nolora" gate: skip kernels whose
-        # zero-LoRA passthrough still accumulates bf16 drift on the NVFP4 path.
         return LoRAHooks()
 
     # Compute alignment / mapping (once, shared by both hooks)

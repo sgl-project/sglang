@@ -879,6 +879,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.experts_shared_outer_loras: bool = False
         self.lora_use_virtual_experts: bool = False
         self.quant_method = base_layer.quant_method
+        self.moe_runner_config = base_layer.moe_runner_config
+        self.dispatcher = base_layer.dispatcher
+        self.num_local_experts = base_layer.num_local_experts
+        self.should_fuse_routed_scaling_factor_in_topk = (
+            base_layer.should_fuse_routed_scaling_factor_in_topk
+        )
 
         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
         self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
@@ -977,6 +983,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
             )
             adapter_enabled.index_fill_(0, wi.long(), 1)
+        rank_enabled = (lora_ranks > 0).to(
+            device=adapter_enabled.device, dtype=adapter_enabled.dtype
+        )
+        adapter_enabled.mul_(rank_enabled)
 
         seg_indptr = (
             batch_info.req_seg_indptr
@@ -1002,7 +1012,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
             lora_use_virtual_experts=self.lora_use_virtual_experts,
-            has_active_lora=bool(getattr(batch_info, "has_active_lora", True)),
         )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
