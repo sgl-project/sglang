@@ -24,7 +24,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 
 
 class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
     layer_names = [
         "encoder.down_blocks",
         "decoder.up_blocks",
