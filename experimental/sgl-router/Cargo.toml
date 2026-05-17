@@ -60,10 +60,11 @@ kube = { version = "0.96", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.23", features = ["v1_31"] }
 tokio-util = "0.7"
 
-# KV-event subsystem (M3) — msgpack-encoded events over ZMQ + xxhash3
-# block hashing.  Wire format authority is
-# `python/sglang/srt/disaggregation/kv_events.py`.
+# KV-event subsystem (M3) — msgpack-encoded events over ZMQ, sha256-based
+# block hashing matching SGLang's `radix_cache`, and an xxhash3 tree key.
+# Wire format authority is `python/sglang/srt/disaggregation/kv_events.py`.
 rmp-serde = "1"
+sha2 = "0.10"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 
