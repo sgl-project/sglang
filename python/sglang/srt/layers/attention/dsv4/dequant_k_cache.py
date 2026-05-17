@@ -15,7 +15,7 @@ fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 #              padded up to a multiple of 576.
 DIM_NOPE = 448
 DIM_ROPE = 64
-TILE_SIZE = 64                  # one nope scale tile = 64 fp8 values
+TILE_SIZE = 64  # one nope scale tile = 64 fp8 values
 NUM_SCALE_TILES = DIM_NOPE // TILE_SIZE  # 7
 NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
 PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
