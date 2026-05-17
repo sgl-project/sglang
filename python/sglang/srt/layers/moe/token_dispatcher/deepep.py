@@ -816,6 +816,19 @@ class DeepEPDispatcher(BaseDispatcher):
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
 
+        # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
+        # pre_permute reroutes them to a sink slot at index num_local_experts,
+        # which is masked off here.
+        self.expert_mask_gpu = None
+        if _use_aiter and num_local_experts is not None:
+            expert_mask = torch.zeros(
+                num_local_experts + 1,
+                device=torch.cuda.current_device(),
+                dtype=torch.int,
+            )
+            expert_mask[:-1] = 1
+            self.expert_mask_gpu = expert_mask
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
