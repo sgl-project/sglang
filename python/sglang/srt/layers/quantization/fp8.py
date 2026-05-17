@@ -1298,11 +1298,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from triton_kernels.tensor import convert_layout, wrap_torch_tensor
             from triton_kernels.tensor_details import layout
 
-            scale_layout, scale_layout_opts = (
-                layout.make_default_matmul_mxfp4_w_scale_layout(
-                    mx_axis=-2, num_warps=num_warps
-                )
+            scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+                mx_axis=-2, num_warps=num_warps
             )
+            scale_layout_opts = {}
             scale = scale.transpose(-2, -1)
             scale = convert_layout(
                 wrap_torch_tensor(scale), scale_layout, **scale_layout_opts
