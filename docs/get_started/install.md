@@ -2,7 +2,7 @@
 
 You can install SGLang using one of the methods below.
 This page primarily applies to common NVIDIA GPU platforms.
-For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Apple Metal](../platforms/apple_metal.md), [Ascend NPUs](../platforms/ascend/ascend_npu.md), [Intel XPU](../platforms/xpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), and [TPU](../platforms/tpu.md).
+For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [TPU](../platforms/tpu.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend/ascend_npu.md), and [Intel XPU](../platforms/xpu.md).
 
 ## Method 1: With pip or uv
 
@@ -52,7 +52,7 @@ export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
 ```bash
 # Use the last release branch
-git clone https://github.com/sgl-project/sglang.git
+git clone -b v0.5.9 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
