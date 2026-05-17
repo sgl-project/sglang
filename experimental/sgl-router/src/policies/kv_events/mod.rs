@@ -11,15 +11,18 @@
 //!   `array_like=True, omit_defaults=True, gc=False, tag=True`) and this
 //!   crate. Pure decoding; no I/O.
 //!
-//! Subsequent M3 tasks add: `subscriber`.
+//! All four core submodules are now in place; M3 Task 6 wires the
+//! registry into the worker manager.
 
 pub mod discovery;
 pub mod hash;
+pub mod subscriber;
 pub mod tree;
 pub mod wire;
 
 pub use discovery::{fetch_event_config, EventConfig};
 pub use hash::{compute_block_hashes, sha256_to_i64};
+pub use subscriber::{KvEventSubscriberRegistry, WorkerEvent};
 pub use tree::{HashTree, KvWorkerId, MatchResult};
 pub use wire::{
     decode_event_batch, BlockRemoved, BlockStored, DecodeError, KvCacheEvent, KvEventBatch,
