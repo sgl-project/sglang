@@ -720,7 +720,7 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
-        paged_input = self.ceil_paged_tokens(req.extend_input_len)
+        paged_input = new_tokens_for_alloc(0, req.extend_input_len, self.page_size)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
@@ -763,8 +763,8 @@ class PrefillAdder:
         if not self.is_hybrid_swa:
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
-            cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
-                req.extend_input_len
+            cur_rem_tokens = self.cur_rem_tokens - new_tokens_for_alloc(
+                0, req.extend_input_len, self.page_size
             )
             tokens_freed = 0
             for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
