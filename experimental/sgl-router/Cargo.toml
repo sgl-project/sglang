@@ -66,6 +66,7 @@ tokio-util = "0.7"
 parking_lot = "0.12"
 rmp-serde = "1"
 sha2 = "0.10"
+url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 
 [dev-dependencies]
