@@ -173,6 +173,9 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
+from sglang.srt.managers.scheduler_components.load_inquirer import (
+    SchedulerLoadInquirer,
+)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
@@ -693,6 +696,28 @@ class Scheduler(
             max_running_requests=self.max_running_requests,
             max_total_num_tokens=self.max_total_num_tokens,
             get_stats=lambda: self.stats,
+        )
+
+        self.load_inquirer = SchedulerLoadInquirer(
+            disaggregation_mode=self.disaggregation_mode,
+            ps=self.ps,
+            server_args=self.server_args,
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_running_requests=self.max_running_requests,
+            pool_stats_observer=self.pool_stats_observer,
+            tp_worker=self.tp_worker,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            spec_algorithm=self.spec_algorithm,
+            get_running_batch=lambda: self.running_batch,
+            get_waiting_queue=lambda: self.waiting_queue,
+            get_stats=lambda: self.stats,
+            get_chunked_req=lambda: self.chunked_req,
+            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
+            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
+            get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
+            get_spec_total_num_accept_tokens=lambda: self.spec_total_num_accept_tokens,
+            get_spec_total_num_forward_ct=lambda: self.spec_total_num_forward_ct,
         )
 
         self.is_initializing = False
@@ -1455,7 +1480,10 @@ class Scheduler(
                     self.load_lora_adapter_from_tensors,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
-                (GetLoadsReqInput, self.get_loads),
+                (
+                    GetLoadsReqInput,
+                    lambda req: self.get_loads(self.load_inquirer, req),
+                ),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
@@ -2631,11 +2659,12 @@ class Scheduler(
             self.running_batch.reqs,
             self.enable_priority_scheduling,
             num_pending_tokens=self._get_num_pending_tokens(
+                self.load_inquirer,
                 chunk_deduct=(
                     self.chunked_req.extend_input_len
                     if self.chunked_req is not None
                     else 0
-                )
+                ),
             ),
         )
 
