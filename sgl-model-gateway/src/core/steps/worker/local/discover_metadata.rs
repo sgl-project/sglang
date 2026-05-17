@@ -197,10 +197,15 @@ async fn get_model_name_from_v1_models(url: &str, api_key: Option<&str>) -> Resu
         .await
         .map_err(|e| format!("Failed to parse response from {}: {}", models_url, e))?;
 
-    json["data"][0]["id"]
-        .as_str()
+    json["data"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|entry| entry["object"].as_str() == Some("model"))
+        })
+        .and_then(|entry| entry["id"].as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| format!("No model id found in response from {}", models_url))
+        .ok_or_else(|| format!("No model found in response from {}", models_url))
 }
 
 /// Fetch gRPC metadata (returns labels and detected runtime type).
