@@ -10,6 +10,9 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -27,11 +30,14 @@ class ServerArgsAutoTuner:
     def __init__(self, server_args: "ServerArgs"):
         self.server_args = server_args
         self._explicit_memory_policy = self._has_explicit_memory_policy()
+        self._explicit_layerwise_replacement_policy = (
+            self._has_explicit_layerwise_replacement_policy()
+        )
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
 
-    def adjust(self) -> None:
+    def adjust_based_on_performance_mode(self) -> None:
         """Adjust the server args based on the performance mode"""
         args = self.server_args
         args.performance_mode = self._normalize_performance_mode()
@@ -56,8 +62,8 @@ class ServerArgsAutoTuner:
                 self._set_gpu_resident_defaults(use_fsdp=True)
                 return
             args.use_fsdp_inference = False
-            if self._can_apply_dit_layerwise_offload_policy():
-                # apply dit layerwise offload to save VRAM during denoising stage
+            if self._can_apply_default_layerwise_offload_policy():
+                # apply default layerwise offload to save VRAM during denoising stage
                 self._set_layerwise_offload_defaults()
             else:
                 self._set_component_offload_defaults()
@@ -127,7 +133,8 @@ class ServerArgsAutoTuner:
                 args.dit_layerwise_offload = False
             self._enable_cfg_parallel_if_supported()
 
-    def maybe_adjust_auto_dit_layerwise_offload(self) -> None:
+    def maybe_adjust_auto_default_layerwise_offload(self) -> None:
+        """adjust the default layerwise offload policy"""
         args = self.server_args
         if not self.could_override_server_args():
             return
@@ -177,6 +184,43 @@ class ServerArgsAutoTuner:
             )
             args.dit_layerwise_offload = True
             args.dit_cpu_offload = False
+
+    def maybe_replace_cpu_offloaded_components_with_layerwise(self) -> None:
+        args = self.server_args
+        if (
+            not self.could_override_server_args()
+            or self._explicit_layerwise_replacement_policy
+            or current_platform.is_cpu()
+            or not current_platform.is_cuda()
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or args.use_fsdp_inference
+            or args.layerwise_offload_components is not None
+        ):
+            return
+
+        layerwise_components: list[str] = []
+        if args.dit_layerwise_offload:
+            layerwise_components.append(LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS)
+
+        changed: list[str] = []
+        if args.text_encoder_cpu_offload:
+            layerwise_components.append("text_encoder")
+            changed.append("text_encoder")
+        if args.image_encoder_cpu_offload:
+            layerwise_components.append("image_encoder")
+            changed.append("image_encoder")
+        if args.vae_cpu_offload:
+            layerwise_components.append("vae")
+            changed.append("vae")
+
+        if not changed:
+            return
+
+        args.layerwise_offload_components = layerwise_components
+        logger.info(
+            "Automatically replacing CPU offload with layerwise offload for components: %s",
+            ", ".join(changed),
+        )
 
     def finalize_auto_flags(self) -> None:
         """if some args are unset after all the adjustment, set them to defaults"""
@@ -266,7 +310,7 @@ class ServerArgsAutoTuner:
         if args.image_encoder_cpu_offload is None:
             args.image_encoder_cpu_offload = True
 
-    def _can_apply_dit_layerwise_offload_policy(self) -> bool:
+    def _can_apply_default_layerwise_offload_policy(self) -> bool:
         return (
             self._deployment_config().auto_dit_layerwise_offload
             and not envs.SGLANG_CACHE_DIT_ENABLED
@@ -299,8 +343,19 @@ class ServerArgsAutoTuner:
             args.use_fsdp_inference is not None
             or args.dit_cpu_offload is not None
             or args.dit_layerwise_offload is not None
+            or args.layerwise_offload_components is not None
             or args.text_encoder_cpu_offload is not None
             or args.image_encoder_cpu_offload is not None
+        )
+
+    def _has_explicit_layerwise_replacement_policy(self) -> bool:
+        args = self.server_args
+        return (
+            args.dit_layerwise_offload is not None
+            or args.layerwise_offload_components is not None
+            or args.text_encoder_cpu_offload is not None
+            or args.image_encoder_cpu_offload is not None
+            or args.vae_cpu_offload is True
         )
 
     def _has_explicit_parallel_policy(self) -> bool:
