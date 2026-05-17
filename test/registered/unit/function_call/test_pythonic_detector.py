@@ -1,7 +1,6 @@
 """Unit tests for PythonicDetector — no server, no model loading."""
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
