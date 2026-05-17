@@ -20,6 +20,7 @@ from sglang.srt.entrypoints.codec_dispatcher import (
     CODEC_BOLT_ON_DISPATCH,
     ToolRegistry,
     dispatch_call,
+    dispatch_call_async,
     reinject_ids_into_context,
 )
 from sglang.srt.entrypoints.codec_frame import encode_frame
@@ -65,6 +66,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        # v0.5 #87: lazy-cached ToolRegistry. The fetch (`ToolRegistry.from_env`)
+        # makes synchronous HTTP calls to manifest URLs; doing that per-request
+        # blocks the event loop and adds startup latency to every tool-watcher
+        # stream. We resolve it once per process on first use and reuse the
+        # registry thereafter. Sentinel = "not yet attempted"; None = attempted
+        # but env not configured (CODEC_BOLT_ON_DISPATCH=0 or no manifest URLs).
+        self._codec_dispatcher_registry: Optional[ToolRegistry] = None
+        self._codec_dispatcher_registry_loaded: bool = False
 
     def _request_id_prefix(self) -> str:
         return "cmpl-"
@@ -296,8 +305,21 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # detected region to the client unchanged (existing behaviour).
         dispatcher_registry: Optional[ToolRegistry] = None
         if CODEC_BOLT_ON_DISPATCH and watcher is not None:
-            tokenizer_hash = getattr(self.tokenizer_manager, "tokenizer_map_hash", "")
-            dispatcher_registry = ToolRegistry.from_env(tokenizer_hash)
+            # Cached on the serving instance — ToolRegistry.from_env performs
+            # blocking HTTP fetches against manifest URLs, so it must NEVER
+            # run inside the async request loop. First request that arrives
+            # after process start pays the fetch cost (off the event loop
+            # via to_thread); every subsequent request reuses the registry.
+            if not self._codec_dispatcher_registry_loaded:
+                tokenizer_hash = getattr(
+                    self.tokenizer_manager, "tokenizer_map_hash", ""
+                )
+                import asyncio as _asyncio
+                self._codec_dispatcher_registry = await _asyncio.to_thread(
+                    ToolRegistry.from_env, tokenizer_hash
+                )
+                self._codec_dispatcher_registry_loaded = True
+            dispatcher_registry = self._codec_dispatcher_registry
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -347,7 +369,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             tool = dispatcher_registry.get(ev.name)
                             if tool is not None and tool.mode == "dispatch":
                                 try:
-                                    result = dispatch_call(
+                                    # Use the async variant — `dispatch_call`
+                                    # itself does a blocking urllib POST,
+                                    # which would freeze the event loop if
+                                    # called directly from this `async def`.
+                                    # `dispatch_call_async` runs it via
+                                    # asyncio.to_thread so other concurrent
+                                    # requests on the worker keep flowing.
+                                    result = await dispatch_call_async(
                                         tool,
                                         arguments_json=ev.arguments_json,
                                         call_id=ev.id or make_call_id(tool_call_seq),

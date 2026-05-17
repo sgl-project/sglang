@@ -74,9 +74,15 @@ def _normalise_ids_to_list(ids: IdsLike) -> List[int]:
     if isinstance(ids, (bytes, bytearray, memoryview)):
         if _HAVE_NUMPY:
             return _np.frombuffer(bytes(ids), dtype="<u4").tolist()
-        # Manual little-endian uint32 unpack as a numpy-free fallback.
+        # Stdlib little-endian uint32 unpack as a numpy-free fallback.
+        # struct.unpack is ~10× faster than a Python list comprehension for
+        # this — same shape, no Python-level loop.
         b = bytes(ids)
-        return [int.from_bytes(b[i:i + 4], "little") for i in range(0, len(b), 4)]
+        if len(b) % 4 != 0:
+            raise ValueError(
+                f"codec_frame: bytes length {len(b)} is not a multiple of 4 (uint32 LE)"
+            )
+        return list(struct.unpack(f"<{len(b) // 4}I", b))
     raise TypeError(f"codec_frame: unsupported ids type {type(ids).__name__}")
 
 # ---------------------------------------------------------------------------
@@ -269,17 +275,31 @@ def decode_protobuf_request(data: bytes) -> dict:
             pos += length
 
             if field == 1:  # packed repeated uint32 prompt_ids
+                # Inline varint loop with the same overflow + truncation
+                # protection as the outer `read_varint` helper (we can't
+                # call the helper here because it works on `data` + `pos`,
+                # not the sub-buffer `chunk` + `p`). Malformed input is
+                # rejected with a ValueError instead of looping infinitely
+                # or silently producing wrong ids.
                 ids: list[int] = []
                 p = 0
                 while p < len(chunk):
                     n = shift = 0
                     while True:
+                        if p >= len(chunk):
+                            raise ValueError(
+                                "Codec: truncated varint in prompt_ids"
+                            )
                         b = chunk[p]
                         p += 1
                         n |= (b & 0x7F) << shift
                         if not (b & 0x80):
                             break
                         shift += 7
+                        if shift > 35:
+                            raise ValueError(
+                                "Codec: varint overflow in prompt_ids"
+                            )
                     ids.append(n)
                 result["prompt_ids"] = ids
             elif field == 4:  # repeated string stop
