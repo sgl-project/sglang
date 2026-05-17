@@ -33,7 +33,11 @@ pub(crate) struct ResponsesContext {
     /// MCP manager for tool support
     pub mcp_manager: Arc<McpManager>,
 
-    /// Server keys for MCP tools requested in this context
+    /// Server keys for MCP tools requested in this context.
+    ///
+    /// Safety: `clone_for_request()` creates a fresh lock per request, so this
+    /// is never shared across concurrent tasks.  The `StdRwLock` is adequate
+    /// because locks are only held for short, non-async operations.
     pub requested_servers: Arc<StdRwLock<Vec<String>>>,
 }
 
@@ -56,5 +60,17 @@ impl ResponsesContext {
             mcp_manager,
             requested_servers: Arc::new(StdRwLock::new(Vec::new())),
         }
+    }
+
+    /// Clone the shared dependencies while creating a fresh per-request server-key buffer.
+    pub fn clone_for_request(&self) -> Self {
+        Self::new(
+            self.pipeline.clone(),
+            self.components.clone(),
+            self.response_storage.clone(),
+            self.conversation_storage.clone(),
+            self.conversation_item_storage.clone(),
+            self.mcp_manager.clone(),
+        )
     }
 }

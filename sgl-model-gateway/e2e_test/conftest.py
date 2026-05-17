@@ -205,6 +205,8 @@ from fixtures import (
     pytest_collection_modifyitems,
     pytest_configure,
     pytest_runtest_setup,
+    pytest_sessionfinish,
+    pytest_unconfigure,
     setup_backend,
 )
 
@@ -216,6 +218,8 @@ __all__ = [
     "pytest_collection_finish",
     "pytest_configure",
     "pytest_runtest_setup",
+    "pytest_sessionfinish",
+    "pytest_unconfigure",
     # Fixtures
     "model_pool",
     "model_client",

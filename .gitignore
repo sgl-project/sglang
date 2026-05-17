@@ -130,6 +130,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+sgl-model-gateway/e2e_test/uv.lock
 
 # Spyder project settings
 .spyderproject

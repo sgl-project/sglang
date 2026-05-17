@@ -226,7 +226,7 @@ jobs:
             runner: 4-gpu-h100
             timeout: 32
             test_dirs: "e2e_test/benchmarks"
-            extra_deps: "genai-bench==0.0.3"
+            extra_deps: "genai-bench==0.0.3 websockets"
             env_vars: ""
             reruns: ""
             upload_benchmarks: true

@@ -87,6 +87,13 @@ jobs:
             sccache_version: "v0.12.0"
             artifact_name: manual-policy-results
             artifact_path: criterion/manual_policy*/
+          - name: WS Response Hotpath
+            bench_name: ws_response_hotpath
+            bench_args: ""
+            runner: ubuntu-latest
+            sccache_version: "v0.12.0"
+            artifact_name: ws-response-hotpath-results
+            artifact_path: criterion/ws_response*/
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
@@ -184,6 +191,7 @@ jobs:
 
           generate_section "Request Processing" "request-processing-results" 60
           generate_section "Manual Policy (Sticky Sessions)" "manual-policy-results" 100
+          generate_section "WS Response Hotpath" "ws-response-hotpath-results" 100
 
           echo -e "---\n_Generated at $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> summary.md
 

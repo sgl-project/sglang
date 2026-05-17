@@ -26,7 +26,13 @@ from .hooks import (
 from .markers import get_marker_kwargs, get_marker_value
 
 # Fixtures (imported by conftest.py)
-from .pool import model_base_url, model_client, model_pool
+from .pool import (
+    model_base_url,
+    model_client,
+    model_pool,
+    pytest_sessionfinish,
+    pytest_unconfigure,
+)
 from .setup_backend import backend_router, setup_backend
 
 __all__ = [
@@ -35,6 +41,8 @@ __all__ = [
     "pytest_collection_finish",
     "pytest_configure",
     "pytest_runtest_setup",
+    "pytest_sessionfinish",
+    "pytest_unconfigure",
     "get_pool_requirements",
     "validate_gpu_requirements",
     "is_parallel_execution",

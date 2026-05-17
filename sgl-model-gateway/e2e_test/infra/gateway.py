@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -18,6 +20,26 @@ if TYPE_CHECKING:
     from .model_pool import ModelInstance
 
 logger = logging.getLogger(__name__)
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_SGLANG_PYTHON = _REPO_ROOT / "python"
+_GATEWAY_BINDINGS_SRC = _REPO_ROOT / "sgl-model-gateway" / "bindings" / "python" / "src"
+
+
+def _python_executable() -> str:
+    """Use the active interpreter so uv/venv installs are visible to subprocesses."""
+    return sys.executable
+
+
+def _build_subprocess_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Expose local checkout modules to router subprocesses."""
+    env = (base_env or os.environ).copy()
+    parts = [str(_SGLANG_PYTHON), str(_GATEWAY_BINDINGS_SRC)]
+    existing = env.get("PYTHONPATH")
+    if existing:
+        parts.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
 
 
 @dataclass
@@ -107,6 +129,9 @@ class Gateway:
         self.cloud_backend: str | None = None
         self._started: bool = False
         self._env: dict[str, str] | None = None  # Custom env for subprocess
+        self.launch_command: list[str] = []
+        self.stdout_log_path: str | None = None
+        self.stderr_log_path: str | None = None
 
     @property
     def is_running(self) -> bool:
@@ -132,6 +157,8 @@ class Gateway:
         timeout: float = DEFAULT_ROUTER_TIMEOUT,
         show_output: bool | None = None,
         extra_args: list[str] | None = None,
+        stdout_path: Path | None = None,
+        stderr_path: Path | None = None,
     ) -> None:
         """Start the gateway.
 
@@ -153,6 +180,8 @@ class Gateway:
             timeout: Startup timeout in seconds.
             show_output: Show subprocess output (env var override).
             extra_args: Additional router arguments.
+            stdout_path: Optional file path for router stdout capture.
+            stderr_path: Optional file path for router stderr capture.
 
         Raises:
             RuntimeError: If gateway is already started.
@@ -196,6 +225,8 @@ class Gateway:
                 timeout=timeout,
                 show_output=show_output,
                 extra_args=extra_args,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
                 log_msg="IGW gateway (no workers)",
             )
         elif is_pd_mode:
@@ -216,6 +247,8 @@ class Gateway:
                 timeout=timeout,
                 show_output=show_output,
                 extra_args=extra_args,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
                 log_msg=f"PD gateway ({len(prefills)} prefill, {len(decodes)} decode)",
             )
         elif is_cloud_mode:
@@ -257,6 +290,8 @@ class Gateway:
                 timeout=timeout,
                 show_output=show_output,
                 extra_args=extra_args,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
                 log_msg=f"{cloud_backend} cloud gateway",
             )
         else:
@@ -272,6 +307,8 @@ class Gateway:
                 timeout=timeout,
                 show_output=show_output,
                 extra_args=extra_args,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
                 num_workers=len(worker_urls),
                 log_msg=f"gateway with {len(worker_urls)} worker(s)",
             )
@@ -282,6 +319,8 @@ class Gateway:
         timeout: float,
         show_output: bool,
         extra_args: list[str] | None,
+        stdout_path: Path | None,
+        stderr_path: Path | None,
         num_workers: int | None = None,
         log_msg: str = "",
     ) -> None:
@@ -304,14 +343,36 @@ class Gateway:
 
         logger.info("Starting %s on port %d", log_msg or "gateway", self.port)
         logger.debug("Gateway command: %s", " ".join(cmd))
+        self.launch_command = list(cmd)
+        self.stdout_log_path = str(stdout_path) if stdout_path else None
+        self.stderr_log_path = str(stderr_path) if stderr_path else None
 
-        self.process = subprocess.Popen(
-            cmd,
-            env=self._env,  # Use custom env if set (e.g., for cloud mode API keys)
-            stdout=None if show_output else subprocess.PIPE,
-            stderr=None if show_output else subprocess.PIPE,
-            start_new_session=True,
-        )
+        stdout_target = None if show_output else subprocess.PIPE
+        stderr_target = None if show_output else subprocess.PIPE
+        stdout_handle = None
+        stderr_handle = None
+        if not show_output and stdout_path is not None:
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            stdout_handle = stdout_path.open("wb")
+            stdout_target = stdout_handle
+        if not show_output and stderr_path is not None:
+            stderr_path.parent.mkdir(parents=True, exist_ok=True)
+            stderr_handle = stderr_path.open("wb")
+            stderr_target = stderr_handle
+
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                env=_build_subprocess_env(self._env),
+                stdout=stdout_target,
+                stderr=stderr_target,
+                start_new_session=True,
+            )
+        finally:
+            if stdout_handle is not None:
+                stdout_handle.close()
+            if stderr_handle is not None:
+                stderr_handle.close()
 
         try:
             if num_workers is not None:
@@ -336,7 +397,7 @@ class Gateway:
     def _build_base_cmd(self) -> list[str]:
         """Build the base command for launching the router."""
         return [
-            "python3",
+            _python_executable(),
             "-m",
             "sglang_router.launch_router",
             "--host",

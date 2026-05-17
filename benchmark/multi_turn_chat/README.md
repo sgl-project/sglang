@@ -25,6 +25,51 @@ Benchmark(long output)
 python3 bench_sglang.py --tokenizer meta-llama/Llama-2-7b-chat-hf --long
 ```
 
+### Benchmark Router Responses
+
+This adapter reuses the existing multi-turn workload generator against a router
+Responses endpoint without replacing the direct-server scripts above.
+
+HTTP SSE and WebSocket comparison on a regular gRPC-worker router:
+
+```
+python3 bench_router_responses.py \
+  --base-url http://127.0.0.1:30000 \
+  --model Qwen/Qwen2.5-72B-Instruct \
+  --tokenizer Qwen/Qwen2.5-72B-Instruct \
+  --client-transport both \
+  --chain-mode full_replay \
+  --store-mode true \
+  --worker-transport grpc \
+  --router-topology regular_grpc_worker
+```
+
+Persistent WebSocket continuation path with incremental `previous_response_id`
+chaining:
+
+```
+python3 bench_router_responses.py \
+  --base-url http://127.0.0.1:30000 \
+  --model Qwen/Qwen2.5-72B-Instruct \
+  --tokenizer Qwen/Qwen2.5-72B-Instruct \
+  --client-transport websocket \
+  --chain-mode previous_response_id \
+  --store-mode false \
+  --worker-transport grpc \
+  --router-topology regular_grpc_worker
+```
+
+Notes:
+
+- `full_replay` mirrors the direct multi-turn-chat shape by replaying the full
+  local conversation window each turn.
+- `previous_response_id` isolates the Responses continuation path instead.
+- HTTP SSE with `previous_response_id` requires `--store-mode true`; otherwise
+  the chain cannot continue across requests.
+- Add `--capture-event-trace` to record bounded per-turn event timing traces in
+  the JSON summary. This is useful when comparing HTTP `first_event` vs
+  `first_content` gaps against the persistent WebSocket path.
+
 ### Benchmark vLLM
 
 Run Llama-7B

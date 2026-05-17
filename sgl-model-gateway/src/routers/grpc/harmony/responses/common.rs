@@ -302,6 +302,13 @@ pub(super) async fn load_previous_messages(
             )
         })?;
 
+    if chain.responses.is_empty() {
+        return Err(error::not_found(
+            "previous_response_not_found",
+            format!("Previous response '{}' not found.", prev_id_str),
+        ));
+    }
+
     // Build conversation history from stored responses
     let mut history_items = Vec::new();
 

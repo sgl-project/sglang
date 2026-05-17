@@ -141,6 +141,7 @@ opentelemetry-proto = { version = "0.27", features = ["gen-tonic"] }
 tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
 rsa = { version = "0.9", features = ["sha2"] }
+tokio-tungstenite = "0.27"
 
 [[bench]]
 name = "consistent_hash_bench"
@@ -163,6 +164,11 @@ harness = false
 name = "manual_policy_benchmark"
 harness = false
 path = "benches/manual_policy_benchmark.rs"
+
+[[bench]]
+name = "ws_response_hotpath"
+harness = false
+path = "benches/ws_response_hotpath.rs"
 
 [profile.release]
 opt-level = "z"     # Optimize for size

@@ -54,99 +54,128 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
             });
         }
         ResponseInput::Items(items) => {
-            // Structured items → convert each to appropriate chat message
+            // Structured items → convert each to appropriate chat message.
+            // Consecutive FunctionToolCall items are grouped into a single
+            // assistant message with multiple tool_calls so that backends
+            // that require parallel tool calls in one message work correctly.
+            let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
+            let mut pending_tool_outputs: Vec<(String, String)> = Vec::new();
+
+            /// Flush accumulated parallel tool calls into `messages`.
+            fn flush_tool_calls(
+                messages: &mut Vec<ChatMessage>,
+                pending_tool_calls: &mut Vec<ToolCall>,
+                pending_tool_outputs: &mut Vec<(String, String)>,
+            ) {
+                if pending_tool_calls.is_empty() {
+                    return;
+                }
+                messages.push(ChatMessage::Assistant {
+                    content: None,
+                    name: None,
+                    tool_calls: Some(std::mem::take(pending_tool_calls)),
+                    reasoning_content: None,
+                });
+                for (call_id, output_text) in pending_tool_outputs.drain(..) {
+                    messages.push(ChatMessage::Tool {
+                        content: MessageContent::Text(output_text),
+                        tool_call_id: call_id,
+                    });
+                }
+            }
+
             for item in items {
                 match item {
-                    ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
-                        // Convert SimpleInputMessage to chat message
-                        let text = match content {
-                            StringOrContentParts::String(s) => s.clone(),
-                            StringOrContentParts::Array(parts) => {
-                                // Extract text from content parts (only InputText supported)
-                                parts
-                                    .iter()
-                                    .filter_map(|part| match part {
-                                        ResponseContentPart::InputText { text } => {
-                                            Some(text.as_str())
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            }
-                        };
-
-                        messages.push(role_to_chat_message(role.as_str(), text));
-                    }
-                    ResponseInputOutputItem::Message { role, content, .. } => {
-                        // Extract text from content parts
-                        let text = extract_text_from_content(content);
-
-                        messages.push(role_to_chat_message(role.as_str(), text));
-                    }
                     ResponseInputOutputItem::FunctionToolCall {
-                        id,
+                        call_id,
                         name,
                         arguments,
                         output,
                         ..
                     } => {
-                        // Tool call from history - add as assistant message with tool call
-                        // followed by tool response if output exists
-
-                        // Add assistant message with tool_calls (the LLM's decision)
-                        messages.push(ChatMessage::Assistant {
-                            content: None,
-                            name: None,
-                            tool_calls: Some(vec![ToolCall {
-                                id: id.clone(),
-                                tool_type: "function".to_string(),
-                                function: FunctionCallResponse {
-                                    name: name.clone(),
-                                    arguments: Some(arguments.clone()),
-                                },
-                            }]),
-                            reasoning_content: None,
+                        // Accumulate — will be flushed when a non-tool-call
+                        // item is encountered or at the end.
+                        pending_tool_calls.push(ToolCall {
+                            id: call_id.clone(),
+                            tool_type: "function".to_string(),
+                            function: FunctionCallResponse {
+                                name: name.clone(),
+                                arguments: Some(arguments.clone()),
+                            },
                         });
-
-                        // Add tool result message if output exists
                         if let Some(output_text) = output {
-                            messages.push(ChatMessage::Tool {
-                                content: MessageContent::Text(output_text.clone()),
-                                tool_call_id: id.clone(),
-                            });
+                            pending_tool_outputs.push((call_id.clone(), output_text.clone()));
                         }
                     }
-                    ResponseInputOutputItem::Reasoning { content, .. } => {
-                        // Reasoning content - add as assistant message with reasoning_content
-                        let reasoning_text = content
-                            .iter()
-                            .map(|c| match c {
-                                ReasoningText { text } => text.as_str(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                    other => {
+                        // Flush any pending parallel tool calls before
+                        // processing a non-tool-call item.
+                        flush_tool_calls(
+                            &mut messages,
+                            &mut pending_tool_calls,
+                            &mut pending_tool_outputs,
+                        );
 
-                        messages.push(ChatMessage::Assistant {
-                            content: None,
-                            name: None,
-                            tool_calls: None,
-                            reasoning_content: Some(reasoning_text),
-                        });
-                    }
-                    ResponseInputOutputItem::FunctionCallOutput {
-                        call_id, output, ..
-                    } => {
-                        // Function call output - add as tool message
-                        // Note: The function name is looked up from prev_outputs in Harmony path
-                        // For Chat path, we just use the call_id
-                        messages.push(ChatMessage::Tool {
-                            content: MessageContent::Text(output.clone()),
-                            tool_call_id: call_id.clone(),
-                        });
+                        match other {
+                            ResponseInputOutputItem::SimpleInputMessage {
+                                content, role, ..
+                            } => {
+                                let text = match content {
+                                    StringOrContentParts::String(s) => s.clone(),
+                                    StringOrContentParts::Array(parts) => parts
+                                        .iter()
+                                        .filter_map(|part| match part {
+                                            ResponseContentPart::InputText { text } => {
+                                                Some(text.as_str())
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(" "),
+                                };
+                                messages.push(role_to_chat_message(role.as_str(), text));
+                            }
+                            ResponseInputOutputItem::Message { role, content, .. } => {
+                                let text = extract_text_from_content(content);
+                                messages.push(role_to_chat_message(role.as_str(), text));
+                            }
+                            ResponseInputOutputItem::Reasoning { content, .. } => {
+                                let reasoning_text = content
+                                    .iter()
+                                    .map(|c| match c {
+                                        ReasoningText { text } => text.as_str(),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+
+                                messages.push(ChatMessage::Assistant {
+                                    content: None,
+                                    name: None,
+                                    tool_calls: None,
+                                    reasoning_content: Some(reasoning_text),
+                                });
+                            }
+                            ResponseInputOutputItem::FunctionCallOutput {
+                                call_id, output, ..
+                            } => {
+                                messages.push(ChatMessage::Tool {
+                                    content: MessageContent::Text(output.clone()),
+                                    tool_call_id: call_id.clone(),
+                                });
+                            }
+                            // FunctionToolCall is handled in the outer match arm
+                            ResponseInputOutputItem::FunctionToolCall { .. } => unreachable!(),
+                        }
                     }
                 }
             }
+
+            // Flush any remaining tool calls at end of items
+            flush_tool_calls(
+                &mut messages,
+                &mut pending_tool_calls,
+                &mut pending_tool_outputs,
+            );
         }
     }
 
@@ -227,8 +256,11 @@ fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
             content: MessageContent::Text(text),
             name: None,
         },
-        _ => {
-            // Unknown role, treat as user message
+        other => {
+            tracing::warn!(
+                role = other,
+                "unknown message role in responses input, treating as user"
+            );
             ChatMessage::User {
                 content: MessageContent::Text(text),
                 name: None,
@@ -366,7 +398,13 @@ pub(crate) fn chat_to_responses(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::protocols::{
+        common::{Function, ToolChoice, ToolChoiceValue},
+        responses::{ResponseTool, ResponseToolType},
+    };
 
     #[test]
     fn test_text_input_conversion() {
@@ -424,5 +462,162 @@ mod tests {
         // Empty text should still create a user message, so this should succeed
         let result = responses_to_chat(&req);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_function_tools_serialize_like_chat_completions_tools() {
+        let req = ResponsesRequest {
+            input: ResponseInput::Text("What is the weather in Berlin?".to_string()),
+            model: "Qwen/Qwen2.5-3B-Instruct".to_string(),
+            max_output_tokens: Some(128),
+            parallel_tool_calls: Some(true),
+            tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
+            tools: Some(vec![ResponseTool {
+                r#type: ResponseToolType::Function,
+                function: Some(Function {
+                    name: "get_weather".to_string(),
+                    description: Some("Get the weather for a city.".to_string()),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "location": { "type": "string" }
+                        },
+                        "required": ["location"]
+                    }),
+                    strict: None,
+                }),
+                server_url: None,
+                authorization: None,
+                server_label: None,
+                server_description: None,
+                require_approval: None,
+                allowed_tools: None,
+            }]),
+            ..Default::default()
+        };
+
+        let chat_req = responses_to_chat(&req).unwrap();
+        let serialized = serde_json::to_value(&chat_req).unwrap();
+
+        assert_eq!(serialized["tool_choice"], "required");
+        assert_eq!(serialized["parallel_tool_calls"], true);
+        assert_eq!(serialized["tools"][0]["type"], "function");
+        assert_eq!(serialized["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            serialized["tools"][0]["function"]["parameters"]["required"][0],
+            "location"
+        );
+    }
+
+    #[test]
+    fn test_streaming_request_shape_matches_manual_chat_request() {
+        let req = ResponsesRequest {
+            input: ResponseInput::Text("Calculate 42 * 17. Use the tool.".to_string()),
+            model: "Qwen/Qwen2.5-3B-Instruct".to_string(),
+            max_output_tokens: Some(128),
+            parallel_tool_calls: Some(true),
+            stream: Some(true),
+            temperature: Some(0.0),
+            tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
+            tools: Some(vec![ResponseTool {
+                r#type: ResponseToolType::Function,
+                function: Some(Function {
+                    name: "calculate".to_string(),
+                    description: Some("Perform a mathematical calculation.".to_string()),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "expression": { "type": "string" }
+                        },
+                        "required": ["expression"]
+                    }),
+                    strict: None,
+                }),
+                server_url: None,
+                authorization: None,
+                server_label: None,
+                server_description: None,
+                require_approval: None,
+                allowed_tools: None,
+            }]),
+            ..Default::default()
+        };
+
+        let converted = responses_to_chat(&req).unwrap();
+        let manual = ChatCompletionRequest {
+            messages: vec![ChatMessage::User {
+                content: MessageContent::Text("Calculate 42 * 17. Use the tool.".to_string()),
+                name: None,
+            }],
+            model: "Qwen/Qwen2.5-3B-Instruct".to_string(),
+            max_completion_tokens: Some(128),
+            parallel_tool_calls: Some(true),
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: Some(true),
+            }),
+            temperature: Some(0.0),
+            tool_choice: Some(ToolChoice::Value(ToolChoiceValue::Required)),
+            tools: Some(vec![crate::protocols::common::Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "calculate".to_string(),
+                    description: Some("Perform a mathematical calculation.".to_string()),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "expression": { "type": "string" }
+                        },
+                        "required": ["expression"]
+                    }),
+                    strict: None,
+                },
+            }]),
+            skip_special_tokens: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            serde_json::to_value(&converted).unwrap(),
+            serde_json::to_value(&manual).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_historical_function_tool_call_uses_call_id_for_chat_resume() {
+        let req = ResponsesRequest {
+            input: ResponseInput::Items(vec![ResponseInputOutputItem::FunctionToolCall {
+                id: "fc_item_123".to_string(),
+                call_id: "call_abc".to_string(),
+                name: "calculate".to_string(),
+                arguments: r#"{"expression":"2+2"}"#.to_string(),
+                output: Some(r#"{"result":4}"#.to_string()),
+                status: Some("completed".to_string()),
+            }]),
+            model: "mock-model".to_string(),
+            ..Default::default()
+        };
+
+        let converted = responses_to_chat(&req).unwrap();
+        assert_eq!(converted.messages.len(), 2);
+
+        match &converted.messages[0] {
+            ChatMessage::Assistant {
+                tool_calls: Some(tool_calls),
+                ..
+            } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "call_abc");
+                assert_eq!(tool_calls[0].function.name, "calculate");
+            }
+            other => panic!("expected assistant tool call message, got {:?}", other),
+        }
+
+        match &converted.messages[1] {
+            ChatMessage::Tool { tool_call_id, .. } => {
+                assert_eq!(tool_call_id, "call_abc");
+            }
+            other => panic!("expected tool response message, got {:?}", other),
+        }
     }
 }
