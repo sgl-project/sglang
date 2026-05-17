@@ -90,7 +90,7 @@ KERNEL_PATH = _resolve_kernel_path()
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
-CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
+CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, str, bool, torch.dtype]
 
 
 class CPPArgList(list[str]):
@@ -119,7 +119,7 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
     def _convert(arg: CPP_TEMPLATE_TYPE) -> str:
         if isinstance(arg, bool):
             return "true" if arg else "false"
-        if isinstance(arg, (int, float)):
+        if isinstance(arg, (int, str, float)):
             return str(arg)
         if isinstance(arg, torch.dtype):
             return CPP_DTYPE_MAP[arg]

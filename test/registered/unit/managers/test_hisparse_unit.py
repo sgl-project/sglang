@@ -16,7 +16,7 @@ import torch
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 # ---------------------------------------------------------------------------
 # Test configuration (small-scale for fast CI runs)
@@ -45,6 +45,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         origin_input_ids=origin_input_ids,
         output_ids=output_ids,
         fill_ids=origin_input_ids + output_ids,
+        seqlen=len(origin_input_ids) + len(output_ids),
         req_pool_idx=None,
         kv_allocated_len=0,
         kv_committed_len=0,
@@ -305,10 +306,14 @@ class TestHiSparseUnit(unittest.TestCase):
             for i in range(TOP_K):
                 if batch[b, i] < 0:
                     continue
-                nd = self.device_pool.kv_buffer[layer_id][naive_locs[b, i].long()]
-                kd = self.device_pool.kv_buffer[layer_id][kernel_locs[b, i].long()]
+                naive_data = self.device_pool.kv_buffer[layer_id][
+                    naive_locs[b, i].long()
+                ]
+                kernel_data = self.device_pool.kv_buffer[layer_id][
+                    kernel_locs[b, i].long()
+                ]
                 self.assertTrue(
-                    torch.allclose(nd.float(), kd.float(), atol=1e-2),
+                    torch.allclose(naive_data.float(), kernel_data.float(), atol=1e-2),
                     f"{msg}layer {layer_id}, b{b} idx {i}: naive != kernel",
                 )
 
