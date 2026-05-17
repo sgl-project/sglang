@@ -93,6 +93,7 @@ class TestPythonicDetector(CustomTestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, '{"city": "Tokyo"}')
         self.assertEqual(result.normal_text, "")
 
     def test_single_tool_call_int_arg(self):
