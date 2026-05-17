@@ -4,6 +4,7 @@
 use crate::config::Config;
 use crate::discovery::{DiscoveryEvent, ModelId, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
+use crate::policies::kv_events::KvEventIndex;
 use crate::workers::WorkerRegistry;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -107,15 +108,104 @@ fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerC
     None
 }
 
+pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistry>) {
+    run_with_config(rx, registry, None, None).await;
+}
+
+/// Run the worker manager, optionally honoring per-model circuit-breaker
+/// configuration from `cfg` and an optional KV-event index that is
+/// notified on every worker add / remove.  When `kv_index` is `None` the
+/// cache-aware-zmq path is disabled (selection falls through to the
+/// non-cache-aware policies); when `cfg` is `None` the default CB config
+/// is used for every worker (threshold = 3).
+///
+/// Uses the default HTTP client (2-second timeout) for `/server_info`
+/// introspection.  Tests that want a tighter timeout call
+/// [`run_with_http`] directly.
+pub async fn run_with_config(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+) {
+    run_with_http(rx, registry, cfg, kv_index, default_http_client()).await
+}
+
+/// Internal entry point used by tests so they can supply a custom HTTP
+/// client (e.g. a shorter timeout, or a fake transport).  Production
+/// callers use [`run_with_config`].
+pub async fn run_with_http(
+    mut rx: mpsc::Receiver<DiscoveryEvent>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    http: Arc<reqwest::Client>,
+) {
+    while let Some(event) = rx.recv().await {
+        match event {
+            DiscoveryEvent::Added(mut spec) => {
+                tracing::info!("discovery: +worker {} ({:?})", spec.id, spec.mode);
+                // Resolve the served model name via HTTP introspection.
+                // Failure registers the worker with empty `model_ids`
+                // (the failure path is logged inside `fetch_…`).
+                if let Some(name) = fetch_served_model_name(&spec.url, &http).await {
+                    spec.model_ids = vec![ModelId(name)];
+                }
+                let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
+                let worker_url = spec.url.clone();
+                registry.add_with_cb(spec, cb);
+                if let Some(idx) = &kv_index {
+                    idx.add_worker(&worker_url).await;
+                }
+            }
+            DiscoveryEvent::Removed { id } => {
+                tracing::info!("discovery: -worker {id}");
+                // Look up the URL before dropping the entry so the
+                // KV-event index can clear its per-(url, dp_rank) state.
+                let worker_url = registry.get(&id).map(|w| w.url.clone());
+                registry.remove(&id);
+                if let (Some(idx), Some(url)) = (&kv_index, worker_url) {
+                    idx.remove_worker(&url).await;
+                }
+            }
+            DiscoveryEvent::ModeChanged { id, mode } => {
+                // Mutate mode in place — preserves active_requests counter
+                // (in-flight LoadGuards stay valid) and CircuitBreaker state
+                // (open/half-open survives PD role flips).
+                //
+                // workers_for_mode filters at query time via w.mode(), so no
+                // secondary index needs updating.
+                match registry.get(&id) {
+                    Some(w) => {
+                        tracing::info!("discovery: ~worker {id} mode→{mode:?}");
+                        w.set_mode(mode);
+                    }
+                    None => {
+                        tracing::warn!(
+                            id = %id,
+                            mode = ?mode,
+                            "discovery: ModeChanged for unknown worker — out-of-order event from backend",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::cb_config_for_spec;
+    use super::*;
     use crate::config::{
-        CircuitBreakerConfig as RawCbConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig,
+        CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, DiscoveryConfig, ModelConfig,
         PolicyKind, ServerConfig, StaticFileDiscoveryConfig,
     };
-    use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::discovery::{ModelId, WorkerId, WorkerMode};
+    use axum::{routing::get, Json, Router};
+    use serde_json::{json, Value};
     use std::num::NonZeroU32;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     fn cfg_with_model_cb(id: &str, threshold: u32, cool_down_secs: u64) -> Config {
         Config {
@@ -153,88 +243,8 @@ mod tests {
         };
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
-        assert_eq!(cb.cool_down, std::time::Duration::from_secs(60));
+        assert_eq!(cb.cool_down, Duration::from_secs(60));
     }
-}
-
-pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistry>) {
-    run_with_config(rx, registry, None).await;
-}
-
-/// Run the worker manager, optionally honoring per-model circuit-breaker
-/// configuration from `cfg`.  When `cfg` is `None` the default CB config is
-/// used for every worker (threshold = 3).
-///
-/// Uses the default HTTP client (2-second timeout) for `/server_info`
-/// introspection.  Tests that want a tighter timeout call
-/// [`run_with_http`] directly.
-pub async fn run_with_config(
-    rx: mpsc::Receiver<DiscoveryEvent>,
-    registry: Arc<WorkerRegistry>,
-    cfg: Option<Arc<Config>>,
-) {
-    run_with_http(rx, registry, cfg, default_http_client()).await
-}
-
-/// Internal entry point used by tests so they can supply a custom HTTP
-/// client (e.g. a shorter timeout, or a fake transport).  Production
-/// callers use [`run_with_config`].
-pub async fn run_with_http(
-    mut rx: mpsc::Receiver<DiscoveryEvent>,
-    registry: Arc<WorkerRegistry>,
-    cfg: Option<Arc<Config>>,
-    http: Arc<reqwest::Client>,
-) {
-    while let Some(event) = rx.recv().await {
-        match event {
-            DiscoveryEvent::Added(mut spec) => {
-                tracing::info!("discovery: +worker {} ({:?})", spec.id, spec.mode);
-                // Resolve the served model name via HTTP introspection.
-                // Failure registers the worker with empty `model_ids`
-                // (the failure path is logged inside `fetch_…`).
-                if let Some(name) = fetch_served_model_name(&spec.url, &http).await {
-                    spec.model_ids = vec![ModelId(name)];
-                }
-                let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
-                registry.add_with_cb(spec, cb);
-            }
-            DiscoveryEvent::Removed { id } => {
-                tracing::info!("discovery: -worker {id}");
-                registry.remove(&id);
-            }
-            DiscoveryEvent::ModeChanged { id, mode } => {
-                // Mutate mode in place — preserves active_requests counter
-                // (in-flight LoadGuards stay valid) and CircuitBreaker state
-                // (open/half-open survives PD role flips).
-                //
-                // workers_for_mode filters at query time via w.mode(), so no
-                // secondary index needs updating.
-                match registry.get(&id) {
-                    Some(w) => {
-                        tracing::info!("discovery: ~worker {id} mode→{mode:?}");
-                        w.set_mode(mode);
-                    }
-                    None => {
-                        tracing::warn!(
-                            id = %id,
-                            mode = ?mode,
-                            "discovery: ModeChanged for unknown worker — out-of-order event from backend",
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::discovery::{WorkerId, WorkerMode};
-    use axum::{routing::get, Json, Router};
-    use serde_json::{json, Value};
-    use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
 
     /// Helper: spawn a tiny fake worker that returns the supplied JSON body
     /// on `GET /server_info`. Returns the worker URL + a shutdown channel.
@@ -291,6 +301,7 @@ mod tests {
             rx,
             registry.clone(),
             None,
+            None,
             fast_http_client(),
         ));
 
@@ -331,6 +342,7 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_http(
             rx,
             registry.clone(),
+            None,
             None,
             fast_http_client(),
         ));
@@ -376,6 +388,7 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_http(
             rx,
             registry.clone(),
+            None,
             None,
             fast_http_client(),
         ));

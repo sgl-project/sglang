@@ -545,15 +545,15 @@ mod tests {
     /// keys; otherwise an event for slice B would overwrite slice A's state.
     #[test]
     fn slice_key_falls_back_to_ns_and_name_when_uid_missing() {
-        let a = make_slice_ns(None, &["m"], &["10.0.0.1"], 30000, true, "ns1", "a");
-        let b = make_slice_ns(None, &["m"], &["10.0.0.2"], 30000, true, "ns1", "b");
+        let a = make_slice_ns(&["10.0.0.1"], 30000, true, "ns1", "a");
+        let b = make_slice_ns(&["10.0.0.2"], 30000, true, "ns1", "b");
         assert_ne!(slice_key(&a), slice_key(&b));
         assert_eq!(slice_key(&a), "ns1/a");
     }
 
     #[test]
     fn slice_key_uses_uid_when_present() {
-        let mut a = make_slice_ns(None, &["m"], &["10.0.0.1"], 30000, true, "ns1", "a");
+        let mut a = make_slice_ns(&["10.0.0.1"], 30000, true, "ns1", "a");
         a.metadata.uid = Some("uid-abc".into());
         assert_eq!(slice_key(&a), "uid-abc");
     }
