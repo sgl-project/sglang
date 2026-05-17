@@ -8,6 +8,10 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+
 
 class BlurDownsample(torch.nn.Module):
     """Anti-aliased spatial downsampling by integer stride using a fixed separable binomial kernel."""
@@ -146,7 +150,7 @@ class SpatialRationalResampler(torch.nn.Module):
         return x
 
 
-class LatentUpsampler(torch.nn.Module):
+class LatentUpsampler(torch.nn.Module, LayerwiseOffloadableModuleMixin):
     """
     Upsample VAE latents spatially and/or temporally.
 
@@ -160,6 +164,9 @@ class LatentUpsampler(torch.nn.Module):
         spatial_scale: Scale factor for spatial upsampling.
         rational_resampler: Whether to use rational resampler for spatial upsampling.
     """
+
+    layerwise_offload_default_enabled = False
+    layer_names = ["res_blocks", "post_upsample_res_blocks"]
 
     def __init__(
         self,
