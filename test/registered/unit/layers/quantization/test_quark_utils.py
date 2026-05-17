@@ -33,7 +33,11 @@ class TestE8M0ToF32(CustomTestCase):
 
     def test_only_255_is_nan(self):
         # Exactly one of 0..255 should be NaN, and it must be index 255.
-        x = torch.arange(0, 256, dtype=torch.uint8)
+        # Build the range in the default int dtype then cast — passing the
+        # uint8 dtype directly to `arange(0, 256, dtype=uint8)` raises on
+        # PyTorch versions that bounds-check the end value (256 is out of
+        # uint8 range).
+        x = torch.arange(256).to(torch.uint8)
         out = e8m0_to_f32(x)
         nan_idx = torch.isnan(out).nonzero().flatten().tolist()
         self.assertEqual(nan_idx, [255])
