@@ -1965,6 +1965,11 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
+            # The PD-disaggregation warmup payload below is `/generate`-style
+            # (input_ids + bootstrap fields); for a VLM with tokenizer init,
+            # request_name was set to `/v1/chat/completions` above, which
+            # would 422 on this payload. Force `/generate` here.
+            request_name = "/generate"
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
