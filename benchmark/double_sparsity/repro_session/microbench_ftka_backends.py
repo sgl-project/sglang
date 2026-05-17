@@ -329,25 +329,51 @@ class _FtkaScoreAndSelectRunner(_PathRunner):
     """Path 4: substitute the score kernel with ``ftka.cuda_ops.
     batched_sparse_gemv`` AND the top-k with ``ftka.cuda_ops.raft_topk``.
 
-    FTKA's GEMV consumes a paged KV cache (kv_indices / kv_indptr /
-    kv_last_page_len) over a ``[T_pool, H_kv, head_dim]`` k buffer. Our
-    K-label cache shape is ``[T_pool, H_kv, S=32]`` which is compatible
-    when we view ``head_dim := S``. To bridge, the runner builds a
-    page_size=1 paged view: ``kv_indices = req_to_token_indexed.flatten()``,
-    ``kv_indptr = arange(bs+1) * seq_len``, ``kv_last_page_len = ones(bs)``.
-    Building those buffers happens in ``setup()``, *not* on the hot path,
-    so the per-call timing reflects only the FTKA kernels.
+    **Structurally rejected — does not run.** FTKA's
+    ``batched_sparse_gemv`` instantiates ``BatchedSparseGEMV<128, ...>``
+    at compile time (``csrc/src/ftka_ops.cu:70``); the head_dim template
+    argument is the literal constant ``128``. DS's K-label cache has
+    ``S = 32`` heavy channels per head. The kernel will either crash
+    or compute over uninitialized memory if invoked with ``head_dim < 128``.
+    To run P4 honestly would require either (a) recompiling FTKA with
+    ``BatchedSparseGEMV<32, ...>`` (no Python knob exposed for this), or
+    (b) padding the S=32 Q/K labels to 128 across all of DS's score /
+    calibration / cache paths — a 4× memory + 4× compute hit that is
+    not "same algorithm". Either path is out of scope for an
+    implementation-substitute evaluation.
 
-    A separate metadata field (``layout_transform_us``) records the
-    one-time cost of building the page-table view, so a reader can decide
-    if amortizing the transform across many steps is realistic in a
-    server deployment (it isn't in general — ``req_to_token`` changes
-    every step).
+    The harness keeps this runner registered so the rejection is visible
+    in the results artifact (status=error, with the source citation in
+    the error message). The remaining dead-code in this class documents
+    the intended page-table view that *would* be needed if the head_dim
+    constraint were ever lifted.
     """
 
     name = "ftka_gemv+ftka_topk"
 
+    # source citation:
+    #   /tmp/flash-topk-attention/csrc/src/ftka_ops.cu:70
+    #     cudaError_t status = BatchedSparseGEMV<128, c_type, c_type, c_type, int32_t>(...)
+    #   /tmp/flash-topk-attention/csrc/include/gemv.cuh:435
+    #     template <uint32_t HEAD_DIM, typename DTypeQ, ...>
+    FTKA_HARDCODED_HEAD_DIM = 128
+    DS_LABEL_HEAD_DIM = 32  # S=32, the DS heavy-channel count
+
     def setup(self, shape, device):
+        if self.DS_LABEL_HEAD_DIM != self.FTKA_HARDCODED_HEAD_DIM:
+            raise RuntimeError(
+                "P4 (ftka_gemv+ftka_topk) is structurally rejected for DS: "
+                f"FTKA's batched_sparse_gemv hardcodes HEAD_DIM="
+                f"{self.FTKA_HARDCODED_HEAD_DIM} at csrc/src/ftka_ops.cu:70 "
+                f"(BatchedSparseGEMV<128, ...>) but DS K-label cache uses "
+                f"S={self.DS_LABEL_HEAD_DIM}. Running this path against the "
+                f"DS layout would crash or compute over uninitialized "
+                f"memory. To unblock, either recompile FTKA with "
+                f"HEAD_DIM=32 or pad DS labels to 128 (4x memory/compute "
+                f"penalty) — neither is in scope for an implementation-"
+                f"substitute evaluation. See REPORT.md section on P4."
+            )
+        # Dead code below — kept for documentation of the would-be layout.
         from ftka.cuda_ops import batched_sparse_gemv as _gemv  # type: ignore
         from ftka.cuda_ops import raft_topk as _raft_topk  # type: ignore
 
@@ -393,6 +419,13 @@ class _FtkaScoreAndSelectRunner(_PathRunner):
         scratch_buf = torch.empty(
             num_rows * shape.max_ctx, dtype=torch.int32, device=device
         )
+        # raft_topk requires input_idx with positional ids per row.
+        input_idx_buf = (
+            torch.arange(shape.max_ctx, dtype=torch.int32, device=device)
+            .unsqueeze(0)
+            .expand(num_rows, shape.max_ctx)
+            .contiguous()
+        )
 
         # Preconstruct a scatter map: gemv_out[row, t] -> score_buf[b, h, t].
         # Since seq_lens are uniform here, the layout is contiguous in
@@ -420,7 +453,14 @@ class _FtkaScoreAndSelectRunner(_PathRunner):
             score_buf[..., seq_len_pad - 1 :] = float("-inf")
             # 3. raft_topk -> indices_buf.
             scores_flat = score_buf.view(num_rows, shape.max_ctx)
-            _raft_topk(scores_flat, values_buf, indices_buf, scratch_buf, shape.top_k)
+            _raft_topk(
+                scores_flat,
+                input_idx_buf,
+                values_buf,
+                indices_buf,
+                scratch_buf,
+                shape.top_k,
+            )
             # 4. Reuse the existing _build_selected_physical Triton
             # kernel to produce the final [bs, h_kv, total] output.
             _build_selected_physical(

@@ -298,16 +298,28 @@ class FtkaRaftTopKSelector(_BaseSelector):
     Layout / arg mapping:
       * Score rows are viewed as ``[bs*h_kv, max_ctx]`` fp32, same as the
         FlashInfer backend.
+      * ``input_idx_buf`` is preallocated at construction and filled with
+        positional indices (``input_idx_buf[r, j] = j``). Required by
+        FTKA's ``raft_topk`` signature; the wrapper at
+        ``ftka.cuda_ops.raft_topk`` passes the tensor's ``data_ptr()``
+        straight through to RAFT's ``decode_select_k`` (see
+        ``csrc/include/raft_topk.cuh::radix_topk_one_block_kernel``),
+        which reads ``in_idx[batch_id * len + i]`` and emits it as the
+        output index. Filling with the identity map gives us back
+        logical positions in the score row, which is what
+        ``_build_selected_physical`` expects.
       * Output ``values_buf`` / ``indices_buf`` are preallocated at
         construction so the per-step call does no device allocation
         (capture-friendly *if* the underlying ``raft_topk`` kernel is
         capture-safe; capture status is probed by the FTKA microbench
         and reported in its JSON output).
-      * ``scratch_buf`` is an opaque int32 workspace passed to RAFT as
-        ``buf``. We size it generously (``max_bs * h_kv * max_ctx`` int32
-        cells), which covers the radix histograms + filtered-candidate
-        scratch RAFT consumes internally; the buffer is opaque and we
-        never read it back.
+      * ``scratch_buf`` is an opaque byte workspace passed to RAFT as
+        ``buf``. RAFT's one-block kernel computes a per-batch slice as
+        ``batch_id * buf_len * 2 * (sizeof(T) + sizeof(IdxT))`` where
+        ``buf_len ≈ len/32``; we over-allocate to
+        ``num_rows * max_ctx * 4`` bytes (≈ 4× the actual requirement
+        for T=fp32, IdxT=int32) so we never have to recompute the
+        sizing when ``max_ctx`` changes inside the precomputed cap.
 
     Constraints:
       * ``max_top_k`` must be passed at construction time. The default
@@ -355,6 +367,16 @@ class FtkaRaftTopKSelector(_BaseSelector):
         self._indices_buf = torch.empty(
             (num_rows, max_top_k), dtype=torch.int32, device=device
         )
+        # input_idx for RAFT decode_select_k: positional ids per row so
+        # the kernel's `out_idx[pos] = in_idx_buf[i]` returns logical
+        # positions in the score row (which is what _build_selected_physical
+        # consumes downstream).
+        self._input_idx_buf = (
+            torch.arange(max_ctx, dtype=torch.int32, device=device)
+            .unsqueeze(0)
+            .expand(num_rows, max_ctx)
+            .contiguous()
+        )
         # Opaque RAFT workspace. Generous worst-case; bounded by max_ctx.
         self._scratch_buf = torch.empty(
             num_rows * max_ctx, dtype=torch.int32, device=device
@@ -387,9 +409,10 @@ class FtkaRaftTopKSelector(_BaseSelector):
 
         num_rows = bs * h_kv
         scores = att_out_approx.view(num_rows, max_ctx)
+        input_idx = self._input_idx_buf[:num_rows, :max_ctx]
         values = self._values_buf[:num_rows, :top_k]
         indices = self._indices_buf[:num_rows, :top_k]
-        self._raft_topk(scores, values, indices, self._scratch_buf, top_k)
+        self._raft_topk(scores, input_idx, values, indices, self._scratch_buf, top_k)
 
         topk_logical = indices.view(bs, h_kv, top_k)
         _build_selected_physical(
