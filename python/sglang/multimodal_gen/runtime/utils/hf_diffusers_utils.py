@@ -335,15 +335,6 @@ def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
 
         quant_config = config.get("quantization_config")
         normalized_quant_config = normalize_flat_modelopt_quant_config(quant_config)
-        if (
-            isinstance(normalized_quant_config, dict)
-            and config.get("_class_name") == "WanTransformer3DModel"
-            and str(normalized_quant_config.get("quant_algo", "")).upper() == "NVFP4"
-            and "swap_weight_nibbles" not in normalized_quant_config
-        ):
-            # NVIDIA's Wan2.2 NVFP4 release omits this SGLang layout knob.
-            normalized_quant_config = dict(normalized_quant_config)
-            normalized_quant_config["swap_weight_nibbles"] = False
         if normalized_quant_config == quant_config:
             return local_component_path
 
