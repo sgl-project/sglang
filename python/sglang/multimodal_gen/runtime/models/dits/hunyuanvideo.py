@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
+    apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
@@ -27,7 +28,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb,
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
@@ -219,16 +219,30 @@ class MMDoubleStreamBlock(nn.Module):
         )
         img_q, img_k, img_v = img_qkv[:, :, 0], img_qkv[:, :, 1], img_qkv[:, :, 2]
 
-        # Apply QK-Norm if needed
-
-        img_q = self.img_attn_q_norm(img_q.contiguous()).to(img_v)
-        img_k = self.img_attn_k_norm(img_k.contiguous()).to(img_v)
-        # Apply rotary embeddings
+        # Fused QK-Norm + RoPE for the image stream. Collapses two RMSNorm
+        # kernels and two _apply_rotary_emb passes into a single in-place
+        # fused JIT kernel on CUDA (fp16/bf16); falls back to eager + fused
+        # rotary otherwise. Same code path that Flux and Qwen-Image use.
         cos, sin = freqs_cis
-        img_q, img_k = (
-            _apply_rotary_emb(img_q, cos, sin, is_neox_style=False),
-            _apply_rotary_emb(img_k, cos, sin, is_neox_style=False),
+        cos_sin_cache = torch.cat(
+            [
+                cos.to(dtype=torch.float32).contiguous(),
+                sin.to(dtype=torch.float32).contiguous(),
+            ],
+            dim=-1,
         )
+        head_dim = img_q.shape[-1]
+        img_q, img_k = apply_qk_norm_with_optional_rope(
+            q=img_q.contiguous(),
+            k=img_k.contiguous(),
+            q_norm=self.img_attn_q_norm,
+            k_norm=self.img_attn_k_norm,
+            head_dim=head_dim,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=False,
+            allow_inplace=True,
+        )
+
         # Prepare text for attention using fused operation
         txt_attn_input = self.txt_attn_norm(txt, txt_attn_shift, txt_attn_scale)
 
@@ -242,9 +256,17 @@ class MMDoubleStreamBlock(nn.Module):
         )
         txt_q, txt_k, txt_v = txt_qkv[:, :, 0], txt_qkv[:, :, 1], txt_qkv[:, :, 2]
 
-        # Apply QK-Norm if needed
-        txt_q = self.txt_attn_q_norm(txt_q.contiguous()).to(txt_q.dtype)
-        txt_k = self.txt_attn_k_norm(txt_k.contiguous()).to(txt_k.dtype)
+        # Fused QK-Norm for the text stream (no RoPE on text tokens). Drops
+        # the two RMSNorm kernels into a single in-place fused JIT kernel.
+        txt_q, txt_k = apply_qk_norm_with_optional_rope(
+            q=txt_q.contiguous(),
+            k=txt_k.contiguous(),
+            q_norm=self.txt_attn_q_norm,
+            k_norm=self.txt_attn_k_norm,
+            head_dim=head_dim,
+            cos_sin_cache=None,
+            allow_inplace=True,
+        )
 
         # Run distributed attention
         img_attn, txt_attn = self.attn(img_q, img_k, img_v, txt_q, txt_k, txt_v)
@@ -381,21 +403,50 @@ class MMSingleStreamBlock(nn.Module):
         # Process QKV
         batch_size, seq_len = qkv.shape[0], qkv.shape[1]
         qkv = qkv.view(batch_size, seq_len, 3, self.num_attention_heads, -1)
-        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+        img_len = seq_len - txt_len
 
-        # Apply QK-Norm
-        q = self.q_norm(q.contiguous()).to(v.dtype)
-        k = self.k_norm(k.contiguous()).to(v.dtype)
+        # Split image / text streams BEFORE QK-Norm so the image portion can
+        # route through the fused QK-Norm + RoPE kernel in a single in-place
+        # pass (replacing the prior 2x RMSNorm + 2x _apply_rotary_emb pattern)
+        # and the text portion through the fused QK-Norm only kernel.
+        img_q = qkv[:, :img_len, 0].contiguous()
+        img_k = qkv[:, :img_len, 1].contiguous()
+        img_v = qkv[:, :img_len, 2].contiguous()
+        txt_q = qkv[:, img_len:, 0].contiguous()
+        txt_k = qkv[:, img_len:, 1].contiguous()
+        txt_v = qkv[:, img_len:, 2].contiguous()
 
-        # Split into image and text parts
-        img_q, txt_q = q[:, :-txt_len], q[:, -txt_len:]
-        img_k, txt_k = k[:, :-txt_len], k[:, -txt_len:]
-        img_v, txt_v = v[:, :-txt_len], v[:, -txt_len:]
-        # Apply rotary embeddings to image parts
         cos, sin = freqs_cis
-        img_q, img_k = (
-            _apply_rotary_emb(img_q, cos, sin, is_neox_style=False),
-            _apply_rotary_emb(img_k, cos, sin, is_neox_style=False),
+        cos_sin_cache = torch.cat(
+            [
+                cos.to(dtype=torch.float32).contiguous(),
+                sin.to(dtype=torch.float32).contiguous(),
+            ],
+            dim=-1,
+        )
+        head_dim = img_q.shape[-1]
+
+        # Image stream: fused QK-Norm + RoPE.
+        img_q, img_k = apply_qk_norm_with_optional_rope(
+            q=img_q,
+            k=img_k,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            head_dim=head_dim,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=False,
+            allow_inplace=True,
+        )
+
+        # Text stream: fused QK-Norm only (no RoPE on text tokens).
+        txt_q, txt_k = apply_qk_norm_with_optional_rope(
+            q=txt_q,
+            k=txt_k,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            head_dim=head_dim,
+            cos_sin_cache=None,
+            allow_inplace=True,
         )
 
         # Run distributed attention
