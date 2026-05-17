@@ -587,8 +587,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-        self.report_prefill_stats(
-            self.metrics_reporter,
+        self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,

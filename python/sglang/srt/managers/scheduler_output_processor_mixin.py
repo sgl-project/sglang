@@ -399,8 +399,7 @@ class SchedulerOutputProcessorMixin:
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-        self.report_prefill_stats(
-            self.metrics_reporter,
+        self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
@@ -514,8 +513,8 @@ class SchedulerOutputProcessorMixin:
 
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
-            self.update_spec_metrics(
-                self.metrics_reporter, batch.batch_size(), result.num_correct_drafts
+            self.metrics_reporter.update_spec_metrics(
+                batch.batch_size(), result.num_correct_drafts
             )
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
@@ -630,8 +629,7 @@ class SchedulerOutputProcessorMixin:
         self.metrics_reporter.forward_ct_decode = (
             self.metrics_reporter.forward_ct_decode + 1
         ) % (1 << 30)
-        self.report_decode_stats(
-            self.metrics_reporter,
+        self.metrics_reporter.report_decode_stats(
             can_run_cuda_graph,
             running_batch=batch,
             num_correct_drafts=result.num_correct_drafts,

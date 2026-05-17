@@ -177,6 +177,8 @@ from sglang.srt.managers.scheduler_components.load_inquirer import (
     SchedulerLoadInquirer,
 )
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    RECORD_STEP_TIME,
+    PrefillStats,
     SchedulerMetricsReporter,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -211,11 +213,6 @@ from sglang.srt.observability.req_time_stats import (
     real_time,
     set_schedule_time_batch,
     set_time_batch,
-)
-from sglang.srt.observability.scheduler_metrics_mixin import (
-    RECORD_STEP_TIME,
-    PrefillStats,
-    SchedulerMetricsMixin,
 )
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -361,7 +358,6 @@ def create_scheduler_watchdog(
 
 class Scheduler(
     SchedulerOutputProcessorMixin,
-    SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
@@ -3067,15 +3063,15 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
 
-        self.log_batch_result_stats(self.metrics_reporter, batch, result)
+        self.metrics_reporter.log_batch_result_stats(batch, result)
 
         # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:
-            self._emit_forward_pass_metrics(self.metrics_reporter, batch, result)
+            self.metrics_reporter._emit_forward_pass_metrics(batch, result)
 
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
-        self.update_device_timer(self.metrics_reporter)
+        self.metrics_reporter.update_device_timer()
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
@@ -3201,7 +3197,7 @@ class Scheduler(
         self.new_token_ratio = self.init_new_token_ratio
 
         # reset device timer window so idle time isn't counted
-        self.reset_device_timer_window(self.metrics_reporter)
+        self.metrics_reporter.reset_device_timer_window()
 
         # sleep until next event
         self.maybe_sleep_on_idle()
@@ -3362,7 +3358,7 @@ class Scheduler(
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
-            self.reset_metrics(self.metrics_reporter)
+            self.metrics_reporter.reset_metrics()
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
@@ -3978,4 +3974,4 @@ def run_scheduler_process(
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
-            scheduler._shutdown_fpm(scheduler.metrics_reporter)
+            scheduler.metrics_reporter._shutdown_fpm()
