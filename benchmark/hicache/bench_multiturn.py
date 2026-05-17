@@ -812,7 +812,12 @@ class WorkloadGenerator:
                     self.performance_metrics["generated_len"]
                 )
                 / duration,
-                "throughput": self.pbar.total / duration,
+                # Use the number of successfully completed requests (which is
+                # also what `total_requests` reports above) instead of
+                # `pbar.total`. In long-run mode `pbar.total` is just a rough
+                # estimate (duration * request_rate) used for the progress bar
+                # and does NOT reflect the actual completed throughput.
+                "throughput": len(self.performance_metrics["ttft"]) / duration,
                 "cache_hit_rate": (
                     0
                     if sum(self.performance_metrics["prompt_len"]) == 0
