@@ -38,7 +38,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
-    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+    LAYERWISE_OFFLOAD_DIT_GROUP,
     cpu_offload_flags_for_layerwise_components,
     normalize_layerwise_offload_components,
 )
@@ -199,7 +199,7 @@ class ServerArgs(DisaggArgsMixin):
 
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
-    # if true, add the legacy default DiT components
+    # if true, select the DiT layerwise group
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
@@ -856,13 +856,12 @@ class ServerArgs(DisaggArgsMixin):
         )
         if self.dit_layerwise_offload:
             if explicitly_set_component_names is None:
-                explicitly_set_component_names = [LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS]
+                explicitly_set_component_names = [LAYERWISE_OFFLOAD_DIT_GROUP]
             elif (
-                LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS
-                not in explicitly_set_component_names
+                LAYERWISE_OFFLOAD_DIT_GROUP not in explicitly_set_component_names
             ):
                 explicitly_set_component_names = [
-                    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+                    LAYERWISE_OFFLOAD_DIT_GROUP,
                     *explicitly_set_component_names,
                 ]
 
@@ -1197,7 +1196,7 @@ class ServerArgs(DisaggArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
-            "It only selects the legacy default DiT components. Cannot be used together with cache-dit "
+            "It selects only the DiT layerwise group. Cannot be used together with cache-dit "
             "(SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )
         parser.add_argument(
@@ -1207,7 +1206,8 @@ class ServerArgs(DisaggArgsMixin):
             nargs="+",
             default=ServerArgs.layerwise_offload_components,
             help="Select pipeline components for layerwise offload. "
-            "Use default to select the legacy default DiT components, "
+            "Use dit to select the DiT layerwise group, default for the default group "
+            "(currently text_encoder and image_encoder), "
             "or all to select every layerwise-offloadable component. "
             "This option does not imply --dit-layerwise-offload. Example: "
             "--layerwise-offload-components text_encoder image_encoder.",
@@ -1749,13 +1749,13 @@ class ServerArgs(DisaggArgsMixin):
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")
 
-            if self.use_fsdp_inference:
+            should_disable_dit_cpu_offload = self.is_dit_layerwise_offload_selected
+            if self.use_fsdp_inference and should_disable_dit_cpu_offload:
                 logger.warning(
-                    "layerwise offload components are selected, automatically disabling use_fsdp_inference."
+                    "layerwise offload is selected for DiT components, automatically disabling use_fsdp_inference."
                 )
                 self.use_fsdp_inference = False
 
-            should_disable_dit_cpu_offload = self.is_dit_layerwise_offload_selected
             if should_disable_dit_cpu_offload and self.dit_cpu_offload is not False:
                 logger.warning(
                     "layerwise offload is selected for DiT components, automatically disabling dit_cpu_offload."

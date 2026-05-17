@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
     LayerwiseOffloadManager,
     configure_layerwise_offload_modules,
+    get_layerwise_offload_component_names_for_pipeline,
     is_layerwise_offloaded_module,
 )
 
@@ -113,7 +114,7 @@ class _SharedBufferModel(torch.nn.Module):
 
 
 class _NestedEncoderDummyModel(_NestedDummyModel):
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
 
 
 class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
@@ -234,7 +235,7 @@ def test_layerwise_capability_selects_layerwise_strategy_for_any_component():
     assert isinstance(strategy, LayerwiseOffloadStrategy)
 
 
-def test_layerwise_configuration_uses_legacy_default_components(monkeypatch):
+def test_layerwise_pipeline_selection_uses_dit_group(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
     )
@@ -246,8 +247,10 @@ def test_layerwise_configuration_uses_legacy_default_components(monkeypatch):
         "scheduler": object(),
     }
 
+    selected = get_layerwise_offload_component_names_for_pipeline(modules)
     configured = configure_layerwise_offload_modules(modules, _server_args())
 
+    assert selected == ["text_encoder", "text_encoder_alias"]
     assert configured == ["text_encoder"]
     assert is_layerwise_offloaded_module(layerwise_module)
 
@@ -276,7 +279,7 @@ def test_layerwise_configuration_filters_by_component_name(monkeypatch):
     assert not is_layerwise_offloaded_module(vae)
 
 
-def test_layerwise_configuration_default_marker_extends_legacy_defaults(monkeypatch):
+def test_layerwise_configuration_default_group_selects_encoders(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
     )
@@ -284,6 +287,7 @@ def test_layerwise_configuration_default_marker_extends_legacy_defaults(monkeypa
     text_encoder = _NestedEncoderDummyModel()
     text_encoder_2 = _NestedEncoderDummyModel()
     transformer = _NestedDummyModel()
+    image_encoder = _NestedEncoderDummyModel()
     vae = _NestedEncoderDummyModel()
     audio_vae = _NestedEncoderDummyModel()
     condition_image_encoder = _NestedEncoderDummyModel()
@@ -291,26 +295,38 @@ def test_layerwise_configuration_default_marker_extends_legacy_defaults(monkeypa
         "text_encoder": text_encoder,
         "text_encoder_2": text_encoder_2,
         "transformer": transformer,
+        "image_encoder": image_encoder,
         "vae": vae,
         "audio_vae": audio_vae,
         "condition_image_encoder": condition_image_encoder,
     }
 
     configured = configure_layerwise_offload_modules(
-        modules, _server_args(), component_names=["default", "text_encoder", "vae"]
+        modules, _server_args(), component_names=["default", "vae"]
     )
 
+    assert get_layerwise_offload_component_names_for_pipeline(
+        modules, ["default", "vae"]
+    ) == [
+        "text_encoder",
+        "text_encoder_2",
+        "image_encoder",
+        "vae",
+        "audio_vae",
+        "condition_image_encoder",
+    ]
     assert configured == [
         "text_encoder",
         "text_encoder_2",
-        "transformer",
+        "image_encoder",
         "vae",
         "audio_vae",
         "condition_image_encoder",
     ]
     assert is_layerwise_offloaded_module(text_encoder)
     assert is_layerwise_offloaded_module(text_encoder_2)
-    assert is_layerwise_offloaded_module(transformer)
+    assert not is_layerwise_offloaded_module(transformer)
+    assert is_layerwise_offloaded_module(image_encoder)
     assert is_layerwise_offloaded_module(vae)
     assert is_layerwise_offloaded_module(audio_vae)
     assert is_layerwise_offloaded_module(condition_image_encoder)

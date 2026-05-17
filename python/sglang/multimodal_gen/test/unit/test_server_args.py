@@ -162,7 +162,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             args.layerwise_offload_components, ["text_encoder", "transformer"]
         )
 
-    def test_dit_layerwise_offload_extends_default_components(self):
+    def test_dit_layerwise_offload_selects_dit_group(self):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "/data/my-model",
@@ -172,7 +172,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         )
 
         self.assertTrue(args.layerwise_offload_components)
-        self.assertEqual(args.layerwise_offload_components, ["default"])
+        self.assertEqual(args.layerwise_offload_components, ["dit"])
 
     def test_dit_layerwise_offload_from_kwargs(self):
         with patch.object(
@@ -185,7 +185,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             )
 
         self.assertTrue(args.layerwise_offload_components)
-        self.assertEqual(args.layerwise_offload_components, ["default"])
+        self.assertEqual(args.layerwise_offload_components, ["dit"])
 
     def test_layerwise_offload_components_normalize_commas(self):
         args = self._from_dict_without_model_resolution(
@@ -199,6 +199,21 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
         self.assertEqual(
             args.layerwise_offload_components, ["text_encoder", "transformer"]
+        )
+
+    def test_layerwise_offload_components_normalize_default_group(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "performance_mode": "manual",
+            }
+        )
+        args.layerwise_offload_components = ["default", "text_encoder"]
+        args._adjust_layerwise_offload_components()
+
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder"],
         )
 
     def test_dit_layerwise_offload_cli_arg(self):
@@ -221,7 +236,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         self.assertTrue(server_args.layerwise_offload_components)
-        self.assertEqual(server_args.layerwise_offload_components, ["default"])
+        self.assertEqual(server_args.layerwise_offload_components, ["dit"])
 
     def test_layerwise_offload_components_cli_args(self):
         parser = FlexibleArgumentParser()
@@ -471,11 +486,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["default", "text_encoder", "image_encoder"],
+            ["text_encoder", "image_encoder"],
         )
 
     def test_memory_wan_layerwise_offload_is_enabled_without_fsdp(self):
@@ -486,11 +502,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["default", "text_encoder", "image_encoder"],
+            ["text_encoder", "image_encoder"],
         )
 
     def test_auto_wan_layerwise_offload_does_not_disable_explicit_fsdp(self):
@@ -520,16 +537,16 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.enable_cfg_parallel)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["default", "text_encoder", "image_encoder"],
+            ["text_encoder", "image_encoder"],
         )
 
-    def test_explicit_multi_gpu_dit_layerwise_only_selects_default_component(self):
+    def test_explicit_multi_gpu_dit_layerwise_only_selects_dit_group(self):
         args = self._from_dict_with_pipeline_config(
             MOVAPipelineConfig(),
             kwargs={
@@ -544,7 +561,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.layerwise_offload_components)
         self.assertTrue(args.text_encoder_cpu_offload)
         self.assertTrue(args.image_encoder_cpu_offload)
-        self.assertEqual(args.layerwise_offload_components, ["default"])
+        self.assertEqual(args.layerwise_offload_components, ["dit"])
 
     def test_auto_multi_gpu_ltx_replaces_component_cpu_offload_with_resident_dit(self):
         args = self._from_dict_with_pipeline_config(
@@ -722,12 +739,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.layerwise_offload_components)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["default", "text_encoder", "image_encoder"],
+            ["text_encoder", "image_encoder"],
         )
 
     def test_memory_mode_preserves_explicit_fsdp(self):
