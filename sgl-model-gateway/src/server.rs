@@ -7,12 +7,14 @@ use std::{
 };
 
 use axum::{
+    body::to_bytes,
     extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
+use bytes::Bytes;
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -21,6 +23,7 @@ use smg_mesh::{
 };
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
+use validator::Validate;
 use wfaas::LoggingSubscriber;
 
 use crate::{
@@ -49,7 +52,7 @@ use crate::{
         rerank::V1RerankReqInput,
         responses::{ResponsesGetParams, ResponsesRequest},
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-        validated::ValidatedJson,
+        validated::{Normalizable, ValidatedJson},
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
@@ -169,26 +172,90 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
     state.router.get_model_info(req).await
 }
 
+/// Read the raw request body up to a generous limit. Matches what
+/// `Json::from_request` would have consumed.
+async fn read_body_bytes(request: Request) -> Result<Bytes, Response> {
+    to_bytes(request.into_body(), usize::MAX)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": format!("Failed to read request body: {}", e),
+                        "type": "invalid_request_error",
+                        "code": "body_read_error"
+                    }
+                })),
+            )
+                .into_response()
+        })
+}
+
+fn json_parse_error(message: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "json_parse_error"
+            }
+        })),
+    )
+        .into_response()
+}
+
 async fn generate(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<GenerateRequest>,
+    request: Request,
 ) -> Response {
+    let body_raw = match read_body_bytes(request).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let body: GenerateRequest = match serde_json::from_slice(&body_raw) {
+        Ok(v) => v,
+        Err(e) => return json_parse_error(format!("Invalid JSON data: {}", e)),
+    };
     let model_id = body.model.as_deref();
     state
         .router
-        .route_generate(Some(&headers), &body, model_id)
+        .route_generate(Some(&headers), &body, Some(&body_raw), model_id)
         .await
 }
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    request: Request,
 ) -> Response {
+    let body_raw = match read_body_bytes(request).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let mut body: ChatCompletionRequest = match serde_json::from_slice(&body_raw) {
+        Ok(v) => v,
+        Err(e) => return json_parse_error(format!("Invalid JSON data: {}", e)),
+    };
+    body.normalize();
+    if let Err(validation_errors) = body.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": validation_errors.to_string(),
+                    "type": "invalid_request_error",
+                    "code": 400
+                }
+            })),
+        )
+            .into_response();
+    }
     state
         .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
+        .route_chat(Some(&headers), &body, Some(&body_raw), Some(&body.model))
         .await
 }
 

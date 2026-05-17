@@ -39,6 +39,8 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        routed_experts_b64: None,
+        always_emit_routed_experts: false,
     });
     let worker_url = worker.start().await.expect("start worker");
 
@@ -532,6 +534,8 @@ async fn test_multi_turn_loop_with_mcp() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        routed_experts_b64: None,
+        always_emit_routed_experts: false,
     });
     let worker_url = worker.start().await.expect("start worker");
 
@@ -685,6 +689,8 @@ async fn test_max_tool_calls_limit() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        routed_experts_b64: None,
+        always_emit_routed_experts: false,
     });
     let worker_url = worker.start().await.expect("start worker");
 
@@ -803,6 +809,8 @@ async fn setup_streaming_mcp_test() -> (
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        routed_experts_b64: None,
+        always_emit_routed_experts: false,
     });
     let worker_url = worker.start().await.expect("start worker");
 

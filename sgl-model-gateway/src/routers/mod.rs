@@ -9,6 +9,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 
 use crate::protocols::{
     chat::ChatCompletionRequest,
@@ -75,11 +76,26 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
-    /// Route a generate request
+    /// Route a generate request.
+    ///
+    /// `body_raw` is the original request bytes. Both HTTP routers (PD
+    /// and regular) call `parse_sglang_extensions` on it to validate
+    /// SGLang extension types up front (e.g. `return_routed_experts:
+    /// "yes"` becomes a 400) and forward the raw JSON to backend
+    /// servers verbatim — this preserves SGLang extension fields (e.g.
+    /// `return_routed_experts`, `routed_dp_rank`) that the typed
+    /// `GenerateRequest` would have dropped as unknown on a typed
+    /// re-serialize. The PD router additionally branches on
+    /// `return_routed_experts` to merge prefill/decode response bytes;
+    /// the regular router is pure passthrough since it has only one
+    /// backend per request. The gRPC routers and OpenAI provider router
+    /// ignore `body_raw`. `None` means raw access wasn't captured (e.g.
+    /// test callers, gRPC paths that build their own proto payload).
     async fn route_generate(
         &self,
         _headers: Option<&HeaderMap>,
         _body: &GenerateRequest,
+        _body_raw: Option<&Bytes>,
         _model_id: Option<&str>,
     ) -> Response {
         (
@@ -89,11 +105,13 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
-    /// Route a chat completion request
+    /// Route a chat completion request. See `route_generate` for the meaning
+    /// of `body_raw`.
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
+        body_raw: Option<&Bytes>,
         model_id: Option<&str>,
     ) -> Response;
 

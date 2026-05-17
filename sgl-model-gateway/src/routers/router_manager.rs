@@ -14,6 +14,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use dashmap::DashMap;
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -495,6 +496,7 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
+        body_raw: Option<&Bytes>,
         model_id: Option<&str>,
     ) -> Response {
         // In IGW mode, resolve model_id and fail fast if not resolvable
@@ -513,7 +515,12 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             router
-                .route_generate(headers, body, effective_model_id.as_deref().or(model_id))
+                .route_generate(
+                    headers,
+                    body,
+                    body_raw,
+                    effective_model_id.as_deref().or(model_id),
+                )
                 .await
         } else {
             (
@@ -528,6 +535,7 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
+        body_raw: Option<&Bytes>,
         model_id: Option<&str>,
     ) -> Response {
         // In IGW mode, resolve model_id and fail fast if not resolvable
@@ -548,7 +556,12 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             router
-                .route_chat(headers, body, effective_model_id.as_deref().or(model_id))
+                .route_chat(
+                    headers,
+                    body,
+                    body_raw,
+                    effective_model_id.as_deref().or(model_id),
+                )
                 .await
         } else {
             (
