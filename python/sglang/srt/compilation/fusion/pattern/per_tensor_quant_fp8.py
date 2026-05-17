@@ -20,7 +20,7 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
 from sglang.srt.compilation.fusion.pattern import OpPatternBase, OpPatternRegistery
 
 
-class _QuantFp8Pattern(OpPatternBase):
+class _PerTensorQuantFp8Pattern(OpPatternBase):
     @staticmethod
     @abstractmethod
     def pattern(x, output, scale):
@@ -28,7 +28,7 @@ class _QuantFp8Pattern(OpPatternBase):
 
 
 # op: sgl-kernel/per_tensor_quant_fp8
-class PerTensorQuantFp8Pattern(_QuantFp8Pattern):
+class PerTensorQuantFp8Pattern(_PerTensorQuantFp8Pattern):
     @staticmethod
     def pattern(x, output, scale):
         per_tensor_quant_fp8 = auto_functionalized_v2(
@@ -47,7 +47,7 @@ class PerTensorQuantFp8Pattern(_QuantFp8Pattern):
 
 
 # op: fp8_kernels.py/static_quant_fp8_fwd
-class StaticQuantFp8Pattern(_QuantFp8Pattern):
+class PerTensorStaticQuantFp8Pattern(_PerTensorQuantFp8Pattern):
     @staticmethod
     def pattern(x, output, scale):
         static_quant_fp8 = auto_functionalized_v2(
@@ -65,10 +65,10 @@ class StaticQuantFp8Pattern(_QuantFp8Pattern):
         )
 
 
-class _QuantFp8PatternRegistery(OpPatternRegistery):
+class _PerTensorQuantFp8PatternRegistery(OpPatternRegistery):
     def build_op_pattern_registery(self):
         self.register_op_pattern(PerTensorQuantFp8Pattern)
-        self.register_op_pattern(StaticQuantFp8Pattern)
+        self.register_op_pattern(PerTensorStaticQuantFp8Pattern)
 
 
-QuantFp8PatternRegistery = _QuantFp8PatternRegistery()
+PerTensorQuantFp8PatternRegistery = _PerTensorQuantFp8PatternRegistery()

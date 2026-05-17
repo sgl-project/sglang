@@ -4,7 +4,6 @@ import torch
 import triton
 import triton.testing
 from flashinfer import fused_add_rmsnorm_quant as fi_fused_add_rmsnorm_quant
-from sgl_kernel import fused_add_rms_norm_static_fp8_quant
 
 from sglang.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
@@ -14,7 +13,7 @@ from sglang.jit_kernel.benchmark.utils import (
 )
 from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
 from sglang.jit_kernel.norm import (
-    fused_add_rmsnorm_quant as jit_fused_add_rmsnorm_quant,
+    fused_add_rmsnorm_per_tensor_quant as jit_fused_add_rmsnorm_per_tensor_quant,
 )
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8 as jit_quant
 
@@ -22,27 +21,17 @@ FP8_DTYPE = torch.float8_e4m3fn
 FP8_E4M3_MAX = 448.0
 
 
-def sglang_aot_fused_add_rmsnorm_quant(
+def sglang_jit_fused_add_rmsnorm_per_tensor_quant(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    fused_add_rms_norm_static_fp8_quant(out, input, residual, weight, scale)
+    jit_fused_add_rmsnorm_per_tensor_quant(out, input, residual, weight, scale)
 
 
-def sglang_jit_fused_add_rmsnorm_quant(
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    jit_fused_add_rmsnorm_quant(out, input, residual, weight, scale)
-
-
-def flashinfer_fused_add_rmsnorm_quant(
+def flashinfer_fused_add_rmsnorm_per_tensor_quant(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -59,14 +48,12 @@ def sglang_unfused_jit(
     scale: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    # fused_add_rmsnorm: residual += input, input = rmsnorm(residual)
     jit_fused_add_rmsnorm(input, residual, weight)
-    # input now holds the normed result, quantize it
     jit_quant(input, out, scale, is_static=True)
 
 
 @torch.compile()
-def torch_impl_fused_add_rmsnorm_quant(
+def torch_impl_fused_add_rmsnorm_per_tensor_quant(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -93,21 +80,18 @@ HIDDEN_SIZE_LIST = get_benchmark_range(
 )
 
 LINE_VALS = [
-    "fused_aot",
     "fused_jit",
     "fused_flashinfer",
     "unfused_jit",
     "unfused_torch",
 ]
 LINE_NAMES = [
-    "SGL AOT Fused",
     "SGL JIT Fused",
     "FlashInfer Fused",
     "SGL JIT Unfused",
     "PyTorch Unfused",
 ]
 STYLES = [
-    ("orange", "-"),
     ("blue", "--"),
     ("purple", "-."),
     ("green", "-."),
@@ -126,7 +110,7 @@ configs = list(itertools.product(HIDDEN_SIZE_LIST, BS_LIST))
         line_names=LINE_NAMES,
         styles=STYLES,
         ylabel="us",
-        plot_name="fused-add-rmsnorm-quant-performance",
+        plot_name="fused-add-rmsnorm-per-tensor-quant-performance",
         args={},
     )
 )
@@ -141,11 +125,10 @@ def benchmark(hidden_size: int, batch_size: int, provider: str):
     scale = torch.tensor([4.0], dtype=torch.float32, device=DEFAULT_DEVICE)
     out = torch.empty((batch_size, hidden_size), dtype=FP8_DTYPE, device=DEFAULT_DEVICE)
     FN_MAP = {
-        "fused_aot": sglang_aot_fused_add_rmsnorm_quant,
-        "fused_jit": sglang_jit_fused_add_rmsnorm_quant,
-        "fused_flashinfer": flashinfer_fused_add_rmsnorm_quant,
+        "fused_jit": sglang_jit_fused_add_rmsnorm_per_tensor_quant,
+        "fused_flashinfer": flashinfer_fused_add_rmsnorm_per_tensor_quant,
         "unfused_jit": sglang_unfused_jit,
-        "unfused_torch": torch_impl_fused_add_rmsnorm_quant,
+        "unfused_torch": torch_impl_fused_add_rmsnorm_per_tensor_quant,
     }
     fn = lambda: FN_MAP[provider](
         input.clone(), residual.clone(), weight, scale, out.clone()

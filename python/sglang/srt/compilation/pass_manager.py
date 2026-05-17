@@ -7,7 +7,10 @@ import logging
 from torch import fx as fx
 
 from sglang.srt.compilation.fusion.ops import register_fused_ops
-from sglang.srt.compilation.fusion.passes import FusedActivationPass, RMSNormQuantPass
+from sglang.srt.compilation.fusion.passes import (
+    FusedActivationPass,
+    RMSNormPerTensorQuantPass,
+)
 
 # from sglang.srt.compilation.fix_functionalization import FixFunctionalizationPass
 from sglang.srt.compilation.inductor_pass import (
@@ -59,7 +62,7 @@ class PostGradPassManager(CustomGraphPass):
         # self.fix_functionalization = FixFunctionalizationPass()
         if self.pass_config.enable_fusion:
             if not self.pass_config.disable_rmsnorm_quant_pass:
-                self.passes.append(RMSNormQuantPass(self.pass_config))
+                self.passes.append(RMSNormPerTensorQuantPass(self.pass_config))
 
             if not self.pass_config.disable_fused_activation_pass:
                 self.passes.append(FusedActivationPass(self.pass_config))

@@ -43,7 +43,7 @@ struct VecTypeTrait<fp16_t, 32> {
 };
 
 template <typename T, int VEC_SIZE_IN_BYTE>
-__global__ void fused_add_rmsnorm_quant_reg_kernel(
+__global__ void fused_add_rmsnorm_per_tensor_quant_reg_kernel(
     T* __restrict__ input,
     T* __restrict__ residual,
     const T* __restrict__ weight,
@@ -136,7 +136,7 @@ __global__ void fused_add_rmsnorm_quant_reg_kernel(
 }
 
 template <typename DType>
-struct FusedAddRMSNormQuantKernel {
+struct FusedAddRMSNormPerTensorQuantKernel {
   static void
   run(const tvm::ffi::TensorView input,
       const tvm::ffi::TensorView residual,
@@ -189,7 +189,7 @@ struct FusedAddRMSNormQuantKernel {
           elements_in_vec);
 
       // Launch kernel
-      auto kernel = fused_add_rmsnorm_quant_reg_kernel<DType, device::kMaxVecBytes>;
+      auto kernel = fused_add_rmsnorm_per_tensor_quant_reg_kernel<DType, device::kMaxVecBytes>;
       LaunchKernel(static_cast<uint>(N.unwrap()), threads, device.unwrap())
           .enable_pdl(false)(
               kernel,

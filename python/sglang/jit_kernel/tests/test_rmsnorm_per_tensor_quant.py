@@ -6,7 +6,7 @@ import torch
 from sglang.jit_kernel.utils import get_ci_test_range
 
 
-def reference_rmsnorm_quant(input, weight, scale, eps=1e-6):
+def reference_rmsnorm_per_tensor_quant(input, weight, scale, eps=1e-6):
     x = input.float()
     mean = x.pow(2).mean(dim=-1, keepdim=True)
     norm = (mean + eps).rsqrt()
@@ -36,18 +36,20 @@ DEVICE = "cuda"
     "batch_size,hidden_size,dtype,scale_val",
     list(itertools.product(BS_LIST, HIDDEN_SIZE_LIST, DTYPE_LIST, SCALE_LIST)),
 )
-def test_rmsnorm_quant_correctness(
+def test_rmsnorm_per_tensor_quant_correctness(
     batch_size: int, hidden_size: int, dtype: torch.dtype, scale_val: float
 ) -> None:
-    from sglang.jit_kernel.norm import rmsnorm_quant as jit_rmsnorm_quant
+    from sglang.jit_kernel.norm import (
+        rmsnorm_per_tensor_quant as jit_rmsnorm_per_tensor_quant,
+    )
 
     input = torch.randn(batch_size, hidden_size, device=DEVICE, dtype=dtype)
     weight = torch.randn(hidden_size, device=DEVICE, dtype=dtype)
     scale = torch.tensor([scale_val], device=DEVICE, dtype=torch.float32)
 
     output = torch.empty(input.shape, dtype=torch.float8_e4m3fn, device=input.device)
-    jit_rmsnorm_quant(output, input, weight, scale)
-    expected = reference_rmsnorm_quant(input, weight, scale)
+    jit_rmsnorm_per_tensor_quant(output, input, weight, scale)
+    expected = reference_rmsnorm_per_tensor_quant(input, weight, scale)
 
     assert output.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(
@@ -59,9 +61,15 @@ def test_rmsnorm_quant_correctness(
     "batch_size,hidden_size",
     list(itertools.product(BS_LIST, HIDDEN_SIZE_LIST)),
 )
-def test_rmsnorm_quant_matches_separate_ops(batch_size: int, hidden_size: int) -> None:
-    from sglang.jit_kernel.norm import rmsnorm
-    from sglang.jit_kernel.norm import rmsnorm_quant as jit_rmsnorm_quant
+def test_rmsnorm_per_tensor_quant_matches_separate_ops(
+    batch_size: int, hidden_size: int
+) -> None:
+    from sglang.jit_kernel.norm import (
+        rmsnorm,
+    )
+    from sglang.jit_kernel.norm import (
+        rmsnorm_per_tensor_quant as jit_rmsnorm_per_tensor_quant,
+    )
     from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 
     dtype = torch.bfloat16
@@ -73,11 +81,11 @@ def test_rmsnorm_quant_matches_separate_ops(batch_size: int, hidden_size: int) -
     fused_output = torch.empty(
         input.shape, dtype=torch.float8_e4m3fn, device=input.device
     )
-    jit_rmsnorm_quant(fused_output, input, weight, scale)
+    jit_rmsnorm_per_tensor_quant(fused_output, input, weight, scale)
 
     # Separate path: rmsnorm then quantize
     normed = input.clone()
-    rmsnorm(normed, weight, output=normed)
+    rmsnorm(normed, weight, out=normed)
     separate_output = torch.empty_like(normed, dtype=torch.float8_e4m3fn)
     per_tensor_quant_fp8(normed, separate_output, scale, is_static=True)
 

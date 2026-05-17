@@ -13,4 +13,4 @@
 # ==============================================================================
 
 from .fused_activation import FusedActivationPass
-from .rmsnorm_quant import RMSNormQuantPass
+from .rmsnorm_per_tensor_quant import RMSNormPerTensorQuantPass

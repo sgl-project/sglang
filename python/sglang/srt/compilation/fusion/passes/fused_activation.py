@@ -25,10 +25,10 @@ from sglang.srt.compilation.fusion.pattern.gemm_fp8_pattern import (
     GemmFp8PatternRegistery,
     TorchScaledMMPattern,
 )
-from sglang.srt.compilation.fusion.pattern.quant_fp8_pattern import (
+from sglang.srt.compilation.fusion.pattern.per_tensor_quant_fp8 import (
     PerTensorQuantFp8Pattern,
-    QuantFp8PatternRegistery,
-    StaticQuantFp8Pattern,
+    PerTensorQuantFp8PatternRegistery,
+    PerTensorStaticQuantFp8Pattern,
 )
 from sglang.srt.compilation.inductor_pass import SGLangPatternMatcherInductorPass
 
@@ -82,14 +82,14 @@ class FusedActivationPass(SGLangPatternMatcherInductorPass):
             dual_gemm_fp8_op_result = dual_gemm_fp8_op.pattern(
                 x, w, x_scale, w_scale, o_scale, output_q
             )
-            if quant_fp8_op.op_type == StaticQuantFp8Pattern:
+            if quant_fp8_op.op_type == PerTensorStaticQuantFp8Pattern:
                 repeated_o_scale = o_scale.view(1, 1).expand(x.shape[0], 1)
             else:
                 repeated_o_scale = o_scale
             return dual_gemm_fp8_op_result, repeated_o_scale
 
         M, K, N = 16, 16, 16
-        if quant_fp8_op.op_type == StaticQuantFp8Pattern:
+        if quant_fp8_op.op_type == PerTensorStaticQuantFp8Pattern:
             SM, SN = M, N
         else:
             SM, SN = 1, 1
@@ -119,12 +119,12 @@ class FusedActivationPass(SGLangPatternMatcherInductorPass):
         pattern_builder(
             self.register_dual_gemm_fp8_replacement_pattern,
             [
-                QuantFp8PatternRegistery,
+                PerTensorQuantFp8PatternRegistery,
                 GemmFp8PatternRegistery,
                 DualGemmFp8PatternRegistery,
             ],
             ignore_combinations=[
-                (StaticQuantFp8Pattern, TorchScaledMMPattern),
+                (PerTensorStaticQuantFp8Pattern, TorchScaledMMPattern),
                 (PerTensorQuantFp8Pattern, CutlassFp8ScaledMMPattern),
             ],
         )

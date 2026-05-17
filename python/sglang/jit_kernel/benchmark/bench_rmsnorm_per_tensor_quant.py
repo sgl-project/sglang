@@ -4,7 +4,6 @@ import torch
 import triton
 import triton.testing
 from flashinfer import rmsnorm_quant as fi_rmsnorm_quant
-from sgl_kernel import rms_norm_static_fp8_quant
 
 from sglang.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
@@ -13,7 +12,9 @@ from sglang.jit_kernel.benchmark.utils import (
     run_benchmark,
 )
 from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
-from sglang.jit_kernel.norm import rmsnorm_quant as jit_rmsnorm_quant
+from sglang.jit_kernel.norm import (
+    rmsnorm_per_tensor_quant as jit_rmsnorm_per_tensor_quant,
+)
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8 as jit_quant
 
 DEVICE = "cuda"
@@ -40,22 +41,13 @@ def scaled_fp8_conversion_ref(
     return r
 
 
-def sglang_aot_rmsnorm_quant(
+def sglang_jit_rmsnorm_per_tensor_quant(
     input: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    rms_norm_static_fp8_quant(out, input, weight, scale)
-
-
-def sglang_jit_rmsnorm_quant(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
-    jit_rmsnorm_quant(out, input, weight, scale)
+    jit_rmsnorm_per_tensor_quant(out, input, weight, scale)
 
 
 def sglang_unfused_jit(
@@ -64,12 +56,12 @@ def sglang_unfused_jit(
     scale: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    temp = input.clone()
-    jit_rmsnorm(temp, weight, output=temp)
+    temp = torch.empty_like(input)
+    jit_rmsnorm(input, weight, out=temp)
     jit_quant(temp, out, scale, is_static=True)
 
 
-def flashinfer_rmsnorm_quant(
+def flashinfer_rmsnorm_per_tensor_quant(
     input: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -79,7 +71,7 @@ def flashinfer_rmsnorm_quant(
 
 
 @torch.compile()
-def torch_impl_rmsnorm_quant(
+def torch_impl_rmsnorm_per_tensor_quant(
     input: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -105,21 +97,18 @@ HIDDEN_SIZE_LIST = get_benchmark_range(
 )
 
 LINE_VALS = [
-    "fused_aot",
     "fused_jit",
     "fused_flashinfer",
     "unfused_jit",
     "unfused_torch",
 ]
 LINE_NAMES = [
-    "SGL AOT Fused",
     "SGL JIT Fused",
     "FlashInfer Fused",
     "SGL JIT Unfused",
     "PyTorch Unfused",
 ]
 STYLES = [
-    ("orange", "-"),
     ("blue", "--"),
     ("purple", "-."),
     ("green", "-."),
@@ -150,11 +139,10 @@ def benchmark(hidden_size: int, batch_size: int, provider: str):
     scale = torch.tensor([4.0], dtype=torch.float32, device=DEFAULT_DEVICE)
     out = torch.empty((batch_size, hidden_size), dtype=FP8_DTYPE, device=DEFAULT_DEVICE)
     FN_MAP = {
-        "fused_aot": sglang_aot_rmsnorm_quant,
-        "fused_jit": sglang_jit_rmsnorm_quant,
-        "fused_flashinfer": flashinfer_rmsnorm_quant,
+        "fused_jit": sglang_jit_rmsnorm_per_tensor_quant,
+        "fused_flashinfer": flashinfer_rmsnorm_per_tensor_quant,
         "unfused_jit": sglang_unfused_jit,
-        "unfused_torch": torch_impl_rmsnorm_quant,
+        "unfused_torch": torch_impl_rmsnorm_per_tensor_quant,
     }
     fn = lambda: FN_MAP[provider](input, weight, scale, out.clone())
     return run_benchmark(fn)
