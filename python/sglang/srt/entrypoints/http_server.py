@@ -57,7 +57,7 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -433,7 +433,7 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
             "param": None,
             "code": exc.status_code,
         }
-        return ORJSONResponse(
+        return JSONResponse(
             content={"error": nested_error}, status_code=exc.status_code
         )
 
@@ -443,7 +443,7 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
         type=str(exc.status_code),
         code=exc.status_code,
     )
-    return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
+    return JSONResponse(content=error.model_dump(), status_code=exc.status_code)
 
 
 # Custom exception handlers to change validation error status codes
@@ -469,7 +469,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "param": None,
             "code": HTTPStatus.BAD_REQUEST.value,
         }
-        return ORJSONResponse(status_code=400, content={"error": nested_error})
+        return JSONResponse(status_code=400, content={"error": nested_error})
 
     err = ErrorResponse(
         message=message,
@@ -477,7 +477,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         code=HTTPStatus.BAD_REQUEST.value,
     )
 
-    return ORJSONResponse(
+    return JSONResponse(
         status_code=400,
         content=err.model_dump(),
     )
@@ -692,7 +692,7 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
         results = await _global_state.tokenizer_manager.dumper_control(obj)
         if any(not r.success for r in results):
             errors = [r.error for r in results if not r.success]
-            return ORJSONResponse(status_code=400, content={"error": errors})
+            return JSONResponse(status_code=400, content={"error": errors})
         return [x for result in results for x in result.response]
 
 
@@ -785,12 +785,12 @@ async def add_external_corpus(request: Request):
     try:
         obj = AddExternalCorpusReqInput(**(await request.json()))
     except TypeError as e:
-        return ORJSONResponse(
+        return JSONResponse(
             {"success": False, "message": str(e)},
             status_code=HTTPStatus.BAD_REQUEST,
         )
     result = await _global_state.tokenizer_manager.add_external_corpus(obj)
-    return ORJSONResponse(
+    return JSONResponse(
         {
             "success": result.success,
             "corpus_id": result.corpus_id,
@@ -808,12 +808,12 @@ async def remove_external_corpus(request: Request):
     body = await request.json()
     corpus_id = body.get("corpus_id")
     if not corpus_id:
-        return ORJSONResponse(
+        return JSONResponse(
             {"success": False, "message": "corpus_id is required."},
             status_code=HTTPStatus.BAD_REQUEST,
         )
     result = await _global_state.tokenizer_manager.remove_external_corpus(corpus_id)
-    return ORJSONResponse(
+    return JSONResponse(
         {"success": result.success, "message": result.message},
         status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
     )
@@ -824,7 +824,7 @@ async def remove_external_corpus(request: Request):
 async def list_external_corpora():
     """List all active external corpora."""
     result = await _global_state.tokenizer_manager.list_external_corpora()
-    return ORJSONResponse(
+    return JSONResponse(
         {
             "success": result.success,
             "corpus_token_counts": result.corpus_token_counts,
@@ -1050,12 +1050,12 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
         "num_paused_requests": num_paused_requests,
     }
     if success:
-        return ORJSONResponse(
+        return JSONResponse(
             content,
             status_code=HTTPStatus.OK,
         )
     else:
-        return ORJSONResponse(
+        return JSONResponse(
             content,
             status_code=HTTPStatus.BAD_REQUEST,
         )
@@ -1073,9 +1073,9 @@ async def init_weights_send_group_for_remote_instance(
     )
     content = {"success": success, "message": message}
     if success:
-        return ORJSONResponse(content, status_code=200)
+        return JSONResponse(content, status_code=200)
     else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+        return JSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/send_weights_to_remote_instance")
@@ -1090,9 +1090,9 @@ async def send_weights_to_remote_instance(
     )
     content = {"success": success, "message": message}
     if success:
-        return ORJSONResponse(content, status_code=200)
+        return JSONResponse(content, status_code=200)
     else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+        return JSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.get("/get_remote_instance_transfer_engine_info")
@@ -1110,7 +1110,7 @@ async def get_remote_instance_transfer_engine_info(rank: int = None):
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def remote_instance_transfer_engine_info(rank: int = None):
     if rank is None or rank < 0:
-        return ORJSONResponse(
+        return JSONResponse(
             {"error": {"message": "Missing or invalid rank parameter"}},
             status_code=HTTPStatus.BAD_REQUEST,
         )
@@ -1127,7 +1127,7 @@ async def remote_instance_transfer_engine_info(rank: int = None):
     except (requests.exceptions.RequestException, ValueError) as e:
         logger.warning(f"Failed to get transfer engine info for rank {rank}: {e}")
 
-    return ORJSONResponse(
+    return JSONResponse(
         {"error": {"message": f"Failed to get transfer engine info for rank {rank}"}},
         status_code=HTTPStatus.BAD_REQUEST,
     )
@@ -1144,9 +1144,9 @@ async def init_weights_update_group(
     )
     content = {"success": success, "message": message}
     if success:
-        return ORJSONResponse(content, status_code=200)
+        return JSONResponse(content, status_code=200)
     else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+        return JSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/destroy_weights_update_group")
@@ -1159,9 +1159,7 @@ async def destroy_weights_update_group(
         await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
     )
     content = {"success": success, "message": message}
-    return ORJSONResponse(
-        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
-    )
+    return JSONResponse(content, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/update_weights_from_tensor")
@@ -1181,9 +1179,7 @@ async def update_weights_from_tensor(
     )
 
     content = {"success": success, "message": message}
-    return ORJSONResponse(
-        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
-    )
+    return JSONResponse(content, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/update_weights_from_distributed")
@@ -1200,9 +1196,9 @@ async def update_weights_from_distributed(
 
     content = {"success": success, "message": message}
     if success:
-        return ORJSONResponse(content, status_code=200)
+        return JSONResponse(content, status_code=200)
     else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+        return JSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/update_weights_from_ipc")
@@ -1217,9 +1213,9 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
     if success:
         if _global_state.tokenizer_manager.initial_weights_loaded is False:
             _global_state.tokenizer_manager.initial_weights_loaded = True
-        return ORJSONResponse(content)
+        return JSONResponse(content)
     else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+        return JSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/update_weight_version")
@@ -1235,7 +1231,7 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
         # Update the weight version in server args (the single source of truth)
         _global_state.tokenizer_manager.server_args.weight_version = obj.new_version
 
-        return ORJSONResponse(
+        return JSONResponse(
             {
                 "success": True,
                 "message": f"Weight version updated to {obj.new_version}",
@@ -1244,7 +1240,7 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
             status_code=HTTPStatus.OK,
         )
     except Exception as e:
-        return ORJSONResponse(
+        return JSONResponse(
             {
                 "success": False,
                 "message": f"Failed to update weight version: {str(e)}",
@@ -1262,7 +1258,7 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
         if ret is None:
             return _create_error_response("Get parameter by name failed")
         else:
-            return ORJSONResponse(ret, status_code=200)
+            return JSONResponse(ret, status_code=200)
     except Exception as e:
         return _create_error_response(e)
 
@@ -1300,7 +1296,7 @@ async def check_weights(obj: CheckWeightsReqInput, request: Request):
     body = {"success": success, "message": message}
     if ranks is not None:
         body["ranks"] = ranks
-    return ORJSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
+    return JSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
@@ -1324,12 +1320,12 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
 
     if result.success:
-        return ORJSONResponse(
+        return JSONResponse(
             result,
             status_code=HTTPStatus.OK,
         )
     else:
-        return ORJSONResponse(
+        return JSONResponse(
             result,
             status_code=HTTPStatus.BAD_REQUEST,
         )
@@ -1345,9 +1341,9 @@ async def load_lora_adapter_from_tensors(
     )
 
     if result.success:
-        return ORJSONResponse(result, status_code=HTTPStatus.OK)
+        return JSONResponse(result, status_code=HTTPStatus.OK)
     else:
-        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
+        return JSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
@@ -1357,12 +1353,12 @@ async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
 
     if result.success:
-        return ORJSONResponse(
+        return JSONResponse(
             result,
             status_code=HTTPStatus.OK,
         )
     else:
-        return ORJSONResponse(
+        return JSONResponse(
             result,
             status_code=HTTPStatus.BAD_REQUEST,
         )
@@ -1432,7 +1428,7 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
         ],  # Convert pydantic objects to dictionaries
     }
 
-    return ORJSONResponse(content=response_data, status_code=200)
+    return JSONResponse(content=response_data, status_code=200)
 
 
 @app.post("/separate_reasoning")
@@ -1452,7 +1448,7 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
         "text": normal_text,
     }
 
-    return ORJSONResponse(content=response_data, status_code=200)
+    return JSONResponse(content=response_data, status_code=200)
 
 
 @app.post("/pause_generation")
@@ -1460,7 +1456,7 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 async def pause_generation(obj: PauseGenerationReqInput, request: Request):
     """Pause generation."""
     await _global_state.tokenizer_manager.pause_generation(obj)
-    return ORJSONResponse(
+    return JSONResponse(
         content={"message": "Generation paused successfully.", "status": "ok"},
         status_code=200,
     )
@@ -1471,7 +1467,7 @@ async def pause_generation(obj: PauseGenerationReqInput, request: Request):
 async def continue_generation(obj: ContinueGenerationReqInput, request: Request):
     """Continue generation."""
     await _global_state.tokenizer_manager.continue_generation(obj)
-    return ORJSONResponse(
+    return JSONResponse(
         content={"message": "Generation continued successfully.", "status": "ok"},
         status_code=200,
     )
@@ -1500,7 +1496,7 @@ async def openai_v1_chat_completions(
 
 @app.post(
     "/v1/embeddings",
-    response_class=ORJSONResponse,
+    response_class=JSONResponse,
     dependencies=[Depends(validate_json_request)],
 )
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
@@ -1512,7 +1508,7 @@ async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
 
 @app.post(
     "/v1/classify",
-    response_class=ORJSONResponse,
+    response_class=JSONResponse,
     dependencies=[Depends(validate_json_request)],
 )
 async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
@@ -1524,12 +1520,12 @@ async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
 
 @app.post(
     "/v1/tokenize",
-    response_class=ORJSONResponse,
+    response_class=JSONResponse,
     dependencies=[Depends(validate_json_request)],
 )
 @app.post(
     "/tokenize",
-    response_class=ORJSONResponse,
+    response_class=JSONResponse,
     dependencies=[Depends(validate_json_request)],
     include_in_schema=False,
 )
@@ -1542,12 +1538,12 @@ async def openai_v1_tokenize(request: TokenizeRequest, raw_request: Request):
 
 @app.post(
     "/v1/detokenize",
-    response_class=ORJSONResponse,
+    response_class=JSONResponse,
     dependencies=[Depends(validate_json_request)],
 )
 @app.post(
     "/detokenize",
-    response_class=ORJSONResponse,
+    response_class=JSONResponse,
     dependencies=[Depends(validate_json_request)],
     include_in_schema=False,
 )
@@ -1573,7 +1569,7 @@ async def openai_v1_audio_transcriptions(
 ):
     """OpenAI-compatible audio transcription endpoint."""
     if response_format not in ["json", "text", "verbose_json"]:
-        return ORJSONResponse(
+        return JSONResponse(
             content={
                 "error": {
                     "message": "Only 'json', 'text', and 'verbose_json' formats supported"
@@ -1598,7 +1594,7 @@ async def openai_v1_audio_transcriptions(
     )
 
 
-@app.get("/v1/models", response_class=ORJSONResponse)
+@app.get("/v1/models", response_class=JSONResponse)
 async def available_models():
     """Show available models. OpenAI-compatible endpoint."""
     served_model_names = [_global_state.tokenizer_manager.served_model_name]
@@ -1630,13 +1626,13 @@ async def available_models():
     return ModelList(data=model_cards)
 
 
-@app.get("/v1/models/{model:path}", response_class=ORJSONResponse)
+@app.get("/v1/models/{model:path}", response_class=JSONResponse)
 async def retrieve_model(model: str):
     """Retrieves a model instance, providing basic information about the model."""
     served_model_names = [_global_state.tokenizer_manager.served_model_name]
 
     if model not in served_model_names:
-        return ORJSONResponse(
+        return JSONResponse(
             status_code=404,
             content={
                 "error": {
@@ -1820,11 +1816,11 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     ret = await generate_request(req, raw_request)
     if isinstance(ret, Response):
         return ret
-    return ORJSONResponse({"predictions": ret})
+    return JSONResponse({"predictions": ret})
 
 
 def _create_error_response(e):
-    return ORJSONResponse(
+    return JSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
     )
 
@@ -1838,8 +1834,8 @@ def _create_error_response(e):
 # admin endpoints, we should switch this logic to use ADMIN_FORCE directly.
 def _admin_api_key_missing_response(
     status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
-) -> ORJSONResponse:
-    return ORJSONResponse(
+) -> JSONResponse:
+    return JSONResponse(
         content={
             "error": (
                 "This endpoint requires admin API key, but this server was started "
