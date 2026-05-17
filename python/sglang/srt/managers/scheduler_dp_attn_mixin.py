@@ -141,7 +141,7 @@ def prepare_mlp_sync_batch_raw(
     offload_tags: set[str],
 ):
     # Check if other DP workers have running batches
-    if local_batch is None or local_batch.forward_mode.is_prebuilt():
+    if local_batch is None or local_batch.forward_mode.is_prebuilt() or local_batch.forward_mode.is_idle():
         num_tokens = 0
         num_tokens_for_logprob = 0
     elif local_batch.forward_mode.is_decode():
