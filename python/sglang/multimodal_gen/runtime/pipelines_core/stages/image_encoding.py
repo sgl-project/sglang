@@ -20,8 +20,13 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    configure_layerwise_offload_modules,
+)
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.models.vision_utils import (
     normalize,
@@ -485,6 +490,14 @@ class LTX2ImageEncodingStage(PipelineStage):
             safetensors_load_file(weights_path), strict=True
         )
         self._condition_image_encoder_dir = encoder_dir
+        if server_args.should_configure_layerwise_offload_for_lazy_component():
+            modules = {"condition_image_encoder": self._condition_image_encoder}
+            configure_layerwise_offload_modules(
+                modules,
+                server_args,
+                component_names=server_args.layerwise_offload_components,
+                warn_missing=False,
+            )
         return True
 
     # -- image preprocessing ---------------------------------------------
