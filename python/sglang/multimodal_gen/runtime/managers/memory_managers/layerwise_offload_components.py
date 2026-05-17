@@ -34,6 +34,13 @@ VAE_COMPONENT_NAMES = frozenset(
         "condition_image_encoder",
     }
 )
+DEFAULT_LAYERWISE_VAE_COMPONENT_NAMES = frozenset(
+    {
+        "vae",
+        "video_vae",
+        "condition_image_encoder",
+    }
+)
 CPU_OFFLOAD_FLAG_NAMES = (
     "dit_cpu_offload",
     "text_encoder_cpu_offload",
@@ -68,7 +75,8 @@ def layerwise_component_matches_selection(
     if selected_component_name == LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP:
         return is_text_encoder_component_name(component_name)
     if selected_component_name == LAYERWISE_OFFLOAD_VAE_GROUP:
-        return is_vae_component_name(component_name)
+        # `vae` is a default-policy selector; AV-side decoders remain explicit-only
+        return component_name in DEFAULT_LAYERWISE_VAE_COMPONENT_NAMES
     return component_name == selected_component_name
 
 

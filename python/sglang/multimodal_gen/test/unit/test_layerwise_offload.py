@@ -290,6 +290,8 @@ def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypa
     image_encoder = _NestedEncoderDummyModel()
     vae = _NestedEncoderDummyModel()
     audio_vae = _NestedEncoderDummyModel()
+    vocoder = _NestedEncoderDummyModel()
+    spatial_upsampler = _NestedEncoderDummyModel()
     condition_image_encoder = _NestedEncoderDummyModel()
     modules = {
         "text_encoder": text_encoder,
@@ -298,6 +300,8 @@ def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypa
         "image_encoder": image_encoder,
         "vae": vae,
         "audio_vae": audio_vae,
+        "vocoder": vocoder,
+        "spatial_upsampler": spatial_upsampler,
         "condition_image_encoder": condition_image_encoder,
     }
 
@@ -310,7 +314,6 @@ def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypa
         "text_encoder_2",
         "image_encoder",
         "vae",
-        "audio_vae",
         "condition_image_encoder",
     ]
     assert configured == [
@@ -318,7 +321,6 @@ def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypa
         "text_encoder_2",
         "image_encoder",
         "vae",
-        "audio_vae",
         "condition_image_encoder",
     ]
     assert is_layerwise_offloaded_module(text_encoder)
@@ -326,8 +328,21 @@ def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypa
     assert not is_layerwise_offloaded_module(transformer)
     assert is_layerwise_offloaded_module(image_encoder)
     assert is_layerwise_offloaded_module(vae)
-    assert is_layerwise_offloaded_module(audio_vae)
+    assert not is_layerwise_offloaded_module(audio_vae)
+    assert not is_layerwise_offloaded_module(vocoder)
+    assert not is_layerwise_offloaded_module(spatial_upsampler)
     assert is_layerwise_offloaded_module(condition_image_encoder)
+
+    for component_name, module in (
+        ("audio_vae", audio_vae),
+        ("vocoder", vocoder),
+        ("spatial_upsampler", spatial_upsampler),
+    ):
+        configured = configure_layerwise_offload_modules(
+            modules, _server_args(), component_names=[component_name]
+        )
+        assert configured == [component_name]
+        assert is_layerwise_offloaded_module(module)
 
 
 def test_layerwise_configuration_all_selects_every_capable_component(monkeypatch):
