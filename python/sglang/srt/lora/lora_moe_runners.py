@@ -335,25 +335,12 @@ def _add_lora_gate_up_delta(
         merged_experts_fused_moe_lora_add,
     )
 
-    if get_is_capture_mode():
-        # During CUDA graph capture, always enter the LoRA path so that
-        # the LoRA kernels are recorded in the graph.  adapter_enabled is
-        # all-zeros during capture, so the Triton kernel early-exits per
-        # program (zero overhead).  During replay the tensor is updated
-        # in-place with the real adapter mask before graph.replay().
-        has_active_lora = True
-    else:
-        num_loras = len(lora_info.lora_ranks)
-        has_active_lora = (
-            (
-                lora_info.adapter_enabled[:num_loras]
-                * (lora_info.lora_ranks > 0).to(lora_info.adapter_enabled.dtype)
-            )
-            .any()
-            .item()
-        )
-    if not has_active_lora or lora_info is None or lora_info.max_lora_rank == 0:
+    if lora_info is None or lora_info.max_lora_rank == 0:
         return
+    # Always launch the LoRA Triton kernel — it early-exits per program when
+    # adapter_enabled[i] == 0, matching the CUDA-graph-capture behavior.
+    # The previous .any().item() guard forced a cudaStreamSynchronize on every
+    # layer call, creating ~100ms of GPU bubbles across 48 layers.
 
     M, top_k, gate_up_dim = intermediate_cache.shape
     r = lora_info.max_lora_rank
