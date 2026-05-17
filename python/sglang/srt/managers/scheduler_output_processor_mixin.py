@@ -33,6 +33,9 @@ if TYPE_CHECKING:
         ScheduleBatch,
         Scheduler,
     )
+    from sglang.srt.managers.scheduler_components.output_streamer import (
+        SchedulerOutputStreamer,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +50,8 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
-    def _get_storage_backend_type(self) -> str:
+    @staticmethod
+    def _get_storage_backend_type(self: "SchedulerOutputStreamer") -> str:
         """Get storage backend type from tree_cache."""
         storage_backend_type = "none"
         cache_controller = getattr(self.tree_cache, "cache_controller", None)
@@ -57,7 +61,10 @@ class SchedulerOutputProcessorMixin:
                 storage_backend_type = type(storage_backend).__name__
         return storage_backend_type
 
-    def _get_cached_tokens_details(self: Scheduler, req: Req) -> Optional[dict]:
+    @staticmethod
+    def get_cached_tokens_details(
+        self: "SchedulerOutputStreamer", req: Req
+    ) -> Optional[dict]:
         """Get detailed cache breakdown for a request, if available.
 
         Returns:
@@ -75,9 +82,11 @@ class SchedulerOutputProcessorMixin:
                 "host": req.cached_tokens_host,
             }
             # Only include storage fields if L3 storage is enabled
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage():
                 details["storage"] = req.cached_tokens_storage
-                details["storage_backend"] = self._get_storage_backend_type()
+                details["storage_backend"] = (
+                    SchedulerOutputProcessorMixin._get_storage_backend_type(self)
+                )
             return details
 
         if req.cached_tokens > 0:
@@ -103,7 +112,7 @@ class SchedulerOutputProcessorMixin:
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
-        self.stream_output(batch.reqs, batch.return_logprob)
+        self.stream_output(self.output_streamer, batch.reqs, batch.return_logprob)
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
 
@@ -402,7 +411,9 @@ class SchedulerOutputProcessorMixin:
                     req.is_chunked -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        self.stream_output(
+            self.output_streamer, batch.reqs, batch.return_logprob, skip_stream_req
+        )
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.metrics_reporter.report_prefill_stats(
@@ -467,8 +478,8 @@ class SchedulerOutputProcessorMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        self.stream_output_generation(
-            batch.reqs, batch.return_logprob, is_idle_batch=True
+        self._stream_output_generation(
+            self.output_streamer, batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
     def process_batch_result_decode(
@@ -629,7 +640,7 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-        self.stream_output(batch.reqs, batch.return_logprob)
+        self.stream_output(self.output_streamer, batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (
@@ -715,24 +726,28 @@ class SchedulerOutputProcessorMixin:
                         actual_seq_len // mamba_track_interval * mamba_track_interval
                     )
 
+    @staticmethod
     def stream_output(
-        self: Scheduler,
+        self: "SchedulerOutputStreamer",
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
         if self.is_generation:
-            self.stream_output_generation(reqs, return_logprob, skip_req)
+            SchedulerOutputProcessorMixin._stream_output_generation(
+                self, reqs, return_logprob, skip_req
+            )
         else:  # embedding or reward model
-            self.stream_output_embedding(reqs)
+            SchedulerOutputProcessorMixin._stream_output_embedding(self, reqs)
 
         if envs.SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS.get() > 0:
-            self._trigger_crash_for_tests(
-                envs.SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS.get()
+            SchedulerOutputProcessorMixin._trigger_crash_for_tests(
+                self, envs.SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS.get()
             )
 
-    def _trigger_crash_for_tests(self: Scheduler, crash_threshold: int):
+    @staticmethod
+    def _trigger_crash_for_tests(self: "SchedulerOutputStreamer", crash_threshold: int):
         # Crash trigger: crash after stream_output is called N times
         # This is used for testing purposes.
         if not hasattr(self, "_test_stream_output_count"):
@@ -743,8 +758,9 @@ class SchedulerOutputProcessorMixin:
                 f"Test crash after stream_output called {self._test_stream_output_count} times"
             )
 
-    def stream_output_generation(
-        self: Scheduler,
+    @staticmethod
+    def _stream_output_generation(
+        self: "SchedulerOutputStreamer",
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
@@ -772,9 +788,7 @@ class SchedulerOutputProcessorMixin:
         spec_correct_drafts_histogram = []
         retraction_counts = []
         output_hidden_states = None
-        load = self.load_inquirer.get_loads(
-            GetLoadsReqInput(include=["core"]),
-        )
+        load = self.load_inquirer_get_loads(GetLoadsReqInput(include=["core"]))
         routed_experts = None
         indexer_topk = None
         customized_info = {}
@@ -821,7 +835,8 @@ class SchedulerOutputProcessorMixin:
             else:
                 if req.stream:
                     stream_interval = (
-                        req.sampling_params.stream_interval or self.stream_interval
+                        req.sampling_params.stream_interval
+                        or self.server_args.stream_interval
                     )
 
                     # origin stream_interval logic
@@ -872,7 +887,9 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens.append(req.cached_tokens)
 
                 # Collect detailed cache breakdown if available
-                cached_tokens_details.append(self._get_cached_tokens_details(req))
+                cached_tokens_details.append(
+                    SchedulerOutputProcessorMixin.get_cached_tokens_details(self, req)
+                )
 
                 retraction_counts.append(req.retraction_count)
 
@@ -1032,7 +1049,8 @@ class SchedulerOutputProcessorMixin:
                 )
             )
 
-    def stream_output_embedding(self: Scheduler, reqs: List[Req]):
+    @staticmethod
+    def _stream_output_embedding(self: "SchedulerOutputStreamer", reqs: List[Req]):
         rids = []
         http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
@@ -1055,7 +1073,9 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens.append(req.cached_tokens)
 
                 # Collect detailed cache breakdown if available
-                cached_tokens_details.append(self._get_cached_tokens_details(req))
+                cached_tokens_details.append(
+                    SchedulerOutputProcessorMixin.get_cached_tokens_details(self, req)
+                )
                 time_stats.append(req.time_stats)
                 retraction_counts.append(req.retraction_count)
 
