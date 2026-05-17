@@ -2003,7 +2003,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             if self._is_cutedsl_v1_deepep:
                 return
 
-        if not moe_runner_backend.is_flashinfer_cutlass():
+        if (
+            not moe_runner_backend.is_flashinfer_cutlass()
+            and not moe_runner_backend.is_cutlass()
+        ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def apply(
