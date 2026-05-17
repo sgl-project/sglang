@@ -38,7 +38,7 @@ class MLPSyncBatchInfo:
     tp0_info: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
-    tbo_split_seq_index: torch.Tensor = None
+    xbo_split_seq_indices: Optional[list[int]] = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
@@ -121,7 +121,7 @@ def _update_gather_batch(
         )
     if not skip_all_gather:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
-        batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
+        batch.xbo_split_seq_indices = mlp_sync_info.xbo_split_seq_indices
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
     # Check forward mode for cuda graph
@@ -201,7 +201,7 @@ def prepare_mlp_sync_batch_raw(
     if not skip_all_gather:
         mlp_sync_info.all_gather(device=device, group=group)
 
-        mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
+        mlp_sync_info.xbo_split_seq_indices, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
                 mlp_sync_info.tp0_info[:, 4:6],
             )

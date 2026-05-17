@@ -325,14 +325,17 @@ class TboCudaGraphRunnerPlugin:
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
         )
 
-        batch.tbo_split_seq_index = compute_split_seq_index(
+        split_seq_index = compute_split_seq_index(
             forward_mode=batch.forward_mode,
             num_tokens=num_tokens,
             extend_lens=None,
             token_num_per_seq=token_num_per_seq,
         )
+        batch.xbo_split_seq_indices = (
+            [split_seq_index] if split_seq_index is not None else None
+        )
         # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
-        assert batch.tbo_split_seq_index is not None, f"{num_tokens=}"
+        assert batch.xbo_split_seq_indices is not None, f"{num_tokens=}"
 
         self._tbo_children_num_token_non_padded[...] = (
             TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)
@@ -353,12 +356,10 @@ class TboCudaGraphRunnerPlugin:
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=forward_mode, spec_info=spec_info
         )
-        tbo_split_seq_index, tbo_split_token_index = (
-            compute_split_indices_for_cuda_graph_replay(
-                forward_mode=forward_mode,
-                cuda_graph_num_tokens=bs * token_num_per_seq,
-                spec_info=spec_info,
-            )
+        _, tbo_split_token_index = compute_split_indices_for_cuda_graph_replay(
+            forward_mode=forward_mode,
+            cuda_graph_num_tokens=bs * token_num_per_seq,
+            spec_info=spec_info,
         )
 
         self._tbo_children_num_token_non_padded[...] = (
@@ -434,9 +435,11 @@ class TboDPAttentionPreparer:
             and forward_mode_agree
         )
 
-        tbo_split_seq_index = self.local_tbo_split_seq_index if can_run_tbo else None
+        xbo_split_seq_indices = (
+            [self.local_tbo_split_seq_index] if can_run_tbo else None
+        )
         global_forward_mode = global_forward_mode if can_run_tbo else None
-        return tbo_split_seq_index, global_forward_mode
+        return xbo_split_seq_indices, global_forward_mode
 
     @staticmethod
     def _compute_local_forward_mode(local_batch):
@@ -474,7 +477,7 @@ class TboDPAttentionPreparer:
 class TboForwardBatchPreparer:
     @classmethod
     def prepare(cls, batch: ForwardBatch, is_draft_worker: bool = False):
-        if batch.tbo_split_seq_index is None or is_draft_worker:
+        if batch.xbo_split_seq_indices is None or is_draft_worker:
             return
 
         tbo_children_num_token_non_padded = (
@@ -501,7 +504,7 @@ class TboForwardBatchPreparer:
             logger.info(
                 f"TboForwardBatchPreparer.prepare "
                 f"is_enable_two_chunk={is_enable_two_chunk} "
-                f"tbo_split_seq_index={batch.tbo_split_seq_index} "
+                f"xbo_split_seq_indices={batch.xbo_split_seq_indices} "
                 f"tbo_split_token_index={tbo_split_token_index} "
                 f"extend_seq_lens={batch.extend_seq_lens_cpu} "
                 f"bs={batch.batch_size} "
@@ -514,6 +517,7 @@ class TboForwardBatchPreparer:
         [out_num_token_non_padded_a, out_num_token_non_padded_b] = (
             tbo_children_num_token_non_padded
         )
+        tbo_split_seq_index = batch.xbo_split_seq_indices[0]
 
         child_a = cls.filter_batch(
             batch,
@@ -521,9 +525,7 @@ class TboForwardBatchPreparer:
             end_token_index=tbo_split_token_index,
             start_seq_index=0,
             end_seq_index=(
-                batch.tbo_split_seq_index + 1
-                if is_enable_two_chunk
-                else batch.tbo_split_seq_index
+                tbo_split_seq_index + 1 if is_enable_two_chunk else tbo_split_seq_index
             ),
             output_attn_backend=attn_backend_child_a,
             out_num_token_non_padded=out_num_token_non_padded_a,
@@ -532,7 +534,7 @@ class TboForwardBatchPreparer:
             batch,
             start_token_index=tbo_split_token_index,
             end_token_index=batch.input_ids.shape[0],
-            start_seq_index=batch.tbo_split_seq_index,
+            start_seq_index=tbo_split_seq_index,
             end_seq_index=batch.batch_size,
             output_attn_backend=attn_backend_child_b,
             out_num_token_non_padded=out_num_token_non_padded_b,
@@ -543,11 +545,11 @@ class TboForwardBatchPreparer:
                 batch,
                 child_a=child_a,
                 child_b=child_b,
-                tbo_split_seq_index=batch.tbo_split_seq_index,
+                tbo_split_seq_index=tbo_split_seq_index,
             )
 
-        assert batch.tbo_children is None
-        batch.tbo_children = [child_a, child_b]
+        assert batch.xbo_children is None
+        batch.xbo_children = [child_a, child_b]
 
     @classmethod
     def derive_fields_related_to_seq_len_for_two_chunk(
@@ -747,9 +749,9 @@ class TboForwardBatchPreparer:
                 num_token_non_padded=out_num_token_non_padded,
                 # TODO: handle it when we need TBO + DeepSeek V3.2
                 num_token_non_padded_cpu=None,
-                tbo_split_seq_index=None,
-                tbo_parent_token_range=(start_token_index, end_token_index),
-                tbo_children=None,
+                xbo_split_seq_indices=None,
+                xbo_parent_token_range=(start_token_index, end_token_index),
+                xbo_children=None,
                 original_global_num_tokens_cpu=None,
                 global_num_tokens_gpu=None,
                 global_num_tokens_cpu=None,
@@ -805,7 +807,7 @@ class TboForwardBatchPreparer:
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
         )
         return compute_split_token_index(
-            split_seq_index=batch.tbo_split_seq_index,
+            split_seq_index=batch.xbo_split_seq_indices[0],
             forward_mode=batch.forward_mode,
             extend_seq_lens=batch.extend_seq_lens_cpu,
             token_num_per_seq=token_num_per_seq,
@@ -969,7 +971,7 @@ def _model_forward_tbo_split_inputs_raw(
             ),
         )
         for tbo_subbatch_index, output_forward_batch in enumerate(
-            forward_batch.tbo_children
+            forward_batch.xbo_children
         )
     ]
 
@@ -981,7 +983,7 @@ def _model_forward_filter_inputs(
     output_forward_batch: ForwardBatch,
     tbo_subbatch_index: int,
 ) -> Dict:
-    token_slice = slice(*output_forward_batch.tbo_parent_token_range)
+    token_slice = slice(*output_forward_batch.xbo_parent_token_range)
     hidden_states = hidden_states[token_slice]
     residual = None if residual is None else residual[token_slice]
     positions = positions[token_slice]
@@ -1015,8 +1017,8 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
         assert (value_a is None) == (value_b is None)
         if value_a is None:
             return None
-        s0, t0 = output_a["forward_batch"].tbo_parent_token_range
-        s1, t1 = output_b["forward_batch"].tbo_parent_token_range
+        s0, t0 = output_a["forward_batch"].xbo_parent_token_range
+        s1, t1 = output_b["forward_batch"].xbo_parent_token_range
         res = torch.zeros(
             (original_len, *value_a.shape[1:]),
             dtype=value_a.dtype,

@@ -415,10 +415,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mrope_positions: torch.Tensor = None
 
     # For two-batch overlap
-    tbo_split_seq_index: Optional[int] = None
-    tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_padded_len: Optional[int] = None
-    tbo_children: Optional[List[ForwardBatch]] = None
+
+    # For x-batch overlap
+    xbo_split_seq_indices: Optional[List[int]] = None  # len=x-1
+    xbo_parent_token_range: Optional[Tuple[int, int]] = None
+    xbo_children: Optional[List[ForwardBatch]] = None  # len=x
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
@@ -485,7 +487,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
             token_type_ids=batch.token_type_ids,
-            tbo_split_seq_index=batch.tbo_split_seq_index,
+            xbo_split_seq_indices=batch.xbo_split_seq_indices,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
@@ -928,8 +930,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # TODO: The following is added to make sure sub-batch input_ids are padded
         # to the multiple of attn_tp_size. It can likely be removed after this
         # function is refactored and merged into the Scheduler.
-        if self.tbo_children:
-            for child in self.tbo_children:
+        if self.xbo_children:
+            for child in self.xbo_children:
                 child._pad_inputs_to_size(
                     model_runner, child.tbo_padded_len, child.batch_size
                 )
@@ -1082,7 +1084,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     @property
     def can_run_tbo(self):
-        return self.tbo_split_seq_index is not None
+        return self.xbo_split_seq_indices is not None
 
 
 def enable_num_token_non_padded():

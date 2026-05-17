@@ -1432,7 +1432,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_extend_in_batch: bool = False
     all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
-    tbo_split_seq_index: Optional[int] = None
+    xbo_split_seq_indices: Optional[List[int]] = None
     global_forward_mode: Optional[ForwardMode] = None
 
     # For processing logprobs
@@ -2569,7 +2569,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_extend_in_batch=self.is_extend_in_batch,
             all_extend_in_batch=self.all_extend_in_batch,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
-            tbo_split_seq_index=self.tbo_split_seq_index,
+            xbo_split_seq_indices=self.xbo_split_seq_indices,
             global_forward_mode=self.global_forward_mode,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
@@ -2776,7 +2776,7 @@ class ModelWorkerBatch:
     is_extend_in_batch: bool
     all_extend_in_batch: bool
     can_run_dp_cuda_graph: bool
-    tbo_split_seq_index: Optional[int]
+    xbo_split_seq_indices: Optional[List[int]]
     global_forward_mode: Optional[ForwardMode]
 
     # For extend

@@ -25,9 +25,9 @@ class TboAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch"):
         self.primary.init_forward_metadata(forward_batch=forward_batch)
-        if forward_batch.tbo_children is not None:
+        if forward_batch.xbo_children is not None:
             for child, forward_batch_child in zip(
-                self.children, forward_batch.tbo_children, strict=True
+                self.children, forward_batch.xbo_children, strict=True
             ):
                 if forward_batch_child.batch_size > 0:
                     child.init_forward_metadata(forward_batch=forward_batch_child)
