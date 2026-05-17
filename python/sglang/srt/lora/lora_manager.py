@@ -332,6 +332,9 @@ class LoRAManager:
             scalings=scalings,
             use_cuda_graph=use_cuda_graph,
         )
+        self.lora_backend.batch_info.has_active_lora = any(
+            lora_ranks[wi] > 0 for wi in weight_indices
+        )
 
     def update_lora_info(self):
         """
