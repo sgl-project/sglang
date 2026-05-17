@@ -43,6 +43,27 @@ def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
 
 
+def new_pages_for_alloc(allocated_len: int, next_alloc_len: int, page_size: int) -> int:
+    # Exact physical page count for allocating next_alloc_len more tokens on top
+    # of allocated_len. Mirrors the kernel formula in alloc_extend_kernel.
+    if page_size == 1:
+        return next_alloc_len
+    return (
+        ceil_align(allocated_len + next_alloc_len, page_size)
+        - ceil_align(allocated_len, page_size)
+    ) // page_size
+
+
+def new_tokens_for_alloc(
+    allocated_len: int, next_alloc_len: int, page_size: int
+) -> int:
+    if page_size == 1:
+        return next_alloc_len
+    return ceil_align(allocated_len + next_alloc_len, page_size) - ceil_align(
+        allocated_len, page_size
+    )
+
+
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
         return
