@@ -2,17 +2,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.attention.nsa.utils import NSA_DEQUANT_K_CACHE_FAST
-
 
 def dequantize_k_cache(quant_k_cache):
-    if NSA_DEQUANT_K_CACHE_FAST:
-        return _dequantize_k_cache_fast_wrapped(quant_k_cache)
-    else:
-        return _dequantize_k_cache_slow(quant_k_cache)
+    return _dequantize_k_cache_fast_wrapped(quant_k_cache)
 
 
-def _dequantize_k_cache_slow(
+def _dequantize_k_cache_ref(
     quant_k_cache: torch.Tensor,  # (num_blocks, block_size, 1, bytes_per_token)
     dv: int = 512,
     tile_size: int = 128,
@@ -189,10 +184,9 @@ def dequantize_k_cache_paged(
     ), f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
-    total_num_tokens, _ = quant_k_cache.shape
+    # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
+    # Index bounds validated in nsa_backend.init_forward_metadata
     num_tokens = page_table_1_flattened.shape[0]
-    assert num_tokens <= total_num_tokens
-
     assert quant_k_cache.dtype == torch.float8_e4m3fn
     dim_nope = 512
     dim_rope = 64

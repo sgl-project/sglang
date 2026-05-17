@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 import torch
 
 try:
-    from . import flashmla_ops  # triggers TORCH extension registration
+    from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
 except Exception as _e:
     _flashmla_import_error = _e
 else:
@@ -35,6 +35,15 @@ def get_mla_metadata(
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
         num_splits: (batch_size + 1), dtype torch.int32.
     """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+
+    if is_fp8_kvcache and topk is None:
+        return torch.ops.sgl_kernel.get_mla_decoding_metadata_dense_fp8.default(
+            cache_seqlens,
+            num_q_tokens_per_head_k,
+            num_heads_k,
+        )
     return torch.ops.sgl_kernel.get_mla_decoding_metadata.default(
         cache_seqlens,
         num_q_tokens_per_head_k,
@@ -55,6 +64,8 @@ def flash_mla_with_kvcache(
     num_splits: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    descale_q: torch.Tensor | None = None,
+    descale_k: torch.Tensor | None = None,
     is_fp8_kvcache: bool = False,
     indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -69,6 +80,8 @@ def flash_mla_with_kvcache(
         num_splits: (batch_size + 1), torch.int32, returned by get_mla_metadata.
         softmax_scale: float. The scale of QK^T before applying softmax. Default to 1 / sqrt(head_dim).
         causal: bool. Whether to apply causal attention mask.
+        descale_q: (batch_size), torch.float32. Descaling factors for Q, used for fp8 quantization.
+        descale_k: (batch_size), torch.float32. Descaling factors for K, used for fp8 quantization.
         is_fp8_kvcache: bool. Whether the k_cache and v_cache are in fp8 format. For the format of FP8 KV cache, please refer to README.md
         indices: (batch_size, seq_len_q, topk), torch.int32. If not None, sparse attention will be enabled, and only tokens in the `indices` array will be attended to. Invalid indices should be set to -1 or numbers >= total_seq_len_kv. For details about how to set up `indices`, please refer to README.md.
 
@@ -76,23 +89,45 @@ def flash_mla_with_kvcache(
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
         softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32.
     """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if indices is not None:
         assert causal == False, "causal must be `false` if sparse attention is enabled."
-    out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla.default(
-        q,
-        k_cache,
-        head_dim_v,
-        cache_seqlens,
-        block_table,
-        softmax_scale,
-        causal,
-        tile_scheduler_metadata,
-        num_splits,
-        is_fp8_kvcache,
-        indices,
-    )
+    assert (descale_q is None) == (
+        descale_k is None
+    ), "descale_q and descale_k should be both None or both not None"
+
+    if indices is None and q.element_size() == 1:
+        out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_fp8.default(
+            q,
+            k_cache,
+            head_dim_v,
+            cache_seqlens,
+            block_table,
+            softmax_scale,
+            causal,
+            tile_scheduler_metadata,
+            num_splits,
+            descale_q,
+            descale_k,
+        )
+    else:
+        out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla.default(
+            q,
+            k_cache,
+            head_dim_v,
+            cache_seqlens,
+            block_table,
+            softmax_scale,
+            causal,
+            tile_scheduler_metadata,
+            num_splits,
+            is_fp8_kvcache,
+            indices,
+        )
     return out, softmax_lse
 
 
@@ -120,6 +155,9 @@ def flash_mla_sparse_fwd(
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float, 2-based log-sum-exp
     """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+
     results = torch.ops.sgl_kernel.sparse_prefill_fwd.default(
         q, kv, indices, sm_scale, d_v
     )

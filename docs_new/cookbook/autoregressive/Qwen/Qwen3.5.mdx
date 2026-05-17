@@ -1,0 +1,1001 @@
+---
+title: Qwen3.5
+metatags:
+    description: "Deploy Qwen3.5 with SGLang - flagship Qwen model with unified vision-language foundation, hybrid architecture, and scalable reasoning."
+---
+
+import { Qwen35Deployment } from '/src/snippets/autoregressive/qwen35-deployment.jsx'
+
+## 1. Model Introduction
+
+[Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) is the latest flagship model in the Qwen series developed by Alibaba, representing a significant leap forward with unified vision-language foundation, efficient hybrid architecture, and scalable reinforcement learning.
+
+Qwen3.5 features a Gated Delta Networks combined with sparse Mixture-of-Experts architecture (397B total parameters, 17B activated), delivering high-throughput inference with minimal latency. It supports multimodal inputs (text, image, video) and natively handles context lengths of up to 262,144 tokens, extensible to over 1M tokens.
+
+**Key Features:**
+
+- **Unified Vision-Language Foundation**: Early fusion training on multimodal tokens achieves cross-generational parity with Qwen3 and outperforms Qwen3-VL models
+- **Efficient Hybrid Architecture**: Gated Delta Networks + sparse MoE (397B total / 17B active) for high-throughput inference
+- **Hybrid Reasoning**: Thinking mode enabled by default with step-by-step reasoning, can be disabled for direct responses
+- **Tool Calling**: Built-in tool calling support with `qwen3_coder` parser
+- **Multi-Token Prediction (MTP)**: Speculative decoding support for lower latency
+- **201 Language Support**: Expanded multilingual coverage across 201 languages and dialects
+
+**Available Models:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16 (Full precision)</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8 (8-bit Quantized)</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>FP4 (4-bit Quantized)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B-A17B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[Qwen/Qwen3.5-397B-A17B-FP8](https://huggingface.co/Qwen/Qwen3.5-397B-A17B-FP8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[nvidia/Qwen3.5-397B-A17B-NVFP4](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-122B-A10B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[Qwen/Qwen3.5-122B-A10B-FP8](https://huggingface.co/Qwen/Qwen3.5-122B-A10B-FP8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-35B-A3B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[Qwen/Qwen3.5-35B-A3B-FP8](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-FP8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-27B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[Qwen/Qwen3.5-27B-FP8](https://huggingface.co/Qwen/Qwen3.5-27B-FP8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-9B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-4B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-2B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-0.8B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>-</td>
+    </tr>
+  </tbody>
+</table>
+
+**License:** Apache 2.0
+
+## 2. SGLang Installation
+
+SGLang from the main branch is required for Qwen3.5. You can install from source or use a Docker image:
+
+```bash Command
+# Install from source
+uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+
+# Or use Docker (NVIDIA GPUs)
+docker pull lmsysorg/sglang:nightly-dev-20260216-d3bae71e
+
+# Or use Docker (AMD MI300X/MI325X)
+docker pull lmsysorg/sglang:v0.5.9-rocm720-mi30x
+
+# Or use Docker (AMD MI355X)
+docker pull lmsysorg/sglang:v0.5.9-rocm720-mi35x
+```
+
+For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and capabilities.
+
+<Qwen35Deployment />
+
+### 3.2 Configuration Tips
+
+- Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
+- **Mamba Radix Cache**: Qwen3.5's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-scheduler-strategy`:
+  - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage. Required for AMD MI GPUs.
+  - **V2 (`extra_buffer`)**: Enables overlap scheduling and branching point caching with `--mamba-scheduler-strategy extra_buffer --page-size 64`. Requires FLA kernel backend (NVIDIA GPUs only). Trades higher mamba state memory for better throughput. Strictly superior in non-KV-cache-bound scenarios; in KV-cache-bound cases, weigh the overlap scheduling benefit against reduced max concurrency. `--page-size` must satisfy `FLA_CHUNK_SIZE % page_size == 0` or `page_size % FLA_CHUNK_SIZE == 0` (`FLA_CHUNK_SIZE` is currently 64).
+- The `--mem-fraction-static` flag is recommended for optimal memory utilization, adjust it based on your hardware and workload.
+- Context length defaults to 262,144 tokens. If you encounter OOM errors, consider reducing it, but maintain at least 128K to preserve thinking capabilities.
+- To speed up weight loading for this large model, add `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'` to the launch command.
+- **CUDA IPC Transport**: Add `SGLANG_USE_CUDA_IPC_TRANSPORT=1` as an environment variable to use CUDA IPC for transferring multimodal features, significantly improving TTFT (Time To First Token). Note: this consumes additional memory proportional to image size, so you may need to lower `--mem-fraction-static` or `--max-running-requests`.
+- **Multimodal Attention Backend**: Use `--mm-attention-backend fa3` on H100/H200 for better vision performance, or `--mm-attention-backend fa4` on B200/B300.
+- **B200 (FP8)**: Add `--enable-flashinfer-allreduce-fusion` for optimized throughput on Blackwell.
+- For processing large images or videos, you may need to lower `--mem-fraction-static` to leave room for image feature tensors.
+- Hardware requirements:
+    - **BF16**: ~397B parameters require ~800GB of GPU memory for weights.
+        - **H100 (80GB)** requires tp=16 (2 nodes) since each rank needs ~100GB at tp=8.
+        - **H200 (141GB)** runs with tp=8.
+        - **B200 (183GB)** runs with tp=8.
+        - **B300 (275GB)** runs with tp=4.
+        - **MI300X (192GB)** runs with tp=8.
+        - **MI325X (256GB)** runs with tp=4.
+        - **MI355X (288GB)** runs with tp=4.
+    - **FP8**: The FP8 quantized model requires ~400GB for weights, cutting memory in half.
+        - **H100 (80GB)** runs with tp=8.
+        - **H200 (141GB)** runs with tp=4.
+        - **B200 (183GB)** runs with tp=4.
+        - **B300 (275GB)** runs with tp=2.
+        - **MI300X (192GB)** runs with tp=4.
+        - **MI325X (256GB)** runs with tp=2.
+        - **MI355X (288GB)** runs with tp=2.
+    - **FP4**: The FP4 quantized model requires ~250GB for weights, cutting memory by almost 4x. Only compatible with B200/B300 (Blackwell architecture).
+        - **B200 (183GB)** runs with tp=4.
+        - **B300 (275GB)** runs with tp=2.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Memory</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>BF16 TP</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>FP8 TP</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>FP4 TP</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H100</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>80GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>141GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>183GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B300</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>275GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI300X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>192GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI325X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>256GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>288GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
+    </tr>
+  </tbody>
+</table>
+
+<Warning>
+**FP8 KV Cache**: `--kv-cache-dtype fp8_e4m3` quantizes the KV cache to FP8 at runtime. Since these FP8 model checkpoints do not include pre-calibrated KV cache scaling factors, SGLang defaults to a scale of 1.0, which may cause noticeable accuracy degradation on reasoning-heavy tasks. It is not included in the generated commands above; add it manually only if memory constraints require the trade-off.
+</Warning>
+
+## 4. Model Invocation
+
+**NVIDIA:**
+
+Deploy Qwen3.5-397B-A17B with the following command (H200, all features enabled):
+
+```shell Command
+sglang serve \
+  --model-path Qwen/Qwen3.5-397B-A17B \
+  --tp 8 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --speculative-algo NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --mem-fraction-static 0.8 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+**AMD:**
+
+Deploy Qwen3.5-397B-A17B with the following command (MI300X/MI325X/MI355X):
+
+```shell Command
+sglang serve \
+  --model-path Qwen/Qwen3.5-397B-A17B \
+  --tp 8 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --mem-fraction-static 0.8 \
+  --attention-backend triton \
+  --host 0.0.0.0 \
+  --port 30000
+```
+> **Note:** TP8 works on all MI GPUs. For MI325X/MI355X, you can use --tp 4 as the minimum requirement.
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+
+### 4.2 Vision Input
+
+Qwen3.5 supports image and video inputs as a unified vision-language model. Here is an example with an image:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.5-397B-A17B",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://qianwen-res.oss-accelerate.aliyuncs.com/Qwen3.5/demo/CI_Demo/mathv-1327.jpg"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "Describe this image in detail."
+                }
+            ]
+        }
+    ],
+    max_tokens=2048,
+    stream=True
+)
+
+thinking_started = False
+has_thinking = False
+has_answer = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        if delta.content:
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+The user wants a detailed description of the provided image.
+
+1.  **Identify the main components:**
+    *   There is a central square.
+    *   There are four circles of varying sizes.
+
+2.  **Analyze the arrangement and relationships:**
+    *   **The Square:** It's in the middle, oriented upright (sides are vertical and horizontal). It's drawn with a thin black line.
+    *   **The Circles:**
+        *   **Top Right:** A large circle. It overlaps the top right corner of the square. A significant portion of the circle is outside the square, but a chunk of it is inside.
+        *   **Bottom Left:** A large circle, roughly the same size as the top right one. It overlaps the bottom left corner of the square. Again, a chunk is inside, most is outside.
+        *   **Top Left:** A smaller circle. It is positioned near the top left corner of the square. It overlaps the corner slightly.
+        *   **Bottom Right:** A smaller circle, roughly the same size as the top left one. It is positioned near the bottom right corner of the square. It overlaps the corner slightly.
+
+3.  **Synthesize the description:**
+    *   Start with a general overview: A geometric line drawing.
+    *   Describe the central shape: A square.
+    *   Describe the surrounding shapes: Four circles.
+    *   Detail the positioning:
+        *   Two large circles are diagonally opposite (bottom-left and top-right).
+        *   Two smaller circles are diagonally opposite (top-left and bottom-right).
+    *   Describe the interaction/overlap: The shapes are not just touching; they intersect. The lines cross over each other. The square acts as a central anchor. The circles seem to be "orbiting" or clustered around the corners of the square.
+    *   Mention the style: Black lines on a white background. Minimalist. No shading or color.
+
+4.  **Refine the details:**
+    *   Let's look closer at the overlaps.
+    *   **Top Left Circle:** It sits mostly above and to the left of the square's top-left corner. The bottom-right part of this small circle cuts into the square.
+    *   **Top Right Circle:** This is the largest circle (or tied for largest). Its bottom-left quadrant overlaps significantly with the top-right quadrant of the square.
+    *   **Bottom Left Circle:** This is also a large circle. Its top-right quadrant overlaps significantly with the bottom-left quadrant of the square.
+    *   **Bottom Right Circle:** This is a small circle. Its top-left part overlaps with the bottom-right corner of the square.
+
+5.  **Final Polish:** Structure the description logically. Start with the big picture, then break down each element's position relative to the center.
+
+    *   *Drafting the description:* The image shows a black and white line drawing of geometric shapes. In the center is a square. Surrounding it are four circles of two different sizes.
+    *   *Adding detail:* There are two large circles and two small circles.
+    *   *Positioning:*
+        *   A large circle is in the bottom left. It overlaps the bottom-left corner of the square.
+        *   A large circle is in the top right. It overlaps the top-right corner of the square.
+        *   A small circle is in the top left. It overlaps the top-left corner of the square.
+        *   A small circle is in the bottom right. It overlaps the bottom-right corner of the square.
+    *   *Visual style:* The lines are thin and black. The background is white. The shapes are transparent (wireframe style), so you can see the lines of the square through the circles and vice versa where they overlap.
+
+6.  **Final Review against the image:** Does this match? Yes. The description is accurate. The "transparency" point is important because it's a line drawing, not solid shapes. The lines cross.
+
+    *   Wait, let me look really closely at the "Top Left" circle. It actually looks like it's touching the top edge and left edge. It overlaps the corner.
+    *   Let me look at the "Bottom Right" circle. It overlaps the bottom right corner.
+    *   The arrangement creates a sort of diagonal symmetry. Large-Large on one diagonal, Small-Small on the other.
+
+    Let's write the final output based on these observations.
+=============== Content =================
+
+
+Based on the image provided, here is a detailed description:
+
+**Overview**
+The image is a minimalist, black-and-white line drawing featuring geometric shapes. It consists of a central square surrounded by four circles of varying sizes. The lines are thin and black against a plain white background. The shapes are drawn in a "wireframe" style, meaning they are transparent outlines; where shapes overlap, the lines cross over each other rather than one blocking the other.
+
+**Detailed Breakdown**
+
+1.  **The Central Square:**
+    *   There is a single square positioned in the center of the composition. It is oriented upright with vertical and horizontal sides.
+
+2.  **The Circles:**
+    *   There are four circles arranged around the corners of the square. They appear in two distinct sizes: two large circles and two smaller circles.
+    *   **Top Right:** A large circle is positioned at the top right. It overlaps significantly with the top-right corner of the square. A portion of the circle's interior is inside the square's boundary.
+    *   **Bottom Left:** Another large circle (roughly the same size as the top right one) is positioned at the bottom left. It overlaps significantly with the bottom-left corner of the square.
+    *   **Top Left:** A smaller circle is positioned near the top left corner. It overlaps slightly with the top-left corner of the square.
+    *   **Bottom Right:** A smaller circle (roughly the same size as the top left one) is positioned near the bottom right corner. It overlaps slightly with the bottom-right corner of the square.
+
+**Composition**
+The arrangement creates a diagonal symmetry. The two largest circles are on a diagonal from bottom-left to top-right, while the two smallest circles are on a diagonal from top-left to bottom-right. The intersecting lines create a complex web of curves and angles in the center of the image.
+```
+
+### 4.3 Advanced Usage
+
+#### 4.3.1 Reasoning Parser
+
+Qwen3.5 supports Thinking mode **by default**. Enable the reasoning parser during deployment to separate the thinking and content sections. The thinking process is returned via `reasoning_content` in the streaming response.
+
+To disable thinking and use Instruct mode, pass `chat_template_kwargs` at request time:
+
+- **Thinking mode** (default): The model performs step-by-step reasoning before answering. No extra parameters needed.
+- **Instruct mode** (`{"enable_thinking": false}`): The model responds directly without a thinking process.
+
+**Example 1: Thinking Mode (Default)**
+
+Thinking mode is enabled by default. The model will reason step-by-step before answering, and the thinking process is returned via `reasoning_content`:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Thinking mode is enabled by default, no extra parameters needed
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.5-397B-A17B",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    max_tokens=2048,
+    stream=True
+)
+
+# Process the stream
+has_thinking = False
+has_answer = False
+thinking_started = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print answer content
+        if delta.content:
+            # Close thinking section and add content header
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+Thinking Process:
+
+1.  **Analyze the Request:** The user wants to solve a math problem: "What is 15% of 240?" and expects a step-by-step explanation.
+
+2.  **Identify the Core Operation:** The problem asks for a percentage of a number. The formula is: $\text{Percentage} \times \text{Number} = \text{Result}$.
+    *   Percentage: $15\%$
+    *   Number: $240$
+
+3.  **Determine the Steps:**
+    *   Step 1: Convert the percentage to a decimal or fraction.
+    *   Step 2: Multiply the converted value by the number.
+    *   Step 3: Calculate the final result.
+    *   Alternative Step (Mental Math): Break down 15% into 10% + 5%.
+
+4.  **Draft the Explanation (Method 1: Decimal Conversion):**
+    *   Convert $15\%$ to $0.15$.
+    *   Multiply $0.15 \times 240$.
+    *   Calculation: $15 \times 24 = 360$, adjust decimal places $\rightarrow 36.0$.
+
+5.  **Draft the Explanation (Method 2: Fraction Conversion):**
+    *   Convert $15\%$ to $\frac{15}{100}$ or $\frac{3}{20}$.
+    *   Multiply $\frac{3}{20} \times 240$.
+    *   $240 / 20 = 12$.
+    *   $3 \times 12 = 36$.
+
+6.  **Draft the Explanation (Method 3: Breaking it down - often easier for step-by-step):**
+    *   Find 10% of 240.
+    *   Find 5% of 240 (which is half of 10%).
+    *   Add them together.
+    *   10% of 240 = 24.
+    *   5% of 240 = 12.
+    *   $24 + 12 = 36$.
+
+7.  **Select the Best Presentation:** Method 3 is very intuitive for "step-by-step" requests as it shows logical reasoning without heavy multiplication. However, the standard decimal multiplication (Method 1) is the most formal. I will present the standard method clearly, perhaps mentioning the breakdown method as a check or alternative way to understand it. Let's stick to the standard multiplication method for clarity but explain the conversion clearly. Actually, providing the breakdown method is often more helpful for understanding *why*. I'll provide the standard calculation method as the primary steps.
+
+    *   Step 1: Convert percentage to decimal.
+    *   Step 2: Multiply.
+    *   Step 3: State answer.
+
+    Let's refine the calculation for the final output.
+    $15\% = 0.15$
+    $0.15 \times 240$
+    $= \frac{15}{100} \times 240$
+    $= 15 \times 2.4$
+    $= 36$
+
+    Or:
+    $10\% = 24$
+    $5\% = 12$
+    $15\% = 36$
+
+    I will write out the solution using the decimal/fraction multiplication method as it's universally applicable, but I'll make the steps very clear.
+
+8.  **Final Review:** Does this answer the prompt accurately and step-by-step? Yes.
+
+    *   Step 1: Convert 15% to a decimal.
+    *   Step 2: Multiply by 240.
+    *   Step 3: Calculate.
+
+    Let's write it out.
+
+    Step 1: Convert the percentage to a decimal.
+    $15\% = 0.15$
+
+    Step 2: Multiply the decimal by the number.
+    $0.15 \times 240$
+
+    Step 3: Perform the multiplication.
+    $15 \times 240 = 3600$
+    Adjust decimal (2 places): $36.00$
+    Result: 36.
+
+    Wait, $0.15 \times 240$.
+    $15 \times 24 = 360$.
+    One zero from 240 cancels one decimal place?
+    $0.15 \times 240 = 15 \times 2.4 = 36$.
+    Or $\frac{15}{100} \times 240 = \frac{15 \times 240}{100} = \frac{3600}{100} = 36$.
+    This looks correct.
+
+    I will also include the "10% + 5%" method as an alternative way to think about it, as it's often easier for mental math.
+
+    Plan:
+    1. Define the formula.
+    2. Convert percent to decimal/fraction.
+    3. Multiply.
+    4. Provide the alternative mental math method for completeness.
+    5. State final answer clearly.
+
+    Actually, keeping it simple is better. Just one clear path. I'll use the fraction/decimal multiplication path.
+
+    Step 1: Convert 15% to a decimal.
+    Step 2: Multiply 240 by 0.15.
+    Step 3: Final result.
+
+    Let's go.cw
+=============== Content =================
+
+
+Here is the step-by-step solution to find 15% of 240:
+
+**Step 1: Convert the percentage to a decimal.**
+To convert a percentage to a decimal, divide by 100.
+$$15\% = \frac{15}{100} = 0.15$$
+
+**Step 2: Multiply the decimal by the number.**
+Now, multiply 0.15 by 240.
+$$0.15 \times 240$$
+
+**Step 3: Calculate the result.**
+You can think of this as:
+$$15 \times 240 = 3600$$
+Since there are two decimal places in 0.15, move the decimal point in the result two places to the left:
+$$3600 \rightarrow 36.00$$
+
+**Alternative Method (Mental Math):**
+*   Find 10% of 240: $240 \div 10 = 24$
+*   Find 5% of 240 (half of 10%): $24 \div 2 = 12$
+*   Add them together (10% + 5% = 15%): $24 + 12 = 36$
+
+**Answer:**
+15% of 240 is **36**.
+```
+
+**Example 2: Instruct Mode (Thinking Off)**
+
+To disable thinking and get a direct response, pass `{"enable_thinking": false}` via `chat_template_kwargs`:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Disable thinking mode via chat_template_kwargs
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.5-397B-A17B",
+    messages=[
+        {"role": "user", "content": "What is 15% of 240?"}
+    ],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    max_tokens=2048,
+    stream=True
+)
+
+# In Instruct mode, the model responds directly without reasoning_content
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+To find 15% of 240, you can follow these steps:
+
+### Step-by-Step Deduction
+
+1.  **Convert the percentage to a decimal
+**:
+    To convert a percentage to a decimal, divide by 100.
+    $$15\% = \frac{15}{100} = 0.15$$
+
+2.  **Multiply the decimal by the number**:
+    Multiply $0.15$ by $240$.
+    $$0.15 \times 240$$
+
+    *Alternative Method (Mental Math)*:
+    - Find 10% of 240: $240 \times 0.10 = 24$
+    - Find 5% of 240 (which is half of 10%): $24 / 2 = 12$
+    - Add them together ($10\% + 5\% = 15\%$): $24 + 12 = 36$
+
+3.  **Calculation**:
+    $$240 \times 0.15 = 36$$
+
+### Final Conclusion
+15% of 240 is **36**.
+```
+
+#### 4.3.2 Tool Calling
+
+Qwen3.5 supports tool calling capabilities. Enable the tool call parser during deployment. Thinking mode is on by default; to disable it for tool calling requests, pass `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`.
+
+**Python Example (with Thinking Process):**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+# Make request with streaming to see thinking process
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.5-397B-A17B",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools,
+    stream=True
+)
+
+# Process streaming response
+thinking_started = False
+has_thinking = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print tool calls
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            # Close thinking section if needed
+            if has_thinking and thinking_started:
+                print("\n=============== Content =================", flush=True)
+                thinking_started = False
+
+            for tool_call in delta.tool_calls:
+                if tool_call.function:
+                    print(f"Tool Call: {tool_call.function.name}")
+                    print(f"   Arguments: {tool_call.function.arguments}")
+
+        # Print content
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+The user is asking about the weather in Beijing. I have access to a get_weather function that can provide current weather information for a location. Let me check the parameters:
+
+- location (required): "Beijing" - this is provided by the user
+- unit (optional): The user didn't specify a temperature unit, so I won't include this optional parameter
+
+I should call the get_weather function with Beijing as the location.
+
+
+=============== Content =================
+Tool Call: get_weather
+   Arguments:
+Tool Call: None
+   Arguments: {
+Tool Call: None
+   Arguments: "location": "Beijing"
+Tool Call: None
+   Arguments: }
+```
+
+## 5. Benchmark
+
+### 5.1 Accuracy Benchmark
+
+#### 5.1.1 GSM8K Benchmark
+
+- Benchmark Command
+```bash Command
+python3 benchmark/gsm8k/bench_sglang.py --port 30000
+```
+
+- Test Result
+```text Output
+100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████| 200/200 [00:31<00:00,  6.43it/s]
+Accuracy: 0.975
+Invalid: 0.005
+Latency: 31.784 s
+Output throughput: 998.166 token/s
+```
+
+#### 5.1.2 MMMU Benchmark
+
+- Benchmark Command
+```bash Command
+python3 benchmark/mmmu/bench_sglang.py --concurrency 128 --port 30000 --max-new-tokens 512
+```
+
+- Test Result
+```text Output
+{'Accounting': {'acc': 1.0, 'num': 3},
+ 'Agriculture': {'acc': 1.0, 'num': 4},
+ 'Art': {'acc': 1.0, 'num': 9},
+ 'Art_Theory': {'acc': 1.0, 'num': 5},
+ 'Basic_Medical_Science': {'acc': 1.0, 'num': 2},
+ 'Biology': {'acc': 1.0, 'num': 1},
+ 'Chemistry': {'acc': 1.0, 'num': 1},
+ 'Computer_Science': {'acc': 1.0, 'num': 1},
+ 'Design': {'acc': 0.909, 'num': 11},
+ 'Diagnostics_and_Laboratory_Medicine': {'acc': 1.0, 'num': 1},
+ 'Economics': {'acc': 1.0, 'num': 5},
+ 'Finance': {'acc': 1.0, 'num': 2},
+ 'Geography': {'acc': 1.0, 'num': 3},
+ 'History': {'acc': 1.0, 'num': 3},
+ 'Literature': {'acc': 0.938, 'num': 16},
+ 'Manage': {'acc': 1.0, 'num': 2},
+ 'Marketing': {'acc': 1.0, 'num': 5},
+ 'Math': {'acc': 1.0, 'num': 1},
+ 'Overall': {'acc': 0.978, 'num': 91},
+ 'Overall-Art and Design': {'acc': 0.96, 'num': 25},
+ 'Overall-Business': {'acc': 1.0, 'num': 17},
+ 'Overall-Health and Medicine': {'acc': 1.0, 'num': 7},
+ 'Overall-Humanities and Social Science': {'acc': 0.966, 'num': 29},
+ 'Overall-Science': {'acc': 1.0, 'num': 8},
+ 'Overall-Tech and Engineering': {'acc': 1.0, 'num': 5},
+ 'Pharmacy': {'acc': 1.0, 'num': 2},
+ 'Physics': {'acc': 1.0, 'num': 2},
+ 'Psychology': {'acc': 1.0, 'num': 4},
+ 'Public_Health': {'acc': 1.0, 'num': 2},
+ 'Sociology': {'acc': 1.0, 'num': 6}}
+eval out saved to ./val_sglang.json
+Overall accuracy: 0.978
+```
+
+### 5.2 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: H200 (8x)
+- Model: Qwen3.5-397B-A17B
+- Tensor Parallelism: 8
+- SGLang Version: main branch
+
+Server Launch Command:
+```bash Command
+SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \
+  --model Qwen/Qwen3.5-397B-A17B \
+  --tp 8 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --speculative-algo NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --mem-fraction-static 0.8 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+#### 5.3.1 Latency Benchmark
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model Qwen/Qwen3.5-397B-A17B \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  18.94
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4211
+Request throughput (req/s):              0.53
+Input token throughput (tok/s):          322.16
+Output token throughput (tok/s):         222.84
+Peak output token throughput (tok/s):    289.00
+Peak concurrent requests:                3
+Total token throughput (tok/s):          545.00
+Concurrency:                             1.00
+Accept length:                           3.12
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   1892.35
+Median E2E Latency (ms):                 1410.85
+P90 E2E Latency (ms):                    3749.34
+P99 E2E Latency (ms):                    4216.52
+---------------Time to First Token----------------
+Mean TTFT (ms):                          190.40
+Median TTFT (ms):                        208.46
+P99 TTFT (ms):                           261.27
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          3.96
+Median TPOT (ms):                        3.79
+P99 TPOT (ms):                           4.96
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           4.04
+Median ITL (ms):                         3.15
+P95 ITL (ms):                            6.65
+P99 ITL (ms):                            12.60
+Max ITL (ms):                            58.03
+==================================================
+```
+
+#### 5.3.2 Throughput Benchmark
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model Qwen/Qwen3.5-397B-A17B \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 1000 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  283.04
+Total input tokens:                      502493
+Total input text tokens:                 502493
+Total generated tokens:                  500251
+Total generated tokens (retokenized):    498222
+Request throughput (req/s):              3.53
+Input token throughput (tok/s):          1775.37
+Output token throughput (tok/s):         1767.45
+Peak output token throughput (tok/s):    3630.00
+Peak concurrent requests:                108
+Total token throughput (tok/s):          3542.82
+Concurrency:                             96.71
+Accept length:                           3.31
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   27372.05
+Median E2E Latency (ms):                 26660.21
+P90 E2E Latency (ms):                    39951.91
+P99 E2E Latency (ms):                    48405.51
+---------------Time to First Token----------------
+Mean TTFT (ms):                          14247.21
+Median TTFT (ms):                        14932.44
+P99 TTFT (ms):                           20998.45
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          26.16
+Median TPOT (ms):                        26.13
+P99 TPOT (ms):                           41.33
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           26.29
+Median ITL (ms):                         11.38
+P95 ITL (ms):                            72.10
+P99 ITL (ms):                            149.57
+Max ITL (ms):                            1220.68
+==================================================
+```
+
+### 5.3 Vision Speed Benchmark
+
+We use SGLang's built-in benchmarking tool to conduct performance evaluation with random images. Each request has 128 input tokens, two 720p images, and 1024 output tokens.
+
+#### 5.3.1 Latency Benchmark
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen3.5-397B-A17B \
+  --dataset-name image \
+  --image-count 2 \
+  --image-resolution 720p \
+  --random-input-len 128 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```text Output
+TODO
+```
+
+#### 5.3.2 Throughput Benchmark
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen3.5-397B-A17B \
+  --dataset-name image \
+  --image-count 2 \
+  --image-resolution 720p \
+  --random-input-len 128 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+```text Output
+TODO
+```

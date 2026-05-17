@@ -66,6 +66,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM, LongcatFlashMLP
@@ -96,7 +97,7 @@ if _is_cuda:
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from sglang.srt.layers.quantization.awq_triton import (
+    from sglang.srt.layers.quantization.awq.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
 else:
@@ -131,7 +132,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             v_head_dim=config.v_head_dim,
             q_lora_rank=config.q_lora_rank,
             kv_lora_rank=config.kv_lora_rank,
-            rope_theta=config.rope_theta,
+            rope_theta=config.rope_parameters["rope_theta"],
             rope_scaling=None,
             max_position_embeddings=config.max_position_embeddings,
             quant_config=quant_config,
@@ -160,6 +161,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=False,
             is_previous_layer_sparse=False,
+            is_next_layer_sparse=False,
         )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -211,7 +213,7 @@ class LongcatFlashModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -424,10 +426,6 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                 )
                 if _is_hip:
                     self_attn.w_scale *= 2.0
-            # TODO: remove this after adding FP8 support in bmm cpu kernel
-            if _is_cpu and _is_cpu_amx_available and w.dtype == torch.float8_e4m3fn:
-                self_attn.w_kc = self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
-                self_attn.w_vc = self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
         else:
             num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
             num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
@@ -455,11 +453,8 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                 self.config.hidden_size / self.config.kv_lora_rank
             ) ** 0.5
 
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and hasattr(self.quant_config, "weight_block_size")
-            and self.quant_config.weight_block_size is not None
+        if should_deepgemm_weight_requant_ue8m0(
+            weight_block_size=getattr(self.quant_config, "weight_block_size", None)
         ):
             self._weight_requant_ue8m0()
 

@@ -22,9 +22,12 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 
 
-class AutoencoderKL(nn.Module):
+class AutoencoderKL(nn.Module, LayerwiseOffloadableModuleMixin):
     r"""
     A VAE model with KL loss for encoding images into latents and decoding latent representations into images.
 
@@ -59,8 +62,10 @@ class AutoencoderKL(nn.Module):
             mid_block will only have resnet blocks
     """
 
+    layerwise_offload_default_enabled = False
     _supports_gradient_checkpointing = True
     _no_split_modules = ["BasicTransformerBlock", "ResnetBlock2D"]
+    layer_names = ["encoder.down_blocks", "decoder.up_blocks"]
 
     def __init__(
         self,
@@ -544,8 +549,6 @@ class AutoencoderKL(nn.Module):
             sample (`torch.Tensor`): Input sample.
             sample_posterior (`bool`, *optional*, defaults to `False`):
                 Whether to sample from the posterior.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`DecoderOutput`] instead of a plain tuple.
         """
         x = sample
         posterior = self.encode(x).latent_dist

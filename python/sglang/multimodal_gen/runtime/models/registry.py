@@ -37,10 +37,27 @@ _IMAGE_ENCODER_MODELS: dict[str, tuple] = {
     "CLIPVisionModelWithProjection": ("encoders", "clip", "CLIPVisionModel"),
 }
 
+# Global alias mapping: external_path -> canonical_class_name
+_ALIAS_TO_MODEL: dict[str, str] = {}
+
+
+def _parse_aliases_from_ast(value_node: ast.expr) -> list[str]:
+    """Parse _aliases list from AST node."""
+    aliases = []
+    if isinstance(value_node, (ast.List, ast.Tuple)):
+        for elt in value_node.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                aliases.append(elt.value)
+    return aliases
+
 
 @lru_cache(maxsize=None)
 def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
-    discovered_models = _IMAGE_ENCODER_MODELS
+    discovered_models = dict(_IMAGE_ENCODER_MODELS)
+
+    # Collect class definitions with their _aliases
+    class_aliases: dict[str, list[str]] = {}
+
     for component in COMPONENT_DIRS:
         component_path = os.path.join(MODELS_PATH, component)
         for filename in os.listdir(component_path):
@@ -57,7 +74,25 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
                 entry_class_node = None
                 first_class_def = None
 
+                # Collect all class definitions and their _aliases
+                file_class_aliases: dict[str, list[str]] = {}
                 for node in ast.walk(tree):
+                    if isinstance(node, ast.ClassDef):
+                        if first_class_def is None:
+                            first_class_def = node
+                        # Look for _aliases in the class body
+                        for class_body_node in node.body:
+                            if isinstance(class_body_node, ast.Assign):
+                                for target in class_body_node.targets:
+                                    if (
+                                        isinstance(target, ast.Name)
+                                        and target.id == "_aliases"
+                                    ):
+                                        aliases = _parse_aliases_from_ast(
+                                            class_body_node.value
+                                        )
+                                        if aliases:
+                                            file_class_aliases[node.name] = aliases
                     if isinstance(node, ast.Assign):
                         for target in node.targets:
                             if (
@@ -66,8 +101,7 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
                             ):
                                 entry_class_node = node
                                 break
-                    if first_class_def is None and isinstance(node, ast.ClassDef):
-                        first_class_def = node
+
                 if entry_class_node and first_class_def:
                     model_cls_name_list = []
                     value_node = entry_class_node.value
@@ -95,14 +129,29 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
                                 mod_relname,
                                 model_cls_str,
                             )
+                            # Collect aliases for this class
+                            if model_cls_str in file_class_aliases:
+                                class_aliases[model_cls_str] = file_class_aliases[
+                                    model_cls_str
+                                ]
 
             except Exception as e:
                 logger.warning(f"Could not parse {filepath} to find models: {e}")
 
+    # Build alias -> canonical class name mapping
+    for class_name, aliases in class_aliases.items():
+        for alias in aliases:
+            if alias in _ALIAS_TO_MODEL:
+                logger.warning(
+                    f"Alias '{alias}' already registered for '{_ALIAS_TO_MODEL[alias]}', "
+                    f"will be overwritten by '{class_name}'"
+                )
+            _ALIAS_TO_MODEL[alias] = class_name
+
     return discovered_models
 
 
-_SGL_DIFFUSION_MODELS = _discover_and_register_models()
+_SGLANG_DIFFUSION_MODELS = _discover_and_register_models()
 
 _SUBPROCESS_COMMAND = [
     sys.executable,
@@ -237,10 +286,17 @@ def _try_inspect_model_cls(
 @dataclass
 class _ModelRegistry:
     # Keyed by model_arch
-    models: dict[str, _BaseRegisteredModel] = field(default_factory=dict)
+    registered_models: dict[str, _BaseRegisteredModel] = field(default_factory=dict)
 
     def get_supported_archs(self) -> Set[str]:
-        return self.models.keys()
+        return self.registered_models.keys()
+
+    def resolve_by_alias(self, alias: str) -> type[nn.Module] | None:
+        """Resolve a model class by its alias (external module path)."""
+        if alias in _ALIAS_TO_MODEL:
+            canonical_name = _ALIAS_TO_MODEL[alias]
+            return self._try_load_model_cls(canonical_name)
+        return None
 
     def register_model(
         self,
@@ -258,7 +314,7 @@ class _ModelRegistry:
           when importing the model and thus the related error
           :code:`RuntimeError: Cannot re-initialize CUDA in forked subprocess`.
         """
-        if model_arch in self.models:
+        if model_arch in self.registered_models:
             logger.warning(
                 "Model architecture %s is already registered, and will be "
                 "overwritten by the new model class %s.",
@@ -276,7 +332,7 @@ class _ModelRegistry:
         else:
             model = _RegisteredModel.from_model_cls(model_cls)
 
-        self.models[model_arch] = model
+        self.registered_models[model_arch] = model
 
     def _raise_for_unsupported(self, architectures: list[str]) -> NoReturn:
         all_supported_archs = self.get_supported_archs()
@@ -293,16 +349,16 @@ class _ModelRegistry:
         )
 
     def _try_load_model_cls(self, model_arch: str) -> type[nn.Module] | None:
-        if model_arch not in self.models:
+        if model_arch not in self.registered_models:
             return None
 
-        return _try_load_model_cls(model_arch, self.models[model_arch])
+        return _try_load_model_cls(model_arch, self.registered_models[model_arch])
 
     def _try_inspect_model_cls(self, model_arch: str) -> _ModelInfo | None:
-        if model_arch not in self.models:
+        if model_arch not in self.registered_models:
             return None
 
-        return _try_inspect_model_cls(model_arch, self.models[model_arch])
+        return _try_inspect_model_cls(model_arch, self.registered_models[model_arch])
 
     def _normalize_archs(
         self,
@@ -314,13 +370,13 @@ class _ModelRegistry:
             logger.warning("No model architectures are specified")
 
         normalized_arch = []
-        for model in architectures:
-            if model not in self.models:
+        for arch in architectures:
+            if arch not in self.registered_models:
+                registered_models = list(self.registered_models.keys())
                 raise Exception(
-                    f"Unsupported model architecture: {model}. Registered architectures: {architectures}"
+                    f"Unsupported model architecture: {arch}. Registered architectures: {registered_models}"
                 )
-                model = "TransformersModel"
-            normalized_arch.append(model)
+            normalized_arch.append(arch)
         return normalized_arch
 
     def inspect_model_cls(
@@ -361,6 +417,6 @@ ModelRegistry = _ModelRegistry(
             component_name,
             mod_relname,
             cls_name,
-        ) in _SGL_DIFFUSION_MODELS.items()
+        ) in _SGLANG_DIFFUSION_MODELS.items()
     }
 )

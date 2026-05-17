@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/quant_utils.py
 
 from __future__ import annotations
@@ -43,6 +45,26 @@ def get_scalar_types():
 ScalarType, scalar_types = get_scalar_types()
 
 
+def _module_path_match(ignored: str, prefix: str) -> bool:
+    # Match on dotted module-path boundaries so that `mlp.gate` does NOT
+    # match `mlp.gate_up_proj`. Needed for quant configs (e.g. Qwen3.6-FP8)
+    # whose `modules_to_not_convert` lists MoE-template names like `mlp.gate`
+    # that collide with fused dense MLP names by plain substring.
+    if ignored == prefix:
+        return True
+    if prefix.startswith(ignored + "."):
+        return True
+    return ("." + ignored + ".") in ("." + prefix + ".")
+
+
+# Known fused-linear -> shard names. Used as a fallback when the quant
+# config doesn't ship packed_modules_mapping (typical for HF FP8 configs).
+_FALLBACK_FUSED_SHARDS: Mapping[str, List[str]] = {
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    "gate_up_proj": ["gate_proj", "up_proj"],
+}
+
+
 def is_layer_skipped(
     prefix: str,
     ignored_layers: List[str],
@@ -56,15 +78,20 @@ def is_layer_skipped(
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
     # each shard of the fused layer has the same scheme.
-    if proj_name in fused_mapping:
+    effective_fused = (
+        fused_mapping if proj_name in fused_mapping else _FALLBACK_FUSED_SHARDS
+    )
+    if proj_name in effective_fused:
         shard_prefixes = [
             prefix.replace(proj_name, shard_proj_name)
-            for shard_proj_name in fused_mapping[proj_name]
+            for shard_proj_name in effective_fused[proj_name]
         ]
 
         is_skipped = None
         for shard_prefix in shard_prefixes:
-            is_shard_skipped = shard_prefix in ignored_layers
+            is_shard_skipped = any(
+                _module_path_match(ignored, shard_prefix) for ignored in ignored_layers
+            )
 
             if is_skipped is None:
                 is_skipped = is_shard_skipped
@@ -75,19 +102,21 @@ def is_layer_skipped(
                     "to have the same precision."
                 )
     else:
-        is_skipped = prefix in ignored_layers
+        is_skipped = any(
+            _module_path_match(ignored, prefix) for ignored in ignored_layers
+        )
         if "gate_up_proj" in prefix:
             prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
             prefix_up = prefix.replace("gate_up_proj", "up_proj")
             if prefix_gate in ignored_layers and prefix_up in ignored_layers:
                 is_skipped = True
         elif "experts" in prefix:
-            is_skipped = any(
-                [
-                    prefix in layer_name
-                    for layer_name in ignored_layers
-                    if "experts" in layer_name
-                ]
+            # Expert names can include full module paths; keep coarse prefix matches
+            # (e.g., "model.layers.{i}.") while also checking expert-specific entries.
+            is_skipped = is_skipped or any(
+                prefix in layer_name
+                for layer_name in ignored_layers
+                if "experts" in layer_name
             )
 
     assert is_skipped is not None
@@ -560,4 +589,180 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
         q_w.to(device=orig_device),
         g_idx.to(device=orig_device),
         sort_indices.to(device=orig_device),
+    )
+
+
+def swizzle_blockscale(scale: torch.Tensor):
+    """
+    Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
+    """
+    assert scale.dtype == torch.float8_e4m3fn
+    # Pad and blockwise interleave weight_scale
+    scale_ndim = scale.ndim
+    if scale.ndim == 2:
+        scale = scale.unsqueeze(0)
+    assert scale.ndim == 3
+    B, M, K = scale.shape
+    round_up_multiple = lambda x, m: (x + m - 1) // m * m
+    M_padded = round_up_multiple(M, 128)
+    K_padded = round_up_multiple(K, 4)
+    padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
+    padded_scale[:B, :M, :K] = scale
+    batches, rows, cols = padded_scale.shape
+    assert rows % 128 == 0
+    assert cols % 4 == 0
+    padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
+    swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
+    swizzled_scale = swizzled_scale.contiguous().cuda()
+    return (
+        swizzled_scale.reshape(M_padded, K_padded)
+        if scale_ndim == 2
+        else swizzled_scale.reshape(B, M_padded, K_padded)
+    )
+
+
+def swap_w13_to_w31(x: torch.Tensor) -> torch.Tensor:
+    return (
+        x.reshape(-1, 2, x.shape[-2] // 2, x.shape[-1]).flip(dims=[1]).reshape(x.shape)
+    )
+
+
+def reorder_w1w3_to_w3w1(
+    weight: torch.Tensor, scale: torch.Tensor, dim: int = -2
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Re-order the concatenated `[w1, w3]` tensors to `[w3, w1]`"""
+    size = weight.size(dim)
+    assert size % 2 == 0, f"Expected even size in dim {dim}, got {size}"
+    half = size // 2
+
+    w1, w3 = weight.split(half, dim=dim)
+    s1, s3 = scale.split(half, dim=dim)
+
+    return (
+        torch.cat([w3, w1], dim=dim).contiguous(),
+        torch.cat([s3, s1], dim=dim).contiguous(),
+    )
+
+
+def prepare_static_weights_for_trtllm_fp4_moe(
+    gemm1_weights,
+    gemm2_weights,
+    gemm1_scales_linear_fp4_bytes,
+    gemm2_scales_linear_fp4_bytes,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+    is_gated: bool = True,
+):
+    from flashinfer import nvfp4_block_scale_interleave
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+    """Prepare quantized weights for kernel (done offline with weights)."""
+    _cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
+    epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
+
+    gemm1_rows = (2 if is_gated else 1) * intermediate_size
+
+    # Convert quantized weights to proper formats
+    gemm1_weights_fp4 = gemm1_weights.view(torch.float8_e4m3fn).reshape(
+        num_experts, gemm1_rows, hidden_size // 2
+    )  # packed fp4
+    gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
+        torch.float8_e4m3fn
+    ).reshape(
+        num_experts, gemm1_rows, hidden_size // 16
+    )  # fp8 scaling factors
+
+    gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
+        num_experts, hidden_size, intermediate_size // 2
+    )  # packed fp4
+    gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
+        torch.float8_e4m3fn
+    ).reshape(
+        num_experts, hidden_size, intermediate_size // 16
+    )  # fp8 scaling factors
+
+    gemm1_weights_fp4_shuffled = []
+    gemm1_scales_fp4_shuffled = []
+    gemm2_weights_fp4_shuffled = []
+    gemm2_scales_fp4_shuffled = []
+    for i in range(num_experts):
+        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+            _cache_permute_indices,
+            gemm1_weights_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
+        )
+        gemm1_weights_fp4_shuffled.append(
+            gemm1_weights_fp4[i]
+            .view(torch.uint8)[permute_indices.to(gemm1_weights_fp4.device)]
+            .contiguous()
+        )
+
+        permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
+            _cache_permute_indices,
+            gemm1_scales_linear_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+            is_gated_act_gemm=is_gated,
+        )
+        gemm1_scales_fp4_shuffled.append(
+            nvfp4_block_scale_interleave(
+                gemm1_scales_linear_fp4[i]
+                .view(torch.uint8)[
+                    permute_sf_indices.to(gemm1_scales_linear_fp4.device)
+                ]
+                .contiguous()
+            )
+        )
+
+        permute_indices = get_w2_permute_indices_with_cache(
+            _cache_permute_indices,
+            gemm2_weights_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+        )
+        gemm2_weights_fp4_shuffled.append(
+            gemm2_weights_fp4[i]
+            .view(torch.uint8)[permute_indices.to(gemm2_weights_fp4.device)]
+            .contiguous()
+        )
+
+        permute_sf_indices = get_w2_permute_indices_with_cache(
+            _cache_permute_indices,
+            gemm2_scales_linear_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+        )
+        gemm2_scales_fp4_shuffled.append(
+            nvfp4_block_scale_interleave(
+                gemm2_scales_linear_fp4[i]
+                .view(torch.uint8)[
+                    permute_sf_indices.to(gemm2_scales_linear_fp4.device)
+                ]
+                .contiguous()
+            )
+        )
+
+    # Stack weights for all experts
+    gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
+    gemm1_scales_fp4_shuffled = (
+        torch.stack(gemm1_scales_fp4_shuffled)
+        .view(torch.float8_e4m3fn)
+        .reshape(num_experts, gemm1_rows, hidden_size // 16)
+    )
+
+    gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
+    gemm2_scales_fp4_shuffled = (
+        torch.stack(gemm2_scales_fp4_shuffled)
+        .view(torch.float8_e4m3fn)
+        .reshape(num_experts, hidden_size, intermediate_size // 16)
+    )
+    return (
+        gemm1_weights_fp4_shuffled,
+        gemm1_scales_fp4_shuffled,
+        gemm2_weights_fp4_shuffled,
+        gemm2_scales_fp4_shuffled,
     )

@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.utils.common import is_npu
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -55,6 +58,15 @@ class AttentionBackend(ABC):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
+    def on_after_cuda_graph_warmup(self):
+        """Hook between cuda graph warmup pass and the actual capture.
+
+        Override to undo state that warmup mutated or eagerly advanced
+        (e.g. dirty metadata buffers, raw->full upgrades) before capture
+        freezes the kernel pointers.
+        """
+        pass
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers of verify attention kernels that needs to be filled after draft.
@@ -74,6 +86,7 @@ class AttentionBackend(ABC):
         """
         raise NotImplementedError()
 
+    @debug_kernel_api
     def forward(
         self,
         q: torch.Tensor,
@@ -89,6 +102,16 @@ class AttentionBackend(ABC):
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
+        elif forward_batch.forward_mode.is_mixed() and is_npu():
+            return self.forward_mixed(
                 q,
                 k,
                 v,
@@ -116,6 +139,7 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run a forward for decode."""
         raise NotImplementedError()
@@ -128,8 +152,21 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run a forward for extend."""
+        raise NotImplementedError()
+
+    def forward_mixed(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        """Run a forward for mix."""
         raise NotImplementedError()
 
     def support_triton(self):

@@ -19,6 +19,10 @@ SGLang HiCache extends the traditional RadixAttention with a three-tier hierarch
 --hicache-storage-backend             # Optional storage backend (e.g., hf3fs, mooncake, etc.)
 ```
 
+Notes:
+
+- Besides configuring `--hicache-storage-backend` at startup, SGLang also supports **runtime attach/detach** of the HiCache storage backend (no restart required) via HTTP admin endpoints. See [Runtime Attach/Detach HiCache Storage Backend](hicache_storage_runtime_attach_detach.md).
+
 ## Key Configurations with Storage Backends Enabled
 
 ### Memory Layout Optimization
@@ -34,6 +38,23 @@ SGLang HiCache extends the traditional RadixAttention with a three-tier hierarch
 **Layout Compatibility:**
 - `page_first`: Only compatible with `kernel` I/O backend, automatically switches to `layer_first` with `direct` backend
 - `page_first_direct`: Specifically designed for `direct` I/O backend with optimized memory organization
+
+### Heterogeneous TP Support (GQA/MHA models)
+
+HiCache storage supports cross-cluster KV reuse when different deployments use different TP sizes (for example, `tp=4` and `tp=8`) and share the same storage backend namespace.
+
+Use `tp_lcm_size` in `--hicache-storage-backend-extra-config`:
+
+```bash
+# Example: heterogeneous TP = {4, 8}, so lcm = 8
+--hicache-storage-backend-extra-config '{"tp_lcm_size": 8}'
+```
+
+Guidelines:
+
+- Set `tp_lcm_size` to the least common multiple (LCM) of all TP sizes that will share the same HiCache storage.
+- For MHA models with Mooncake and `page_head` layout, HiCache will split head shards based on `tp_lcm_size` to make keys reusable across heterogeneous TP deployments.
+- If all clusters use the same TP size, this option is not needed.
 
 ### Prefetch Policies
 
@@ -182,6 +203,7 @@ python3 -m sglang.launch_server \
   - `backend_name`: Custom backend identifier
   - `module_path`: Python module path to your implementation
   - `class_name`: Your HiCache implementation class name
+  - `interface_v1`: 0 (disable) or 1 (enable) to control usage of batch_get_v1 and batch_set_v1 methods
 
 
 ## Community and Support

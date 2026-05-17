@@ -1,7 +1,7 @@
 import logging
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils.common import is_blackwell
+from sglang.srt.utils.common import is_blackwell, is_musa
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +18,16 @@ class DraftBackendFactory:
         self.draft_model_runner = draft_model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self.draft_attn_backend = server_args.speculative_draft_attention_backend
 
     def _create_backend(
         self, backend_name: str, backend_map: dict, error_template: str
     ):
-        backend_type = getattr(self.server_args, backend_name)
+        backend_type = (
+            self.draft_attn_backend
+            if self.draft_attn_backend
+            else getattr(self.server_args, backend_name)
+        )
         if backend_type is None:
             backend_type = self.server_args.attention_backend
 
@@ -48,8 +53,11 @@ class DraftBackendFactory:
             "flashmla": self._create_flashmla_decode_backend,
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
+            "tokenspeed_mla": self._create_tokenspeed_mla_decode_backend,
             "nsa": self._create_nsa_decode_backend,
             "ascend": self._create_ascend_decode_backend,
+            "fa4": self._create_fa4_decode_backend,
+            "dsv4": self._create_dsv4_decode_backend,
         }
 
         return self._create_backend(
@@ -72,8 +80,11 @@ class DraftBackendFactory:
             "flashmla": self._create_flashmla_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
+            "tokenspeed_mla": self._create_tokenspeed_mla_prefill_backend,
             "nsa": self._create_nsa_prefill_backend,
             "ascend": self._create_ascend_prefill_backend,
+            "fa4": self._create_fa4_prefill_backend,
+            "dsv4": self._create_dsv4_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"
@@ -134,14 +145,28 @@ class DraftBackendFactory:
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
-    def _create_fa3_decode_backend(self):
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionMultiStepBackend,
-        )
+    def _create_fa_decode_backend(self, fa_impl_ver: int = 3):
+        if not is_musa():
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionMultiStepBackend,
+            )
+        else:
+            from sglang.srt.hardware_backend.musa.attention.flashattention_backend import (
+                MusaFlashAttentionMultiStepBackend as FlashAttentionMultiStepBackend,
+            )
 
         return FlashAttentionMultiStepBackend(
-            self.draft_model_runner, self.topk, self.speculative_num_steps
+            self.draft_model_runner,
+            self.topk,
+            self.speculative_num_steps,
+            fa_impl_ver=fa_impl_ver,
         )
+
+    def _create_fa3_decode_backend(self):
+        return self._create_fa_decode_backend(fa_impl_ver=3)
+
+    def _create_fa4_decode_backend(self):
+        return self._create_fa_decode_backend(fa_impl_ver=4)
 
     def _create_flashmla_decode_backend(self):
         from sglang.srt.layers.attention.flashmla_backend import (
@@ -175,12 +200,35 @@ class DraftBackendFactory:
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
+    def _create_tokenspeed_mla_decode_backend(self):
+        if not get_global_server_args().use_mla_backend:
+            raise ValueError(
+                "tokenspeed_mla backend requires MLA model (use_mla_backend=True)."
+            )
+
+        from sglang.srt.layers.attention.tokenspeed_mla_backend import (
+            TokenspeedMLAMultiStepDraftBackend,
+        )
+
+        return TokenspeedMLAMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
     def _create_ascend_decode_backend(self):
-        from sglang.srt.layers.attention.ascend_backend import (
+        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
             AscendAttnMultiStepDraftBackend,
         )
 
         return AscendAttnMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_dsv4_decode_backend(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4MultiStepBackend,
+        )
+
+        return DeepseekV4MultiStepBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
@@ -208,12 +256,24 @@ class DraftBackendFactory:
 
         return AiterAttnBackend(self.draft_model_runner, skip_prefill=False)
 
-    def _create_fa3_prefill_backend(self):
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionBackend,
+    def _create_fa_prefill_backend(self, fa_impl_ver: int = 3):
+        if not is_musa():
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+        else:
+            from sglang.srt.hardware_backend.musa.attention.flashattention_backend import (
+                MusaFlashAttentionBackend as FlashAttentionBackend,
+            )
+        return FlashAttentionBackend(
+            self.draft_model_runner, skip_prefill=False, fa_impl_ver=fa_impl_ver
         )
 
-        return FlashAttentionBackend(self.draft_model_runner, skip_prefill=False)
+    def _create_fa3_prefill_backend(self):
+        return self._create_fa_prefill_backend(fa_impl_ver=3)
+
+    def _create_fa4_prefill_backend(self):
+        return self._create_fa_prefill_backend(fa_impl_ver=4)
 
     def _create_trtllm_mha_prefill_backend(self):
         from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
@@ -230,8 +290,22 @@ class DraftBackendFactory:
 
         return TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False)
 
+    def _create_tokenspeed_mla_prefill_backend(self):
+        if not get_global_server_args().use_mla_backend:
+            raise ValueError(
+                "tokenspeed_mla backend requires MLA model (use_mla_backend=True)."
+            )
+
+        from sglang.srt.layers.attention.tokenspeed_mla_backend import (
+            TokenspeedMLABackend,
+        )
+
+        return TokenspeedMLABackend(self.draft_model_runner, skip_prefill=False)
+
     def _create_ascend_prefill_backend(self):
-        from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+        from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+            AscendAttnBackend,
+        )
 
         return AscendAttnBackend(self.draft_model_runner)
 
@@ -240,3 +314,10 @@ class DraftBackendFactory:
             "flashmla prefill backend is not yet supported for draft extend."
         )
         return None
+
+    def _create_dsv4_prefill_backend(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        return DeepseekV4AttnBackend(self.draft_model_runner, skip_prefill=False)

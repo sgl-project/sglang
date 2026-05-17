@@ -26,7 +26,6 @@ class SelfForcingFlowMatchSchedulerOutput(BaseOutput):
 
 
 class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
-
     config_name = "scheduler_config.json"
     order = 1
 
@@ -41,7 +40,8 @@ class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         inverse_timesteps=False,
         extra_one_step=False,
         reverse_sigmas=False,
-        training=False,
+        *args,
+        **kwargs,
     ):
         self.num_train_timesteps = num_train_timesteps
         self.shift = shift
@@ -50,13 +50,12 @@ class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         self.inverse_timesteps = inverse_timesteps
         self.extra_one_step = extra_one_step
         self.reverse_sigmas = reverse_sigmas
-        self.set_timesteps(num_inference_steps, training=training)
+        self.set_timesteps(num_inference_steps)
 
     def set_timesteps(
         self,
         num_inference_steps=100,
         denoising_strength=1.0,
-        training=False,
         return_dict=False,
         **kwargs,
     ):
@@ -77,14 +76,6 @@ class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         if self.reverse_sigmas:
             self.sigmas = 1 - self.sigmas
         self.timesteps = self.sigmas * self.num_train_timesteps
-        if training:
-            x = self.timesteps
-            y = torch.exp(
-                -2 * ((x - num_inference_steps / 2) / num_inference_steps) ** 2
-            )
-            y_shifted = y - y.min()
-            bsmntw_weighing = y_shifted * (num_inference_steps / y_shifted.sum())
-            self.linear_timesteps_weights = bsmntw_weighing
 
     def step(
         self,
@@ -138,27 +129,6 @@ class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1)
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample.type_as(noise)
-
-    def training_target(self, sample, noise, timestep):
-        target = noise - sample
-        return target
-
-    def training_weight(self, timestep):
-        """
-        Input:
-            - timestep: the timestep with shape [B*T]
-        Output: the corresponding weighting [B*T]
-        """
-        if timestep.ndim == 2:
-            timestep = timestep.flatten(0, 1)
-        self.linear_timesteps_weights = self.linear_timesteps_weights.to(
-            timestep.device
-        )
-        timestep_id = torch.argmin(
-            (self.timesteps.unsqueeze(1) - timestep.unsqueeze(0)).abs(), dim=0
-        )
-        weights = self.linear_timesteps_weights[timestep_id]
-        return weights
 
     def scale_model_input(
         self, sample: torch.Tensor, timestep: int | None = None

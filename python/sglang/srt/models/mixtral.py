@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -208,7 +210,7 @@ class MixtralDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         # Requires transformers > 4.32.0
-        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_theta = config.rope_parameters["rope_theta"]
         self.self_attn = MixtralAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -353,6 +355,7 @@ class MixtralForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

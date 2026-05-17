@@ -36,8 +36,9 @@ def eval_mmmu(args):
         try:
             # check if the model is belongs to internvl
             if "InternVL" in args.model_path:
-                from internvl_utils import load_image
                 from transformers import AutoTokenizer
+
+                from sglang.srt.multimodal.internvl_utils import image_to_pixel_values
 
                 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
                 model = AutoModel.from_pretrained(
@@ -69,6 +70,10 @@ def eval_mmmu(args):
     )
 
     samples = prepare_samples(eval_args)
+    if getattr(args, "limit", None):
+        total = len(samples)
+        samples = samples[: args.limit]
+        print(f"--limit {args.limit}: keeping {len(samples)} of {total} samples")
     out_samples = dict()
 
     answer_dict = {}
@@ -80,7 +85,11 @@ def eval_mmmu(args):
         assert image is not None
 
         if "InternVL" in args.model_path:
-            pixel_values = load_image(sample["image_path"]).to(torch.bfloat16).cuda()
+            image = PIL.Image.open(sample["image_path"]).convert("RGB")
+            pixel_values = image_to_pixel_values(
+                image, input_size=448, max_num=12, use_thumbnail=True
+            )
+            pixel_values = pixel_values.to(device="cuda", dtype=torch.bfloat16)
             contents = ""
             if prefix:
                 contents += prefix
@@ -90,7 +99,7 @@ def eval_mmmu(args):
             response = model.chat(
                 tokenizer, pixel_values, contents, generation_config_internvl
             )
-            print(f"response: {response}")
+            sample["original_response"] = response
             process_result(response, sample, answer_dict, out_samples)
             continue
 
@@ -138,7 +147,7 @@ def eval_mmmu(args):
                 generate_audio=False,
                 temperature=0.0,
             )
-        print(f"response: {response}")
+        sample["original_response"] = response
         process_result(response, sample, answer_dict, out_samples)
 
     args.output_path = f"{args.model_path}_answer_hf.json"
@@ -157,6 +166,12 @@ if __name__ == "__main__":
         type=str,
         help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
         required=True,
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="If set, only evaluate this many samples (debug / smoke runs).",
     )
     EvalArgs.add_cli_args(parser)
     args = parser.parse_args()

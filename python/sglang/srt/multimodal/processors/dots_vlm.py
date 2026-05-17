@@ -1,6 +1,7 @@
 import re
 from typing import Dict, List, Union
 
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.dots_ocr import DotsOCRForCausalLM
 from sglang.srt.models.dots_vlm import DotsVLMForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
@@ -24,8 +25,8 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
         self.im_end_id = _processor.tokenizer.encode("<|endofimg|>")[0]
         self.image_token_id = _processor.tokenizer.encode("<|imgpad|>")[0]
         self.IM_TOKEN_ID = self.image_token_id
-        self.IM_START_ID = self.im_start_id
-        self.IM_END_ID = self.im_end_id
+        self.IM_START_TOKEN_ID = self.im_start_id
+        self.IM_END_TOKEN_ID = self.im_end_id
 
         vision_config = hf_config.vision_config
         patch_size = vision_config.patch_size
@@ -72,10 +73,10 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
         if combined_mm_item is None:
             return None
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": combined_mm_item,
-            "im_start_id": self.im_start_id,
-            "im_end_id": self.im_end_id,
-            "im_token_id": self.image_token_id,
-        }
+        return MultimodalProcessorOutput(
+            mm_items=combined_mm_item,
+            input_ids=input_ids.tolist(),
+            im_token_id=self.image_token_id,
+            im_start_id=self.im_start_id,
+            im_end_id=self.im_end_id,
+        )

@@ -46,7 +46,7 @@ class ModelConfig:
     # Diffuser/Transformer parameters
     arch_config: ArchConfig = field(default_factory=ArchConfig)
 
-    # sgl-diffusion-specific parameters here
+    # sglang-diffusion-specific parameters here
     # i.e. STA, quantization, teacache
 
     def __getattr__(self, name):
@@ -73,14 +73,9 @@ class ModelConfig:
         Update arch_config with source_model_dict
         """
         arch_config = self.arch_config
-        valid_fields = {f.name for f in fields(arch_config)}
 
         for key, value in source_model_dict.items():
             setattr(arch_config, key, value)
-            # else:
-            #     raise AttributeError(
-            #         f"{type(arch_config).__name__} has no field '{key}'"
-            #     )
 
         if hasattr(arch_config, "__post_init__"):
             arch_config.__post_init__()

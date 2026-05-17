@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/phi.py
 from typing import Iterable, Optional
 
@@ -63,7 +65,7 @@ class PhiAttention(nn.Module):
         )
         assert rotary_dim % 2 == 0
 
-        rope_theta = getattr(config, "rope_theta", 10000.0)
+        rope_theta = config.rope_parameters["rope_theta"]
         max_position_embeddings = getattr(config, "max_position_embeddings", 2048)
         self.rotary_emb = get_rope(
             self.head_size,

@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
@@ -17,13 +17,15 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.mem_cache.common import get_last_loc
+from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -45,33 +47,48 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+TREE_SPEC_KERNEL_AVAILABLE = (
+    _is_cuda or _is_musa
+)  # This kernel is only available for CUDA and MUSA now
+
+
+def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
+    if server_args is None:
+        server_args = get_global_server_args()
+
+    # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
+    # multi_layer_eagle handles hidden_states internally, not via FutureMap.
+    # TODO(lsyin): also skip when step == 1.
+    if server_args.speculative_algorithm == "STANDALONE":
+        return False
+    return not server_args.enable_multi_layer_eagle
 
 
 @triton.jit
 def create_extend_after_decode_spec_info(
-    verified_id,
+    accept_tokens,
     seq_lens,
     accept_lens,
     positions,
-    new_verified_id,
+    bonus_tokens_ptr,
     bs_upper: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     offsets = tl.arange(0, bs_upper)
     seq_length = tl.load(seq_lens + pid)
-    accept_length = tl.load(accept_lens + pid)
+    # `accept_lens` includes the bonus token; load this req's value.
+    accept_len = tl.load(accept_lens + pid)
 
     accept_len_cumsum = tl.sum(
         tl.load(accept_lens + offsets, mask=offsets < pid, other=0)
     )
     positions_ptr = positions + accept_len_cumsum
-    mask = offsets < accept_length
-    tl.store(positions_ptr + offsets, seq_length - accept_length + offsets, mask)
+    mask = offsets < accept_len
+    tl.store(positions_ptr + offsets, seq_length - accept_len + offsets, mask)
 
-    accept_len_cumsum += accept_length - 1
-    verified_id_data = tl.load(verified_id + accept_len_cumsum)
-    tl.store(new_verified_id + pid, verified_id_data)
+    accept_len_cumsum += accept_len - 1
+    bonus_token = tl.load(accept_tokens + accept_len_cumsum)
+    tl.store(bonus_tokens_ptr + pid, bonus_token)
 
 
 @triton.jit
@@ -117,26 +134,15 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
-    if _is_cuda or _is_hip:
-        assign_req_to_token_pool[(batch_size,)](
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            req_to_token.shape[1],
-            next_power_of_2(batch_size),
-        )
-    elif _is_npu:
-        import sgl_kernel_npu  # noqa: F401
-
-        torch.ops.npu.cache_loc_assign(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-        )
+    assign_req_to_token_pool[(batch_size,)](
+        req_pool_indices,
+        req_to_token,
+        start_offset,
+        end_offset,
+        out_cache_loc,
+        req_to_token.shape[1],
+        next_power_of_2(batch_size),
+    )
 
 
 @triton.jit
@@ -147,6 +153,10 @@ def assign_draft_cache_locs(
     extend_lens,
     num_new_pages_per_topk,
     out_cache_loc,
+    source_cache_loc,
+    target_cache_loc,
+    last_page_lens_cumsum,
+    duplicate_cache_len: tl.constexpr,
     pool_len: tl.constexpr,
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
@@ -175,44 +185,74 @@ def assign_draft_cache_locs(
         mask = copy_offset < copy_len
         data = tl.load(out_cache_ptr + copy_offset, mask=mask)
         tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
-
-    if page_size == 1 or topk == 1:
-        return
-
-    # Part 2: Copy the indices for the last partial page
-    prefix_len = tl.load(seq_lens + pid)
-    last_page_len = prefix_len % page_size
-    offsets = tl.arange(0, page_size)
-    mask = offsets < last_page_len
-    num_new_pages_per_topk_ = tl.load(num_new_pages_per_topk + pid)
-    prefix_base = token_pool + prefix_len - last_page_len
-
-    for topk_id in range(topk):
-        value = tl.load(prefix_base + offsets, mask=mask)
-        tl.store(
-            prefix_base + topk_id * num_new_pages_per_topk_ * page_size + offsets,
-            value,
-            mask=mask,
-        )
-
-    # Part 3: Remove the padding in out_cache_loc
-    iter_offest = tl.arange(0, iter_upper)
-    for topk_id in range(topk):
-        indices = tl.load(
-            prefix_base
-            + topk_id * num_new_pages_per_topk_ * page_size
-            + last_page_len
-            + iter_offest,
-            mask=iter_offest < speculative_num_steps,
-        )
-        tl.store(
-            out_cache_loc
-            + pid * topk * speculative_num_steps
-            + topk_id * speculative_num_steps
-            + iter_offest,
-            indices,
-            mask=iter_offest < speculative_num_steps,
-        )
+    # XXX (MUSA): Triton issue: chained boolean operators (A or B or C) are not supported.
+    if (page_size != 1 and topk != 1) and duplicate_cache_len > 0:
+        # Part 2: Copy indices into source_cache_loc and target_cache_loc
+        # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
+        prefix_len = tl.load(seq_lens + pid)
+        last_page_len = prefix_len % page_size
+        offsets = tl.arange(0, page_size)
+        mask = offsets < last_page_len
+        num_new_pages_per_topk_ = tl.load(num_new_pages_per_topk + pid)
+        prefix_base = token_pool + prefix_len - last_page_len
+        src_indices = tl.load(prefix_base + offsets, mask=mask)
+        last_page_lens_cumsum_ = tl.load(last_page_lens_cumsum + pid)
+        # Skip the first one since no copy is needed
+        for topk_id in range(1, topk):
+            tl.store(
+                source_cache_loc
+                + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
+                + (topk_id - 1) * last_page_len
+                + offsets,
+                src_indices,
+                mask=mask,
+            )
+            tgt_indices = tl.load(
+                prefix_base + topk_id * num_new_pages_per_topk_ * page_size + offsets,
+                mask=mask,
+            )
+            tl.store(
+                target_cache_loc
+                + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
+                + (topk_id - 1) * last_page_len
+                + offsets,
+                tgt_indices,
+                mask=mask,
+            )
+        # Part 3: Copy and remove the used indices for duplication
+        # speculative_num_steps=5, page_size=4, num_new_pages_per_topk_=2, last_page_len=1
+        #  - xxxxx .. | - xxxxx .. |
+        #   topk=0        topk=1
+        #  "-" means prefix tokens
+        #  "x" means speculative draft tokens
+        #  "." means padded tokens
+        # we only want to copy the "x" part.
+        iter_offset = tl.arange(0, iter_upper)
+        for topk_id in range(topk):
+            mask_upper = iter_offset < (speculative_num_steps + last_page_len)
+            mask_lower = iter_offset >= last_page_len
+            combined_mask = mask_upper & mask_lower
+            indices = tl.load(
+                prefix_base
+                + topk_id * num_new_pages_per_topk_ * page_size
+                + iter_offset,
+                mask=combined_mask,
+                other=0,
+            )
+            # Shift from previous batches
+            ptr_offset = pid * speculative_num_steps * topk
+            # Subtract last_page_len to fill the gap of duplicated last page tokens.
+            # For example, token pool is (1, 2, 3, 4 ,5) and last page is 1,
+            # we write 2, 3, 4 to the front of out_cache_loc.
+            tl.store(
+                out_cache_loc
+                + ptr_offset
+                + topk_id * speculative_num_steps
+                - last_page_len
+                + iter_offset,
+                indices,
+                mask=combined_mask,
+            )
 
 
 @triton.jit
@@ -325,7 +365,7 @@ def align_evict_mask_to_page_size(
 def get_target_cache_loc(
     tgt_cache_loc,
     to_free_slots,
-    accept_length,
+    num_correct_drafts,
     to_free_num_slots,
     out_cache_loc,
     num_verify_tokens: tl.constexpr,
@@ -337,9 +377,9 @@ def get_target_cache_loc(
     bs_offset = tl.arange(0, bs_upper)
 
     # write the first part to tgt_cache_loc
-    accept_len_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
+    accept_len_all = tl.load(num_correct_drafts + bs_offset, mask=bs_offset < bid)
     tgt_cache_loc_start = tl.sum(accept_len_all) + bid
-    copy_len = tl.load(accept_length + bid) + 1
+    copy_len = tl.load(num_correct_drafts + bid) + 1
     out_cache_loc_row = tl.load(
         out_cache_loc + bid * num_verify_tokens + offset, mask=offset < copy_len
     )
@@ -372,7 +412,7 @@ def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
     accept_index: torch.Tensor,
-    accept_length: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
     draft_token_num: int,
     page_size: int,
 ):
@@ -380,7 +420,7 @@ def get_src_tgt_cache_loc(
     tgt_cache_loc = torch.empty_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
-        (seq_lens + accept_length + 1 + page_size - 1) // page_size * page_size,
+        (seq_lens + num_correct_drafts + 1 + page_size - 1) // page_size * page_size,
         extended_len,
     )
     to_free_num_slots = extended_len - keep_len
@@ -391,23 +431,25 @@ def get_src_tgt_cache_loc(
 def filter_finished_cache_loc_kernel(
     out_cache_loc,
     tgt_cache_loc,
-    accept_length,
-    accept_length_filter,
+    num_correct_drafts,
+    num_accept_tokens_filter,
     bs_upper: tl.constexpr,
     num_verify_tokens_upper: tl.constexpr,
 ):
     bid = tl.program_id(0)
     bs_offset = tl.arange(0, bs_upper)
 
-    accept_length_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
-    old_start = tl.sum(accept_length_all) + bid
-
-    accept_length_filter_all = tl.load(
-        accept_length_filter + bs_offset, mask=bs_offset < bid
+    num_correct_drafts_all = tl.load(
+        num_correct_drafts + bs_offset, mask=bs_offset < bid
     )
-    new_start = tl.sum(accept_length_filter_all)
+    old_start = tl.sum(num_correct_drafts_all) + bid
 
-    copy_len = tl.load(accept_length_filter + bid)
+    num_accept_tokens_filter_all = tl.load(
+        num_accept_tokens_filter + bs_offset, mask=bs_offset < bid
+    )
+    new_start = tl.sum(num_accept_tokens_filter_all)
+
+    copy_len = tl.load(num_accept_tokens_filter + bid)
     copy_offset = tl.arange(0, num_verify_tokens_upper)
     value = tl.load(
         tgt_cache_loc + old_start + copy_offset, mask=copy_offset < copy_len
@@ -418,20 +460,76 @@ def filter_finished_cache_loc_kernel(
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
-def create_accept_length_filter(
-    accept_length: torch.Tensor,
+def create_num_accept_tokens_filter(
+    num_correct_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
     seq_lens: torch.Tensor,
 ):
-    accept_length_filter = torch.zeros_like(accept_length)
-    accept_length_filter[unfinished_index_device] = (
-        accept_length[unfinished_index_device] + 1
+    num_accept_tokens_filter = torch.zeros_like(num_correct_drafts)
+    num_accept_tokens_filter[unfinished_index_device] = (
+        num_correct_drafts[unfinished_index_device] + 1
     )
-    seq_lens.add_(accept_length + 1)
-    return accept_length_filter
+    seq_lens.add_(num_correct_drafts + 1)
+    return num_accept_tokens_filter
+
+
+def _select_top_k_tokens_first(
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    topk: int,
+):
+    input_ids = topk_index.flatten()
+    if hidden_states is not None:
+        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+
+    tree_info = (
+        topk_p.unsqueeze(1),  # (b, 1, topk)
+        topk_index,  # (b, topk)
+        torch.arange(-1, topk, dtype=torch.long, device=input_ids.device).expand(
+            topk_p.shape[0], -1
+        ),  # (b, topk + 1) — expand avoids the allocation of repeat
+    )
+    return input_ids, hidden_states, topk_p, tree_info
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
+def _select_top_k_tokens_later(
+    i: int,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: torch.Tensor,
+    scores: torch.Tensor,
+    topk: int,
+):
+    topk_sq = topk * topk
+
+    expand_scores = scores.unsqueeze(2) * topk_p.view(-1, topk, topk)
+    # (b, topk, 1) * (b, topk, topk) -> (b, topk, topk)
+
+    topk_cs_p, topk_cs_index = fast_topk(
+        expand_scores.flatten(start_dim=1), topk, dim=-1
+    )  # (b, topk)
+
+    topk_index = topk_index.view(-1, topk_sq)
+    input_ids = torch.gather(topk_index, 1, topk_cs_index).flatten()
+
+    if hidden_states is not None and hidden_states.shape[0] > 0:
+        flat_cs = topk_cs_index.flatten()
+        batch_offsets = torch.arange(
+            0, hidden_states.shape[0], step=topk, device=flat_cs.device
+        )
+        selected_input_index = flat_cs // topk + batch_offsets.repeat_interleave(topk)
+        hidden_states = hidden_states[selected_input_index]
+
+    tree_info = (
+        expand_scores,  # (b, topk, topk)
+        topk_index,  # (b, topk * topk)
+        topk_cs_index + (topk_sq * (i - 1) + topk),  # (b, topk)
+    )
+    return input_ids, hidden_states, topk_cs_p, tree_info
+
+
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -441,50 +539,16 @@ def select_top_k_tokens(
     topk: int,
 ):
     if i == 0:
-        # The first step after extend
-        input_ids = topk_index.flatten()
-        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
-        scores = topk_p  # shape: (b, topk)
-
-        tree_info = (
-            topk_p.unsqueeze(1),  # shape: (b, 1, topk)
-            topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
-            .unsqueeze(0)
-            .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
-        )
-    else:
-        # The later decode steps
-        expand_scores = torch.mul(
-            scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
-        )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
-        topk_cs_p, topk_cs_index = fast_topk(
-            expand_scores.flatten(start_dim=1), topk, dim=-1
-        )  # (b, topk)
-        scores = topk_cs_p  # shape: (b, topk)
-
-        topk_index = topk_index.reshape(-1, topk**2)
-        input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
-
-        if hidden_states.shape[0] > 0:
-            selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-                0, hidden_states.shape[0], step=topk, device="cuda"
-            ).repeat_interleave(topk)
-            hidden_states = hidden_states[selected_input_index, :]
-
-        tree_info = (
-            expand_scores,  # shape: (b, topk, topk)
-            topk_index,  # shape: (b, topk * topk)
-            topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
-        )
-
-    return input_ids, hidden_states, scores, tree_info
+        return _select_top_k_tokens_first(topk_p, topk_index, hidden_states, topk)
+    return _select_top_k_tokens_later(
+        i, topk_p, topk_index, hidden_states, scores, topk
+    )
 
 
 def generate_simulated_accept_index(
     accept_index,
     predict,
-    accept_length,
+    num_correct_drafts,
     bs,
     spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
@@ -529,7 +593,7 @@ def generate_simulated_accept_index(
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
     )
-    accept_length.fill_(simulate_acc_len - 1)
+    num_correct_drafts.fill_(simulate_acc_len - 1)
     predict.fill_(100)  # some legit token id
     return sim_accept_index
 
@@ -540,6 +604,7 @@ def traverse_tree(
     draft_tokens: torch.Tensor,
     grammar: BaseGrammarObject,
     allocate_token_bitmask: torch.Tensor,
+    vocab_size: Optional[int] = None,
 ):
     """
     Traverse the tree constructed by the draft model to generate the logits mask.
@@ -547,8 +612,6 @@ def traverse_tree(
     assert (
         retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
     )
-
-    allocate_token_bitmask.fill_(0)
 
     def dfs(
         curr: int,
@@ -559,26 +622,29 @@ def traverse_tree(
         if curr == 0:
             # the first token generated by the target model, and thus it is always
             # accepted from the previous iteration
-            accepted = True
+            is_accepted = True
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
             curr_token_id = draft_tokens[curr]
-            # 32 boolean bitmask values are packed into 32-bit integers
-            accepted = (
-                parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
-            ) != 0
+            if vocab_size and curr_token_id >= vocab_size:
+                is_accepted = False
+            else:
+                # 32 boolean bitmask values are packed into 32-bit integers
+                is_accepted = (
+                    parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
+                ) != 0
 
-        if accepted:
+        if is_accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(draft_tokens[curr])
+                grammar.accept_token(int(draft_tokens[curr]))
             if not grammar.is_terminated():
                 # Generate the bitmask for the current token
                 grammar.fill_vocab_mask(allocate_token_bitmask, curr)
                 if retrieve_next_token[curr] != -1:
                     # Visit the child node
                     dfs(
-                        retrieve_next_token[curr],
+                        int(retrieve_next_token[curr]),
                         retrieve_next_token,
                         retrieve_next_sibling,
                         curr,
@@ -591,7 +657,7 @@ def traverse_tree(
         if retrieve_next_sibling[curr] != -1:
             # Visit the sibling node
             dfs(
-                retrieve_next_sibling[curr],
+                int(retrieve_next_sibling[curr]),
                 retrieve_next_token,
                 retrieve_next_sibling,
                 parent_pos,
@@ -639,6 +705,7 @@ def generate_token_bitmask(
                 allocate_token_bitmask[
                     i * num_draft_tokens : (i + 1) * num_draft_tokens
                 ],
+                vocab_size=vocab_size,
             )
             tree_traverse_time = time.perf_counter() - s
             if tree_traverse_time > TREE_TRAVERSE_TIME_THRESHOLD:
@@ -653,11 +720,30 @@ def generate_token_bitmask(
 
 def load_token_map(token_map_path: str) -> List[int]:
     if not os.path.exists(token_map_path):
-        cache_dir = snapshot_download(
-            os.path.dirname(token_map_path),
-            ignore_patterns=["*.bin", "*.safetensors"],
-        )
-        token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
+        repo_id = os.path.dirname(token_map_path)
+        file_name = os.path.basename(token_map_path)
+
+        cache_dir = None
+        if envs.SGLANG_USE_MODELSCOPE.get():
+            from modelscope.utils.file_utils import get_model_cache_root
+
+            cached_repo_path = os.path.join(get_model_cache_root(), repo_id)
+            if os.path.exists(cached_repo_path):
+                cache_dir = cached_repo_path
+
+        if cache_dir is None:
+            if envs.SGLANG_USE_MODELSCOPE.get():
+                from modelscope.hub.snapshot_download import (
+                    snapshot_download as download_func,
+                )
+            else:
+                download_func = snapshot_download
+            cache_dir = download_func(
+                repo_id,
+                ignore_patterns=["*.bin", "*.safetensors"],
+            )
+
+        token_map_path = os.path.join(cache_dir, file_name)
     hot_token_id = torch.load(token_map_path, weights_only=True)
     return torch.tensor(hot_token_id, dtype=torch.int64)
 
@@ -670,8 +756,56 @@ def draft_tp_context(tp_group: GroupCoordinator):
         yield
 
 
-def detect_nan(logits_output: LogitsProcessorOutput):
-    logits = logits_output.next_token_logits
-    if torch.any(torch.isnan(logits)):
-        logger.error("Detected errors during sampling! NaN in the logits.")
-        raise ValueError("Detected errors during sampling! NaN in the logits.")
+def maybe_detect_nan(tensor: torch.Tensor, msg: str = ""):
+    """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
+    if not envs.SGLANG_SPEC_NAN_DETECTION.get():
+        return
+    torch._assert_async(~torch.any(torch.isnan(tensor)), f"NaN detected! {msg}")
+
+
+def maybe_detect_oob(indices: torch.Tensor, low: int, high: int, msg: str):
+    """Async OOB check — no GPU-CPU sync, error surfaces at next sync point."""
+    if not envs.SGLANG_SPEC_OOB_DETECTION.get():
+        return
+    if indices.numel() == 0:
+        return
+    torch._assert_async(
+        (indices.min() >= low) & (indices.max() < high),
+        f"OOB indices not in [{low}, {high}): {msg}",
+    )
+
+
+# Disable torch.compile for this function because it will be
+# even slower.
+# @torch.compile(dynamic=True)
+def get_last_loc_large_page_size_large_top_k(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    speculative_num_steps: int,
+    topk: int,
+    page_size: int,
+):
+    prefix_lens = seq_lens
+    last_page_lens = prefix_lens % page_size
+    num_new_pages_per_topk = (
+        last_page_lens + speculative_num_steps + page_size - 1
+    ) // page_size
+    seq_lens = prefix_lens // page_size * page_size + num_new_pages_per_topk * (
+        page_size * topk
+    )
+    extend_lens = seq_lens - prefix_lens
+    last_loc = get_last_loc(
+        req_to_token,
+        req_pool_indices,
+        prefix_lens,
+    )
+
+    return (
+        prefix_lens,
+        seq_lens,
+        last_loc,
+        num_new_pages_per_topk,
+        extend_lens,
+        last_page_lens,
+    )

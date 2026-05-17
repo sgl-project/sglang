@@ -21,7 +21,7 @@ def cmd_init() -> list[CLISubcommand]:
 
 
 def main() -> None:
-    parser = FlexibleArgumentParser(description="sgl-diffusion CLI")
+    parser = FlexibleArgumentParser(description="sglang-diffusion CLI")
     parser.add_argument("-v", "--version", action="version", version="0.1.0")
 
     subparsers = parser.add_subparsers(required=False, dest="subparser")
@@ -30,12 +30,12 @@ def main() -> None:
     for cmd in cmd_init():
         cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
         cmds[cmd.name] = cmd
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
     if args.subparser in cmds:
         cmds[args.subparser].validate(args)
 
     if hasattr(args, "dispatch_function"):
-        args.dispatch_function(args)
+        args.dispatch_function(args, unknown_args=unknown_args)
     else:
         parser.print_help()
 

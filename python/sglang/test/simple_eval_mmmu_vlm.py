@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import io
+import re
 from typing import List, Optional, Tuple
 
 from datasets import concatenate_datasets, load_dataset
@@ -53,7 +54,11 @@ class MMMUVLMEval(Eval):
     }
 
     def __init__(
-        self, num_examples: Optional[int] = 100, num_threads: int = 32, seed: int = 42
+        self,
+        num_examples: Optional[int] = 100,
+        num_threads: int = 32,
+        seed: int = 42,
+        response_answer_regex: str = None,
     ):
         """Create MMMU VLM eval (Math subset, 100 fixed samples by default)."""
         self.num_examples = num_examples
@@ -61,6 +66,8 @@ class MMMUVLMEval(Eval):
         self.seed = seed
         # Prepare samples deterministically across all MMMU subjects (validation split)
         self.samples = self._prepare_mmmu_samples(self.num_examples)
+        # For example, "<\|begin_of_box\|>foo<\|end_of_box\|>" could be used to extract "foo" as the answer from the response text
+        self.response_answer_regex = response_answer_regex
 
     @staticmethod
     def _to_data_uri(image: Image.Image) -> str:
@@ -141,12 +148,20 @@ class MMMUVLMEval(Eval):
                     options = None
 
             # Build final textual prompt; include choices if MC
-            prompt_text = f"Question: {question}\n\n"
+            prompt_text = f"{question}\n"
             if options:
                 letters = [chr(ord("A") + i) for i in range(len(options))]
                 for letter, opt in zip(letters, options):
-                    prompt_text += f"{letter}) {opt}\n"
-            prompt_text += "\nAnswer: "
+                    prompt_text += f"{letter}. {opt}\n"
+                prompt_text += (
+                    "\nAnswer the following multiple-choice question. "
+                    "The last line of your response should be of the "
+                    "following format: 'Answer: $LETTER' (without quotes) "
+                    "where LETTER is one of the options. "
+                    "Think step by step before answering."
+                )
+            else:
+                prompt_text += "\nAnswer: "
 
             samples.append(
                 {
@@ -205,6 +220,15 @@ class MMMUVLMEval(Eval):
             # Sample
             response_text = sampler(prompt_messages)
             response_text = response_text or ""
+            if self.response_answer_regex:
+                match = (
+                    re.search(self.response_answer_regex, response_text)
+                    if response_text is not None
+                    else None
+                )
+                response_text = (
+                    match.group(1).strip() if match is not None else response_text
+                )
 
             # Parse and score
             gold = sample["answer"]
@@ -314,6 +338,14 @@ def _parse_multi_choice_response(
     response: str, all_choices: List[str], index2ans: dict
 ) -> str:
     # loosely adapted from benchmark mmmu eval
+
+    # First, look for explicit "Answer: X" pattern (last occurrence)
+    answer_matches = re.findall(r"[Aa]nswer\s*:\s*\*?\*?\s*\(?([A-Z])\)?", response)
+    if answer_matches:
+        candidate = answer_matches[-1]
+        if candidate in all_choices:
+            return candidate
+
     for char in [",", ".", "!", "?", ";", ":", "'"]:
         response = response.strip(char)
     response = " " + response + " "

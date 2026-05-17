@@ -2,229 +2,143 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Inspired by SGLang: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py
-"""The arguments of sgl-diffusion Inference."""
+"""The arguments of sglang-diffusion Inference."""
+
 import argparse
 import dataclasses
-import inspect
 import json
+import math
+import os
 import random
 import sys
 import tempfile
-from contextlib import contextmanager
 from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
-from sglang.multimodal_gen.configs.configs import PreprocessConfig
-from sglang.multimodal_gen.configs.pipelines import FluxPipelineConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig, STA_Mode
-from sglang.multimodal_gen.configs.pipelines.qwen_image import (
-    QwenImageEditPipelineConfig,
-    QwenImagePipelineConfig,
+import addict
+import yaml
+
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.models.encoders import T5Config
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    is_ltx23_native_variant,
+)
+from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.runtime.disaggregation.disagg_args import (
+    DisaggArgsMixin,
+    add_disagg_cli_args,
+    convert_disagg_role_string,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
+    NunchakuConfig,
+)
+from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+    cpu_offload_flags_for_layerwise_components,
+    normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
+)
+from sglang.multimodal_gen.runtime.server_args_auto_tune import (
+    PERFORMANCE_MODES,
+    ServerArgsAutoTuner,
 )
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
     is_valid_ipv6_address,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    CYAN,
+    GREEN,
+    RED,
+    RESET,
+    _sanitize_for_logging,
     configure_logger,
     init_logger,
 )
-from sglang.multimodal_gen.utils import FlexibleArgumentParser, StoreBoolean
+from sglang.multimodal_gen.utils import (
+    FlexibleArgumentParser,
+    StoreBoolean,
+    expand_path_fields,
+)
 
 logger = init_logger(__name__)
 
-ZMQ_TCP_PORT_DELTA = 233
+LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
+LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
+# H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
+LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
+LORA_MERGE_MODES = ("auto", "merge", "dynamic")
 
 
-def _is_torch_tensor(obj: Any) -> tuple[bool, Any]:
-    """Return (is_tensor, torch_module_or_None) without importing torch at module import time."""
-    try:
-        import torch  # type: ignore
-
-        return isinstance(obj, torch.Tensor), torch
-    except Exception:
-        return False, None
+def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
+    if mode is None:
+        return None
+    mode = mode.lower()
+    return mode
 
 
-def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
-    """Recursively convert objects to JSON-serializable forms for concise logging.
+def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
+    return pipeline_class_name in LTX2_TWO_STAGE_PIPELINE_NAMES
 
-    Rules:
-    - Drop any field/dict key named 'param_names_mapping'.
-    - Render Enums using their value.
-    - Render torch.Tensor as a compact summary; if key name is 'scaling_factor', include stats.
-    - Dataclasses are expanded to dicts and sanitized recursively.
-    - Callables/functions are rendered as their qualified name.
-    - Fallback to str(...) for unknown types.
+
+class Backend(str, Enum):
     """
-    # Handle simple types quickly
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-
-    # Enum -> value for readability
-    if isinstance(obj, Enum):
-        return obj.value
-
-    # torch.Tensor handling (lazy import)
-    is_tensor, torch_mod = _is_torch_tensor(obj)
-    if is_tensor:
-        try:
-            ten = obj.detach().cpu()
-            if key_hint == "scaling_factor":
-                # Provide a compact, single-line summary for scaling_factor
-                stats = {
-                    "shape": list(ten.shape),
-                    "dtype": str(ten.dtype),
-                }
-                # Stats might fail for some dtypes; guard individually
-                try:
-                    stats["min"] = float(ten.min().item())
-                except Exception:
-                    pass
-                try:
-                    stats["max"] = float(ten.max().item())
-                except Exception:
-                    pass
-                try:
-                    stats["mean"] = float(ten.float().mean().item())
-                except Exception:
-                    pass
-                return {"tensor": "scaling_factor", **stats}
-            # Generic tensor summary
-            return {"tensor": True, "shape": list(ten.shape), "dtype": str(ten.dtype)}
-        except Exception:
-            return "<tensor>"
-
-    # Dataclasses -> dict
-    if dataclasses.is_dataclass(obj):
-        result: dict[str, Any] = {}
-        for f in dataclasses.fields(obj):
-            if not f.repr:
-                continue
-            name = f.name
-            if "names_mapping" in name:  # drop noisy mappings
-                continue
-            try:
-                value = getattr(obj, name)
-            except Exception:
-                continue
-            result[name] = _sanitize_for_logging(value, key_hint=name)
-        return result
-
-    # Dicts -> sanitize keys/values; drop 'param_names_mapping'
-    if isinstance(obj, dict):
-        result_dict: dict[str, Any] = {}
-        for k, v in obj.items():
-            try:
-                key_str = str(k)
-            except Exception:
-                key_str = "<key>"
-            if key_str == "param_names_mapping":
-                continue
-            result_dict[key_str] = _sanitize_for_logging(v, key_hint=key_str)
-        return result_dict
-
-    # Sequences/Sets -> list
-    if isinstance(obj, (list, tuple, set)):
-        return [_sanitize_for_logging(x) for x in obj]
-
-    # Functions / Callables -> qualified name
-    try:
-        if inspect.isroutine(obj) or inspect.isclass(obj):
-            module = getattr(obj, "__module__", "")
-            qn = getattr(obj, "__qualname__", getattr(obj, "__name__", "<callable>"))
-            return f"{module}.{qn}" if module else qn
-    except Exception:
-        pass
-
-    # Fallback: string representation
-    try:
-        return str(obj)
-    except Exception:
-        return "<unserializable>"
-
-
-class ExecutionMode(str, Enum):
-    """
-    Enumeration for different pipeline modes.
-
-    Inherits from str to allow string comparison for backward compatibility.
+    Enumeration for different model backends.
+    - AUTO: Automatically select backend (prefer sglang native, fallback to diffusers)
+    - SGLANG: Use sglang's native optimized implementation
+    - DIFFUSERS: Use vanilla diffusers pipeline (supports all diffusers models)
     """
 
-    INFERENCE = "inference"
-    PREPROCESS = "preprocess"
-    FINETUNING = "finetuning"
-    DISTILLATION = "distillation"
+    AUTO = "auto"
+    SGLANG = "sglang"
+    DIFFUSERS = "diffusers"
 
     @classmethod
-    def from_string(cls, value: str) -> "ExecutionMode":
-        """Convert string to ExecutionMode enum."""
+    def from_string(cls, value: str) -> "Backend":
+        """Convert string to Backend enum."""
         try:
             return cls(value.lower())
         except ValueError:
             raise ValueError(
-                f"Invalid mode: {value}. Must be one of: {', '.join([m.value for m in cls])}"
+                f"Invalid backend: {value}. Must be one of: {', '.join([m.value for m in cls])}"
             ) from None
 
     @classmethod
     def choices(cls) -> list[str]:
         """Get all available choices as strings for argparse."""
-        return [mode.value for mode in cls]
+        return [backend.value for backend in cls]
 
 
-class WorkloadType(str, Enum):
-    """
-    Enumeration for different workload types.
-
-    Inherits from str to allow string comparison for backward compatibility.
-    """
-
-    I2V = "i2v"  # Image to Video
-    T2V = "t2v"  # Text to Video
-    T2I = "t2i"  # Text to Image
-    I2I = "i2i"  # Image to Image
-
-    @classmethod
-    def from_string(cls, value: str) -> "WorkloadType":
-        """Convert string to WorkloadType enum."""
-        try:
-            return cls(value.lower())
-        except ValueError:
-            raise ValueError(
-                f"Invalid workload type: {value}. Must be one of: {', '.join([m.value for m in cls])}"
-            ) from None
-
-    @classmethod
-    def choices(cls) -> list[str]:
-        """Get all available choices as strings for argparse."""
-        return [workload.value for workload in cls]
-
-
-# args for sgl_diffusion framework
 @dataclasses.dataclass
-class ServerArgs:
+class ServerArgs(DisaggArgsMixin):
     # Model and path configuration (for convenience)
     model_path: str
 
+    # explicit model ID override (e.g. "Qwen-Image")
+    model_id: str | None = None
+
+    # Model backend (sglang native or diffusers)
+    backend: Backend = Backend.AUTO
+
     # Attention
     attention_backend: str = None
-
-    # Running mode
-    mode: ExecutionMode = ExecutionMode.INFERENCE
-
-    # Workload type
-    workload_type: WorkloadType = WorkloadType.T2V
-
-    # Cache strategy
-    cache_strategy: str = "none"
+    attention_backend_config: addict.Dict | None = None
+    component_attention_backends: dict[str, str] | str | None = field(
+        default_factory=dict
+    )
+    cache_dit_config: str | dict[str, Any] | None = (
+        None  # cache-dit config for diffusers
+    )
 
     # Distributed executor backend
-    distributed_executor_backend: str = "mp"
     nccl_port: Optional[int] = None
 
     # HuggingFace specific parameters
@@ -233,8 +147,9 @@ class ServerArgs:
 
     # Parallelism
     num_gpus: int = 1
-    tp_size: int = -1
-    sp_degree: int = -1
+    performance_mode: str = "auto"
+    tp_size: Optional[int] = None
+    sp_degree: Optional[int] = None
     # sequence parallelism
     ulysses_degree: Optional[int] = None
     ring_degree: Optional[int] = None
@@ -243,63 +158,103 @@ class ServerArgs:
     dp_size: int = 1
     # number of gpu in a dp group
     dp_degree: int = 1
-    # cfg parallel
-    enable_cfg_parallel: bool = False
+    # cfg parallel (None = auto-decide based on num_gpus)
+    enable_cfg_parallel: Optional[bool] = None
+    # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
+    cfg_parallel_degree: Optional[int] = None
 
     hsdp_replicate_dim: int = 1
-    hsdp_shard_dim: int = -1
-    dist_timeout: int | None = None  # timeout for torch.distributed
+    hsdp_shard_dim: Optional[int] = None
+    dist_timeout: int | None = 3600  # 1 hour
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
-    preprocess_config: PreprocessConfig | None = None
+
+    # Pipeline override
+    pipeline_class_name: str | None = (
+        None  # Override pipeline class from model_index.json
+    )
 
     # LoRA parameters
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
+    lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_merge_mode: str = "auto"
+    lora_weight_name: str | None = None
+
+    # Component path overrides (key = model_index.json component name, value = path)
+    component_paths: dict[str, str] = field(default_factory=dict)
+
+    # path to pre-quantized transformer weights (single .safetensors or directory).
+    transformer_weights_path: str | None = None
+
+    # Quantization method for online quantization
+    quantization: str | None = None
+    # Layer name patterns to skip during online quantization
+    quantization_ignored_layers: list[str] | None = None
+
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
 
-    output_type: str = "pil"
-
     # CPU offload parameters
-    dit_cpu_offload: bool = True
-    use_fsdp_inference: bool = False
-    text_encoder_cpu_offload: bool = True
-    image_encoder_cpu_offload: bool = True
-    vae_cpu_offload: bool = True
+    dit_cpu_offload: bool | None = None
+    # if true, add the legacy default DiT components
+    dit_layerwise_offload: bool | None = None
+    layerwise_offload_components: list[str] | None = None
+    dit_offload_prefetch_size: float = 0.0
+    text_encoder_cpu_offload: bool | None = None
+    image_encoder_cpu_offload: bool | None = None
+    vae_cpu_offload: bool | None = False
+    use_fsdp_inference: bool | None = None
     pin_cpu_memory: bool = True
+    ltx2_two_stage_device_mode: str | None = None
 
-    # STA (Sliding Tile Attention) parameters
-    mask_strategy_file_path: str | None = None
-    STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
-    skip_time_steps: int = 15
+    # ComfyUI integration
+    comfyui_mode: bool = False
 
     # Compilation
     enable_torch_compile: bool = False
 
-    disable_autocast: bool = False
+    # warmup
+    warmup: bool = False
+    warmup_resolutions: list[str] = None
+    warmup_steps: int = 1
 
-    # VSA parameters
-    VSA_sparsity: float = 0.0  # inference/validation sparsity
+    disable_autocast: bool | None = None
 
-    # V-MoBA parameters
-    moba_config_path: str | None = None
-    moba_config: dict[str, Any] = field(default_factory=dict)
+    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
+    # When set, the transformer loader will use this instead of auto-detection.
+    quantization: str | None = None
+
+    # Quantization / Nunchaku SVDQuant configuration
+    nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
+        default_factory=NunchakuSVDQuantArgs, repr=False
+    )
 
     # Master port for distributed inference
-    # TODO: do not hard code
-    master_port: int | None = None
+    master_port: int = 30005
 
-    # http server endpoint config, would be ignored in local mode
-    host: str | None = None
-    port: int | None = None
+    # http server endpoint config
+    host: str | None = "127.0.0.1"
+    port: int | None = 30000
+
+    # TODO: webui and their endpoint, check if webui_port is available.
+    webui: bool = False
+    webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+    batching_mode: str = "dynamic"
+    batching_max_size: int = 1
+    batching_delay_ms: float = 0.0
+    batching_config: str | None = None
+    enable_batching_metrics: bool = False
 
-    # Stage verification
-    enable_stage_verification: bool = True
+    # Strict port mode: fail if requested port is unavailable instead of auto-selecting
+    strict_ports: bool = False
+
+    output_path: str | None = "outputs/"
+    input_save_path: str | None = "inputs/uploads"
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -310,9 +265,13 @@ class ServerArgs:
         default_factory=lambda: {
             "transformer": True,
             "vae": True,
+            "video_vae": True,
+            "audio_vae": True,
+            "video_dit": True,
+            "audio_dit": True,
+            "dual_tower_bridge": True,
         }
     )
-    override_transformer_cls_name: str | None = None
 
     # # DMD parameters
     # dmd_denoising_steps: List[int] | None = field(default=None)
@@ -320,8 +279,38 @@ class ServerArgs:
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
+    # Disaggregation — fields defined here, methods in DisaggArgsMixin,
+    # CLI registration in disagg_args.add_disagg_cli_args().
+    base_gpu_id: int = 0
+    disagg_role: RoleType = RoleType.MONOLITHIC
+    disagg_timeout: int = 600
+    disagg_dispatch_policy: str = "round_robin"
+    disagg_mode: bool = False
+    disagg_server_addr: str | None = None
+    encoder_urls: str | None = None
+    denoiser_urls: str | None = None
+    decoder_urls: str | None = None
+    encoder_tp: int | None = None
+    denoiser_tp: int | None = None
+    denoiser_sp: int | None = None
+    denoiser_ulysses: int | None = None
+    denoiser_ring: int | None = None
+    decoder_tp: int | None = None
+    disagg_transfer_pool_size: int = 256 * 1024 * 1024
+    disagg_p2p_hostname: str = "127.0.0.1"
+    disagg_ib_device: str | None = None
+    pool_work_endpoint: str | None = None
+    pool_result_endpoint: str | None = None
+
     # Logging
     log_level: str = "info"
+    uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
+
+    # Tracing
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
+
+    # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
     @property
     def broker_port(self) -> int:
@@ -334,26 +323,644 @@ class ServerArgs:
         """
         return self.host is None or self.port is None
 
-    def __post_init__(self):
-        # Add randomization to avoid race condition when multiple servers start simultaneously
-        initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
-        self.scheduler_port = self.settle_port(initial_scheduler_port)
-        # TODO: remove hard code
-        initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
-        self.master_port = self.settle_port(initial_master_port, 37)
-        if self.moba_config_path:
-            try:
-                with open(self.moba_config_path) as f:
-                    self.moba_config = json.load(f)
-                logger.info("Loaded V-MoBA config from %s", self.moba_config_path)
-            except (FileNotFoundError, json.JSONDecodeError) as e:
-                logger.error(
-                    "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
-                )
-                raise
-        self.check_server_args()
+    def _adjust_path(self):
+        expand_path_fields(self)
+        self._adjust_save_paths()
 
+    def _adjust_parameters(self):
+        """set defaults and normalize values."""
+        auto_tuner = ServerArgsAutoTuner(self)
+        auto_tuner.adjust_based_on_performance_mode()
+        if auto_tuner.could_override_server_args():
+            self._adjust_offload()
+            auto_tuner.maybe_adjust_auto_default_layerwise_offload()
+        self._adjust_ltx2_two_stage_device_mode()
+        if auto_tuner.could_override_server_args():
+            auto_tuner.maybe_adjust_auto_component_residency_after_offload()
+            auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
+            auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
+        self._adjust_path()
+        self._adjust_quant_config()
+        self._adjust_warmup()
+        self._adjust_network_ports()
+        # adjust parallelism before attention backend
+        self._adjust_parallelism()
+        self._adjust_attention_backend()
+        self._adjust_platform_specific()
+        self._adjust_layerwise_offload_components()
+        self._adjust_autocast()
+        auto_tuner.finalize_auto_flags()
+        self.adjust_pipeline_config()
+
+    def _validate_parameters(self):
+        """check consistency and raise errors for invalid configs"""
+        self._validate_pipeline()
+        self._validate_offload()
+        if not current_platform.is_cpu():
+            self._validate_parallelism()
+        self._validate_cfg_parallel()
+        self._validate_batching()
+
+    def _adjust_save_paths(self):
+        """Normalize empty-string save paths to None (disabled)."""
+        if self.output_path is not None and self.output_path.strip() == "":
+            self.output_path = None
+        if self.input_save_path is not None and self.input_save_path.strip() == "":
+            self.input_save_path = None
+
+    def _adjust_quant_config(self):
+        """
+        resolve, validate and adjust quantization config
+
+        handles only nunchaku for now
+        """
+
+        ncfg = self.nunchaku_config
+        if ncfg is None or isinstance(ncfg, NunchakuConfig):
+            return
+
+        resolution = ncfg.resolve_runtime_config()
+        if resolution.transformer_weights_path:
+            self.transformer_weights_path = resolution.transformer_weights_path
+        self.nunchaku_config = resolution.nunchaku_config
+
+    def adjust_pipeline_config(self):
+        # enable parallel folding when SP is enabled
+        if self.tp_size != 1 or self.sp_degree <= 1:
+            return
+
+        enabled = False
+        for text_encoder_config in self.pipeline_config.text_encoder_configs:
+            if isinstance(text_encoder_config, T5Config):
+                text_encoder_config.parallel_folding = True
+                enabled = True
+                text_encoder_config.parallel_folding_mode = "sp"
+
+        if enabled:
+            logger.info(
+                "Enabled T5 text encoder parallel folding (mode=sp) for %s (tp_size=%s, sp_degree=%s).",
+                self.__class__.__name__,
+                self.tp_size,
+                self.sp_degree,
+            )
+
+    def _adjust_offload(self):
+        if current_platform.is_cpu():
+            # CPU platform does not need offload
+            return
+
+        # TODO: to be handled by each platform
+        if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
+            logger.info(
+                "Enabling large component offloading for GPU with low device memory"
+            )
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = True
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = True
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = True
+        elif self.pipeline_config.task_type.is_image_gen():
+            logger.info(
+                "Disabling some offloading (except dit, text_encoder) for image generation model"
+            )
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = True
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = True
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = False
+        else:
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = True
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = True
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = True
+
+    def _adjust_ltx2_two_stage_device_mode(self):
+        if not self._is_ltx23_two_stage_pipeline():
+            return
+
+        mode = self.ltx2_two_stage_device_mode
+        if mode is None:
+            env_mode = os.getenv("SGLANG_LTX2_TWO_STAGE_DEVICE_MODE")
+            mode = (
+                _normalize_ltx2_two_stage_device_mode(env_mode)
+                if env_mode
+                else self._resolve_default_ltx2_two_stage_device_mode()
+            )
+        else:
+            mode = _normalize_ltx2_two_stage_device_mode(mode)
+
+        if mode not in LTX2_TWO_STAGE_DEVICE_MODES:
+            raise ValueError(
+                f"Invalid ltx2_two_stage_device_mode={mode!r}. "
+                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODES}."
+            )
+
+        self.ltx2_two_stage_device_mode = mode
+
+    def _resolve_default_ltx2_two_stage_device_mode(self) -> str:
+        if not current_platform.is_cuda():
+            logger.info(
+                "Automatically set ltx2_two_stage_device_mode=snapshot on non-CUDA platform"
+            )
+            return "snapshot"
+
+        device_name = str(current_platform.get_device_name(0)).upper()
+        device_total_memory_gb = (
+            current_platform.get_device_total_memory() / BYTES_PER_GB
+        )
+        if (
+            "H200" in device_name
+            or device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
+        ):
+            logger.info(
+                "Automatically set ltx2_two_stage_device_mode=resident for high-memory CUDA GPU (%s, %.2f GiB total)",
+                device_name,
+                device_total_memory_gb,
+            )
+            return "resident"
+
+        logger.info(
+            "Automatically set ltx2_two_stage_device_mode=snapshot for CUDA GPU (%s, %.2f GiB total)",
+            device_name,
+            device_total_memory_gb,
+        )
+        return "snapshot"
+
+    def _is_ltx23_two_stage_pipeline(self) -> bool:
+        return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
+            self._is_ltx23_model_path(self.model_path)
+            or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
+        )
+
+    def _uses_ltx23_snapshot_two_stage_residency(self) -> bool:
+        return (
+            self.ltx2_two_stage_device_mode == "snapshot"
+            and self._is_ltx23_two_stage_pipeline()
+        )
+
+    def _adjust_attention_backend(self):
+        if self.attention_backend in ["fa3", "fa4"]:
+            self.attention_backend = "fa"
+        self.component_attention_backends = (
+            self._normalize_component_attention_backends(
+                self.component_attention_backends
+            )
+        )
+
+        # attention_backend_config
+        if self.attention_backend_config is None:
+            self.attention_backend_config = addict.Dict()
+        elif isinstance(self.attention_backend_config, str):
+            self.attention_backend_config = addict.Dict(
+                self._parse_attention_backend_config(self.attention_backend_config)
+            )
+
+        if self.backend != Backend.DIFFUSERS and isinstance(
+            self.pipeline_config, LTX2PipelineConfig
+        ):
+            text_backend = self.component_attention_backends.get("text_encoder")
+            if text_backend != "torch_sdpa":
+                if text_backend is None:
+                    logger.info(
+                        "Automatically set torch_sdpa backend for component text_encoder to preserve LTX2 official attention semantics"
+                    )
+                else:
+                    logger.warning(
+                        "Overriding %s backend with torch_sdpa for component text_encoder to preserve LTX2 official attention semantics",
+                        text_backend,
+                    )
+                self.component_attention_backends["text_encoder"] = "torch_sdpa"
+
+        if self.ring_degree > 1:
+            if self.attention_backend is not None and self.attention_backend not in (
+                "fa",
+                "sage_attn",
+            ):
+                raise ValueError(
+                    "Ring Attention is only supported for flash attention or sage attention backend for now"
+                )
+            if self.attention_backend is None:
+                self.attention_backend = "fa"
+                logger.info(
+                    "Ring Attention is currently only supported for flash attention or sage attention; "
+                    "attention_backend has been automatically set to flash attention"
+                )
+
+        if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
+            if (
+                current_platform.is_cuda()
+                and self.pipeline_class_name is None
+                and self.num_gpus == 1
+                and self.tp_size == 1
+                and self.sp_degree == 1
+                and self.ulysses_degree == 1
+                and self.ring_degree == 1
+                and self._is_ltx23_model_path(self.model_path)
+            ):
+                self.attention_backend = "fa"
+                logger.info(
+                    "Automatically set attention_backend=fa for LTX-2.3 one-stage on 1 GPU to preserve precision"
+                )
+                return
+            self._set_default_attention_backend()
+
+    @staticmethod
+    def _normalize_attention_backend_name(backend: str) -> str:
+        if not isinstance(backend, str):
+            raise ValueError("Attention backend name must be a string")
+        normalized = backend.strip().lower()
+        if normalized in ("fa3", "fa4"):
+            normalized = "fa"
+        try:
+            return AttentionBackendEnum[normalized.upper()].name.lower()
+        except KeyError:
+            raise ValueError(
+                f"Invalid attention backend '{backend}'. "
+                f"Available options are: {[e.name.lower() for e in AttentionBackendEnum]}"
+            ) from None
+
+    @staticmethod
+    def _parse_component_attention_backend_map(
+        value: dict[str, str] | str | None,
+    ) -> dict[str, str]:
+        if value is None or value == "":
+            return {}
+        if isinstance(value, dict):
+            return dict(value)
+        if not isinstance(value, str):
+            raise ValueError(
+                "component_attention_backends must be a dict or a comma-separated component=backend string"
+            )
+
+        try:
+            parsed = json.loads(value)
+            if not isinstance(parsed, dict):
+                raise ValueError
+            return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        result: dict[str, str] = {}
+        for pair in value.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(
+                    "component_attention_backends must use component=backend entries"
+                )
+            component, backend = pair.split("=", 1)
+            result[component.strip()] = backend.strip()
+        return result
+
+    @classmethod
+    def _normalize_component_attention_backends(
+        cls, value: dict[str, str] | str | None
+    ) -> dict[str, str]:
+        raw = cls._parse_component_attention_backend_map(value)
+        normalized: dict[str, str] = {}
+        for component, backend in raw.items():
+            if not isinstance(component, str):
+                raise ValueError("Component attention backend key must be a string")
+            component_name = component.strip().replace("-", "_")
+            if not component_name:
+                raise ValueError("Component attention backend key must not be empty")
+            normalized[component_name] = cls._normalize_attention_backend_name(backend)
+        return normalized
+
+    def resolve_component_attention_backend(
+        self, *component_names: str | None
+    ) -> tuple[AttentionBackendEnum | None, str | None]:
+        for component_name in component_names:
+            if component_name is None:
+                continue
+            key = component_name.replace("-", "_")
+            fallback_keys = [key]
+            if key.endswith("_2"):
+                # Secondary two-stage components inherit the base component
+                # backend unless explicitly overridden.
+                fallback_keys.append(key[:-2])
+            for backend_key in fallback_keys:
+                backend = self.component_attention_backends.get(backend_key)
+                if backend is not None:
+                    return AttentionBackendEnum[backend.upper()], backend_key
+        return None, None
+
+    def _adjust_warmup(self):
+        if self.warmup_resolutions is not None:
+            self.warmup = True
+
+        if self.warmup:
+            logger.info(
+                "Warmup enabled, the launch time is expected to be longer than usual"
+            )
+
+    @staticmethod
+    def _require_port(port: int, name: str) -> None:
+        """Raise if *port* is occupied (used under ``--strict-ports``)."""
+        if not is_port_available(port):
+            raise RuntimeError(
+                f"{name} port {port} is unavailable and --strict-ports is enabled. "
+                f"Either use a different port or disable --strict-ports."
+            )
+
+    def _adjust_network_ports(self):
+        # Disagg role instances (encoder/denoiser/decoder) don't serve HTTP,
+        # so skip settling the HTTP port to avoid unnecessary port collisions.
+        needs_http = self.disagg_role in (
+            RoleType.MONOLITHIC,
+            RoleType.SERVER,
+        )
+
+        if self.strict_ports:
+            requested_ports = []
+            if needs_http:
+                requested_ports.append((self.port, "HTTP"))
+            requested_ports.append((self.scheduler_port, "Scheduler"))
+            if self.master_port is not None:
+                requested_ports.append((self.master_port, "Master"))
+            seen_ports: dict[int, str] = {}
+            for port, name in requested_ports:
+                if port in seen_ports:
+                    raise RuntimeError(
+                        f"{name} port {port} duplicates {seen_ports[port]} port and "
+                        "--strict-ports is enabled."
+                    )
+                seen_ports[port] = name
+                self._require_port(port, name)
+        else:
+            settled_ports: set[int] = set()
+            if needs_http:
+                self.port = self.settle_port(self.port)
+                settled_ports.add(self.port)
+            initial_scheduler_port = self.scheduler_port + (
+                random.randint(0, 100) if self.scheduler_port == 5555 else 0
+            )
+            self.scheduler_port = self.settle_port(
+                initial_scheduler_port, avoid=settled_ports
+            )
+            settled_ports.add(self.scheduler_port)
+            if self.master_port is not None:
+                self.master_port = self.settle_port(
+                    self.master_port, 37, avoid=settled_ports
+                )
+
+    def _adjust_parallelism(self):
+        sp_unspecified = self.sp_degree is None
+        ulysses_unspecified = self.ulysses_degree is None
+        ring_unspecified = self.ring_degree is None
+        cfg_unspecified = self.enable_cfg_parallel is None
+
+        if current_platform.is_cpu() and (self.tp_size or 1) > 1:
+            # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
+            self.num_gpus = self.tp_size
+
+        if self.hsdp_shard_dim is None:
+            self.hsdp_shard_dim = self.num_gpus
+
+        if self.tp_size is None:
+            self.tp_size = 1
+
+        # --cfg-parallel-size takes precedence over --enable-cfg-parallel bool.
+        if self.cfg_parallel_degree is not None:
+            if self.cfg_parallel_degree == 1:
+                self.enable_cfg_parallel = False
+            elif self.cfg_parallel_degree > 1:
+                self.enable_cfg_parallel = True
+            cfg_unspecified = False
+
+        # Auto-enable CFG parallel when user hasn't set any parallelism flags
+        # and there are enough GPUs.  Only auto-enable for models whose default
+        # SamplingParams use classifier-free guidance (negative_prompt is not None),
+        # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
+        if cfg_unspecified:
+            cfg_group_size = self.dp_size * self.tp_size * 2
+            if (
+                self.performance_mode != "manual"
+                and self.num_gpus >= 2
+                and self.num_gpus % cfg_group_size == 0
+                and sp_unspecified
+                and ulysses_unspecified
+                and ring_unspecified
+                and self._model_default_uses_cfg()
+            ):
+                self.enable_cfg_parallel = True
+                logger.info(
+                    "Automatically enabled CFG parallel for %d GPUs. "
+                    "Use --sp-degree / --ulysses-degree to use sequence "
+                    "parallelism instead.",
+                    self.num_gpus,
+                )
+            else:
+                self.enable_cfg_parallel = False
+
+        # Resolve cfg_parallel_degree to a concrete int now that enable_cfg_parallel is settled.
+        if self.cfg_parallel_degree is None:
+            self.cfg_parallel_degree = 2 if self.enable_cfg_parallel else 1
+
+        # adjust sp_degree: allocate all remaining GPUs after TP and DP
+        if self.sp_degree is None:
+            num_gpus_per_group = self.dp_size * self.tp_size
+            if self.enable_cfg_parallel:
+                num_gpus_per_group *= self.cfg_parallel_degree
+            if self.num_gpus % num_gpus_per_group == 0:
+                self.sp_degree = self.num_gpus // num_gpus_per_group
+            else:
+                # Will be validated later
+                self.sp_degree = 1
+
+        if (
+            self.ulysses_degree is None
+            and self.ring_degree is None
+            and self.sp_degree != 1
+        ):
+            self.ulysses_degree = self.sp_degree
+            logger.info(
+                f"Automatically set ulysses_degree=sp_degree={self.ulysses_degree} for best performance"
+            )
+
+        if self.ulysses_degree is None:
+            self.ulysses_degree = 1
+            logger.debug(
+                f"Ulysses degree not set, using default value {self.ulysses_degree}"
+            )
+
+        if self.ring_degree is None:
+            self.ring_degree = 1
+            logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+    def _model_default_uses_cfg(self) -> bool:
+        """
+        Check whether the model uses classifier-free guidance by default.
+
+        CFG is active when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
+        """
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(self.model_path, self.backend, self.model_id)
+        if model_info is None:
+            return False
+        default_params = model_info.sampling_param_cls()
+
+        return (
+            getattr(default_params, "negative_prompt", None) is not None
+            and getattr(default_params, "guidance_scale", 0) > 1.0
+        )
+
+    @staticmethod
+    def _is_ltx23_model_path(model_path: str | None) -> bool:
+        if not model_path:
+            return False
+        normalized = model_path.lower()
+        return any(
+            token in normalized
+            for token in (
+                "lightricks/ltx-2.3",
+                "models--lightricks--ltx-2.3",
+                "lightricks__ltx-2.3",
+            )
+        )
+
+    def _adjust_platform_specific(self):
+        if current_platform.is_mps():
+            self.use_fsdp_inference = False
+            self.dit_layerwise_offload = False
+            self.layerwise_offload_components = None
+
+    def should_configure_layerwise_offload_for_lazy_component(self) -> bool:
+        """Return whether a lazy-loaded component should try layerwise offload.
+
+        Lazy components are loaded after the normal pipeline-wide configuration
+        pass, so they should only attempt layerwise configuration when a
+        component scope is present.
+        """
+        return bool(self.layerwise_offload_components)
+
+    @property
+    def is_dit_layerwise_offload_selected(self) -> bool:
+        """returns if dit is selected to be layerwise-offload"""
+        component_names = self.layerwise_offload_components
+        return bool(
+            component_names
+            and "dit_cpu_offload"
+            in cpu_offload_flags_for_layerwise_components(component_names)
+        )
+
+    def _adjust_layerwise_offload_components(self):
+        explicitly_set_component_names = normalize_layerwise_offload_components(
+            self.layerwise_offload_components
+        )
+        if self.dit_layerwise_offload:
+            if explicitly_set_component_names is None:
+                explicitly_set_component_names = [LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS]
+            elif (
+                LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS
+                not in explicitly_set_component_names
+            ):
+                explicitly_set_component_names = [
+                    LAYERWISE_OFFLOAD_DEFAULT_COMPONENTS,
+                    *explicitly_set_component_names,
+                ]
+
+        if explicitly_set_component_names is not None:
+            self.layerwise_offload_components = explicitly_set_component_names
+            self._disable_cpu_offload_for_layerwise_components(
+                explicitly_set_component_names
+            )
+            return
+
+    def _disable_cpu_offload_for_layerwise_components(
+        self, component_names: list[str]
+    ) -> None:
+        # Layerwise offload owns H2D/D2H for selected component weights.
+        flag_names = cpu_offload_flags_for_layerwise_components(component_names)
+        disabled_flag_names: list[str] = []
+
+        if "dit_cpu_offload" in flag_names and self.dit_cpu_offload is not False:
+            self.dit_cpu_offload = False
+            disabled_flag_names.append("dit_cpu_offload")
+        if (
+            "text_encoder_cpu_offload" in flag_names
+            and self.text_encoder_cpu_offload is not False
+        ):
+            self.text_encoder_cpu_offload = False
+            disabled_flag_names.append("text_encoder_cpu_offload")
+        if (
+            "image_encoder_cpu_offload" in flag_names
+            and self.image_encoder_cpu_offload is not False
+        ):
+            self.image_encoder_cpu_offload = False
+            disabled_flag_names.append("image_encoder_cpu_offload")
+        if "vae_cpu_offload" in flag_names and self.vae_cpu_offload is not False:
+            self.vae_cpu_offload = False
+            disabled_flag_names.append("vae_cpu_offload")
+
+        if disabled_flag_names:
+            logger.info(
+                "Disabling %s because the selected layerwise offload components "
+                "manage the same weights.",
+                ", ".join(disabled_flag_names),
+            )
+
+    def _adjust_autocast(self):
+        if self.disable_autocast is None:
+            self.disable_autocast = not self.pipeline_config.enable_autocast
+
+    def _parse_attention_backend_config(self, config_str: str) -> dict[str, Any]:
+        """parse attention backend config from string."""
+        if not config_str:
+            return {}
+
+        # 1. treat as file path
+        if os.path.exists(config_str):
+            if config_str.endswith((".yaml", ".yml")):
+                with open(config_str, "r") as f:
+                    return yaml.safe_load(f)
+            elif config_str.endswith(".json"):
+                with open(config_str, "r") as f:
+                    return json.load(f)
+
+        # 2. treat as JSON string
+        try:
+            return json.loads(config_str)
+        except json.JSONDecodeError:
+            pass
+
+        # 3. treat as k=v pairs (simple implementation). e.g., "sparsity=0.5,enable_x=true"
+        try:
+            config = {}
+            pairs = config_str.split(",")
+            for pair in pairs:
+                k, v = pair.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if v.lower() == "true":
+                    v = True
+                elif v.lower() == "false":
+                    v = False
+                elif v.replace(".", "", 1).isdigit():
+                    v = float(v) if "." in v else int(v)
+                config[k] = v
+            return config
+        except Exception:
+            raise ValueError(f"Could not parse attention backend config: {config_str}")
+
+    def __post_init__(self):
+        # configure logger before use
         configure_logger(server_args=self)
+
+        # Convert string disagg_role to enum (from CLI/config)
+        convert_disagg_role_string(self.__dict__)
+
+        # 1. adjust parameters
+        self._adjust_parameters()
+
+        # 2. Validate parameters
+        self._validate_parameters()
 
         # log clean server_args
         try:
@@ -372,45 +979,58 @@ class ServerArgs:
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
         )
         parser.add_argument(
-            "--model-dir",
+            "--model-id",
             type=str,
-            help="Directory containing StepVideo model",
+            default=ServerArgs.model_id,
+            help=(
+                "Override the model ID used for config resolution. "
+                "Useful when --model-path is a local directory whose name does not match "
+                "any registered HF repo name. Should be the repo name portion of the HF ID "
+                "(e.g. 'Qwen-Image' for 'Qwen/Qwen-Image')."
+            ),
         )
-
+        parser.add_argument(
+            "--pipeline-class-name",
+            type=str,
+            default=ServerArgs.pipeline_class_name,
+            help=(
+                "Override pipeline class selection from model_index.json. "
+                "Must match a registered pipeline_name."
+            ),
+        )
         # attention
         parser.add_argument(
             "--attention-backend",
             type=str,
             default=None,
-            choices=[e.name.lower() for e in AttentionBackendEnum],
-            help="The attention backend to use. If not specified, the backend is automatically selected based on hardware and installed packages.",
+            help=(
+                "The attention backend to use. For SGLang-native pipelines, use "
+                "values like fa, torch_sdpa, sage_attn, etc. For diffusers pipelines, "
+                "use diffusers attention backend names such as flash, _flash_3_hub, "
+                "sage, or xformers."
+            ),
         )
-
-        # Running mode
         parser.add_argument(
-            "--mode",
+            "--attention-backend-config",
             type=str,
-            choices=ExecutionMode.choices(),
-            default=ServerArgs.mode.value,
-            help="The mode to run sgl-diffusion",
+            default=None,
+            help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
         )
-
-        # Workload type
         parser.add_argument(
-            "--workload-type",
+            "--component-attention-backends",
             type=str,
-            choices=WorkloadType.choices(),
-            default=ServerArgs.workload_type.value,
-            help="The workload type",
+            default=None,
+            help=(
+                "Per-component attention backend overrides for native pipelines. "
+                "Use component names from model_index.json, e.g. "
+                "'text_encoder=torch_sdpa,transformer=fa'."
+            ),
         )
-
-        # distributed_executor_backend
         parser.add_argument(
-            "--distributed-executor-backend",
+            "--cache-dit-config",
             type=str,
-            choices=["mp"],
-            default=ServerArgs.distributed_executor_backend,
-            help="The distributed executor backend to use",
+            default=ServerArgs.cache_dit_config,
+            help="Path to a Cache-DiT YAML/JSON config. Enables cache-dit for diffusers backend.",
         )
 
         # HuggingFace specific parameters
@@ -427,6 +1047,22 @@ class ServerArgs:
             help="The specific model version to use (can be a branch name, tag name, or commit id)",
         )
 
+        parser.add_argument(
+            "--performance-mode",
+            "--mode",
+            type=str,
+            choices=PERFORMANCE_MODES,
+            default=ServerArgs.performance_mode,
+            help=(
+                "Preset for performance and memory defaults. "
+                "'manual' keeps performance-related server args under explicit user control, no adjustment is made; "
+                "'auto' keeps safe defaults and applies high-confidence FSDP/CFG improvements; "
+                "'speed' favors GPU-resident execution for lower latency and higher throughput, and may OOM; "
+                "'memory' favors lower GPU memory usage; "
+                "Explicit offload/FSDP/parallelism flags take precedence."
+            ),
+        )
+
         # Parallelism
         parser.add_argument(
             "--num-gpus",
@@ -437,14 +1073,14 @@ class ServerArgs:
         parser.add_argument(
             "--tp-size",
             type=int,
-            default=ServerArgs.tp_size,
-            help="The tensor parallelism size.",
+            default=None,
+            help="The tensor parallelism size. Defaults to 1 if not specified.",
         )
         parser.add_argument(
             "--sp-degree",
             type=int,
-            default=ServerArgs.sp_degree,
-            help="The sequence parallelism size.",
+            default=None,
+            help="The sequence parallelism size. If not specified, will use all remaining GPUs after accounting for TP and DP.",
         )
         parser.add_argument(
             "--ulysses-degree",
@@ -460,9 +1096,20 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-cfg-parallel",
-            action="store_true",
-            default=ServerArgs.enable_cfg_parallel,
-            help="Enable cfg parallel.",
+            action=StoreBoolean,
+            default=None,
+            help="Enable cfg parallel at degree 2. Auto-enabled when num_gpus >= 2 and no SP flags are set. Use false to disable it explicitly.",
+        )
+        parser.add_argument(
+            "--cfg-parallel-size",
+            dest="cfg_parallel_degree",
+            type=int,
+            default=None,
+            help=(
+                "Number of GPUs per CFG parallel group (1 = disabled, N > 1 = enabled at degree N). "
+                "Supersedes --enable-cfg-parallel. Allows 4-branch CFG parallel (e.g., --cfg-parallel-size 4) "
+                "for models with cond + neg + perturbed + modality branches."
+            ),
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -482,24 +1129,19 @@ class ServerArgs:
         parser.add_argument(
             "--hsdp-shard-dim",
             type=int,
-            default=ServerArgs.hsdp_shard_dim,
-            help="The data parallelism shards.",
+            default=None,
+            help="The data parallelism shards. Defaults to num_gpus if not specified.",
         )
         parser.add_argument(
             "--dist-timeout",
             type=int,
             default=ServerArgs.dist_timeout,
-            help="Set timeout for torch.distributed initialization.",
+            help="Timeout for torch.distributed operations in seconds. "
+            "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
         )
 
-        # Output type
-        parser.add_argument(
-            "--output-type",
-            type=str,
-            default=ServerArgs.output_type,
-            choices=["pil"],
-            help="Output type for the generated video",
-        )
+        # Disaggregated diffusion args (defined in disagg_args.py)
+        add_disagg_cli_args(parser)
 
         # Prompt text file for batch processing
         parser.add_argument(
@@ -509,20 +1151,6 @@ class ServerArgs:
             help="Path to a text file containing prompts (one per line) for batch processing",
         )
 
-        # STA (Sliding Tile Attention) parameters
-        parser.add_argument(
-            "--STA-mode",
-            type=str,
-            default=ServerArgs.STA_mode.value,
-            choices=[mode.value for mode in STA_Mode],
-            help="STA mode contains STA_inference, STA_searching, STA_tuning, STA_tuning_cfg, None",
-        )
-        parser.add_argument(
-            "--skip-time-steps",
-            type=int,
-            default=ServerArgs.skip_time_steps,
-            help="Number of time steps to warmup (full attention) for STA",
-        )
         parser.add_argument(
             "--mask-strategy-file-path",
             type=str,
@@ -536,15 +1164,64 @@ class ServerArgs:
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
 
+        # warmup
+        parser.add_argument(
+            "--warmup",
+            action=StoreBoolean,
+            default=ServerArgs.warmup,
+            help="Perform some warmup after server starts (if `--warmup-resolutions` is specified) or before processing the first request (if `--warmup-resolutions` is not specified)."
+            "Recommended to enable when benchmarking to ensure fair comparison and best performance."
+            "When enabled with `--warmup-resolutions` unspecified, look for the line ending with `(with warmup excluded)` for actual processing time.",
+        )
+        parser.add_argument(
+            "--warmup-resolutions",
+            type=str,
+            nargs="+",
+            default=ServerArgs.warmup_resolutions,
+            help="Specify resolutions for server to warmup. e.g., `--warmup-resolutions 256x256, 720x720`",
+        )
+        parser.add_argument(
+            "--warmup-steps",
+            type=int,
+            default=ServerArgs.warmup_steps,
+            help="The number of warmup steps to perform for each resolution.",
+        )
+
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
             help="Use CPU offload for DiT inference. Enable if run out of memory with FSDP.",
         )
         parser.add_argument(
+            "--dit-layerwise-offload",
+            action=StoreBoolean,
+            default=ServerArgs.dit_layerwise_offload,
+            help="Enable layerwise CPU offload with async H2D prefetch overlap for DiTs. "
+            "It only selects the legacy default DiT components. Cannot be used together with cache-dit "
+            "(SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+        )
+        parser.add_argument(
+            "--layerwise-offload-components",
+            "--layerwise-offload-modules",
+            type=str,
+            nargs="+",
+            default=ServerArgs.layerwise_offload_components,
+            help="Select pipeline components for layerwise offload. "
+            "Use default to select the legacy default DiT components, "
+            "or all to select every layerwise-offloadable component. "
+            "This option does not imply --dit-layerwise-offload. Example: "
+            "--layerwise-offload-components text_encoder image_encoder.",
+        )
+        parser.add_argument(
+            "--dit-offload-prefetch-size",
+            type=float,
+            default=ServerArgs.dit_offload_prefetch_size,
+            help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
+        )
+        parser.add_argument(
             "--use-fsdp-inference",
             action=StoreBoolean,
-            help="Use FSDP for inference by sharding the model weights. Latency is very low due to prefetch--enable if run out of memory.",
+            help="Use FSDP inference to shard DiT weights across GPUs. For single-GPU memory pressure, prefer CPU or layerwise offload.",
         )
         parser.add_argument(
             "--text-encoder-cpu-offload",
@@ -568,18 +1245,51 @@ class ServerArgs:
             "Should be enabled in almost all cases",
         )
         parser.add_argument(
+            "--ltx2-two-stage-device-mode",
+            type=str,
+            choices=LTX2_TWO_STAGE_DEVICE_MODES,
+            default=ServerArgs.ltx2_two_stage_device_mode,
+            help=(
+                "LTX-2.3 two-stage device residency mode: "
+                "'original' keeps official two-stage semantics without premerged stage2, "
+                "'snapshot' keeps premerged stage2 with snapshot-based release, "
+                "'resident' keeps both transformers resident on GPU. "
+                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise snapshot."
+            ),
+        )
+        parser.add_argument(
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
         )
 
-        # VSA parameters
         parser.add_argument(
-            "--VSA-sparsity",
-            type=float,
-            default=ServerArgs.VSA_sparsity,
-            help="Validation sparsity for VSA",
+            "--quantization",
+            type=str,
+            default=ServerArgs.quantization,
+            help=(
+                "Quantization method for the transformer. If omitted, the method is "
+                "auto-detected from the checkpoint config or safetensors metadata when "
+                "possible. Applies to both pre-quantized checkpoints and online "
+                "quantization. Use this flag to override auto-detection. "
+                "Options: 'fp8', 'mxfp8', 'mxfp4', 'modelslim'. "
+                "Note: MXFP4 requires ROCm and MI350+ (gfx95x)."
+            ),
         )
+        parser.add_argument(
+            "--quantization-ignored-layers",
+            type=str,
+            nargs="+",
+            default=ServerArgs.quantization_ignored_layers,
+            help=(
+                "Layer name patterns to keep unquantized during online quantization "
+                "(fp8/mxfp4). Each pattern is matched against the layer prefix. "
+                "Example: --quantization-ignored-layers img_mod txt_mod to_out"
+            ),
+        )
+
+        # Nunchaku SVDQuant quantization parameters
+        NunchakuSVDQuantArgs.add_cli_args(parser)
 
         # Master port for distributed inference
         parser.add_argument(
@@ -595,6 +1305,41 @@ class ServerArgs:
             help="Port for the scheduler server.",
         )
         parser.add_argument(
+            "--batching-mode",
+            type=str,
+            default=ServerArgs.batching_mode,
+            choices=["dynamic"],
+            help="Request batching scheduler mode. Currently only 'dynamic' is implemented.",
+        )
+        parser.add_argument(
+            "--batching-max-size",
+            type=int,
+            default=ServerArgs.batching_max_size,
+            help="Maximum number of compatible generation requests to merge into one batch.",
+        )
+        parser.add_argument(
+            "--batching-delay-ms",
+            type=float,
+            default=ServerArgs.batching_delay_ms,
+            help="Maximum time (in ms) to wait for forming a larger batch before dispatch.",
+        )
+        parser.add_argument(
+            "--batching-config",
+            type=str,
+            default=ServerArgs.batching_config,
+            help=(
+                "Optional JSON file with {'schema_version': 1, 'rules': [...]} "
+                "batching admission rules that can cap model/resolution shapes "
+                "below --batching-max-size."
+            ),
+        )
+        parser.add_argument(
+            "--enable-batching-metrics",
+            action="store_true",
+            default=ServerArgs.enable_batching_metrics,
+            help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -606,25 +1351,76 @@ class ServerArgs:
             default=ServerArgs.port,
             help="Port for the HTTP API server.",
         )
-
-        # Stage verification
         parser.add_argument(
-            "--enable-stage-verification",
+            "--strict-ports",
             action=StoreBoolean,
-            default=ServerArgs.enable_stage_verification,
-            help="Enable input/output verification for pipeline stages",
+            default=ServerArgs.strict_ports,
+            help="If enabled, fail when requested ports are unavailable instead of auto-selecting.",
         )
         parser.add_argument(
-            "--override-transformer-cls-name",
+            "--webui",
+            action=StoreBoolean,
+            default=ServerArgs.webui,
+            help="Whether to use webui for better display",
+        )
+
+        parser.add_argument(
+            "--webui-port",
+            type=int,
+            default=ServerArgs.webui_port,
+            help="Whether to use webui for better display",
+        )
+        parser.add_argument(
+            "--output-path",
             type=str,
-            default=ServerArgs.override_transformer_cls_name,
-            help="Override transformer cls name",
+            default=ServerArgs.output_path,
+            help='Directory path to save generated images/videos. Set to "" to disable persistent saving.',
+        )
+        parser.add_argument(
+            "--input-save-path",
+            type=str,
+            default=ServerArgs.input_save_path,
+            help='Directory path to save uploaded input images/videos. Set to "" to disable persistent saving.',
+        )
+
+        # LoRA
+        parser.add_argument(
+            "--lora-path",
+            type=str,
+            default=ServerArgs.lora_path,
+            help="The path to the LoRA adapter weights (can be local file path or HF hub id) to launch with",
+        )
+        parser.add_argument(
+            "--lora-nickname",
+            type=str,
+            default=ServerArgs.lora_nickname,
+            help="The nickname for the LoRA adapter to launch with",
+        )
+        parser.add_argument(
+            "--lora-scale",
+            type=float,
+            default=ServerArgs.lora_scale,
+            help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
+        )
+        parser.add_argument(
+            "--lora-merge-mode",
+            type=str,
+            choices=LORA_MERGE_MODES,
+            default=ServerArgs.lora_merge_mode,
+            help=(
+                "How LoRA is applied: auto keeps static merge for regular weights "
+                "and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather; "
+                "merge always merges into base weights; dynamic always applies LoRA at forward time."
+            ),
+        )
+        parser.add_argument(
+            "--lora-weight-name",
+            type=str,
+            default=ServerArgs.lora_weight_name,
+            help="Specific safetensors filename to load from a multi-file LoRA repo",
         )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
-
-        # Add preprocessing configuration arguments
-        PreprocessConfig.add_cli_args(parser)
 
         # Logging
         parser.add_argument(
@@ -633,44 +1429,77 @@ class ServerArgs:
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
         )
+
+        # Tracing
+        parser.add_argument(
+            "--enable-trace",
+            action="store_true",
+            default=False,
+            help="Enable OpenTelemetry tracing.",
+        )
+        parser.add_argument(
+            "--otlp-traces-endpoint",
+            type=str,
+            default=ServerArgs.otlp_traces_endpoint,
+            help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
+        )
+        parser.add_argument(
+            "--uvicorn-access-log-exclude-prefixes",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
+            "Defaults to empty (disabled). "
+            "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
+        )
+        parser.add_argument(
+            "--backend",
+            type=str,
+            choices=Backend.choices(),
+            default=ServerArgs.backend.value,
+            help="The model backend to use. 'auto' prefers sglang native and falls back to diffusers. "
+            "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
+        )
         return parser
 
     def url(self):
-        if is_valid_ipv6_address(self.host):
-            return f"http://[{self.host}]:{self.port}"
+        host = self.host
+        if not host or host == "0.0.0.0":
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        if is_valid_ipv6_address(host):
+            return f"http://[{host}]:{self.port}"
         else:
-            return f"http://{self.host}:{self.port}"
+            return f"http://{host}:{self.port}"
 
+    @property
     def scheduler_endpoint(self):
         """
-        Internal endpoint for scheduler
-
+        Internal endpoint for scheduler.
+        Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
         """
-        scheduler_host = self.host or "localhost"
+        scheduler_host = self.host
+        if scheduler_host is None or scheduler_host == "localhost":
+            scheduler_host = "127.0.0.1"
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
     def settle_port(
-        self, port: int, port_inc: int = 42, max_attempts: int = 100
+        self,
+        port: int,
+        port_inc: int = 42,
+        max_attempts: int = 100,
+        avoid: set[int] | None = None,
     ) -> int:
         """
         Find an available port with retry logic.
-
-        Args:
-            port: Initial port to check
-            port_inc: Port increment for each attempt
-            max_attempts: Maximum number of attempts to find an available port
-
-        Returns:
-            An available port number
-
-        Raises:
-            RuntimeError: If no available port is found after max_attempts
         """
         attempts = 0
         original_port = port
+        avoid = avoid or set()
 
         while attempts < max_attempts:
-            if is_port_available(port):
+            if port not in avoid and is_port_available(port):
                 if attempts > 0:
                     logger.info(
                         f"Port {original_port} was unavailable, using port {port} instead"
@@ -689,15 +1518,89 @@ class ServerArgs:
             f"(started from port {original_port})"
         )
 
-    def post_init_serve(self):
+    @staticmethod
+    def _extract_component_paths(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
         """
-        Post init when in serve mode
+        Extract dynamic component path args from unrecognised CLI args.
+
+        Supported forms:
+        - ``--<component>-path /path/to/component``
+        - ``--component-paths.<component> /path/to/component`` (expanded from config)
         """
-        if self.host is None:
-            self.host = "localhost"
-        if self.port is None:
-            self.port = 3000
-        self.port = self.settle_port(self.port)
+        component_paths: dict[str, str] = {}
+        remaining: list[str] = []
+        i = 0
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            component = None
+            if key_part.startswith("--component-paths."):
+                component = key_part[len("--component-paths.") :].replace("-", "_")
+            elif key_part.startswith("--component_paths."):
+                component = key_part[len("--component_paths.") :].replace("-", "_")
+            elif key_part.startswith("--") and key_part.endswith("-path"):
+                component = key_part[2:-5].replace("-", "_")
+
+            if component is not None:
+                if "=" in arg:
+                    component_paths[component] = arg.split("=", 1)[1]
+                elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    component_paths[component] = unknown_args[i]
+                else:
+                    remaining.append(arg)
+                    i += 1
+                    continue
+            else:
+                remaining.append(arg)
+            i += 1
+
+        # canonicalize and validate
+        for component, path in component_paths.items():
+            path = os.path.expanduser(path)
+            component_paths[component] = path
+        return component_paths, remaining
+
+    @staticmethod
+    def _extract_component_attention_backends(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        component_attention_backends: dict[str, str] = {}
+        remaining: list[str] = []
+        i = 0
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            component = None
+            if key_part.startswith("--component-attention-backends."):
+                component = key_part[len("--component-attention-backends.") :].replace(
+                    "-", "_"
+                )
+            elif key_part.startswith("--component_attention_backends."):
+                component = key_part[len("--component_attention_backends.") :].replace(
+                    "-", "_"
+                )
+
+            if component is not None:
+                if "=" in arg:
+                    component_attention_backends[component] = arg.split("=", 1)[1]
+                elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    component_attention_backends[component] = unknown_args[i]
+                else:
+                    remaining.append(arg)
+                    i += 1
+                    continue
+            else:
+                remaining.append(arg)
+            i += 1
+        return component_attention_backends, remaining
 
     @classmethod
     def from_cli_args(
@@ -705,35 +1608,54 @@ class ServerArgs:
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
+
+        # extract dynamic --<component>-path from unknown args
+        dynamic_paths, remaining = cls._extract_component_paths(unknown_args)
+        dynamic_attention_backends, remaining = (
+            cls._extract_component_attention_backends(remaining)
+        )
+        if remaining:
+            raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
+
         provided_args = cls.get_provided_args(args, unknown_args)
 
         # Handle config file
         config_file = provided_args.get("config")
         if config_file:
             config_args = cls.load_config_file(config_file)
-            # Provided args override config file args
             provided_args = {**config_args, **provided_args}
 
-        # Handle special cases
-        # if "tp_size" in provided_args:
-        #     provided_args["tp"] = provided_args.pop("tp_size")
+        if dynamic_paths:
+            existing = dict(provided_args.get("component_paths") or {})
+            existing.update(dynamic_paths)
+            provided_args["component_paths"] = existing
+        if dynamic_attention_backends:
+            existing = cls._parse_component_attention_backend_map(
+                provided_args.get("component_attention_backends")
+            )
+            existing.update(dynamic_attention_backends)
+            provided_args["component_attention_backends"] = existing
 
         return cls.from_dict(provided_args)
 
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        attrs = [attr.name for attr in dataclasses.fields(cls) if attr.init]
         server_args_kwargs: dict[str, Any] = {}
+
+        component_paths = dict(kwargs.get("component_paths") or {})
+        if component_paths:
+            server_args_kwargs["component_paths"] = component_paths
 
         for attr in attrs:
             if attr == "pipeline_config":
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
                 logger.debug(f"Using PipelineConfig: {type(pipeline_config)}")
                 server_args_kwargs["pipeline_config"] = pipeline_config
-            elif attr == "preprocess_config":
-                preprocess_config = PreprocessConfig.from_kwargs(kwargs)
-                server_args_kwargs["preprocess_config"] = preprocess_config
+            elif attr == "nunchaku_config":
+                nunchaku_config = NunchakuSVDQuantArgs.from_dict(kwargs)
+                server_args_kwargs["nunchaku_config"] = nunchaku_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
@@ -760,16 +1682,14 @@ class ServerArgs:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
-        # Convert mode string to enum if necessary
-        if "mode" in kwargs and isinstance(kwargs["mode"], str):
-            kwargs["mode"] = ExecutionMode.from_string(kwargs["mode"])
+        # Convert backend string to enum if necessary
+        if "backend" in kwargs and isinstance(kwargs["backend"], str):
+            kwargs["backend"] = Backend.from_string(kwargs["backend"])
 
-        # Convert workload_type string to enum if necessary
-        if "workload_type" in kwargs and isinstance(kwargs["workload_type"], str):
-            kwargs["workload_type"] = WorkloadType.from_string(kwargs["workload_type"])
+        # Convert disagg_role string to enum if necessary
+        convert_disagg_role_string(kwargs)
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
-        kwargs["preprocess_config"] = PreprocessConfig.from_kwargs(kwargs)
         return cls(**kwargs)
 
     @staticmethod
@@ -790,6 +1710,8 @@ class ServerArgs:
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
                 provided_arg_names.add(arg_name)
+        if "mode" in provided_arg_names:
+            provided_arg_names.add("performance_mode")
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
@@ -798,156 +1720,152 @@ class ServerArgs:
 
         return provided_args
 
-    def check_server_sp_args(self):
-
-        if self.pipeline_config.task_type.is_image_task():
-            if (
-                (self.sp_degree and self.sp_degree > 1)
-                or (self.ulysses_degree and self.ulysses_degree > 1)
-                or (self.ring_degree and self.ring_degree > 1)
-            ):
-                raise ValueError(
-                    "SP is not supported for image generation models for now"
-                )
-            self.sp_degree = self.ulysses_degree = self.ring_degree = 1
-
-        if self.sp_degree == -1:
-            # assume we leave all remaining gpus to sp
-            num_gpus_per_group = self.dp_size * self.tp_size
-            if self.enable_cfg_parallel:
-                num_gpus_per_group *= 2
-            if self.num_gpus % num_gpus_per_group != 0:
-                raise ValueError(f"{self.num_gpus=} % {num_gpus_per_group} != 0")
-            self.sp_degree = self.num_gpus // num_gpus_per_group
-
-        if (
-            self.ulysses_degree is None
-            and self.ring_degree is None
-            and self.sp_degree != 1
-        ):
-            self.ulysses_degree = self.sp_degree
-            logger.info(
-                f"Automatically set ulysses_degree=sp_degree={self.ulysses_degree} for best performance"
-            )
-
-        if self.ulysses_degree is None:
-            self.ulysses_degree = 1
-            logger.info(
-                f"Ulysses degree not set, " f"using default value {self.ulysses_degree}"
-            )
-
-        if self.ring_degree is None:
-            self.ring_degree = 1
-            logger.info(
-                f"Ring degree not set, " f"using default value {self.ring_degree}"
-            )
-
-        if self.ring_degree > 1:
-            if self.attention_backend != None and self.attention_backend != "fa3":
-                raise ValueError(
-                    "Ring Attention is only supported for fa3 backend for now"
-                )
-            else:
-                self.attention_backend = "fa3"
-                logger.info(
-                    "Ring Attention is currently only supported for fa3, attention_backend has been automatically set to fa3"
-                )
-
-        if self.sp_degree == -1:
-            self.sp_degree = self.ring_degree * self.ulysses_degree
-            logger.info(
-                f"sequence_parallel_degree is not provided, using ring_degree * ulysses_degree = {self.sp_degree}"
-            )
-
-        if self.sp_degree != self.ring_degree * self.ulysses_degree:
-            raise ValueError(
-                f"sequence_parallel_degree is not equal to ring_degree * ulysses_degree, {self.sp_degree} != {self.ring_degree} * {self.ulysses_degree}"
-            )
-
-    def check_server_dp_args(self):
-        assert self.num_gpus % self.dp_size == 0, f"{self.num_gpus=}, {self.dp_size=}"
-        assert self.dp_size >= 1, "--dp-size must be natural number"
-        self.dp_degree = self.num_gpus // self.dp_size
-        logger.info(f"Setting dp_degree to: {self.dp_degree}")
-
-    def check_server_args(self) -> None:
-        """Validate inference arguments for consistency"""
-        if current_platform.is_mps():
-            self.use_fsdp_inference = False
-
-        # autocast
-        is_flux = (
-            isinstance(self.pipeline_config, FluxPipelineConfig)
-            or isinstance(self.pipeline_config, QwenImagePipelineConfig)
-            or isinstance(self.pipeline_config, QwenImageEditPipelineConfig)
-        )
-        if is_flux:
-            self.disable_autocast = True
-
-        # Validate mode consistency
-        assert isinstance(
-            self.mode, ExecutionMode
-        ), f"Mode must be an ExecutionMode enum, got {type(self.mode)}"
-        assert (
-            self.mode in ExecutionMode.choices()
-        ), f"Invalid execution mode: {self.mode}"
-
-        # Validate workload type
-        assert isinstance(
-            self.workload_type, WorkloadType
-        ), f"Workload type must be a WorkloadType enum, got {type(self.workload_type)}"
-        assert (
-            self.workload_type in WorkloadType.choices()
-        ), f"Invalid workload type: {self.workload_type}"
-
-        if self.tp_size == -1:
-            self.tp_size = 1
-
-        if self.hsdp_shard_dim == -1:
-            self.hsdp_shard_dim = self.num_gpus
-
-        assert (
-            self.sp_degree <= self.num_gpus and self.num_gpus % self.sp_degree == 0
-        ), "num_gpus must >= and be divisible by sp_size"
-        assert (
-            self.hsdp_replicate_dim <= self.num_gpus
-            and self.num_gpus % self.hsdp_replicate_dim == 0
-        ), "num_gpus must >= and be divisible by hsdp_replicate_dim"
-        assert (
-            self.hsdp_shard_dim <= self.num_gpus
-            and self.num_gpus % self.hsdp_shard_dim == 0
-        ), "num_gpus must >= and be divisible by hsdp_shard_dim"
-
-        if self.num_gpus < max(self.tp_size, self.sp_degree):
-            self.num_gpus = max(self.tp_size, self.sp_degree)
-
+    def _validate_pipeline(self):
         if self.pipeline_config is None:
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
 
-        # Add preprocessing config validation if needed
-        if self.mode == ExecutionMode.PREPROCESS:
-            if self.preprocess_config is None:
-                raise ValueError(
-                    "preprocess_config is not set in ServerArgs when mode is PREPROCESS"
+    def _validate_offload(self):
+        # validate dit_offload_prefetch_size
+        if self.dit_offload_prefetch_size > 1 and (
+            isinstance(self.dit_offload_prefetch_size, float)
+            and not self.dit_offload_prefetch_size.is_integer()
+        ):
+            self.dit_offload_prefetch_size = int(
+                math.floor(self.dit_offload_prefetch_size)
+            )
+            logger.info(
+                f"Invalid --dit-offload-prefetch-size value passed, truncated to: {self.dit_offload_prefetch_size}"
+            )
+
+        if 0.5 <= self.dit_offload_prefetch_size < 1.0:
+            logger.info(
+                "We do not recommend --dit-offload-prefetch-size to be between 0.5 and 1.0"
+            )
+
+        # validate layerwise offload conflicts
+        if self.layerwise_offload_components:
+            if self.dit_offload_prefetch_size < 0.0:
+                raise ValueError("dit_offload_prefetch_size must be non-negative")
+
+            if self.use_fsdp_inference:
+                logger.warning(
+                    "layerwise offload components are selected, automatically disabling use_fsdp_inference."
                 )
-            if self.preprocess_config.model_path == "":
-                self.preprocess_config.model_path = self.model_path
-            if not self.pipeline_config.vae_config.load_encoder:
-                self.pipeline_config.vae_config.load_encoder = True
-            self.preprocess_config.check_preprocess_config()
+                self.use_fsdp_inference = False
 
-        # parallelism
-        self.check_server_dp_args()
-        # allocate all remaining gpus for sp-size
-        self.check_server_sp_args()
+            should_disable_dit_cpu_offload = self.is_dit_layerwise_offload_selected
+            if should_disable_dit_cpu_offload and self.dit_cpu_offload is not False:
+                logger.warning(
+                    "layerwise offload is selected for DiT components, automatically disabling dit_cpu_offload."
+                )
+                self.dit_cpu_offload = False
 
+            if envs.SGLANG_CACHE_DIT_ENABLED and should_disable_dit_cpu_offload:
+                raise ValueError(
+                    "DiT layerwise offload cannot be enabled together with cache-dit. "
+                    "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
+                    "causing shape mismatch errors. "
+                    "Please disable --dit-layerwise-offload, remove DiT from --layerwise-offload-components, "
+                    "or disable SGLANG_CACHE_DIT_ENABLED."
+                )
+
+            logger.warning(
+                "layerwise offload components are selected: %slower GPU memory usage%s, but %smay reduce throughput or increase latency%s. "
+                "%sIf you are using multi-GPU deployment and already have enough memory headroom, prefer keeping layerwise offload disabled.%s "
+                "Please tune this based on your memory headroom and performance target.",
+                GREEN,
+                RESET,
+                RED,
+                RESET,
+                CYAN,
+                RESET,
+            )
+
+    def _validate_parallelism(self):
+        if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be >= and divisible by sp_degree ({self.sp_degree})"
+            )
+
+        if (
+            self.hsdp_replicate_dim > self.num_gpus
+            or self.num_gpus % self.hsdp_replicate_dim != 0
+        ):
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be >= and divisible by hsdp_replicate_dim ({self.hsdp_replicate_dim})"
+            )
+
+        if (
+            self.hsdp_shard_dim > self.num_gpus
+            or self.num_gpus % self.hsdp_shard_dim != 0
+        ):
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be >= and divisible by hsdp_shard_dim ({self.hsdp_shard_dim})"
+            )
+
+        if self.num_gpus % self.dp_size != 0:
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be divisible by dp_size ({self.dp_size})"
+            )
+
+        if self.dp_size < 1:
+            raise ValueError("--dp-size must be a natural number")
+
+        if self.dp_size > 1:
+            raise ValueError("DP is not yet supported")
+
+        num_gpus_per_group = self.dp_size * self.tp_size
         if self.enable_cfg_parallel:
-            if self.num_gpus == 1:
-                raise ValueError(
-                    "CFG Parallelism is enabled via `--enable-cfg-parallel`, while -num-gpus==1"
+            num_gpus_per_group *= self.cfg_parallel_degree
+
+        if self.num_gpus % num_gpus_per_group != 0:
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) must be divisible by (dp_size * tp_size"
+                f"{f' * {self.cfg_parallel_degree}' if self.enable_cfg_parallel else ''}"
+                f") = {num_gpus_per_group}"
+            )
+
+        if self.sp_degree != self.ring_degree * self.ulysses_degree:
+            raise ValueError(
+                f"sp_degree ({self.sp_degree}) must equal ring_degree * ulysses_degree "
+                f"({self.ring_degree} * {self.ulysses_degree} = {self.ring_degree * self.ulysses_degree})"
+            )
+
+        if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
+            has_sp = self.sp_degree > 1
+            has_tp = self.tp_size > 1
+            if has_sp and has_tp:
+                logger.warning(
+                    "cache-dit is enabled with hybrid parallelism (SP + TP). "
+                    "Proceeding anyway (SGLang integration may support this mode)."
                 )
+
+    def _validate_cfg_parallel(self):
+        if self.enable_cfg_parallel and self.num_gpus == 1:
+            raise ValueError(
+                "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
+            )
+
+    def _validate_batching(self):
+        if self.batching_mode != "dynamic":
+            raise ValueError("batching_mode must be one of: dynamic")
+        if self.batching_max_size < 1:
+            raise ValueError("batching_max_size must be >= 1")
+        if self.batching_delay_ms < 0:
+            raise ValueError("batching_delay_ms must be >= 0")
+
+    def _set_default_attention_backend(self) -> None:
+        """Configure ROCm defaults when users do not specify an attention backend."""
+        if current_platform.is_rocm():
+            default_backend = AttentionBackendEnum.AITER.name.lower()
+            self.attention_backend = default_backend
+            logger.info(
+                "Attention backend not specified. Using '%s' by default on ROCm "
+                "to match SGLang SRT defaults.",
+                default_backend,
+            )
 
 
 @dataclasses.dataclass
@@ -993,47 +1911,18 @@ class PortArgs:
         )
 
 
-# TODO: not sure what _current_server_args is for, using a _global_server_args instead
-_current_server_args = None
 _global_server_args = None
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     Prepare the inference arguments from the command line arguments.
-
-    Args:
-        argv: The command line arguments. Typically, it should be `sys.argv[1:]`
-            to ensure compatibility with `parse_args` when no arguments are passed.
-
-    Returns:
-        The inference arguments.
     """
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
-    raw_args = parser.parse_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args)
-    global _current_server_args
-    _current_server_args = server_args
+    raw_args, unknown_args = parser.parse_known_args(argv)
+    server_args = ServerArgs.from_cli_args(raw_args, unknown_args)
     return server_args
-
-
-@contextmanager
-def set_current_server_args(server_args: ServerArgs):
-    """
-    Temporarily set the current sgl_diffusion config.
-    Used during model initialization.
-    We save the current sgl_diffusion config in a global variable,
-    so that all modules can access it, e.g. custom ops
-    can access the sgl_diffusion config to determine how to dispatch.
-    """
-    global _current_server_args
-    old_server_args = _current_server_args
-    try:
-        _current_server_args = server_args
-        yield
-    finally:
-        _current_server_args = old_server_args
 
 
 def set_global_server_args(server_args: ServerArgs):
@@ -1044,16 +1933,6 @@ def set_global_server_args(server_args: ServerArgs):
     _global_server_args = server_args
 
 
-def get_current_server_args() -> ServerArgs:
-    if _current_server_args is None:
-        # in ci, usually when we test custom ops/modules directly,
-        # we don't set the sgl_diffusion config. In that case, we set a default
-        # config.
-        # TODO(will): may need to handle this for CI.
-        raise ValueError("Current sgl_diffusion args is not set.")
-    return _current_server_args
-
-
 def get_global_server_args() -> ServerArgs:
     if _global_server_args is None:
         # in ci, usually when we test custom ops/modules directly,
@@ -1062,9 +1941,3 @@ def get_global_server_args() -> ServerArgs:
         # TODO(will): may need to handle this for CI.
         raise ValueError("Global sgl_diffusion args is not set.")
     return _global_server_args
-
-
-def parse_int_list(value: str) -> list[int]:
-    if not value:
-        return []
-    return [int(x.strip()) for x in value.split(",")]

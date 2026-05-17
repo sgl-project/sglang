@@ -6,7 +6,17 @@ from types import MappingProxyType
 from typing import Any, Optional
 
 import torch
-from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+try:
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+except ImportError as err:
+
+    def raise_aiter_import_error(*args, **kwargs):
+        raise ImportError(
+            "Failed to import aiter. " "Make sure AITER is installed and accessible."
+        )
+
+    dynamic_mxfp4_quant = raise_aiter_import_error
 from torch import nn
 
 
@@ -118,10 +128,10 @@ def b_dynamic_mxfp4_quant(x):
     return x.view(h, b, d // 2), x_scales.view(h, b, d // 32)
 
 
-def mxfp4_to_f32(x, is_threed):
+def mxfp4_to_f32(x, is_3d):
     # 2 because we pack fp4 in uint8.
     x = x.repeat_interleave(2, dim=-1)
-    if is_threed:
+    if is_3d:
         x[..., ::2] = x[..., ::2] & 0xF
         x[..., 1::2] = x[..., 1::2] >> 4
     else:
