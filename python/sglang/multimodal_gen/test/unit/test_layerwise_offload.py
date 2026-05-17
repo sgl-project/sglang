@@ -279,7 +279,7 @@ def test_layerwise_configuration_filters_by_component_name(monkeypatch):
     assert not is_layerwise_offloaded_module(vae)
 
 
-def test_layerwise_configuration_default_group_selects_encoders(monkeypatch):
+def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
     )
@@ -302,11 +302,11 @@ def test_layerwise_configuration_default_group_selects_encoders(monkeypatch):
     }
 
     configured = configure_layerwise_offload_modules(
-        modules, _server_args(), component_names=["default", "vae"]
+        modules, _server_args(), component_names=["default"]
     )
 
     assert get_layerwise_offload_component_names_for_pipeline(
-        modules, ["default", "vae"]
+        modules, ["default"]
     ) == [
         "text_encoder",
         "text_encoder_2",

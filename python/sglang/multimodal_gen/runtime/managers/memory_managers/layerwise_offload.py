@@ -783,11 +783,10 @@ def configure_layerwise_offload_modules(
                 sorted(unsupported_component_names),
             )
 
-    logger.info(f"Trying to apply layerwise-offlod on: {selected_component_names}")
-
-
     for component_name in selected_pipeline_component_names:
         module = modules[component_name]
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            continue
         module_id = id(module)
         if module_id in configured_module_ids:
             # avoid duplicated configures on a same module
@@ -806,5 +805,5 @@ def configure_layerwise_offload_modules(
             configured_component_names,
         )
     else:
-        logger.warning("No pipeline component supports layerwise offload.")
+        logger.info("No pipeline component supports layerwise offload.")
     return configured_component_names

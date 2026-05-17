@@ -4,10 +4,15 @@ LAYERWISE_OFFLOAD_ALL_COMPONENTS = "all"
 LAYERWISE_OFFLOAD_DIT_GROUP = "dit"
 LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP = "text_encoder"
 LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP = "image_encoder"
+LAYERWISE_OFFLOAD_VAE_GROUP = "vae"
 LAYERWISE_OFFLOAD_DEFAULT_GROUP = "default"
+
+# Components whose layerwise policy has been validated as a better default than
+# component-level CPU offload when the user has not pinned their placement.
 LAYERWISE_OFFLOAD_DEFAULT_GROUP_COMPONENTS = (
     LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
+    LAYERWISE_OFFLOAD_VAE_GROUP,
 )
 DIT_COMPONENT_NAMES = frozenset(
     {
@@ -62,7 +67,7 @@ def layerwise_component_matches_selection(
     """if the provided component_name (unnormalized, e.g., text_encoder_2)  matches with the selected_component_name (normalized)"""
     if selected_component_name == LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP:
         return is_text_encoder_component_name(component_name)
-    if selected_component_name == "vae":
+    if selected_component_name == LAYERWISE_OFFLOAD_VAE_GROUP:
         return is_vae_component_name(component_name)
     return component_name == selected_component_name
 
