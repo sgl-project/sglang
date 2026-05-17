@@ -133,16 +133,6 @@ class ModeMetrics:
 
 
 def parse_args() -> argparse.Namespace:
-    def str_to_bool(value: str | bool) -> bool:
-        if isinstance(value, bool):
-            return value
-        normalized = value.lower()
-        if normalized in ("1", "true", "t", "yes", "y", "on"):
-            return True
-        if normalized in ("0", "false", "f", "no", "n", "off"):
-            return False
-        raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
-
     parser = argparse.ArgumentParser(
         description=(
             "Run decoupled speculation on one prompt or a parquet prompt batch, "
@@ -204,8 +194,8 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help=(
             "Number of valid prompts to run in one generate call. When using "
-            "multiple verifier replicas, this must be divisible by the number "
-            "of verifier replicas."
+            "multiple verifier replicas, prompts are distributed as evenly as "
+            "possible across verifier replicas."
         ),
     )
     parser.add_argument(
@@ -382,16 +372,6 @@ def parse_args() -> argparse.Namespace:
         "--decoupled-spec-trace-dir",
         default=None,
         help="Directory for decoupled speculative decoding CSV trace files.",
-    )
-    parser.add_argument(
-        "--decoupled-spec-allow-partial",
-        type=str_to_bool,
-        default=True,
-        help=(
-            "Whether the verifier may snapshot currently available partial draft "
-            "tails. Set to false to block until every request in the verifier "
-            "batch has enough draft tokens."
-        ),
     )
     return parser.parse_args()
 
@@ -748,6 +728,17 @@ def _parse_host_port(addr: str) -> tuple[str, int | None]:
     return addr, None
 
 
+def _host_from_endpoint(endpoint: str) -> str:
+    """Extract the host from a tcp://host:port endpoint."""
+    endpoint = endpoint.removeprefix("tcp://")
+    if endpoint.startswith("["):
+        end = endpoint.find("]")
+        if end != -1:
+            return endpoint[1:end]
+    host, _ = _parse_host_port(endpoint)
+    return host
+
+
 def _pick_free_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -963,6 +954,71 @@ def create_target_placement_groups(
     ]
 
 
+def _get_pg_bundle_hosts(pg, num_bundles: int) -> list[str]:
+    hosts = []
+    for bundle_index in range(num_bundles):
+        scheduling_strategy = PlacementGroupSchedulingStrategy(
+            placement_group=pg,
+            placement_group_bundle_index=bundle_index,
+        )
+        actor = PortActor.options(
+            num_cpus=0,
+            scheduling_strategy=scheduling_strategy,
+        ).remote()
+        try:
+            info = ray.get(actor.get_node_info.remote())
+            hosts.append(info["host"])
+        finally:
+            ray.kill(actor, no_restart=True)
+    return hosts
+
+
+def print_decoupled_spec_layout(
+    *,
+    args: argparse.Namespace,
+    target_nnodes: int,
+    target_gpus_per_node: int,
+    verifier_pgs: list[Any],
+    topology: Any,
+) -> None:
+    node_hosts = sorted(
+        {
+            node["NodeManagerAddress"]
+            for node in ray.nodes()
+            if node.get("Alive") and node.get("NodeManagerAddress")
+        }
+    )
+    node_layout: dict[str, list[str]] = {host: [] for host in node_hosts}
+
+    for verifier_rank, pg in enumerate(verifier_pgs):
+        bundle_hosts = _get_pg_bundle_hosts(pg, target_nnodes)
+        for bundle_index, host in enumerate(bundle_hosts):
+            node_layout.setdefault(host, [])
+            label = f"verifier{verifier_rank}(tp={args.target_tp_size}"
+            if target_nnodes > 1:
+                label += f", bundle={bundle_index}"
+            label += f", gpus={target_gpus_per_node})"
+            node_layout[host].append(label)
+
+    for drafter_rank, config in enumerate(topology.drafter_configs):
+        host = _host_from_endpoint(config.bind_endpoint)
+        node_layout.setdefault(host, [])
+        node_layout[host].append(f"drafter{drafter_rank}(tp={args.draft_tp_size})")
+
+    print("=== decoupled_spec_layout ===")
+    print(f"nnodes: {args.nnodes}")
+    print(
+        f"nverifier={args.num_verifier_replicas}, "
+        f"tp_size={args.target_tp_size}, "
+        f"target_nnodes={target_nnodes}, "
+        f"target_gpus_per_node={target_gpus_per_node}"
+    )
+    print(f"ndrafter={args.num_draft_replicas}, tp_size={args.draft_tp_size}")
+    for node_index, host in enumerate(sorted(node_layout), start=1):
+        items = ", ".join(node_layout[host]) if node_layout[host] else "idle"
+        print(f"node{node_index} ({host}): {items}")
+
+
 def launch_target_actors(
     *,
     args: argparse.Namespace,
@@ -975,7 +1031,7 @@ def launch_target_actors(
     connect_endpoints: list[str] | None = None,
     rank: int | None = None,
 ) -> list[Any]:
-    actor_env_vars = get_decoupled_spec_actor_env_vars(args)
+    actor_env_vars = get_decoupled_spec_actor_env_vars()
     actors = []
     for node_rank in range(target_nnodes):
         scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -1104,11 +1160,19 @@ def collect_mode_metrics(
     mode: str,
     outputs: list[dict[str, Any]],
     prompt_samples: list[PromptSample],
+    verifier_assignments: list[int] | None = None,
     include_output_text: bool = True,
 ) -> ModeMetrics:
     if len(outputs) != len(prompt_samples):
         raise RuntimeError(
             f"{mode} returned {len(outputs)} outputs for {len(prompt_samples)} prompts"
+        )
+    if verifier_assignments is not None and len(verifier_assignments) != len(
+        prompt_samples
+    ):
+        raise RuntimeError(
+            f"{mode} has {len(verifier_assignments)} verifier assignments for "
+            f"{len(prompt_samples)} prompts"
         )
 
     total_generated_tokens = 0
@@ -1163,6 +1227,11 @@ def collect_mode_metrics(
         request_metrics = {
             "batch_index": index,
             "row_index": sample.row_index,
+            "verifier_rank": (
+                verifier_assignments[index]
+                if verifier_assignments is not None
+                else None
+            ),
             "prompt_text": sample.prompt,
             "prompt_tokens": sample.prompt_tokens,
             "generated_tokens": generated_tokens,
@@ -1224,16 +1293,15 @@ def collect_mode_metrics(
 def _split_indices(num_items: int, num_shards: int) -> list[list[int]]:
     if num_shards <= 0:
         raise ValueError("num_shards must be positive")
-    if num_items % num_shards != 0:
-        raise ValueError(
-            f"batch size ({num_items}) must be divisible by verifier replicas "
-            f"({num_shards})"
-        )
-    shard_size = num_items // num_shards
-    return [
-        list(range(shard_index * shard_size, (shard_index + 1) * shard_size))
-        for shard_index in range(num_shards)
-    ]
+    base_shard_size, remainder = divmod(num_items, num_shards)
+    shards: list[list[int]] = []
+    start = 0
+    for shard_index in range(num_shards):
+        shard_size = base_shard_size + (1 if shard_index < remainder else 0)
+        end = start + shard_size
+        shards.append(list(range(start, end)))
+        start = end
+    return shards
 
 
 def run_mode(
@@ -1265,6 +1333,10 @@ def run_mode(
         raise ValueError(f"pgs has {len(pgs)} entries, expected {num_replicas}")
 
     replica_indices = _split_indices(len(prompt_samples), num_replicas)
+    verifier_assignments = [0] * len(prompt_samples)
+    for replica_index, indices in enumerate(replica_indices):
+        for index in indices:
+            verifier_assignments[index] = replica_index
     outputs_by_index: list[dict[str, Any] | None] = [None] * len(prompt_samples)
     try:
         if pgs is None:
@@ -1303,6 +1375,8 @@ def run_mode(
 
         result_refs = []
         for replica_index, indices in enumerate(replica_indices):
+            if not indices:
+                continue
             shard_input_ids = [prompt_input_ids[index] for index in indices]
             result_refs.append(
                 (
@@ -1341,6 +1415,7 @@ def run_mode(
         mode=mode,
         outputs=[output for output in outputs_by_index if output is not None],
         prompt_samples=prompt_samples,
+        verifier_assignments=verifier_assignments,
         include_output_text=include_output_text,
     )
 
@@ -1361,6 +1436,7 @@ def build_result(
         if decode_metrics is not None and spec_metrics.generation_time_s > 0
         else None
     )
+    actor_env_vars = get_decoupled_spec_actor_env_vars()
     result = {
         "config": {
             "dataset_path": args.dataset_path,
@@ -1396,7 +1472,9 @@ def build_result(
             "skip_decode": args.skip_decode,
             "show_responses": args.show_responses,
             "decoupled_spec_trace_dir": args.decoupled_spec_trace_dir,
-            "decoupled_spec_allow_partial": args.decoupled_spec_allow_partial,
+            "SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL": actor_env_vars[
+                "SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL"
+            ],
         },
         "dataset": {
             "total_rows": total_rows,
@@ -1434,6 +1512,7 @@ def _request_output_record(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "index": item["batch_index"],
         "offset": item["row_index"],
+        "verifier-rank": item["verifier_rank"],
         "prompt-length": item["prompt_tokens"],
         "response-length": item["generated_tokens"],
         "steps": steps,
@@ -1445,6 +1524,7 @@ def _csv_fieldnames_for_mode(mode_key: str) -> list[str]:
     fieldnames = [
         "index",
         "offset",
+        "verifier-rank",
         "prompt-length",
         "response-length",
         "steps",
@@ -1592,6 +1672,7 @@ def print_summary(result: dict[str, Any]) -> None:
             "  "
             f"batch_index={item['batch_index']}, "
             f"row_index={item['row_index']}, "
+            f"verifier_rank={item['verifier_rank']}, "
             f"prompt_tokens={item['prompt_tokens']}, "
             f"generated_tokens={item['generated_tokens']}, "
             f"request_latency_s={item['request_latency_s']}, "
@@ -1615,7 +1696,8 @@ def print_summary(result: dict[str, Any]) -> None:
             print(
                 "  "
                 f"batch_index={spec_item['batch_index']}, "
-                f"row_index={spec_item['row_index']}"
+                f"row_index={spec_item['row_index']}, "
+                f"verifier_rank={spec_item['verifier_rank']}"
             )
             _print_response_block(
                 "decoupled_spec_response",
@@ -1703,6 +1785,13 @@ def main() -> None:
             avoid_ports=reserved_dist_init_ports,
             preferred_result_ports=preferred_result_ports,
             preferred_control_ports=preferred_control_ports,
+        )
+        print_decoupled_spec_layout(
+            args=args,
+            target_nnodes=target_nnodes,
+            target_gpus_per_node=target_gpus_per_node,
+            verifier_pgs=spec_pgs,
+            topology=topology,
         )
         draft_actors = topology.draft_actors or []
         spec_metrics = run_mode(

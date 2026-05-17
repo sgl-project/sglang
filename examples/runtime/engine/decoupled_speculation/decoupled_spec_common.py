@@ -56,15 +56,13 @@ class DecoupledSpecTopology:
     draft_actors: list[Any] | None = None
 
 
-def get_decoupled_spec_actor_env_vars(
-    args: argparse.Namespace | None = None,
-) -> dict[str, str]:
+def get_decoupled_spec_actor_env_vars() -> dict[str, str]:
     """Collect decoupled-spec environment variables for Ray actors."""
-    env_vars: dict[str, str] = {}
-    if args is not None and hasattr(args, "decoupled_spec_allow_partial"):
-        env_vars["SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL"] = (
-            "1" if args.decoupled_spec_allow_partial else "0"
+    env_vars: dict[str, str] = {
+        "SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL": os.environ.get(
+            "SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL", "1"
         )
+    }
     for env_name in (
         "CUDA_LAUNCH_BLOCKING",
         "SGLANG_DECOUPLED_SPEC_TRACE_DIR",
@@ -250,6 +248,12 @@ class PortActor:
             self._reserved_socket = None
         return True
 
+    def get_node_info(self) -> dict[str, Any]:
+        """Return the Ray node identity for this actor."""
+        return {
+            "host": ray.util.get_node_ip_address(),
+        }
+
 
 def create_result_endpoint_from_pg(
     pg,
@@ -392,7 +396,7 @@ def launch_draft_actors(
         )
 
     actors = []
-    actor_env_vars = get_decoupled_spec_actor_env_vars(args)
+    actor_env_vars = get_decoupled_spec_actor_env_vars()
     for node_id, endpoint_config in zip(
         node_assignments,
         endpoint_configs,
