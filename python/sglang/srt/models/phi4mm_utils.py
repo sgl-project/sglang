@@ -71,22 +71,24 @@ def adaptive_enc_mask(x_len, chunk_start_idx, left_window=0, right_window=0):
                     [False., True., True., False.],
                     [False., False., True., True.]])
     """
-    chunk_start_idx = torch.Tensor(
-        chunk_start_idx
-    ).long()  # first idx of each chunk, such as [0,18,36,48].
+    chunk_start_idx = torch.as_tensor(
+        chunk_start_idx, dtype=torch.long
+    )  # first idx of each chunk, such as [0,18,36,48].
     start_pad = torch.nn.functional.pad(
         chunk_start_idx, (1, 0)
     )  # append 0 to the beginning, so it becomes [0, 0, 18, 36, 48]
     end_pad = torch.nn.functional.pad(
         chunk_start_idx, (0, 1), value=x_len
     )  # append x_len to the end, so it becomes [0,18,36,48, x_len]
-    seq_range = torch.arange(0, x_len).unsqueeze(-1)  # seq_range size: [x_len, 1]
-    idx = ((seq_range < end_pad) & (seq_range >= start_pad)).nonzero()[
-        :, 1
-    ]  # idx size: [x_len]
+    seq_range = torch.arange(
+        0, x_len, device=chunk_start_idx.device
+    )  # seq_range size: [x_len]
+    idx = torch.bucketize(seq_range, chunk_start_idx, right=True)  # idx size: [x_len]
     # boundary = end_pad[idx]  # boundary size: [x_len]
     seq_range_expand = (
-        torch.arange(0, x_len).unsqueeze(0).expand(x_len, -1)
+        torch.arange(0, x_len, device=chunk_start_idx.device)
+        .unsqueeze(0)
+        .expand(x_len, -1)
     )  # seq_range_expand size [x_len, x_len]
     idx_left = idx - left_window
     idx_left[idx_left < 0] = 0
