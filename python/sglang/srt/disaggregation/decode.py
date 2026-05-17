@@ -1654,8 +1654,8 @@ class SchedulerDisaggregationDecodeMixin:
         new_prebuilt_batch = self.get_new_prebuilt_batch()
         if new_prebuilt_batch:
             assert self.chunked_req is None
-            self.process_batch_result_prebuilt(
-                self.batch_result_processor, new_prebuilt_batch
+            self.batch_result_processor.process_batch_result_prebuilt(
+                new_prebuilt_batch
             )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
