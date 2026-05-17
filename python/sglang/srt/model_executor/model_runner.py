@@ -752,6 +752,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # runs with aux hidden state capture enabled.
         self.init_aux_hidden_state_capture()
 
+        # Collect attention/moe layer references for downstream consumers
+        # (e.g. CUDA graph runner, piecewise CUDA graph capture, torch.compile fusion passes).
+        # Must run before init_device_graphs(), since CudaGraphRunner reads
+        # model_runner.attention_layers in its constructor.
+        self.collect_attention_and_moe_layers()
+
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
@@ -2781,6 +2787,93 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
+    def collect_attention_and_moe_layers(self) -> bool:
+        """Populate ``self.attention_layers``, ``self.moe_layers`` and
+        ``self.moe_fusions`` by walking the model's transformer layers.
+
+        Returns ``True`` if collection succeeded, ``False`` otherwise.
+        On failure the three lists are still initialised (empty) so callers
+        can safely reference them.
+        """
+        self.attention_layers = []
+        self.moe_layers = []
+        self.moe_fusions = []
+
+        # Non-language models don't expose a ``model`` attribute we can walk.
+        if not hasattr(self.model, "model"):
+            return False
+
+        # Collect attention layers and moe layers from the model
+        self.model.model = resolve_language_model(self.model)
+        language_model = getattr(self.model, "language_model", self.model)
+
+        # Resolve model with layers: handle CausalLM wrapper (.model.layers)
+        # and direct TextModel (.layers).
+        if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
+            layer_model = language_model.model
+        elif hasattr(language_model, "layers"):
+            layer_model = language_model
+        else:
+            logger.warning(
+                "Could not collect attention/moe layers: model does not have a 'layers' attribute"
+            )
+            return False
+
+        for layer in layer_model.layers:
+            attn_layer = None
+            if hasattr(layer, "self_attn"):
+                if hasattr(layer.self_attn, "attn"):
+                    attn_layer = layer.self_attn.attn
+                elif hasattr(layer.self_attn, "attn_mqa"):
+                    # For DeepSeek model
+                    attn_layer = layer.self_attn.attn_mqa
+            # For hybrid model
+            elif hasattr(layer, "attn"):
+                attn_layer = layer.attn
+            elif hasattr(layer, "linear_attn"):
+                if hasattr(layer.linear_attn, "attn"):
+                    attn_layer = layer.linear_attn.attn
+                else:
+                    attn_layer = layer.linear_attn
+            # For InternVL model
+            elif hasattr(layer, "attention"):
+                if hasattr(layer.attention, "attn"):
+                    attn_layer = layer.attention.attn
+            # For NemotronH and similar hybrid models using 'mixer' attribute
+            elif hasattr(layer, "mixer"):
+                if hasattr(layer.mixer, "attn"):
+                    attn_layer = layer.mixer.attn
+                elif hasattr(layer, "_forward_mamba"):
+                    # Mamba layer with split op support - store the layer itself
+                    attn_layer = layer
+
+            if attn_layer is not None:
+                self.attention_layers.append(attn_layer)
+            elif hasattr(layer, "mixer"):
+                self.attention_layers.append(None)
+
+            moe_block = None
+            moe_fusion = None
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                moe_block = layer.mlp.experts
+                moe_fusion = layer.mlp
+            if hasattr(layer, "block_sparse_moe") and hasattr(
+                layer.block_sparse_moe, "experts"
+            ):
+                moe_block = layer.block_sparse_moe.experts
+                moe_fusion = layer.block_sparse_moe
+            if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
+                moe_block = layer.moe.experts
+                moe_fusion = layer.moe
+            # For NemotronH MoE layers using 'mixer' attribute
+            if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
+                moe_block = layer.mixer.experts
+                moe_fusion = layer.mixer
+            self.moe_layers.append(moe_block)
+            self.moe_fusions.append(moe_fusion)
+
+        return True
+
     def init_piecewise_cuda_graphs(self):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
@@ -2789,6 +2882,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(
                 "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
             )
+            return
+
+        # Draft models use decode CUDA graphs, not PCG
+        if self.is_draft_worker:
             return
 
         # Disable piecewise CUDA graph for non-language models

@@ -17,13 +17,12 @@ from abc import abstractmethod
 import torch
 from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.compilation.fusion.pattern import OpPatternBase, OpPatternRegistery
-from sglang.srt.utils import is_flashinfer_rmsnorm_quant_kernels_available
 
 
 def _is_jit_rmsnorm_quant_available():
     try:
+        from sglang.jit_kernel.norm import fused_add_rmsnorm_quant  # noqa: F401
         from sglang.jit_kernel.norm import rmsnorm_quant  # noqa: F401
 
         return True
@@ -53,45 +52,12 @@ class JitRmsnormQuantFp8Pattern(_RmsnormQuantFp8Pattern):
         )
 
 
-# op: flashinfer/rmsnorm_quant
-class FlashinferRmsnormQuantFp8Pattern(_RmsnormQuantFp8Pattern):
-    @staticmethod
-    def pattern(x, weight, scale, eps, output):
-        return auto_functionalized_v2(
-            torch.ops.sglang.flashinfer_rmsnorm_quant.default,
-            input=x,
-            weight=weight,
-            scale=scale,
-            eps=eps,
-            enable_pdl=is_arch_support_pdl(),
-            _out_base_index=0,
-            _all_bases=[output],
-        )
-
-
-# op: sgl-kernel/rmsnorm_quant
-class SglangRmsnormQuantFp8Pattern(_RmsnormQuantFp8Pattern):
-    @staticmethod
-    def pattern(x, weight, scale, eps, output):
-        return auto_functionalized_v2(
-            torch.ops.sgl_kernel.rms_norm_static_fp8_quant.default,
-            input=x,
-            weight=weight,
-            scale=scale,
-            epsilon=eps,
-            _result_base_index=0,
-            _all_bases=[output],
-        )
-
-
 class _RmsnormQuantFp8PatternRegistery(OpPatternRegistery):
     def build_op_pattern_registery(self):
         if _is_jit_rmsnorm_quant_available():
             self.register_op_pattern(JitRmsnormQuantFp8Pattern)
-        elif is_flashinfer_rmsnorm_quant_kernels_available():
-            self.register_op_pattern(FlashinferRmsnormQuantFp8Pattern)
         else:
-            self.register_op_pattern(SglangRmsnormQuantFp8Pattern)
+            raise RuntimeError("sglang.jit_kernel.norm is not available")
 
 
 RmsnormQuantFp8PatternRegistery = _RmsnormQuantFp8PatternRegistery()
@@ -121,47 +87,12 @@ class JitFusedAddRmsnormQuantFp8Pattern(_FusedAddRmsnormQuantFp8Pattern):
         )
 
 
-# op: flashinfer/fused_add_rmsnorm_quant
-class FlashinferFusedAddRmsnormQuantFp8Pattern(_FusedAddRmsnormQuantFp8Pattern):
-    @staticmethod
-    def pattern(x, residual, weight, scale, result, eps):
-        return auto_functionalized_v2(
-            torch.ops.sglang.flashinfer_fused_add_rmsnorm_quant.default,
-            input=x,
-            weight=weight,
-            scale=scale,
-            eps=eps,
-            enable_pdl=is_arch_support_pdl(),
-            _out_base_index=0,
-            _residual_base_index=1,
-            _all_bases=[result, residual],
-        )
-
-
-# op: sgl-kernel/fused_add_rmsnorm_quant
-class SglangFusedAddRmsnormQuantFp8Pattern(_FusedAddRmsnormQuantFp8Pattern):
-    @staticmethod
-    def pattern(x, residual, weight, scale, result, eps):
-        return auto_functionalized_v2(
-            torch.ops.sgl_kernel.fused_add_rms_norm_static_fp8_quant.default,
-            input=x,
-            weight=weight,
-            scale=scale,
-            epsilon=eps,
-            _result_base_index=0,
-            _residual_base_index=1,
-            _all_bases=[result, residual],
-        )
-
-
 class _FusedAddRmsnormQuantFp8PatternRegistery(OpPatternRegistery):
     def build_op_pattern_registery(self):
         if _is_jit_rmsnorm_quant_available():
             self.register_op_pattern(JitFusedAddRmsnormQuantFp8Pattern)
-        elif is_flashinfer_rmsnorm_quant_kernels_available():
-            self.register_op_pattern(FlashinferFusedAddRmsnormQuantFp8Pattern)
         else:
-            self.register_op_pattern(SglangFusedAddRmsnormQuantFp8Pattern)
+            raise RuntimeError("sglang.jit_kernel.norm is not available")
 
 
 FusedAddRmsnormQuantFp8PatternRegistery = _FusedAddRmsnormQuantFp8PatternRegistery()

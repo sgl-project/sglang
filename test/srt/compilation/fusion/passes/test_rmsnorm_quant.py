@@ -20,13 +20,9 @@ import torch
 from torch._inductor.utils import run_and_get_code
 from transformers import LlamaConfig
 
-from sglang.srt.compilation.fusion.pattern.rmsnorm_quant_fp8_pattern import (
-    _is_jit_rmsnorm_quant_available,
-)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_flashinfer_rmsnorm_quant_kernels_available
 from sglang.test.model_bench import LlamaBench, ModelBenchArgs
 
 
@@ -89,24 +85,11 @@ def test_rmsnorm_quant_pass(model, model_initializer):
 
         torch.testing.assert_close(ref_res, res)
 
-        if _is_jit_rmsnorm_quant_available():
-            assert "sglang.jit_rmsnorm_quant" in code
-            assert "sgl_kernel.rmsnorm" not in code
+        assert "sglang.jit_rmsnorm_quant" in code
+        assert "sgl_kernel.rmsnorm" not in code
 
-            assert "sglang.jit_fused_add_rmsnorm_quant" in code
-            assert "sgl_kernel.fused_add_rmsnorm" not in code
-        elif is_flashinfer_rmsnorm_quant_kernels_available():
-            assert "sglang.flashinfer_rmsnorm_quant" in code
-            assert "sgl_kernel.rmsnorm" not in code
-
-            assert "sglang.flashinfer_fused_add_rmsnorm_quant" in code
-            assert "sgl_kernel.fused_add_rmsnorm" not in code
-        else:
-            assert "sgl_kernel.rms_norm_static_fp8_quant" in code
-            assert "sgl_kernel.rmsnorm" not in code
-
-            assert "sgl_kernel.fused_add_rms_norm_static_fp8_quant" in code
-            assert "sgl_kernel.fused_add_rmsnorm" not in code
+        assert "sglang.jit_fused_add_rmsnorm_quant" in code
+        assert "sgl_kernel.fused_add_rmsnorm" not in code
 
 
 if __name__ == "__main__":
