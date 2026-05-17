@@ -2,7 +2,8 @@
 
 Variants combine this base with `CustomTestCase` and override class
 attributes (`attention_backend`, plus optional `speculative_eagle_topk` /
-`speculative_num_draft_tokens` / `enable_spec_v2`) to select a backend
+`speculative_num_draft_tokens` / `enable_spec_v2` /
+`enable_deterministic_inference`) to select a backend, deterministic mode,
 and the V1 / V2 spec engine.
 
 Pure mixin (does NOT inherit `TestCase`), so unittest does not collect
@@ -41,12 +42,12 @@ class StandaloneServerBase:
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int = 5
     enable_spec_v2: bool = True
-    extra_args: list = []
+    enable_deterministic_inference: bool = False
 
     @classmethod
     def get_server_args(cls):
         assert cls.attention_backend, f"{cls.__name__} must set `attention_backend`"
-        return [
+        args = [
             "--trust-remote-code",
             "--cuda-graph-max-bs",
             "8",
@@ -64,7 +65,10 @@ class StandaloneServerBase:
             0.7,
             "--attention-backend",
             cls.attention_backend,
-        ] + list(cls.extra_args)
+        ]
+        if cls.enable_deterministic_inference:
+            args.append("--enable-deterministic-inference")
+        return args
 
     @classmethod
     def setUpClass(cls):

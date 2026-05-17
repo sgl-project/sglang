@@ -21,7 +21,7 @@ class TestStandaloneSpeculativeDecodingTriton(StandaloneServerBase, CustomTestCa
     speculative_eagle_topk = 2
     speculative_num_draft_tokens = 7
     enable_spec_v2 = False
-    extra_args = ["--enable-deterministic-inference"]
+    enable_deterministic_inference = True
 
 
 class TestStandaloneSpeculativeDecodingFlashinfer(StandaloneServerBase, CustomTestCase):
