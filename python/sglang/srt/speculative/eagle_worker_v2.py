@@ -963,13 +963,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ) = backup
 
     def verify(self, batch: ScheduleBatch):
-        # Tell caching allocator that all SB GPU tensors read by the verify
-        # forward kernels are also used on forward_stream, so memory is not
-        # recycled while forward_stream's queued work is still in flight
-        # (e.g. when subsequent _draft_extend_for_decode rebinds
-        # batch.input_ids and drops the only SB ref to the old tensor).
-        # Pre-MWB-removal this protection was implicit: ModelWorkerBatch's
-        # per-field copy + Scheduler.batch_record_buf held one full iter.
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
@@ -994,11 +987,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             )
 
-        # prepare_for_v2_verify rebinds batch.input_ids (= draft_token) and
-        # batch.out_cache_loc (= assign_extend_cache_locs output, allocated
-        # on plan_stream). Record both on forward_stream so subsequent
-        # _draft_extend_for_decode rebinds (which drop these from SB) do not
-        # release their memory before forward_stream finishes verify.
+        # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
         record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
 
         # Correct some buffers due to the overlap plan

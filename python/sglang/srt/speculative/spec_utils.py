@@ -64,12 +64,17 @@ def record_stream_each(tensors, stream):
 
 
 def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
-    """Tell the caching allocator that the listed SB / spec_info GPU tensors
-    are also used on `fwd_stream`. Without this, mid-forward Python rebinds
-    on SB attributes (or on spec_info) can drop the only ref to a tensor
-    while forward_stream's queued kernels are still reading its memory; the
-    allocator may then recycle that memory and corrupt in-flight forward
-    work, manifesting as a hang on the verify_done event.
+    """Mark pre-prepare SB / verify_input GPU tensors as used on `fwd_stream`.
+
+    Spec V2 mutates SB mid-forward (`prepare_for_v2_verify` rebinds
+    `batch.input_ids` / `out_cache_loc`; `_draft_extend_for_decode` later
+    replaces `batch.input_ids` again). Each rebind drops the only SB Python
+    ref to the old tensor while the verify forward kernel may still be
+    reading its memory on `fwd_stream`; `record_stream` tells the caching
+    allocator to wait for `fwd_stream` before recycling the block.
+
+    Covers pre-prepare tensors only; caller must also `record_stream_each`
+    the post-prepare rebinds (new `batch.input_ids` / `out_cache_loc`).
     """
     candidates = [
         batch.seq_lens,
