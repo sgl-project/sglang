@@ -196,10 +196,14 @@ jobs:
     steps:
       - name: Check job status
         run: |
-          result="${{ needs.stage-b-test-1-gpu-xpu.result }}"
-          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-            echo "Job failed with result: $result"
+          stage_b="${{ needs.stage-b-test-1-gpu-xpu.result }}"
+
+          echo "Stage B (1-GPU): $stage_b"
+
+          if [ "$stage_b" != "success" ] && [ "$stage_b" != "skipped" ]; then
+            echo "Job failed with result: $stage_b"
             exit 1
           fi
-          echo "All jobs completed successfully (result: $result)"
+
+          echo "All jobs completed successfully"
           exit 0
