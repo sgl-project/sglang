@@ -80,7 +80,6 @@ import pybase64
 import requests
 import torch
 import torch.distributed as dist
-import triton
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
@@ -90,6 +89,7 @@ from torch.utils._contextlib import _DecoratorContextManager
 from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
+import triton
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
@@ -3664,12 +3664,27 @@ def is_triton_kernels_available() -> bool:
     if importlib.util.find_spec("triton_kernels") is None:
         return False
     try:
-        ragged_metadata_spec = importlib.util.find_spec(
-            "triton_kernels.tensor_details.ragged_tensor"
+        import dataclasses
+
+        from triton_kernels.matmul import PrecisionConfig
+
+        if "b_mx_scale" not in {
+            field.name for field in dataclasses.fields(PrecisionConfig)
+        }:
+            return False
+
+        required_specs = (
+            "triton_kernels.matmul",
+            "triton_kernels.matmul_details.opt_flags",
+            "triton_kernels.swiglu",
+            "triton_kernels.tensor_details.ragged_tensor",
+            "triton_kernels.topk",
         )
-    except ModuleNotFoundError:
+        return all(
+            importlib.util.find_spec(spec) is not None for spec in required_specs
+        )
+    except (ImportError, ModuleNotFoundError, TypeError):
         return False
-    return ragged_metadata_spec is not None
 
 
 @lru_cache(maxsize=1)
