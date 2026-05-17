@@ -841,21 +841,16 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        # Reserve page_size for page-alignment overhead. The paged allocator
-        # may consume up to one extra page per request (see alloc_extend), and
-        # _update_prefill_budget already accounts for this in the deduction.
-        # Without this, admission is more optimistic than the actual budget
-        # deduction, allowing over-admission when the pool is nearly full.
         max_new = min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
-        total_tokens = req.extend_input_len + max_new + self.page_size
-
-        # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = req.extend_input_len - req.host_hit_length
-        real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
+        total_tokens = new_tokens_for_alloc(
+            prefix_len, req.extend_input_len + max_new, self.page_size
+        )
+
+        real_input_tokens = req.extend_input_len - req.host_hit_length
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
@@ -891,7 +886,7 @@ class PrefillAdder:
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
-            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+            input_tokens = req.extend_input_len
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
