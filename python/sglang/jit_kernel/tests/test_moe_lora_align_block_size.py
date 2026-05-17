@@ -11,7 +11,7 @@ import torch
 from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=28, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=28, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
