@@ -120,13 +120,33 @@ The generator currently picks values on the **conservative** side (mirroring an 
 **Hopper (H200) note**
 
 We provide two different options for running DeepSeek-V4 models on Hopper devices (H200)
-- Original FP4 checkpoints: To run original FP4 checkpoints, apply the w4a16 MoE kernels (marlin) as in interactive command generator. For this option we only support TP method. Complete Pro model can be run on a single H200 node with this option.
+- Original FP4 checkpoints: To run original FP4 checkpoints, we provide two different options for w4a16 MoE kernels: Marlin (`--moe-runner-backend marlin`) and Flashinfer (`--moe-runner-backend flashinfer_mxfp4). For this variant we only support Tensor Parallelism. Complete Pro model can be run on a single H200 node with this option.
 - Converted FP8 checkpoints: We also provide pre-converted FP8 checkpoints (`sgl-project/DeepSeek-V4-Flash-FP8`, `sgl-project/DeepSeek-V4-Pro-FP8`), which support more parallelism and features.
 
 PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=-1`
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake
 can discover the IB HCAs; without IB exposure mooncake silently falls back to
 TCP, which can lead to garbled KV transfer on large checkpoints.
+
+**MegaMoE**
+
+MegaMoE fuses expert dispatch + GEMM into a single kernel for higher throughput
+on MoE layers. To enable it, use the **MegaMoE** toggle in the
+[command generator above](#3-model-deployment) — the generator will swap
+`--moe-a2a-backend deepep` for `--moe-a2a-backend megamoe` and add the
+relevant env vars automatically.
+
+
+Two variants are exposed:
+- **W4A8** — default MegaMoE kernel (FP4 weights, FP8 activations).
+- **W4A4** — adds `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1` and
+  `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1` to run the custom W4A4
+  kernel (FP4 activations). Higher throughput with negligible accuracy drop
+  (~89.5 GPQA on Pro).
+
+Notes:
+- MegaMoE is **not** supported on Hopper (H100 / H200) nor on the `low-latency` / `cp` settings. When running MegaMoE, don't set `--moe-runner-backend` manually.
+- Adjust `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` based on your workload and memory usage. Setting higher number of tokens for MegaMoE requires more HBM space. (recommended: 4096 for balanced, 8320 for max-throughput).
 
 **GB300 PD-Disagg cross-pod MNNVL**
 
