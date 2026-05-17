@@ -529,12 +529,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
             if forward_mode.is_draft_extend_v2():
-                num_tokens_per_bs = (
-                    spec_info.num_tokens_per_req
-                    if getattr(spec_info, "num_tokens_per_req", None) is not None
-                    and spec_info.num_tokens_per_req > 0
-                    else self.speculative_num_draft_tokens
-                )
+                num_tokens_per_bs = spec_info.num_tokens_per_req
+                assert num_tokens_per_bs > 0
                 metadata.max_seq_len_q = num_tokens_per_bs
                 metadata.cu_seqlens_q[1:].copy_(
                     torch.arange(

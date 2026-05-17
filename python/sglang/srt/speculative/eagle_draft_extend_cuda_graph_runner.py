@@ -549,7 +549,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             # DRAFT_EXTEND_V2: all tokens calculations whether accepted or not.
             unpadding_bs = num_tokens
-            topk_unpadding_bs = raw_bs
         elif bs != raw_bs:
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[
                 :raw_bs
@@ -558,10 +557,8 @@ class EAGLEDraftExtendCudaGraphRunner:
                 :raw_bs
             ]
             unpadding_bs = raw_bs
-            topk_unpadding_bs = raw_bs
         else:
             unpadding_bs = None
-            topk_unpadding_bs = None
 
         if unpadding_bs is not None:
             out_copy = out
@@ -570,6 +567,6 @@ class EAGLEDraftExtendCudaGraphRunner:
                 hidden_states=out.hidden_states[:unpadding_bs],
             )
             if self.forward_mode != ForwardMode.DRAFT_EXTEND_V2:
-                out.topk_p = out_copy.topk_p[:topk_unpadding_bs]
-                out.topk_index = out_copy.topk_index[:topk_unpadding_bs]
+                out.topk_p = out_copy.topk_p[:raw_bs]
+                out.topk_index = out_copy.topk_index[:raw_bs]
         return out
