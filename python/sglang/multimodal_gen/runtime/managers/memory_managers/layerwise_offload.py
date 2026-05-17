@@ -697,9 +697,7 @@ def get_layerwise_offload_component_names_for_pipeline(
             if isinstance(module, LayerwiseOffloadableModuleMixin)
         ]
 
-    explicit_component_names = selected_component_names - {
-        LAYERWISE_OFFLOAD_DIT_GROUP
-    }
+    explicit_component_names = selected_component_names - {LAYERWISE_OFFLOAD_DIT_GROUP}
     select_dit_group = LAYERWISE_OFFLOAD_DIT_GROUP in selected_component_names
     selected_pipeline_component_names: list[str] = []
     for component_name, module in modules.items():

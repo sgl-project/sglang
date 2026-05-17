@@ -857,9 +857,7 @@ class ServerArgs(DisaggArgsMixin):
         if self.dit_layerwise_offload:
             if explicitly_set_component_names is None:
                 explicitly_set_component_names = [LAYERWISE_OFFLOAD_DIT_GROUP]
-            elif (
-                LAYERWISE_OFFLOAD_DIT_GROUP not in explicitly_set_component_names
-            ):
+            elif LAYERWISE_OFFLOAD_DIT_GROUP not in explicitly_set_component_names:
                 explicitly_set_component_names = [
                     LAYERWISE_OFFLOAD_DIT_GROUP,
                     *explicitly_set_component_names,
