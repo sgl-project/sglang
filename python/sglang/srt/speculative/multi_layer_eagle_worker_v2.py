@@ -50,6 +50,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     maybe_detect_nan,
     maybe_detect_oob,
+    record_sb_tensors_on_stream,
     select_top_k_tokens,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
@@ -721,15 +722,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # recycled while forward_stream's queued work is still in flight
         # (e.g. when subsequent _draft_extend_for_decode rebinds
         # batch.input_ids and drops the only SB ref to the old tensor).
-        # Pre-MWB-removal this protection was implicit: ModelWorkerBatch's
-        # per-field copy + Scheduler.batch_record_buf held one full iter.
-        from sglang.srt.speculative.eagle_worker_v2 import (
-            _record_sb_tensors_on_stream,
-        )
-
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
-        _record_sb_tensors_on_stream(batch, verify_input, fwd_stream)
+        record_sb_tensors_on_stream(batch, verify_input, fwd_stream)
 
         bs = len(batch.seq_lens)
 

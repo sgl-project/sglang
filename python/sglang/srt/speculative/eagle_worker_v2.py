@@ -59,6 +59,7 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     maybe_detect_nan,
     maybe_detect_oob,
+    record_sb_tensors_on_stream,
     select_top_k_tokens,
 )
 from sglang.srt.utils.common import (
@@ -92,39 +93,6 @@ def _get_plan_stream(
         return plan_stream, plan_stream_ctx
     else:
         return None, contextlib.nullcontext()
-
-
-def _record_sb_tensors_on_stream(batch, verify_input, fwd_stream):
-    """Tell the caching allocator that the listed SB / spec_info GPU tensors
-    are also used on `fwd_stream`. Without this, mid-forward Python rebinds
-    on SB attributes (or on spec_info) can drop the only ref to a tensor
-    while forward_stream's queued kernels are still reading its memory; the
-    allocator may then recycle that memory and corrupt in-flight forward
-    work, manifesting as a hang on the verify_done event.
-    """
-    candidates = [
-        batch.seq_lens,
-        batch.req_pool_indices,
-        batch.input_ids,
-        batch.out_cache_loc,
-    ]
-    if verify_input is not None:
-        candidates.extend(
-            [
-                getattr(verify_input, attr, None)
-                for attr in (
-                    "draft_token",
-                    "custom_mask",
-                    "positions",
-                    "retrieve_index",
-                    "retrieve_next_token",
-                    "retrieve_next_sibling",
-                )
-            ]
-        )
-    for t in candidates:
-        if isinstance(t, torch.Tensor) and t.is_cuda:
-            t.record_stream(fwd_stream)
 
 
 class EagleDraftWorker(BaseDraftWorker):
@@ -1003,7 +971,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # per-field copy + Scheduler.batch_record_buf held one full iter.
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
-        _record_sb_tensors_on_stream(batch, verify_input, fwd_stream)
+        record_sb_tensors_on_stream(batch, verify_input, fwd_stream)
 
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
