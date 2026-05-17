@@ -528,8 +528,25 @@ def alloc_paged_token_slots_decode(
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
-    # Over estimate the number of tokens: assume each request needs a new page.
-    num_tokens = len(seq_lens) * allocator.page_size
+    if token_per_req == 1:
+        num_tokens = (
+            get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=allocator.page_size,
+                decode=True,
+            )
+            * allocator.page_size
+        )
+    else:
+        prefix_lens_cpu = seq_lens_cpu - token_per_req
+        num_tokens = (
+            get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=allocator.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
+            * allocator.page_size
+        )
     evict_from_tree_cache(tree_cache, num_tokens)
 
     out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
