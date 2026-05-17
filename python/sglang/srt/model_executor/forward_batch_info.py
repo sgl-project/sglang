@@ -434,6 +434,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hisparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
+    # For mixed chunked prefill with flashinfer POD-Attention
+    num_decoding_reqs: Optional[int] = None
+
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
@@ -453,6 +456,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            num_decoding_reqs=batch.num_decoding_reqs or 0,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,

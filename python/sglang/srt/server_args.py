@@ -543,6 +543,7 @@ class ServerArgs:
     )
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
+    enable_flashinfer_pod_attention: bool = False
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -5368,6 +5369,12 @@ class ServerArgs:
             action="store_true",
             help="Disable FlashInfer autotuning.",
         )
+        parser.add_argument(
+            "--enable-flashinfer-pod-attention",
+            action="store_true",
+            default=ServerArgs.enable_flashinfer_pod_attention,
+            help="Enable FlashInfer POD mode.",
+        )
 
         # Speculative decoding
         parser.add_argument(
@@ -6821,6 +6828,10 @@ class ServerArgs:
             self.tp_size * self.pp_size
         ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
+        if self.enable_flashinfer_pod_attention:
+            assert (
+                self.enable_mixed_chunk
+            ), "enable_flashinfer_pod_attention requires enable_mixed_chunk"
         assert (
             self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1
         ), (

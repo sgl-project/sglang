@@ -48,6 +48,7 @@ if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
 if is_flashinfer_available():
     from flashinfer import (
         BatchDecodeWithPagedKVCacheWrapper,
+        BatchPODWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
         fast_decode_plan,
@@ -103,12 +104,43 @@ class PrefillMetadata:
     multi_item_params: Optional[MultiItemScoringParams] = None
 
 
+@dataclass
+class PodAttentionMetadata:
+    pod_attention_wrappers: List[BatchPODWithPagedKVCacheWrapper]
+
+
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
+
+# Global output buffer for POD-Attention
+_global_pod_attention_output_buffer = None
+_global_pod_attention_output_size = 0
+
+
+def _get_pod_attention_output_buffer(
+    size: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    global _global_pod_attention_output_buffer, _global_pod_attention_output_size
+
+    if (
+        _global_pod_attention_output_buffer is None
+        or _global_pod_attention_output_size < size
+    ):
+        new_size = (
+            max(size, _global_pod_attention_output_size * 2)
+            if _global_pod_attention_output_size > 0
+            else size * 2
+        )
+        _global_pod_attention_output_buffer = torch.empty(
+            new_size, dtype=dtype, device=device
+        )
+        _global_pod_attention_output_size = new_size
+
+    return _global_pod_attention_output_buffer[:size]
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -145,6 +177,25 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.enable_pod_attention = (
+            model_runner.server_args.enable_flashinfer_pod_attention
+            and model_runner.server_args.enable_mixed_chunk
+        )
+
+        # POD attention does not support logits_soft_cap (flashinfer hardcodes it
+        # to 0.0 in the POD wrapper). Disable POD for models that use it.
+        if self.enable_pod_attention:
+            hf_config = model_runner.model_config.hf_config
+            if getattr(
+                hf_config, "attn_logit_softcapping", None
+            ) is not None or getattr(hf_config, "logits_soft_cap", None):
+                logger.warning(
+                    "Disabling POD attention: model uses logits_soft_cap which is "
+                    "not supported by flashinfer's BatchPODWithPagedKVCacheWrapper."
+                )
+                self.enable_pod_attention = False
+        self.page_size = model_runner.page_size
+
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -214,11 +265,18 @@ class FlashInferAttnBackend(AttentionBackend):
             self.workspace_buffer = global_workspace_buffer
         max_bs = model_runner.req_to_token_pool.size
         if kv_indptr_buf is None:
+            # For POD-Attention, we need 2 kv_indptr buffers (prefill + decode)
+            # For other modes, we need num_wrappers kv_indptr buffers
+            num_kv_indptr = (
+                2
+                if (self.enable_pod_attention and not skip_prefill)
+                else self.num_wrappers
+            )
             self.kv_indptr = [
                 torch.zeros(
                     (max_bs + 1,), dtype=torch.int32, device=model_runner.device
                 )
-                for _ in range(self.num_wrappers)
+                for _ in range(num_kv_indptr)
             ]
         else:
             assert self.num_wrappers == 1
@@ -233,11 +291,18 @@ class FlashInferAttnBackend(AttentionBackend):
             self.kv_last_page_len = kv_last_page_len_buf
 
         if not self.skip_prefill:
+            # For POD-Attention, we need 2 qo_indptr buffers (prefill + decode)
+            # For other modes, we need num_wrappers qo_indptr buffers
+            num_qo_indptr = (
+                2
+                if (self.enable_pod_attention and not skip_prefill)
+                else self.num_wrappers
+            )
             self.qo_indptr = [
                 torch.zeros(
                     (max_bs + 1,), dtype=torch.int32, device=model_runner.device
                 )
-                for _ in range(self.num_wrappers)
+                for _ in range(num_qo_indptr)
             ]
 
         fmha_backend = "auto"
@@ -261,7 +326,15 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
+        self.pod_attention_wrappers = []
         for _ in range(self.num_wrappers):
+            if self.enable_pod_attention and not skip_prefill:
+                self.pod_attention_wrappers.append(
+                    BatchPODWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                    )
+                )
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
                     BatchPrefillWithPagedKVCacheWrapper(
@@ -286,15 +359,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
 
-        # Create indices updater
+        # Create indices updaters
+        self.indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner, self)
         if not skip_prefill:
             self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(
                 model_runner, self
             )  # for verify
-        self.indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner, self)
+        if self.enable_pod_attention and not skip_prefill:
+            self.indices_updater_pod_attention = FlashInferIndicesUpdaterPodAttention(
+                model_runner, self
+            )
 
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
+        self.forward_metadata_pod_attention: Optional[PodAttentionMetadata] = None
 
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
@@ -433,6 +511,28 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self.forward_metadata_pod_attention = None
+        self._pod_plan_done = False
+
+        if (
+            self.enable_pod_attention
+            and not self.skip_prefill
+            and forward_batch.forward_mode.is_mixed()
+        ):
+            prefix_lens = forward_batch.extend_prefix_lens
+            bs = len(forward_batch.req_pool_indices)
+
+            num_decode_reqs = forward_batch.num_decoding_reqs or 0
+            num_prefill_reqs = bs - num_decode_reqs
+
+            if num_prefill_reqs > 0 and num_decode_reqs > 0:
+                self.forward_metadata_pod_attention = PodAttentionMetadata(
+                    self.pod_attention_wrappers
+                )
+                # Do NOT return here — fall through to set self.forward_metadata
+                # as fallback for backends that use forward_extend instead of
+                # forward_mixed (e.g. hybrid_linear_attn_backend).
+
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -928,6 +1028,100 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def forward_mixed(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+    ):
+        if self.forward_metadata_pod_attention is None:
+            return self.forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache
+            )
+
+        if not q.is_contiguous():
+            q = q.contiguous()
+
+        paged_kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        if k is not None and v is not None:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v, layer.k_scale, layer.v_scale
+            )
+
+        # First layer of batch: plan + cache all per-batch constants.
+        # Subsequent layers skip everything inside this block.
+        if not self._pod_plan_done:
+            num_decoding_reqs = forward_batch.num_decoding_reqs or 0
+            num_prefill_tokens = forward_batch.extend_num_tokens - num_decoding_reqs
+            k_scale = layer.k_scale_float
+
+            updater = self.indices_updater_pod_attention
+            sm_scale = updater._sm_scale
+            if sm_scale is None:
+                sm_scale = layer.scaling
+                if k_scale != 1.0:
+                    sm_scale = sm_scale * k_scale
+
+            updater.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_cpu,
+                forward_batch.seq_lens_sum,
+                forward_batch.extend_prefix_lens,
+                pod_attention_wrappers=self.pod_attention_wrappers,
+                encoder_lens=forward_batch.encoder_lens,
+                spec_info=None,
+                num_decode_reqs=num_decoding_reqs,
+                sm_scale=sm_scale,
+            )
+
+            # Cache per-batch constants for layers 2..N
+            hidden_size = layer.tp_q_head_num * layer.head_dim
+            q_shape = (-1, layer.tp_q_head_num, layer.head_dim)
+            total_tokens = num_prefill_tokens + num_decoding_reqs
+
+            self._pod_wrapper = (
+                self.forward_metadata_pod_attention.pod_attention_wrappers[
+                    self._get_wrapper_idx(layer)
+                ]
+            )
+            self._pod_n_p = num_prefill_tokens
+            self._pod_q_shape = q_shape
+            self._pod_hidden = hidden_size
+            self._pod_v_scale = layer.v_scale_float
+
+            o = _get_pod_attention_output_buffer(
+                total_tokens * hidden_size, q.dtype, q.device
+            )
+            self._pod_out = o.view(total_tokens, hidden_size)
+            self._pod_out_p = self._pod_out[:num_prefill_tokens].view(q_shape)
+            self._pod_out_d = self._pod_out[num_prefill_tokens:].view(q_shape)
+
+            self._pod_plan_done = True
+
+        # Hot path: minimal per-layer work
+        q_p = q[: self._pod_n_p].view(self._pod_q_shape)
+        q_d = q[self._pod_n_p :].view(self._pod_q_shape)
+
+        self._pod_wrapper.run(
+            q_p,
+            paged_kv_cache,
+            q_d,
+            paged_kv_cache,
+            causal_p=True,
+            out_p=self._pod_out_p,
+            out_d=self._pod_out_d,
+        )
+
+        if self._pod_v_scale != 1.0:
+            self._pod_out.mul_(self._pod_v_scale)
+
+        return self._pod_out.view(-1, self._pod_hidden)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
@@ -1498,6 +1692,223 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_ptr=token_pos_in_items_ptr,
             token_pos_in_items_len=token_pos_in_items_len,
             max_item_len_ptr=max_item_len_ptr,
+        )
+
+
+class FlashInferIndicesUpdaterPodAttention:
+    def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
+        # Parse Constants
+        self.num_qo_heads = (
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+        )
+        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
+            get_attention_tp_size()
+        )
+        self.head_dim = model_runner.model_config.head_dim
+        self.data_type = model_runner.kv_cache_dtype
+        self.q_data_type = model_runner.dtype
+        self.attn_backend = attn_backend
+        # sm_scale will be set from layer.scaling on first forward_mixed call
+        self._sm_scale = None
+
+        # Buffers and wrappers
+        self.kv_indptr = attn_backend.kv_indptr
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.pod_attention_wrappers = attn_backend.pod_attention_wrappers
+
+        # Pre-allocate buffers
+        max_bs = model_runner.req_to_token_pool.size
+        kv_indices_size = max_bs * model_runner.model_config.context_len + 256
+        device = model_runner.device
+
+        self._pod_attention_last_page_len_buffer = torch.ones(
+            max_bs, dtype=torch.int32, device=device
+        )
+        self._pod_attention_qo_indptr_p_buffer = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=device
+        )
+        self._pod_attention_kv_indices_buffer = torch.empty(
+            kv_indices_size,  # Reserve space for both prefill and decode
+            dtype=torch.int32,
+            device=device,
+        )
+
+        # Pre-allocate empty tensors for else branches
+        self._pod_attention_empty_tensor_1 = torch.zeros(
+            1, dtype=torch.int32, device=device
+        )
+        self._pod_attention_empty_tensor_0 = torch.zeros(
+            0, dtype=torch.int32, device=device
+        )
+
+        # Pre-compute qo_indptr pattern for decode: [0, 1, 2, ..., max_bs]
+        self._pod_attention_qo_indptr_d_pattern = torch.arange(
+            max_bs + 1, dtype=torch.int32, device=device
+        )
+
+        # Dispatch the update function
+        # POD-Attention only supports single wrapper
+        assert self.attn_backend.num_wrappers == 1
+        self.update = self.update_single_wrapper
+
+    def update(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_sum: int,
+        prefix_lens: torch.Tensor,
+        pod_attention_wrappers: List[BatchPODWithPagedKVCacheWrapper],
+        encoder_lens: Optional[torch.Tensor],
+        spec_info: Optional[SpecInput],
+        num_decode_reqs: int = 0,
+    ):
+        # Keep the signature for type checking. It will be assigned during runtime.
+        raise NotImplementedError()
+
+    def update_single_wrapper(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        seq_lens_sum: int,
+        prefix_lens: torch.Tensor,
+        pod_attention_wrappers: List[BatchPODWithPagedKVCacheWrapper],
+        encoder_lens: Optional[torch.Tensor],
+        spec_info: Optional[SpecInput],
+        num_decode_reqs: int = 0,
+        sm_scale: Optional[float] = None,
+    ):
+        pod_attention_wrappers = pod_attention_wrappers or self.pod_attention_wrappers
+        self.call_begin_forward(
+            pod_attention_wrappers[0],
+            req_pool_indices,
+            seq_lens,
+            prefix_lens,
+            num_decode_reqs,
+            spec_info,
+            sm_scale=sm_scale,
+        )
+
+    def call_begin_forward(
+        self,
+        pod_attention_wrapper: BatchPODWithPagedKVCacheWrapper,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        num_decode_reqs: int,
+        spec_info: Optional[SpecInput],
+        sm_scale: Optional[float] = None,
+    ):
+        if sm_scale is not None:
+            self._sm_scale = sm_scale
+
+        if spec_info is None:
+            bs = len(seq_lens)
+            bs_p = bs - num_decode_reqs
+            bs_d = num_decode_reqs
+
+            seq_lens_p = (
+                seq_lens.narrow(0, 0, bs_p)
+                if bs_p > 0
+                else self._pod_attention_empty_tensor_0
+            )
+            seq_lens_d = (
+                seq_lens.narrow(0, bs_p, bs_d)
+                if bs_d > 0
+                else self._pod_attention_empty_tensor_0
+            )
+
+            paged_kernel_lens_sum_p = seq_lens_p.sum() if bs_p > 0 else 0
+            paged_kernel_lens_sum_d = seq_lens_d.sum() if bs_d > 0 else 0
+
+            kv_indptr_p = self.kv_indptr[0]
+            kv_indptr_d = self.kv_indptr[1]
+
+            # Single cumsum on full seq_lens, then narrow for prefill/decode.
+            # Decode indptr needs offset correction since full_cumsum includes
+            # the prefix sum of prefill seq_lens.
+            if bs_p > 0 or bs_d > 0:
+                full_cumsum = torch.cumsum(seq_lens, dim=0)
+            if bs_p > 0:
+                kv_indptr_p[1 : bs_p + 1] = full_cumsum.narrow(0, 0, bs_p)
+            if bs_d > 0:
+                decode_offset = full_cumsum[bs_p - 1] if bs_p > 0 else 0
+                kv_indptr_d[1 : bs_d + 1] = (
+                    full_cumsum.narrow(0, bs_p, bs_d) - decode_offset
+                )
+
+            if bs_p > 0:
+                kv_indptr_p_buf = kv_indptr_p[: bs_p + 1]
+                kv_indices_p = self._pod_attention_kv_indices_buffer[
+                    : paged_kernel_lens_sum_p + 256
+                ]
+                create_flashinfer_kv_indices_triton[(bs_p,)](
+                    self.req_to_token,
+                    req_pool_indices[:bs_p],
+                    seq_lens_p,
+                    kv_indptr_p_buf,
+                    None,
+                    kv_indices_p,
+                    self.req_to_token.shape[1],
+                )
+                last_page_len_p = self._pod_attention_last_page_len_buffer[:bs_p]
+                qo_indptr_p = self._pod_attention_qo_indptr_p_buffer[: bs_p + 1]
+                prefix_lens_p = prefix_lens.narrow(0, 0, bs_p)
+                qo_indptr_p[1 : bs_p + 1] = torch.cumsum(
+                    seq_lens_p - prefix_lens_p, dim=0
+                )
+            else:
+                kv_indptr_p_buf = self._pod_attention_empty_tensor_1
+                kv_indices_p = self._pod_attention_empty_tensor_1
+                qo_indptr_p = self._pod_attention_empty_tensor_1
+                last_page_len_p = self._pod_attention_empty_tensor_0
+
+            if bs_d > 0:
+                kv_indptr_d_buf = kv_indptr_d[: bs_d + 1]
+                kv_indices_d = self._pod_attention_kv_indices_buffer[
+                    paged_kernel_lens_sum_p
+                    + 256 : paged_kernel_lens_sum_p
+                    + 256
+                    + paged_kernel_lens_sum_d
+                ]
+                create_flashinfer_kv_indices_triton[(bs_d,)](
+                    self.req_to_token,
+                    req_pool_indices[bs_p:],
+                    seq_lens_d,
+                    kv_indptr_d_buf,
+                    None,
+                    kv_indices_d,
+                    self.req_to_token.shape[1],
+                )
+                last_page_len_d = self._pod_attention_last_page_len_buffer[:bs_d]
+                qo_indptr_d = self._pod_attention_qo_indptr_d_pattern[: bs_d + 1]
+            else:
+                kv_indptr_d_buf = self._pod_attention_empty_tensor_1
+                kv_indices_d = self._pod_attention_empty_tensor_1
+                qo_indptr_d = self._pod_attention_empty_tensor_1
+                last_page_len_d = self._pod_attention_empty_tensor_0
+        else:
+            raise NotImplementedError(
+                "Speculative decoding not supported in POD-Attention yet"
+            )
+
+        pod_attention_wrapper.begin_forward(
+            qo_indptr_p,
+            kv_indptr_p_buf,
+            kv_indices_p,
+            last_page_len_p,
+            qo_indptr_d,
+            kv_indptr_d_buf,
+            kv_indices_d,
+            last_page_len_d,
+            self.num_qo_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            1,
+            q_data_type=self.q_data_type,
+            kv_data_type=self.data_type,
+            sm_scale=self._sm_scale,
         )
 
 
