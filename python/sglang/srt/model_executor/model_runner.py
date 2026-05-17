@@ -402,6 +402,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
+        self.enable_spec_v2_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -3238,6 +3239,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and forward_batch.global_num_tokens_gpu is not None
             and require_gathered_buffer(self.server_args)
             and not is_nsa_enable_prefill_cp()
+            and not self.enable_spec_v2_zero_bubble
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
                 server_args=self.server_args,

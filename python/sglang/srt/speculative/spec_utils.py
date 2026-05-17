@@ -61,6 +61,12 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     # TODO(lsyin): also skip when step == 1.
     if server_args.speculative_algorithm == "STANDALONE":
         return False
+
+    # When enable `spec_v2_zero_bubble` feature, we don't need to save hidden_states for next step
+    enable_spec_v2_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
+    if enable_spec_v2_zero_bubble:
+        return False
+
     return not server_args.enable_multi_layer_eagle
 
 

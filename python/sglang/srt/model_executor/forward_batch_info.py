@@ -62,7 +62,7 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -492,6 +492,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device
+        _pin = is_pin_memory_available(device)
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -522,12 +523,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64
+                global_num_tokens, dtype=torch.int64, pin_memory=_pin
             ).to(device, non_blocking=True)
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
+                global_num_tokens_for_logprob, dtype=torch.int64, pin_memory=_pin
             ).to(device, non_blocking=True)
 
         if ret.forward_mode.is_idle():
@@ -561,10 +562,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32
+                batch.extend_seq_lens, dtype=torch.int32, pin_memory=_pin
             ).to(device, non_blocking=True)
             ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, dtype=torch.int32
+                batch.extend_prefix_lens, dtype=torch.int32, pin_memory=_pin
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(

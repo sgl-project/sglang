@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -95,6 +96,7 @@ class EAGLEDraftCudaGraphRunner:
         )
         self.enable_pdmux = False
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self.enable_spec_v2_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
@@ -368,7 +370,13 @@ class EAGLEDraftCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            ret = self.eagle_worker.draft_forward(forward_batch)
+            if self.enable_spec_v2_zero_bubble:
+                assert hasattr(
+                    self.eagle_worker, "draft_forward_zero_bubble"
+                ), "`Spec v2 zero bubble` just support when enable `overlap scheduler` and enable `eagle algorithm` now"
+                ret = self.eagle_worker.draft_forward_zero_bubble(forward_batch)
+            else:
+                ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -388,6 +396,10 @@ class EAGLEDraftCudaGraphRunner:
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         # Keep the variables name for readability
+        if self.enable_spec_v2_zero_bubble:
+            ret_topk_p_list, ret_topk_index_list = (t[:raw_bs] for t in out)
+            return ret_topk_p_list, ret_topk_index_list
+
         parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)
         return parent_list, top_scores_index, draft_tokens
 
