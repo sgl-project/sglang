@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -14,7 +14,10 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
+    from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import (
+        DeepEPLLCombineInput,
+        DeepEPLLDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -350,3 +353,90 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     )
 
     return StandardCombineInput(hidden_states=output)
+
+
+@dataclass
+class CuteDslFp4DeepEPMoeQuantInfo(MoeQuantInfo):
+    """Quantization payload for the FlashInfer CuteDSL masked-GEMM path.
+
+    Consumed by the DeepEP low-latency dispatch + FlashInfer CuteDSL runner
+    combination. Weights are in [Gate, Up] order (non-interleaved) with
+    swizzled blockscales -- the layout expected by
+    ``flashinfer_cutedsl_moe_masked`` (grouped_gemm_nt_masked).
+    """
+
+    w13_weight: torch.Tensor
+    w2_weight: torch.Tensor
+    w13_blockscale_swizzled: torch.Tensor
+    w2_blockscale_swizzled: torch.Tensor
+    g1_alphas: torch.Tensor
+    g2_alphas: torch.Tensor
+    w13_input_scale_quant: torch.Tensor
+    w2_input_scale_quant: torch.Tensor
+    use_nvfp4_dispatch: bool
+    down_gemm_overlap_args: Optional["DownGemmOverlapArgs"] = None
+
+
+@register_fused_func("deepep", "flashinfer_cutedsl")
+def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
+    dispatch_output: DeepEPLLDispatchOutput,
+    quant_info: CuteDslFp4DeepEPMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> DeepEPLLCombineInput:
+    from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
+        flashinfer_cutedsl_moe_masked,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+
+    assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+    assert (
+        not runner_config.apply_router_weight_on_input
+    ), "apply_router_weight_on_input is not supported for Flashinfer"
+
+    hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
+
+    # flashinfer_cutedsl_moe_masked reinterprets scales as float8_e4m3fn.
+    # Same-dtype .view is a no-op; only wider dtypes (e.g. int32-packed
+    # UE8M0) need stride(-1)==1.
+    if (
+        quant_info.use_nvfp4_dispatch
+        and hidden_states_scale is not None
+        and hidden_states_scale.element_size() != 1
+        and hidden_states_scale.stride(-1) != 1
+    ):
+        raise AssertionError(
+            f"NVFP4 dispatch scale has stride(-1)={hidden_states_scale.stride(-1)}, "
+            f"dtype={hidden_states_scale.dtype}; .view(float8_e4m3fn) requires stride(-1)==1. "
+            "Try SGLANG_MOE_NVFP4_DISPATCH=0 or check DeepEP version."
+        )
+
+    overlap = quant_info.down_gemm_overlap_args
+    output = flashinfer_cutedsl_moe_masked(
+        hidden_states=(hidden_states, hidden_states_scale),
+        input_global_scale=(
+            None if quant_info.use_nvfp4_dispatch else quant_info.w13_input_scale_quant
+        ),
+        w1=quant_info.w13_weight,
+        w1_blockscale=quant_info.w13_blockscale_swizzled,
+        w1_alpha=quant_info.g1_alphas,
+        w2=quant_info.w2_weight,
+        a2_global_scale=quant_info.w2_input_scale_quant,
+        w2_blockscale=quant_info.w2_blockscale_swizzled,
+        w2_alpha=quant_info.g2_alphas,
+        masked_m=masked_m,
+        **(
+            dict(
+                down_sm_count=overlap.num_sms,
+                down_signals=overlap.signal,
+                down_start_event=overlap.start_event,
+            )
+            if overlap is not None
+            else {}
+        ),
+    )
+
+    return DeepEPLLCombineInput(
+        hidden_states=output,
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
+    )

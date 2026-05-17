@@ -105,6 +105,12 @@ class DeepEPMoE(FusedMoE):
             and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         ):
             self.deprecate_flag = True
+        elif (
+            get_moe_runner_backend().is_flashinfer_cutedsl()
+            and quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+        ):
+            self.deprecate_flag = True
         else:
             self.deprecate_flag = False
 
@@ -134,15 +140,9 @@ class DeepEPMoE(FusedMoE):
             self.deepep_mode.enable_low_latency()
             and not _is_npu
             and not _is_hip
-            and not (
-                get_moe_runner_backend().is_flashinfer_cutedsl()
-                and self.quant_config is not None
-                and self.quant_config.get_name() == "modelopt_fp4"
-            )
             and quant_config is not None
         ):
-            # AMD HIP, NPU supports low_latency deepep without deepgemm
-            # NV FP4 quantization with flashinfer_cutedsl also supports low_latency deepep without deepgemm
+            # AMD HIP and NPU support low_latency DeepEP without DeepGEMM.
             # Unquantized draft MoE uses BF16 DeepEP dispatch and a local fallback.
             assert (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -220,12 +220,6 @@ class DeepEPMoE(FusedMoE):
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if self.quant_config is None:
                 output = self.forward_unquantized_deepep_ll(dispatch_output)
-            elif (
-                get_moe_runner_backend().is_flashinfer_cutedsl()
-                and self.quant_config is not None
-                and self.quant_config.get_name() == "modelopt_fp4"
-            ):
-                output = self.forward_flashinfer_cutedsl(dispatch_output)
             elif self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
             else:
@@ -287,22 +281,6 @@ class DeepEPMoE(FusedMoE):
         if w2_bias is not None:
             output = output + w2_bias.unsqueeze(1)
         return output.masked_fill(~valid_mask, 0)
-
-    def forward_flashinfer_cutedsl(
-        self,
-        dispatch_output: DeepEPLLDispatchOutput,
-    ):
-        hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
-        assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
-
-        output = self.quant_method.apply_without_routing_weights(
-            layer=self,
-            x=(hidden_states, hidden_states_scale),
-            masked_m=masked_m,
-            moe_runner_config=self.moe_runner_config,
-        )
-        return output
 
     def forward_cutlass_w4afp8(
         self,
