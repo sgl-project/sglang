@@ -149,21 +149,20 @@ The following setup was validated against a hybrid Mamba model with HiCache enab
 
 - model: `Qwen/Qwen3.5-0.8B`
 - storage backend: `nixl`
-- NIXL plugin: `POSIX` with `io_uring`
+- NIXL plugin: `POSIX`
 - HiCache layout: `page_first`
 - model type: hybrid attention + Mamba sidecar cache (`KV + MAMBA`)
 
 Important details from this validation:
 
 - Use a real `.toml` file path with `--hicache-storage-backend-extra-config`.
-- Do not point SGLang at `nixl.config.toml.sample` directly, because SGLang validates the file extension and `.sample` is not accepted.
 - For this validated path, the storage directory was provided through `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`.
+- Use `--mamba-scheduler-strategy extra_buffer` to support larger than 1 page size
 
 Example TOML file:
 
 ```toml
 [plugin.posix]
-use_uring = "true"
 active = true
 ```
 
@@ -173,10 +172,9 @@ Example serve command for a hybrid model:
 export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/tmp/sglang_nixl_e2e_storage
 
 ~/ve_sgl_dev/bin/sglang serve \
-  --model-path /workspace/LLM_models/Qwen3.5-0.8B \
+  --model-path /path/to/Qwen3.5-0.8B \
   --served-model-name Qwen/Qwen3.5-0.8B \
   --host 127.0.0.1 \
-  --port 31000 \
   --enable-hierarchical-cache \
   --hicache-ratio 2 \
   --hicache-io-backend kernel \
