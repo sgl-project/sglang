@@ -687,7 +687,7 @@ class PrefillAdder:
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
-            0,
+            req.kv_committed_len,
             req.extend_input_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
