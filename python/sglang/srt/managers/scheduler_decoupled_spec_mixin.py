@@ -165,11 +165,6 @@ class SchedulerDecoupledSpecMixin:
             )
         ):
             return None
-        start_ns = self.decoupled_spec_tracer.start_timer()
-        if start_ns is None:
-            return None
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
         return self.decoupled_spec_tracer.start_timer()
 
     @trace_decoupled_spec(DecoupledSpecTraceEvent.SCHEDULER_FORWARD_BATCH)
@@ -181,8 +176,6 @@ class SchedulerDecoupledSpecMixin:
     ) -> None:
         if start_ns is None:
             return
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
 
     def flush_draft_updates(
         self: Scheduler,

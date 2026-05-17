@@ -3144,7 +3144,7 @@ class Scheduler(
                 )
 
         if decoupled_forward_start_ns is not None:
-            self.record_forward_latency(batch, decoupled_forward_start_ns, ret)
+            ret.decoupled_forward_start_ns = decoupled_forward_start_ns
 
         if (
             self.server_args.enable_dp_attention
@@ -3204,6 +3204,11 @@ class Scheduler(
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
+
+        decoupled_forward_start_ns = getattr(result, "decoupled_forward_start_ns", None)
+        if decoupled_forward_start_ns is not None:
+            self.record_forward_latency(batch, decoupled_forward_start_ns, result)
+            result.decoupled_forward_start_ns = None
 
         if self.spec_algorithm.is_decoupled_verify():
             self.submit_verify_updates(batch)

@@ -59,6 +59,10 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
+    # Decoupled-spec trace start timestamp. This is recorded after normal
+    # output processing so tracing does not add its own CUDA synchronization.
+    decoupled_forward_start_ns: Optional[int] = None
+
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,

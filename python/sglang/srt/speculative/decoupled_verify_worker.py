@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -117,28 +116,11 @@ class VerifyWorker:
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        self.trace_timing_enabled = bool(
-            getattr(server_args, "decoupled_spec_trace_dir", None)
-        )
         self.total_accept_length = 0
         self.total_num_verified_reqs = 0
 
     def clear_cache_pool(self):
         return
-
-    def _trace_timestamp_ns(self) -> int | None:
-        if not self.trace_timing_enabled:
-            return None
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        return time.perf_counter_ns()
-
-    def _trace_elapsed_ms(self, start_ns: int | None) -> float:
-        if start_ns is None:
-            return 0.0
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        return (time.perf_counter_ns() - start_ns) / 1_000_000
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         return self.target_worker.update_weights_from_tensor(recv_req)
@@ -233,25 +215,18 @@ class VerifyWorker:
 
         return raw_accept_lens
 
-    def draft(
-        self,
-        batch: ScheduleBatch,
-        timings: dict | None = None,
-    ) -> EagleVerifyInput:
+    def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
         draft_token_num = self.speculative_num_draft_tokens
         if draft_token_num < 2:
             raise RuntimeError(
                 "External draft verification requires at least one draft token per request."
             )
 
-        start_ns = self._trace_timestamp_ns()
         batch.maybe_evict_swa()
         for req in batch.reqs:
             req.decode_batch_idx += 1
         seq_lens_sum = int(torch.sum(batch.seq_lens).item())
         batch.seq_lens_sum = seq_lens_sum
-        if timings is not None:
-            timings["seq_lens_sum"] = seq_lens_sum
 
         # Accumulate penalty
         sampling_info = getattr(batch, "sampling_info", None)
@@ -270,10 +245,7 @@ class VerifyWorker:
             )
 
         pad_token_id = self._get_pad_token_id()
-        if timings is not None:
-            timings["draft_preamble_ms"] = self._trace_elapsed_ms(start_ns)
 
-        start_ns = self._trace_timestamp_ns()
         full_draft_tokens_by_req = [
             self._build_req_verify_tokens(req, pad_token_id) for req in batch.reqs
         ]
@@ -295,15 +267,9 @@ class VerifyWorker:
             spec_steps,
             batch.device,
         )
-        if timings is not None:
-            timings["draft_build_tokens_ms"] = self._trace_elapsed_ms(start_ns)
 
-        start_ns = self._trace_timestamp_ns()
         tree_mask_buf, position_buf = self._get_verify_buffers(draft_token_num)
-        if timings is not None:
-            timings["draft_get_verify_buffers_ms"] = self._trace_elapsed_ms(start_ns)
 
-        start_ns = self._trace_timestamp_ns()
         (
             tree_mask,
             positions,
@@ -325,11 +291,7 @@ class VerifyWorker:
             tree_mask_buf=tree_mask_buf,
             position_buf=position_buf,
         )
-        if timings is not None:
-            timings["draft_tree_mask_numel"] = int(tree_mask.numel())
-            timings["draft_build_tree_ms"] = self._trace_elapsed_ms(start_ns)
 
-        start_ns = self._trace_timestamp_ns()
         terminal_indices = torch.tensor(
             self._get_snapshot_tail_lens(batch),
             dtype=torch.long,
@@ -337,8 +299,6 @@ class VerifyWorker:
         )
         row_indices = torch.arange(batch_size, dtype=torch.long, device=batch.device)
         retrieve_next_token[row_indices, terminal_indices] = -1
-        if timings is not None:
-            timings["draft_terminal_mask_ms"] = self._trace_elapsed_ms(start_ns)
 
         return EagleVerifyInput(
             draft_token=flat_draft_tokens,
@@ -360,15 +320,10 @@ class VerifyWorker:
         self,
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
-        timings: dict | None = None,
     ):
-        if timings is None:
-            timings = {}
-
         was_idle = batch.forward_mode.is_idle()
         seq_lens_pre_verify = batch.seq_lens.clone()
 
-        start_ns = self._trace_timestamp_ns()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = self.speculative_num_steps + 1
         batch.return_hidden_states = False
@@ -386,13 +341,10 @@ class VerifyWorker:
             draft_tokens_cpu = spec_info.draft_token.view(
                 spec_info.retrieve_next_token.shape
             ).cpu()
-        timings["prepare_verify_ms"] = self._trace_elapsed_ms(start_ns)
 
-        start_ns = self._trace_timestamp_ns()
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
-        timings["target_forward_ms"] = self._trace_elapsed_ms(start_ns)
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -418,7 +370,6 @@ class VerifyWorker:
             logits_output.next_token_logits, "decoupled_verify: target model logits"
         )
 
-        start_ns = self._trace_timestamp_ns()
         # Decoupled verify has no local draft-extend consumer for target hidden
         # states, but EagleVerifyInput.verify expects this attribute to exist.
         spec_info.hidden_states = None
@@ -447,8 +398,6 @@ class VerifyWorker:
                 batch, verify_output, logits_output, spec_info, seq_lens_pre_verify
             )
 
-        timings["eagle_verify_ms"] = self._trace_elapsed_ms(start_ns)
-
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
 
@@ -460,7 +409,6 @@ class VerifyWorker:
             logits_output,
             verify_output,
             can_run_cuda_graph,
-            timings,
         )
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
@@ -473,12 +421,7 @@ class VerifyWorker:
             result = self.target_worker.forward_batch_generation(model_worker_batch)
             return result
 
-        total_start_ns = self._trace_timestamp_ns()
-        timings = {}
-        start_ns = self._trace_timestamp_ns()
-        spec_info = self.draft(batch, timings if self.trace_timing_enabled else None)
-        draft_ms = self._trace_elapsed_ms(start_ns)
-        valid_tail_lens = self._get_snapshot_tail_lens(batch)
+        spec_info = self.draft(batch)
         can_use_full_graph_path = (
             spec_info.draft_token_num == self.speculative_num_draft_tokens
         )
@@ -486,14 +429,11 @@ class VerifyWorker:
             logits_output,
             verify_output,
             can_run_cuda_graph,
-            timings,
-        ) = self.verify(batch, spec_info, timings)
+        ) = self.verify(batch, spec_info)
 
-        start_ns = self._trace_timestamp_ns()
         num_correct_drafts_per_req_cpu = (
             self._assert_verify_output_within_snapshot_tail(batch, verify_output)
         )
-        assert_ms = self._trace_elapsed_ms(start_ns)
         accepted_tokens = verify_output.accept_tokens
         num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
         reported_can_run_cuda_graph = can_run_cuda_graph and can_use_full_graph_path
@@ -505,41 +445,6 @@ class VerifyWorker:
             num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=reported_can_run_cuda_graph,
         )
-        if self.trace_timing_enabled:
-            if torch.is_tensor(accepted_tokens):
-                accepted_tokens_num = int(accepted_tokens.numel())
-            else:
-                accepted_tokens_num = len(accepted_tokens or [])
-            timings.update(
-                batch_size=batch.batch_size(),
-                draft_token_num=int(spec_info.draft_token_num),
-                num_input_tokens=int(spec_info.draft_token.numel()),
-                target_can_run_cuda_graph=bool(can_run_cuda_graph),
-                reported_can_run_cuda_graph=bool(reported_can_run_cuda_graph),
-                valid_tail_sum=int(sum(valid_tail_lens)),
-                valid_tail_min=int(min(valid_tail_lens)) if valid_tail_lens else 0,
-                valid_tail_max=int(max(valid_tail_lens)) if valid_tail_lens else 0,
-                num_accepted_drafts=int(num_correct_drafts),
-                accepted_tokens_num=accepted_tokens_num,
-                draft_ms=draft_ms,
-                verify_impl="eagle",
-                assert_ms=assert_ms,
-                total_worker_ms=self._trace_elapsed_ms(total_start_ns),
-            )
-            timings.setdefault("cuda_graph_replay_prepare_ms", 0.0)
-            timings.setdefault("cuda_graph_replay_ms", 0.0)
-            timings.setdefault("seq_lens_sum", 0)
-            timings.setdefault("draft_tree_mask_numel", 0)
-            timings.setdefault("eagle_verify_ms", 0.0)
-            for timing_name in (
-                "draft_preamble_ms",
-                "draft_build_tokens_ms",
-                "draft_get_verify_buffers_ms",
-                "draft_build_tree_ms",
-                "draft_terminal_mask_ms",
-            ):
-                timings.setdefault(timing_name, 0.0)
-            result.decoupled_verify_timings = timings
         num_verified_reqs = len(num_correct_drafts_per_req_cpu)
         self.total_accept_length += int(result.num_correct_drafts)
         self.total_num_verified_reqs += num_verified_reqs
