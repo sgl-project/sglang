@@ -1164,11 +1164,11 @@
         "wan2_2_ti2v_5b": {
             "stages_ms": {
                 "InputValidationStage": 380.0,
-                "TextEncodingStage": 1152.06,
+                "TextEncodingStage": 900.0,
                 "LatentPreparationStage": 0.13,
                 "TimestepPreparationStage": 2.32,
                 "DenoisingStage": 18728.92,
-                "DecodingStage": 4110.73
+                "DecodingStage": 1700.0
             },
             "denoise_step_ms": {
                 "0": 225.06,
@@ -1222,7 +1222,7 @@
                 "48": 373.94,
                 "49": 371.58
             },
-            "expected_e2e_ms": 24821.68,
+            "expected_e2e_ms": 19000.0,
             "expected_avg_denoise_ms": 364.69,
             "expected_median_denoise_ms": 367.69,
             "estimated_full_test_time_s": 141.7
@@ -1351,18 +1351,18 @@
         "fastwan2_2_ti2v_5b": {
             "stages_ms": {
                 "InputValidationStage": 380.0,
-                "TextEncodingStage": 1207.93,
+                "TextEncodingStage": 750.0,
                 "TimestepPreparationStage": 41.12,
                 "LatentPreparationStage": 0.15,
                 "DmdDenoisingStage": 428.28,
-                "DecodingStage": 2501.21
+                "DecodingStage": 1650.0
             },
             "denoise_step_ms": {
                 "0": 49.59,
                 "1": 171.65,
                 "2": 200.43
             },
-            "expected_e2e_ms": 5014.57,
+            "expected_e2e_ms": 3300.0,
             "expected_avg_denoise_ms": 140.56,
             "expected_median_denoise_ms": 171.65,
             "estimated_full_test_time_s": 125.2

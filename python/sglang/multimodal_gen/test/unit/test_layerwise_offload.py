@@ -305,9 +305,7 @@ def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypa
         modules, _server_args(), component_names=["default"]
     )
 
-    assert get_layerwise_offload_component_names_for_pipeline(
-        modules, ["default"]
-    ) == [
+    assert get_layerwise_offload_component_names_for_pipeline(modules, ["default"]) == [
         "text_encoder",
         "text_encoder_2",
         "image_encoder",

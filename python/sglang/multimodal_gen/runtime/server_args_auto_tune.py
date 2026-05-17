@@ -74,8 +74,7 @@ class ServerArgsAutoTuner:
                     and self._can_apply_default_layerwise_offload_policy()
                 ):
                     args.layerwise_offload_components = (
-                        self._default_layerwise_components_for_unset_placement()
-                        or None
+                        self._default_layerwise_components_for_unset_placement() or None
                     )
                 return
             args.use_fsdp_inference = False
@@ -223,9 +222,7 @@ class ServerArgsAutoTuner:
         ):
             layerwise_components.append(LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP)
             changed.append(LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP)
-        if args.vae_cpu_offload and not args.is_arg_explicitly_set(
-            "vae_cpu_offload"
-        ):
+        if args.vae_cpu_offload and not args.is_arg_explicitly_set("vae_cpu_offload"):
             layerwise_components.append(LAYERWISE_OFFLOAD_VAE_GROUP)
             changed.append(LAYERWISE_OFFLOAD_VAE_GROUP)
 
@@ -333,9 +330,10 @@ class ServerArgsAutoTuner:
 
     def _default_layerwise_components_for_unset_placement(self) -> list[str]:
         args = self.server_args
-        if args.is_arg_explicitly_set(
-            "layerwise_offload_components"
-        ) or args.dit_layerwise_offload is True:
+        if (
+            args.is_arg_explicitly_set("layerwise_offload_components")
+            or args.dit_layerwise_offload is True
+        ):
             # The legacy --dit-layerwise-offload flag is a DiT-only selector.
             # Do not merge implicit non-DiT defaults into that explicit mode.
             return []
