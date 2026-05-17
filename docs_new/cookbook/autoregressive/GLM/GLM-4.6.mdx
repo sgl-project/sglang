@@ -1,0 +1,888 @@
+---
+title: GLM-4.6
+metatags:
+    description: "Deploy GLM-4.6 with SGLang - 200K context window, superior coding, advanced reasoning, and enhanced agentic capabilities."
+---
+
+## 1. Model Introduction
+
+[GLM-4.6](https://huggingface.co/zai-org/GLM-4.6) is a powerful language model developed by Zhipu AI, featuring advanced capabilities in reasoning, function calling, and multi-modal understanding.
+
+As the latest iteration in the GLM series, GLM-4.6 achieves comprehensive enhancements across multiple domains, including real-world coding, long-context processing, reasoning, searching, writing, and agentic applications. Details are as follows:
+
+- **Longer context window**: The context window has been expanded from 128K to 200K tokens, enabling the model to handle more complex agentic tasks.
+- **Superior coding performance**: The model achieves higher scores on code benchmarks and demonstrates better real-world performance in applications such as Claude Code, Cline, Roo Code and Kilo Code, including improvements in generating visually polished front-end pages.
+- **Advanced reasoning**: GLM-4.6 shows a clear improvement in reasoning performance and supports tool use during inference, leading to stronger overall capability.
+- **More capable agents**: GLM-4.6 exhibits stronger performance in tool use and search-based agents, and integrates more effectively within agent frameworks.
+- **Refined writing**: Better aligns with human preferences in style and readability, and performs more naturally in role-playing scenarios.
+
+For more details, please refer to the [official GLM-4.6 documentation](https://docs.z.ai/guides/llm/glm-4.6).
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, deployment strategy, and thinking capabilities.
+
+import { GLM46Deployment } from "/src/snippets/autoregressive/glm-46-deployment.jsx";
+
+<GLM46Deployment />
+
+### 3.2 Configuration Tips
+
+For more detailed configuration tips, please refer to [GLM-4.5/GLM-4.6 Usage](../../../docs/basic_usage/glm45).
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Reasoning Parser
+
+GLM-4.6 supports Thinking mode by default. Enable the reasoning parser during deployment to separate the thinking and the content sections:
+
+```shell Command
+python -m sglang.launch_server \
+  --model zai-org/GLM-4.6 \
+  --reasoning-parser glm45 \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+**Streaming with Thinking Process:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+# Enable streaming to see the thinking process in real-time
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.6",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    temperature=0.7,
+    max_tokens=2048,
+    stream=True
+)
+
+# Process the stream
+has_thinking = False
+has_answer = False
+thinking_started = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print answer content
+        if delta.content:
+            # Close thinking section and add content header
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+To solve this problem, I need to calculate 15% of 240.
+Step 1: Convert 15% to decimal: 15% = 0.15
+Step 2: Multiply 240 by 0.15
+Step 3: 240 × 0.15 = 36
+=============== Content =================
+
+The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
+```
+
+**Note:** The reasoning parser captures the model's step-by-step thinking process, allowing you to see how the model arrives at its conclusions.
+
+#### 4.2.2 Tool Calling
+
+GLM-4.6 supports tool calling capabilities. Enable the tool call parser:
+
+```shell Command
+python -m sglang.launch_server \
+  --model zai-org/GLM-4.6 \
+  --reasoning-parser glm45 \
+  --tool-call-parser glm45 \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+**Python Example (with Thinking Process):**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+# Make request with streaming to see thinking process
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.6",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools,
+    temperature=0.7,
+    stream=True
+)
+
+# Process streaming response
+thinking_started = False
+has_thinking = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print tool calls
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            # Close thinking section if needed
+            if has_thinking and thinking_started:
+                print("\n=============== Content =================", flush=True)
+                thinking_started = False
+
+            for tool_call in delta.tool_calls:
+                if tool_call.function:
+                    print(f"🔧 Tool Call: {tool_call.function.name}")
+                    print(f"   Arguments: {tool_call.function.arguments}")
+
+        # Print content
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+The user is asking about the weather in Beijing. I need to use the get_weather function to retrieve this information.
+I should call the function with location="Beijing".
+=============== Content =================
+
+🔧 Tool Call: get_weather
+   Arguments: {"location": "Beijing", "unit": "celsius"}
+```
+
+**Note:**
+
+- The reasoning parser shows how the model decides to use a tool
+- Tool calls are clearly marked with the function name and arguments
+- You can then execute the function and send the result back to continue the conversation
+
+**Handling Tool Call Results:**
+
+```python Example
+# After getting the tool call, execute the function
+def get_weather(location, unit="celsius"):
+    # Your actual weather API call here
+    return f"The weather in {location} is 22°{unit[0].upper()} and sunny."
+
+# Send tool result back to the model
+messages = [
+    {"role": "user", "content": "What's the weather in Beijing?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": '{"location": "Beijing", "unit": "celsius"}'
+            }
+        }]
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": get_weather("Beijing", "celsius")
+    }
+]
+
+final_response = client.chat.completions.create(
+    model="zai-org/GLM-4.6",
+    messages=messages,
+    temperature=0.7
+)
+
+print(final_response.choices[0].message.content)
+# Output: "The weather in Beijing is currently 22°C and sunny."
+```
+
+## 5. Benchmark
+
+This section uses **industry-standard configurations** for comparable benchmark results.
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA B200 GPU (8x), AMD MI300X (8x), AMD MI325X (8x), AMD MI355X (8x)
+- Model: GLM-4.6
+- Tensor Parallelism: 8
+- SGLang Version: 0.5.6.post1
+
+**Benchmark Methodology:**
+
+We use industry-standard benchmark configurations to ensure results are comparable across frameworks and hardware platforms.
+
+#### 5.1.1 Standard Test Scenarios
+
+Three core scenarios reflect real-world usage patterns:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Scenario</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Input Length</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Output Length</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Use Case</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Chat**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Most common conversational AI workload</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Reasoning**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Long-form generation, complex reasoning tasks</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Summarization**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Document summarization, RAG retrieval</td>
+    </tr>
+  </tbody>
+</table>
+
+#### 5.1.2 Concurrency Levels
+
+Test each scenario at three concurrency levels to capture the throughput vs. latency tradeoff (Pareto frontier):
+
+- **Low Concurrency**: `--max-concurrency 1` (Latency-optimized)
+- **Medium Concurrency**: `--max-concurrency 16` (Balanced)
+- **High Concurrency**: `--max-concurrency 100` (Throughput-optimized)
+
+#### 5.1.3 Number of Prompts
+
+For each concurrency level, configure `num_prompts` to simulate realistic user loads:
+
+- **Quick Test**: `num_prompts = concurrency × 1` (minimal test)
+- **Recommended**: `num_prompts = concurrency × 5` (standard benchmark)
+- **Stable Measurements**: `num_prompts = concurrency × 10` (production-grade)
+
+---
+
+#### 5.1.4 Benchmark Commands
+
+**Scenario 1: Chat (1K/1K) - Most Important**
+
+- **Model Deployment**
+```bash Command
+python -m sglang.launch_server \
+  --model zai-org/GLM-4.6 \
+  --tp 8
+```
+
+
+- Low Concurrency (Latency-Optimized)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.6 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  63.82
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total input vision tokens:               0
+Total generated tokens:                  4210
+Total generated tokens (retokenized):    4209
+Request throughput (req/s):              0.16
+Input token throughput (tok/s):          95.60
+Output token throughput (tok/s):         65.97
+Peak output token throughput (tok/s):    68.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          161.57
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   6379.24
+Median E2E Latency (ms):                 5085.00
+---------------Time to First Token----------------
+Mean TTFT (ms):                          155.57
+Median TTFT (ms):                        149.79
+P99 TTFT (ms):                           207.69
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          14.81
+Median TPOT (ms):                        14.80
+P99 TPOT (ms):                           14.84
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           14.82
+Median ITL (ms):                         14.82
+P95 ITL (ms):                            15.17
+P99 ITL (ms):                            15.36
+Max ITL (ms):                            25.05
+==================================================
+```
+
+
+- Medium Concurrency (Balanced)
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.6 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+```text Output
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  72.06
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total input vision tokens:               0
+Total generated tokens:                  40725
+Total generated tokens (retokenized):    40672
+Request throughput (req/s):              1.11
+Input token throughput (tok/s):          550.47
+Output token throughput (tok/s):         565.14
+Peak output token throughput (tok/s):    752.00
+Peak concurrent requests:                20
+Total token throughput (tok/s):          1115.61
+Concurrency:                             13.71
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   12348.93
+Median E2E Latency (ms):                 13164.81
+---------------Time to First Token----------------
+Mean TTFT (ms):                          196.08
+Median TTFT (ms):                        155.22
+P99 TTFT (ms):                           377.98
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          24.24
+Median TPOT (ms):                        24.55
+P99 TPOT (ms):                           30.42
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           23.92
+Median ITL (ms):                         21.40
+P95 ITL (ms):                            22.49
+P99 ITL (ms):                            123.83
+Max ITL (ms):                            486.54
+==================================================
+```
+
+
+- High Concurrency (Throughput-Optimized)
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.6 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 500 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     500
+Benchmark duration (s):                  138.50
+Total input tokens:                      249831
+Total input text tokens:                 249831
+Total input vision tokens:               0
+Total generated tokens:                  252162
+Total generated tokens (retokenized):    251841
+Request throughput (req/s):              3.61
+Input token throughput (tok/s):          1803.78
+Output token throughput (tok/s):         1820.61
+Peak output token throughput (tok/s):    2900.00
+Peak concurrent requests:                107
+Total token throughput (tok/s):          3624.40
+Concurrency:                             90.91
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   25183.97
+Median E2E Latency (ms):                 23968.49
+---------------Time to First Token----------------
+Mean TTFT (ms):                          337.77
+Median TTFT (ms):                        180.65
+P99 TTFT (ms):                           906.14
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          49.97
+Median TPOT (ms):                        52.20
+P99 TPOT (ms):                           61.81
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           49.36
+Median ITL (ms):                         35.05
+P95 ITL (ms):                            124.91
+P99 ITL (ms):                            187.69
+Max ITL (ms):                            440.34
+==================================================
+```
+
+**Scenario 2: Reasoning (1K/8K)**
+
+- Low Concurrency
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.6 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  666.64
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total input vision tokens:               0
+Total generated tokens:                  44452
+Total generated tokens (retokenized):    44387
+Request throughput (req/s):              0.02
+Input token throughput (tok/s):          9.15
+Output token throughput (tok/s):         66.68
+Peak output token throughput (tok/s):    68.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          75.83
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   66661.35
+Median E2E Latency (ms):                 71902.36
+---------------Time to First Token----------------
+Mean TTFT (ms):                          160.21
+Median TTFT (ms):                        140.32
+P99 TTFT (ms):                           295.56
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          14.92
+Median TPOT (ms):                        14.94
+P99 TPOT (ms):                           15.02
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           14.96
+Median ITL (ms):                         14.96
+P95 ITL (ms):                            15.36
+P99 ITL (ms):                            15.57
+Max ITL (ms):                            19.06
+==================================================
+```
+
+- Medium Concurrency
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.6 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  503.30
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total input vision tokens:               0
+Total generated tokens:                  318226
+Total generated tokens (retokenized):    318025
+Request throughput (req/s):              0.16
+Input token throughput (tok/s):          78.82
+Output token throughput (tok/s):         632.28
+Peak output token throughput (tok/s):    752.00
+Peak concurrent requests:                19
+Total token throughput (tok/s):          711.09
+Concurrency:                             13.88
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   87349.22
+Median E2E Latency (ms):                 88248.04
+---------------Time to First Token----------------
+Mean TTFT (ms):                          228.54
+Median TTFT (ms):                        142.78
+P99 TTFT (ms):                           569.84
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          21.97
+Median TPOT (ms):                        22.14
+P99 TPOT (ms):                           22.47
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           21.91
+Median ITL (ms):                         21.80
+P95 ITL (ms):                            22.30
+P99 ITL (ms):                            22.78
+Max ITL (ms):                            137.19
+==================================================
+```
+
+- High Concurrency
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.6 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 320 \
+  --max-concurrency 64 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 64
+Successful requests:                     320
+Benchmark duration (s):                  772.28
+Total input tokens:                      158939
+Total input text tokens:                 158939
+Total input vision tokens:               0
+Total generated tokens:                  1300705
+Total generated tokens (retokenized):    1299924
+Request throughput (req/s):              0.41
+Input token throughput (tok/s):          205.80
+Output token throughput (tok/s):         1684.24
+Peak output token throughput (tok/s):    2112.00
+Peak concurrent requests:                68
+Total token throughput (tok/s):          1890.05
+Concurrency:                             56.17
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   135563.36
+Median E2E Latency (ms):                 140888.88
+---------------Time to First Token----------------
+Mean TTFT (ms):                          232.45
+Median TTFT (ms):                        145.59
+P99 TTFT (ms):                           576.49
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          33.47
+Median TPOT (ms):                        34.02
+P99 TPOT (ms):                           35.10
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           33.30
+Median ITL (ms):                         32.63
+P95 ITL (ms):                            34.27
+P99 ITL (ms):                            104.39
+Max ITL (ms):                            155.65
+==================================================
+```
+
+**Scenario 3: Summarization (8K/1K)**
+
+- Low
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.6 \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  65.11
+Total input tokens:                      41941
+Total input text tokens:                 41941
+Total input vision tokens:               0
+Total generated tokens:                  4210
+Total generated tokens (retokenized):    4210
+Request throughput (req/s):              0.15
+Input token throughput (tok/s):          644.17
+Output token throughput (tok/s):         64.66
+Peak output token throughput (tok/s):    68.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          708.83
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   6508.31
+Median E2E Latency (ms):                 5263.36
+---------------Time to First Token----------------
+Mean TTFT (ms):                          189.48
+Median TTFT (ms):                        159.23
+P99 TTFT (ms):                           304.09
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          15.02
+Median TPOT (ms):                        15.03
+P99 TPOT (ms):                           15.27
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           15.04
+Median ITL (ms):                         15.03
+P95 ITL (ms):                            15.46
+P99 ITL (ms):                            15.65
+Max ITL (ms):                            24.20
+==================================================
+```
+
+- Medium Concurrency
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.6 \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  76.43
+Total input tokens:                      300020
+Total input text tokens:                 300020
+Total input vision tokens:               0
+Total generated tokens:                  41589
+Total generated tokens (retokenized):    41577
+Request throughput (req/s):              1.05
+Input token throughput (tok/s):          3925.47
+Output token throughput (tok/s):         544.15
+Peak output token throughput (tok/s):    752.00
+Peak concurrent requests:                19
+Total token throughput (tok/s):          4469.62
+Concurrency:                             13.95
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   13329.63
+Median E2E Latency (ms):                 14141.09
+---------------Time to First Token----------------
+Mean TTFT (ms):                          339.88
+Median TTFT (ms):                        252.75
+P99 TTFT (ms):                           906.54
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          25.37
+Median TPOT (ms):                        25.73
+P99 TPOT (ms):                           30.94
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           25.04
+Median ITL (ms):                         21.68
+P95 ITL (ms):                            22.69
+P99 ITL (ms):                            146.98
+Max ITL (ms):                            483.14
+==================================================
+```
+
+
+- High Concurrency
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.6 \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 320 \
+  --max-concurrency 64 \
+  --request-rate inf
+```
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 64
+Successful requests:                     320
+Benchmark duration (s):                  136.24
+Total input tokens:                      1273893
+Total input text tokens:                 1273893
+Total input vision tokens:               0
+Total generated tokens:                  169680
+Total generated tokens (retokenized):    169452
+Request throughput (req/s):              2.35
+Input token throughput (tok/s):          9350.32
+Output token throughput (tok/s):         1245.44
+Peak output token throughput (tok/s):    1984.00
+Peak concurrent requests:                69
+Total token throughput (tok/s):          10595.77
+Concurrency:                             58.46
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   24889.40
+Median E2E Latency (ms):                 25123.37
+---------------Time to First Token----------------
+Mean TTFT (ms):                          355.82
+Median TTFT (ms):                        268.84
+P99 TTFT (ms):                           858.64
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          46.62
+Median TPOT (ms):                        49.04
+P99 TPOT (ms):                           58.88
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           46.36
+Median ITL (ms):                         32.46
+P95 ITL (ms):                            135.23
+P99 ITL (ms):                            204.27
+Max ITL (ms):                            508.14
+==================================================
+```
+
+#### 5.1.5 Understanding the Results
+
+**Key Metrics:**
+
+- **Request Throughput (req/s)**: Number of requests processed per second
+- **Output Token Throughput (tok/s)**: Total tokens generated per second
+- **Mean TTFT (ms)**: Time to First Token - measures responsiveness
+- **Mean TPOT (ms)**: Time Per Output Token - measures generation speed
+- **Mean ITL (ms)**: Inter-Token Latency - measures streaming consistency
+
+**Why These Configurations Matter:**
+
+- **1K/1K (Chat)**: Represents the most common conversational AI workload. This is the highest priority scenario for most deployments.
+- **1K/8K (Reasoning)**: Tests long-form generation capabilities crucial for complex reasoning, code generation, and detailed explanations.
+- **8K/1K (Summarization)**: Evaluates performance with large context inputs, essential for RAG systems, document Q&A, and summarization tasks.
+- **Variable Concurrency**: Captures the Pareto frontier - the optimal tradeoff between throughput and latency at different load levels. Low concurrency shows best-case latency, high concurrency shows maximum throughput.
+
+**Interpreting Results:**
+
+- Compare your results against baseline numbers for your hardware
+- Higher throughput at same latency = better performance
+- Lower TTFT = more responsive user experience
+- Lower TPOT = faster generation speed
+
+### 5.2 Accuracy Benchmark
+
+Document model accuracy on standard benchmarks:
+
+#### 5.2.1 GSM8K Benchmark
+
+- Benchmark Command
+```bash Command
+python -m sglang.test.few_shot_gsm8k \
+  --num-questions 200 \
+  --port 30000
+```
+
+- Test Result
+```text Output
+Accuracy: 0.975
+Invalid: 0.000
+Latency: 16.574 s
+Output throughput: 1194.637 token/s
+```

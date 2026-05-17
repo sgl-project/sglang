@@ -18,6 +18,9 @@ from sglang.srt.distributed import (
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
+)
+from sglang.srt.distributed import get_moe_dp_group as _get_moe_dp_group
+from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -123,8 +126,8 @@ class _DpGatheredBufferWrapper:
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
-    def get_global_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
+    def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._global_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
@@ -133,8 +136,8 @@ class _DpGatheredBufferWrapper:
         return buffer
 
     @classmethod
-    def get_local_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
+    def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._local_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
@@ -190,12 +193,12 @@ def set_dp_buffer_len(
     )
 
 
-def get_global_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_global_dp_buffer()
+def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_global_dp_buffer(group=group)
 
 
-def get_local_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer()
+def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
 
 
 def get_global_dp_buffer_len() -> int:
@@ -248,7 +251,7 @@ def compute_dp_attention_world_info(
         # tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size + attn_tp_rank
         attn_dp_rank = tp_rank // (attn_tp_size * attn_cp_size)
 
-    return attn_tp_rank, attn_tp_size, attn_dp_rank
+    return attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size
 
 
 def compute_dp_attention_local_info(
@@ -284,7 +287,7 @@ def initialize_dp_attention(
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    _, _, _ATTN_DP_RANK = compute_dp_attention_world_info(
+    _, _, _ATTN_DP_RANK, _ = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
     _, _, _LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(
@@ -397,6 +400,23 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
         forward_batch.dp_local_num_tokens = local_num_tokens
 
     return forward_batch.dp_local_start_pos, forward_batch.dp_local_num_tokens
+
+
+def get_dp_local_slice_cpu(
+    forward_batch: ForwardBatch,
+    can_run_graph: bool,
+    cuda_graph_batch: Optional[int],
+) -> Tuple[int, int]:
+    # CPU (start, length) slice for DP-local data in a rank-padded buffer.
+    # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
+    global_num_tokens = forward_batch.global_num_tokens_cpu
+    dp_rank = get_attention_dp_rank()
+    local_num_tokens = global_num_tokens[dp_rank]
+    if can_run_graph:
+        local_start_pos = dp_rank * cuda_graph_batch
+    else:
+        local_start_pos = sum(global_num_tokens[:dp_rank])
+    return local_start_pos, local_num_tokens
 
 
 @triton.jit
@@ -578,6 +598,31 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attention_cp_group().all_gather_into_tensor(output, input)
+
+
+def get_moe_cp_group() -> GroupCoordinator:
+    """Returns the MOE_DP group, which includes CP partners when attn_cp_size > moe_dp_size."""
+    return _get_moe_dp_group()
+
+
+def get_moe_cp_rank() -> int:
+    return _get_moe_dp_group().rank_in_group
+
+
+def get_moe_cp_size() -> int:
+    return _get_moe_dp_group().world_size
+
+
+def is_enable_moe_cp_allgather() -> bool:
+    """True when moe_dp_size < attn_cp_size, requiring allgather across CP ranks before MoE."""
+    from sglang.srt.server_args import get_global_server_args
+
+    sa = get_global_server_args()
+    return sa.attn_cp_size > sa.moe_dp_size
+
+
+def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return _get_moe_dp_group().all_gather_into_tensor(output, input)
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):

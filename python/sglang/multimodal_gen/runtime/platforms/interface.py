@@ -63,6 +63,7 @@ class PlatformEnum(enum.Enum):
     MPS = enum.auto()
     NPU = enum.auto()
     MUSA = enum.auto()
+    XPU = enum.auto()
     OOT = enum.auto()
     UNSPECIFIED = enum.auto()
 
@@ -200,6 +201,11 @@ class Platform:
         return True
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def is_float64_supported(cls) -> bool:
+        return True
+
+    @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
         return None
 
@@ -208,20 +214,8 @@ class Platform:
         return None, None
 
     @classmethod
-    def has_modelopt_fp4_best_performance_kit(cls) -> bool:
-        return False
-
-    @classmethod
-    def can_use_modelopt_fp4_best_performance_kit(cls) -> bool:
-        return False
-
-    @classmethod
-    def should_use_modelopt_fp4_best_performance_kit(cls) -> bool:
-        return False
-
-    @classmethod
-    def warn_if_modelopt_fp4_best_performance_kit_missing(cls) -> None:
-        pass
+    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
+        return "auto"
 
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
@@ -290,6 +284,8 @@ class Platform:
             return torch.device("cuda", local_rank)
         elif self.is_npu():
             return torch.device("npu", local_rank)
+        elif self.is_xpu():
+            return torch.device("xpu", local_rank)
         elif self.is_musa():
             return torch.device("musa", local_rank)
         elif self.is_mps():
@@ -307,6 +303,10 @@ class Platform:
             return "mccl"
         elif self.is_mps():
             return "gloo"
+        elif self.is_cpu():
+            return "gloo"
+        elif self.is_xpu():
+            return "xccl"
         else:
             raise NotImplementedError(
                 "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"
