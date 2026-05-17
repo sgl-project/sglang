@@ -199,9 +199,6 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
-from sglang.srt.managers.scheduler_runtime_checker_mixin import (
-    SchedulerRuntimeCheckerMixin,
-)
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
@@ -361,7 +358,6 @@ class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
-    SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
@@ -3188,7 +3184,7 @@ class Scheduler(
         self.invariant_checker._check_tree_cache()
 
         # metrics every 30s
-        self._maybe_log_idle_metrics()
+        self.metrics_reporter._maybe_log_idle_metrics()
 
         # kv event publishing
         self.kv_events_publisher.publish_kv_events()
