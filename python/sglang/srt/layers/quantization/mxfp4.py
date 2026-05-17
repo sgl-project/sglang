@@ -168,9 +168,9 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         # This MXFP4 path uses StridedLayout and the non-persistent kernel.
         from triton_kernels.tensor_details.layout import StridedLayout
 
-        value_layout = StridedLayout
+        value_layout = StridedLayout(-2)
         value_layout_opts = {}
-        scale_layout = StridedLayout
+        scale_layout = StridedLayout(-2)
         scale_layout_opts = {}
         constraints = {
             "is_persistent": False,
