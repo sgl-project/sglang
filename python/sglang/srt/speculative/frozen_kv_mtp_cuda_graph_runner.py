@@ -46,9 +46,7 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     hidden_states: torch.Tensor
-    # Bonus token per request (last accepted target token). Consumed by the
-    # captured seed iteration that fronts the recurrent draft loop; see
-    # `FrozenKVMTPWorker.draft_forward`.
+    # Consumed by the captured seed iter; see `FrozenKVMTPWorker.draft_forward`.
     bonus_tokens: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -110,8 +108,6 @@ class FrozenKVMTPCudaGraphRunner:
                 (self.max_bs, frozen_kv_mtp_worker._recurrent_hidden_size),
                 dtype=self.model_runner.dtype,
             )
-            # One bonus token per request; the captured seed iter expands it to
-            # `expanded_bs = max_bs * topk` inside `draft_forward`.
             bonus_tokens = torch.zeros((self.max_bs,), dtype=torch.int64)
 
             if self.require_gathered_buffer:
@@ -359,9 +355,7 @@ class FrozenKVMTPCudaGraphRunner:
             buffers.mrope_positions[:, :raw_num_token].copy_(
                 forward_batch.mrope_positions
             )
-        # `bonus_tokens` + `hidden_states` (target h) seed the captured loop's
-        # first iter. `topk_p`/`topk_index` are produced internally by that
-        # seed iter and don't need to be copied in.
+        # `topk_p`/`topk_index` are produced by the captured seed iter.
         buffers.bonus_tokens[:raw_bs].copy_(forward_batch.spec_info.bonus_tokens)
         buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         buffers.req_pool_indices[:raw_expanded_bs].copy_(forward_batch.req_pool_indices)
@@ -393,13 +387,7 @@ class FrozenKVMTPCudaGraphRunner:
 
         self.raw_bs = raw_bs
         self.bs = bs
-        # Make the captured draft loop visible on the NVTX timeline. Today
-        # the graph bypasses `model_runner.forward`, so its
-        # `record_function("step[...]")` wrap never fires; without this
-        # explicit span the seed iter + N-1 model forwards show up as an
-        # unlabeled gap between `step[DRAFT_SEED ...]` (eager fallback path)
-        # and `step[TARGET_VERIFY ...]`. The span covers the entire captured
-        # graph replay, including the seed iter that used to be eager.
+        # NVTX span: the graph bypasses `model_runner.forward`'s record_function.
         span_name = f"step[DRAFT_LOOP raw_bs={raw_bs} bs={bs} topk={self.topk}]"
         if torch.autograd._profiler_enabled():
             with torch.profiler.record_function(span_name):

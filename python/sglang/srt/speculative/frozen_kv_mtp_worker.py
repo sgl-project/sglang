@@ -352,21 +352,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         mm_input_embeds: Optional[torch.Tensor] = None,
         draft_input: Optional[FrozenKVMTPDraftInput] = None,
     ) -> None:
-        """Stash seed inputs on ``batch.spec_info`` for the next draft iter.
-
-        Historically this ran a one-token assistant forward eagerly to (a)
-        emit the first draft token's topk distribution and (b) update the
-        recurrent hidden into the assistant's space. That forward is now
-        the first iteration of the captured draft cuda graph (see
-        ``FrozenKVMTPCudaGraphRunner`` and ``draft_forward``'s seed iter),
-        so this hook only has to pass the inputs forward.
-
-        ``seq_lens_cpu`` / ``mm_input_embeds`` / ``draft_input`` are kept
-        in the signature for caller compatibility; they are unused now.
-        ``mm_input_embeds`` in particular is dropped because the seed
-        consumes a single text bonus token, which the assistant resolves
-        via its own embedding lookup.
-        """
+        """Stash seed inputs on ``batch.spec_info``; the forward runs inside
+        the captured draft graph (see ``draft_forward``'s seed iter)."""
         del seq_lens_cpu, mm_input_embeds, draft_input
 
         if batch.forward_mode.is_idle() or last_token_ids.numel() == 0:
@@ -382,14 +369,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         stashed = FrozenKVMTPDraftInput()
         stashed.bonus_tokens = last_token_ids.to(torch.int64)
         stashed.hidden_states = last_hidden_states
-        # `EagleDraftInput.filter_batch` / `merge_batch` (inherited) slice and
-        # concatenate `topk_p` / `topk_index` whenever requests join or leave
-        # the running batch. Pre-Option-A the eager seed step populated these
-        # via `_capture_for_decode`; now that the seed runs inside the captured
-        # cuda graph, the values are produced after `replay()` -- but the
-        # scheduler still touches them between iters, so we need real-shaped
-        # tensors here. Zeros are fine; the captured seed iter overwrites them
-        # before any downstream code reads them.
+        # Real-shaped zeros so inherited `filter_batch`/`merge_batch` can slice
+        # them between iters; overwritten by the captured seed iter.
         bs = last_token_ids.shape[0]
         device = last_token_ids.device
         stashed.topk_p = torch.zeros(
@@ -642,28 +623,14 @@ class FrozenKVMTPWorker(TpModelWorker):
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
 
-        # The seed iter + N-1 draft model forwards all run at the same
-        # `seq_lens - 1` rope position (see `set_frozen_kv_positions`'s
-        # "Rope phase = last written target slot, not advanced per draft
-        # step." docstring), so a single attention init covers the whole
-        # captured loop. The seed iter always runs at least one
-        # `model.forward`, so attention metadata must be initialized even
-        # when `speculative_num_steps == 1` (which was the previous gate).
+        # Seed + recurrent iters share the same `seq_lens - 1` rope position,
+        # so one init covers the loop. Must run even at num_steps == 1.
         if not skip_attn_backend_init:
             self._init_frozen_kv_metadata(forward_batch)
 
-        # === Seed iteration ===========================================
-        # Absorbs the previously-eager `_run_assistant_seed_step`. Runs the
-        # assistant once on (bonus_token, target_h) to convert the target's
-        # hidden state into the assistant's recurrent space and emit the
-        # first draft token's topk distribution. The result feeds the
-        # existing N-step recurrent loop as iter 0's `(topk_p, topk_index,
-        # hidden_states)`.
-        #
-        # Topk>1: replicate the per-req bonus token / target hidden out to
-        # `bs*topk` so kernel shapes match the rest of the captured loop,
-        # then slice the duplicated rows back down to per-req before
-        # softmax. Topk==1 makes the replicate/slice a no-op.
+        # Seed iter: assistant forward on (bonus_token, target_h) to produce
+        # iter-0 `(topk_p, topk_index, hidden_states)`. For topk>1, replicate
+        # to `bs*topk` to match kernel shapes, then slice back per-req.
         bonus_tokens = spec_info.bonus_tokens
         target_hidden = spec_info.hidden_states
         if self.topk > 1:
@@ -703,7 +670,6 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
         hidden_states = seed_hidden_per_req
 
-        # === Recurrent draft loop =====================================
         scores = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
