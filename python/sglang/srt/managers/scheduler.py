@@ -651,9 +651,7 @@ class Scheduler(
             server_args=self.server_args,
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
-            stream_output=lambda *a, **kw: self.stream_output(
-                self.output_streamer, *a, **kw
-            ),
+            stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_forward_mode=lambda: (
                 self.last_batch.forward_mode if self.last_batch is not None else None
             ),
@@ -1930,7 +1928,7 @@ class Scheduler(
                         abort_info={"reason": error_msg}
                     )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-                    self.stream_output(self.output_streamer, [req], req.return_logprob)
+                    self.output_streamer.stream_output([req], req.return_logprob)
                     return
 
         elif (
