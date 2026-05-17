@@ -37,6 +37,71 @@ response = requests.post(url + "/v1/embeddings", json=payload).json()
 print("Embedding:", response["data"][0]["embedding"])
 ```
 
+### Smoke Benchmark
+
+Use `bench_serving` with the `sglang-embedding` backend to benchmark the
+OpenAI-compatible `/v1/embeddings` endpoint. The benchmark reports successful
+requests, benchmark duration, total input tokens, request throughput, input
+token throughput, peak concurrent requests, concurrency, and end-to-end latency
+percentiles. Embedding requests do not generate output tokens, so generation
+throughput metrics are omitted.
+
+Start an embedding server:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3-Embedding-0.6B \
+  --is-embedding \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+Run a synthetic random-text smoke benchmark against `/v1/embeddings`. The
+`random-ids` dataset avoids downloading ShareGPT data:
+
+```bash
+python3 -m sglang.bench_serving \
+  --backend sglang-embedding \
+  --dataset-name random-ids \
+  --model Qwen/Qwen3-Embedding-0.6B \
+  --num-prompts 100 \
+  --random-input-len 128 \
+  --random-output-len 0 \
+  --request-rate inf \
+  --max-concurrency 16 \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+You can also use the small usage wrapper to validate or print the same commands
+without loading a model:
+
+```bash
+python3 -m sglang.bench_embedding_serving --dry-run
+```
+
+To run the benchmark through the wrapper against an already running server:
+
+```bash
+python3 -m sglang.bench_embedding_serving \
+  --run-benchmark \
+  --num-prompts 100 \
+  --random-input-len 128 \
+  --max-concurrency 16
+```
+
+To let the wrapper launch and stop the server around the benchmark, add
+`--launch-server`. Extra server arguments can be passed after `--`:
+
+```bash
+python3 -m sglang.bench_embedding_serving \
+  --run-benchmark \
+  --launch-server \
+  --model-path Qwen/Qwen3-Embedding-0.6B \
+  --num-prompts 100 \
+  -- --trust-remote-code
+```
+
 
 ## Multimodal Embedding Example
 
