@@ -230,7 +230,7 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
-                batch = self.maybe_prepare_mlp_sync_batch(batch)
+                batch = self.maybe_prepare_mlp_sync_batch(self.dp_attn_adapter, batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
