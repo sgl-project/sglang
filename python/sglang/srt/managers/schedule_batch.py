@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import is_pin_memory_available
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -2120,22 +2120,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_spec_v2:
             return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 
+        return self._new_tokens_required_next_decode_spec_v1(requests, page_size)
+
+    def _new_tokens_required_next_decode_spec_v1(self, requests, page_size):
+        """Per-req exact estimate matching eagle_worker.draft alloc shape.
+
+        Topk > 1 branches each take their own page-aligned chunk
+        (ceil((last_page + len_per_topk) / ps) pages); verify phase allocs
+        one contiguous spec_tokens block. Budget reserves max of the two.
+        """
         server_args = get_global_server_args()
         len_per_topk = server_args.speculative_num_steps or 1
         spec_topk = server_args.speculative_eagle_topk or 1
         spec_tokens = server_args.speculative_num_draft_tokens
 
-        if page_size > 1 and spec_topk > 1:
-            # last partial page and ceil alignment
-            len_per_topk = ceil_align(len_per_topk + page_size, page_size)
-            spec_tokens = ceil_align(spec_tokens, page_size)
-        elif page_size > 1:
-            # only page alignment
-            len_per_topk = ceil_align(len_per_topk, page_size)
-            spec_tokens = ceil_align(spec_tokens, page_size)
-
-        num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
-        return num_tokens
+        total = 0
+        for r in requests:
+            if page_size > 1 and spec_topk > 1:
+                last_page = r.kv_allocated_len % page_size
+                branch_pages = (last_page + len_per_topk + page_size - 1) // page_size
+                n_topk = spec_topk * branch_pages * page_size - last_page
+            else:
+                n_topk = len_per_topk * spec_topk
+            n = max(n_topk, spec_tokens)
+            total += new_tokens_for_alloc(r.kv_allocated_len, n, page_size)
+        return total
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_info_v2.prepare_for_decode allocation."""
