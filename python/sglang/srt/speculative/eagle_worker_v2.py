@@ -588,11 +588,8 @@ class EagleDraftWorker(BaseDraftWorker):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
-        forward_batch = ForwardBatch.init_new(
-            batch,
-            self.draft_runner,
-            capture_hidden_mode=capture_hidden_mode,
-        )
+        batch.capture_hidden_mode = capture_hidden_mode
+        forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
@@ -792,9 +789,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
-            batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
-            )
+            batch.capture_hidden_mode = target_capture_mode
+            batch_output = self.target_worker.forward_batch_generation(batch)
 
             # Draft prefill
             with (

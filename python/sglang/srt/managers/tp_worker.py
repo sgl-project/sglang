@@ -54,7 +54,6 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
-    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
@@ -210,14 +209,8 @@ class BaseTpWorker(ABC):
         )
         return result
 
-    def forward_batch_embedding(
-        self,
-        batch: ScheduleBatch,
-        seq_lens_cpu_cache: Optional[torch.Tensor] = None,
-    ):
-        forward_batch = ForwardBatch.init_new(
-            batch, self.model_runner, seq_lens_cpu_cache=seq_lens_cpu_cache
-        )
+    def forward_batch_embedding(self, batch: ScheduleBatch):
+        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         output = self.model_runner.forward(forward_batch).logits_output
         return output  # Returns EmbeddingPoolerOutput
 
@@ -458,9 +451,6 @@ class TpModelWorker(BaseTpWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
-        seq_lens_cpu_cache: Optional[torch.Tensor] = None,
-        capture_hidden_mode: Optional["CaptureHiddenMode"] = None,
-        return_hidden_states_before_norm: bool = False,
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
@@ -470,14 +460,7 @@ class TpModelWorker(BaseTpWorker):
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
-            forward_batch = ForwardBatch.init_new(
-                batch,
-                self.model_runner,
-                seq_lens_cpu_cache=seq_lens_cpu_cache,
-                capture_hidden_mode=capture_hidden_mode,
-            )
-            if return_hidden_states_before_norm:
-                forward_batch.return_hidden_states_before_norm = True
+            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -559,7 +542,6 @@ class TpModelWorker(BaseTpWorker):
         if batch.split_index == 0:
             forward_batch = ForwardBatch.init_new(batch, self.model_runner)
             batch.split_forward_batch = forward_batch
-            batch.seq_lens_cpu_cache = forward_batch.seq_lens_cpu
 
         out = self.model_runner.forward(
             batch.split_forward_batch, split_forward_count=batch.split_forward_count

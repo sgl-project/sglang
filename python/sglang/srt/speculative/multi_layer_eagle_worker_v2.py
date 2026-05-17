@@ -401,12 +401,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             draft_capture_hidden_mode = CaptureHiddenMode.LAST
 
         # Run forward
-        forward_batch = ForwardBatch.init_new(
-            batch,
-            self.draft_runner_list[0],
-            capture_hidden_mode=draft_capture_hidden_mode,
-        )
-        forward_batch.return_hidden_states_before_norm = True
+        batch.capture_hidden_mode = draft_capture_hidden_mode
+        batch.return_hidden_states_before_norm = True
+        forward_batch = ForwardBatch.init_new(batch, self.draft_runner_list[0])
 
         # Construct input_ids
         if not batch.forward_mode.is_idle():
@@ -678,9 +675,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
-            batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
-            )
+            batch.capture_hidden_mode = target_capture_mode
+            batch_output = self.target_worker.forward_batch_generation(batch)
 
             # Chain-style MTP needs FULL to get all-token hidden states;
             # non-chain only needs LAST (the target model's hidden states).

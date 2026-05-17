@@ -588,9 +588,8 @@ class EAGLEWorker(TpModelWorker):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.FULL
         )
-        batch_result = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=capture_mode
-        )
+        batch.capture_hidden_mode = capture_mode
+        batch_result = self.target_worker.forward_batch_generation(batch)
         logits_output, next_token_ids = (
             batch_result.logits_output,
             batch_result.next_token_ids,
@@ -949,10 +948,9 @@ class EAGLEWorker(TpModelWorker):
             ).cpu()
 
         # Forward
+        batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
         batch_result = self.target_worker.forward_batch_generation(
-            batch,
-            is_verify=True,
-            seq_lens_cpu_cache=spec_info.seq_lens_cpu,
+            batch, is_verify=True
         )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
@@ -1130,9 +1128,8 @@ class EAGLEWorker(TpModelWorker):
             else CaptureHiddenMode.LAST
         )
         batch.spec_info.capture_hidden_mode = capture_mode
-        forward_batch = ForwardBatch.init_new(
-            batch, self.draft_model_runner, seq_lens_cpu_cache=seq_lens_cpu
-        )
+        batch.seq_lens_cpu_cache = seq_lens_cpu
+        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds

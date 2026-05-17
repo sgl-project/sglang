@@ -99,9 +99,6 @@ class MlxTpModelWorker(TpModelWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
-        seq_lens_cpu_cache: Optional[torch.Tensor] = None,
-        capture_hidden_mode=None,
-        return_hidden_states_before_norm: bool = False,
     ) -> GenerationBatchResult:
         """Override to route through MLX model runner."""
         if batch is not None:
@@ -115,9 +112,6 @@ class MlxTpModelWorker(TpModelWorker):
             pp_proxy_tensors,
             is_verify,
             skip_attn_backend_init,
-            seq_lens_cpu_cache=seq_lens_cpu_cache,
-            capture_hidden_mode=capture_hidden_mode,
-            return_hidden_states_before_norm=return_hidden_states_before_norm,
         )
 
     def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:

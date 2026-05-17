@@ -444,11 +444,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         cls,
         batch: ScheduleBatch,
         model_runner: ModelRunner,
-        seq_lens_cpu_cache: Optional[torch.Tensor] = None,
-        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ):
-        # Resolve capture_hidden_mode: explicit override wins, else derive from
-        # SB.return_hidden_states / spec_info.capture_hidden_mode.
+        # Consume one-shot per-forward overrides from SB; reset to defaults so
+        # the next forward on the same SB starts clean. See SB field comment
+        # for the contract.
+        capture_hidden_mode = batch.capture_hidden_mode
+        batch.capture_hidden_mode = None
+        seq_lens_cpu_cache = batch.seq_lens_cpu_cache
+        batch.seq_lens_cpu_cache = None
+        return_hidden_states_before_norm = batch.return_hidden_states_before_norm
+        batch.return_hidden_states_before_norm = False
+
+        # capture_hidden_mode default: derive from SB.return_hidden_states /
+        # spec_info.capture_hidden_mode when caller did not override.
         if capture_hidden_mode is None:
             if batch.return_hidden_states:
                 capture_hidden_mode = CaptureHiddenMode.FULL
@@ -478,9 +486,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # ScheduleBatch.sampling_info is already swapped to the forward-only
         # copy by Scheduler.run_batch under overlap mode (see save/restore
         # block there). Use it directly.
-        seq_lens_cpu = (
-            seq_lens_cpu_cache if seq_lens_cpu_cache is not None else batch.seq_lens_cpu
-        )
+        if seq_lens_cpu_cache is not None:
+            # Stale-cache guard: shape must match current GPU seq_lens. Mismatch
+            # means caller forgot to refresh the override after batch size
+            # changed (e.g. filter/merge_batch); using a stale cache would
+            # propagate wrong CPU mirror to downstream DP / cudagraph logic.
+            assert seq_lens_cpu_cache.shape == batch.seq_lens.shape, (
+                f"seq_lens_cpu_cache shape {seq_lens_cpu_cache.shape} != "
+                f"seq_lens {batch.seq_lens.shape}; stale override on batch?"
+            )
+            seq_lens_cpu = seq_lens_cpu_cache
+        else:
+            seq_lens_cpu = batch.seq_lens_cpu
 
         ret = cls(
             forward_mode=batch.forward_mode,
@@ -524,6 +541,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
+            return_hidden_states_before_norm=return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device

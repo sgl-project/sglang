@@ -1119,9 +1119,8 @@ class DFlashWorker:
             )
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            batch_result = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=CaptureHiddenMode.FULL, **kwargs
-            )
+            batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            batch_result = self.target_worker.forward_batch_generation(batch, **kwargs)
             logits_output, next_token_ids = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
