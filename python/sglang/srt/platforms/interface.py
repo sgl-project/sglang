@@ -7,7 +7,7 @@ and adds SRT-specific subsystem factory methods, capability flags, and
 configuration lifecycle hooks.
 
 Out-of-tree platforms register via setuptools entry_points under the
-"sglang.platform_plugins" group and should subclass SRTPlatform.
+"sglang.srt.platforms" group and should subclass SRTPlatform.
 """
 
 from __future__ import annotations
