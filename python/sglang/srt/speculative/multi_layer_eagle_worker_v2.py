@@ -810,17 +810,14 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
-        # Construct the next draft input. The `_keep_alive_for_verify_forward`
-        # field anchors verify_forward_batch (and transitively the verify-time
-        # GPU tensors like draft_token / out_cache_loc) so they survive the
-        # imminent batch.input_ids rebind in prepare_for_extend_to_fill_draft_kvcache
-        # until the next iter's verify_done.synchronize() in filter_batch.
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
-            _keep_alive_for_verify_forward=verify_forward_batch,
         )
+        # verify_forward_batch transitively holds verify-time GPU tensors that
+        # must outlive the imminent batch.input_ids rebind; scheduler pins it
+        # in batch_record_buf via extra_keep_alive_refs. See EAGLEWorkerV2.verify.
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
@@ -830,6 +827,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_lens=accept_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
+            extra_keep_alive_refs=[verify_forward_batch],
         )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):

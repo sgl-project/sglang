@@ -3003,7 +3003,9 @@ class Scheduler(
             getattr(batch, f.name, None) for f in dataclasses.fields(batch)
         ]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
-        self.batch_record_buf[self.batch_record_ct] = (batch, attr_snapshot)
+        # List (not tuple) so that workers can register additional refs via
+        # GenerationBatchResult.extra_keep_alive_refs after forward returns.
+        self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
 
     @contextmanager
     def _overlap_forward_isolation(self, batch: ScheduleBatch):
@@ -3077,6 +3079,13 @@ class Scheduler(
                         self.future_map.resolve_future(batch)
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(batch)
+                        # Park any refs the worker wants kept alive 2 iters
+                        # (cross-stream tensor lifetime; pinned in the same
+                        # ring slot as the SB attr snapshot).
+                        if batch_result.extra_keep_alive_refs:
+                            self.batch_record_buf[self.batch_record_ct].extend(
+                                batch_result.extra_keep_alive_refs
+                            )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
