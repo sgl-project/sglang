@@ -158,6 +158,11 @@ class TestPythonicDetector(CustomTestCase):
             self.detector._find_matching_bracket("[outer [inner] end]", 0), 18
         )
 
+    def test_find_matching_bracket_in_string(self):
+        # Note: The current implementation is not string-aware and will fail this test
+        text = '[func(arg="]")]'
+        self.assertEqual(self.detector._find_matching_bracket(text, 0), 14)
+
     def test_find_matching_bracket_no_match(self):
         self.assertEqual(self.detector._find_matching_bracket("[abc", 0), -1)
 
