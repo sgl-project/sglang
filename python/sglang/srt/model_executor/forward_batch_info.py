@@ -633,7 +633,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
         if model_runner.use_ngram_embedding:
-            ret._init_ngram_embedding_info(batch, model_runner, device)
+            ret._init_ngram_embedding_info(batch, device)
 
         if model_runner.model_is_mrope:
             if (
@@ -734,9 +734,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.contains_image_inputs()
         )
 
-    def _init_ngram_embedding_info(
-        self, batch: ScheduleBatch, model_runner: ModelRunner, device: torch.device
-    ):
+    def _init_ngram_embedding_info(self, batch: ScheduleBatch, device: torch.device):
         if self.forward_mode.is_decode():
             column_starts, req_lens = self.seq_lens - 1, 1
         else:
