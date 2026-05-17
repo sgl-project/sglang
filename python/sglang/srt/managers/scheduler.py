@@ -3707,18 +3707,6 @@ class Scheduler(
         pass
 
 
-def is_work_request(recv_req):
-    return isinstance(
-        recv_req,
-        (
-            TokenizedGenerateReqInput,
-            TokenizedEmbeddingReqInput,
-            BatchTokenizedGenerateReqInput,
-            BatchTokenizedEmbeddingReqInput,
-        ),
-    )
-
-
 def dispatch_event_loop(scheduler: Scheduler):
     # Dispatch to the appropriate event loop based on the disaggregation mode
     server_args = scheduler.server_args
