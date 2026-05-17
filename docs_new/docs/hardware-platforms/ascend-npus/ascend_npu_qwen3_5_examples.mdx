@@ -7,13 +7,13 @@ metatags:
 
 ### Installation
 
-The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the quay.io platform. You can directly pull it.
+The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the online platform. You can directly pull it.
 
 ```bash Command
 #Atlas 800 A3
-docker pull quay.io/ascend/sglang:main-cann8.5.0-a3
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-a3
 #Atlas 800 A2
-docker pull quay.io/ascend/sglang:main-cann8.5.0-910b
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-910b
 
 #start container
 docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
@@ -42,7 +42,7 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:${tag}
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${tag}
 ```
 
 ## Deployment
@@ -52,6 +52,10 @@ quay.io/ascend/sglang:${tag}
 Run the following script to execute online inference.
 
 #### Qwen3.5 397B
+
+<Tip>
+Recommended model: `Eco-Tech/Qwen3.5-397B-A17B-w8a8-mtp`
+</Tip>
 
 ```bash Command
 # high performance cpu
@@ -97,6 +101,10 @@ python3 -m sglang.launch_server \
 
 #### Qwen3.5 122B
 
+<Tip>
+Recommended model: `Eco-Tech/Qwen3.5-122B-A10B-w8a8-mtp`
+</Tip>
+
 ```bash Command
 # high performance cpu
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
@@ -141,6 +149,10 @@ python3 -m sglang.launch_server \
 
 #### Qwen3.5 35B
 
+<Tip>
+Recommended model: `Eco-Tech/Qwen3.5-35B-A3B-w8a8-mtp`
+</Tip>
+
 ```bash Command
 # high performance cpu
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
@@ -184,6 +196,10 @@ python3 -m sglang.launch_server \
 ```
 
 #### Qwen3.5 27B
+
+<Tip>
+Recommended model: `Eco-Tech/Qwen3.5-27B-w8a8-mtp`
+</Tip>
 
 ```bash Command
 # high performance cpu
