@@ -68,6 +68,18 @@ impl Default for ServiceDiscoveryConfig {
     }
 }
 
+impl ServiceDiscoveryConfig {
+    pub fn warn_if_misconfigured(&self) {
+        if self.pd_mode && !self.igw_mode && !self.selector.is_empty() {
+            warn!(
+                "--selector is set in PD mode without IGW mode enabled; \
+                regular worker discovery alongside PD workers requires IGW mode, \
+                selector will be ignored"
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PodType {
     Prefill,
@@ -102,8 +114,10 @@ impl PodInfo {
     pub fn should_include(pod: &Pod, config: &ServiceDiscoveryConfig) -> bool {
         if config.pd_mode {
             if config.prefill_selector.is_empty() && config.decode_selector.is_empty() {
-                warn!("PD mode enabled but both prefill_selector and decode_selector are empty");
-                return false;
+                if !(config.igw_mode && !config.selector.is_empty()) {
+                    warn!("PD mode enabled but both prefill_selector and decode_selector are empty");
+                    return false;
+                }
             }
             let matches_pd = Self::matches_selector(pod, &config.prefill_selector)
                 || Self::matches_selector(pod, &config.decode_selector);

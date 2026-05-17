@@ -1091,15 +1091,7 @@ impl CliArgs {
 
             let selector = Self::parse_selector(&self.selector);
 
-            if self.pd_disaggregation && !self.enable_igw && !selector.is_empty() {
-                tracing::warn!(
-                    "--selector is set in PD mode without --enable-igw; \
-                    regular worker discovery alongside PD workers requires IGW mode, \
-                    selector will be ignored"
-                );
-            }
-
-            Some(ServiceDiscoveryConfig {
+            let service_discovery_config = ServiceDiscoveryConfig {
                 enabled: true,
                 selector,
                 check_interval: std::time::Duration::from_secs(60),
@@ -1112,7 +1104,9 @@ impl CliArgs {
                 router_selector,
                 router_mesh_port_annotation,
                 igw_mode: self.enable_igw,
-            })
+            };
+            service_discovery_config.warn_if_misconfigured();
+            Some(service_discovery_config)
         } else {
             None
         };
