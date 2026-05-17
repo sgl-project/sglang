@@ -2545,11 +2545,24 @@ class Scheduler(
             if self.dllm_config is not None and self.last_batch.reqs:
                 chunked_req_to_exclude.update(self.last_batch.reqs)
 
-            # Filter batch
+            # Filter last_batch before merging it into running_batch. We drop
+            # finished reqs, chunked reqs, AND prefill-only reqs (e.g.
+            # /v1/score). Prefill-only reqs need exactly one forward pass —
+            # their result is processed through the result_queue snapshot, so
+            # they must not be merged into running_batch where they would
+            # otherwise leak into a later decode step. This is visible under
+            # --enable-mis when /v1/score and /generate run concurrently.
             last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            keep_indices = [
+                i
+                for i in range(len(self.last_batch.reqs))
+                if (
+                    not self.last_batch.reqs[i].finished()
+                    and self.last_batch.reqs[i] not in chunked_req_to_exclude
+                    and not self.last_batch.reqs[i].is_prefill_only
+                )
+            ]
+            self.last_batch.filter_batch(keep_indices=keep_indices)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -2729,10 +2742,23 @@ class Scheduler(
                     self.running_batch.reqs,
                 )
 
+        # Under --enable-mis, the MIS attention/logits paths require a homogeneous
+        # batch: either every req is MIS-structured (delimiter indices populated)
+        # or none are. The head of the waiting queue picks the type for this
+        # iteration; reqs of the other type stay in the queue for the next pass.
+        batch_is_mis: Optional[bool] = None
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
+
+            if self.server_args.enable_mis:
+                req_is_mis = req.multi_item_delimiter_indices is not None
+                if batch_is_mis is None:
+                    batch_is_mis = req_is_mis
+                elif batch_is_mis != req_is_mis:
+                    continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):

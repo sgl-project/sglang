@@ -595,5 +595,76 @@ class TestMultiItemScoringClassificationAdvanced(CustomTestCase):
                     )
 
 
+class TestMultiItemScoringMixedWithGenerate(CustomTestCase):
+    """Regression for sgl-project/sglang#25414.
+
+    Mixing /v1/score (prefill-only MIS) and /generate (decoding) requests
+    concurrently under --enable-mis used to crash the scheduler with
+    `AssertionError: MIS batch must have delimiter indices on every
+    request`. The fix partitions the prefill batch by MIS-ness and excludes
+    prefill-only reqs from running_batch so they cannot leak into decode.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = Engine(
+            model_path=TEST_MODEL_NAME,
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+            enable_mis=True,
+            attention_backend="flashinfer",
+            mem_fraction_static=0.15,
+            log_level="error",
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.engine is not None:
+            cls.engine.shutdown()
+        torch.cuda.empty_cache()
+
+    def test_mixed_concurrent_score_and_generate(self):
+        score_query = "Rate each option:"
+        score_items = ["alpha", "beta", "gamma"]
+        score_labels = [9454, 2753]
+
+        gen_prompts = [f"The number {i} in words is" for i in range(8)]
+
+        async def _run():
+            tasks = []
+            for _ in range(8):
+                tasks.append(
+                    self.engine.async_score(
+                        query=score_query,
+                        items=score_items,
+                        label_token_ids=score_labels,
+                        apply_softmax=True,
+                    )
+                )
+            for prompt in gen_prompts:
+                tasks.append(
+                    self.engine.async_generate(
+                        prompt=prompt,
+                        sampling_params={"max_new_tokens": 8, "temperature": 0},
+                    )
+                )
+            return await asyncio.gather(*tasks)
+
+        results = self.engine.loop.run_until_complete(_run())
+
+        score_results = results[:8]
+        gen_results = results[8:]
+
+        for r in score_results:
+            self.assertEqual(len(r.scores), len(score_items))
+            for sl in r.scores:
+                self.assertEqual(len(sl), len(score_labels))
+                self.assertAlmostEqual(sum(sl), 1.0, places=5)
+
+        for r in gen_results:
+            self.assertGreater(len(r["text"]), 0)
+            self.assertEqual(r["meta_info"]["completion_tokens"], 8)
+
+
 if __name__ == "__main__":
     unittest.main()
