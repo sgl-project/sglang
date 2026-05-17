@@ -1,12 +1,9 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
-
-register_cuda_ci(est_time=120, suite="stage-b-test-large-1-gpu")
 
 GRANITE_MOE_HYBRID_MODEL = "ibm-granite/granite-4.0-h-micro"
 
