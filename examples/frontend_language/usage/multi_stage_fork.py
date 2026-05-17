@@ -25,6 +25,7 @@ import argparse
 import time
 
 import requests
+
 import sglang as sgl
 
 # Stub data — publicly-known chipmaker facts. In production, load from a fundamentals pipeline.
