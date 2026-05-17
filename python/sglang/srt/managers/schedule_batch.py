@@ -70,6 +70,7 @@ from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
     evict_from_tree_cache,
+    new_tokens_for_alloc,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -2144,9 +2145,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         total = 0
         for r in requests:
             x = max(0, r.kv_committed_len + 2 * alloc_len - r.kv_allocated_len)
-            cur = r.kv_allocated_len
-            nxt = cur + x
-            total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
+            total += new_tokens_for_alloc(r.kv_allocated_len, x, page_size)
         return total
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):

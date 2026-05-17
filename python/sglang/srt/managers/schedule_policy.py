@@ -560,9 +560,6 @@ class PrefillAdder:
             alloc = extend_input_len
         return max(alloc, self.tree_cache.sliding_window_size) + self.page_size
 
-    def ceil_paged_tokens(self, tokens: int) -> int:
-        return -(-tokens // self.page_size) * self.page_size
-
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
