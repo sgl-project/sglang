@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.common import new_tokens_for_alloc
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -584,13 +585,14 @@ class PrefillAdder:
     def _update_prefill_budget(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
     ):
-        # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
-        extend_input_len = self.ceil_paged_tokens(extend_input_len)
-
-        # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
-        page_overhead = self.page_size
-        self.rem_total_token_offset += extend_input_len + max_new_tokens + page_overhead
-        self.cur_rem_token_offset += extend_input_len + page_overhead
+        new_extend_tokens = new_tokens_for_alloc(
+            prefix_len, extend_input_len, self.page_size
+        )
+        new_full_tokens = new_tokens_for_alloc(
+            prefix_len, extend_input_len + max_new_tokens, self.page_size
+        )
+        self.rem_total_token_offset += new_full_tokens
+        self.cur_rem_token_offset += new_extend_tokens
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
