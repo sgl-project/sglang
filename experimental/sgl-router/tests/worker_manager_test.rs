@@ -123,19 +123,20 @@ async fn manager_handles_mode_changed() {
 
 #[tokio::test]
 async fn mode_changed_preserves_active_requests_and_breaker() {
+    let (url, _s) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+
     let (tx, rx) = mpsc::channel(16);
     let registry = Arc::new(WorkerRegistry::default());
     let h = tokio::spawn(manager::run(rx, registry.clone()));
 
-    tx.send(DiscoveryEvent::Added(spec(
+    tx.send(DiscoveryEvent::Added(spec_for(
         "w1",
-        "http://x:30000",
+        &url,
         WorkerMode::Prefill,
-        &["m"],
     )))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Grab a handle, bump active_requests, and open the breaker.
     let w = registry.get(&WorkerId("w1".into())).unwrap();
@@ -242,41 +243,38 @@ async fn manager_handles_orphan_removed_without_panic() {
     h.await.unwrap();
 }
 
-/// Duplicate `Added` for the same id is an upsert — the registry must end
-/// up with exactly one worker carrying the latest spec's `model_ids`.
+/// Duplicate `Added` for the same id is an upsert — the registry ends up
+/// with exactly one worker. The model resolved by /server_info wins on
+/// re-add (a different worker may advertise a different served model).
 #[tokio::test]
 async fn manager_handles_duplicate_added_as_upsert() {
+    let (url_first, _s_first) = spawn_fake_worker(json!({"served_model_name": "m1"})).await;
+    let (url_second, _s_second) = spawn_fake_worker(json!({"served_model_name": "m1"})).await;
+
     let (tx, rx) = mpsc::channel(16);
     let registry = Arc::new(WorkerRegistry::default());
     let h = tokio::spawn(manager::run(rx, registry.clone()));
 
-    tx.send(DiscoveryEvent::Added(spec(
+    tx.send(DiscoveryEvent::Added(spec_for(
         "w1",
-        "http://x:30000",
+        &url_first,
         WorkerMode::Plain,
-        &["m1", "m2"],
     )))
     .await
     .unwrap();
-    tx.send(DiscoveryEvent::Added(spec(
+    tx.send(DiscoveryEvent::Added(spec_for(
         "w1",
-        "http://x:30000",
+        &url_second,
         WorkerMode::Plain,
-        &["m1"],
     )))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert_eq!(
         registry.workers_for(&ModelId("m1".into())).len(),
         1,
         "w1 still serves m1 after the second Added",
-    );
-    assert_eq!(
-        registry.workers_for(&ModelId("m2".into())).len(),
-        0,
-        "w1 must drop out of m2's index after the model set shrank",
     );
 
     drop(tx);

@@ -79,10 +79,15 @@ async fn main() -> Result<()> {
     let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
         .await
         .context("spawn discovery")?;
+    // KV-event index is None until a cache-aware policy ships (M4); when
+    // enabled, replace with `Some(KvEventIndex::new())` and the manager
+    // will subscribe/unsubscribe on every Added/Removed.
+    let kv_index: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> = None;
     let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config(
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
+        kv_index,
     ));
 
     let proxy = Arc::new(

@@ -16,12 +16,14 @@
 
 pub mod discovery;
 pub mod hash;
+pub mod index;
 pub mod subscriber;
 pub mod tree;
 pub mod wire;
 
 pub use discovery::{fetch_event_config, EventConfig};
 pub use hash::{compute_block_hashes, sha256_to_i64};
+pub use index::KvEventIndex;
 pub use subscriber::{KvEventSubscriberRegistry, WorkerEvent};
 pub use tree::{HashTree, KvWorkerId, MatchResult};
 pub use wire::{
