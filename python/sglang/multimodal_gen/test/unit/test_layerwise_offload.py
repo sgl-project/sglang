@@ -113,6 +113,32 @@ class _SharedBufferModel(torch.nn.Module):
         )
 
 
+class _OrderedLinearLayer(torch.nn.Module):
+    def __init__(self, scale: float) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.eye(2, dtype=torch.float32) * scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self.weight
+
+
+class _ReverseLayerwiseModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(
+            [
+                _OrderedLinearLayer(2.0),
+                _OrderedLinearLayer(3.0),
+                _OrderedLinearLayer(5.0),
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in reversed(self.blocks):
+            x = block(x)
+        return x
+
+
 class _NestedEncoderDummyModel(_NestedDummyModel):
     layerwise_offload_dit_group_enabled = False
 
@@ -206,6 +232,28 @@ def test_layerwise_offload_keeps_shared_buffers_resident(monkeypatch):
     cache = model.blocks[1].shared.cache
     assert torch.equal(cache, original_cache)
     assert torch.equal(cache.index_select(0, torch.tensor([2])), original_cache[2:3])
+
+
+def test_layerwise_offload_loads_current_layer_for_reverse_execution(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _ReverseLayerwiseModel()
+    x = torch.ones(1, 2, dtype=torch.float32)
+    expected = model(x)
+
+    LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=3,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+
+    assert torch.equal(model(x), expected)
 
 
 def test_modelopt_fp8_adapter_keeps_layerwise_offload_enabled():

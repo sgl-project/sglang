@@ -515,9 +515,11 @@ class LayerwiseOffloadManager:
 
         def make_pre_hook(i):
             def hook(module, input):
-                # wait only for the current layer if it's being prefetched
                 if i == 0:
                     self.prepare_for_next_req(non_blocking=False)
+                if i not in self._gpu_layers:
+                    # some models execute ModuleList entries in reverse or custom order
+                    self.prefetch_layer(i, non_blocking=False)
                 if i in self._prefetch_events:
                     torch.get_device_module().current_stream().wait_event(
                         self._prefetch_events[i]
