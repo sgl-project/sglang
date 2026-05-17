@@ -187,7 +187,7 @@ def _generate_maybe_interleaved(
                     temperature=sampling_temperature,
                 )
             )
-            if end < len(ordered_inputs) and inter_batch_delay_s > 0:
+            if inter_batch_delay_s > 0:
                 time.sleep(inter_batch_delay_s)
         return results
 
