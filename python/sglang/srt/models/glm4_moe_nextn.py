@@ -155,21 +155,20 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        exit_stack = ExitStack()
-        if (
-            is_npu()
-            and self.quant_config is None
-            and get_global_server_args().quantization is not None
-        ):
-            # ascend mtp unquant
-            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
-            exit_stack.enter_context(
-                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
-            )
-
-        hidden_states = self.model(input_ids, positions, forward_batch)
-
-        exit_stack.close()
+        with ExitStack() as exit_stack:
+            if (
+                _is_npu
+                and self.quant_config is None
+                and get_global_server_args().quantization is not None
+            ):
+                # ascend mtp unquant
+                exit_stack.enter_context(
+                    envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True)
+                )
+                exit_stack.enter_context(
+                    envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
+                )
+            hidden_states = self.model(input_ids, positions, forward_batch)
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
