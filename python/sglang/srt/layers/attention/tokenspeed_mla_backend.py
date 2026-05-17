@@ -21,6 +21,11 @@
 from __future__ import annotations
 
 """Attention backend for the tokenspeed-mla CuTe DSL kernels on Blackwell.
+
+Subclasses :class:`TRTLLMMLABackend` and overrides only ``_run_decode_kernel``
+and ``_run_prefill_kernel``. All metadata, KV-cache layout, CUDA-graph
+plumbing, FP8 quantize/rope, draft-extend padding, and chunked-prefix
+dispatch are inherited unchanged from the parent.
 """
 
 import logging
@@ -54,7 +59,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +104,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             skip_prefill,
             kv_indptr_buf,
             q_indptr_decode_buf,
-            skip_init_workspace_buffer=True,
         )
 
         if self.data_type != torch.float8_e4m3fn:
@@ -116,10 +119,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
 
-        # Pre-JIT prefill variants. cute.compile takes 1-2 min per variant;
+        # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2 min;
         # without warm-up the first request trips the 300 s scheduler watchdog.
-        # Driving the private compile helper directly because the public
-        # warmup entry point skips return_lse=False.
         if is_tokenspeed_mla_available():
             _compile_prefill_kernel = tokenspeed_mla.mla_prefill._compile_prefill_kernel
             _compiled_kernels = tokenspeed_mla.mla_prefill._compiled_kernels
@@ -128,8 +129,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             use_pdl = is_arch_support_pdl()
             for is_causal in (True, False):
                 for return_lse in (True, False):
-                    # Non-causal is only reached from chunked-prefix, which
-                    # always wants the LSE.
+                    # Non-causal is only entered from the chunked-prefix
+                    # branch, which always asks for the LSE.
                     if is_causal is False and return_lse is False:
                         continue
                     config = (
