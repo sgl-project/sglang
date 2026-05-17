@@ -1467,10 +1467,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     split_forward_count: int = 1
     split_forward_batch: ForwardBatch = None
 
-    # Per-forward-call override fields (one-shot). Caller writes before calling
-    # ForwardBatch.init_new / forward_batch_generation; init_new consumes the
-    # value and resets back to the default. Reused across V1 spec verify,
-    # V1 spec draft extend, and split-prefill cross-call CPU-mirror reuse.
+    # One-shot per-forward overrides; init_new consumes and resets.
     seq_lens_cpu_cache: torch.Tensor = None
     capture_hidden_mode: Optional[CaptureHiddenMode] = None
     return_hidden_states_before_norm: bool = False
