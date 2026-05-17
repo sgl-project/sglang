@@ -208,6 +208,7 @@ class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
         # First lora completes, freeing capacity
         loader.lora_to_overlap_load_event["lora_0"].query.return_value = True
 
+        loader._drain_completed_overlap_loads()
         self.assertEqual(
             loader._check_overlap_load_status("lora_0"), LoRAOverlapLoadStatus.LOADED
         )

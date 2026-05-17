@@ -35,6 +35,10 @@ class LoRAOverlapLoader:
         Check a LoRA adapter's asynchronous load status, and try to load it if there's capacity
         in the memory pool. Returns whether or not the adapter has been loaded.
         """
+        # Drain completed async loads before status/capacity checks so finished
+        # adapters no longer count as in-flight.
+        self._drain_completed_overlap_loads()
+
         lora_pipeline_load_status = self._check_overlap_load_status(lora_id)
         if lora_pipeline_load_status == LoRAOverlapLoadStatus.LOADING:
             return False
@@ -51,13 +55,11 @@ class LoRAOverlapLoader:
     def _check_overlap_load_status(
         self, lora_id: Optional[str]
     ) -> LoRAOverlapLoadStatus:
-        self._drain_completed_overlap_loads()
-
         if lora_id in self.lora_to_overlap_load_event:
             return LoRAOverlapLoadStatus.LOADING
 
-        # After completed events are drained, a memory-pool entry with no pending
-        # event is safe to use on the current stream.
+        # After completed events have been drained, a memory-pool entry with no
+        # pending event is safe to use on the current stream.
         if lora_id in self.lora_manager.memory_pool.uid_to_buffer_id:
             return LoRAOverlapLoadStatus.LOADED
 
