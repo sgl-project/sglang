@@ -229,9 +229,11 @@ class TestProfileMergerIntegration(unittest.TestCase):
         self.assertIn("merge_profiles", sig.parameters)
 
         # Test SchedulerProfilerMixin
-        from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
+        from sglang.srt.managers.scheduler_components.profiler_manager import (
+            SchedulerProfilerManager,
+        )
 
-        sig = inspect.signature(SchedulerProfilerMixin._init_profile)
+        sig = inspect.signature(SchedulerProfilerManager._init_profile)
         self.assertIn("merge_profiles", sig.parameters)
 
         # Test CLI profiler
