@@ -97,9 +97,16 @@ def _load_quant_cls(quant_cfg: dict):
 
 
 def find_quant_modelslim_config(model_config, component_model_path):
+    # Try exact name first, then glob for variant filenames (e.g. after repack)
     quant_config_file = Path(component_model_path, "quant_model_description.json")
+    if not quant_config_file.is_file():
+        candidates = sorted(
+            Path(component_model_path).glob("quant_model_description*.json")
+        )
+        quant_config_file = candidates[0] if candidates else None
+
     quant_cfg = None
-    if quant_config_file.is_file():
+    if quant_config_file is not None and Path(quant_config_file).is_file():
         with open(quant_config_file) as f:
             quant_cfg = json.load(f)
         # This field is required for flagless model loading but is not present in
@@ -120,12 +127,13 @@ def get_quant_config(
     model_config,
     component_model_path: str,
     packed_modules_mapping: Dict[str, List[str]] = {},
+    reverse_param_names_mapping: Dict[str, List[str]] = {},
     remap_prefix: Dict[str, str] | None = None,
 ) -> QuantizationConfig:
     quant_cfg = find_quant_modelslim_config(model_config, component_model_path)
     if quant_cfg is not None:
         quant_cls = _load_quant_cls(quant_cfg)
-        return quant_cls.from_config(quant_cfg)
+        return quant_cls.from_config(quant_cfg, reverse_param_names_mapping)
 
     if "quantization_config" not in model_config:
         return None
@@ -403,7 +411,9 @@ def _build_nvfp4_config_from_safetensors_files(
         if mapping_fn is not None:
             mapped, _, _ = mapping_fn(raw_weight_name)
             if mapped != raw_weight_name:
-                exclude_modules.append(module_bfl)
+                exclude_modules.append(
+                    mapped[: -len(".weight")] if mapped.endswith(".weight") else mapped
+                )
                 continue
 
         if reverse_mapping_fn is not None:

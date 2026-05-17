@@ -17,6 +17,11 @@
 #   SLURM_ACCOUNT     - Slurm account  (default: sglang)
 #   SRT_SLURM_BRANCH  - branch of srt-slurm repo to check out
 #   GITHUB_WORKSPACE  - set automatically by GitHub Actions
+#   MATRIX_CONFIG_NAME- matrix entry name (e.g. dsr1-fp4-1k1k-mid-curve); used in S3 prefix
+#   S3_BUCKET         - MinIO bucket for benchmark log uploads
+#   S3_ENDPOINT_URL   - MinIO endpoint URL (e.g. https://minio.<host>.nip.io)
+#   AWS_ACCESS_KEY_ID - writer access key for S3_BUCKET (via GH secrets)
+#   AWS_SECRET_ACCESS_KEY - writer secret key for S3_BUCKET (via GH secrets)
 
 set -euo pipefail
 set -x
@@ -90,6 +95,31 @@ fi
 # ---------------------------------------------------------------------------
 SRTCTL_ROOT="$SRT_REPO_DIR"
 
+: "${S3_BUCKET:?S3_BUCKET must be set}"
+: "${S3_ENDPOINT_URL:?S3_ENDPOINT_URL must be set}"
+: "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID must be set}"
+: "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY must be set}"
+: "${MATRIX_CONFIG_NAME:?MATRIX_CONFIG_NAME must be set}"
+: "${GITHUB_RUN_ID:?GITHUB_RUN_ID must be set}"
+: "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT must be set}"
+
+# Map the GitHub trigger into a friendlier top-level prefix: cron/manual.
+case "${GITHUB_EVENT_NAME:-}" in
+    schedule)          TRIGGER=cron ;;
+    workflow_dispatch) TRIGGER=manual ;;
+    *)                 TRIGGER="${GITHUB_EVENT_NAME:-unknown}" ;;
+esac
+
+# Format ISL/OSL as "1k1k" / "1k8k" / "8k1k" etc. for the S3 prefix, so logs
+# group naturally by sequence-length bucket under each run.
+fmt_seq_len() {
+    local n=$1
+    if (( n % 1024 == 0 )); then echo "$((n / 1024))k"; else echo "$n"; fi
+}
+SEQ_LEN="$(fmt_seq_len "$ISL")$(fmt_seq_len "$OSL")"
+
+S3_PREFIX="${TRIGGER}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${SEQ_LEN}/${MATRIX_CONFIG_NAME}"
+
 cat > srtslurm.yaml <<EOF
 # SRT SLURM configuration for SGLang GB200 nightly CI
 default_account: "${SLURM_ACCOUNT}"
@@ -108,10 +138,20 @@ containers:
   dynamo-sglang: ${SQUASH_FILE}
   nginx: ${NGINX_SQUASH_FILE}
   nginx-sqsh: ${NGINX_SQUASH_FILE}
+
+# srt-slurm postprocess uploads /logs to this bucket after each Slurm job.
+# Credentials are read from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars,
+# not written to disk. srt-slurm appends /<date>/<slurm-job-id>/ after prefix.
+reporting:
+  s3:
+    bucket: "${S3_BUCKET}"
+    prefix: "${S3_PREFIX}"
+    endpoint_url: "${S3_ENDPOINT_URL}"
 EOF
 
 echo "--- srtslurm.yaml ---"
 cat srtslurm.yaml
+echo "--- S3 log upload: s3://${S3_BUCKET}/${S3_PREFIX}/ ---"
 
 make setup ARCH=aarch64
 

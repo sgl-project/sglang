@@ -23,6 +23,12 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -115,27 +121,35 @@ class RadixAttention(nn.Module):
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            return unified_attention_with_output(
-                q,
-                k,
-                v,
-                self.tp_q_head_num * self.v_head_dim,
-                save_kv_cache,
-                self.layer_id,
-                **kwargs,
-            )
+            if self.qk_head_dim != self.v_head_dim:
+                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+            else:
+                output = torch.empty_like(q)
+            if is_in_breakable_cuda_graph():
+                bcg_unified_attention_with_output(
+                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                )
+            else:
+                unified_attention_with_output(
+                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                )
+            return output
         elif (
             forward_batch.forward_mode.is_decode() and get_forward_context() is not None
         ):
-            return unified_attention_with_output(
-                q,
-                k,
-                v,
-                self.tp_q_head_num * self.v_head_dim,
-                save_kv_cache,
-                self.layer_id,
-                **kwargs,
-            )
+            if self.qk_head_dim != self.v_head_dim:
+                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+            else:
+                output = torch.empty_like(q)
+            if is_in_breakable_cuda_graph():
+                bcg_unified_attention_with_output(
+                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                )
+            else:
+                unified_attention_with_output(
+                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                )
+            return output
         else:
             return forward_batch.attn_backend.forward(
                 q,
@@ -152,15 +166,15 @@ def _unified_attention_fake(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    num_out_features: int,
+    output: torch.Tensor,
     save_kv_cache: bool,
     layer_id: int,
     *,
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    return query.new_empty(query.shape[0], num_out_features)
+) -> None:
+    return
 
 
 @register_custom_op(fake_impl=_unified_attention_fake)
@@ -169,14 +183,14 @@ def unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    num_out_features: int,
+    output: torch.Tensor,
     save_kv_cache: bool,
     layer_id: int,
     *,
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+) -> None:
     context = get_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
@@ -207,6 +221,11 @@ def unified_attention_with_output(
         if hasattr(token_to_kv_pool, "set_swa_loc"):
             token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
+    # Store pre-allocated output for FA backend to write directly into.
+    # Must slice to real_num_tokens to match the narrowed query shape —
+    # the FA kernel validates out.size(0) == q.size(0).
+    forward_batch._attn_output = output[:real_num_tokens]
+
     ret = forward_batch.attn_backend.forward(
         query,
         key,
@@ -223,6 +242,9 @@ def unified_attention_with_output(
     ):
         token_to_kv_pool.set_swa_loc(original_swa_loc)
 
-    # TODO: fix the return shape and tensor
-    # output[:real_num_tokens].view(ret.shape).copy_(ret)
-    return ret
+    if ret.data_ptr() != output.data_ptr():
+        output[:real_num_tokens].view(ret.shape).copy_(ret)
+    return
+
+
+bcg_unified_attention_with_output = eager_on_graph(True)(unified_attention_with_output)

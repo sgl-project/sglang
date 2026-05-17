@@ -1560,7 +1560,6 @@ class ShmPointerMMData:
         self.shm_name = state["shm_name"]
         self.shape = state["shape"]
         self.dtype = state["dtype"]
-        self.shm = None
         self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         # Zero-copy view into shared memory (no clone, no unlink)
         self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
@@ -1608,13 +1607,33 @@ def wrap_shm_features(obj):
 
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         for item in obj.mm_inputs.mm_items:
-            if (
-                hasattr(item, "feature")
-                and isinstance(item.feature, torch.Tensor)
-                and item.feature.is_cpu
-            ):
-                item.feature = ShmPointerMMData(item.feature)
+            if not hasattr(item, "feature"):
+                continue
+            feat = item.feature
+            if isinstance(feat, torch.Tensor) and feat.is_cpu:
+                item.feature = ShmPointerMMData(feat)
+            elif isinstance(feat, (list, tuple)):
+                wrapped = [
+                    (
+                        ShmPointerMMData(t)
+                        if isinstance(t, torch.Tensor) and t.is_cpu
+                        else t
+                    )
+                    for t in feat
+                ]
+                item.feature = (
+                    type(feat)(wrapped) if isinstance(feat, tuple) else wrapped
+                )
     return obj
+
+
+def _feature_has_shm(feat) -> bool:
+    """Check whether a single feature (tensor, ShmPointer, or list) contains ShmPointerMMData."""
+    if isinstance(feat, ShmPointerMMData):
+        return True
+    if isinstance(feat, (list, tuple)):
+        return any(isinstance(t, ShmPointerMMData) for t in feat)
+    return False
 
 
 def has_shm_features(recv_reqs):
@@ -1625,7 +1644,7 @@ def has_shm_features(recv_reqs):
                 return True
         elif hasattr(req, "mm_inputs") and req.mm_inputs:
             for item in req.mm_inputs.mm_items:
-                if isinstance(item.feature, ShmPointerMMData):
+                if _feature_has_shm(item.feature):
                     return True
     return False
 
@@ -1646,6 +1665,15 @@ def unwrap_shm_features(obj):
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         mm_items = obj.mm_inputs.mm_items
         for item in mm_items:
-            if isinstance(item.feature, ShmPointerMMData):
-                item.feature = item.feature.materialize()
+            feat = item.feature
+            if isinstance(feat, ShmPointerMMData):
+                item.feature = feat.materialize()
+            elif isinstance(feat, (list, tuple)):
+                unwrapped = [
+                    t.materialize() if isinstance(t, ShmPointerMMData) else t
+                    for t in feat
+                ]
+                item.feature = (
+                    type(feat)(unwrapped) if isinstance(feat, tuple) else unwrapped
+                )
     return obj
