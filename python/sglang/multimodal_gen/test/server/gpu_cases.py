@@ -21,6 +21,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
     MODELOPT_TI2I_CI_sampling_params,
+    MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
     MULTI_FRAME_I2I_sampling_params,
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
@@ -484,7 +485,7 @@ else:
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
             extras=[],
-            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            env_vars=MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
         ),
     ]
 
