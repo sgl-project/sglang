@@ -572,7 +572,7 @@ class TargetActor:
                 disable_radix_cache=True,
             )
         elif mode == "decode":
-            engine_kwargs["disable_piecewise_cuda_graph"] = True
+            engine_kwargs["disable_overlap_schedule"] = True
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 
