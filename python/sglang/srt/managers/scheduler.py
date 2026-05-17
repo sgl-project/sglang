@@ -170,6 +170,9 @@ from sglang.srt.managers.scheduler_components.dp_attn import (
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
+from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+    SchedulerKvEventsPublisher,
+)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
@@ -491,7 +494,11 @@ class Scheduler(
             tp_cpu_group=self.tp_cpu_group,
             attn_cp_cpu_group=self.attn_cp_cpu_group,
             enable_metrics=self.enable_metrics,
-            enable_kv_cache_events=self.enable_kv_cache_events,
+            enable_kv_cache_events=bool(
+                self.server_args.kv_events_config
+                and self.ps.attn_tp_rank == 0
+                and self.ps.attn_cp_rank == 0
+            ),
             ps=self.ps,
             tp_group=self.tp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
@@ -674,6 +681,20 @@ class Scheduler(
             get_running_batch=lambda: self.running_batch,
         )
 
+        self.kv_events_publisher = SchedulerKvEventsPublisher(
+            kv_events_config=self.server_args.kv_events_config,
+            ps=self.ps,
+            attn_tp_rank=self.ps.attn_tp_rank,
+            attn_cp_rank=self.ps.attn_cp_rank,
+            attn_dp_rank=self.ps.attn_dp_rank,
+            dp_rank=self.ps.dp_rank,
+            tree_cache=self.tree_cache,
+            send_metrics_from_scheduler=self.send_metrics_from_scheduler,
+            max_running_requests=self.max_running_requests,
+            max_total_num_tokens=self.max_total_num_tokens,
+            get_stats=lambda: self.stats,
+        )
+
         self.is_initializing = False
 
     def init_zbal_on_npu(self):
@@ -710,6 +731,7 @@ class Scheduler(
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
         self.idle_sleeper = None
+        self.send_metrics_from_scheduler = None
 
         if (
             self.ps.pp_rank == 0
@@ -3118,7 +3140,7 @@ class Scheduler(
         self._maybe_log_idle_metrics()
 
         # kv event publishing
-        self._publish_kv_events()
+        self.publish_kv_events(self.kv_events_publisher)
 
         # reset token ratio
         self.new_token_ratio = self.init_new_token_ratio
