@@ -29,7 +29,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor?  k_new,"             // (b, s_k_new, h_k, d) or (total_k_new, h_k, d)
       "    Tensor?  v_new,"             // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv)
       "    Tensor?  q_v,"               // (b, s_q, h, dv) or (total_q_new, h, dv)
-      "    Tensor?  out,"               // (b, s_q, h, dv) or (total_q, h, dv)
+      "    Tensor(a!)?  out,"           // (b, s_q, h, dv) or (total_q, h, dv)
       "    Tensor?  cu_seqlens_q,"      // b+1
       "    Tensor?  cu_seqlens_k,"      // b+1
       "    Tensor?  cu_seqlens_k_new,"  // b+1
@@ -58,7 +58,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool?    pack_gqa,"
       "    int      sm_margin,"
       "    Tensor?  sinks"
-      ") -> (Tensor, Tensor, Tensor, Tensor)");  // NEW return type: tuple of 4 tensors
+      ") -> (Tensor(a!), Tensor, Tensor, Tensor)");  // first return aliases out
 
   m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 

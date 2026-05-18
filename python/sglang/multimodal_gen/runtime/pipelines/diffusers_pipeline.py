@@ -10,11 +10,9 @@ import argparse
 import inspect
 import re
 import warnings
-from io import BytesIO
 from typing import Any
 
 import numpy as np
-import requests
 import torch
 import torchvision.transforms as T
 from diffusers import DiffusionPipeline
@@ -22,6 +20,13 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentResidencyStrategy,
+    get_global_component_residency_manager,
+)
+from sglang.multimodal_gen.runtime.models.vision_utils import (
+    load_image as load_vision_image,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -337,11 +342,8 @@ class DiffusersExecutionStage(PipelineStage):
             batch.image_path = batch.image_path[0]
 
         try:
-            if batch.image_path.startswith(("http://", "https://")):
-                response = requests.get(batch.image_path, timeout=30)
-                response.raise_for_status()
-                return Image.open(BytesIO(response.content)).convert("RGB")
-            return Image.open(batch.image_path).convert("RGB")
+            image = load_vision_image(batch.image_path)
+            return image.convert("RGB")
         except Exception as e:
             logger.error("Failed to load image from %s: %s", batch.image_path, e)
             return None
@@ -373,6 +375,8 @@ class DiffusersPipeline(ComposedPipelineBase):
         self._stage_name_mapping: dict[str, PipelineStage] = {}
         self.modules: dict[str, Any] = {}
         self.memory_usages: dict[str, float] = {}
+        self.component_residency_strategies: dict[str, ComponentResidencyStrategy] = {}
+        self.component_residency_manager = None
         self.post_init_called = False
         self.executor = executor or SyncExecutor(server_args=server_args)
         self._cache_dit_enabled = False
@@ -728,7 +732,13 @@ class DiffusersPipeline(ComposedPipelineBase):
         """Execute the pipeline on the given batch."""
         if not self.post_init_called:
             self.post_init()
-        return self.executor.execute(self.stages, batch, server_args)
+
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+
+        return self.executor.execute_with_profiling(self.stages, batch, server_args)
 
     @classmethod
     def from_pretrained(

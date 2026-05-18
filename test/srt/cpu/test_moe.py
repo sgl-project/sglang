@@ -300,35 +300,16 @@ class TestFusedExperts(CustomTestCase):
         )
         score = torch.softmax(score, dim=-1, dtype=torch.float32)
         topk_weight, topk_ids = torch.topk(score, topk)
-        awq_w13_weight_pack = []
-        awq_w13_zero_pack = []
-        awq_w13_scales_pack = []
-        awq_w2_weight_pack = []
-        awq_w2_zero_pack = []
-        awq_w2_scales_pack = []
-        for i in range(E):
-            packed_weight_13_i, packed_zero_13_i, packed_scales_13_i = (
-                torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                    awq_w13_weight[i], awq_w13_zero[i], awq_w13_scales[i]
-                )
+        awq_w13_weight_pack, awq_w13_zero_pack, awq_w13_scales_pack = (
+            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                awq_w13_weight, awq_w13_zero, awq_w13_scales, 0
             )
-            awq_w13_weight_pack.append(packed_weight_13_i)
-            awq_w13_zero_pack.append(packed_zero_13_i)
-            awq_w13_scales_pack.append(packed_scales_13_i)
-            packed_weight_2_i, packed_zero_2_i, packed_scales_2_i = (
-                torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                    awq_w2_weight[i], awq_w2_zero[i], awq_w2_scales[i]
-                )
+        )
+        awq_w2_weight_pack, awq_w2_zero_pack, awq_w2_scales_pack = (
+            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                awq_w2_weight, awq_w2_zero, awq_w2_scales, 0
             )
-            awq_w2_weight_pack.append(packed_weight_2_i)
-            awq_w2_zero_pack.append(packed_zero_2_i)
-            awq_w2_scales_pack.append(packed_scales_2_i)
-        awq_w13_weight_pack = torch.stack(awq_w13_weight_pack).detach()
-        awq_w13_zero_pack = torch.stack(awq_w13_zero_pack).detach()
-        awq_w13_scales_pack = torch.stack(awq_w13_scales_pack).detach()
-        awq_w2_weight_pack = torch.stack(awq_w2_weight_pack).detach()
-        awq_w2_zero_pack = torch.stack(awq_w2_zero_pack).detach()
-        awq_w2_scales_pack = torch.stack(awq_w2_scales_pack).detach()
+        )
 
         out = kernel.fused_experts_cpu(
             a,

@@ -125,8 +125,9 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   if (tx == 0) {
     temp_storage.block_aggregate.value = sum_relu_q_minus_p;
   }
-  // init the first rejected token to (d - 1)
-  temp_storage.sampled_id = d - 1;
+
+  temp_storage.sampled_id = d;
+  temp_storage.last_valid_id = -1;
   __syncthreads();
   sum_relu_q_minus_p = temp_storage.block_aggregate.value;
   DType u = coin * sum_relu_q_minus_p;
@@ -156,8 +157,19 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
     }
   }
   __syncthreads();
+  // This would happen when u is very close to 1
+  // and the sum of probabilities is smaller than u
+  // In this case, we use the last valid index as the sampled id
+  int sampled_id = temp_storage.sampled_id;
+  if (sampled_id == d) {
+    if (temp_storage.last_valid_id == -1) {
+      sampled_id = d - 1;
+    } else {
+      sampled_id = temp_storage.last_valid_id;
+    }
+  }
   // set the first rejected token
-  predicts[last_accepted_retrive_idx] = temp_storage.sampled_id;
+  predicts[last_accepted_retrive_idx] = sampled_id;
   // value at not used indices are undefined
 }
 

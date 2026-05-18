@@ -11,10 +11,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Breakable CUDA Graph: capture a region as a sequence of
+``torch.cuda.CUDAGraph`` segments separated by eager break points.
+
+Each segment is a real ``torch.cuda.CUDAGraph``. Its destructor calls
+``releasePool`` on the shared mempool, so the pool's ``use_count`` tracks how
+many segments are alive; the pool stays pinned as long as any segment graph
+is alive. This lets ``weak_ref_tensor`` views of intermediate pool-allocated
+tensors remain valid across replays — we don't need Python-managed bridge
+buffers to keep break-point tensors at stable addresses.
+"""
+
 import logging
 import threading
 from contextvars import ContextVar
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable
 
 import torch
 
@@ -43,17 +54,11 @@ def _check_cuda_bindings():
         )
 
 
-class GraphBreakInfo(NamedTuple):
-    # python function breaking the graph
-    func: Callable
-    # output of the function (must be a tensor so we keep them)
-    output: Any
-    # raw handle after capture or raw exec handle after instantiate
-    graph_handle: Any
-
-
-_captured_graphs_var: ContextVar[list[GraphBreakInfo] | None] = ContextVar(
-    "captured_graphs", default=None
+# Active BreakableCUDAGraphCapture context for the currently-capturing thread.
+# eager_on_graph's wrapper uses this to split the current torch.cuda.CUDAGraph
+# at break points.
+_current_capture_var: ContextVar["BreakableCUDAGraphCapture | None"] = ContextVar(
+    "current_capture", default=None
 )
 _current_stream_var: ContextVar[torch.cuda.Stream | None] = ContextVar(
     "current_stream", default=None
@@ -84,7 +89,10 @@ def _is_capturing(stream_ptr: int) -> bool:
     )
 
 
-# hook wait_stream to track forks/joins during breakable capture.
+# Hook torch.cuda.Stream.wait_stream to track side-stream forks/joins that happen
+# during breakable capture. We need this because capture_end() on a torch
+# CUDAGraph fails if there are still side streams participating in the capture
+# — so before ending each segment we auto-join any forked-but-not-rejoined streams.
 _original_wait_stream: Callable | None = None
 _hook_lock = threading.Lock()
 _hook_refcount = 0
@@ -106,9 +114,6 @@ def _hooked_wait_stream(self: torch.cuda.Stream, other: torch.cuda.Stream):
     is_other_cap = other is capturing or other.cuda_stream == cap_ptr
 
     if is_self_cap and not is_other_cap:
-        # Join: capturing_stream.wait_stream(other).
-        # other might not be part of the capture because we join it in the last segment
-        # skip the wait to avoid cuda error
         if (
             _capture_status(other.cuda_stream)
             != rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
@@ -117,7 +122,6 @@ def _hooked_wait_stream(self: torch.cuda.Stream, other: torch.cuda.Stream):
         _original_wait_stream(self, other)
         forked.discard(other)
     elif is_other_cap and not is_self_cap:
-        # Fork: other.wait_stream(capturing_stream).
         _original_wait_stream(self, other)
         forked.add(self)
     else:
@@ -143,49 +147,20 @@ def _uninstall_wait_stream_hook():
             _original_wait_stream = None
 
 
-def _end_capture_segment(stream: torch.cuda.Stream):
-    """End a capture segment, auto-joining any forked streams first."""
-    # Join forked streams that are still part of this capture.
-    forked = _forked_streams_var.get()
-    if forked:
-        assert _original_wait_stream is not None
-        for s in forked:
-            if _is_capturing(s.cuda_stream):
-                _original_wait_stream(stream, s)
-        forked.clear()
+def _weak_ref_if_tensor(x):
+    """Return a weak-ref tensor view (shared storage, no refcount) for tensors;
+    pass-through for non-tensors. Weak-ref'ing captured args lets the shared
+    mempool reclaim per-layer intermediates between segments — storage stays
+    alive for each segment CUDAGraph's lifetime via its pool use_count.
 
-    graph = checkCudaErrors(rt.cudaStreamEndCapture(stream.cuda_stream))
-    assert graph is not None
-    return graph
+    ``weak_ref_tensors`` is imported lazily: the module hard-raises on
+    non-CUDA/NPU platforms, and we only reach this code during an active
+    BCG capture (which can't happen on CPU-only runners anyway)."""
+    if torch.is_tensor(x):
+        from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
-
-def _begin_capture_segment(stream: torch.cuda.Stream):
-    checkCudaErrors(
-        rt.cudaStreamBeginCapture(
-            stream.cuda_stream,
-            rt.cudaStreamCaptureMode.cudaStreamCaptureModeGlobal,
-        )
-    )
-
-
-def _instantiate_graph(graph_ptr: int) -> int:
-    graph_exec = checkCudaErrors(
-        rt.cudaGraphInstantiateWithFlags(
-            graph_ptr,
-            rt.cudaGraphInstantiateFlags.cudaGraphInstantiateFlagAutoFreeOnLaunch,
-        )
-    )
-    assert graph_exec is not None
-    checkCudaErrors(rt.cudaGraphDestroy(graph_ptr))
-    return graph_exec
-
-
-def _destroy_graph_exec(graph_exec_ptr: int) -> None:
-    checkCudaErrors(rt.cudaGraphExecDestroy(graph_exec_ptr))
-
-
-def _replay_graph(graph_exec_ptr: int, stream_ptr: int) -> None:
-    checkCudaErrors(rt.cudaGraphLaunch(graph_exec_ptr, stream_ptr))
+        return weak_ref_tensors(x)
+    return x
 
 
 def _copy_output(dst: Any, src: Any) -> Any:
@@ -199,7 +174,6 @@ def _copy_output(dst: Any, src: Any) -> Any:
         dst.copy_(src)
         return dst
 
-    # Handle objects with __dict__ (dataclasses, regular objects)
     if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
         for key, src_val in src.__dict__.items():
             dst_val = getattr(dst, key, None)
@@ -209,7 +183,6 @@ def _copy_output(dst: Any, src: Any) -> Any:
                 setattr(dst, key, src_val)
         return dst
 
-    # Handle dicts of tensors
     if isinstance(dst, dict) and isinstance(src, dict):
         for key, src_val in src.items():
             dst_val = dst.get(key)
@@ -228,32 +201,35 @@ def eager_on_graph(enable: bool):
             return inner
 
         def wrapper(*args, **kwargs):
-            stream = get_current_stream()
-            if not _is_capturing(stream.cuda_stream):
+            capture = _current_capture_var.get()
+            if capture is None:
                 return inner(*args, **kwargs)
-            last_graph = _end_capture_segment(stream)
-            logger.debug(f"Break graph due to function: {inner.__name__}")
-            # run the function once to allocate the output tensor captured by later graphs
+
+            logger.debug("Break graph due to function: %s", inner.__name__)
+
+            # End the segment that captured up to this break point.
+            capture._end_current_segment()
+
+            # Run the eager function once so it allocates its outputs and
+            # writes real data into them.
             output = inner(*args, **kwargs)
 
-            # Store the callable and its arguments so replay can re-invoke with
-            # the same argument *references* (which point to CUDA graph input
-            # buffers whose contents are updated before replay).
+            # Weak-ref the closure state. Storage lives with the segment
+            # CUDAGraphs' mempool pin; Python refs don't need to prevent
+            # pool reuse across layers.
             captured_inner = inner
-            captured_args = args
-            captured_kwargs = kwargs
-            captured_output = output
+            captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
+            captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
+            captured_output = _weak_ref_if_tensor(output)
 
             def replay_fn():
                 new_out = captured_inner(*captured_args, **captured_kwargs)
                 return _copy_output(captured_output, new_out)
 
-            captured_graphs = _captured_graphs_var.get()
-            assert (
-                captured_graphs is not None
-            ), "eager_on_graph wrapper called outside of BreakableCUDAGraphCapture"
-            captured_graphs.append(GraphBreakInfo(replay_fn, output, last_graph))
-            _begin_capture_segment(stream)
+            capture.cuda_graph._break_fns.append(replay_fn)
+
+            # Start a fresh CUDAGraph segment for the remainder of the forward.
+            capture._begin_new_segment()
             return output
 
         return wrapper
@@ -261,60 +237,37 @@ def eager_on_graph(enable: bool):
     return decorator
 
 
-class BreakableCUDAGraph(torch.cuda.CUDAGraph):
+class BreakableCUDAGraph:
+    """Container holding one ``torch.cuda.CUDAGraph`` per segment plus an
+    eager break function between consecutive segments."""
 
-    def __new__(cls) -> "BreakableCUDAGraph":
-        return super().__new__(cls, True)
+    def __init__(self) -> None:
+        self._segments: list[torch.cuda.CUDAGraph] = []
+        self._break_fns: list[Callable[[], Any]] = []
 
-    def capture_begin(self, pool=None, capture_error_mode: str = "global") -> None:
-        _check_cuda_bindings()
-        super().capture_begin(pool, capture_error_mode)
-        stream = get_current_stream()
-        # torch graph will not record any operation but only for compatibility
-        _end_capture_segment(stream)
-        _begin_capture_segment(stream)
-
-    def capture_end(self):
-        stream = get_current_stream()
-        self.last_graph = _end_capture_segment(stream)
-        self.last_graph_exec = _instantiate_graph(self.last_graph)
-        breaks = _captured_graphs_var.get()
-        self._exec = []
-        if breaks:
-            for replay_fn, output, handle in breaks:
-                graph_exec = _instantiate_graph(handle)
-                self._exec.append(GraphBreakInfo(replay_fn, output, graph_exec))
-
-        # start a dummy capture so torch's capture_end() can finalize
-        _begin_capture_segment(stream)
-        super().capture_end()
-
-    def replay(self):
+    def replay(self) -> None:
         stream = torch.cuda.current_stream()
         token = _current_stream_var.set(stream)
         try:
-            if not self._exec:
-                _replay_graph(self.last_graph_exec, stream.cuda_stream)
-                return
-            for func, _, handle in self._exec:
-                _replay_graph(handle, stream.cuda_stream)
-                func()
-            _replay_graph(self.last_graph_exec, stream.cuda_stream)
+            for i, seg in enumerate(self._segments):
+                seg.replay()
+                if i < len(self._break_fns):
+                    self._break_fns[i]()
         finally:
             _current_stream_var.reset(token)
 
-    def __del__(self):
-        try:
-            if hasattr(self, "_exec"):
-                for _, _, handle in self._exec:
-                    _destroy_graph_exec(handle)
-            if hasattr(self, "last_graph_exec"):
-                _destroy_graph_exec(self.last_graph_exec)
-        except Exception:
-            pass
 
+class BreakableCUDAGraphCapture:
+    """Context manager that captures the enclosed code as one or more
+    ``torch.cuda.CUDAGraph`` segments separated by eager break points.
 
-class BreakableCUDAGraphCapture(torch.cuda.graph):
+    Each segment shares the supplied ``pool`` (``MempoolId_t`` tuple) so
+    pool-allocated intermediates can be reused across segments. While any
+    segment is alive, its ``beginAllocateToPool`` call keeps the mempool's
+    ``use_count`` > 0, which makes ``weak_ref_tensor`` of segment-allocated
+    tensors safe across subsequent replays.
+    """
+
     def __init__(
         self,
         cuda_graph: BreakableCUDAGraph,
@@ -322,31 +275,66 @@ class BreakableCUDAGraphCapture(torch.cuda.graph):
         stream: torch.cuda.Stream | None = None,
         capture_error_mode: str = "global",
     ):
-        super().__init__(
-            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode
-        )
-        self._stream = stream
         assert isinstance(
             cuda_graph, BreakableCUDAGraph
         ), "cuda_graph must be a BreakableCUDAGraph"
+        self.cuda_graph = cuda_graph
+        self._pool = pool if pool is not None else (0, 0)
+        self._stream = stream
+        self._capture_error_mode = capture_error_mode
+        self._stream_ctx = None
+        self._capture_token = None
+        self._stream_token = None
+        self._forked_token = None
 
     def __enter__(self):
         _install_wait_stream_hook()
-        self._breaks_token = _captured_graphs_var.set([])
-        self._stream_token = _current_stream_var.set(self._stream)
-        self._forked_streams_token = _forked_streams_var.set(set())
-        return super().__enter__()
+        if self._stream is not None:
+            self._stream_ctx = torch.cuda.stream(self._stream)
+            self._stream_ctx.__enter__()
+        self._capture_token = _current_capture_var.set(self)
+        self._stream_token = _current_stream_var.set(
+            self._stream or torch.cuda.current_stream()
+        )
+        self._forked_token = _forked_streams_var.set(set())
+        self._begin_new_segment()
+        return self
 
     def __exit__(self, *args: object):
-        super().__exit__(*args)
-        _current_stream_var.reset(self._stream_token)
-        _captured_graphs_var.reset(self._breaks_token)
-        _forked_streams_var.reset(self._forked_streams_token)
-        _uninstall_wait_stream_hook()
+        try:
+            self._end_current_segment()
+        finally:
+            _forked_streams_var.reset(self._forked_token)
+            _current_stream_var.reset(self._stream_token)
+            _current_capture_var.reset(self._capture_token)
+            if self._stream_ctx is not None:
+                self._stream_ctx.__exit__(*args)
+                self._stream_ctx = None
+            _uninstall_wait_stream_hook()
+        return False
+
+    def _begin_new_segment(self) -> None:
+        graph = torch.cuda.CUDAGraph()
+        graph.capture_begin(
+            pool=self._pool, capture_error_mode=self._capture_error_mode
+        )
+        self.cuda_graph._segments.append(graph)
+
+    def _end_current_segment(self) -> None:
+        # Auto-join any side streams forked during this segment but not joined.
+        main_stream = get_current_stream()
+        forked = _forked_streams_var.get()
+        if forked:
+            assert _original_wait_stream is not None
+            for side in list(forked):
+                if _is_capturing(side.cuda_stream):
+                    _original_wait_stream(main_stream, side)
+            forked.clear()
+        self.cuda_graph._segments[-1].capture_end()
 
 
 @eager_on_graph(True)
-def break_graph():
+def break_graph() -> None:
     """Insert a graph break. The @eager_on_graph decorator does the actual
     segment split; this function body intentionally does nothing."""
     pass

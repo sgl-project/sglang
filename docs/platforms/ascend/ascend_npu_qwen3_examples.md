@@ -61,7 +61,6 @@ export STREAMS_PER_DEVICE=32
 export HCCL_BUFFSIZE=1536
 export HCCL_OP_EXPANSION_MODE=AIV
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
-export SGLANG_DEEPEP_BF16_DISPATCH=1
 
 python -m sglang.launch_server \
    --device npu \
@@ -82,7 +81,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export HCCL_BUFFSIZE=1536
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
-export SGLANG_DEEPEP_BF16_DISPATCH=1
 
 python -m sglang.launch_server \
    --model-path Qwen/Qwen3-235B-A22B-Instruct-2507 \
@@ -114,7 +112,6 @@ MODEL_PATH=/root/.cache/modelscope/hub/models/zcgy26/Qwen3-235B-A22B-Instruct-25
 
 ```shell
 export ASCEND_LAUNCH_BLOCKING=1
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export HCCL_BUFFSIZE=1500
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=128
@@ -146,7 +143,6 @@ python3 -m sglang.launch_server \
 **Decode node:**
 
 ```shell
-export SGLANG_DEEPEP_BF16_DISPATCH=0
 export HCCL_BUFFSIZE=4000
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
@@ -184,6 +180,86 @@ python3 -m sglang_router.launch_router \
    --port 6689 \
    --prometheus-port 29010
 ```
+
+#### Running Qwen3-235B-A22B-Instruct-2507-W8A8 with Prefill Context Parallel (CP) on 2 x Atlas 800I A3
+
+This example enables **Prefill Context Parallel** (`--enable-prefill-context-parallel`) to split the context across CP ranks during prefill, reducing per-device memory pressure and improving TTFT for long sequences. PD disaggregation is required.
+
+> **Constraints**
+> - Prefill side must set `--max-running-requests 1` (PCP only supports batch_size=1)
+> - `--attn-cp-size` must evenly divide `--tp-size`; each CP rank occupies `tp_size / cp_size` NPUs
+
+**Prefill node <PREFILL_HOST_IP>:**
+
+```shell
+export SGLANG_SET_CPU_AFFINITY=1
+export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:23456"
+export ASCEND_USE_FIA=True
+
+python3 -m sglang.launch_server \
+  --model-path /mnt/share/weights/Qwen3-235B-A22B-Instruct-2507-W8A8 \
+  --trust-remote-code \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend ascend \
+  --disaggregation-bootstrap-port 8995 \
+  --quantization modelslim \
+  --attention-backend ascend \
+  --skip-server-warmup \
+  --mem-fraction-static 0.7 \
+  --chunked-prefill-size 32768 \
+  --device npu \
+  --base-gpu-id 0 \
+  --tp-size 16 \
+  --enable-prefill-context-parallel \
+  --attn-cp-size 2 \
+  --moe-dp-size 2 \
+  --max-running-requests 1 \
+  --host <PREFILL_HOST_IP> \
+  --port 8000 \
+  --nnodes 1 \
+  --node-rank 0 \
+  --dist-init-addr <PREFILL_HOST_IP>:6688
+```
+
+Key parameters for PCP:
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `--enable-prefill-context-parallel` | flag | Enable PCP feature |
+| `--attn-cp-size` | 2 | Split context across 2 CP ranks (each rank handles half the sequence) |
+| `--moe-dp-size` | 2 | MoE DP size, should match `--attn-cp-size` |
+| `--max-running-requests` | 1 | Required by PCP (batch_size=1 constraint) |
+
+**Decode node (<DECODE_HOST_IP>):**
+
+```shell
+export ASCEND_MF_STORE_URL="tcp://141.61.39.231:23456"
+export ASCEND_USE_FIA=True
+
+python3 -m sglang.launch_server \
+  --model-path /mnt/share/weights/Qwen3-235B-A22B-Instruct-2507-W8A8 \
+  --trust-remote-code \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend ascend \
+  --quantization modelslim \
+  --attention-backend ascend \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --mem-fraction-static 0.7 \
+  --chunked-prefill-size 32768 \
+  --skip-server-warmup \
+  --device npu \
+  --base-gpu-id 0 \
+  --tp-size 8 \
+  --max-running-requests 32 \
+  --host <DECODE_HOST_IP> \
+  --port 8001 \
+  --nnodes 1 \
+  --node-rank 0 \
+  --dist-init-addr <DECODE_HOST_IP>:6688
+```
+
+> **Note:** `ASCEND_MF_STORE_URL` on both nodes must point to the same KV store (typically the Prefill node IP). `ASCEND_USE_FIA=True` enables fast interconnect aggregation for KV transfer. PCP is a Prefill-only feature; the Decode side needs no CP-related flags.
 
 #### Running Qwen3-VL-8B-Instruct on 1 x Atlas 800I A3.
 
