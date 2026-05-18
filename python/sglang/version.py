@@ -1,3 +1,4 @@
+# sandbox: trigger full main CI on this commit (do not merge)
 try:
     from sglang._version import __version__, __version_tuple__
 except ImportError:
