@@ -108,17 +108,26 @@ class LoRAManager:
         )
 
     def init_cuda_graph_batch_info(
-        self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
+        self,
+        max_bs_in_cuda_graph: int,
+        num_tokens_per_bs: int,
+        max_num_tokens_pcg: Optional[int] = None,
     ):
         """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
 
         Called during CudaGraphRunner.__init__(), after init_memory_pool().
         Phase 1 (MoE buffers) is handled earlier via init_cuda_graph_moe_buffers().
+
+        Args:
+            max_num_tokens_pcg: PCG token bucket upper bound (max of
+                server_args.piecewise_cuda_graph_tokens) so prefill capture/replay
+                can share the pinned cuda_graph_batch_info. None = PCG disabled.
         """
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
         self.lora_backend.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
+            max_num_tokens_pcg=max_num_tokens_pcg,
         )
 
     def init_cuda_graph_moe_buffers(
@@ -302,14 +311,20 @@ class LoRAManager:
             lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
 
-    def prepare_lora_batch(self, forward_batch: ForwardBatch):
+    def prepare_lora_batch(
+        self,
+        forward_batch: ForwardBatch,
+        force_cuda_graph: bool = False,
+    ):
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
+        # force_cuda_graph=True lets PCG (extend) drive in-place batch info updates
+        # even though ForwardMode.EXTEND is not in ForwardMode.is_cuda_graph().
         use_cuda_graph = (
             hasattr(self, "max_bs_in_cuda_graph")
             and bs <= self.max_bs_in_cuda_graph
-            and forward_batch.forward_mode.is_cuda_graph()
+            and (forward_batch.forward_mode.is_cuda_graph() or force_cuda_graph)
         )
 
         weight_indices = [0] * len(forward_batch.lora_ids)
