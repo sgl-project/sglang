@@ -567,7 +567,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         start_time = time.perf_counter()
         full_num_tokens = params.num_tokens
         swa_num_tokens = params.swa_num_tokens
-        debug_enabled = envs.SGLANG_DEBUG_KV_ALLOC.get()
+        debug_enabled = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         debug_before = _kv_pressure_snapshot(self) if debug_enabled else None
         full_num_evicted = 0
         swa_num_evicted = 0

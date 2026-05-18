@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -139,7 +139,7 @@ def _log_kv_alloc_debug(
     tree_cache: BasePrefixCache | None,
     **fields,
 ) -> None:
-    if not envs.SGLANG_DEBUG_KV_ALLOC.get():
+    if not envs.SGLANG_DEBUG_MEMORY_POOL.get():
         return
     merged = {"event": event, **fields, **_kv_pressure_snapshot(tree_cache)}
     logger.info(
@@ -726,56 +726,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
-def release_kv_cache(
-    req: Req,
-    tree_cache: BasePrefixCache,
-    is_insert: bool = True,
-    debug_context: Optional[str] = None,
-):
-    log_cache_debug = (
-        debug_context is not None and envs.SGLANG_DEBUG_DISAGG_PREFILL_CACHE.get()
-    )
-    if log_cache_debug:
-        req_pool_idx_before = req.req_pool_idx
-        kv_committed_len_before = req.kv_committed_len
-        kv_allocated_len_before = req.kv_allocated_len
-        skip_radix_cache_insert = getattr(req, "skip_radix_cache_insert", False)
-        effective_is_insert = is_insert and not skip_radix_cache_insert
-        cache_disable = getattr(tree_cache, "disable", None)
-        cache_disable_finished_insert = getattr(
-            tree_cache, "disable_finished_insert", None
-        )
-        cache_total_before = _safe_cache_stat(tree_cache, "total_size")
-        cache_evictable_before = _safe_cache_stat(tree_cache, "evictable_size")
-        cache_protected_before = _safe_cache_stat(tree_cache, "protected_size")
-
+def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
-        if log_cache_debug:
-            logger.info(
-                "release_kv_cache_debug context=%s rid=%s req_pool_idx=None "
-                "kv_committed_len=%s kv_allocated_len=%s is_insert=%s "
-                "effective_is_insert=%s skip_radix_cache_insert=%s "
-                "cache_disable=%s cache_disable_finished_insert=%s "
-                "bootstrap_host=%s bootstrap_room=%s extra_key=%s "
-                "tree_total_before=%s tree_evictable_before=%s "
-                "tree_protected_before=%s",
-                debug_context,
-                getattr(req, "rid", None),
-                kv_committed_len_before,
-                kv_allocated_len_before,
-                is_insert,
-                effective_is_insert,
-                skip_radix_cache_insert,
-                cache_disable,
-                cache_disable_finished_insert,
-                getattr(req, "bootstrap_host", None),
-                getattr(req, "bootstrap_room", None),
-                _short_repr(getattr(req, "extra_key", None)),
-                cache_total_before,
-                cache_evictable_before,
-                cache_protected_before,
-            )
         assert (
             tree_cache.supports_mamba()
         ), "Only MambaRadixCache allow freeing before alloc"
@@ -791,56 +744,6 @@ def release_kv_cache(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
     )
-
-    if log_cache_debug:
-        cache_total_after = _safe_cache_stat(tree_cache, "total_size")
-        cache_evictable_after = _safe_cache_stat(tree_cache, "evictable_size")
-        cache_protected_after = _safe_cache_stat(tree_cache, "protected_size")
-        logger.info(
-            "release_kv_cache_debug context=%s rid=%s req_pool_idx_before=%s "
-            "req_pool_idx_after=%s kv_committed_len_before=%s "
-            "kv_committed_len_after=%s kv_allocated_len_before=%s "
-            "kv_allocated_len_after=%s is_insert=%s effective_is_insert=%s "
-            "skip_radix_cache_insert=%s cache_disable=%s "
-            "cache_disable_finished_insert=%s bootstrap_host=%s bootstrap_port=%s "
-            "bootstrap_room=%s routed_dp_rank=%s disagg_prefill_dp_rank=%s "
-            "origin_input_len=%s output_len=%s fill_len=%s cached_tokens=%s "
-            "cache_protected_len=%s prefix_indices_len=%s extra_key=%s "
-            "tree_total_before=%s tree_total_after=%s "
-            "tree_evictable_before=%s tree_evictable_after=%s "
-            "tree_protected_before=%s tree_protected_after=%s",
-            debug_context,
-            getattr(req, "rid", None),
-            req_pool_idx_before,
-            req.req_pool_idx,
-            kv_committed_len_before,
-            req.kv_committed_len,
-            kv_allocated_len_before,
-            req.kv_allocated_len,
-            is_insert,
-            effective_is_insert,
-            skip_radix_cache_insert,
-            cache_disable,
-            cache_disable_finished_insert,
-            getattr(req, "bootstrap_host", None),
-            getattr(req, "bootstrap_port", None),
-            getattr(req, "bootstrap_room", None),
-            getattr(req, "routed_dp_rank", None),
-            getattr(req, "disagg_prefill_dp_rank", None),
-            len(getattr(req, "origin_input_ids", [])),
-            len(getattr(req, "output_ids", [])),
-            len(getattr(req, "fill_ids", [])),
-            getattr(req, "cached_tokens", None),
-            getattr(req, "cache_protected_len", None),
-            len(getattr(req, "prefix_indices", [])),
-            _short_repr(getattr(req, "extra_key", None)),
-            cache_total_before,
-            cache_total_after,
-            cache_evictable_before,
-            cache_evictable_after,
-            cache_protected_before,
-            cache_protected_after,
-        )
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # and bookkeeping flag sync internally, then sets req_pool_idx = None.
