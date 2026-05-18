@@ -368,6 +368,11 @@ class ForwardData:
     lora_ids: Optional[List[str]] = None
     rids: Optional[List[str]] = None
 
+    # Spec V1 legacy needs Req objects for time_stats mutation inside
+    # forward_batch_generation. Non-spec / spec V2 paths leave this None
+    # and consume rids / lora_ids instead.
+    reqs: Optional[List[Any]] = None
+
     # Aliases let mrope / ngram helpers keep their SB-style getter names
     # (batch.extend_lens / batch.prefix_lens) without per-helper edits.
     @property

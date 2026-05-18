@@ -1796,6 +1796,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dimensions=getattr(self, "dimensions", None),
             lora_ids=[req.lora_id for req in self.reqs],
             rids=[req.rid for req in self.reqs],
+            reqs=self.reqs,
         )
 
     def bind_relayer_for_iter(self, relayer):
