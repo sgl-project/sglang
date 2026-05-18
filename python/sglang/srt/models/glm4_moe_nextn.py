@@ -15,7 +15,6 @@
 """Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 Speculative Decoding."""
 
 import logging
-from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -23,7 +22,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -37,8 +35,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
-
-_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +126,11 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
+        if (
+            is_npu()
+            and get_global_server_args().speculative_draft_model_quantization is None
+        ):
+            quant_config = None
         self.quant_config = quant_config
 
         self.model = Glm4MoeModelNextN(
@@ -155,21 +156,7 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        with ExitStack() as exit_stack:
-            if (
-                _is_npu
-                and self.quant_config is None
-                and get_global_server_args().quantization is not None
-            ):
-                # ascend mtp unquant
-                exit_stack.enter_context(
-                    envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True)
-                )
-                exit_stack.enter_context(
-                    envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
-                )
-            hidden_states = self.model(input_ids, positions, forward_batch)
-
+        hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
