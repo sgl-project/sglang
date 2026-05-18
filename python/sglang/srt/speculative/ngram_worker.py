@@ -13,7 +13,7 @@ from sglang.srt.utils import is_npu
     from sgl_kernel_npu.speculative import (
         reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask,
     )
- 
+
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
