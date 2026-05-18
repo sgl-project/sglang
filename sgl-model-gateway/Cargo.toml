@@ -164,6 +164,11 @@ name = "manual_policy_benchmark"
 harness = false
 path = "benches/manual_policy_benchmark.rs"
 
+[[bench]]
+name = "sse_event_type_alloc"
+harness = false
+path = "benches/sse_event_type_alloc.rs"
+
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = "fat"         # Full LTO for smaller binaries
