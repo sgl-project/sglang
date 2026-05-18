@@ -681,17 +681,15 @@ class USPAttention(nn.Module):
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
         v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
 
-        # Pad to nearest multiple of total_sp_size if needed.
-        pad_len = (total_sp_size - num_rep % total_sp_size) % total_sp_size
-        if pad_len > 0:
-            pad_shape = (q_rep.shape[0], pad_len, *q_rep.shape[2:])
-            q_rep = torch.cat([q_rep, q_rep.new_zeros(pad_shape)], dim=1)
-            k_rep = torch.cat([k_rep, k_rep.new_zeros(pad_shape)], dim=1)
-            v_rep = torch.cat([v_rep, v_rep.new_zeros(pad_shape)], dim=1)
-        padded_rep = num_rep + pad_len
+        assert num_rep % total_sp_size == 0, (
+            f"Number of replicated tokens ({num_rep}) is not divisible by "
+            f"total_sp_size ({total_sp_size}). Ring attention requires an "
+            f"even split of replicated tokens across ranks. Try "
+            f"--ring-degree 1 or adjusting the prompt length."
+        )
 
         # Each rank keeps only its chunk of the replicated tokens.
-        rep_chunk = padded_rep // total_sp_size
+        rep_chunk = num_rep // total_sp_size
         rep_start = sp_rank * rep_chunk
         rep_end = rep_start + rep_chunk
 
