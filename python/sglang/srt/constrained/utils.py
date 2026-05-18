@@ -2,7 +2,9 @@ from typing import Dict, List
 
 import torch
 
-from sglang.srt.constrained.torch_ops.token_filter_torch_ops import set_token_filter_torch
+from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
+    set_token_filter_torch,
+)
 from sglang.srt.constrained.triton_ops.token_filter_ops import set_token_filter_triton
 from sglang.srt.utils import is_hip
 
@@ -18,6 +20,7 @@ def is_legacy_structural_tag(obj: Dict) -> bool:
     else:
         assert obj.get("format", None) is not None
         return False
+
 
 def set_token_filter(
     vocab_mask: torch.Tensor,
