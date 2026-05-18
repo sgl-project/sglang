@@ -1128,6 +1128,12 @@ class EAGLEWorker(TpModelWorker):
             else CaptureHiddenMode.LAST
         )
         batch.spec_info.capture_hidden_mode = capture_mode
+
+        batch.forward_mode = (
+            ForwardMode.DRAFT_EXTEND
+            if not batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
         batch.seq_lens_cpu_cache = seq_lens_cpu
         forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
         forward_batch.return_logprob = False
