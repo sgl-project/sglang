@@ -536,7 +536,13 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     batch.maybe_evict_swa()
 
-    bs = batch.seq_lens.shape[0]
+    # Channel-resolved reads: when SB has a Relayer ctx, the gpu_scalar
+    # channel holds the post-decode seq_lens (with cuda-event cross-stream
+    # sync). Pulling here ensures the page-aware decode allocator and the
+    # last_loc lookup see the same settled value forward will read.
+    seq_lens = batch.relayer_resolve_seq_lens()
+    seq_lens_cpu = batch.relayer_resolve_seq_lens_cpu()
+    bs = seq_lens.shape[0]
 
     if batch.tree_cache.page_size == 1:
         # Non-paged allocation
@@ -544,13 +550,13 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, batch.seq_lens - 1
+            batch.req_pool_indices, seq_lens - 1
         ]
-        seq_lens_next = batch.seq_lens + token_per_req
+        seq_lens_next = seq_lens + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
             seq_lens=seq_lens_next,
-            seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+            seq_lens_cpu=seq_lens_cpu + token_per_req,
             last_loc=last_loc,
             token_per_req=token_per_req,
         )
