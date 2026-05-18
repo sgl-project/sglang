@@ -357,6 +357,12 @@ class Relayer:
         if draft_input is None or draft_input.future_indices is None:
             return
         indices = draft_input.future_indices.indices
+        # Idle / bs=0 batch: producer side (``store_to_map_for_new_batch``)
+        # skips store on empty interval and thus does not ensure the buffer;
+        # mirror that here so consumers do not trip a KeyError. Worker-side
+        # idle draft tensors stay attached to ``draft_input``.
+        if indices.numel() == 0:
+            return
         draft_input.topk_p = self.gpu_scalar.resolve_by_indices(indices, "topk_p")
         draft_input.topk_index = self.gpu_scalar.resolve_by_indices(
             indices, "topk_index"
