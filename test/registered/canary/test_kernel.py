@@ -13,12 +13,10 @@ import torch
 
 from sglang.jit_kernel.kv_cache_canary import (
     CANARY_SLOT_BYTES,
-    FAIL_REASON_HASH,
-    FAIL_REASON_POSITION_MONOTONIC,
-    FAIL_REASON_REQ_ID,
     KERNEL_KIND_HEAD,
     KERNEL_KIND_TAIL,
     VIOLATION_FIELDS,
+    FailReason,
     canary_step,
 )
 from sglang.srt.kv_cache_canary.fingerprint import splitmix64_mix, to_signed_int64
@@ -272,7 +270,7 @@ def test_verify_req_id_mismatch_reports_req_id_fail_reason():
 
     assert int(state["is_errored"].item()) == 1
     first = state["first_violation"].cpu().tolist()
-    assert int(first[1]) == FAIL_REASON_REQ_ID
+    assert int(first[1]) == FailReason.REQ_ID.value
 
 
 def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
@@ -326,7 +324,7 @@ def test_verify_position_mismatch_reports_position_monotonic_fail_reason():
 
     assert int(state["is_errored"].item()) == 1
     first = state["first_violation"].cpu().tolist()
-    assert int(first[1]) == FAIL_REASON_POSITION_MONOTONIC
+    assert int(first[1]) == FailReason.POSITION_MONOTONIC.value
 
 
 def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
@@ -385,7 +383,7 @@ def test_verify_chain_hash_mismatch_reports_hash_fail_reason():
 
     assert int(state["is_errored"].item()) == 1
     first = state["first_violation"].cpu().tolist()
-    assert int(first[1]) == FAIL_REASON_HASH
+    assert int(first[1]) == FailReason.HASH.value
 
 
 def test_inactive_mask_rows_are_skipped_no_io_no_counter():

@@ -33,13 +33,6 @@ class FailReason(enum.IntEnum):
     POSITION_MONOTONIC = 5
 
 
-FAIL_REASON_REQ_ID: int = FailReason.REQ_ID.value
-FAIL_REASON_TOKEN_ID: int = FailReason.TOKEN_ID.value
-FAIL_REASON_POSITION: int = FailReason.POSITION.value
-FAIL_REASON_HASH: int = FailReason.HASH.value
-FAIL_REASON_POSITION_MONOTONIC: int = FailReason.POSITION_MONOTONIC.value
-
-
 @cache_once
 def _jit_canary_module() -> "Module":
     return load_jit(
