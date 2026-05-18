@@ -1491,15 +1491,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         pass
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
-        # Guard: an empty rid would be treated as a startswith-prefix that matches
-        # every request in the scheduler. Refuse it unless abort_all is set.
+        # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        # With a single tokenizer worker, rid_to_state is authoritative, so we can
-        # short-circuit. With multiple workers each worker only sees the requests
-        # it received, so an /abort_request load-balanced to a non-owner worker
-        # must still be forwarded to the scheduler.
+        # Multi-worker: rid_to_state is per-worker, always forward to scheduler.
         if (
             not abort_all
             and self.server_args.tokenizer_worker_num == 1

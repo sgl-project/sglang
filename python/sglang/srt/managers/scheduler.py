@@ -3660,8 +3660,6 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
-                    # Mark FINISH_ABORT so pop_preallocated drops it instead of
-                    # waiting for WAITING_TIMEOUT after transfer eventually starts.
                     if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                         decode_req.req.finished_reason = FINISH_ABORT()
 
