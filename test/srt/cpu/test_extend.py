@@ -383,6 +383,18 @@ class TestExtendAttention(CustomTestCase):
             b_seq_len_extend=[5000],
         )
 
+    def test_extend_attention_gqa_partial_extend_with_prefix(self):
+        self._test_extend_attention_once(
+            B=1,
+            N_CTX=256,
+            H_Q=16,
+            H_KV=4,
+            D=128,
+            DV=96,
+            b_seq_len_prefix=[97],
+            b_seq_len_extend=[37],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

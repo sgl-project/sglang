@@ -1193,7 +1193,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                 layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
 
-                if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
+                if get_moe_a2a_backend().is_megamoe():
                     from sglang.srt.layers.moe.mega_moe import (
                         build_mega_moe_experts_weights,
                     )
@@ -1640,10 +1640,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             elif (
                 _is_hip
                 and (_use_aiter or _use_hip_int4)
-                and get_moe_a2a_backend().is_none()
+                and get_moe_a2a_backend().supports_aiter()
             ):
-                # *EPMoE backends bypass self.runner via run_moe_core, and the
-                # AITER fused func is only registered for ("none", "aiter").
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON

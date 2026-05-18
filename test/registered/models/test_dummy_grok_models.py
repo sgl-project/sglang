@@ -5,7 +5,7 @@ from sglang.test.test_utils import CustomTestCase, is_in_ci, run_bench_one_batch
 
 register_cuda_ci(
     est_time=120,
-    stage="stage-b",
+    stage="base-b",
     runner_config="2-gpu-large",
     disabled="Temporarily disabled",
 )
