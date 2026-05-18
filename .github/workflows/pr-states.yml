@@ -90,7 +90,7 @@ jobs:
               });
               return data.workflow_runs[0] || null;
             }
-            async function findRunWithRetry(workflowFile, maxAttempts = 6, delayMs = 5000) {
+            async function findRunWithRetry(workflowFile, maxAttempts = 3, delayMs = 6000) {
               for (let i = 0; i < maxAttempts; i++) {
                 const run = await findRunBySha(workflowFile);
                 if (run) return run;
@@ -99,11 +99,19 @@ jobs:
               return null;
             }
 
-            const ptRun = hasCI ? await findRunWithRetry('pr-test.yml') : null;
-            // pr-test-extra's gate requires BOTH run-ci AND run-ci-extra
-            // (see pr-test-extra.yml check-changes if-condition), so without
-            // run-ci the extra workflow doesn't run either.
-            const peRun = (hasCI && hasExtra) ? await findRunWithRetry('pr-test-extra.yml') : null;
+            // Query unconditionally: a run may exist from before the label
+            // was removed (deleting a label does NOT cancel an in-flight
+            // workflow). Label state decides only the fallback text when no
+            // real run is found. pr-test-extra's gate requires BOTH run-ci
+            // AND run-ci-extra (see pr-test-extra.yml check-changes
+            // if-condition) -- that's enforced by the gate, not here.
+            //
+            // Retry budget: with the relevant label set, the run may not be
+            // API-visible yet right after push, so retry briefly. Without the
+            // label, any existing run was started earlier and is already in
+            // GH's index -- a single lookup is enough.
+            const ptRun = await findRunWithRetry('pr-test.yml', hasCI ? 3 : 1);
+            const peRun = await findRunWithRetry('pr-test-extra.yml', (hasCI && hasExtra) ? 3 : 1);
 
             // Treat a fully-skipped run as "no real run" — happens when the PR
             // was opened without the label and label was added later (GHA does
@@ -114,14 +122,16 @@ jobs:
             const peBlockedByCIText = ':x: **Blocked** — `run-ci` is required first.';
             const notExtraEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
             const stalePushText = ':warning: **Not run on latest push** — push again to dispatch.';
-            const ptText = !hasCI
-              ? missingCIText
-              : (isReal(ptRun) ? `[Run #${ptRun.id}](${ptRun.html_url})` : '_Not run yet_');
-            const peText = !hasCI
-              ? peBlockedByCIText
-              : !hasExtra
-                ? notExtraEnabledText
-                : (isReal(peRun) ? `[Run #${peRun.id}](${peRun.html_url})` : stalePushText);
+            const ptText = isReal(ptRun)
+              ? `[Run #${ptRun.id}](${ptRun.html_url})`
+              : (!hasCI ? missingCIText : '_Not run yet_');
+            const peText = isReal(peRun)
+              ? `[Run #${peRun.id}](${peRun.html_url})`
+              : !hasCI
+                ? peBlockedByCIText
+                : !hasExtra
+                  ? notExtraEnabledText
+                  : stalePushText;
 
             const outerStart = '<!-- pr-states:start -->';
             const outerEnd   = '<!-- pr-states:end -->';
