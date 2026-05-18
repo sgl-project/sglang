@@ -15,8 +15,11 @@ state.
 """
 
 import logging
+import sys
 import time
 from dataclasses import dataclass
+from importlib import import_module
+from pathlib import Path
 
 import mlx.core as mx
 import psutil
@@ -40,6 +43,18 @@ from sglang.srt.hardware_backend.mlx.kv_cache.kv_pool import MlxKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
+
+
+def _import_sgl_kernel_metal():
+    try:
+        return import_module("sgl_kernel.metal")
+    except ModuleNotFoundError:
+        for parent in Path(__file__).resolve().parents:
+            candidate = parent / "sgl-kernel" / "python"
+            if (candidate / "sgl_kernel" / "metal.py").is_file():
+                sys.path.insert(0, str(candidate))
+                return import_module("sgl_kernel.metal")
+        raise
 
 
 @dataclass
@@ -313,6 +328,85 @@ class MlxModelRunner:
     def pool_size(self) -> int:
         return self._pool_size
 
+    def _maybe_get_rope_state(self):
+        """Build state for the AOT custom Metal RoPE kernel (default-on).
+
+        Returns ``(rope_base, rope_config)``:
+          * ``rope_base`` is the model's RoPE theta when the AOT kernel
+            ``sgl_kernel.metal.rope_pool_fused`` is available and the model
+            uses a supported RoPE variant; ``0.0`` otherwise.
+          * ``rope_config`` is the standard dict ``{head_dim, rope_dim,
+            num_qo_heads, num_kv_heads}``; empty when the kernel is unused.
+
+        The AOT kernel is enabled by default. Set ``SGLANG_DISABLE_CUSTOM_ROPE=1``
+        to force the MLX ``mx.fast.rope`` fallback. The fallback also kicks
+        in automatically when the kernel hasn't been built (``sgl-kernel``
+        Metal extension missing) or when the model uses an unsupported RoPE
+        variant (``traditional=True`` or ``rope_dim != head_dim``).
+        """
+        import os
+
+        if os.environ.get("SGLANG_DISABLE_CUSTOM_ROPE", "0") == "1":
+            return 0.0, {}
+        if hasattr(self, "_cached_rope_state"):
+            return self._cached_rope_state
+        try:
+            metal = _import_sgl_kernel_metal()
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "AOT Metal RoPE kernel not available (%s) - falling back to "
+                "mx.fast.rope. Build the kernel with: "
+                "`TOOLCHAINS=metal python sgl-kernel/setup_metal.py build_ext --inplace` "
+                "to enable.",
+                exc,
+            )
+            self._cached_rope_state = (0.0, {})
+            return self._cached_rope_state
+
+        if not metal.is_available():
+            logger.info(
+                "AOT Metal RoPE kernel not available - falling back to "
+                "mx.fast.rope. Build the kernel with: "
+                "`TOOLCHAINS=metal python sgl-kernel/setup_metal.py build_ext --inplace` "
+                "to enable."
+            )
+            self._cached_rope_state = (0.0, {})
+            return self._cached_rope_state
+        layer_list, attn_attr = find_attention_layers(self.model)
+        if not layer_list:
+            self._cached_rope_state = (0.0, {})
+            return self._cached_rope_state
+        sample_attn = getattr(layer_list[0], attn_attr)
+        if isinstance(sample_attn, MLXAttentionWrapper):
+            sample_attn = sample_attn._inner
+        rope = getattr(sample_attn, "rope", None)
+        if rope is None or getattr(rope, "traditional", False):
+            self._cached_rope_state = (0.0, {})
+            return self._cached_rope_state
+        rope_dim = int(getattr(rope, "dims", 0))
+        if rope_dim == 0:
+            self._cached_rope_state = (0.0, {})
+            return self._cached_rope_state
+        n_kv_heads, head_dim, _ = self._get_attn_config()
+        if rope_dim != head_dim:
+            # AOT kernel currently requires rope_dim == head_dim.
+            self._cached_rope_state = (0.0, {})
+            return self._cached_rope_state
+        base = float(getattr(rope, "base", 10000.0))
+        cfg = {
+            "head_dim": head_dim,
+            "rope_dim": rope_dim,
+            "num_qo_heads": int(sample_attn.n_heads),
+            "num_kv_heads": int(n_kv_heads),
+        }
+        logger.info(
+            f"AOT Metal RoPE kernel ENABLED: head_dim={head_dim}, "
+            f"n_heads={cfg['num_qo_heads']}, n_kv={cfg['num_kv_heads']}, "
+            f"base={base}"
+        )
+        self._cached_rope_state = (base, cfg)
+        return self._cached_rope_state
+
     def init_kv_pool(self, req_to_token_pool: ReqToTokenPool) -> None:
         """Create MlxKVPool (+1 for padding slot 0) and wire scheduler pools."""
         self._req_to_token_pool = req_to_token_pool
@@ -378,7 +472,7 @@ class MlxModelRunner:
         end = cache_start + len(slot_ids)
         slot_ids_mx = mx.array(slot_ids, dtype=mx.int32)
         # TODO: Standardize ContiguousKVCache size to avoid transpose
-        # Transpose cache (1, n_kv_heads, S, head_dim) → pool (S, n_kv_heads, head_dim)
+        # Transpose cache (1, n_kv_heads, S, head_dim) to pool (S, n_kv_heads, head_dim)
         k_all = mx.stack(
             [
                 cache[i].keys[0, :, cache_start:end, :].transpose(1, 0, 2)
@@ -424,6 +518,45 @@ class MlxModelRunner:
             return
         for req_id in list(self._req_caches.keys()):
             self._sync_decode_kv_to_pool(req_id)
+
+    def _decode_rope_kwargs(
+        self,
+        req_ids: list[str],
+        caches: list[list[ContiguousKVCache | PoolBackedCache]],
+    ) -> dict:
+        """Return BatchedDecodeContext kwargs for the AOT RoPE path."""
+        rope_base, rope_config = self._maybe_get_rope_state()
+        if rope_base <= 0.0 or not rope_config or self._kv_pool is None:
+            return {}
+
+        new_token_slots = None
+        if self._req_to_token_pool is not None:
+            try:
+                slot_ids = []
+                for i, rid in enumerate(req_ids):
+                    req_pool_idx = self._req_pool_idx.get(rid)
+                    if req_pool_idx is None:
+                        raise KeyError(rid)
+                    slot = int(
+                        self._req_to_token_pool.req_to_token[
+                            req_pool_idx, caches[i][0].offset
+                        ].item()
+                    )
+                    slot_ids.append(slot)
+                new_token_slots = mx.array(slot_ids, dtype=mx.int32)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "AOT RoPE: failed to resolve new-token slots (%s); "
+                    "falling back to RoPE-only for this decode step",
+                    exc,
+                )
+
+        return {
+            "rope_config": rope_config,
+            "rope_base": rope_base,
+            "kv_pool": self._kv_pool,
+            "new_token_slots": new_token_slots,
+        }
 
     def decode_batch(
         self,
@@ -488,7 +621,7 @@ class MlxModelRunner:
         if new_token_count > 0:
             extend_tokens = new_token_ids
         else:
-            # Full cache hit — rerun last token to get next-token logits
+            # Full cache hit - rerun last token to get next-token logits
             extend_tokens = full_token_ids[-1:]
             for c in cache:
                 c.offset = max(c.offset - 1, 0)
@@ -500,7 +633,7 @@ class MlxModelRunner:
         last_logits = logits[:, -1, :]
         lazy_token = mx.argmax(last_logits, axis=-1)
 
-        # Convert PoolBackedCache → ContiguousKVCache for decode.
+        # Convert PoolBackedCache to ContiguousKVCache for decode.
         # This appends a lazy slice-assign onto the forward graph; the
         # arrays get materialised when the caller evaluates lazy_token.
         if prefix_len > 0:
@@ -619,6 +752,7 @@ class MlxModelRunner:
             batch_size=batch_size,
             seq_lens=seq_lens,
             layer_caches=layer_caches,
+            **self._decode_rope_kwargs(req_ids, caches),
         )
         set_context(ctx)
         try:
@@ -668,7 +802,7 @@ class MlxModelRunner:
         # to accommodate dynamic growing like ContiguousKVCache.update_and_fetch.
 
         # After prev's graph ran, each ContiguousKVCache.offset was
-        # bumped by one per layer — attention wrapper's `write_token`
+        # bumped by one per layer - attention wrapper's `write_token`
         # mutates the Python offset synchronously at graph-build time.
         # So layer-0 offsets reflect the position the NEW token will
         # be written at in step N+1 (and equivalently the RoPE offset).
@@ -694,6 +828,7 @@ class MlxModelRunner:
             batch_size=batch_size,
             seq_lens=seq_lens,
             layer_caches=layer_caches,
+            **self._decode_rope_kwargs(prev.req_ids, caches),
         )
         set_context(ctx)
         try:

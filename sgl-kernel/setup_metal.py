@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import importlib
+import json
 import os
 import platform
 import shutil
@@ -40,17 +41,46 @@ def _ensure_toolchain():
             "Apple toolchain not found. Install the Xcode Command Line Tools "
             "with `xcode-select --install` (or a full Xcode install) and retry."
         )
+    _resolve_metal_toolchain()
+    missing = []
+    for tool in ("metal", "metallib"):
+        try:
+            subprocess.check_output(
+                ["xcrun", "-sdk", "macosx", "--find", tool],
+                stderr=subprocess.STDOUT,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            missing.append(tool)
+    if missing:
+        raise SystemExit(
+            "Apple Metal shader toolchain not found: "
+            f"{', '.join(missing)}. Install a full Xcode and, on recent "
+            "Xcode versions, run `sudo xcodebuild -downloadComponent "
+            "MetalToolchain`, then retry."
+        )
+
+
+def _resolve_metal_toolchain():
+    """Prefer the installed MetalToolchain identifier over plain TOOLCHAINS=metal."""
+    requested = os.environ.get("TOOLCHAINS")
+    if requested and requested != "metal":
+        return
     try:
-        subprocess.check_output(
-            ["xcrun", "-sdk", "macosx", "metal", "--version"],
+        raw = subprocess.check_output(
+            ["xcodebuild", "-showComponent", "MetalToolchain", "-json"],
+            text=True,
             stderr=subprocess.STDOUT,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        raise SystemExit(
-            "Apple Metal shader compiler not found. Install a full Xcode "
-            "(not just Command Line Tools) so that `xcrun -sdk macosx metal` "
-            "is available, then retry."
-        ) from exc
+        info = json.loads(raw)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError):
+        if requested is None:
+            os.environ["TOOLCHAINS"] = "metal"
+        return
+    identifier = info.get("toolchainIdentifier")
+    if info.get("status") == "installed" and identifier:
+        os.environ["TOOLCHAINS"] = identifier
+    elif requested is None:
+        os.environ["TOOLCHAINS"] = "metal"
 
 
 def _ensure_build_requires():
@@ -96,9 +126,11 @@ metallib_name = "sgl_metal_kernels.metallib"
 # (compiled with `c++`). Add new kernels by appending to these lists.
 metal_shader_sources = [
     "csrc/metal/placeholder.metal",
+    "csrc/metal/rope_pool_fused.metal",
 ]
 cxx_sources = [
     "csrc/metal/placeholder.cpp",
+    "csrc/metal/rope_pool_fused.cpp",
 ]
 
 # Header search paths shared by both the Metal shader compiler and the C++
@@ -131,15 +163,18 @@ class BuildMetalExtension(build_ext):
             print(f"[sgl-kernel:metal] using ccache at {ccache}", flush=True)
 
         python_exe = Path(sys.executable)
-        python_include = Path(sysconfig.get_paths()["include"])
+        python_include = Path(
+            sysconfig.get_config_var("INCLUDEPY") or sysconfig.get_paths()["include"]
+        )
         python_lib = Path(sysconfig.get_config_var("LIBDIR"))
         # Match the deployment target that Python itself was built against
         # unless the user overrides it. MLX's prebuilt wheels may require a
         # higher minimum; in that case set MACOSX_DEPLOYMENT_TARGET explicitly.
-        deployment_target = os.environ.get(
-            "MACOSX_DEPLOYMENT_TARGET",
-            str(sysconfig.get_config_var("MACOSX_DEPLOYMENT_TARGET") or "11.0"),
-        )
+        deployment_target = os.environ.get("MACOSX_DEPLOYMENT_TARGET")
+        if deployment_target is None:
+            deployment_target = subprocess.check_output(
+                ["sw_vers", "-productVersion"], text=True
+            ).strip()
 
         def _python_eval(expr: str) -> str:
             return subprocess.check_output(
@@ -275,6 +310,11 @@ class BuildMetalExtension(build_ext):
         staged_metallib = ext_path.parent / metallib_path.name
         if metallib_path.resolve() != staged_metallib.resolve():
             shutil.copy2(metallib_path, staged_metallib)
+        # `build_ext --inplace` copies the extension module into package_dir but
+        # does not copy package_data. Keep source-tree manual tests working.
+        inplace_metallib = root / "python" / "sgl_kernel" / metallib_path.name
+        if staged_metallib.resolve() != inplace_metallib.resolve():
+            shutil.copy2(metallib_path, inplace_metallib)
 
 
 ext_modules = [
