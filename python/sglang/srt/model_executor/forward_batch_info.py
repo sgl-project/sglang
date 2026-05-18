@@ -374,9 +374,17 @@ class ForwardData:
     def extend_lens(self) -> Optional[List[int]]:
         return self.extend_seq_lens
 
+    @extend_lens.setter
+    def extend_lens(self, value: Optional[List[int]]):
+        self.extend_seq_lens = value
+
     @property
     def prefix_lens(self) -> Optional[List[int]]:
         return self.extend_prefix_lens
+
+    @prefix_lens.setter
+    def prefix_lens(self, value: Optional[List[int]]):
+        self.extend_prefix_lens = value
 
     def batch_size(self) -> int:
         return self.seq_lens.shape[0]
