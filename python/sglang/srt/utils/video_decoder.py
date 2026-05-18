@@ -113,7 +113,11 @@ class VideoDecoderWrapper:
         """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory)."""
         import torch
 
-        if _BACKEND == "torchcodec" and self._num_decode_threads != 1 and len(indices) > 1:
+        if (
+            _BACKEND == "torchcodec"
+            and self._num_decode_threads != 1
+            and len(indices) > 1
+        ):
             num_threads = self._num_decode_threads
             if num_threads <= 0:
                 num_threads = os.cpu_count() or 4

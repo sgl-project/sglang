@@ -608,7 +608,8 @@ class MiMoProcessor:
                 )
 
         vdw = VideoDecoderWrapper(
-            video_blob, device="cpu",
+            video_blob,
+            device="cpu",
             num_decode_threads=self.video_decode_num_threads,
         )
         try:
@@ -635,7 +636,10 @@ class MiMoProcessor:
             all_patches, all_grids = [], []
             for img in mm_data:
                 img_tensor, _, _ = self.get_visual_transform(
-                    img, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels,
+                    img,
+                    factor=factor,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
                     device=self.device,
                 )
                 patches, grid = self._flatten_visual_inputs(img_tensor, "image")
