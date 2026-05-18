@@ -54,13 +54,21 @@ def canary_step(
     src_buf: torch.Tensor,
     dst_buf: torch.Tensor,
     slot_stride_bytes: int,
-    slot_indices: torch.Tensor,
-    expected_req_ids: torch.Tensor,
-    expected_token_ids: torch.Tensor,
-    expected_positions: torch.Tensor,
-    expected_prev_hashes: torch.Tensor,
-    verify_mask: torch.Tensor,
-    verify_seq_positions: torch.Tensor,
+    verify_slot_indices: torch.Tensor,
+    verify_token_ids: torch.Tensor,
+    verify_positions: torch.Tensor,
+    verify_req_ids: torch.Tensor,
+    verify_prev_slot_indices: torch.Tensor,
+    verify_active_mask: torch.Tensor,
+    write_slot_indices: torch.Tensor,
+    write_token_ids: torch.Tensor,
+    write_positions: torch.Tensor,
+    write_req_ids: torch.Tensor,
+    write_req_seed_slot_indices: torch.Tensor,
+    write_req_entry_starts: torch.Tensor,
+    write_req_entry_counts: torch.Tensor,
+    write_req_active_mask: torch.Tensor,
+    seed: int,
     violation_ring: torch.Tensor,
     violation_ring_valid: torch.Tensor,
     violation_write_index: torch.Tensor,
@@ -73,55 +81,65 @@ def canary_step(
 ) -> None:
     """Launch one KV-cache canary step.
 
-    Each entry is either a verify (``verify_mask == 1``, reads ``src_buf``
-    at the given slot index, checks the stored 4-int64 fingerprint against
-    expected values, including the monotonic ``input_position`` from
-    ``verify_seq_positions``) or a write (``verify_mask == 0``, writes the
-    expected fingerprint into ``dst_buf`` at the slot index).
+    The kernel runs two distinct workloads sharing one grid:
+
+    1. **Verify entries** (per-thread): read a slot's stored fingerprint,
+       compute the expected ``prev_hash`` by reading the previous slot and
+       running ``splitmix64_mix`` on-device, then compare against the four
+       expected fields (``req_id``, ``token_id``, ``position``, ``prev_hash``)
+       — one independent fail_reason per field.
+    2. **Write-req chains** (per-thread, one driver thread per request): walk
+       the splitmix64 chain across all writes for that req, seeded from
+       either ``kSeed`` (``write_req_seed_slot_indices == -1``) or the
+       canary slot at ``K_req - 1``, and store ``(req_id, token_id, position,
+       prev_hash)`` into each slot in order.
+
+    The host emits **raw input data** (``token_id``, ``position``) from the
+    sglang ``ForwardBatch`` — no host-side hash computation. ``seed`` is
+    ``CanaryConfig.seed``.
 
     Args:
-        src_buf:               uint8 flatten view of the source layer-shaped shadow
-                               tensor (verify path reads from here).
-        dst_buf:               uint8 flatten view of the destination shadow tensor
-                               (write path stores into here).
-        slot_stride_bytes:     bytes per logical slot in both buffers.
-        slot_indices:          int64 [num_slots]. Per-entry slot index in
-                               ``src_buf`` / ``dst_buf``.
-        expected_req_ids:      int64 [num_slots]. Expected ``req_pool_idx``.
-        expected_token_ids:    int64 [num_slots]. Expected ``input_token_id``.
-        expected_positions:    int64 [num_slots]. Expected ``input_position``.
-        expected_prev_hashes:  int64 [num_slots]. Expected chain ``prev_hash``.
-        verify_mask:           int32 [num_slots]. ``1`` = verify-then-skip-write,
-                               ``0`` = write-only.
-        verify_seq_positions:  int64 [num_slots]. Expected 0..K sequence
-                               position for verify entries (``-1`` for writes).
-                               Checked independently of any req→slot table.
-        violation_ring:        int64 [ring_capacity, 8]. Circular log of
-                               violations (ring buffer).
-        violation_ring_valid:  int32 [ring_capacity]. Per-row valid latch
-                               (0 = empty, 1 = writing, 2 = readable).
-        violation_write_index: int32 [1]. ``atomicAdd`` target for sequence #.
-        first_violation:       int64 [8]. First-violation latch (never
-                               overwritten by cascades).
-        first_violation_set:   int32 [1]. CAS guard for ``first_violation``.
-        is_errored:            int32 [1]. ``atomicOr`` flag; set when ANY
-                               thread records a violation.
-        slot_run_counter:      int64 [1]. ``+= num_slots`` per launch.
-        kernel_run_counter:    int64 [1]. ``+= 1`` per launch.
-        kernel_kind:           ``KERNEL_KIND_HEAD`` or ``KERNEL_KIND_TAIL``.
+        src_buf:             uint8 flatten view of the source shadow tensor
+                             (verify reads + prev-slot reads here).
+        dst_buf:             uint8 flatten view of the destination shadow.
+        slot_stride_bytes:   bytes per logical slot in both buffers.
+        verify_*:            per-verify-entry arrays. ``verify_prev_slot_indices``
+                             at ``-1`` means "position 0, expected prev_hash =
+                             kSeed". ``verify_active_mask`` at 0 means
+                             "skip-sentinel padding for cuda graph".
+        write_*:             per-write-entry arrays (pure data; driver threads
+                             read these).
+        write_req_*:         per-write-req arrays, one row per req with new
+                             writes. The driver thread walks
+                             ``[entry_starts, entry_starts + entry_counts)``
+                             sequentially, advancing splitmix64.
+        seed:                ``CanaryConfig.seed`` (chain head).
+        violation_*:         GPU ring + first-violation latch + is_errored
+                             flag for error reporting.
+        slot_run_counter:    int64 [1]. ``+= num_active_slots`` per launch.
+        kernel_run_counter:  int64 [1]. ``+= 1`` per launch.
+        kernel_kind:         ``KERNEL_KIND_HEAD`` or ``KERNEL_KIND_TAIL``.
     """
     module = _jit_canary_module()
     module.canary_step(
         src_buf,
         dst_buf,
         slot_stride_bytes,
-        slot_indices,
-        expected_req_ids,
-        expected_token_ids,
-        expected_positions,
-        expected_prev_hashes,
-        verify_mask,
-        verify_seq_positions,
+        verify_slot_indices,
+        verify_token_ids,
+        verify_positions,
+        verify_req_ids,
+        verify_prev_slot_indices,
+        verify_active_mask,
+        write_slot_indices,
+        write_token_ids,
+        write_positions,
+        write_req_ids,
+        write_req_seed_slot_indices,
+        write_req_entry_starts,
+        write_req_entry_counts,
+        write_req_active_mask,
+        seed,
         violation_ring,
         violation_ring_valid,
         violation_write_index,

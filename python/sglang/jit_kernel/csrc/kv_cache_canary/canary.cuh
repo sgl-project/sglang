@@ -33,28 +33,46 @@ constexpr int kFailReasonHash = 4;
 constexpr int kFailReasonPositionMonotonic = 5;
 
 struct CanaryParams {
-  // Source buffer: read prior canary slots from here (verification target).
+  // Source buffer: read prior canary slots from here (verification target,
+  // and the prev-slot read source for chain hash recomputation).
   const uint8_t* __restrict__ src_buf;
   // Destination buffer: write the new canary slots here.
   uint8_t* __restrict__ dst_buf;
   // Bytes per slot in both src and dst (= per-slot stride of the underlying real-layer-shaped tensor).
   int64_t slot_stride_bytes;
 
-  // Per-token-slot inputs. All have shape [num_slots].
-  const int64_t* __restrict__ slot_indices;
-  const int64_t* __restrict__ expected_req_ids;
-  const int64_t* __restrict__ expected_token_ids;
-  const int64_t* __restrict__ expected_positions;
-  const int64_t* __restrict__ expected_prev_hashes;
-  // 1 = verify-then-write, 0 = write-only (first-write skip)
-  const int32_t* __restrict__ verify_mask;
-  // Per-verify-slot 0..K monotonic expected position; -1 for write-only slots.
-  // Position-monotonic check (README §3 (b)) compares the slot's stored
-  // ``input_position`` against this value WITHOUT consulting any expected
-  // table that derives from the request→token map. It is the indirection-free
-  // check that catches map-pointing-wrong bugs.
-  const int64_t* __restrict__ verify_seq_positions;
-  uint32_t num_slots;
+  // Per-verify-entry arrays, length == num_verify.
+  const int64_t* __restrict__ verify_slot_indices;
+  const int64_t* __restrict__ verify_token_ids;
+  const int64_t* __restrict__ verify_positions;
+  const int64_t* __restrict__ verify_req_ids;
+  // For verify entry i, the slot index of position (verify_positions[i] - 1)
+  // for the same req. -1 means "this is position 0; expected prev_hash =
+  // kSeed". The kernel reads (prev_token, prev_position, prev_prev_hash) from
+  // that slot and recomputes splitmix64_mix on-device.
+  const int64_t* __restrict__ verify_prev_slot_indices;
+  // 1 = active verify entry, 0 = skip-sentinel padding (cuda graph fixed
+  // buffer capacity exceeds plan size).
+  const int32_t* __restrict__ verify_active_mask;
+  uint32_t num_verify;
+
+  // Per-write-entry arrays, length == num_write. Pure data; read by the
+  // per-write-req driver thread that walks the chain.
+  const int64_t* __restrict__ write_slot_indices;
+  const int64_t* __restrict__ write_token_ids;
+  const int64_t* __restrict__ write_positions;
+  const int64_t* __restrict__ write_req_ids;
+
+  // Per-write-req arrays, length == num_write_reqs. One driver thread per row
+  // walks the splitmix64 chain across this req's writes in sequence.
+  const int64_t* __restrict__ write_req_seed_slot_indices;  // -1 = kSeed
+  const int64_t* __restrict__ write_req_entry_starts;
+  const int64_t* __restrict__ write_req_entry_counts;
+  const int32_t* __restrict__ write_req_active_mask;
+  uint32_t num_write_reqs;
+
+  // splitmix64 chain seed (== CanaryConfig.seed).
+  uint64_t seed;
 
   // Violation ring + first-violation slot + is_errored flag.
   int64_t* __restrict__ violation_ring;          // [ring_capacity, kViolationFields]
@@ -77,6 +95,19 @@ __device__ inline int64_t load_field(const uint8_t* buf, int64_t slot_idx, int64
 __device__ inline void store_field(uint8_t* buf, int64_t slot_idx, int64_t stride, int field, int64_t value) {
   int64_t* p = reinterpret_cast<int64_t*>(buf + slot_idx * stride);
   p[field] = value;
+}
+
+// Standard splitmix64 finalizer. Bit-wise equivalent to the Python reference
+// in ``srt/kv_cache_canary/fingerprint.py``. ``test_splitmix64_consistency.py``
+// cross-validates the two implementations.
+__device__ inline uint64_t splitmix64_finalize(uint64_t x) {
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+  return x ^ (x >> 31);
+}
+
+__device__ inline uint64_t splitmix64_mix(uint64_t prev_hash, uint64_t token_id, uint64_t position) {
+  return splitmix64_finalize(prev_hash ^ token_id ^ position);
 }
 
 __device__ inline void record_violation(
@@ -141,73 +172,119 @@ __device__ inline void record_violation(
   atomicOr(reinterpret_cast<unsigned int*>(p.is_errored), 1u);
 }
 
+__device__ inline void run_verify_entry(const CanaryParams& p, uint32_t tid) {
+  if (p.verify_active_mask[tid] == 0) {
+    return;
+  }
+  const int64_t slot_idx = p.verify_slot_indices[tid];
+  const int64_t expected_req_id = p.verify_req_ids[tid];
+  const int64_t expected_token_id = p.verify_token_ids[tid];
+  const int64_t expected_position = p.verify_positions[tid];
+  const int64_t prev_slot_idx = p.verify_prev_slot_indices[tid];
+
+  const int64_t actual_req_id = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId);
+  const int64_t actual_token_id = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
+  const int64_t actual_position = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+  const uint64_t actual_prev_hash =
+      static_cast<uint64_t>(load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
+
+  uint64_t expected_prev_hash;
+  if (prev_slot_idx < 0) {
+    expected_prev_hash = p.seed;
+  } else {
+    const uint64_t prev_prev_hash =
+        static_cast<uint64_t>(load_field(p.src_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
+    const int64_t prev_token = load_field(p.src_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
+    const int64_t prev_position = load_field(p.src_buf, prev_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+    expected_prev_hash =
+        splitmix64_mix(prev_prev_hash, static_cast<uint64_t>(prev_token), static_cast<uint64_t>(prev_position));
+  }
+
+  // Four independent fail_reason categories (README §3):
+  // (b1) req_id, (b2) token_id, (b3) position monotonic, (a) chain hash.
+  int32_t fail_reason = 0;
+  if (actual_req_id != expected_req_id) {
+    fail_reason = kFailReasonReqId;
+  } else if (actual_token_id != expected_token_id) {
+    fail_reason = kFailReasonTokenId;
+  } else if (actual_position != expected_position) {
+    fail_reason = kFailReasonPositionMonotonic;
+  } else if (actual_prev_hash != expected_prev_hash) {
+    fail_reason = kFailReasonHash;
+  }
+  if (fail_reason != 0) {
+    record_violation(
+        p,
+        fail_reason,
+        slot_idx,
+        actual_req_id,
+        actual_token_id,
+        actual_position,
+        expected_prev_hash,
+        actual_prev_hash);
+  }
+  atomicAdd(reinterpret_cast<unsigned long long*>(p.slot_run_counter), 1ULL);
+}
+
+__device__ inline void run_write_req_chain(const CanaryParams& p, uint32_t req_tid) {
+  if (p.write_req_active_mask[req_tid] == 0) {
+    return;
+  }
+  const int64_t entry_start = p.write_req_entry_starts[req_tid];
+  const int64_t entry_count = p.write_req_entry_counts[req_tid];
+  if (entry_count <= 0) {
+    return;
+  }
+  const int64_t seed_slot_idx = p.write_req_seed_slot_indices[req_tid];
+
+  // Seed of the chain at the first write entry's position. If seed_slot < 0,
+  // K_req_old == 0 so we start from kSeed; otherwise read the canary slot at
+  // (K_req_old - 1) and recompute splitmix64_mix from its stored
+  // (prev_hash, token_id, position) to derive the prev_hash field for the
+  // first new write.
+  uint64_t prev_hash;
+  if (seed_slot_idx < 0) {
+    prev_hash = p.seed;
+  } else {
+    const uint64_t seed_prev_hash =
+        static_cast<uint64_t>(load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
+    const int64_t seed_token = load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
+    const int64_t seed_position = load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+    prev_hash =
+        splitmix64_mix(seed_prev_hash, static_cast<uint64_t>(seed_token), static_cast<uint64_t>(seed_position));
+  }
+
+  for (int64_t k = 0; k < entry_count; ++k) {
+    const int64_t i = entry_start + k;
+    const int64_t slot_idx = p.write_slot_indices[i];
+    const int64_t req_id = p.write_req_ids[i];
+    const int64_t token_id = p.write_token_ids[i];
+    const int64_t position = p.write_positions[i];
+
+    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId, req_id);
+    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId, token_id);
+    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition, position);
+    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(prev_hash));
+
+    prev_hash = splitmix64_mix(prev_hash, static_cast<uint64_t>(token_id), static_cast<uint64_t>(position));
+    atomicAdd(reinterpret_cast<unsigned long long*>(p.slot_run_counter), 1ULL);
+  }
+}
+
 __global__ void canary_kernel(const CanaryParams __grid_constant__ p) {
   const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= p.num_slots) {
+  const uint32_t total_threads = p.num_verify + p.num_write_reqs;
+  if (tid >= total_threads) {
     return;
   }
 
-  const int32_t do_verify = p.verify_mask[tid];
-  // verify_mask sentinel ``-1`` = padding row in a fixed-size pre-allocated
-  // launch (cuda-graph-capturable). Skip entirely: no slot I/O, no counter
-  // increment. ``0`` = write, ``1`` = verify; both real entries fall through.
-  if (do_verify < 0) {
-    return;
-  }
-
-  const int64_t slot_idx = p.slot_indices[tid];
-  const int64_t expected_req_id = p.expected_req_ids[tid];
-  const int64_t expected_token_id = p.expected_token_ids[tid];
-  const int64_t expected_position = p.expected_positions[tid];
-  const uint64_t expected_prev_hash = static_cast<uint64_t>(p.expected_prev_hashes[tid]);
-  const int64_t verify_seq_position = p.verify_seq_positions[tid];
-
-  if (do_verify != 0) {
-    const int64_t actual_req_id = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId);
-    const int64_t actual_token_id = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
-    const int64_t actual_position = load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
-    const uint64_t actual_prev_hash =
-        static_cast<uint64_t>(load_field(p.src_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
-
-    int32_t fail_reason = 0;
-    // (b) position monotonic check. Independent of any req→token table:
-    // the slot's stored ``input_position`` field must equal the expected
-    // sequence index 0..K we baked into the verify entry.
-    if (verify_seq_position >= 0 && actual_position != verify_seq_position) {
-      fail_reason = kFailReasonPositionMonotonic;
-    } else if (actual_req_id != expected_req_id) {
-      fail_reason = kFailReasonReqId;
-    } else if (actual_token_id != expected_token_id) {
-      fail_reason = kFailReasonTokenId;
-    } else if (actual_position != expected_position) {
-      fail_reason = kFailReasonPosition;
-    } else if (actual_prev_hash != expected_prev_hash) {
-      fail_reason = kFailReasonHash;
-    }
-    if (fail_reason != 0) {
-      record_violation(
-          p,
-          fail_reason,
-          slot_idx,
-          actual_req_id,
-          actual_token_id,
-          actual_position,
-          expected_prev_hash,
-          actual_prev_hash);
-    }
+  if (tid < p.num_verify) {
+    run_verify_entry(p, tid);
   } else {
-    // do_verify == 0 means "write-only" entry. Per README §2, slot[i] stores
-    // the chain hash *before* position i (= ``expected_prev_hash``); the host
-    // advances the chain itself, so we do NOT mix the current token into the
-    // value we store.
-    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldReqId, expected_req_id);
-    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId, expected_token_id);
-    store_field(p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition, expected_position);
-    store_field(
-        p.dst_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(expected_prev_hash));
+    const uint32_t req_tid = tid - p.num_verify;
+    run_write_req_chain(p, req_tid);
   }
 
-  atomicAdd(reinterpret_cast<unsigned long long*>(p.slot_run_counter), 1ULL);
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     atomicAdd(reinterpret_cast<unsigned long long*>(p.kernel_run_counter), 1ULL);
   }
@@ -217,13 +294,21 @@ void canary_step(
     tvm::ffi::TensorView src_buf,
     tvm::ffi::TensorView dst_buf,
     int64_t slot_stride_bytes,
-    tvm::ffi::TensorView slot_indices,
-    tvm::ffi::TensorView expected_req_ids,
-    tvm::ffi::TensorView expected_token_ids,
-    tvm::ffi::TensorView expected_positions,
-    tvm::ffi::TensorView expected_prev_hashes,
-    tvm::ffi::TensorView verify_mask,
-    tvm::ffi::TensorView verify_seq_positions,
+    tvm::ffi::TensorView verify_slot_indices,
+    tvm::ffi::TensorView verify_token_ids,
+    tvm::ffi::TensorView verify_positions,
+    tvm::ffi::TensorView verify_req_ids,
+    tvm::ffi::TensorView verify_prev_slot_indices,
+    tvm::ffi::TensorView verify_active_mask,
+    tvm::ffi::TensorView write_slot_indices,
+    tvm::ffi::TensorView write_token_ids,
+    tvm::ffi::TensorView write_positions,
+    tvm::ffi::TensorView write_req_ids,
+    tvm::ffi::TensorView write_req_seed_slot_indices,
+    tvm::ffi::TensorView write_req_entry_starts,
+    tvm::ffi::TensorView write_req_entry_counts,
+    tvm::ffi::TensorView write_req_active_mask,
+    int64_t seed,
     tvm::ffi::TensorView violation_ring,
     tvm::ffi::TensorView violation_ring_valid,
     tvm::ffi::TensorView violation_write_index,
@@ -235,22 +320,40 @@ void canary_step(
     int64_t kernel_kind) {
   using namespace host;
 
-  SymbolicSize N = {"num_slots"};
+  SymbolicSize N_verify = {"num_verify"};
+  SymbolicSize N_write = {"num_write"};
+  SymbolicSize N_write_reqs = {"num_write_reqs"};
   SymbolicDevice device_;
   device_.set_options<kDLCUDA>();
 
-  TensorMatcher({N})
+  TensorMatcher({N_verify})
       .with_dtype<int64_t>()
       .with_device<kDLCUDA>(device_)
-      .verify(slot_indices)
-      .verify(expected_req_ids)
-      .verify(expected_token_ids)
-      .verify(expected_positions)
-      .verify(expected_prev_hashes)
-      .verify(verify_seq_positions);
-  TensorMatcher({N}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_mask);
+      .verify(verify_slot_indices)
+      .verify(verify_token_ids)
+      .verify(verify_positions)
+      .verify(verify_req_ids)
+      .verify(verify_prev_slot_indices);
+  TensorMatcher({N_verify}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_active_mask);
 
-  const uint32_t num_slots = static_cast<uint32_t>(N.unwrap());
+  TensorMatcher({N_write})
+      .with_dtype<int64_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(write_slot_indices)
+      .verify(write_token_ids)
+      .verify(write_positions)
+      .verify(write_req_ids);
+
+  TensorMatcher({N_write_reqs})
+      .with_dtype<int64_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(write_req_seed_slot_indices)
+      .verify(write_req_entry_starts)
+      .verify(write_req_entry_counts);
+  TensorMatcher({N_write_reqs}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(write_req_active_mask);
+
+  const uint32_t num_verify = static_cast<uint32_t>(N_verify.unwrap());
+  const uint32_t num_write_reqs = static_cast<uint32_t>(N_write_reqs.unwrap());
   const DLDevice device = device_.unwrap();
 
   RuntimeCheck(
@@ -269,7 +372,8 @@ void canary_step(
       violation_ring_valid.size(0) == static_cast<int64_t>(ring_capacity),
       "canary: violation_ring_valid first dim must equal ring_capacity");
 
-  if (num_slots == 0) {
+  const uint32_t total_threads = num_verify + num_write_reqs;
+  if (total_threads == 0) {
     return;
   }
 
@@ -277,14 +381,23 @@ void canary_step(
   p.src_buf = static_cast<const uint8_t*>(src_buf.data_ptr());
   p.dst_buf = static_cast<uint8_t*>(dst_buf.data_ptr());
   p.slot_stride_bytes = slot_stride_bytes;
-  p.slot_indices = static_cast<const int64_t*>(slot_indices.data_ptr());
-  p.expected_req_ids = static_cast<const int64_t*>(expected_req_ids.data_ptr());
-  p.expected_token_ids = static_cast<const int64_t*>(expected_token_ids.data_ptr());
-  p.expected_positions = static_cast<const int64_t*>(expected_positions.data_ptr());
-  p.expected_prev_hashes = static_cast<const int64_t*>(expected_prev_hashes.data_ptr());
-  p.verify_mask = static_cast<const int32_t*>(verify_mask.data_ptr());
-  p.verify_seq_positions = static_cast<const int64_t*>(verify_seq_positions.data_ptr());
-  p.num_slots = num_slots;
+  p.verify_slot_indices = static_cast<const int64_t*>(verify_slot_indices.data_ptr());
+  p.verify_token_ids = static_cast<const int64_t*>(verify_token_ids.data_ptr());
+  p.verify_positions = static_cast<const int64_t*>(verify_positions.data_ptr());
+  p.verify_req_ids = static_cast<const int64_t*>(verify_req_ids.data_ptr());
+  p.verify_prev_slot_indices = static_cast<const int64_t*>(verify_prev_slot_indices.data_ptr());
+  p.verify_active_mask = static_cast<const int32_t*>(verify_active_mask.data_ptr());
+  p.num_verify = num_verify;
+  p.write_slot_indices = static_cast<const int64_t*>(write_slot_indices.data_ptr());
+  p.write_token_ids = static_cast<const int64_t*>(write_token_ids.data_ptr());
+  p.write_positions = static_cast<const int64_t*>(write_positions.data_ptr());
+  p.write_req_ids = static_cast<const int64_t*>(write_req_ids.data_ptr());
+  p.write_req_seed_slot_indices = static_cast<const int64_t*>(write_req_seed_slot_indices.data_ptr());
+  p.write_req_entry_starts = static_cast<const int64_t*>(write_req_entry_starts.data_ptr());
+  p.write_req_entry_counts = static_cast<const int64_t*>(write_req_entry_counts.data_ptr());
+  p.write_req_active_mask = static_cast<const int32_t*>(write_req_active_mask.data_ptr());
+  p.num_write_reqs = num_write_reqs;
+  p.seed = static_cast<uint64_t>(seed);
   p.violation_ring = static_cast<int64_t*>(violation_ring.data_ptr());
   p.violation_ring_valid = static_cast<int32_t*>(violation_ring_valid.data_ptr());
   p.violation_write_index = static_cast<uint32_t*>(violation_write_index.data_ptr());
@@ -297,7 +410,7 @@ void canary_step(
   p.kernel_kind = static_cast<int32_t>(kernel_kind);
 
   constexpr uint32_t kBlockSize = 128;
-  const uint32_t grid = (num_slots + kBlockSize - 1) / kBlockSize;
+  const uint32_t grid = (total_threads + kBlockSize - 1) / kBlockSize;
   LaunchKernel(grid, kBlockSize, device)(canary_kernel, p);
 }
 
