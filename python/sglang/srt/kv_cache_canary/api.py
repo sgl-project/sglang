@@ -79,6 +79,9 @@ def install_req_to_token_pool_free_hook(
     setattr(req_to_token_pool, "_kv_canary_free_patched", True)
 
 
+_PERTURB_RNG_CACHE: dict = {}
+
+
 def maybe_perturb_req_to_token(
     *,
     runner: Optional[CanaryRunner],
@@ -87,8 +90,9 @@ def maybe_perturb_req_to_token(
 ) -> None:
     """Self-test helper: probabilistically swap slot pointers in ``req_to_token``.
 
-    Per-rank deterministic RNG so multi-rank perturbations don't interact in
-    non-reproducible ways.
+    Per-rank stateful RNG (seeded deterministically at first use) so the
+    perturbation sequence is reproducible AND advances every call instead of
+    sampling the same first draw repeatedly.
     """
     if runner is None:
         return
@@ -96,9 +100,12 @@ def maybe_perturb_req_to_token(
     if prob <= 0.0:
         return
 
-    rng = random.Random(
-        _rng_seed_for_rank(runner.config.perturb_req_to_token_seed, rank)
-    )
+    rng = _PERTURB_RNG_CACHE.get(rank)
+    if rng is None:
+        rng = random.Random(
+            _rng_seed_for_rank(runner.config.perturb_req_to_token_seed, rank)
+        )
+        _PERTURB_RNG_CACHE[rank] = rng
     if rng.random() >= prob:
         return
     table = req_to_token_pool.req_to_token
