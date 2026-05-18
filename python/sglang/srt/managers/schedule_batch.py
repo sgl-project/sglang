@@ -2561,6 +2561,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 has_been_filtered=has_been_filtered,
             )
 
+        if envs.SGLANG_RELAYER_DEBUG_LOCKSTEP.get():
+            self.assert_lockstep()
+
     def merge_batch(self, other: "ScheduleBatch"):
         # In the regular scheduler path:
         # 1) self is always prefill, whose seq_lens is not a future
