@@ -231,6 +231,21 @@ class CpuValueChannel:
         self.future_ct = (cur + bs) % self.future_limit
         start = cur + 1
         end = cur + 1 + bs
+        # Clear stale data from prior wrap: ``future_ct`` wraps modulo
+        # ``future_limit`` so the same slot range is reused across iters,
+        # but ``_slots`` is a dict that retains old values until overwritten.
+        # If a producer (``_resolve_spec_overlap_tokens``) does not store
+        # into a freshly alloc'd slot before a consumer (``filter_batch``
+        # via ``resolve_finished_status``) reads it, the read returns the
+        # stale value from the previous wrap. For ``finished_status``,
+        # that means a freshly-allocated slot can report ``True`` even
+        # though the current req is not finished, causing ``filter_batch``
+        # to drop the req without running ``cache_finished_req`` and
+        # leaking its KV slots.
+        intv = slice(start, end)
+        s, e, _ = intv.indices(self.future_buffer_len)
+        for slot in range(s, e):
+            self._slots.pop(slot, None)
         indices = torch.arange(start, end, dtype=torch.int64)
         return FutureIndices(indices=indices, interval=slice(start, end))
 
