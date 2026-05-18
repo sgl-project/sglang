@@ -175,7 +175,7 @@ class LoRAInfo:
 
     # LoRA config per adapter
     lora_ranks: torch.Tensor  # [num_loras]
-    adapter_enabled: torch.Tensor  # [num_loras] - which adapters are enabled
+    adapter_enabled: torch.Tensor  # [num_loras] - requested adapters with rank > 0
     max_lora_rank: int  # Maximum LoRA rank across all adapters
 
     num_experts: int
@@ -214,7 +214,11 @@ def _compute_token_lora_mapping(
         token_positions,
         right=True,
     )
-    return lora_info.req_to_lora.to(torch.int32)[req_indices]
+    mapping = lora_info.req_to_lora.to(torch.int32)[req_indices]
+    valid = mapping >= 0
+    safe_mapping = mapping.clamp_min(0).long()
+    active = lora_info.adapter_enabled[safe_mapping] > 0
+    return torch.where(valid & active, mapping, torch.full_like(mapping, -1))
 
 
 def _compute_lora_alignment(
