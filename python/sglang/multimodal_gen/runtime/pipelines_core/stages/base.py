@@ -127,9 +127,11 @@ class PipelineStage(StageDedupMixin, ABC):
         )
 
     def _active_component_stage_name(self) -> str:
-        manager = self._component_residency_manager
-        if manager is not None and manager.state.stage_name is not None:
-            return manager.state.stage_name
+        manager = getattr(self, "_component_residency_manager", None)
+        manager_state = getattr(manager, "state", None)
+        manager_stage_name = getattr(manager_state, "stage_name", None)
+        if manager_stage_name is not None:
+            return manager_stage_name
         return self._component_stage_name()
 
     def _finish_active_component_use(self) -> None:
