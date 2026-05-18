@@ -304,6 +304,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 dtype=self.store_dtype,
                 device=self.device,
             )
+            self.k_buffer = [self.k_buffer[i] for i in range(layer_num)]
             self.v_buffer = torch.zeros(
                 (
                     layer_num,
@@ -315,6 +316,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 dtype=self.store_dtype,
                 device=self.device,
             )
+            self.v_buffer = [self.v_buffer[i] for i in range(layer_num)]
             self.index_k_buffer = None
             if self.index_head_dim is not None:
                 self.index_k_buffer = torch.zeros(
@@ -328,6 +330,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.store_dtype,
                     device=self.device,
                 )
+                self.index_k_buffer = [self.index_k_buffer[i] for i in range(layer_num)]
 
         self._finalize_allocation_log(size)
 

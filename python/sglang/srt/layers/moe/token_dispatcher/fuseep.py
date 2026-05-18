@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
+from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -66,21 +67,45 @@ class NpuFuseEPDispatcher(BaseDispatcher):
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
 
+        self.rank = self.group.rank()
+        self.num_ranks = self.group.size()
+        backend = self.group._get_backend(torch.device("npu"))
+        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(self.rank)
+        if not self.moe_all_to_all_group_name:
+            raise RuntimeError("get moe_all_to_all_group_name failed")
+
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs
     ) -> DispatchOutput:
-        hidden_states, _ = self._get_buffer().fused_deep_moe(
-            hidden_states,
-            topk_idx=topk_output.topk_ids,
-            topk_weights=topk_output.topk_weights,
-            gmm1_permuted_weight=kwargs["gmm1_permuted_weight"],
-            gmm1_permuted_weight_scale=kwargs["gmm1_permuted_weight_scale"],
-            gmm2_weight=kwargs["gmm2_weight"],
-            gmm2_weight_scale=kwargs["gmm2_weight_scale"],
-            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
-            num_experts=self.num_experts,
-            fuse_mode=envs.SGLANG_NPU_FUSED_MOE_MODE.get(),
-        )
+        if not get_global_server_args().enable_torch_compile:
+            hidden_states, _ = self._get_buffer().fused_deep_moe(
+                hidden_states,
+                topk_idx=topk_output.topk_ids,
+                topk_weights=topk_output.topk_weights,
+                gmm1_permuted_weight=kwargs["gmm1_permuted_weight"],
+                gmm1_permuted_weight_scale=kwargs["gmm1_permuted_weight_scale"],
+                gmm2_weight=kwargs["gmm2_weight"],
+                gmm2_weight_scale=kwargs["gmm2_weight_scale"],
+                num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+                num_experts=self.num_experts,
+                fuse_mode=envs.SGLANG_NPU_FUSED_MOE_MODE.get(),
+            )
+        else:
+            hidden_states, _ = torch.ops.npu.fused_deep_moe_op(
+                x=hidden_states,
+                topk_ids=topk_output.topk_ids,
+                topk_weights=topk_output.topk_weights,
+                gmm1_permuted_weight=kwargs["gmm1_permuted_weight"],
+                gmm1_permuted_weight_scale=kwargs["gmm1_permuted_weight_scale"],
+                gmm2_weight=kwargs["gmm2_weight"],
+                gmm2_weight_scale=kwargs["gmm2_weight_scale"],
+                num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+                num_experts=self.num_experts,
+                quant_mode=1,
+                rank=self.rank,
+                num_ranks=self.num_ranks,
+                moe_all_to_all_group_name=self.moe_all_to_all_group_name,
+            )
         return FuseEPDispatchOutput(hidden_states)
 
     def combine(self, combine_input: CombineInput, **kwargs) -> torch.Tensor:

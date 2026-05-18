@@ -2083,6 +2083,9 @@ def get_compiler_backend(mode=None) -> str:
         if mode == "npugraph_ex":
             compiler_config.mode = "reduce-overhead"
             compiler_config.debug.run_eagerly = True
+            compiler_config.experimental_config.aclgraph._aclnn_static_shape_kernel = (
+                True
+            )
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 

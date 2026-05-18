@@ -1616,9 +1616,6 @@ class DeepseekV2AttentionMLA(
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
-        if self.attn_mha.kv_b_proj is None:
-            self.attn_mha.kv_b_proj = self.kv_b_proj
-
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
         if isinstance(hidden_states, tuple):
             if (
@@ -2281,7 +2278,8 @@ class DeepseekV2Model(nn.Module):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
                 nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
+                if get_global_server_args().enable_torch_compile
+                or not get_global_server_args().disable_piecewise_cuda_graph
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
@@ -2494,7 +2492,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     forward_batch.seq_lens_cpu.tolist(),
                 )
 
-        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+        ctx = (
+            nullcontext()
+            if get_global_server_args().enable_torch_compile
+            else get_attn_tp_context().maybe_input_scattered(forward_batch)
+        )
+        with ctx:
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
