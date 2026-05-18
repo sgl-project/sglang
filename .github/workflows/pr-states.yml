@@ -1,0 +1,163 @@
+name: PR States
+# Maintains a CI-states block at the bottom of the PR body. Triggered by
+# `pull_request_target` (not `pull_request`) so fork PRs get a write-enabled
+# GITHUB_TOKEN. Safe because the workflow never checks out PR head code —
+# only reads metadata via API and PATCHes the PR body.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_run:
+    # Listen to pr-test* lifecycle so reruns initiated by slash commands
+    # (run.rerun / run.rerun_failed_jobs via GITHUB_TOKEN) — which don't
+    # refire pull_request_target — still refresh the CI-states block.
+    workflows: ["PR Test", "PR Test Extra"]
+    types: [requested, completed]
+
+permissions:
+  pull-requests: write
+  actions: read
+
+concurrency:
+  # Dedupe per commit SHA across both event sources so simultaneous
+  # synchronize + workflow_run firings on the same push queue instead
+  # of racing on the body PATCH.
+  group: pr-states-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  update-pr-body:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update CI states block in PR body
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Event-agnostic PR lookup.
+            // - pull_request_target: PR is in the payload.
+            // - workflow_run: pull_requests[] is populated for same-repo PRs;
+            //   for fork PRs it's empty and we reverse-lookup by head ref
+            //   ("forkOwner:branch"), which is the GH-documented fork-PR query
+            //   pattern and avoids the "commit must be in default branch" caveat
+            //   of listPullRequestsAssociatedWithCommit. Bail cleanly when no
+            //   open PR matches (e.g. workflow run from a push to main).
+            let prNumber;
+            if (context.payload.pull_request) {
+              prNumber = context.payload.pull_request.number;
+            } else {
+              const wr = context.payload.workflow_run;
+              if (wr.pull_requests && wr.pull_requests.length > 0) {
+                prNumber = wr.pull_requests[0].number;
+              } else if (wr.head_repository && wr.head_branch) {
+                const headSpec = `${wr.head_repository.owner.login}:${wr.head_branch}`;
+                const { data: prs } = await github.rest.pulls.list({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'open',
+                  head: headSpec,
+                });
+                // Multiple PRs could share a head ref if a branch was reused;
+                // match by head_sha to pick the right one.
+                const match = prs.find(p => p.head.sha === wr.head_sha) || prs[0];
+                if (!match) {
+                  core.info(`No open PR for head=${headSpec}; skipping.`);
+                  return;
+                }
+                prNumber = match.number;
+              } else {
+                core.info(`workflow_run has no PR linkage; skipping.`);
+                return;
+              }
+            }
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            const sha = pr.head.sha;
+            const labels = pr.labels.map(l => l.name);
+            const hasCI = labels.includes('run-ci');
+            const hasExtra = labels.includes('run-ci-extra');
+
+            // Retry briefly: pr-test* may not be API-visible yet when we start.
+            async function findRunBySha(workflowFile) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflowFile,
+                head_sha: sha,
+                per_page: 1,
+              });
+              return data.workflow_runs[0] || null;
+            }
+            async function findRunWithRetry(workflowFile, maxAttempts = 6, delayMs = 5000) {
+              for (let i = 0; i < maxAttempts; i++) {
+                const run = await findRunBySha(workflowFile);
+                if (run) return run;
+                if (i < maxAttempts - 1) await new Promise(r => setTimeout(r, delayMs));
+              }
+              return null;
+            }
+
+            const ptRun = hasCI ? await findRunWithRetry('pr-test.yml') : null;
+            // pr-test-extra's gate requires BOTH run-ci AND run-ci-extra
+            // (see pr-test-extra.yml check-changes if-condition), so without
+            // run-ci the extra workflow doesn't run either.
+            const peRun = (hasCI && hasExtra) ? await findRunWithRetry('pr-test-extra.yml') : null;
+
+            // Treat a fully-skipped run as "no real run" — happens when the PR
+            // was opened without the label and label was added later (GHA does
+            // not retrigger on `labeled`).
+            const isReal = (run) => run && run.conclusion !== 'skipped';
+
+            const missingCIText = ':x: **Missing `run-ci` label** — add it to run CI tests.';
+            const peBlockedByCIText = ':x: **Blocked** — `run-ci` is required first.';
+            const notExtraEnabledText = ':warning: **Not enabled** — add `run-ci-extra` label to opt in.';
+            const stalePushText = ':warning: **Not run on latest push** — push again to dispatch.';
+            const ptText = !hasCI
+              ? missingCIText
+              : (isReal(ptRun) ? `[Run #${ptRun.id}](${ptRun.html_url})` : '_Not run yet_');
+            const peText = !hasCI
+              ? peBlockedByCIText
+              : !hasExtra
+                ? notExtraEnabledText
+                : (isReal(peRun) ? `[Run #${peRun.id}](${peRun.html_url})` : stalePushText);
+
+            const outerStart = '<!-- pr-states:start -->';
+            const outerEnd   = '<!-- pr-states:end -->';
+            const ptStart    = '<!-- slot:pr-test:start -->';
+            const ptEnd      = '<!-- slot:pr-test:end -->';
+            const peStart    = '<!-- slot:pr-test-extra:start -->';
+            const peEnd      = '<!-- slot:pr-test-extra:end -->';
+
+            const newBlock = [
+              outerStart,
+              '---',
+              '### CI States',
+              '',
+              `Latest PR Test (Base): ${ptStart}${ptText}${ptEnd}`,
+              `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
+              outerEnd,
+            ].join('\n');
+
+            const body = pr.body || '';
+
+            const blockRe = new RegExp(`(?:\\n+---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
+            let newBody;
+            if (blockRe.test(body)) {
+              newBody = body.replace(blockRe, `\n\n${newBlock}`);
+            } else {
+              const sep = body.length === 0
+                ? ''
+                : (body.endsWith('\n') ? '\n' : '\n\n');
+              newBody = `${body}${sep}${newBlock}`;
+            }
+
+            if (newBody !== body) {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                body: newBody,
+              });
+            }

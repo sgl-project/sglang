@@ -42,7 +42,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     apply_flashinfer_rope_qk_inplace,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -294,9 +296,14 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        query, key, value, encoder_query, encoder_key, encoder_value = (
-            _get_qkv_projections(self, hidden_states, encoder_hidden_states)
-        )
+        (
+            query,
+            key,
+            value,
+            encoder_query,
+            encoder_key,
+            encoder_value,
+        ) = _get_qkv_projections(self, hidden_states, encoder_hidden_states)
 
         query = query.unflatten(-1, (self.local_heads, -1))
         key = key.unflatten(-1, (self.local_heads, -1))
@@ -850,7 +857,7 @@ class Flux2PosEmbed(nn.Module):
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
-class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
+class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Flux 2.
 
