@@ -445,13 +445,11 @@ class SchedulerOutputProcessorMixin:
 
             if req.finished():
                 # -1 because prepare_for_decode pre-claimed the bonus slot.
-                req.kv_committed_len -= 1
                 kv_committed_deltas.append(-1)
                 finished_status.append(True)
                 continue
 
             # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
             req.spec_verify_ct += 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
@@ -461,15 +459,26 @@ class SchedulerOutputProcessorMixin:
             kv_committed_deltas.append(accept_lens[i] - 1)
             finished_status.append(False)
 
-        # Mirror the per-req decisions onto the cpu_value channel. Producer
-        # side of the relay; the in-place mutations above stay until consumer
-        # sites (cache_finished_req, prepare_for_decode) read via Relayer.
+        # Relayer cpu_value channel is the single source of truth for per-req
+        # kv_committed_delta + finished status after iter N. Read back the
+        # delta and apply to req.kv_committed_len in one place so consumers
+        # (cache_finished_req / prepare_for_decode / SWA evict) see a
+        # post-iter value derived from the channel rather than from an
+        # in-place mutation scattered across this loop.
         relayer = getattr(self, "relayer", None)
         if relayer is not None and result.cpu_future_indices is not None:
             relayer.store_kv_committed_delta(
                 result.cpu_future_indices, kv_committed_deltas
             )
             relayer.store_finished_status(result.cpu_future_indices, finished_status)
+            for req, delta in zip(
+                batch.reqs,
+                relayer.resolve_kv_committed_delta(result.cpu_future_indices),
+            ):
+                req.kv_committed_len += delta
+        else:
+            for req, delta in zip(batch.reqs, kv_committed_deltas):
+                req.kv_committed_len += delta
 
         return predict_tokens
 
