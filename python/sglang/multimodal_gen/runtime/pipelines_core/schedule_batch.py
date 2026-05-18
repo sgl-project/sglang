@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import pprint
+from collections import Counter
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Optional, Union
@@ -37,6 +38,23 @@ from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 logger = init_logger(__name__)
 
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
+
+
+@dataclass
+class BatchMetricsWindow:
+    """Counters accumulated between dynamic batching metric logs.
+
+    `total_capacity` uses each dispatch's effective admission cap, so
+    utilization reflects model/config limits instead of only the user max.
+    """
+
+    dispatches: int = 0
+    total_requests: int = 0
+    total_capacity: int = 0
+    merged_dispatches: int = 0
+    full_dispatches: int = 0
+    wait_times_ms: list[float] = field(default_factory=list)
+    reject_reasons: Counter[str] = field(default_factory=Counter)
 
 
 @dataclass(init=False)
@@ -69,8 +87,13 @@ class Req:
     # Primary encoder embeddings
     prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
     negative_prompt_embeds: list[torch.Tensor] | None = None
-    prompt_attention_mask: list[torch.Tensor] | None = None
-    negative_attention_mask: list[torch.Tensor] | None = None
+    prompt_attention_mask: list[torch.Tensor | None] | None = None
+    negative_attention_mask: list[torch.Tensor | None] | None = None
+    # Masks and lengths aligned to postprocessed embeddings, one entry per text encoder.
+    prompt_embeds_mask: list[torch.Tensor | None] | None = None
+    negative_prompt_embeds_mask: list[torch.Tensor | None] | None = None
+    prompt_seq_lens: list[list[int]] | None = None
+    negative_prompt_seq_lens: list[list[int]] | None = None
     clip_embedding_pos: list[torch.Tensor] | None = None
     clip_embedding_neg: list[torch.Tensor] | None = None
 
@@ -269,6 +292,13 @@ class Req:
             return None
         return os.path.join(self.output_path, output_file_name)
 
+    @property
+    def resolution_key(self) -> str | None:
+        """Return the batching config resolution key, e.g. "1024x1024"."""
+        if self.width is None or self.height is None:
+            return None
+        return f"{int(self.width)}x{int(self.height)}"
+
     def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True
         self.save_output = False
@@ -353,7 +383,7 @@ class OutputBatch:
     Final output (after pipeline completion)
     """
 
-    output: torch.Tensor | None = None
+    output: Any | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
     trajectory_timesteps: torch.Tensor | None = None

@@ -7,8 +7,10 @@ import torch
 from torch.nn import functional as F
 
 from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import swiglu_with_alpha_and_limit
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+    swiglu_gpt_oss_sigmoid_alpha,
+)
 from sglang.srt.layers.moe.token_dispatcher import (
     StandardCombineInput,
     StandardDispatchOutput,
@@ -112,7 +114,7 @@ def moe_forward_native(
             and moe_runner_config.gemm1_alpha is not None
         ):
             assert moe_runner_config.gemm1_clamp_limit is not None
-            gate_up = swiglu_with_alpha_and_limit(
+            gate_up = swiglu_gpt_oss_sigmoid_alpha(
                 gate_up,
                 moe_runner_config.gemm1_alpha,
                 moe_runner_config.gemm1_clamp_limit,

@@ -207,6 +207,7 @@ class LMCRadixCache(RadixCache):
                 device_indices=value,
                 last_device_node=last_node,
                 last_host_node=last_node,
+                best_match_node=last_node,
             )
 
         return base_res

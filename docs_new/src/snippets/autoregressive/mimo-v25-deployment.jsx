@@ -230,6 +230,12 @@ export const MiMoV25Deployment = () => {
       // Recipe sources:
       //   v7x: tp=ep=32, dp=4, omits --attention-backend, mem-frac 0.95, swa 0.25
       //   v6e: tp=ep=64, dp=8, --attention-backend fa,    mem-frac 0.92, swa 0.15
+      //
+      // sgl-jax conventions:
+      //   - `--tp-size` is always the total JAX device count; per-DP TP is
+      //     derived automatically as tp/dp.
+      //   - No `--enable-dp-attention` flag — DP attention is the default
+      //     (FFN layers auto-pick EP-split for MoE, attn-TP-split for dense).
       const isV7x = hardware === "tpu-v7x";
       const useEp = expertParallelism === "enabled";
       const useDpAttn = dpAttention === "enabled";
@@ -239,7 +245,7 @@ export const MiMoV25Deployment = () => {
       flags.push("  --trust-remote-code");
       flags.push(`  --tp-size ${tp}`);
       if (useEp) flags.push(`  --ep-size ${tp}`);
-      if (useDpAttn) flags.push(`  --dp-size ${dpSize}`, "  --enable-dp-attention");
+      if (useDpAttn) flags.push(`  --dp-size ${dpSize}`);
       flags.push("  --moe-backend fused");
       if (!isV7x) flags.push("  --attention-backend fa");
       flags.push("  --host 0.0.0.0");

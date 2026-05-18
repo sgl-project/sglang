@@ -15,7 +15,6 @@
 """Inference-only Qwen3_5 MTP model."""
 
 import logging
-from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -23,7 +22,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -61,6 +59,18 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             and get_global_server_args().speculative_draft_model_quantization is None
         ):
             quant_config = None
+
+        # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in
+        # bf16; every `mtp.*` layer appears under the quantization exclude
+        # list. Detect that and skip quantization here so linear/MoE weight
+        # loaders allocate bf16 shapes (see sgl-project/sglang#23113).
+        if quant_config and quant_config.get_name() == "quark":
+            exclude_layers = getattr(quant_config, "exclude_layers", [])
+            if any(
+                isinstance(layer, str) and layer.startswith("mtp.")
+                for layer in exclude_layers
+            ):
+                quant_config = None
 
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -126,17 +136,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        exit_stack = ExitStack()
-        if (
-            is_npu()
-            and self.quant_config is None
-            and get_global_server_args().quantization is not None
-        ):
-            # ascend mtp unquant
-            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
-            exit_stack.enter_context(
-                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
-            )
 
         assert input_embeds is None
         input_embeds = forward_batch.mm_input_embeds
@@ -169,8 +168,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 forward_batch,
                 hidden_states,
             )
-
-        exit_stack.close()
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
