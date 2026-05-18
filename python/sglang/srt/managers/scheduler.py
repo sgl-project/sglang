@@ -2721,7 +2721,9 @@ class Scheduler(
             self._chunked_req_scheduled_last_iter = False
 
         if self.enable_lora:
-            running_loras = {req.lora_id for req in self.running_batch.reqs}
+            running_loras = {req.lora_id for req in self.running_batch.reqs} | {
+                req.lora_id for req in adder.can_run_list
+            }
 
             if self.lora_drainer:
                 self.lora_drainer.update_draining_state(
