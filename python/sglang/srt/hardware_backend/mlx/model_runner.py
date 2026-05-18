@@ -20,7 +20,9 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 import psutil
+from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
+from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
 
 from sglang.srt.hardware_backend.mlx.kv_cache import (
     BatchedDecodeContext,
@@ -90,6 +92,13 @@ class MlxPendingDecode:
     caches: list  # list[list[ContiguousKVCache]]
 
 
+_MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
+    # name -> (bits, group_size). group_size=64 matches the mlx-community convention.
+    "mlx_q4": (4, 64),
+    "mlx_q8": (8, 64),
+}
+
+
 class MlxModelRunner:
     """MLX model runner with radix-cache prefix sharing."""
 
@@ -100,6 +109,7 @@ class MlxModelRunner:
         disable_radix_cache: bool = False,
         pool_size: int | None = None,
         mem_fraction_static: float = 0.8,
+        quantization: str | None = None,
     ):
         self.model_path = model_path
         self.trust_remote_code = trust_remote_code
@@ -108,6 +118,11 @@ class MlxModelRunner:
         self._mem_fraction_static = mem_fraction_static
         # Counter used to trigger periodic mx.clear_cache() calls.
         self._decode_step_ct: int = 0
+        # On-the-fly quantization preset (e.g. "mlx_q4"). None = no on-load quantization.
+        # Pre-quantized HF repos (e.g. mlx-community/Qwen3-0.6B-4bit) load correctly
+        # regardless of this setting — mlx_lm.load() detects the config and instantiates
+        # QuantizedLinear modules directly.
+        self._quantization: str | None = quantization
 
         self._load_model()
 
@@ -180,14 +195,64 @@ class MlxModelRunner:
         ]
 
     def _load_model(self):
-        """Load model using mlx_lm."""
+        """Load model using mlx_lm. If ``self._quantization`` requests a preset
+        (e.g. ``mlx_q4``), quantize fp16 weights in-place via
+        :func:`mlx_lm.utils.quantize_model` after load.
+        """
         logger.info(f"Loading MLX model: {self.model_path}")
         start_time = time.time()
 
-        self.model, _ = mlx_lm_load(
+        # We need the config dict to pass into quantize_model so it knows tied/embedding
+        # layout. return_config=True is cheap and ignored when no quantization is requested.
+        loaded = mlx_lm_load(
             self.model_path,
             tokenizer_config={"trust_remote_code": self.trust_remote_code},
+            return_config=True,
         )
+        self.model, _tokenizer, config = loaded
+
+        if self._quantization in _MLX_QUANTIZATION_PRESETS:
+            bits, group_size = _MLX_QUANTIZATION_PRESETS[self._quantization]
+            # Skip if the model was already loaded quantized (pre-quantized HF repo);
+            # mlx_lm.load detects the config and instantiates QuantizedLinear directly,
+            # so applying the preset on top would be redundant.
+            if "quantization" in (config or {}):
+                logger.info(
+                    "MLX model is already quantized by the HF repo; "
+                    f"ignoring --quantization={self._quantization}"
+                )
+            else:
+                # Read weight-tensor totals from MLX array metadata (shape + dtype).
+                # This is zero-cost — neither materializes the lazy fp16 weights nor
+                # forces them to be peak-resident in memory at once (which on a 64 GB
+                # Mac running a 32 B model would put us within a few GB of OOM).
+                bytes_before = sum(
+                    p.size * p.itemsize
+                    for _, p in tree_flatten(self.model.parameters())
+                )
+                q_start = time.time()
+                logger.info(
+                    f"Quantizing MLX model on-the-fly: bits={bits} "
+                    f"group_size={group_size} (preset={self._quantization})"
+                )
+                self.model, _new_config = mlx_lm_quantize_model(
+                    self.model,
+                    config or {},
+                    group_size=group_size,
+                    bits=bits,
+                )
+                bytes_after = sum(
+                    p.size * p.itemsize
+                    for _, p in tree_flatten(self.model.parameters())
+                )
+                q_time = time.time() - q_start
+                pct_reduction = (1 - bytes_after / max(bytes_before, 1)) * 100
+                logger.info(
+                    f"Quantization complete in {q_time:.2f}s — "
+                    f"weight bytes: {bytes_before / 1024**3:.2f} GB -> "
+                    f"{bytes_after / 1024**3:.2f} GB ({pct_reduction:.1f}% reduction)"
+                )
+
         # Force-evaluate weights so mx.get_active_memory() reflects
         # actual usage before KV pool sizing.
         mx.eval(self.model.parameters())

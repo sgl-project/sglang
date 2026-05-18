@@ -20,7 +20,7 @@ __Notice:__ The following commands are based on Atlas 800I A3 machines. If you a
 
 ```shell Command
 # For Atlas 800I A3
-export IMAGE=quay.io/ascend/sglang:main-cann8.5.0-a3
+export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-a3
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \

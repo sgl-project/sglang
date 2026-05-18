@@ -61,6 +61,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    is_musa,
     is_npu,
     log_info_on_rank0,
     require_gathered_buffer,
@@ -72,6 +73,8 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_musa = is_musa()
 
 
 @dataclass
@@ -146,6 +149,13 @@ def set_torch_compile_config():
     torch._dynamo.config.accumulated_cache_size_limit = 1024
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
+
+    if _is_musa:
+        from sglang.srt.hardware_backend.musa.utils.patch_torch import (
+            patch_fx_custom_device,
+        )
+
+        patch_fx_custom_device()
 
 
 class PiecewiseCudaGraphRunner:
@@ -478,9 +488,10 @@ class PiecewiseCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context:
+        with (
+            freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
+            graph_capture() as graph_capture_context,
+        ):
             stream = graph_capture_context.stream
             with set_pcg_capture_stream(stream):
                 avail_mem = get_available_gpu_memory(
