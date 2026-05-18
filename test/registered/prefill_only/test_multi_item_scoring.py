@@ -595,14 +595,15 @@ class TestMultiItemScoringClassificationAdvanced(CustomTestCase):
                     )
 
 
-class TestMultiItemScoringMixedWithGenerate(CustomTestCase):
+class TestMultiItemScoringRejectsGenerate(CustomTestCase):
     """Regression for sgl-project/sglang#25414.
 
-    Mixing /v1/score (prefill-only MIS) and /generate (decoding) requests
-    concurrently under --enable-mis used to crash the scheduler with
-    `AssertionError: MIS batch must have delimiter indices on every
-    request`. The fix partitions the prefill batch by MIS-ness and excludes
-    prefill-only reqs from running_batch so they cannot leak into decode.
+    Under --enable-mis the scheduler / attention / logits paths assume
+    every batch member is MIS-structured. Mixing in a non-MIS /generate
+    request used to crash the scheduler with `AssertionError: MIS batch
+    must have delimiter indices on every request`. The fix rejects
+    non-MIS GenerateReqInputs at tokenizer_manager.generate_request so
+    they never reach the scheduler.
     """
 
     @classmethod
@@ -623,47 +624,77 @@ class TestMultiItemScoringMixedWithGenerate(CustomTestCase):
             cls.engine.shutdown()
         torch.cuda.empty_cache()
 
-    def test_mixed_concurrent_score_and_generate(self):
+    def test_generate_rejected_under_mis(self):
+        """Engine.generate() must raise instead of crashing the scheduler."""
+        with self.assertRaises(ValueError) as cm:
+            self.engine.generate(
+                prompt="The capital of France is",
+                sampling_params={"max_new_tokens": 4, "temperature": 0},
+            )
+        self.assertIn("enable-mis", str(cm.exception))
+
+    def test_score_still_works_after_generate_rejected(self):
+        """A rejected /generate must not poison subsequent /v1/score calls."""
+        try:
+            self.engine.generate(
+                prompt="anything",
+                sampling_params={"max_new_tokens": 1, "temperature": 0},
+            )
+        except ValueError:
+            pass
+
+        scores = self.engine.score(
+            query="Rate each option:",
+            items=["alpha", "beta", "gamma"],
+            label_token_ids=[9454, 2753],
+            apply_softmax=True,
+        ).scores
+        self.assertEqual(len(scores), 3)
+        for sl in scores:
+            self.assertAlmostEqual(sum(sl), 1.0, places=5)
+
+    def test_concurrent_score_and_rejected_generate(self):
+        """Concurrent score + rejected generate: scheduler must stay healthy."""
         score_query = "Rate each option:"
         score_items = ["alpha", "beta", "gamma"]
         score_labels = [9454, 2753]
 
-        gen_prompts = [f"The number {i} in words is" for i in range(8)]
-
         async def _run():
-            tasks = []
-            for _ in range(8):
-                tasks.append(
-                    self.engine.async_score(
-                        query=score_query,
-                        items=score_items,
-                        label_token_ids=score_labels,
-                        apply_softmax=True,
-                    )
+            score_tasks = [
+                self.engine.async_score(
+                    query=score_query,
+                    items=score_items,
+                    label_token_ids=score_labels,
+                    apply_softmax=True,
                 )
-            for prompt in gen_prompts:
-                tasks.append(
-                    self.engine.async_generate(
-                        prompt=prompt,
-                        sampling_params={"max_new_tokens": 8, "temperature": 0},
-                    )
+                for _ in range(8)
+            ]
+            gen_tasks = [
+                self.engine.async_generate(
+                    prompt=f"prompt {i}",
+                    sampling_params={"max_new_tokens": 4, "temperature": 0},
                 )
-            return await asyncio.gather(*tasks)
+                for i in range(8)
+            ]
+            return await asyncio.gather(
+                *score_tasks, *gen_tasks, return_exceptions=True
+            )
 
         results = self.engine.loop.run_until_complete(_run())
-
         score_results = results[:8]
         gen_results = results[8:]
 
         for r in score_results:
+            self.assertFalse(
+                isinstance(r, BaseException), f"score raised: {r!r}"
+            )
             self.assertEqual(len(r.scores), len(score_items))
             for sl in r.scores:
-                self.assertEqual(len(sl), len(score_labels))
                 self.assertAlmostEqual(sum(sl), 1.0, places=5)
 
         for r in gen_results:
-            self.assertGreater(len(r["text"]), 0)
-            self.assertEqual(r["meta_info"]["completion_tokens"], 8)
+            self.assertIsInstance(r, ValueError, f"expected ValueError, got {r!r}")
+            self.assertIn("enable-mis", str(r))
 
 
 if __name__ == "__main__":
