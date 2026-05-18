@@ -45,7 +45,7 @@ on:
           - multimodal-gen-test-2-gpu-amd-rocm720
           - stage-c-test-large-8-gpu-amd-rocm720
           - stage-c-test-large-8-gpu-amd-mi35x-rocm720
-          - stage-b-test-large-8-gpu-35x-disaggregation-amd-rocm720
+          - stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720
           - stage-c-test-4-gpu-amd-rocm720
       target_stage:
         description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
@@ -930,12 +930,12 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== Disaggregation ====================================================
-  stage-b-test-large-8-gpu-35x-disaggregation-amd-rocm720:
+  stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-35x-disaggregation-amd-rocm720,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -1039,7 +1039,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
-            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   pr-test-amd-rocm720-finish:
     needs:
@@ -1058,7 +1058,7 @@ jobs:
         stage-b-test-1-gpu-small-amd-nondeterministic-rocm720,
         stage-b-test-1-gpu-large-amd-rocm720,
         stage-b-test-2-gpu-large-amd-rocm720,
-        stage-b-test-large-8-gpu-35x-disaggregation-amd-rocm720,
+        stage-b-test-large-8-gpu-mi35x-disaggregation-amd-rocm720,
         stage-c-test-4-gpu-amd-rocm720,
         stage-c-test-large-8-gpu-amd-rocm720,
         stage-c-test-large-8-gpu-amd-mi35x-rocm720,
