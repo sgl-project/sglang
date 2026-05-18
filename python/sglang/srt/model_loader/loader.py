@@ -197,7 +197,12 @@ def _get_quantization_config(
 ) -> Optional[QuantizationConfig]:
     """Get the quantization config."""
     model_class, _ = get_model_architecture(model_config)
-    packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
+    packed_modules_mapping = dict(getattr(model_class, "packed_modules_mapping", {}))
+    get_packed_modules_mapping = getattr(
+        model_class, "get_packed_modules_mapping", None
+    )
+    if get_packed_modules_mapping is not None:
+        packed_modules_mapping.update(get_packed_modules_mapping(model_config) or {})
     remap_prefix = getattr(model_class, "remap_prefix", None)
     # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
     if model_config.quantization == "quark":

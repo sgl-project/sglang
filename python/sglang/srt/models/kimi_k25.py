@@ -632,6 +632,21 @@ class KimiK25ForConditionalGeneration(nn.Module):
         }
     )
 
+    @staticmethod
+    def get_packed_modules_mapping(model_config):
+        model_path = str(getattr(model_config, "model_path", "")).lower()
+        if (
+            getattr(model_config, "quantization", None) == "quark"
+            and "kimi-k2.5-mxfp4" in model_path
+        ):
+            return {
+                "fused_qkv_a_proj_with_mqa": [
+                    "q_a_proj",
+                    "kv_a_proj_with_mqa",
+                ],
+            }
+        return {}
+
     def __init__(
         self,
         config: KimiK25Config,
