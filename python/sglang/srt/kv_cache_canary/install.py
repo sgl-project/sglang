@@ -11,14 +11,13 @@ from sglang.jit_kernel.kv_cache_canary import KERNEL_KIND_HEAD, KERNEL_KIND_TAIL
 from sglang.srt.kv_cache_canary.api import (
     attach,
     finalize_replay,
-    get_runner,
+    get_runners,
     launch_canary_for_capture,
     prepare_replay,
     run_head,
     run_tail,
 )
 from sglang.srt.kv_cache_canary.config import CanaryConfig
-from sglang.srt.kv_cache_canary.pool_patch import PoolKind
 from sglang.srt.kv_cache_canary.test_utils import maybe_perturb_hook
 
 if TYPE_CHECKING:
@@ -50,8 +49,7 @@ def install_on_model_runner(
         return
 
     pool = model_runner.token_to_kv_pool
-    pool_kind = _select_pool_kind(model_runner=model_runner, pool=pool)
-    if pool_kind is None:
+    if not _supports_canary(pool):
         logger.warning(
             "kv-canary: unsupported pool type %s; skipping install.",
             type(pool).__name__,
@@ -61,17 +59,18 @@ def install_on_model_runner(
     if getattr(model_runner, _FORWARD_PATCHED_ATTR, False):
         return
 
-    if pool_kind is PoolKind.SWA:
+    if _is_swa_pool(pool):
         # SWA's req_to_token mapping only addresses the most recent
-        # ``sliding_window_size`` slots; the verify range must be clipped
-        # accordingly. The MHA / MLA / DRAFT / TARGET branches keep the
-        # default ``None`` (full-prefix verify).
+        # ``sliding_window_size`` slots; the verify range for the SWA
+        # canary must be clipped accordingly. The FULL canary on the
+        # same pool gets ``swa_window_size = None`` injected by
+        # :func:`attach` and uses the full prefix.
         window_size = model_runner.sliding_window_size
         if window_size is None or int(window_size) <= 0:
             logger.warning(
                 "kv-canary: SWA pool detected but model_runner.sliding_window_size "
-                "is %r; falling back to full-prefix verify (may produce spurious "
-                "violations on long prefixes).",
+                "is %r; falling back to full-prefix verify for the SWA canary "
+                "(may produce spurious violations on long prefixes).",
                 window_size,
             )
         else:
@@ -81,16 +80,15 @@ def install_on_model_runner(
     verify_capacity, write_capacity, write_req_capacity = _compute_launch_capacities(
         model_runner=model_runner, config=config
     )
-    runner = attach(
+    runners = attach(
         pool=pool,
         config=config,
         device=device,
-        pool_kind=pool_kind,
         verify_capacity=verify_capacity,
         write_capacity=write_capacity,
         write_req_capacity=write_req_capacity,
     )
-    if runner is None:
+    if not runners:
         return
 
     _patch_model_forward(model_runner=model_runner)
@@ -132,22 +130,18 @@ def _compute_launch_capacities(
     return verify_capacity, write_capacity, write_req_capacity
 
 
-def _select_pool_kind(
-    *, model_runner: "ModelRunner", pool: object
-) -> Optional[PoolKind]:
+def _supports_canary(pool: object) -> bool:
+    """Return True if ``pool`` matches any of the known canary dispatch shapes."""
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 
-    is_draft = bool(model_runner.is_draft_worker)
-    if isinstance(pool, BaseSWAKVPool):
-        return PoolKind.SWA
-    if isinstance(pool, MLATokenToKVPool):
-        return PoolKind.MLA
-    if isinstance(pool, MHATokenToKVPool):
-        if is_draft:
-            return PoolKind.DRAFT
-        return PoolKind.FULL
-    return None
+    return isinstance(pool, (BaseSWAKVPool, MLATokenToKVPool, MHATokenToKVPool))
+
+
+def _is_swa_pool(pool: object) -> bool:
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+
+    return isinstance(pool, BaseSWAKVPool)
 
 
 def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
@@ -175,25 +169,25 @@ def _patch_model_forward(*, model_runner: "ModelRunner") -> None:
     def patched_model_forward(*args, **kwargs):
         forward_batch = _extract_forward_batch(args, kwargs)
         pool = model_runner.token_to_kv_pool
-        runner = get_runner(pool)
-        if forward_batch is None or runner is None or not runner.config.enabled:
+        runners = get_runners(pool)
+        if forward_batch is None or not runners or not runners[0].config.enabled:
             return original_forward(*args, **kwargs)
 
         is_capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
         if is_capturing:
-            launch_canary_for_capture(runner, kernel_kind=KERNEL_KIND_HEAD)
+            launch_canary_for_capture(runners, kernel_kind=KERNEL_KIND_HEAD)
             output = original_forward(*args, **kwargs)
-            launch_canary_for_capture(runner, kernel_kind=KERNEL_KIND_TAIL)
+            launch_canary_for_capture(runners, kernel_kind=KERNEL_KIND_TAIL)
             return output
 
         maybe_perturb_hook(
-            runner=runner, model_runner=model_runner, forward_batch=forward_batch
+            runner=runners[0], model_runner=model_runner, forward_batch=forward_batch
         )
-        plan = run_head(runner=runner, forward_batch=forward_batch)
+        plans = run_head(runners=runners, forward_batch=forward_batch)
         output = original_forward(*args, **kwargs)
-        run_tail(runner=runner, plan=plan)
+        run_tail(runners=runners, plans=plans)
         return output
 
     model.forward = patched_model_forward
@@ -261,16 +255,16 @@ def _patch_graph_runner_class_replay(cls: type) -> None:
     def patched_replay(self, forward_batch, *args, **kwargs):
         model_runner = self.model_runner
         pool = model_runner.token_to_kv_pool
-        runner = get_runner(pool)
-        if runner is None or not runner.config.enabled:
+        runners = get_runners(pool)
+        if not runners or not runners[0].config.enabled:
             return original_replay(self, forward_batch, *args, **kwargs)
 
         maybe_perturb_hook(
-            runner=runner, model_runner=model_runner, forward_batch=forward_batch
+            runner=runners[0], model_runner=model_runner, forward_batch=forward_batch
         )
-        plan = prepare_replay(runner=runner, forward_batch=forward_batch)
+        plans = prepare_replay(runners=runners, forward_batch=forward_batch)
         output = original_replay(self, forward_batch, *args, **kwargs)
-        finalize_replay(runner=runner, plan=plan)
+        finalize_replay(runners=runners, plans=plans)
         return output
 
     cls.replay = patched_replay

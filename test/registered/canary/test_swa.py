@@ -18,7 +18,11 @@ import torch
 
 from sglang.srt.kv_cache_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_cache_canary.host_state import _build_plan
-from sglang.srt.kv_cache_canary.pool_patch import PoolKind, attach_shadow_buffers
+from sglang.srt.kv_cache_canary.pool_patch import (
+    PoolKind,
+    attach_shadow_buffers,
+    get_shadow_groups,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="base-b-test-1-gpu-small")
@@ -82,15 +86,26 @@ class _FakeSWAPool:
 
 
 class TestSWAShadowAttach(unittest.TestCase):
-    def test_attach_uses_swa_sub_pool_slot_index_space(self) -> None:
+    def test_attach_creates_both_full_and_swa_shadow_groups(self) -> None:
         pool = _FakeSWAPool(layer_num=3, slot_count=24, head_num=1, head_dim=8)
         attach_shadow_buffers(pool, pool_kind=PoolKind.SWA)
 
-        # Shadows sized off the SWA sub-pool (24 slots), NOT any larger
-        # full-pool slot space — SWA must never reuse full-pool slot indices.
-        self.assertEqual(pool.canary_k_head.shape[0], 24)
-        self.assertEqual(pool.canary_v_head.shape[0], 24)
-        self.assertTrue(pool.canary_has_v_half)
+        # SWA-system pools always get TWO independent canaries: FULL + SWA.
+        groups = get_shadow_groups(pool)
+        self.assertEqual(set(groups.keys()), {PoolKind.FULL, PoolKind.SWA})
+
+        # Both shadows are sized off the SWA sub-pool's slot count when the
+        # fake pool has no separate full_kv_pool (DSV4-style fallback).
+        self.assertEqual(groups[PoolKind.FULL].k_head.shape[0], 24)
+        self.assertEqual(groups[PoolKind.SWA].k_head.shape[0], 24)
+        self.assertTrue(groups[PoolKind.SWA].has_v_half)
+        self.assertTrue(groups[PoolKind.FULL].has_v_half)
+
+        # The shadow groups are independent allocations (different storage).
+        self.assertNotEqual(
+            groups[PoolKind.FULL].k_head.data_ptr(),
+            groups[PoolKind.SWA].k_head.data_ptr(),
+        )
 
     def test_attach_is_idempotent_on_swa_pool(self) -> None:
         pool = _FakeSWAPool(layer_num=2, slot_count=16, head_num=1, head_dim=8)
@@ -106,17 +121,31 @@ class TestSWAStateBufInfosPatch(unittest.TestCase):
         attach_shadow_buffers(pool, pool_kind=PoolKind.SWA)
         ptrs, lens, item_lens = pool.get_state_buf_infos()
 
-        # Original [K*4, V*4] = 8 entries -> patched [K*4, K_head, K_tail,
-        # V*4, V_head, V_tail] = 12, so ``len // 2`` still bisects K vs V.
-        self.assertEqual(len(ptrs), 12)
-        self.assertEqual(len(lens), 12)
-        self.assertEqual(len(item_lens), 12)
+        # Original [K*4, V*4] = 8 entries -> with TWO shadow groups
+        # (FULL + SWA), each contributing K_head + K_tail in the K block
+        # and V_head + V_tail in the V block, total becomes
+        # [K*4, K_full_head, K_full_tail, K_swa_head, K_swa_tail,
+        #  V*4, V_full_head, V_full_tail, V_swa_head, V_swa_tail] = 16
+        # entries, and ``len // 2`` still bisects K vs V.
+        self.assertEqual(len(ptrs), 16)
+        self.assertEqual(len(lens), 16)
+        self.assertEqual(len(item_lens), 16)
         mid = len(ptrs) // 2
-        self.assertEqual(mid, 6)
-        self.assertEqual(ptrs[4], pool.canary_k_head.data_ptr())
-        self.assertEqual(ptrs[5], pool.canary_k_tail.data_ptr())
-        self.assertEqual(ptrs[10], pool.canary_v_head.data_ptr())
-        self.assertEqual(ptrs[11], pool.canary_v_tail.data_ptr())
+        self.assertEqual(mid, 8)
+
+        groups = get_shadow_groups(pool)
+        full_group = groups[PoolKind.FULL]
+        swa_group = groups[PoolKind.SWA]
+        # K block tail: full first (dict order), then swa.
+        self.assertEqual(ptrs[4], full_group.k_head.data_ptr())
+        self.assertEqual(ptrs[5], full_group.k_tail.data_ptr())
+        self.assertEqual(ptrs[6], swa_group.k_head.data_ptr())
+        self.assertEqual(ptrs[7], swa_group.k_tail.data_ptr())
+        # V block tail: same order.
+        self.assertEqual(ptrs[12], full_group.v_head.data_ptr())
+        self.assertEqual(ptrs[13], full_group.v_tail.data_ptr())
+        self.assertEqual(ptrs[14], swa_group.v_head.data_ptr())
+        self.assertEqual(ptrs[15], swa_group.v_tail.data_ptr())
 
 
 class TestSWAVerifyWindowClipping(unittest.TestCase):

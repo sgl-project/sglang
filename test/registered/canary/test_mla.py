@@ -15,7 +15,12 @@ import unittest
 
 import torch
 
-from sglang.srt.kv_cache_canary.pool_patch import PoolKind, attach_shadow_buffers
+from sglang.jit_kernel.kv_cache_canary import CANARY_SLOT_BYTES
+from sglang.srt.kv_cache_canary.pool_patch import (
+    PoolKind,
+    attach_shadow_buffers,
+    get_shadow_groups,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="base-b-test-1-gpu-small")
@@ -53,30 +58,35 @@ class _FakeMLAPool:
 class TestMLAShadowAttach(unittest.TestCase):
     def test_mla_attach_allocates_only_k_half(self) -> None:
         pool = _FakeMLAPool(layer_num=4, slot_count=32, kv_cache_dim=576)
-        attach_shadow_buffers(pool, pool_kind=PoolKind.MLA)
+        attach_shadow_buffers(pool, pool_kind=PoolKind.FULL)
 
-        # MLA does NOT allocate a V half.
-        self.assertIsNotNone(pool.canary_k_head)
-        self.assertIsNotNone(pool.canary_k_tail)
-        self.assertIsNone(pool.canary_v_head)
-        self.assertIsNone(pool.canary_v_tail)
-        self.assertFalse(pool.canary_has_v_half)
+        groups = get_shadow_groups(pool)
+        # MLA-style pools get exactly one FULL group.
+        self.assertEqual(list(groups.keys()), [PoolKind.FULL])
+        group = groups[PoolKind.FULL]
+        self.assertIsNotNone(group.k_head)
+        self.assertIsNotNone(group.k_tail)
+        self.assertIsNone(group.v_head)
+        self.assertIsNone(group.v_tail)
+        self.assertFalse(group.has_v_half)
 
-        # Shadow shape matches the latent representation (slot_count, 1, dim).
-        self.assertEqual(pool.canary_k_head.shape, (32, 1, 576))
+        # Shadow is sized [num_slots, CANARY_SLOT_BYTES] uint8: the canary
+        # carries its own tiny fingerprint per slot, not the latent rep.
+        self.assertEqual(group.k_head.shape, (32, CANARY_SLOT_BYTES))
+        self.assertEqual(group.k_head.dtype, torch.uint8)
 
     def test_mla_attach_is_idempotent(self) -> None:
         pool = _FakeMLAPool(layer_num=2, slot_count=16, kv_cache_dim=128)
-        attach_shadow_buffers(pool, pool_kind=PoolKind.MLA)
+        attach_shadow_buffers(pool, pool_kind=PoolKind.FULL)
         first_ptr = pool.canary_k_head.data_ptr()
-        attach_shadow_buffers(pool, pool_kind=PoolKind.MLA)
+        attach_shadow_buffers(pool, pool_kind=PoolKind.FULL)
         self.assertEqual(pool.canary_k_head.data_ptr(), first_ptr)
 
 
 class TestMLAContiguousBufInfosPatch(unittest.TestCase):
     def test_patched_appends_k_head_and_k_tail(self) -> None:
         pool = _FakeMLAPool(layer_num=4, slot_count=32, kv_cache_dim=576)
-        attach_shadow_buffers(pool, pool_kind=PoolKind.MLA)
+        attach_shadow_buffers(pool, pool_kind=PoolKind.FULL)
         ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
 
         # Original 4 entries (one per layer), +2 canary entries = 6 total.
@@ -87,19 +97,11 @@ class TestMLAContiguousBufInfosPatch(unittest.TestCase):
         # series so there is no K|V midpoint to preserve here.
         self.assertEqual(ptrs[4], pool.canary_k_head.data_ptr())
         self.assertEqual(ptrs[5], pool.canary_k_tail.data_ptr())
-        # Per-slot stride is uniform across the original layers and the canary
-        # entries (canary slot stride = real layer slot stride).
-        layer0_item_len = item_lens[0]
-        self.assertEqual(item_lens[4], layer0_item_len)
-        self.assertEqual(item_lens[5], layer0_item_len)
 
-    def test_slot_stride_bytes_matches_latent_dim(self) -> None:
+    def test_slot_stride_bytes_matches_canary_slot_bytes(self) -> None:
         pool = _FakeMLAPool(layer_num=2, slot_count=8, kv_cache_dim=512)
-        attach_shadow_buffers(pool, pool_kind=PoolKind.MLA)
-        # slot_stride_bytes = nbytes of one slot in the latent representation:
-        # 1 head * 512 dim * 2 bytes (bf16) = 1024.
-        expected = 1 * 512 * 2
-        self.assertEqual(pool.canary_slot_stride_bytes, expected)
+        attach_shadow_buffers(pool, pool_kind=PoolKind.FULL)
+        self.assertEqual(pool.canary_slot_stride_bytes, CANARY_SLOT_BYTES)
 
 
 class TestMLADispatchFallthroughForNSAAndFP4(unittest.TestCase):
@@ -118,7 +120,7 @@ class TestMLADispatchFallthroughForNSAAndFP4(unittest.TestCase):
         pool.index_k_with_scale_buffer = [
             torch.zeros(4, 256, dtype=torch.uint8) for _ in range(3)
         ]
-        attach_shadow_buffers(pool, pool_kind=PoolKind.MLA)
+        attach_shadow_buffers(pool, pool_kind=PoolKind.FULL)
 
         self.assertFalse(pool.canary_has_v_half)
         # Index buffer is unchanged; canary doesn't touch it.

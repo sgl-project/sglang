@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
@@ -10,7 +11,11 @@ from sglang.srt.kv_cache_canary.host_state import (
     BatchPlan,
     plan_batch_from_forward_batch,
 )
-from sglang.srt.kv_cache_canary.pool_patch import PoolKind
+from sglang.srt.kv_cache_canary.pool_patch import (
+    PoolKind,
+    attach_shadow_buffers,
+    get_shadow_groups,
+)
 from sglang.srt.kv_cache_canary.runner import CanaryRunner
 
 if TYPE_CHECKING:
@@ -19,7 +24,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_GLOBAL_RUNNER_KEY = "_kv_cache_canary_runner"
+_GLOBAL_RUNNERS_KEY = "_kv_cache_canary_runners"
 
 
 def attach(
@@ -27,110 +32,172 @@ def attach(
     pool: "KVCache",
     config: CanaryConfig,
     device: torch.device,
-    pool_kind: PoolKind = PoolKind.FULL,
     verify_capacity: int,
     write_capacity: int,
     write_req_capacity: int,
-) -> Optional[CanaryRunner]:
-    """Attach canary to ``pool`` and create a runner.
+) -> Optional[List[CanaryRunner]]:
+    """Attach canaries to ``pool`` and create one runner per shadow group.
+
+    For SWA-style pools this returns **two** runners (one ``FULL`` + one
+    ``SWA``); for plain MHA / MLA pools it returns a single ``FULL``
+    runner.
 
     Must be called AFTER ``init_memory_pool`` and BEFORE ``init_device_graphs``
-    so that the canary kernel is captured into the CUDA graph and the shadow
+    so that every canary kernel is captured into the CUDA graph and the shadow
     tensors are baked into the graph's pointer table.
-
-    The three capacities pre-size the fixed-address GPU launch buffers; the
-    cuda graph records these specific addresses, so they must cover every
-    forward shape (eager + replay).
     """
     if not config.enabled:
         return None
-    if hasattr(pool, _GLOBAL_RUNNER_KEY):
-        logger.warning("kv-canary: pool already has a runner attached; reusing it")
-        return get_runner(pool)
+    if hasattr(pool, _GLOBAL_RUNNERS_KEY):
+        logger.warning("kv-canary: pool already has runners attached; reusing them")
+        return get_runners(pool)
 
-    runner = CanaryRunner(
-        config=config,
-        pool=pool,
-        device=device,
-        pool_kind=pool_kind,
-        verify_capacity=verify_capacity,
-        write_capacity=write_capacity,
-        write_req_capacity=write_req_capacity,
-    )
-    setattr(pool, _GLOBAL_RUNNER_KEY, runner)
+    attach_shadow_buffers(pool)
+    shadow_groups = get_shadow_groups(pool)
+    if not shadow_groups:
+        return None
+
+    runners: List[CanaryRunner] = []
+    for kind, group in shadow_groups.items():
+        runner_config = _per_kind_config(config, kind=kind)
+        runners.append(
+            CanaryRunner(
+                config=runner_config,
+                shadow_group=group,
+                device=device,
+                verify_capacity=verify_capacity,
+                write_capacity=write_capacity,
+                write_req_capacity=write_req_capacity,
+            )
+        )
+    setattr(pool, _GLOBAL_RUNNERS_KEY, runners)
     logger.info(
-        "kv-canary: attached runner in mode=%s pool_kind=%s",
+        "kv-canary: attached %d runner(s) in mode=%s kinds=%s",
+        len(runners),
         config.mode.value,
-        pool_kind.value,
+        [r.pool_kind.value for r in runners],
     )
-    return runner
+    return runners
+
+
+def _per_kind_config(config: CanaryConfig, *, kind: PoolKind) -> CanaryConfig:
+    """Specialise the shared CanaryConfig for one attention regime.
+
+    The ``swa_window_size`` field gates verify-range clipping in the
+    planner. Only the SWA canary clips; the FULL canary always covers
+    the full prefix even when the parent pool is an SWA system, so we
+    null out the window for it.
+    """
+    if kind is PoolKind.SWA:
+        return config
+    if config.swa_window_size is None:
+        return config
+    return dataclasses.replace(config, swa_window_size=None)
+
+
+def get_runners(pool: "KVCache") -> Optional[List[CanaryRunner]]:
+    """Return the list of runners attached to the pool, or ``None``."""
+    return getattr(pool, _GLOBAL_RUNNERS_KEY, None)
 
 
 def get_runner(pool: "KVCache") -> Optional[CanaryRunner]:
-    return getattr(pool, _GLOBAL_RUNNER_KEY, None)
+    """Return the FIRST (FULL) runner attached to the pool, or ``None``.
+
+    Convenience accessor for callers that only need to peek at canary
+    config / state without iterating over every attached runner.
+    """
+    runners = get_runners(pool)
+    if not runners:
+        return None
+    return runners[0]
 
 
 def run_head(
     *,
-    runner: Optional[CanaryRunner],
+    runners: Optional[List[CanaryRunner]],
     forward_batch: "ForwardBatch",
-) -> Optional[BatchPlan]:
-    if runner is None:
-        return None
-    plan = plan_batch_from_forward_batch(
-        forward_batch=forward_batch, config=runner.config
-    )
-    if plan is None:
-        return None
-    runner.run_head(plan=plan)
-    return plan
+) -> Dict[PoolKind, BatchPlan]:
+    """Build per-kind plans, launch each runner's head kernel.
+
+    Returns a dict mapping each runner's pool kind to its plan; the same
+    dict is passed verbatim back into :func:`run_tail` so the second pass
+    skips re-computing identical inputs.
+    """
+    if not runners:
+        return {}
+    plans: Dict[PoolKind, BatchPlan] = {}
+    for runner in runners:
+        plan = plan_batch_from_forward_batch(
+            forward_batch=forward_batch, config=runner.config
+        )
+        if plan is None:
+            continue
+        runner.run_head(plan=plan)
+        plans[runner.pool_kind] = plan
+    return plans
 
 
 def run_tail(
     *,
-    runner: Optional[CanaryRunner],
-    plan: Optional[BatchPlan],
+    runners: Optional[List[CanaryRunner]],
+    plans: Dict[PoolKind, BatchPlan],
 ) -> None:
-    if runner is None or plan is None:
+    """Launch each runner's tail kernel and run its end-of-forward bookkeeping."""
+    if not runners:
         return
-    runner.run_tail(plan=plan)
-    runner.end_of_forward()
+    for runner in runners:
+        plan = plans.get(runner.pool_kind)
+        if plan is None:
+            continue
+        runner.run_tail(plan=plan)
+        runner.end_of_forward()
 
 
 def launch_canary_for_capture(
-    runner: Optional[CanaryRunner], *, kernel_kind: int
+    runners: Optional[List[CanaryRunner]], *, kernel_kind: int
 ) -> None:
-    """Capture-only kernel launch: record one kernel with skip-sentinel buffers."""
-    if runner is None or not runner.config.enabled:
+    """Capture-only: record one kernel launch per attached runner."""
+    if not runners:
         return
-    runner.launch_for_capture(kernel_kind=kernel_kind)
+    for runner in runners:
+        if not runner.config.enabled:
+            continue
+        runner.launch_for_capture(kernel_kind=kernel_kind)
 
 
 def prepare_replay(
     *,
-    runner: Optional[CanaryRunner],
+    runners: Optional[List[CanaryRunner]],
     forward_batch: "ForwardBatch",
-) -> Optional[BatchPlan]:
+) -> Dict[PoolKind, BatchPlan]:
     """Replay-side host hook: build the plan and refill the fixed buffers."""
-    if runner is None or not runner.config.enabled:
-        return None
-    plan = plan_batch_from_forward_batch(
-        forward_batch=forward_batch, config=runner.config
-    )
-    if plan is None:
-        runner.reset_launch_buffers_to_skip_sentinel()
-        return None
-    runner.prepare_for_replay(plan=plan)
-    return plan
+    if not runners:
+        return {}
+    plans: Dict[PoolKind, BatchPlan] = {}
+    for runner in runners:
+        if not runner.config.enabled:
+            continue
+        plan = plan_batch_from_forward_batch(
+            forward_batch=forward_batch, config=runner.config
+        )
+        if plan is None:
+            runner.reset_launch_buffers_to_skip_sentinel()
+            continue
+        runner.prepare_for_replay(plan=plan)
+        plans[runner.pool_kind] = plan
+    return plans
 
 
 def finalize_replay(
     *,
-    runner: Optional[CanaryRunner],
-    plan: Optional[BatchPlan],
+    runners: Optional[List[CanaryRunner]],
+    plans: Dict[PoolKind, BatchPlan],
 ) -> None:
-    """Replay-side host hook: run end-of-forward AFTER replay."""
-    if runner is None or not runner.config.enabled:
+    """Replay-side host hook: run end-of-forward AFTER replay on every runner."""
+    if not runners:
         return
-    _ = plan  # plan is now stateless — kept for symmetry with prepare_replay.
-    runner.end_of_forward()
+    _ = plans  # plans are stateless — kept for symmetry with prepare_replay.
+    for runner in runners:
+        if not runner.config.enabled:
+            continue
+        runner.end_of_forward()

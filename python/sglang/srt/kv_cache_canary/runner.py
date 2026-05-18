@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -24,13 +24,9 @@ from sglang.srt.kv_cache_canary.host_state import (
     CanaryLaunchBuffers,
 )
 from sglang.srt.kv_cache_canary.pool_patch import (
+    CanaryShadowGroup,
     PoolKind,
-    attach_shadow_buffers,
-    get_shadow_buffers,
 )
-
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
 
@@ -69,30 +65,24 @@ class CanaryRunner:
         self,
         *,
         config: CanaryConfig,
-        pool: "KVCache",
+        shadow_group: CanaryShadowGroup,
         device: torch.device,
-        pool_kind: PoolKind = PoolKind.FULL,
         verify_capacity: int,
         write_capacity: int,
         write_req_capacity: int,
     ) -> None:
         self._config = config
         self._device = device
-        self._pool_kind = pool_kind
-
-        attach_shadow_buffers(pool, pool_kind=pool_kind)
-        k_slot_stride_bytes = pool.canary_k_slot_stride_bytes
-        v_slot_stride_bytes = pool.canary_v_slot_stride_bytes
-        k_head, k_tail, v_head, v_tail = get_shadow_buffers(pool)
-        self._has_v_half: bool = pool.canary_has_v_half
+        self._pool_kind = shadow_group.kind
+        self._has_v_half: bool = shadow_group.has_v_half
 
         self._device_state = CanaryDeviceState.allocate(
             device=device, ring_capacity=config.violation_ring_capacity
         )
         self._head_endpoint = CanaryEndpoint(
             kernel_kind=KERNEL_KIND_HEAD,
-            k_shadow=k_head,
-            v_shadow=v_head,
+            k_shadow=shadow_group.k_head,
+            v_shadow=shadow_group.v_head,
             k_violation=self._device_state.get_violation_slot(VIOLATION_KIND_HEAD_K),
             v_violation=(
                 self._device_state.get_violation_slot(VIOLATION_KIND_HEAD_V)
@@ -101,13 +91,13 @@ class CanaryRunner:
             ),
             slot_run_counter=self._device_state.slot_run_counter_head,
             kernel_run_counter=self._device_state.kernel_run_counter_head,
-            k_slot_stride_bytes=k_slot_stride_bytes,
-            v_slot_stride_bytes=v_slot_stride_bytes,
+            k_slot_stride_bytes=shadow_group.k_slot_stride_bytes,
+            v_slot_stride_bytes=shadow_group.v_slot_stride_bytes,
         )
         self._tail_endpoint = CanaryEndpoint(
             kernel_kind=KERNEL_KIND_TAIL,
-            k_shadow=k_tail,
-            v_shadow=v_tail,
+            k_shadow=shadow_group.k_tail,
+            v_shadow=shadow_group.v_tail,
             k_violation=self._device_state.get_violation_slot(VIOLATION_KIND_TAIL_K),
             v_violation=(
                 self._device_state.get_violation_slot(VIOLATION_KIND_TAIL_V)
@@ -116,8 +106,8 @@ class CanaryRunner:
             ),
             slot_run_counter=self._device_state.slot_run_counter_tail,
             kernel_run_counter=self._device_state.kernel_run_counter_tail,
-            k_slot_stride_bytes=k_slot_stride_bytes,
-            v_slot_stride_bytes=v_slot_stride_bytes,
+            k_slot_stride_bytes=shadow_group.k_slot_stride_bytes,
+            v_slot_stride_bytes=shadow_group.v_slot_stride_bytes,
         )
         # Pre-allocated fixed-address launch buffers. Cuda graph capture
         # records these specific addresses; replay-side host code refills
@@ -367,8 +357,9 @@ class CanaryRunner:
 
         if step > 0 and step % period == 0:
             logger.info(
-                "kv-canary: protected %d forwards "
-                "(full.head=%d kernels / %d slots, full.tail=%d kernels / %d slots)",
+                "kv-canary[%s]: protected %d forwards "
+                "(head=%d kernels / %d slots, tail=%d kernels / %d slots)",
+                self._pool_kind.value,
                 step,
                 kernel_head,
                 slot_head,
