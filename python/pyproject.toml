@@ -123,6 +123,8 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+tilelang = ["tilelang>=0.1.9"]
+
 test = [
   "accelerate",
   "bitsandbytes",
@@ -142,6 +144,7 @@ dev = ["sglang[test]"]
 
 all = [
   "sglang[diffusion]",
+  "sglang[tilelang]",
   "sglang[tracing]",
 ]
 
