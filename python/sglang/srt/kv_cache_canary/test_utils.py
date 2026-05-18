@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_PERTURB_RNG_CACHE: dict = {}
+_PERTURB_RNG_CACHE: Dict[int, random.Random] = {}
 
 
 def maybe_perturb_hook(
@@ -105,8 +105,8 @@ def maybe_perturb_req_to_token(
 
 
 def _extract_active_rows(
-    forward_batch,
-) -> tuple[Optional[list], Optional[list]]:
+    forward_batch: Optional["ForwardBatch"],
+) -> Tuple[Optional[List[int]], Optional[List[int]]]:
     """Pull (req_pool_indices, seq_lens) lists for active-row-aware perturb."""
     if forward_batch is None:
         return None, None
