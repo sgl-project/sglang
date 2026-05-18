@@ -40,9 +40,7 @@ def _alloc_state(ring_capacity: int = 32) -> dict:
             ring_capacity, dtype=torch.int32, device="cuda"
         ),
         violation_write_index=torch.zeros(1, dtype=torch.int32, device="cuda"),
-        first_violation=torch.zeros(
-            VIOLATION_FIELDS, dtype=torch.int64, device="cuda"
-        ),
+        first_violation=torch.zeros(VIOLATION_FIELDS, dtype=torch.int64, device="cuda"),
         first_violation_set=torch.zeros(1, dtype=torch.int32, device="cuda"),
         is_errored=torch.zeros(1, dtype=torch.int32, device="cuda"),
         slot_run_counter=torch.zeros(1, dtype=torch.int64, device="cuda"),
@@ -53,7 +51,9 @@ def _alloc_state(ring_capacity: int = 32) -> dict:
 def test_python_and_cuda_splitmix64_chains_match_bitwise():
     rng = random.Random(20260518)
     n = 1000
-    slot_stride = CANARY_SLOT_BYTES * 2  # over-aligned, kernel only touches the first 32
+    slot_stride = (
+        CANARY_SLOT_BYTES * 2
+    )  # over-aligned, kernel only touches the first 32
 
     tokens = [rng.randrange(1, 1 << 31) for _ in range(n)]
     positions = list(range(n))
@@ -72,9 +72,7 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
         verify_req_ids=torch.zeros(1, dtype=torch.int64, device="cuda"),
         verify_prev_slot_indices=torch.full((1,), -1, dtype=torch.int64, device="cuda"),
         verify_active_mask=torch.zeros(1, dtype=torch.int32, device="cuda"),
-        write_slot_indices=torch.tensor(
-            slot_indices, dtype=torch.int64, device="cuda"
-        ),
+        write_slot_indices=torch.tensor(slot_indices, dtype=torch.int64, device="cuda"),
         write_token_ids=torch.tensor(tokens, dtype=torch.int64, device="cuda"),
         write_positions=torch.tensor(positions, dtype=torch.int64, device="cuda"),
         write_req_ids=torch.full((n,), 1, dtype=torch.int64, device="cuda"),

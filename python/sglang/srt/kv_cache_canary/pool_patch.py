@@ -323,5 +323,3 @@ def get_pool_kind(pool: "KVCache") -> PoolKind:
             "kv-canary: pool has no canary kind set; call attach_shadow_buffers() first"
         )
     return kind
-
-

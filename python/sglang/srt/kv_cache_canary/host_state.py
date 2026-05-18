@@ -191,9 +191,7 @@ def _build_plan(
                 if pos == 0:
                     verify_prev_slot_indices.append(-1)
                 elif j > 0:
-                    verify_prev_slot_indices.append(
-                        int(slot_indices_for_verify[j - 1])
-                    )
+                    verify_prev_slot_indices.append(int(slot_indices_for_verify[j - 1]))
                 else:
                     # Truncated window head: prev slot lives at column
                     # (pos - 1) of the same req in req_to_token.
@@ -203,9 +201,7 @@ def _build_plan(
         if n > 0:
             seed_slot = -1
             if k_req_int > 0:
-                seed_slot = int(
-                    req_to_token_table[req_pool_idx_int, k_req_int - 1]
-                )
+                seed_slot = int(req_to_token_table[req_pool_idx_int, k_req_int - 1])
             entry_start = len(write_slot_indices)
             write_req_seed_slot_indices.append(seed_slot)
             write_req_entry_starts.append(entry_start)
@@ -544,15 +540,9 @@ class CanaryLaunchBuffers:
             self.write_slot_indices[:nw].copy_(
                 to_i64(plan.write_slot_indices, slice(0, nw))
             )
-            self.write_token_ids[:nw].copy_(
-                to_i64(plan.write_token_ids, slice(0, nw))
-            )
-            self.write_positions[:nw].copy_(
-                to_i64(plan.write_positions, slice(0, nw))
-            )
-            self.write_req_ids[:nw].copy_(
-                to_i64(plan.write_req_ids, slice(0, nw))
-            )
+            self.write_token_ids[:nw].copy_(to_i64(plan.write_token_ids, slice(0, nw)))
+            self.write_positions[:nw].copy_(to_i64(plan.write_positions, slice(0, nw)))
+            self.write_req_ids[:nw].copy_(to_i64(plan.write_req_ids, slice(0, nw)))
         if nw < self.write_capacity:
             self.write_slot_indices[nw:].zero_()
             self.write_token_ids[nw:].zero_()

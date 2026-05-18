@@ -256,8 +256,7 @@ __device__ inline void run_write_req_chain(const CanaryParams& p, uint32_t req_t
         static_cast<uint64_t>(load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash));
     const int64_t seed_token = load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldTokenId);
     const int64_t seed_position = load_field(p.src_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
-    prev_hash =
-        splitmix64_mix(seed_prev_hash, static_cast<uint64_t>(seed_token), static_cast<uint64_t>(seed_position));
+    prev_hash = splitmix64_mix(seed_prev_hash, static_cast<uint64_t>(seed_token), static_cast<uint64_t>(seed_position));
   }
 
   for (int64_t k = 0; k < entry_count; ++k) {
