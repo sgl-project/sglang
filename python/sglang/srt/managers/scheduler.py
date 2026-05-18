@@ -3339,7 +3339,7 @@ class Scheduler(
                 current_platform.empty_cache()
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
-            if self.is_stats_logging_rank:
+            if self.metrics_reporter.is_stats_logging_rank:
                 logger.info("Cache flushed successfully!")
             success = True
         else:
@@ -3518,12 +3518,16 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                        decode_req.req.finished_reason = FINISH_ABORT()
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                        decode_req.req.finished_reason = FINISH_ABORT()
 
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:
