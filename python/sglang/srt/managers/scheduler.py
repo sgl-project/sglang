@@ -3062,6 +3062,28 @@ class Scheduler(
             if sched_sampling_info is not None:
                 batch.sampling_info = sched_sampling_info
 
+    def _apply_spec_v2_relay_outputs(
+        self,
+        batch: ScheduleBatch,
+        batch_result,
+        future_indices,
+    ):
+        """Apply the spec V2 forward-output relay to the SB.
+
+        The ``next_draft_input`` payload (topk_p / topk_index / bonus_tokens /
+        new_seq_lens / hidden_states) is already on the gpu_scalar channel by
+        the time this runs (via ``store_to_map_for_new_batch``). What remains
+        is the explicit handoff to the SB so the next-iter schedule can read
+        these as if they were ordinary SB attributes: the new draft input is
+        bound to ``batch.spec_info`` with its ``future_indices`` so consumer
+        ``resolve_future`` will pull the channel slot; the new lens is set
+        on ``batch.seq_lens`` which, when a Relayer seq_lens ctx is attached,
+        will also mirror into the gpu_scalar channel via ``__setattr__``.
+        """
+        batch.spec_info = batch_result.next_draft_input
+        batch.spec_info.future_indices = future_indices
+        batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+
     def _relayer_barrier(self):
         """Schedule-side cross-stream barrier.
 
@@ -3153,15 +3175,17 @@ class Scheduler(
                 future_indices_or_next_token_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
-
-                    batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
-
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                    # Spec V2 relay step: forward N's verify kernel emits
+                    # ``next_draft_input`` (carrying topk_p / topk_index /
+                    # bonus_tokens / new_seq_lens / hidden_states) on the
+                    # gpu_scalar channel via ``store_to_map_for_new_batch``
+                    # above; the explicit handles below thread this iter's
+                    # future indices into the draft input and bind the
+                    # new_seq_lens onto SB so the next-iter schedule sees a
+                    # settled view.
+                    self._apply_spec_v2_relay_outputs(
+                        batch, batch_result, future_indices
+                    )
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
