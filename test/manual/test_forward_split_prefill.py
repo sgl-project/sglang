@@ -121,8 +121,7 @@ class TestForwardSplitPrefill(CustomTestCase):
             batch.prepare_for_extend()
 
         # Create forward batch
-        model_worker_batch = batch.get_model_worker_batch()
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
 
         return forward_batch
 
