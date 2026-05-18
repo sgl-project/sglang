@@ -423,6 +423,12 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
+        self.mm_receiver = None
+        self.disagg_prefill_bootstrap_queue = None
+        self.disagg_prefill_inflight_queue = None
+        self.disagg_decode_prealloc_queue = None
+        self.disagg_decode_transfer_queue = None
+
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
 
