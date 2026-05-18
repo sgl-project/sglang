@@ -627,7 +627,11 @@ def _register_configs():
     register_configs(
         sampling_param_cls=SenseNovaU1SamplingParams,
         pipeline_config_cls=SenseNovaU1PipelineConfig,
-        hf_model_paths=["sensenova/SenseNova-U1-8B-MoT"],
+        hf_model_paths=[
+            "sensenova/SenseNova-U1-8B-MoT",
+            "sensenova-u1",
+            "sensenova_u1",
+        ],
         model_detectors=[
             lambda hf_id: "sensenova-u1" in hf_id.lower(),
             lambda hf_id: "sensenova_u1" in hf_id.lower(),

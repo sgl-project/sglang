@@ -72,6 +72,7 @@ class OmniRequest:
     # max number of images allowed in a req
     max_images: int = 1
     max_text_segments: int = 8
+    max_text_segments_after_media: int | None = None
     think: bool = False
     think_max_new_tokens: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -95,6 +96,11 @@ class OmniRequest:
             sampling_params=payload.get("sampling_params") or {},
             max_images=int(payload.get("max_images", 1)),
             max_text_segments=int(payload.get("max_text_segments", 8)),
+            max_text_segments_after_media=(
+                None
+                if payload.get("max_text_segments_after_media") is None
+                else int(payload.get("max_text_segments_after_media"))
+            ),
             think=bool(payload.get("think", False)),
             think_max_new_tokens=payload.get("think_max_new_tokens"),
             metadata=dict(payload.get("metadata") or {}),

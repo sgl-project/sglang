@@ -13,7 +13,9 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     SenseNovaU1PixelFlowCFG,
     resolve_sensenova_u1_pixel_flow_cfg,
 )
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (

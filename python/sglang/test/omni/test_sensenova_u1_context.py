@@ -12,6 +12,7 @@ from sglang.omni.core.interleaved import (
     INTERLEAVED_BOUNDARY_POSITION_ID_KEY,
     INTERLEAVED_BOUNDARY_TOKEN_ID_KEY,
     INTERLEAVED_GENERATION_BOUNDARY_METADATA_KEY,
+    STREAMED_TEXT_METADATA_KEY,
     TEXT_ROLE_METADATA_KEY,
     TEXT_ROLE_THINK,
 )
@@ -60,6 +61,13 @@ class TestSenseNovaU1Context(unittest.TestCase):
         self.assertTrue(
             prompt.startswith("<|im_start|>system\nYou are a multimodal assistant")
         )
+
+    def test_interleave_system_message_hides_planning_from_final_answer(self):
+        prompt = build_u1_interleave_prompt(prompt="hi", think_mode=True)
+
+        self.assertIn("final answer must not include hidden reasoning", prompt)
+        self.assertIn("planning steps", prompt)
+        self.assertIn("explicit image prompts", prompt)
 
     def test_u1_special_tokens_are_model_local_contract(self):
         self.assertIsInstance(U1_SPECIAL_TOKENS, U1SpecialTokens)
@@ -132,6 +140,16 @@ class TestSenseNovaU1Context(unittest.TestCase):
         self.assertIsNotNone(non_think_prepared)
         self.assertNotIn("<think>\n\n</think>\n\n", think_prepared[0].input_text)
         self.assertIn("<think>\n\n</think>\n\n", non_think_prepared[0].input_text)
+        self.assertTrue(
+            think_prepared[-1].policy_metadata["omni_model_state_updates"]["u1"][
+                "interleave_think_mode"
+            ]
+        )
+        self.assertFalse(
+            think_prepared[-1].policy_metadata["omni_model_state_updates"]["u1"][
+                "interleave_thinking_done"
+            ]
+        )
 
     def test_policy_t2i_think_flag_reaches_prepared_prompt(self):
         policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
@@ -372,6 +390,93 @@ class TestSenseNovaU1Context(unittest.TestCase):
             runtime.model_state_updates[-1]["u1"]["generation_position_start"],
         )
 
+    def test_interleave_think_role_survives_image_handoff_until_think_end(self):
+        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
+        runtime = _DecodeRuntime(output_ids=[42, 124])
+        session = OmniSessionHandle(
+            session_id="s0",
+            anchor_request_id="r0",
+            context_length=480,
+            context_version=1,
+        )
+        stream_sink = _TextDeltaSink()
+
+        result = policy._decode_native_interleave_next_segment(
+            runtime=runtime,
+            session=session,
+            u1_state={
+                "native_interleave_prompt": True,
+                "interleave_think_mode": True,
+                "interleave_thinking_done": False,
+                "generation_position_start": 225,
+            },
+            stream_sink=stream_sink,
+        )
+
+        self.assertEqual("text", result.type)
+        self.assertEqual((42, 124), result.token_ids)
+        self.assertEqual(TEXT_ROLE_THINK, result.metadata[TEXT_ROLE_METADATA_KEY])
+        self.assertTrue(result.metadata[STREAMED_TEXT_METADATA_KEY])
+        self.assertEqual(
+            [{TEXT_ROLE_METADATA_KEY: TEXT_ROLE_THINK}] * 2,
+            stream_sink.metadata,
+        )
+        self.assertTrue(
+            runtime.model_state_updates[-1]["u1"]["interleave_thinking_done"]
+        )
+
+    def test_interleave_text_after_think_end_is_user_visible(self):
+        policy = U1OmniSessionModelPolicy(native_tokenizer=_Tokenizer())
+        runtime = _DecodeRuntime(output_ids=[42, 999])
+        session = OmniSessionHandle(
+            session_id="s0",
+            anchor_request_id="r0",
+            context_length=480,
+            context_version=1,
+        )
+
+        result = policy._decode_native_interleave_next_segment(
+            runtime=runtime,
+            session=session,
+            u1_state={
+                "native_interleave_prompt": True,
+                "interleave_think_mode": True,
+                "interleave_thinking_done": True,
+                "generation_position_start": 225,
+            },
+        )
+
+        self.assertEqual("text", result.type)
+        self.assertEqual((42,), result.token_ids)
+        self.assertNotIn(TEXT_ROLE_METADATA_KEY, result.metadata)
+
+    def test_interleave_planning_after_think_end_stays_hidden(self):
+        policy = U1OmniSessionModelPolicy(native_tokenizer=_PlanningTokenizer())
+        runtime = _DecodeRuntime(output_ids=[42, 999])
+        session = OmniSessionHandle(
+            session_id="s0",
+            anchor_request_id="r0",
+            context_length=480,
+            context_version=1,
+        )
+        stream_sink = _TextDeltaSink()
+
+        result = policy._decode_native_interleave_next_segment(
+            runtime=runtime,
+            session=session,
+            u1_state={
+                "native_interleave_prompt": True,
+                "interleave_think_mode": True,
+                "interleave_thinking_done": True,
+                "generation_position_start": 225,
+                "last_generated_image_commit": True,
+            },
+            stream_sink=stream_sink,
+        )
+
+        self.assertEqual("done", result.type)
+        self.assertEqual([], stream_sink.deltas)
+
     def test_marker_prepare_accepts_raw_session_handle(self):
         session = OmniSessionHandle(
             session_id="s0",
@@ -457,6 +562,13 @@ class _Tokenizer:
         return "".join(str(token_id) for token_id in token_ids)
 
 
+class _PlanningTokenizer(_Tokenizer):
+    def decode(self, token_ids, skip_special_tokens=True):
+        if list(token_ids) == [42]:
+            return "The user has initiated a conversation. I will craft a response."
+        return super().decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+
 class _DecodeRuntime:
     srt_ar_decode_max_new_tokens = 8
     srt_request_executor = object()
@@ -497,6 +609,9 @@ class _DecodeRuntime:
         self.committed_tokens.append((token_id, position_id))
         self.model_state_updates.append(model_state_updates)
         return session
+
+    def merge_model_state_updates(self, session, *, namespace, updates):
+        self.model_state_updates.append({namespace: updates})
 
     def get_condition_path_handle(self, session, role):
         return None

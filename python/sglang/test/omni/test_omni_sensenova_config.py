@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from sglang.omni.configs.registry import resolve_omni_model_key
 from sglang.omni.configs.sensenova_u1 import (
     SenseNovaU1OmniPlugin,
+    _build_default_generation_backend,
     _build_diffusion_server_kwargs,
     _parse_diffusion_server_args,
     _resolve_omni_max_concurrent_generations,
@@ -41,10 +42,26 @@ class TestSenseNovaU1OmniConfig(unittest.TestCase):
         self.assertEqual("vlm", normalized.mode)
         self.assertEqual(4, normalized.metadata["max_new_tokens"])
         self.assertEqual(2, normalized.max_images)
+        self.assertIsNone(normalized.max_text_segments_after_media)
         self.assertTrue(normalized.think)
         self.assertEqual("vlm", normalized.sampling_params.omni_generation_mode)
         self.assertTrue(normalized.sampling_params.think_mode)
         self.assertEqual(3, normalized.sampling_params.num_inference_steps)
+
+    def test_interleave_defaults_to_one_visible_text_after_media(self):
+        plugin = SenseNovaU1OmniPlugin()
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="hi"),),
+            mode="interleave",
+            max_text_segments=3,
+            sampling_params={},
+        )
+
+        normalized = plugin.normalize_request(request)
+
+        self.assertEqual("interleave", normalized.mode)
+        self.assertEqual(3, normalized.max_text_segments)
+        self.assertEqual(1, normalized.max_text_segments_after_media)
 
     def test_sampling_defaults_follow_u1_official_image_generation(self):
         plugin = SenseNovaU1OmniPlugin()
@@ -97,6 +114,17 @@ class TestSenseNovaU1OmniConfig(unittest.TestCase):
 
         self.assertEqual("sensenova-u1", kwargs["model_path"])
         self.assertEqual("SenseNovaU1Pipeline", kwargs["pipeline_class_name"])
+
+    def test_default_generation_backend_imports_u1_pipeline(self):
+        backend = _build_default_generation_backend(
+            SimpleNamespace(model_path="sensenova-u1", diffusion_server_args=None)
+        )
+
+        self.assertEqual("sensenova-u1", backend.server_args.model_path)
+        self.assertEqual(
+            "SenseNovaU1Pipeline",
+            backend.server_args.pipeline_class_name,
+        )
 
     def test_omni_generation_admission_limit_defaults_to_one(self):
         self.assertEqual(1, _resolve_omni_max_concurrent_generations(None))

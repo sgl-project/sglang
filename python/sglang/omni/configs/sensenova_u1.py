@@ -46,6 +46,7 @@ _REQUEST_METADATA_FIELDS = {
     "max_length",
     "max_interleave_images",
     "max_interleave_text_segments",
+    "max_text_segments_after_media",
     "think",
     "think_max_new_tokens",
 }
@@ -76,6 +77,12 @@ class SenseNovaU1OmniPlugin:
             "think_max_new_tokens",
             request.think_max_new_tokens,
         )
+        max_text_segments_after_media = metadata.pop(
+            "max_text_segments_after_media",
+            request.max_text_segments_after_media,
+        )
+        if max_text_segments_after_media is None and mode == "interleave":
+            max_text_segments_after_media = 1
         metadata["mode"] = mode
         return replace(
             request,
@@ -84,6 +91,7 @@ class SenseNovaU1OmniPlugin:
             sampling_params=sampling_params,
             max_images=max_images,
             max_text_segments=max_text_segments,
+            max_text_segments_after_media=max_text_segments_after_media,
             think=sampling_params.think_mode,
             think_max_new_tokens=think_max_new_tokens,
             metadata=metadata,

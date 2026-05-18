@@ -493,7 +493,7 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
     if "_diffusers_version" not in config:
         raise ValueError("model_index.json does not contain _diffusers_version")
 
-    logger.info("Diffusers version: %s", config["_diffusers_version"])
+    logger.debug("Diffusers version: %s", config["_diffusers_version"])
 
     component_keys = [
         key

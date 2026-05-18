@@ -118,6 +118,35 @@ def build_sensenova_u1_srt_session_adapter(
     return SenseNovaU1SessionAdapter(runtime)
 
 
+def _u1_text_looks_like_planning(text: str) -> bool:
+    """return true for U1 final-answer text that still reads like planning"""
+
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized:
+        return False
+    planning_prefixes = (
+        "the user's input",
+        "the user has",
+        "to respond",
+        "my goal",
+        "my plan",
+        "i will",
+        "1.",
+        "1)",
+        "instruction understanding",
+    )
+    if normalized.startswith(planning_prefixes):
+        return True
+    planning_phrases = (
+        "my plan",
+        "i will",
+        "the visual component will",
+        "explicit prompt",
+        "numbered analysis",
+    )
+    return any(phrase in normalized[:512] for phrase in planning_phrases)
+
+
 class U1OmniSessionModelPolicy(OmniModelPolicy):
     """SenseNova U1 policy shell for SRT-owned omni sessions.
 
@@ -339,6 +368,36 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
             return OmniDecodeResult(type="done")
 
         eos_token_ids = _u1_eos_token_ids(self.native_tokenizer)
+        think_end_token_id = _u1_token_id(self.native_tokenizer, "</think>")
+        # 1. inside_interleave_think is the current hidden-reasoning text state
+        # 2. keep it in session state because image generation can reset adapter temps
+        inside_interleave_think = bool(
+            u1_state.get("interleave_think_mode")
+        ) and not bool(
+            u1_state.get("interleave_thinking_done")
+        )
+        # guarded_post_think_text is U1 final-answer text that may still leak planning
+        guarded_post_think_text = bool(
+            u1_state.get("interleave_think_mode")
+        ) and bool(
+            u1_state.get("interleave_thinking_done")
+        )
+        stream_text_deltas = stream_sink is not None and not guarded_post_think_text
+
+        def decode_text_and_metadata(
+            token_ids: list[int],
+        ) -> tuple[str, dict[str, Any], bool]:
+            text = _u1_decode_token_ids(self.native_tokenizer, token_ids)
+            metadata: dict[str, Any] = {}
+            if stream_text_deltas:
+                metadata[STREAMED_TEXT_METADATA_KEY] = True
+            hidden_planning = guarded_post_think_text and _u1_text_looks_like_planning(
+                text
+            )
+            if inside_interleave_think or hidden_planning:
+                metadata[TEXT_ROLE_METADATA_KEY] = TEXT_ROLE_THINK
+            return text, metadata, hidden_planning
+
         max_new_tokens = max(
             1,
             int(runtime.srt_ar_decode_max_new_tokens or 0),
@@ -414,19 +473,14 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                     session=session,
                 )
                 if generated_text_ids:
-                    metadata = (
-                        {STREAMED_TEXT_METADATA_KEY: True}
-                        if stream_sink is not None
-                        else {}
+                    text, metadata, hidden_planning = decode_text_and_metadata(
+                        generated_text_ids
                     )
-                    if self.native_interleave_think_mode:
-                        metadata[TEXT_ROLE_METADATA_KEY] = TEXT_ROLE_THINK
+                    if hidden_planning:
+                        return OmniDecodeResult(type="done")
                     return OmniDecodeResult(
                         type="text",
-                        text=_u1_decode_token_ids(
-                            self.native_tokenizer,
-                            generated_text_ids,
-                        ),
+                        text=text,
                         token_ids=tuple(generated_text_ids),
                         metadata=metadata,
                     )
@@ -448,24 +502,22 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                     ),
                 )
                 if generated_text_ids:
+                    text, metadata, hidden_planning = decode_text_and_metadata(
+                        generated_text_ids
+                    )
+                    if hidden_planning:
+                        return OmniDecodeResult(type="done")
                     return OmniDecodeResult(
                         type="text",
-                        text=_u1_decode_token_ids(
-                            self.native_tokenizer,
-                            generated_text_ids,
-                        ),
+                        text=text,
                         token_ids=tuple(generated_text_ids),
-                        metadata=(
-                            {STREAMED_TEXT_METADATA_KEY: True}
-                            if stream_sink is not None
-                            else {}
-                        ),
+                        metadata=metadata,
                     )
                 return OmniDecodeResult(type="done")
             generated_text_ids.append(token_id)
             # 1. the generated token becomes the next decode input position
             decode_input_position = output_position
-            if stream_sink is not None:
+            if stream_text_deltas:
                 current_text = _u1_decode_token_ids(
                     self.native_tokenizer,
                     generated_text_ids,
@@ -477,9 +529,38 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                 )
                 streamed_text = current_text
                 metadata = None
-                if self.native_interleave_think_mode:
+                if inside_interleave_think:
                     metadata = {TEXT_ROLE_METADATA_KEY: TEXT_ROLE_THINK}
                 stream_sink.text_delta(delta, token_id=token_id, metadata=metadata)
+            if token_id == think_end_token_id:
+                self._merge_runtime_u1_state(
+                    runtime,
+                    session,
+                    U1ModelStateUpdate(
+                        last_segment_type="interleave",
+                        last_source="native_interleave_think_end",
+                        native_interleave_prompt=True,
+                        interleave_thinking_done=True,
+                        generation_position_start=get_ar_next_output_position(
+                            output_position
+                        ),
+                    ),
+                )
+                # 1. think_end_token_id is the U1 marker that closes hidden reasoning
+                # 2. mark later text as final-answer text after this boundary
+                metadata = {}
+                if stream_sink is not None:
+                    metadata[STREAMED_TEXT_METADATA_KEY] = True
+                if inside_interleave_think:
+                    metadata[TEXT_ROLE_METADATA_KEY] = TEXT_ROLE_THINK
+                return OmniDecodeResult(
+                    type="text",
+                    text=_u1_decode_token_ids(
+                        self.native_tokenizer, generated_text_ids
+                    ),
+                    token_ids=tuple(generated_text_ids),
+                    metadata=metadata,
+                )
 
         self._merge_runtime_u1_state(
             runtime,
@@ -494,15 +575,16 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
             ),
         )
         if generated_text_ids:
+            text, metadata, hidden_planning = decode_text_and_metadata(
+                generated_text_ids
+            )
+            if hidden_planning:
+                return OmniDecodeResult(type="done")
             return OmniDecodeResult(
                 type="text",
-                text=_u1_decode_token_ids(self.native_tokenizer, generated_text_ids),
+                text=text,
                 token_ids=tuple(generated_text_ids),
-                metadata=(
-                    {STREAMED_TEXT_METADATA_KEY: True}
-                    if stream_sink is not None
-                    else {}
-                ),
+                metadata=metadata,
             )
         return OmniDecodeResult(type="done")
 

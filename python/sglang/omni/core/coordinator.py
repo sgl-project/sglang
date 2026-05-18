@@ -100,6 +100,16 @@ class OmniCoordinator:
         num_image_segments = 0
         num_audio_segments = 0
         num_video_segments = 0
+        max_text_segments_after_media = request.max_text_segments_after_media
+        if max_text_segments_after_media is not None:
+            max_text_segments_after_media = int(max_text_segments_after_media)
+            if max_text_segments_after_media < 0:
+                raise ValueError(
+                    "max_text_segments_after_media must be non-negative, got "
+                    f"{max_text_segments_after_media}"
+                )
+        # post_media_text_segments is the user-visible text budget after media output
+        post_media_text_segments = 0
 
         try:
             # the main loop: coordinator owns modality handoff; backends own token and pixel internals
@@ -118,14 +128,12 @@ class OmniCoordinator:
 
                 if boundary.type == "text":
                     is_think_text = (
-                        boundary.metadata.get(TEXT_ROLE_METADATA_KEY)
-                        == TEXT_ROLE_THINK
+                        boundary.metadata.get(TEXT_ROLE_METADATA_KEY) == TEXT_ROLE_THINK
                     )
                     if is_think_text:
                         # 1. think text may have already streamed; it is not user-visible answer text
-                        if (
-                            stream_sink is not None
-                            and boundary.metadata.get(STREAMED_TEXT_METADATA_KEY)
+                        if stream_sink is not None and boundary.metadata.get(
+                            STREAMED_TEXT_METADATA_KEY
                         ):
                             stream_sink.finish_text()
                         continue
@@ -141,6 +149,19 @@ class OmniCoordinator:
                     output_segment.metadata.pop(STREAMED_TEXT_METADATA_KEY, None)
                     segments.append(output_segment)
                     num_text_segments += 1
+                    has_generated_media = (
+                        num_image_segments + num_audio_segments + num_video_segments
+                    ) > 0
+                    if has_generated_media:
+                        post_media_text_segments += 1
+                        if (
+                            max_text_segments_after_media is not None
+                            and post_media_text_segments
+                            >= max_text_segments_after_media
+                        ):
+                            # 1. post-media text is the visible wrap-up for this turn
+                            # 2. stop before probing another AR planning or image round
+                            break
                     if (
                         stop_after_generation_limit
                         and num_image_segments >= request.max_images

@@ -260,6 +260,33 @@ class TestOmniCoordinator(unittest.TestCase):
         self.assertEqual(["image"], [segment.type for segment in response.segments])
         self.assertEqual(1, gen_backend.calls)
 
+    def test_post_media_text_budget_stops_extra_planning_segments(self):
+        ar_backend = _ScriptedARBackend(
+            [
+                OmniBoundary(type="image"),
+                OmniBoundary(type="text", text="visible answer"),
+                OmniBoundary(type="text", text="1. internal plan"),
+                OmniBoundary(type="image"),
+            ]
+        )
+        gen_backend = _ImageBackend()
+        coordinator = OmniCoordinator(ar_backend, gen_backend)
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="hi"),),
+            max_images=1,
+            max_text_segments=3,
+            max_text_segments_after_media=1,
+        )
+
+        response = coordinator.generate(request)
+
+        self.assertEqual(
+            ["image", "text"],
+            [segment.type for segment in response.segments],
+        )
+        self.assertEqual("visible answer", response.segments[1].text)
+        self.assertEqual(1, gen_backend.calls)
+
 
 if __name__ == "__main__":
     unittest.main()

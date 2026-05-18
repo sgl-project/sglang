@@ -195,6 +195,10 @@
       accent-color: var(--accent-2);
     }
 
+    .checkline.compact {
+      margin: 0;
+    }
+
     .segmented {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -402,6 +406,34 @@
       font-size: 16px;
     }
 
+    .thinking-trace {
+      border-top: 1px dashed var(--line);
+      padding-top: 12px;
+      color: var(--muted);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 12px;
+    }
+
+    .thinking-trace summary {
+      cursor: pointer;
+      color: var(--accent-2);
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .thinking-trace-text {
+      max-height: 220px;
+      overflow: auto;
+      margin-top: 10px;
+      border-left: 3px solid rgba(29, 107, 107, 0.28);
+      background: #f6fbf7;
+      padding: 10px 12px;
+      white-space: pre-wrap;
+      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #4f5f5a;
+    }
+
     .image {
       display: block;
       width: min(100%, 560px);
@@ -556,6 +588,10 @@
             <button class="segment-button active" id="thinkOn" type="button">On</button>
           </div>
           <input id="thinkMode" type="checkbox" checked hidden>
+        </div>
+        <div class="checkline compact">
+          <input id="showThinkingTrace" type="checkbox" checked>
+          <span>Show thinking trace</span>
         </div>
       </div>
 
@@ -814,6 +850,8 @@
       const pending = appendTurnShell(prompt, payload);
       pending.turn.classList.add("pending");
       pending.segments = new Map();
+      pending.thinkingRaw = "";
+      pending.thinkingTrace = null;
       pending.status = renderPendingStatus("Generating");
       pending.body.appendChild(pending.status);
       return pending;
@@ -840,8 +878,44 @@
       if (label) label.textContent = text;
     }
 
+    function shouldShowThinkingTrace() {
+      return Boolean($("showThinkingTrace")?.checked);
+    }
+
+    function normalizeThinkingTrace(rawText) {
+      return String(rawText || "")
+        .replace(/<\/?think>/g, "")
+        .replace(/<image(\d+)>/g, "\n[image boundary $1]\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trimStart();
+    }
+
+    function ensureThinkingTrace(pending) {
+      if (pending.thinkingTrace) return pending.thinkingTrace;
+      const wrap = document.createElement("details");
+      wrap.className = "thinking-trace";
+      wrap.open = true;
+      wrap.appendChild(makeEl("summary", "", "Thinking trace"));
+      const content = makeEl("div", "thinking-trace-text", "");
+      wrap.appendChild(content);
+      pending.thinkingTrace = {wrap, content};
+      pending.body.insertBefore(wrap, pending.status || null);
+      return pending.thinkingTrace;
+    }
+
+    function appendThinkingTrace(pending, delta) {
+      pending.thinkingRaw = `${pending.thinkingRaw || ""}${delta || ""}`;
+      if (!shouldShowThinkingTrace()) return;
+      const trace = ensureThinkingTrace(pending);
+      trace.content.textContent = normalizeThinkingTrace(pending.thinkingRaw);
+      trace.content.scrollTop = trace.content.scrollHeight;
+    }
+
     function renderSegment(segment) {
       if (segment?.metadata?.role === "think") {
+        return null;
+      }
+      if (segment?.type === "text" && !(segment.text || "").trim()) {
         return null;
       }
       const wrap = makeEl("div", "segment");
@@ -1002,18 +1076,27 @@
       if (event.type === "text_delta") {
         const role = event.metadata?.role || "";
         if (role === "think") {
+          appendThinkingTrace(pending, event.delta || "");
           setPendingStatus(pending, "Thinking");
+          return;
+        }
+        const segmentId = event.segment_id || "seg-text";
+        if (!(event.delta || "").trim() && !pending.segments.has(segmentId)) {
+          setPendingStatus(pending, "Writing");
           return;
         }
         const entry = getLiveSegment(
           pending,
-          event.segment_id || "seg-text",
+          segmentId,
           "text"
         );
         entry.content.textContent += event.delta || "";
         setPendingStatus(pending, "Writing");
       } else if (event.type === "text_end") {
-        setPendingStatus(pending, "Thinking");
+        setPendingStatus(
+          pending,
+          event.metadata?.role === "think" ? "Thinking" : "Generating"
+        );
       } else if (event.type === "image_start") {
         getLiveSegment(pending, event.segment_id || "seg-image", "image");
         setPendingStatus(pending, "Generating image");

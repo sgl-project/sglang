@@ -93,6 +93,10 @@ class U1ModelStateUpdate:
     open_image_marker: bool | None = None
     interleave_pending_image_marker: bool | None = None
     interleave_image_count: int | None = None
+    # interleave_think_mode is the request-level U1 hidden-reasoning switch
+    interleave_think_mode: bool | None = None
+    # interleave_thinking_done is true after U1 has emitted </think>
+    interleave_thinking_done: bool | None = None
     # u1 m-rope positions are logical positions, not always raw srt token count
     generation_position_start: int | None = None
     t2i_think_mode: bool | None = None
@@ -141,6 +145,10 @@ class U1ModelStateUpdate:
             )
         if self.interleave_image_count is not None:
             state["interleave_image_count"] = self.interleave_image_count
+        if self.interleave_think_mode is not None:
+            state["interleave_think_mode"] = self.interleave_think_mode
+        if self.interleave_thinking_done is not None:
+            state["interleave_thinking_done"] = self.interleave_thinking_done
         if self.generation_position_start is not None:
             state["generation_position_start"] = self.generation_position_start
         if self.t2i_think_mode is not None:
@@ -217,8 +225,10 @@ U1_INTERLEAVE_SYSTEM_MESSAGE = (
     "without reasoning. Do not use tags like <image1>, <image2>; present any "
     "images naturally alongside the text.\n\n"
     "After the think block, always provide a concise, user-facing final answer. "
-    "The answer may include text, images, or both. Match the user's language in "
-    "both reasoning and the final answer."
+    "The final answer must not include hidden reasoning, planning steps, numbered "
+    "analysis, explicit image prompts, or phrases like \"I will\". The answer may "
+    "include text, images, or both. Match the user's language in both reasoning "
+    "and the final answer."
 )
 
 
@@ -343,6 +353,8 @@ def build_u1_native_interleave_prepared_input(
             open_image_marker=False,
             interleave_pending_image_marker=False,
             interleave_image_count=0,
+            interleave_think_mode=bool(think_mode),
+            interleave_thinking_done=not bool(think_mode),
         ),
     )
 
