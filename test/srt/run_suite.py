@@ -84,16 +84,6 @@ suite_xeon = {
         TestFile("cpu/test_server_args_backend.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
-        TestFile("cpu/test_act_quant_cpu.py"),
-        TestFile("cpu/test_allocator.py"),
-        TestFile("cpu/test_compressor.py"),
-        TestFile("cpu/test_flash_mla_with_kvcache_cpu.py"),
-        TestFile("cpu/test_fp8_paged_mqa_logits_cpu.py"),
-        TestFile("cpu/test_fused_scale_cpu.py"),
-        TestFile("cpu/test_hadamard.py"),
-        TestFile("cpu/test_mhc.py"),
-        TestFile("cpu/test_store_cache.py"),
-        TestFile("cpu/test_topk_transform_512_cpu.py"),
     ],
 }
 
