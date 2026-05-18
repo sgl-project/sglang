@@ -115,7 +115,7 @@ def analyse(args):
         if isinstance(response, dict) and "error" in response:
             continue
 
-        if not response.choices or response.choices[0].message is None:
+        if not response.choices or response.choices[0].message is None or response.choices[0].message.content is None:
             continue
         hyps.append(response.choices[0].message.content.strip())
         refs.append(ex["answer"])
