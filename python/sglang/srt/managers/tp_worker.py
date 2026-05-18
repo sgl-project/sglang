@@ -41,11 +41,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardData,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
@@ -461,19 +457,21 @@ class TpModelWorker(BaseTpWorker):
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 
-        # Strict mode: worker entry must consume a ForwardData snapshot. Live
-        # SB is permitted by typing for the legacy fallback path; in strict
-        # mode the union is collapsed to FD-only so any regression where SB
-        # leaks into the worker stack fails fast in CI.
+        # Strict mode: in overlap mode the worker entry must consume a
+        # ForwardData snapshot; non-overlap legitimately passes SB for the
+        # mutator-style legacy paths (spec V1 / dflash / frozen_kv_mtp /
+        # non-spec). The strict guard only collapses the union under
+        # enable_overlap so any regression where SB leaks into the overlap
+        # worker stack fails fast in CI.
         if (
             envs.SGLANG_RELAYER_DEBUG_STRICT.get()
-            and batch is not None
-            and not isinstance(batch, ForwardData)
+            and isinstance(batch, ScheduleBatch)
+            and batch.enable_overlap
         ):
             raise AssertionError(
                 f"strict: TpModelWorker.forward_batch_generation must receive "
-                f"ForwardData, got {type(batch).__name__}. Use "
-                f"ScheduleBatch.to_forward_data() at the schedule->worker "
+                f"ForwardData under enable_overlap=True, got ScheduleBatch. "
+                f"Use ScheduleBatch.to_forward_data() at the schedule->worker "
                 f"boundary."
             )
 

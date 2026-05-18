@@ -2913,20 +2913,12 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                forward_data = batch.to_forward_data()
+                # Non-overlap path: spec V1 / dflash / frozen_kv_mtp / non-spec
+                # all mutate SB directly inside the worker; no FD boundary
+                # since there is no cross-iter race window here.
                 batch_result = self.model_worker.forward_batch_generation(
-                    forward_data, **kwargs
+                    batch, **kwargs
                 )
-                # Spec V1 worker mutates forward_data.spec_info in-place
-                # across draft -> verify -> draft_extend; the next iter's
-                # prepare_for_decode reads SB.spec_info, so propagate it back.
-                # Other fields (out_cache_loc / seq_lens_sum / forward_mode /
-                # capture_hidden_mode / return_hidden_states) are transient
-                # inside the worker call and get re-derived next iter.
-                # This branch is the non-overlap path (enable_overlap=False),
-                # where spec V2 cannot apply by definition of is_spec_v2.
-                if not self.spec_algorithm.is_none():
-                    batch.spec_info = forward_data.spec_info
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
