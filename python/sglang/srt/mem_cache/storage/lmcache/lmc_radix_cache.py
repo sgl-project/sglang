@@ -377,6 +377,7 @@ class LMCRadixCache(RadixCache):
         """MP non-layerwise loader: fire ``retrieve_kv`` and wait for the
         load_stream so the compute stream observes the writes.
         """
+        self.load_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.load_stream):
             n = self.lmcache_connector.retrieve_kv(
                 LoadMetadata(
