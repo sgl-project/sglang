@@ -100,18 +100,6 @@ def get_runners(pool: "KVCache") -> Optional[List[CanaryRunner]]:
     return getattr(pool, _GLOBAL_RUNNERS_KEY, None)
 
 
-def get_runner(pool: "KVCache") -> Optional[CanaryRunner]:
-    """Return the FIRST (FULL) runner attached to the pool, or ``None``.
-
-    Convenience accessor for callers that only need to peek at canary
-    config / state without iterating over every attached runner.
-    """
-    runners = get_runners(pool)
-    if not runners:
-        return None
-    return runners[0]
-
-
 def run_head(
     *,
     runners: Optional[List[CanaryRunner]],
