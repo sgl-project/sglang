@@ -84,9 +84,14 @@ def compute_partition_count(
         fallback_count = math.ceil(total_time_seconds / target_time_seconds)
         return max(1, min(fallback_count, max_partitions))
 
-    preferred_count = math.ceil(total_time_seconds / target_time_seconds)
-    preferred_count = max(1, min(preferred_count, max_partitions))
-    return max(min_partition_count, min(preferred_count, max_partition_count))
+    candidate_counts = range(min_partition_count, max_partition_count + 1)
+    return min(
+        candidate_counts,
+        key=lambda count: (
+            abs(total_time_seconds / count - target_time_seconds),
+            count,
+        ),
+    )
 
 
 def build_partition_items(

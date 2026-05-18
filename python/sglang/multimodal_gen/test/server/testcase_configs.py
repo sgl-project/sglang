@@ -101,6 +101,7 @@ class BaselineConfig:
     """Full baseline configuration."""
 
     scenarios: dict[str, ScenarioConfig]
+    partition_estimates_s: dict[str, float]
     step_fractions: Sequence[float]
     tolerances: ToleranceConfig
     improvement_threshold: float
@@ -130,6 +131,7 @@ class BaselineConfig:
 
         return cls(
             scenarios=scenarios,
+            partition_estimates_s=dict(data.get("partition_estimates_s", {})),
             step_fractions=tuple(data["sampling"]["step_fractions"]),
             tolerances=tolerances,
             improvement_threshold=data.get("improvement_reporting", {}).get(
@@ -154,6 +156,7 @@ class BaselineConfig:
             )
 
         self.scenarios.update(scenarios_new)
+        self.partition_estimates_s.update(data.get("partition_estimates_s", {}))
         return self
 
 

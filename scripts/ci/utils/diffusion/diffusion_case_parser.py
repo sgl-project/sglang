@@ -301,6 +301,9 @@ def load_baselines(baseline_path: Path) -> Dict[str, float]:
             expected_e2e_ms = scenario.get("expected_e2e_ms", 0)
             baselines[case_id] = expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
 
+    for case_id, est_time in data.get("partition_estimates_s", {}).items():
+        baselines.setdefault(case_id, est_time)
+
     return baselines
 
 
