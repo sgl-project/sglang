@@ -133,6 +133,10 @@ def _launch(
         slot_run_counter=state["slot_run_counter"],
         kernel_run_counter=state["kernel_run_counter"],
         kernel_kind=KERNEL_KIND_HEAD,
+        real_kv_buf=torch.zeros(1, dtype=torch.uint8, device=DEFAULT_DEVICE),
+        real_kv_slot_stride_bytes=0,
+        real_kv_read_bytes=0,
+        real_kv_hash_mode=0,
     )
 
 

@@ -747,6 +747,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         install_on_model_runner(
             model_runner=self,
             mode=server_args.kv_cache_canary,
+            real_kv_hash_mode=server_args.kv_cache_canary_real_data,
         )
 
         # Init ngram embedding token table

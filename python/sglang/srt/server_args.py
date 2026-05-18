@@ -676,6 +676,7 @@ class ServerArgs:
     # Optimization/debug options
     disable_radix_cache: bool = False
     kv_cache_canary: str = "off"
+    kv_cache_canary_real_data: str = "off"
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -6042,6 +6043,25 @@ class ServerArgs:
                 "cross-rank allreduce of the error flag and raises on every rank "
                 "to avoid TP deadlocks (CI lane). See "
                 "python/sglang/srt/kv_cache_canary/README for details."
+            ),
+        )
+        parser.add_argument(
+            "--kv-cache-canary-real-data",
+            type=str,
+            default=ServerArgs.kv_cache_canary_real_data,
+            choices=["off", "bit", "all"],
+            help=(
+                "Enable the canary-with-real-data fingerprint (UserInstr Fix 5 "
+                "/ part c). 'off' (default) leaves the new real_kv_hash slot "
+                "field at zero. 'bit' reads the first 16 bytes of the real KV "
+                "pool's slot at write time, folds through splitmix64, and "
+                "verifies on read; useful when corruption is suspected but "
+                "overhead must stay tiny. 'all' reads the full real-KV slot "
+                "stride for maximum coverage at higher cost. Catches "
+                "corruption that is invisible to the pure-canary path because "
+                "the canary slot itself is intact but the real KV got "
+                "written wrong (attn-kernel idle-logic misconfig; PD "
+                "transfer bit-rot)."
             ),
         )
         parser.add_argument(

@@ -11,8 +11,16 @@ from sglang.jit_kernel.kv_cache_canary import (
     KERNEL_KIND_TAIL,
     FailReason,
 )
-from sglang.srt.kv_cache_canary.config import CanaryConfig, CanaryMode
-from sglang.srt.kv_cache_canary.endpoint import CanaryEndpoint
+from sglang.srt.kv_cache_canary.config import (
+    CanaryConfig,
+    CanaryMode,
+    real_kv_hash_mode_to_int,
+    real_kv_hash_read_bytes,
+)
+from sglang.srt.kv_cache_canary.endpoint import (
+    CanaryEndpoint,
+    _empty_real_kv_buf,
+)
 from sglang.srt.kv_cache_canary.host_state import (
     VIOLATION_KIND_HEAD_K,
     VIOLATION_KIND_HEAD_V,
@@ -79,6 +87,25 @@ class CanaryRunner:
         self._device_state = CanaryDeviceState.allocate(
             device=device, ring_capacity=config.violation_ring_capacity
         )
+
+        real_kv_hash_mode_int = real_kv_hash_mode_to_int(config.real_kv_hash_mode)
+        if (
+            shadow_group.real_kv_source is not None
+            and real_kv_hash_mode_int != 0
+            and shadow_group.real_kv_slot_stride_bytes > 0
+        ):
+            real_kv_buf = (
+                shadow_group.real_kv_source.view(torch.uint8).contiguous().flatten()
+            )
+            real_kv_slot_stride_bytes = shadow_group.real_kv_slot_stride_bytes
+            real_kv_read_bytes = real_kv_hash_read_bytes(
+                config.real_kv_hash_mode, real_kv_slot_stride_bytes
+            )
+        else:
+            real_kv_buf = _empty_real_kv_buf(device)
+            real_kv_slot_stride_bytes = 0
+            real_kv_read_bytes = 0
+
         self._head_endpoint = CanaryEndpoint(
             kernel_kind=KERNEL_KIND_HEAD,
             k_shadow=shadow_group.k_head,
@@ -93,6 +120,10 @@ class CanaryRunner:
             kernel_run_counter=self._device_state.kernel_run_counter_head,
             k_slot_stride_bytes=shadow_group.k_slot_stride_bytes,
             v_slot_stride_bytes=shadow_group.v_slot_stride_bytes,
+            real_kv_buf=real_kv_buf,
+            real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
+            real_kv_read_bytes=real_kv_read_bytes,
+            real_kv_hash_mode=real_kv_hash_mode_int,
         )
         self._tail_endpoint = CanaryEndpoint(
             kernel_kind=KERNEL_KIND_TAIL,
@@ -108,6 +139,10 @@ class CanaryRunner:
             kernel_run_counter=self._device_state.kernel_run_counter_tail,
             k_slot_stride_bytes=shadow_group.k_slot_stride_bytes,
             v_slot_stride_bytes=shadow_group.v_slot_stride_bytes,
+            real_kv_buf=real_kv_buf,
+            real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
+            real_kv_read_bytes=real_kv_read_bytes,
+            real_kv_hash_mode=real_kv_hash_mode_int,
         )
         # Pre-allocated fixed-address launch buffers. Cuda graph capture
         # records these specific addresses; replay-side host code refills

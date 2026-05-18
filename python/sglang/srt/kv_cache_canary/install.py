@@ -32,6 +32,7 @@ def install_on_model_runner(
     *,
     model_runner: "ModelRunner",
     mode: Optional[str],
+    real_kv_hash_mode: Optional[str] = None,
 ) -> None:
     """Attach the canary to the model runner's pool and wire its hooks.
 
@@ -43,8 +44,12 @@ def install_on_model_runner(
     and ``cuda_graph_runner.patch_model`` yields ``model.forward`` for capture
     too — so patching the bound method is the single point that covers both
     the eager and the captured-into-cuda-graph paths.
+
+    ``real_kv_hash_mode`` (one of ``off`` / ``bit`` / ``all``, default
+    ``off``) controls the canary-with-real-data fingerprint (UserInstr
+    Fix 5 / part c).
     """
-    config = CanaryConfig.from_server_args(mode)
+    config = CanaryConfig.from_server_args(mode, real_kv_hash_mode=real_kv_hash_mode)
     if not config.enabled:
         return
 

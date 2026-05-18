@@ -64,6 +64,14 @@ class CanaryShadowGroup:
     The same group is wrapped in two :class:`~CanaryEndpoint` instances
     inside :class:`~CanaryRunner` (head + tail), so the K/V split lives
     here as data while the head/tail symmetry lives in the endpoint.
+
+    The optional ``real_kv_source`` references the underlying **real** KV
+    pool's layer-0 K buffer (uint8-view, flat across slots). When
+    ``--kv-cache-canary-real-data`` is on, the canary kernel reads a
+    portion of this tensor at the same slot index it is writing the
+    canary fingerprint for, hashes the bytes through splitmix64, and
+    stores / verifies the result against the ``real_kv_hash`` slot
+    field. ``None`` means the feature is disabled for this group.
     """
 
     kind: PoolKind
@@ -73,6 +81,8 @@ class CanaryShadowGroup:
     v_tail: Optional[torch.Tensor]
     k_slot_stride_bytes: int
     v_slot_stride_bytes: int
+    real_kv_source: Optional[torch.Tensor] = None
+    real_kv_slot_stride_bytes: int = 0
 
     @property
     def has_v_half(self) -> bool:
@@ -153,6 +163,7 @@ def _allocate_shadow_group(
     kind: PoolKind,
     k_template: torch.Tensor,
     v_template: Optional[torch.Tensor],
+    real_kv_source: Optional[torch.Tensor] = None,
 ) -> CanaryShadowGroup:
     """Allocate a fresh shadow group sized off the provided slot templates.
 
@@ -160,6 +171,11 @@ def _allocate_shadow_group(
     the slot count is borrowed from the template; the per-slot footprint
     is the canary's tiny fingerprint rather than the real KV's per-slot
     size, so canary memory and PD transfer stay bounded.
+
+    ``real_kv_source`` (optional) is the underlying real KV pool's layer
+    template (same tensor used for ``k_template`` for K-half pools); we
+    derive the per-slot real-stride from its layout so the kernel can
+    address slot N at ``real_kv_source.flatten().view(uint8)[N*stride : ...]``.
     """
     device = k_template.device
     num_slots = int(k_template.shape[0])
@@ -183,6 +199,10 @@ def _allocate_shadow_group(
         )
         v_slot_stride_bytes = CANARY_SLOT_BYTES
 
+    real_kv_slot_stride_bytes: int = 0
+    if real_kv_source is not None and num_slots > 0:
+        real_kv_slot_stride_bytes = int(real_kv_source[0].nbytes)
+
     return CanaryShadowGroup(
         kind=kind,
         k_head=k_head,
@@ -191,6 +211,8 @@ def _allocate_shadow_group(
         v_tail=v_tail,
         k_slot_stride_bytes=CANARY_SLOT_BYTES,
         v_slot_stride_bytes=v_slot_stride_bytes,
+        real_kv_source=real_kv_source,
+        real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
     )
 
 
@@ -203,6 +225,7 @@ def _attach_mha(
         kind=PoolKind.FULL,
         k_template=pool.k_buffer[0],
         v_template=pool.v_buffer[0],
+        real_kv_source=pool.k_buffer[0],
     )
     shadow_groups[PoolKind.FULL] = group
     _patch_get_contiguous_buf_infos(pool, shadow_groups=shadow_groups, has_v_half=True)
@@ -225,6 +248,7 @@ def _attach_mla(
         kind=PoolKind.FULL,
         k_template=pool.kv_buffer[0],
         v_template=None,
+        real_kv_source=pool.kv_buffer[0],
     )
     shadow_groups[PoolKind.FULL] = group
     _patch_get_contiguous_buf_infos(pool, shadow_groups=shadow_groups, has_v_half=False)
@@ -296,11 +320,13 @@ def _attach_swa(
         kind=PoolKind.FULL,
         k_template=full_k_template,
         v_template=full_v_template,
+        real_kv_source=full_k_template,
     )
     swa_group = _allocate_shadow_group(
         kind=PoolKind.SWA,
         k_template=swa_k_template,
         v_template=swa_v_template,
+        real_kv_source=swa_k_template,
     )
     shadow_groups[PoolKind.FULL] = full_group
     shadow_groups[PoolKind.SWA] = swa_group

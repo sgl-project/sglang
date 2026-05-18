@@ -58,6 +58,10 @@ def _i32(values: list[int]) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32, device="cuda")
 
 
+def _empty_real_kv() -> torch.Tensor:
+    return torch.zeros(1, dtype=torch.uint8, device="cuda")
+
+
 def _run(
     *,
     src: torch.Tensor,
@@ -79,6 +83,10 @@ def _run(
     state: dict,
     kernel_kind: int,
     seed: int = _SEED,
+    real_kv_buf: torch.Tensor | None = None,
+    real_kv_slot_stride_bytes: int = 0,
+    real_kv_read_bytes: int = 0,
+    real_kv_hash_mode: int = 0,
 ) -> None:
     canary_step(
         src_buf=src.flatten(),
@@ -107,13 +115,18 @@ def _run(
         slot_run_counter=state["slot_run_counter"],
         kernel_run_counter=state["kernel_run_counter"],
         kernel_kind=kernel_kind,
+        real_kv_buf=real_kv_buf if real_kv_buf is not None else _empty_real_kv(),
+        real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
+        real_kv_read_bytes=real_kv_read_bytes,
+        real_kv_hash_mode=real_kv_hash_mode,
     )
     torch.cuda.synchronize()
 
 
 def _read_slot(
     buf: torch.Tensor, slot_idx: int, slot_stride_bytes: int
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
+    """Return ``(req_id, token_id, position, prev_hash, real_kv_hash)``."""
     row = buf[slot_idx, :CANARY_SLOT_BYTES].clone().view(torch.int64).cpu().tolist()
     return tuple(int(x) for x in row)
 
@@ -155,11 +168,13 @@ def test_write_chain_seeded_from_kseed_fills_slots_with_splitmix64_chain():
     # Recompute the expected chain in Python and bit-wise-match the stored prev_hash.
     expected_prev = _SEED
     for slot_idx, token, position in zip(slot_indices, tokens, positions):
-        rid, tid, pos, ph = _read_slot(dst, slot_idx, slot_stride)
+        rid, tid, pos, ph, real_kv_hash = _read_slot(dst, slot_idx, slot_stride)
         assert rid == req_id
         assert tid == token
         assert pos == position
         assert ph == to_signed_int64(expected_prev)
+        # real_kv_hash_mode defaults to OFF in this test -> field stays at 0.
+        assert real_kv_hash == 0
         expected_prev = splitmix64_mix(expected_prev, token, position)
 
 
@@ -607,10 +622,24 @@ def _run_differential(
     slot_stride: int,
     kernel_kind: int,
     seed: int = _SEED,
+    real_kv_buf_cuda: torch.Tensor | None = None,
+    real_kv_buf_ref: torch.Tensor | None = None,
+    real_kv_slot_stride_bytes: int = 0,
+    real_kv_read_bytes: int = 0,
+    real_kv_hash_mode: int = 0,
 ) -> None:
     """Drive both implementations and bit-wise compare every output field."""
     src_cuda = src_initial.detach().clone().to(state_cuda["dst_buf"].device)
     src_ref = src_initial.detach().clone().to(state_ref["dst_buf"].device)
+
+    if real_kv_buf_cuda is None:
+        real_kv_buf_cuda = torch.zeros(
+            1, dtype=torch.uint8, device=state_cuda["dst_buf"].device
+        )
+    if real_kv_buf_ref is None:
+        real_kv_buf_ref = torch.zeros(
+            1, dtype=torch.uint8, device=state_ref["dst_buf"].device
+        )
 
     canary_step(
         src_buf=src_cuda.flatten(),
@@ -626,6 +655,10 @@ def _run_differential(
         is_errored=state_cuda["is_errored"],
         slot_run_counter=state_cuda["slot_run_counter"],
         kernel_run_counter=state_cuda["kernel_run_counter"],
+        real_kv_buf=real_kv_buf_cuda,
+        real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
+        real_kv_read_bytes=real_kv_read_bytes,
+        real_kv_hash_mode=real_kv_hash_mode,
         **inputs_cuda,
     )
     torch.cuda.synchronize()
@@ -644,6 +677,10 @@ def _run_differential(
         is_errored=state_ref["is_errored"],
         slot_run_counter=state_ref["slot_run_counter"],
         kernel_run_counter=state_ref["kernel_run_counter"],
+        real_kv_buf=real_kv_buf_ref,
+        real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
+        real_kv_read_bytes=real_kv_read_bytes,
+        real_kv_hash_mode=real_kv_hash_mode,
         **inputs_ref,
     )
 
@@ -989,6 +1026,106 @@ def _scenario_ring_buffer_small_capacity() -> dict:
     )
 
 
+def _scenario_real_kv_hash_clean_chain(*, mode_int: int, read_bytes: int) -> dict:
+    """Real-KV hash on / clean chain: write 3 slots then verify them.
+
+    The real-KV buffer is filled with a deterministic per-slot pattern so
+    each slot has distinct bytes (otherwise the hash collisions would
+    hide a corruption bug); both the write and verify passes go through
+    the same buffer, so the stored fingerprint matches the recomputed
+    one and no violation should fire.
+    """
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=8,
+        ring_capacity=8,
+        kernel_kind=KERNEL_KIND_HEAD,
+        prefill_writes=None,
+        plan=dict(
+            verify_slot_indices=[0, 1, 2],
+            verify_positions=[0, 1, 2],
+            verify_req_ids=[3, 3, 3],
+            verify_prev_slot_indices=[-1, 0, 1],
+            verify_active_mask=[1, 1, 1],
+            write_slot_indices=[0, 1, 2],
+            write_token_ids=[101, 202, 303],
+            write_positions=[0, 1, 2],
+            write_req_ids=[3, 3, 3],
+            write_req_seed_slot_indices=[-1],
+            write_req_entry_starts=[0],
+            write_req_entry_counts=[3],
+            write_req_active_mask=[1],
+        ),
+        real_kv=dict(
+            slot_stride_bytes=64,
+            read_bytes=read_bytes,
+            mode_int=mode_int,
+            # Per-slot byte pattern: byte j of slot i = (i + 1) * 13 + j.
+            # Distinct per (i, j) so different slots hash to different
+            # values within the read window.
+            byte_pattern="seq",
+        ),
+    )
+
+
+def _scenario_real_kv_hash_corruption_caught() -> dict:
+    """Real-KV hash on: prefill 3 slots (writes the fingerprint), corrupt one
+    real-KV byte, then verify-only.
+
+    Step 1 (prefill, executed before the differential run): the prefill
+    helper launches a write-only canary_step with real-KV mode ON, so
+    each slot's ``real_kv_hash`` field stores the splitmix64 fold of the
+    clean real-KV bytes.
+
+    Step 2 (between prefill and verify): we mutate one byte inside slot
+    1's read window, so the verify path will recompute a different
+    fingerprint than the one stored.
+
+    Step 3 (verify, the actual differential launch): verify_only on
+    slots 0..2; verify thread for slot 1 detects ``REAL_KV_HASH`` and
+    records a violation. The CUDA + torch reference paths must produce
+    bit-identical state.
+    """
+    return dict(
+        slot_stride=CANARY_SLOT_BYTES,
+        num_slots=8,
+        ring_capacity=8,
+        kernel_kind=KERNEL_KIND_HEAD,
+        prefill_writes=dict(
+            slots=[0, 1, 2],
+            tokens=[101, 202, 303],
+            positions=[0, 1, 2],
+            req_id=3,
+        ),
+        plan=dict(
+            verify_slot_indices=[0, 1, 2],
+            verify_positions=[0, 1, 2],
+            verify_req_ids=[3, 3, 3],
+            verify_prev_slot_indices=[-1, 0, 1],
+            verify_active_mask=[1, 1, 1],
+            write_slot_indices=[],
+            write_token_ids=[],
+            write_positions=[],
+            write_req_ids=[],
+            write_req_seed_slot_indices=[],
+            write_req_entry_starts=[],
+            write_req_entry_counts=[],
+            write_req_active_mask=[],
+        ),
+        real_kv=dict(
+            slot_stride_bytes=64,
+            read_bytes=16,
+            mode_int=1,
+            byte_pattern="seq",
+            # Apply BEFORE the verify-only differential launch:
+            # mutate one byte inside slot 1's read window so the
+            # recomputed fingerprint won't match the prefill-stored one.
+            corrupt_between=dict(slot_idx=1, byte_offset=0, new_value=0xFF),
+        ),
+        expected_fail_reason=FailReason.REAL_KV_HASH,
+    )
+
+
 def _scenario_inactive_mask_skipped() -> dict:
     # Every active_mask = 0 -> kernel must be a no-op on slot I/O and
     # slot_run_counter, but kernel_run_counter still advances. Same
@@ -1030,6 +1167,13 @@ _DIFFERENTIAL_SCENARIOS = {
     "large_k_req_1w": _scenario_large_k_req_1w,
     "ring_buffer_small_capacity": _scenario_ring_buffer_small_capacity,
     "inactive_mask_skipped": _scenario_inactive_mask_skipped,
+    "real_kv_hash_clean_chain_bit_mode": (
+        lambda: _scenario_real_kv_hash_clean_chain(mode_int=1, read_bytes=16)
+    ),
+    "real_kv_hash_clean_chain_all_mode": (
+        lambda: _scenario_real_kv_hash_clean_chain(mode_int=2, read_bytes=64)
+    ),
+    "real_kv_hash_corruption_caught": _scenario_real_kv_hash_corruption_caught,
 }
 
 
@@ -1041,6 +1185,10 @@ def _prefill_buffer_with_chain(
     positions: list[int],
     req_id: int,
     slot_stride: int,
+    real_kv_buf: torch.Tensor | None = None,
+    real_kv_slot_stride_bytes: int = 0,
+    real_kv_read_bytes: int = 0,
+    real_kv_hash_mode: int = 0,
 ) -> None:
     """Drive a clean chain into ``buf`` via the CUDA kernel (used to set up
     the source buffer for verify-only differential scenarios)."""
@@ -1068,6 +1216,8 @@ def _prefill_buffer_with_chain(
         write_req_active_mask=[1],
     )
     # Use canary_step itself; result lives in state["dst_buf"], copy to buf.
+    if real_kv_buf is None:
+        real_kv_buf = torch.zeros(1, dtype=torch.uint8, device=buf.device)
     canary_step(
         src_buf=state["dst_buf"].flatten(),
         dst_buf=state["dst_buf"].flatten(),
@@ -1082,10 +1232,27 @@ def _prefill_buffer_with_chain(
         is_errored=state["is_errored"],
         slot_run_counter=state["slot_run_counter"],
         kernel_run_counter=state["kernel_run_counter"],
+        real_kv_buf=real_kv_buf,
+        real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
+        real_kv_read_bytes=real_kv_read_bytes,
+        real_kv_hash_mode=real_kv_hash_mode,
         **inputs,
     )
     torch.cuda.synchronize()
     buf.copy_(state["dst_buf"])
+
+
+def _build_real_kv_buf(
+    *, num_slots: int, slot_stride_bytes: int, pattern: str
+) -> torch.Tensor:
+    """Build a deterministic real-KV buffer for differential test scenarios."""
+    if pattern != "seq":
+        raise ValueError(f"unknown real-KV pattern {pattern!r}")
+    buf = torch.zeros(num_slots, slot_stride_bytes, dtype=torch.uint8, device="cuda")
+    for i in range(num_slots):
+        for j in range(slot_stride_bytes):
+            buf[i, j] = ((i + 1) * 13 + j) & 0xFF
+    return buf
 
 
 @pytest.mark.parametrize("scenario_name", sorted(_DIFFERENTIAL_SCENARIOS.keys()))
@@ -1099,6 +1266,22 @@ def test_canary_step_cuda_matches_torch_reference(scenario_name: str) -> None:
     plan_lists = scenario["plan"]
     prefill = scenario.get("prefill_writes")
     corrupt = scenario.get("corrupt_prev_hash")
+    real_kv_cfg = scenario.get("real_kv")
+
+    real_kv_slot_stride_bytes = 0
+    real_kv_read_bytes = 0
+    real_kv_hash_mode = 0
+    real_kv_buf_cuda: torch.Tensor | None = None
+    real_kv_buf_ref: torch.Tensor | None = None
+    if real_kv_cfg is not None:
+        real_kv_slot_stride_bytes = int(real_kv_cfg["slot_stride_bytes"])
+        real_kv_read_bytes = int(real_kv_cfg["read_bytes"])
+        real_kv_hash_mode = int(real_kv_cfg["mode_int"])
+        real_kv_buf_cuda = _build_real_kv_buf(
+            num_slots=num_slots,
+            slot_stride_bytes=real_kv_slot_stride_bytes,
+            pattern=real_kv_cfg["byte_pattern"],
+        )
 
     src_initial = torch.zeros(num_slots, slot_stride, dtype=torch.uint8, device="cuda")
     if prefill is not None:
@@ -1109,6 +1292,10 @@ def test_canary_step_cuda_matches_torch_reference(scenario_name: str) -> None:
             positions=prefill["positions"],
             req_id=prefill["req_id"],
             slot_stride=slot_stride,
+            real_kv_buf=real_kv_buf_cuda,
+            real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
+            real_kv_read_bytes=real_kv_read_bytes,
+            real_kv_hash_mode=real_kv_hash_mode,
         )
     if corrupt is not None:
         slot_idx = int(corrupt["slot"])
@@ -1127,6 +1314,27 @@ def test_canary_step_cuda_matches_torch_reference(scenario_name: str) -> None:
     inputs_cuda = _build_inputs_on("cuda", **plan_lists)
     inputs_ref = {k: v.detach().clone().to("cuda") for k, v in inputs_cuda.items()}
 
+    if real_kv_buf_cuda is not None:
+        real_kv_buf_ref = real_kv_buf_cuda.detach().clone()
+        # Optional corruption between write and verify: we run the write
+        # path on a CLEAN real-KV (already in ``real_kv_buf_cuda``), then
+        # mutate the byte the verify path will see. To pull this off
+        # inside a single differential kernel launch we mutate the buffer
+        # IN PLACE: the verify thread reads slot at index
+        # ``verify_slot_indices[i]`` and hashes the current bytes; the
+        # write driver writes slot at ``write_slot_indices[k]`` and
+        # hashes the bytes BEFORE the verify thread is guaranteed to
+        # have run. We avoid that ordering hazard by ensuring no
+        # ``verify_slot_indices`` overlap with the corruption target —
+        # the existing scenario builders enforce this.
+        corrupt_between = real_kv_cfg.get("corrupt_between") if real_kv_cfg else None
+        if corrupt_between is not None:
+            slot_i = int(corrupt_between["slot_idx"])
+            offset = int(corrupt_between["byte_offset"])
+            new_value = int(corrupt_between["new_value"]) & 0xFF
+            real_kv_buf_cuda[slot_i, offset] = new_value
+            real_kv_buf_ref[slot_i, offset] = new_value
+
     _run_differential(
         scenario=scenario_name,
         src_initial=src_initial,
@@ -1136,6 +1344,11 @@ def test_canary_step_cuda_matches_torch_reference(scenario_name: str) -> None:
         inputs_ref=inputs_ref,
         slot_stride=slot_stride,
         kernel_kind=kernel_kind,
+        real_kv_buf_cuda=real_kv_buf_cuda,
+        real_kv_buf_ref=real_kv_buf_ref,
+        real_kv_slot_stride_bytes=real_kv_slot_stride_bytes,
+        real_kv_read_bytes=real_kv_read_bytes,
+        real_kv_hash_mode=real_kv_hash_mode,
     )
 
     expected_fail_reason = scenario.get("expected_fail_reason")

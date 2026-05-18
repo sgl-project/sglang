@@ -92,6 +92,10 @@ def test_python_and_cuda_splitmix64_chains_match_bitwise():
         slot_run_counter=state["slot_run_counter"],
         kernel_run_counter=state["kernel_run_counter"],
         kernel_kind=KERNEL_KIND_HEAD,
+        real_kv_buf=torch.zeros(1, dtype=torch.uint8, device="cuda"),
+        real_kv_slot_stride_bytes=0,
+        real_kv_read_bytes=0,
+        real_kv_hash_mode=0,
     )
     torch.cuda.synchronize()
 

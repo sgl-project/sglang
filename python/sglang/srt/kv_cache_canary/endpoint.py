@@ -11,6 +11,19 @@ from sglang.srt.kv_cache_canary.host_state import (
     CanaryViolationSlot,
 )
 
+_DEFAULT_DISABLED_REAL_KV_BUF: Optional[torch.Tensor] = None
+
+
+def _empty_real_kv_buf(device: torch.device) -> torch.Tensor:
+    """One-byte placeholder ``real_kv_buf`` for OFF-mode kernel launches.
+
+    The kernel takes a non-null tensor handle but never dereferences it
+    in OFF mode (``real_kv_hash_mode == 0`` -> early-out). A 1-byte
+    uint8 tensor satisfies the type / non-null constraint without
+    allocating real KV memory.
+    """
+    return torch.zeros(1, dtype=torch.uint8, device=device)
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryEndpoint:
@@ -36,6 +49,10 @@ class CanaryEndpoint:
     kernel_run_counter: torch.Tensor
     k_slot_stride_bytes: int
     v_slot_stride_bytes: int
+    real_kv_buf: torch.Tensor
+    real_kv_slot_stride_bytes: int
+    real_kv_read_bytes: int
+    real_kv_hash_mode: int
 
     @property
     def has_v_half(self) -> bool:
@@ -102,4 +119,8 @@ class CanaryEndpoint:
                 slot_run_counter=self.slot_run_counter,
                 kernel_run_counter=self.kernel_run_counter,
                 kernel_kind=self.kernel_kind,
+                real_kv_buf=self.real_kv_buf,
+                real_kv_slot_stride_bytes=self.real_kv_slot_stride_bytes,
+                real_kv_read_bytes=self.real_kv_read_bytes,
+                real_kv_hash_mode=self.real_kv_hash_mode,
             )
