@@ -1,4 +1,8 @@
-"""Bench the hybrid ``mla_kv_pack_quantize_fp8`` against an inlined naive Triton baseline."""
+"""Compare the JIT mla_kv_pack_quantize_fp8 against the tokenspeed Triton
+reference at
+https://github.com/lightseekorg/tokenspeed/blob/ea9799067810479da9e7473fcbee48eb900de65e/tokenspeed-mla/python/tokenspeed_mla/mla_kv_pack_quantize_fp8.py
+(reproduced inline so the bench is self-contained).
+"""
 
 import itertools
 from typing import Tuple
@@ -15,7 +19,7 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
 )
 from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import (
-    mla_kv_pack_quantize_fp8 as hybrid_pack,
+    mla_kv_pack_quantize_fp8 as jit_pack,
 )
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -23,8 +27,11 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=15, suite="base-b-kernel-benchmark-1-gpu-large")
 
 
+# ---------- tokenspeed Triton reference (inlined verbatim) -------------------
+
+
 @triton.jit
-def _triton_mla_kv_pack_quantize_fp8_kernel(
+def _ts_mla_kv_pack_quantize_fp8_kernel(
     k_nope_ptr,
     k_pe_ptr,
     v_ptr,
@@ -100,7 +107,7 @@ def _triton_pack(k_nope, k_pe, v, k_out, v_out):
         block_s, num_warps, num_stages = 16, 4, 3
     extra = {"launch_pdl": True} if enable_pdl else {}
     grid = (triton.cdiv(s, block_s), num_heads)
-    _triton_mla_kv_pack_quantize_fp8_kernel[grid](
+    _ts_mla_kv_pack_quantize_fp8_kernel[grid](
         k_nope,
         k_pe_2d,
         v,
@@ -130,9 +137,13 @@ def _triton_pack(k_nope, k_pe, v, k_out, v_out):
     )
 
 
+# ---------- Benchmark scaffolding --------------------------------------------
+
+# Per-head dims (DSv3 standard).
 QK_NOPE = 128
 QK_ROPE = 64
 V_HEAD = 128
+# TP=4 of 128 heads → 32 heads per rank.
 NUM_HEADS = 32
 NUM_LAYERS = 8
 
@@ -141,8 +152,8 @@ BS_RANGE = get_benchmark_range(
     ci_range=[1, 64, 1024, 4096, 16384],
 )
 
-LINE_VALS = ["hybrid", "triton"]
-LINE_NAMES = ["hybrid (v0+v1_flat)", "naive Triton"]
+LINE_VALS = ["jit", "triton_ts"]
+LINE_NAMES = ["JIT (auto)", "Triton (tokenspeed)"]
 STYLES = [("green", "-"), ("red", "--")]
 CONFIGS = list(itertools.product(BS_RANGE))
 
@@ -188,11 +199,11 @@ def benchmark(batch_size: int, provider: str) -> Tuple[float, float, float]:
     )
     torch.cuda.synchronize()
 
-    if provider == "hybrid":
+    if provider == "jit":
 
         def fn():
             for i in range(NUM_LAYERS):
-                hybrid_pack(k_nope[i], k_pe[i], v[i], k_out=k_out[i], v_out=v_out[i])
+                jit_pack(k_nope[i], k_pe[i], v[i], k_out=k_out[i], v_out=v_out[i])
 
     else:
 

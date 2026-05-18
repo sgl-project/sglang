@@ -38,6 +38,8 @@ if _use_aiter_gfx95:
 
 
 def _resolve_attn_backend(forward_batch: ForwardBatch):
+    """Unwrap TboAttnBackend so ``hasattr``-based hook dispatch works
+    regardless of whether two-batch overlap is on."""
     backend = forward_batch.attn_backend
     if isinstance(backend, TboAttnBackend):
         backend = backend.primary
@@ -220,6 +222,24 @@ class DeepseekMHAForwardMixin:
             kv_a = self.kv_a_layernorm(kv_a)
 
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
+
+        # Backend prefill hook: the backend owns the BF16->FP8 transition
+        # (fused RoPE + quantize for Q/K, direct FP8 KV-cache write) and
+        # returns FP8 tensors ready for its kernel. Backends without the
+        # hook fall through to the BF16 path below.
+        backend = _resolve_attn_backend(forward_batch)
+        if hasattr(backend, "prepare_prefill_qkv"):
+            q_out, k_out, v_out = backend.prepare_prefill_qkv(
+                q=q,
+                q_pe=q_pe,
+                kv_a=kv_a,
+                k_pe=k_pe,
+                positions=positions,
+                layer=self,
+                forward_batch=forward_batch,
+            )
+            return q_out, k_out, v_out, forward_batch
+
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
@@ -377,7 +397,10 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
 
-        # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
+        # Backend hook: when present, the backend owns the BF16->FP8 K/V
+        # build for the prefix chunk. kv_b_proj always needs BF16 input, so
+        # request BF16 from the cache fetch — the legacy ``q.dtype`` happened
+        # to be BF16 in pre-hook code and breaks once q is FP8.
         backend = _resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
         kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype

@@ -403,17 +403,16 @@ class MoEGate(nn.Module):
                 and _device_sm >= 90
             ):
                 if _device_sm in [100, 103] and self.weight.shape[0] == 256:
-                    # router gemm output float32
                     logits = torch.empty(
                         hidden_states.shape[0],
                         self.weight.shape[0],
                         device=hidden_states.device,
-                        dtype=torch.float32,
+                        dtype=torch.bfloat16,
                     )
                     flashinfer_dsv3_router_gemm(logits, hidden_states, self.weight)
                 else:
                     logits = dsv3_router_gemm(
-                        hidden_states, self.weight, out_dtype=torch.float32
+                        hidden_states, self.weight, out_dtype=torch.bfloat16
                     )
 
             elif _use_aiter:
@@ -756,36 +755,39 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Heavy router+experts path stays on the main (current) stream; shared
+        # experts run on the alt stream. Matches tokenspeed's StreamFork
+        # layout — keeps the many small kernels of the routed path on the
+        # default stream to avoid per-launch context-switch cost.
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = self._forward_shared_experts(
-            hidden_states, gemm_output_zero_allocator
-        )
         server_args = get_global_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if server_args.enable_eplb
             else None
         )
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+        topk_kwargs = (
+            {"input_ids": input_ids_global} if getattr(self, "is_hash", False) else {}
+        )
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=dispatch_info,
+            **topk_kwargs,
+        )
+        final_hidden_states = self.experts(hidden_states, topk_output)
+        if not (_is_cuda or _is_musa) or isinstance(
+            self.experts.quant_method, KTEPWrapperMethod
+        ):
+            final_hidden_states *= self.routed_scaling_factor
+
         with torch.cuda.stream(self.alt_stream):
-            # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
             )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
-            )
-            final_hidden_states = self.experts(hidden_states, topk_output)
-            if not (_is_cuda or _is_musa) or isinstance(
-                self.experts.quant_method, KTEPWrapperMethod
-            ):
-                final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -2559,9 +2561,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
             self.capture_aux_hidden_states = True
-            # we plus 1 here because in sglang, for the ith layer, it takes the output
-            # of the (i-1)th layer as aux hidden state
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            # TODO (Qiaolin-Yu): check if other draft models need similar layer id
+            # adjustment
+            if layer_ids and layer_ids[0] == 1:
+                self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            else:
+                self.model.layers_to_capture = list(layer_ids)
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:

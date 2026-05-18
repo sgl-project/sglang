@@ -11,6 +11,7 @@ register_cuda_ci(est_time=60, suite="base-b-kernel-unit-1-gpu-large")
 
 DEVICE = "cuda"
 
+# DSv3 / DeepSeek-V4 typical per-head dims.
 SHAPES = get_ci_test_range(
     [(128, 64, 128), (64, 32, 64)],
     [(128, 64, 128)],
@@ -48,7 +49,9 @@ def test_correctness(dtype, shape, num_heads, batch_size):
     qk_nope, qk_rope, v_head = shape
 
     torch.manual_seed(0)
-    k_nope = torch.randn((batch_size, num_heads, qk_nope), dtype=dtype, device=DEVICE)
+    k_nope = torch.randn(
+        (batch_size, num_heads, qk_nope), dtype=dtype, device=DEVICE
+    )
     k_pe = torch.randn((batch_size, 1, qk_rope), dtype=dtype, device=DEVICE)
     v = torch.randn((batch_size, num_heads, v_head), dtype=dtype, device=DEVICE)
 
@@ -59,10 +62,19 @@ def test_correctness(dtype, shape, num_heads, batch_size):
         k_nope, k_pe, v, k_scale_inv=k_scale_inv, v_scale_inv=v_scale_inv
     )
 
-    k_ref, v_ref = _ref(k_nope, k_pe, v, k_scale_inv, v_scale_inv, torch.float8_e4m3fn)
+    k_ref, v_ref = _ref(
+        k_nope, k_pe, v, k_scale_inv, v_scale_inv, torch.float8_e4m3fn
+    )
 
-    torch.testing.assert_close(k_fp8.float(), k_ref.float(), rtol=1e-2, atol=0.5)
-    torch.testing.assert_close(v_fp8.float(), v_ref.float(), rtol=1e-2, atol=0.5)
+    # FP8 is exact-equal when both impls round identically. Allow a 1-ULP
+    # tolerance in case of subtle rounding differences between Triton-style
+    # `.to(fp8)` and CUDA's saturating `static_cast<fp8>`.
+    torch.testing.assert_close(
+        k_fp8.float(), k_ref.float(), rtol=1e-2, atol=0.5
+    )
+    torch.testing.assert_close(
+        v_fp8.float(), v_ref.float(), rtol=1e-2, atol=0.5
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -70,6 +82,8 @@ def test_strided_inputs(dtype):
     s, h = 16, 32
     qk_nope, qk_rope, v_head = 128, 64, 128
 
+    # Strided view: simulate an `kv = cat(kv_a, k_nope)` layout where k_nope is
+    # the second slice.
     full = torch.randn(
         (s, h, qk_nope * 2), dtype=dtype, device=DEVICE, requires_grad=False
     )
@@ -95,7 +109,9 @@ def test_kpe_2d_accepted():
     v = torch.randn((s, h, v_head), dtype=dtype, device=DEVICE)
 
     k_fp8, v_fp8 = mla_kv_pack_quantize_fp8(k_nope, k_pe, v)
-    k_ref, v_ref = _ref(k_nope, k_pe.unsqueeze(1), v, 1.0, 1.0, torch.float8_e4m3fn)
+    k_ref, v_ref = _ref(
+        k_nope, k_pe.unsqueeze(1), v, 1.0, 1.0, torch.float8_e4m3fn
+    )
     torch.testing.assert_close(k_fp8.float(), k_ref.float(), rtol=1e-2, atol=0.5)
     torch.testing.assert_close(v_fp8.float(), v_ref.float(), rtol=1e-2, atol=0.5)
 
